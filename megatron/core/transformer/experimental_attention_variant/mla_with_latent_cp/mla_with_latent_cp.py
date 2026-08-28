@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -90,6 +91,22 @@ def _validate_supported_submodules(submodules: MLASelfAttentionSubmodules) -> No
     )
 
 
+@dataclass(frozen=True)
+class _MicrobatchLayoutKey:
+    """Host-only identity for one immutable packed microbatch layout."""
+
+    packed_id: int
+    cu_q_id: int
+    cu_kv_id: int
+    cp_group_id: int
+    local_tokens: int
+    device: torch.device
+    max_q: int | None
+    max_kv: int | None
+    local_cp_size: int | None
+    partition_mode: str
+
+
 class MLAWithLatentCP(MLASelfAttention):
     """Training-only THD MLA whose P2P CP ring exchanges normalized latent KV."""
 
@@ -143,6 +160,12 @@ class MLAWithLatentCP(MLASelfAttention):
         self._backend_adapter, self._backend_runtime_tuple = _qualified_backend_adapter(
             self.config.attention_backend
         )
+        self._prepared_microbatch: (
+            tuple[
+                _MicrobatchLayoutKey, dist.ProcessGroup, latent_cp_layout.ZigZagLayout
+            ]
+            | None
+        ) = None
 
     def _validate_initial_config(self) -> None:
         config = self.config
@@ -353,12 +376,40 @@ class MLAWithLatentCP(MLASelfAttention):
             self._parameter_dtypes_validated = True
         return packed_seq_params
 
+    def _microbatch_layout_key(
+        self,
+        hidden_states: Tensor,
+        packed_seq_params: PackedSeqParams,
+        cp_group: dist.ProcessGroup,
+    ) -> _MicrobatchLayoutKey:
+        cu_q = packed_seq_params.cu_seqlens_q
+        cu_kv = packed_seq_params.cu_seqlens_kv
+        if cu_kv is None:
+            cu_kv = cu_q
+        return _MicrobatchLayoutKey(
+            packed_id=id(packed_seq_params),
+            cu_q_id=id(cu_q),
+            cu_kv_id=id(cu_kv),
+            cp_group_id=id(cp_group),
+            local_tokens=hidden_states.size(0),
+            device=hidden_states.device,
+            max_q=packed_seq_params.max_seqlen_q,
+            max_kv=packed_seq_params.max_seqlen_kv,
+            local_cp_size=packed_seq_params.local_cp_size,
+            partition_mode=packed_seq_params.cp_partition_mode,
+        )
+
     def _microbatch_layout(
         self, hidden_states: Tensor, packed_seq_params: PackedSeqParams
     ) -> tuple[dist.ProcessGroup, latent_cp_layout.ZigZagLayout]:
-        """Build the cheap per-microbatch layout using the scheduler-selected CP group."""
+        """Return a preprocessed layout or build one for direct module callers."""
 
         cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        key = self._microbatch_layout_key(hidden_states, packed_seq_params, cp_group)
+        if self._prepared_microbatch is not None:
+            prepared_key, prepared_group, prepared_layout = self._prepared_microbatch
+            if prepared_key == key:
+                return prepared_group, prepared_layout
         layout = self._layout_adapter.prepare(
             hidden_states,
             packed_seq_params,
@@ -366,18 +417,30 @@ class MLAWithLatentCP(MLASelfAttention):
             tp_group=self.pg_collection.tp,
             sequence_parallel=self.config.sequence_parallel,
         )
+        self._prepared_microbatch = (key, cp_group, layout)
         return cp_group, layout
 
     def _preprocess_backend(
-        self, hidden_states: Tensor, packed_seq_params: PackedSeqParams
+        self,
+        hidden_states: Tensor,
+        packed_seq_params: PackedSeqParams,
+        prepared_layout: tuple[dist.ProcessGroup, latent_cp_layout.ZigZagLayout]
+        | None = None,
     ) -> None:
-        """Prepare expensive backend plans before the transformer layer loop."""
+        """Retain the shared layout and prepare expensive backend bindings."""
 
         _require(
             isinstance(packed_seq_params, PackedSeqParams),
             "PackedSeqParams is required",
         )
-        _, layout = self._microbatch_layout(hidden_states, packed_seq_params)
+        if prepared_layout is None:
+            cp_group, layout = self._microbatch_layout(hidden_states, packed_seq_params)
+        else:
+            cp_group, layout = prepared_layout
+            key = self._microbatch_layout_key(
+                hidden_states, packed_seq_params, cp_group
+            )
+            self._prepared_microbatch = (key, cp_group, layout)
         self._backend_adapter.prepare(
             num_heads=self.num_attention_heads_per_partition,
             qk_dim=self.q_head_dim,
@@ -715,8 +778,8 @@ def preprocess_mla_latent_cp(
 ) -> None:
     """Prepare every latent-CP attention layer before a block enters its layer loop.
 
-    Backend qualification is construction-time state. This hook owns only expensive,
-    microbatch-specific plan preparation; it does not cache forward state or run collectives.
+    Backend qualification is construction-time state. This hook shares immutable layout metadata
+    and prepares expensive microbatch-specific backend bindings. It runs no collectives.
     """
 
     latent_layers = tuple(
@@ -727,5 +790,12 @@ def preprocess_mla_latent_cp(
     _require(
         isinstance(packed_seq_params, PackedSeqParams), "PackedSeqParams is required"
     )
-    for layer in latent_layers:
-        layer._preprocess_backend(hidden_states, packed_seq_params)
+    first_layer, *other_layers = latent_layers
+    prepared_layout = first_layer._microbatch_layout(hidden_states, packed_seq_params)
+    first_layer._preprocess_backend(
+        hidden_states, packed_seq_params, prepared_layout=prepared_layout
+    )
+    for layer in other_layers:
+        layer._preprocess_backend(
+            hidden_states, packed_seq_params, prepared_layout=prepared_layout
+        )

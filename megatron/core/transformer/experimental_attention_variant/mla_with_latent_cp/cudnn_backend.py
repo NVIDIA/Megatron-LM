@@ -8,6 +8,7 @@ import importlib
 import importlib.metadata
 import os
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Callable, Final
@@ -71,6 +72,34 @@ class _CudnnPlan:
     forward_graph: Any
     backward_graph: Any
     key: _CudnnPlanKey
+
+
+@dataclass(frozen=True)
+class _CudnnBindingKey:
+    """Identity of immutable phase metadata prepared before layer execution."""
+
+    cu_q_id: int
+    cu_kv_id: int
+    dtype: torch.dtype
+    heads: int
+    qk_dim: int
+    v_dim: int
+    max_q: int
+    max_kv: int
+    causal: bool
+    scale: float
+
+
+@dataclass(frozen=True)
+class _CudnnBinding:
+    """Prepared plan and canonical ragged buffers for one phase metadata pair."""
+
+    plan: _CudnnPlan
+    metadata: dict[_CudnnUid, Tensor]
+    cu_q: Tensor
+    cu_kv: Tensor
+    total_q: int
+    total_kv: int
 
 
 def _packed_bshd_stride(shape: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
@@ -289,6 +318,7 @@ class CudnnFusedAttentionAdapter:
                 f"cuDNN adapter identity {self.identity!r} != {expected_identity!r}"
             )
         self._plans: dict[_CudnnPlanKey, _CudnnPlan] = {}
+        self._bindings: OrderedDict[_CudnnBindingKey, _CudnnBinding] = OrderedDict()
         self._execution_lock = threading.RLock()
 
     def __del__(self) -> None:
@@ -589,6 +619,63 @@ class CudnnFusedAttentionAdapter:
             )
         return plan
 
+    @staticmethod
+    def _binding_key(
+        *,
+        cu_q: Tensor,
+        cu_kv: Tensor,
+        dtype: torch.dtype,
+        heads: int,
+        qk_dim: int,
+        v_dim: int,
+        max_q: int,
+        max_kv: int,
+        causal: bool,
+        scale: float,
+    ) -> _CudnnBindingKey:
+        _require(
+            cu_q.dtype == cu_kv.dtype == torch.int32,
+            "cuDNN cumulative lengths must be INT32",
+        )
+        _require(
+            cu_q.is_contiguous() and cu_kv.is_contiguous(),
+            "cuDNN cumulative lengths must be contiguous",
+        )
+        return _CudnnBindingKey(
+            cu_q_id=id(cu_q),
+            cu_kv_id=id(cu_kv),
+            dtype=dtype,
+            heads=heads,
+            qk_dim=qk_dim,
+            v_dim=v_dim,
+            max_q=max_q,
+            max_kv=max_kv,
+            causal=causal,
+            scale=float(scale),
+        )
+
+    def _get_binding(self, key: _CudnnBindingKey) -> _CudnnBinding | None:
+        with self._execution_lock:
+            binding = self._bindings.get(key)
+            if binding is not None:
+                self._bindings.move_to_end(key)
+            return binding
+
+    def _remember_binding(self, key: _CudnnBindingKey, binding: _CudnnBinding) -> None:
+        with self._execution_lock:
+            self._bindings[key] = binding
+            self._bindings.move_to_end(key)
+            while len(self._bindings) > 128:
+                self._bindings.popitem(last=False)
+
+    def _require_binding(self, key: _CudnnBindingKey) -> _CudnnBinding:
+        binding = self._get_binding(key)
+        if binding is None:
+            raise BackendPlanNotSupportedError(
+                "cuDNN phase metadata was not prepared before transformer block execution"
+            )
+        return binding
+
     def prepare(
         self,
         *,
@@ -598,9 +685,23 @@ class CudnnFusedAttentionAdapter:
         phases: tuple[PhaseSpec, ...],
         scale: float,
     ) -> None:
-        """Build or reuse public cuDNN Graph plans for every phase."""
+        """Build or reuse public cuDNN Graph plans and ragged bindings."""
         device = torch.device("cuda", self.device_index)
         for phase in phases:
+            binding_key = self._binding_key(
+                cu_q=phase.cu_seqlens_q,
+                cu_kv=phase.cu_seqlens_kv,
+                dtype=torch.bfloat16,
+                heads=num_heads,
+                qk_dim=qk_dim,
+                v_dim=v_dim,
+                max_q=phase.max_seqlen_q,
+                max_kv=phase.max_seqlen_kv,
+                causal=phase.causal,
+                scale=scale,
+            )
+            if self._get_binding(binding_key) is not None:
+                continue
             key = self._plan_key_from_metadata(
                 device=device,
                 dtype=torch.bfloat16,
@@ -614,9 +715,26 @@ class CudnnFusedAttentionAdapter:
                 causal=phase.causal,
                 scale=scale,
             )
-            self._prepare_plan(key)
+            plan = self._prepare_plan(key)
+            self._remember_binding(
+                binding_key,
+                _CudnnBinding(
+                    plan=plan,
+                    metadata=self._metadata(
+                        phase.cu_seqlens_q,
+                        phase.cu_seqlens_kv,
+                        num_heads,
+                        qk_dim,
+                        v_dim,
+                    ),
+                    cu_q=phase.cu_seqlens_q,
+                    cu_kv=phase.cu_seqlens_kv,
+                    total_q=phase.q_indices.numel(),
+                    total_kv=phase.kv_indices.numel(),
+                ),
+            )
 
-    def _execution_key(
+    def _execution_binding(
         self,
         q: Tensor,
         k: Tensor,
@@ -627,7 +745,7 @@ class CudnnFusedAttentionAdapter:
         max_kv: int,
         causal: bool,
         scale: float,
-    ) -> _CudnnPlanKey:
+    ) -> _CudnnBinding:
         _require(
             q.dtype == k.dtype == v.dtype == torch.bfloat16,
             "cuDNN Q/K/V must all be BF16",
@@ -641,17 +759,16 @@ class CudnnFusedAttentionAdapter:
             and q.size(2) == k.size(2),
             "invalid cuDNN THD Q/K/V shapes",
         )
+        self._assert_bound_device(q.device)
         _require(
-            q.size(0) == int(cu_q[-1].item())
-            and k.size(0) == v.size(0) == int(cu_kv[-1].item()),
-            "cuDNN tensor rows disagree with cumulative lengths",
+            cu_q.device == q.device and cu_kv.device == q.device,
+            "cuDNN metadata must be on the Q/K/V device",
         )
-        return self._plan_key_from_metadata(
-            device=q.device,
-            dtype=q.dtype,
+        binding_key = self._binding_key(
             cu_q=cu_q,
             cu_kv=cu_kv,
-            num_heads=q.size(1),
+            dtype=q.dtype,
+            heads=q.size(1),
             qk_dim=q.size(2),
             v_dim=v.size(2),
             max_q=max_q,
@@ -659,6 +776,15 @@ class CudnnFusedAttentionAdapter:
             causal=causal,
             scale=scale,
         )
+        binding = self._require_binding(binding_key)
+        _require(
+            binding.cu_q is cu_q
+            and binding.cu_kv is cu_kv
+            and q.size(0) == binding.total_q
+            and k.size(0) == v.size(0) == binding.total_kv,
+            "cuDNN tensors disagree with prepared cumulative lengths",
+        )
+        return binding
 
     def _execute_forward(
         self,
@@ -672,9 +798,12 @@ class CudnnFusedAttentionAdapter:
         causal: bool,
         scale: float,
     ) -> tuple[Tensor, Tensor]:
-        key = self._execution_key(q, k, v, cu_q, cu_kv, max_q, max_kv, causal, scale)
-        plan = self._get_prepared_plan(key)
-        metadata = self._metadata(cu_q, cu_kv, key.heads, key.qk_dim, key.v_dim)
+        binding = self._execution_binding(
+            q, k, v, cu_q, cu_kv, max_q, max_kv, causal, scale
+        )
+        plan = binding.plan
+        key = plan.key
+        metadata = binding.metadata
         q_buffer = _pad_token_rows(q, key.capacity_q)
         k_buffer = _pad_token_rows(k, key.capacity_kv)
         v_buffer = _pad_token_rows(v, key.capacity_kv)
@@ -720,9 +849,12 @@ class CudnnFusedAttentionAdapter:
         causal: bool,
         scale: float,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        key = self._execution_key(q, k, v, cu_q, cu_kv, max_q, max_kv, causal, scale)
-        plan = self._get_prepared_plan(key)
-        metadata = self._metadata(cu_q, cu_kv, key.heads, key.qk_dim, key.v_dim)
+        binding = self._execution_binding(
+            q, k, v, cu_q, cu_kv, max_q, max_kv, causal, scale
+        )
+        plan = binding.plan
+        key = plan.key
+        metadata = binding.metadata
         q_buffer = _pad_token_rows(q, key.capacity_q)
         k_buffer = _pad_token_rows(k, key.capacity_kv)
         v_buffer = _pad_token_rows(v, key.capacity_kv)

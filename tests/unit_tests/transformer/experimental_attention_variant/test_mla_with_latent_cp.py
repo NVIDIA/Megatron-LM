@@ -1857,6 +1857,64 @@ def test_cudnn_phase_execution_requires_prepared_plan():
     assert adapter._get_prepared_plan(key) is prepared
 
 
+def test_cudnn_prepare_caches_phase_metadata_binding():
+    adapter = object.__new__(latent_cp.CudnnFusedAttentionAdapter)
+    adapter.device_index = 0
+    adapter._execution_lock = latent_cp_cudnn_backend.threading.RLock()
+    adapter._bindings = latent_cp_cudnn_backend.OrderedDict()
+    plan_key = mock.sentinel.plan_key
+    plan = mock.sentinel.plan
+    metadata = {mock.sentinel.uid: mock.sentinel.tensor}
+    adapter._plan_key_from_metadata = mock.Mock(return_value=plan_key)
+    adapter._prepare_plan = mock.Mock(return_value=plan)
+    adapter._metadata = mock.Mock(return_value=metadata)
+
+    cu_q = torch.tensor([0, 2, 6], dtype=torch.int32)
+    cu_kv = torch.tensor([0, 1, 3], dtype=torch.int32)
+    phase = latent_cp.PhaseSpec(
+        phase=0,
+        owner=0,
+        kind="lower",
+        q_indices=torch.arange(6),
+        kv_indices=torch.arange(3),
+        cu_seqlens_q=cu_q,
+        cu_seqlens_kv=cu_kv,
+        max_seqlen_q=4,
+        max_seqlen_kv=2,
+        causal=False,
+    )
+    kwargs = {
+        "num_heads": 3,
+        "qk_dim": 192,
+        "v_dim": 128,
+        "phases": (phase,),
+        "scale": 0.125,
+    }
+    adapter.prepare(**kwargs)
+    adapter.prepare(**kwargs)
+
+    adapter._plan_key_from_metadata.assert_called_once()
+    adapter._prepare_plan.assert_called_once_with(plan_key)
+    adapter._metadata.assert_called_once_with(cu_q, cu_kv, 3, 192, 128)
+    binding_key = adapter._binding_key(
+        cu_q=cu_q,
+        cu_kv=cu_kv,
+        dtype=torch.bfloat16,
+        heads=3,
+        qk_dim=192,
+        v_dim=128,
+        max_q=4,
+        max_kv=2,
+        causal=False,
+        scale=0.125,
+    )
+    binding = adapter._require_binding(binding_key)
+    assert binding.plan is plan
+    assert binding.metadata is metadata
+    assert binding.cu_q is cu_q and binding.cu_kv is cu_kv
+    assert binding.total_q == 6 and binding.total_kv == 3
+
+
 def test_shared_cudnn_adapter_is_process_device_runtime_scoped(monkeypatch):
     created = []
 
@@ -2198,11 +2256,24 @@ def test_block_preprocess_dispatches_only_to_latent_cp_layers():
     packed = PackedSeqParams()
     latent_cp.preprocess_mla_latent_cp(nn.Sequential(nn.Identity()), hidden, None)
 
-    layer = object.__new__(latent_cp.MLAWithLatentCP)
-    nn.Module.__init__(layer)
-    layer._preprocess_backend = mock.Mock()
-    latent_cp.preprocess_mla_latent_cp(nn.Sequential(layer), hidden, packed)
-    layer._preprocess_backend.assert_called_once_with(hidden, packed)
+    first = object.__new__(latent_cp.MLAWithLatentCP)
+    second = object.__new__(latent_cp.MLAWithLatentCP)
+    nn.Module.__init__(first)
+    nn.Module.__init__(second)
+    prepared = (mock.sentinel.cp_group, mock.sentinel.layout)
+    first._microbatch_layout = mock.Mock(return_value=prepared)
+    first._preprocess_backend = mock.Mock()
+    second._preprocess_backend = mock.Mock()
+    latent_cp.preprocess_mla_latent_cp(
+        nn.Sequential(first, nn.Identity(), second), hidden, packed
+    )
+    first._microbatch_layout.assert_called_once_with(hidden, packed)
+    first._preprocess_backend.assert_called_once_with(
+        hidden, packed, prepared_layout=prepared
+    )
+    second._preprocess_backend.assert_called_once_with(
+        hidden, packed, prepared_layout=prepared
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

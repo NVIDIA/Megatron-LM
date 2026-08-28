@@ -512,12 +512,13 @@ identical operation lists, and identical phase counts prevent mismatched-message
 deadlocks.
 
 Feature-static config, package, runtime, and capability checks run in the layer constructor, using
-the configured maximum CP/TP groups where group properties are needed. Cheap dtype, metadata, and
-peer checks run in `forward`. Before the layer loop, block-level preprocessing enumerates the exact
-microbatch phase shapes and builds or reuses the expensive cuDNN Graph plans. It stores no
-microbatch result, performs no rank consensus, and introduces no decoder scope or wrapper class.
-During a phase, the cuDNN adapter only looks up a previously prepared plan; it cannot build one in
-the ring. A direct/custom layer call that bypasses block preprocessing therefore fails in phase zero
+the configured maximum CP/TP groups where group properties are needed. Cheap activation checks run
+in `forward`. Before the layer loop, block-level preprocessing derives one immutable microbatch
+layout shared by every latent-CP layer, then builds or reuses expensive cuDNN Graph plans and
+canonical ragged bindings. It stores no attention result, performs no rank consensus, and introduces
+no decoder scope or wrapper class. During a phase, the cuDNN adapter only looks up a previously
+prepared binding; it cannot build a graph or derive metadata in the ring. A direct/custom layer call
+that bypasses block preprocessing therefore fails in phase zero
 before the first ring hop. Once P2P starts, the module makes no claim to recover from an arbitrary
 Python, CUDA, or NCCL exception; failures propagate through normal PyTorch/NCCL error handling.
 
@@ -563,10 +564,13 @@ The adapter imports public `cudnn` and uses only:
   `graph.check_support`, `graph.build_plans`, `graph.get_workspace_size`, and `graph.execute`; and
 - public `cudnn.data_type` and `cudnn.heur_mode` enums.
 
-One cuDNN adapter, public handle, and plan cache are shared by all latent-CP layers in one process on
-one CUDA device. Forward/backward graphs are keyed by process/device identity, exact
+One cuDNN adapter, public handle, plan cache, and bounded ragged-binding cache are shared by all
+latent-CP layers in one process on one CUDA device. Forward/backward graphs are keyed by
+process/device identity, exact
 frontend/runtime versions, dtype and capability, heads/dimensions, phase shape, causal flag, scale,
-maximum packed lengths, and metadata capacity. Handle stream mutation, plan construction, and
+maximum packed lengths, and metadata capacity. Each binding retains exact cumulative tensors,
+canonical rank-4 length/offset buffers, actual token totals, and its prepared plan. Handle mutation,
+plan construction, and
 execution are lock-protected. Workspace tensors and variant packs are invocation-local and are never
 adapter-owned or reused across concurrent calls. `generate_stats=True` supplies local FP32 LSE for
 the corrected backward.
@@ -653,21 +657,21 @@ qualified adapter. These checks are feature-specific and independent of a microb
 
 Cheap activation, dtype, head-dimension, packed-metadata, and effective-group checks stay in
 `forward`. `preprocess_mla_latent_cp(block, hidden_states, packed_seq_params)` is called by both
-`TransformerBlock` and `HybridStack` after input scheduling and before the layer loop. It finds the
-latent-CP layers, derives each exact microbatch phase layout with the effective CP group, and calls
-the adapter's `prepare` method. FA4 preparation is a no-op; the shared cuDNN adapter builds or reuses
-the public forward/backward Graph plans for every phase class.
+`TransformerBlock` and `HybridStack` after input scheduling and before the layer loop. It derives one
+exact microbatch phase layout with the effective CP group, installs that immutable layout on every
+latent-CP layer, and calls each adapter's `prepare` method. FA4 preparation is a no-op; the shared
+cuDNN adapter builds or reuses public forward/backward Graph plans and canonical ragged buffers.
 
-The preprocessing function stores no forward result, creates no context, wraps no decoder class,
-and launches no collective. `forward` cheaply derives the same deterministic layout for execution;
-cuDNN phase execution calls only `_get_prepared_plan` and never builds a Graph inside the ring. A
+The preprocessing function stores no attention result, creates no decoder context or wrapper class,
+and launches no collective. `forward` validates a host-only identity key and reuses the prepared
+layout without reading CUDA scalars. cuDNN phase execution uses the exact metadata-tensor identity to
+look up its binding and never rebuilds a key, ragged buffer, or Graph inside the ring. A
 custom caller that invokes a latent-CP layer outside a normal block must call the public
 preprocessing function first or fail before the first phase executes.
 
-The adapter's process/device plan cache contains only expensive deterministic Graph artifacts keyed
-by the exact runtime, shape, dtype, and descriptor contract. It is not a microbatch availability
-protocol and never runs reference inputs, compares numbers, mutates the allow-list, or provides an
-opt-in numerical probe.
+The adapter caches deterministic Graph artifacts by runtime/shape contract and up to 128 immutable
+microbatch bindings by metadata object identity. It is not an availability protocol and never runs
+reference inputs, compares numbers, mutates the allow-list, or provides a numerical probe.
 
 ## Feature-owned architecture and config-driven construction
 
@@ -785,9 +789,9 @@ Responsibility follows ownership and cost:
   and the group size matches before publishing `PackedSeqParams`;
 - `MLAWithLatentCP.__init__` validates feature-static config, projection/group wiring, package and
   runtime versions, hardware capability, and exact allow-list membership;
-- `forward` validates cheap activation, metadata, layout, dtype, and effective-group properties for
-  the current microbatch; and
-- block preprocessing owns only expensive microbatch-specific cuDNN descriptor and plan creation.
+- `forward` validates cheap activation, dtype, and effective-group identity for the current
+  microbatch; and
+- block preprocessing owns layout validation plus microbatch-specific cuDNN bindings and plans.
 
 The supported contract is:
 
@@ -970,9 +974,10 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    Assert the production source pin and immutable allow-list equal the independently spelled
    evidence tuples exactly, and that the epsilon mapping has the same keys and no extras. An
    installed unqualified tuple skips a real-backend test before layer/adapter/Graph construction.
-   A qualified layer must hold its matching adapter/runtime immediately after construction, and the
-   explicit block function must dispatch preprocessing only to latent-CP layers. Fake cuDNN tests
-   build plans through `prepare` and prove phase execution only looks up prepared plans.
+   A qualified layer must hold its matching adapter/runtime immediately after construction. The
+   explicit block function derives one layout and shares it across latent-CP layers. Fake cuDNN tests
+   call `prepare` twice and prove the second call reuses the same plan and canonical metadata binding;
+   phase execution only performs a binding lookup.
    Feature-initialization tests require non-mutating GPT/Hybrid spec rewrites that preserve ordinary
    block classes. Existing data-scheduler tests own dynamic `local_cp_size/cp_group` consistency;
    full dynamic parity owns per-microbatch effective-group behavior.
