@@ -13,7 +13,10 @@ import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
@@ -68,14 +71,16 @@ class TestMcoreAdapterDense:
             num_attention_heads=4,
             init_method=initialize_to_constant,
             output_layer_init_method=initialize_to_constant,
-            use_cpu_initialization=True,
             # The FSDP adapter uses this flag to materialize and initialize meta parameters.
             init_model_with_meta_device=True,
         )
-        # MCore local linear layers otherwise allocate directly on CUDA. With CPU
-        # initialization enabled, their allocations inherit this meta device context.
         with torch.device("meta"):
-            meta_layer = _build_layer(config)
+            meta_layer = TransformerLayer(
+                config=config,
+                submodules=get_gpt_layer_with_transformer_engine_spec().submodules,
+                layer_number=1,
+                add_layer_offset=False,
+            )
         meta_parameters = list(meta_layer.parameters())
         assert meta_parameters
         assert all(parameter.is_meta for parameter in meta_parameters)
@@ -102,7 +107,7 @@ class TestMcoreAdapterDense:
 
             if name.endswith("bias"):
                 expected_value = 0.0
-            elif "layernorm" in name:
+            elif "layernorm" in name or "layer_norm" in name:
                 expected_value = 1.0
             else:
                 expected_value = 0.25

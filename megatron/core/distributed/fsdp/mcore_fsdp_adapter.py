@@ -65,6 +65,9 @@ logger = logging.getLogger(__name__)
 
 def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> None:
     """Materialize and initialize one module's direct meta parameters."""
+    if not any(parameter.is_meta for parameter in module.parameters(recurse=False)):
+        return
+
     if device is None:
         device = torch.device("cpu")
 
@@ -75,11 +78,9 @@ def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> 
 
     reset_parameters = getattr(module, "reset_parameters", None)
     if reset_parameters is None:
-        reset_parameters = getattr(module, "_reset_parameters", None)
-    if reset_parameters is None:
         raise ValueError(
             f"Meta parameter module {type(module).__qualname__} does not have a "
-            "reset_parameters or _reset_parameters method."
+            "reset_parameters method."
         )
 
     module._apply(materialize_tensor, recurse=False)
