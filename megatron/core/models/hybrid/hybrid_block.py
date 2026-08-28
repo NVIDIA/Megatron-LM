@@ -42,11 +42,9 @@ from megatron.core.tensor_parallel.random import MHCCheckpointManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention_residual import (
     AttentionResidual,
-    attn_res_num_payload_slices,
+    AttnResStageSources,
     attn_res_num_sources,
     is_attn_res_block_start,
-    pack_attn_res_payload,
-    unpack_attn_res_payload,
 )
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.hyper_connection import (
@@ -234,6 +232,8 @@ class HybridStack(MegatronModule):
         mtp_layer_number (int, optional): enclosing MTP depth for nested MoE metrics.
         hash_moe_layer_threshold (int, optional): global Hybrid layer-number threshold used
             to select hash-routed MoE layers.
+        vp_stage (int, optional): virtual pipeline stage of this stack chunk; used by the
+            attention-residual source cache under interleaved pipeline parallelism.
     """
 
     def __init__(
@@ -254,6 +254,7 @@ class HybridStack(MegatronModule):
         name: str | None = None,
         layer_config_list: Sequence[TransformerConfig] | None = None,
         boundary_layout: CPLayout | None = None,
+        vp_stage: Optional[int] = None,
     ) -> None:
         """
         Args:
@@ -303,6 +304,7 @@ class HybridStack(MegatronModule):
         )
         self.mtp_layer_number = mtp_layer_number
         self.pp_layer_offset = pp_layer_offset
+        self.vp_stage = vp_stage
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -799,20 +801,29 @@ class HybridStack(MegatronModule):
         # On the first stage the embedding output is the initial partial sum (it
         # becomes depth source b_0 when entry 1 opens the first block); later
         # stages unpack the seq-dim-concatenated payload from the previous stage.
-        attn_res_sources: Optional[List[Tensor]] = None
+        # Under interleaved VPP the payload is a padded delta and the rest of
+        # the prefix comes from the rank-local source cache.
+        attn_res_state: Optional[AttnResStageSources] = None
         if self.config.enable_attention_residuals:
             assert not self.is_mtp_layer, "Attention residuals do not support hybrid MTP stacks."
-            if self.pre_process:
-                attn_res_sources = []
-            else:
-                nvtx_range_push(msg="attn_res.unpack_payload")
-                attn_res_sources, hidden_states = unpack_attn_res_payload(
-                    hidden_states,
-                    attn_res_num_payload_slices(
-                        self.pp_layer_offset, self.config.attn_res_block_layers
-                    ),
+            current_microbatch = None
+            if self.config.virtual_pipeline_model_parallel_size is not None:
+                current_microbatch = (
+                    getattr(self.layers[0], 'current_microbatch', None) if self.layers else None
                 )
-                nvtx_range_pop(msg="attn_res.unpack_payload")
+            attn_res_state, hidden_states = AttnResStageSources.enter(
+                self.config,
+                hidden_states,
+                layers_before=self.pp_layer_offset,
+                pp_rank=(
+                    torch.distributed.get_rank(self.pp_group)
+                    if self.config.virtual_pipeline_model_parallel_size is not None
+                    else 0
+                ),
+                vp_stage=self.vp_stage,
+                microbatch_id=current_microbatch,
+                pre_process=self.pre_process,
+            )
 
         if inference_context and inference_context.is_static_batching():
             # NOTE(bnorick): match BaseInferenceContext attributes for
@@ -971,7 +982,7 @@ class HybridStack(MegatronModule):
                                 if layer.attn_res_is_block_start:
                                     # Block boundary: the completed partial sum becomes
                                     # a depth source; the entry starts a fresh partial.
-                                    attn_res_sources.append(hidden_states)
+                                    attn_res_state.append_block_start(hidden_states)
                                 hidden_states = layer(
                                     hidden_states=hidden_states,
                                     attention_mask=attention_mask,
@@ -983,7 +994,7 @@ class HybridStack(MegatronModule):
                                     input_ids=(
                                         input_ids if self._uses_hash_routing(layer) else None
                                     ),
-                                    attn_res_sources=tuple(attn_res_sources),
+                                    attn_res_sources=tuple(attn_res_state.graph_sources),
                                 )
                             elif isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                                 layer_kwargs = dict(
@@ -1116,16 +1127,17 @@ class HybridStack(MegatronModule):
             # The network end is a block boundary: the trailing partial sum always
             # holds the last (possibly incomplete) depth block and is never in the
             # source list, so it must be aggregated (and shipped) alongside them.
-            attn_res_values = [*attn_res_sources, hidden_states]
             if self.post_process:
+                attn_res_values = attn_res_state.exit_aggregate_values(hidden_states)
                 nvtx_range_push(msg="attn_res.final_aggregate")
                 hidden_states = self.final_attn_res(attn_res_values)
                 nvtx_range_pop(msg="attn_res.final_aggregate")
             else:
-                # Not the final stage: pack sources + partial into the single
-                # pipeline payload tensor (concatenated along the seq dim).
+                # Not the final stage: pack the pipeline payload (full prefix, or
+                # delta + padding under interleaved VPP), concatenated along the
+                # sequence dim.
                 nvtx_range_push(msg="attn_res.pack_payload")
-                hidden_states = pack_attn_res_payload(attn_res_values)
+                hidden_states = attn_res_state.exit_pack(hidden_states)
                 nvtx_range_pop(msg="attn_res.pack_payload")
 
         # Final layer norm.
