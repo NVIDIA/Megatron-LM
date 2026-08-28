@@ -195,6 +195,7 @@ run_testmon_phase() {
     local mode="$1"
     local phase="$2"
     shift 2
+    uv pip install --python /opt/venv/bin/python --no-deps "pytest-testmon==2.2.0"
     local -a command=(uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}")
     command+=(
         tests/unit_tests/testmon_selector.py
