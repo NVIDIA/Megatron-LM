@@ -627,7 +627,7 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "mhc": recompute HyperConnection intermediate activations via
-            CheckpointWithoutOutput + MHCCheckpointManager. Requires
+            CheckpointWithoutOutput + CheckpointWithoutOutputManager. Requires
             enable_hyper_connections=True. Cannot be used with "mlp".
     "gdn": recompute the entire GDN-family layer, including GatedDeltaNet and KDA
             (input projections, conv1d, gated delta rule, gated norm, CP all-to-all, and
@@ -1258,8 +1258,8 @@ class TransformerConfig(ModelParallelConfig):
     """Number of layers in each mHC recompute group.
 
     Layers are grouped in their local transformer-block order. The last layer in each group leaves
-    its final MLP BDA output uncheckpointed and closes the current ``MHCCheckpointManager``; a new
-    manager is created for the next group.
+    its final MLP BDA output uncheckpointed and closes the current
+    ``CheckpointWithoutOutputManager``; a new manager is created for the next group.
 
     In the standard forward path, the group-ending layer registers a unified recompute hook on its
     MLP BDA output. In the fine-grained expert-parallel overlap schedule, the group outputs are

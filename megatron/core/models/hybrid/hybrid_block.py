@@ -24,7 +24,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as Layer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
-from megatron.core.tensor_parallel.random import MHCCheckpointManager
+from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import CudaGraphModule
@@ -826,13 +826,13 @@ class HybridStack(MegatronModule):
 
     def _build_mhc_recompute_layer_plan(
         self, use_mhc_recompute: bool
-    ) -> Tuple[List[Optional[MHCCheckpointManager]], List[bool]]:
+    ) -> Tuple[List[Optional[CheckpointWithoutOutputManager]], List[bool]]:
         """Pre-build per-layer MHC recompute managers and block-end markers.
 
         The block-end plan is deterministic from config and cached on the
-        instance; only the per-block ``MHCCheckpointManager`` instances are
-        allocated fresh per forward pass (managers are single-use). Mirrors
-        the caching scheme used by ``TransformerBlock``.
+        instance; only the per-block ``CheckpointWithoutOutputManager``
+        instances are allocated fresh per forward pass (managers are single-use).
+        This mirrors the caching scheme used by ``TransformerBlock``.
         """
         num_layers = len(self.layers)
         if not use_mhc_recompute or num_layers == 0:
@@ -842,17 +842,17 @@ class HybridStack(MegatronModule):
             self._mhc_block_end_plan = self._compute_mhc_block_end_plan()
         is_recompute_block_end = self._mhc_block_end_plan
 
-        layer_managers: List[Optional[MHCCheckpointManager]] = [None] * num_layers
-        mhc_manager = MHCCheckpointManager()
+        layer_managers: List[Optional[CheckpointWithoutOutputManager]] = [None] * num_layers
+        mhc_manager = CheckpointWithoutOutputManager()
         for l_no in range(num_layers):
             layer_managers[l_no] = mhc_manager
             if is_recompute_block_end[l_no] and l_no != num_layers - 1:
-                mhc_manager = MHCCheckpointManager()
+                mhc_manager = CheckpointWithoutOutputManager()
         return layer_managers, is_recompute_block_end
 
     @staticmethod
     def _finalize_mhc_recompute_layer(
-        mhc_manager: Optional[MHCCheckpointManager],
+        mhc_manager: Optional[CheckpointWithoutOutputManager],
         hidden_states: Tensor,
         is_last_in_recompute_block: bool,
     ) -> None:

@@ -26,6 +26,7 @@ class PackedSeqParams:
     seq_idx: Tensor = None
     tokens_per_sample: int = None
     pad_between_seqs: bool = None
+    cp_partition_mode: str = "zigzag"
     cp_scatter_cache: object = None
 
     def __post_init__(self):
@@ -67,3 +68,12 @@ class PackedSeqParams:
                 .to(torch.int32)
                 .unsqueeze(0)  # Add a batch dimension
             )
+
+
+def resolve_cp_group(
+    static_cp_group: dist.ProcessGroup, packed_seq_params: PackedSeqParams = None
+) -> dist.ProcessGroup:
+    """Return the packed-sequence CP group when present, otherwise the static group."""
+    if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+        return packed_seq_params.cp_group
+    return static_cp_group

@@ -334,6 +334,11 @@ def forward_step(data_iterator, model: HybridModel):
             cu_seqlens_for_params = cu_seqlens
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
+            cp_partition_mode=(
+                "contiguous"
+                if args.linear_cp_mode == "chunkwise" and args.context_parallel_size > 1
+                else "zigzag"
+            ),
             cu_seqlens_q=cu_seqlens_for_params,
             cu_seqlens_kv=cu_seqlens_for_params,
             cu_seqlens_q_padded=cu_seqlens_padded,
