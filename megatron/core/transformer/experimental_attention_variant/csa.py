@@ -3,7 +3,7 @@
 import copy
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Optional, Tuple, Union
+from typing import Optional, Protocol, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -33,6 +33,60 @@ CSA_OPERATION_DETERMINISM: dict[str, str] = {
     "non_compressed_lse": "unknown",
     "compressor_pooling": "unknown",
 }
+
+
+class CompressorBuilder(Protocol):
+    """Typed builder for a CSA compressor with its submodules already bound."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        compress_ratio: int,
+        head_dim: int,
+        rotate: bool = False,
+        rotary_pos_emb: nn.Module | None = None,
+        pg_collection: ProcessGroupCollection | None = None,
+        name: str | None = None,
+    ) -> "Compressor": ...
+
+
+class CSAIndexerBuilder(Protocol):
+    """Typed builder for a CSA indexer with its submodules already bound."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        compress_ratio: int,
+        rotary_pos_emb: nn.Module | None = None,
+        pg_collection: ProcessGroupCollection | None = None,
+        name: str | None = None,
+    ) -> "CSAIndexer": ...
+
+
+class CompressedSparseAttentionBuilder(Protocol):
+    """Typed builder for CSA core attention with its submodules already bound."""
+
+    def __call__(
+        self,
+        *,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        attention_type: str,
+        attention_dropout: float | None = None,
+        softmax_scale: float | None = None,
+        k_channels: int | None = None,
+        v_channels: int | None = None,
+        cp_comm_type: str = "p2p",
+        pg_collection: ProcessGroupCollection | None = None,
+        rotary_pos_emb: nn.Module | None = None,
+        compress_ratio: int = 0,
+        is_mtp_layer: bool = False,
+        name: str | None = None,
+    ) -> "CompressedSparseAttention": ...
+
 
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
@@ -558,7 +612,7 @@ class CSAIndexerSubmodules:
 
     linear_wq_b: Union[ModuleSpec, type] = None
     linear_weights_proj: Union[ModuleSpec, type] = None
-    compressor: Union[ModuleSpec, type] = None
+    compressor: CompressorBuilder | None = None
 
 
 class CSAIndexer(MegatronModule):
@@ -633,8 +687,9 @@ class CSAIndexer(MegatronModule):
             )
 
         # Own compressor (smaller head_dim, with Hadamard rotation)
-        self.compressor = build_module(
-            submodules.compressor,
+        if submodules.compressor is None:
+            raise ValueError("CSAIndexer requires a compressor builder")
+        self.compressor = submodules.compressor(
             config=config,
             compress_ratio=compress_ratio,
             head_dim=self.index_head_dim,
@@ -711,8 +766,8 @@ class CSAIndexer(MegatronModule):
 class CompressedSparseAttentionSubmodules:
     """Submodule specs for CompressedSparseAttention."""
 
-    compressor: Union[ModuleSpec, type] = None
-    indexer: Union[ModuleSpec, type] = None
+    compressor: CompressorBuilder | None = None
+    indexer: CSAIndexerBuilder | None = None
 
 
 class CompressedSparseAttention(MegatronModule):
@@ -784,8 +839,7 @@ class CompressedSparseAttention(MegatronModule):
 
         # Conditionally build Compressor (ratio > 1)
         if self.compress_ratio > 1 and submodules.compressor is not None:
-            self.compressor = build_module(
-                submodules.compressor,
+            self.compressor = submodules.compressor(
                 config=config,
                 compress_ratio=self.compress_ratio,
                 head_dim=config.v_head_dim,
@@ -803,8 +857,7 @@ class CompressedSparseAttention(MegatronModule):
             and not config.csa_dense_mode
             and submodules.indexer is not None
         ):
-            self.indexer = build_module(
-                submodules.indexer,
+            self.indexer = submodules.indexer(
                 config=config,
                 compress_ratio=self.compress_ratio,
                 rotary_pos_emb=rotary_pos_emb,

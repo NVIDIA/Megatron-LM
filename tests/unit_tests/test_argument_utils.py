@@ -750,6 +750,55 @@ class TestMegatronNetworkArgumentGeneration:
             self._parser().parse_args(["--mhc-fused-backend", "cuda"])
 
 
+class TestMegatronMLAArgumentGeneration:
+    """Test Megatron's manually registered MLA arguments."""
+
+    @staticmethod
+    def _parser() -> ArgumentParser:
+        from megatron.training.arguments import _add_mla_args
+
+        return _add_mla_args(ArgumentParser())
+
+    def test_original_max_position_embeddings_parser(self):
+        """The MLA YaRN context length has the expected default and accepts overrides."""
+        parser = self._parser()
+
+        assert parser.parse_args([]).original_max_position_embeddings == 4096
+        assert (
+            parser.parse_args(
+                ['--original-max-position-embeddings', '65536']
+            ).original_max_position_embeddings
+            == 65536
+        )
+
+    def test_original_max_position_embeddings_reaches_mla_config(self):
+        """A validated non-default CLI value is propagated to MLATransformerConfig."""
+        argv = [
+            'test_argument_utils.py',
+            '--multi-latent-attention',
+            '--num-layers',
+            '2',
+            '--hidden-size',
+            '128',
+            '--num-attention-heads',
+            '8',
+            '--micro-batch-size',
+            '1',
+            '--seq-length',
+            '32',
+            '--max-position-embeddings',
+            '65536',
+            '--original-max-position-embeddings',
+            '65536',
+        ]
+        with patch('sys.argv', argv):
+            args = validate_args(parse_args())
+
+        config = core_transformer_config_from_args(args)
+
+        assert config.original_max_position_embeddings == 65536
+
+
 class TestMegatronMixedPrecisionArguments:
     """Test language-model logit dtype CLI choices."""
 
