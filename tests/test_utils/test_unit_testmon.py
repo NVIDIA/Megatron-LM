@@ -66,6 +66,29 @@ def _run_wrapper(cache: Path, mode: str, phase: str = "prod") -> int:
     )
 
 
+def test_dependency_override_tracks_only_selected_packages(monkeypatch):
+    monkeypatch.setattr(
+        wrapper,
+        "distributions",
+        lambda: (
+            SimpleNamespace(metadata={"Name": "numpy"}),
+            SimpleNamespace(metadata={"Name": "pytest"}),
+            SimpleNamespace(metadata={"Name": "torch"}),
+            SimpleNamespace(metadata={"Name": "Transformer_Engine"}),
+            SimpleNamespace(metadata={"Name": "Transformer_Engine_Torch"}),
+            SimpleNamespace(metadata={"Name": "transformers"}),
+            SimpleNamespace(metadata={"Name": "triton"}),
+            SimpleNamespace(metadata={"Name": "megatron-core"}),
+            SimpleNamespace(metadata={"Name": "pytest-testmon"}),
+        ),
+    )
+
+    assert (
+        wrapper._testmon_dependency_override()
+        == "testmon_ignore_dependencies=megatron-core pytest-testmon transformers"
+    )
+
+
 def test_baseline_rank_zero_generates_one_database_per_phase(tmp_path, monkeypatch):
     calls = _fake_pytest(monkeypatch)
     monkeypatch.setenv("WORLD_SIZE", "8")
@@ -76,6 +99,7 @@ def test_baseline_rank_zero_generates_one_database_per_phase(tmp_path, monkeypat
     prod_database = tmp_path / "prod/.testmondata"
     assert prod_database.read_bytes() == b"baseline"
     assert {"--testmon", "--testmon-noselect"} <= set(calls[-1])
+    assert calls[-1][calls[-1].index("-o") + 1].startswith("testmon_ignore_dependencies=")
 
     assert _run_wrapper(tmp_path, "baseline", "experimental") == 0
     experimental_database = tmp_path / "experimental/.testmondata"
@@ -92,6 +116,7 @@ def test_baseline_nonzero_rank_disables_testmon(tmp_path, monkeypatch):
 
     assert not list(tmp_path.rglob(".testmondata"))
     assert {"-p", "no:testmon", "no:pytest-testmon"} <= set(calls[-1])
+    assert "-o" not in calls[-1]
     assert "TESTMON_DATAFILE" not in os.environ
 
 
@@ -113,6 +138,7 @@ def test_selection_uses_a_copy_and_records_nodeids(tmp_path, monkeypatch, rank):
     assert {"--collect-only", "--testmon", "--testmon-nocollect", "--testmon-forceselect"} <= set(
         arguments
     )
+    assert arguments[arguments.index("-o") + 1].startswith("testmon_ignore_dependencies=")
     disposable = tmp_path / f".testmon-work/experimental/rank-{rank}/.testmondata"
     assert Path(os.environ["TESTMON_DATAFILE"]) == disposable
     assert disposable.read_bytes() == b"trusted baseline"

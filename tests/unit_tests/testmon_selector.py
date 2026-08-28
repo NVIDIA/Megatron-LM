@@ -8,10 +8,16 @@ import argparse
 import os
 import shutil
 import sys
+from importlib.metadata import distributions
 from pathlib import Path
 
+from packaging.utils import canonicalize_name
+
 PHASES = ("prod", "experimental")
-TESTMON_DEPENDENCY_OVERRIDE = "testmon_ignore_dependencies=pytest-testmon megatron-core"
+TRACKED_ENVIRONMENT_PACKAGES = frozenset(
+    {"numpy", "pytest", "torch", "transformer-engine", "triton"}
+)
+TRACKED_ENVIRONMENT_PACKAGE_PREFIXES = ("transformer-engine-",)
 
 
 class _SelectionOutput:
@@ -47,6 +53,19 @@ def _copy_database(cache_dir: Path, phase: str, rank: int) -> Path:
     return destination
 
 
+def _testmon_dependency_override() -> str:
+    installed_packages = {
+        name for distribution in distributions() if (name := distribution.metadata["Name"])
+    }
+    ignored_packages = sorted(
+        name
+        for name in installed_packages
+        if canonicalize_name(name) not in TRACKED_ENVIRONMENT_PACKAGES
+        and not canonicalize_name(name).startswith(TRACKED_ENVIRONMENT_PACKAGE_PREFIXES)
+    )
+    return f"testmon_ignore_dependencies={' '.join(ignored_packages)}"
+
+
 def _run(args: argparse.Namespace) -> int:
     try:
         rank = int(os.environ["RANK"])
@@ -69,7 +88,7 @@ def _run(args: argparse.Namespace) -> int:
             _clear_database_files(database)
             os.environ["TESTMON_DATAFILE"] = str(database)
             pytest_args.extend(
-                ("-o", TESTMON_DEPENDENCY_OVERRIDE, "--testmon", "--testmon-noselect")
+                ("-o", _testmon_dependency_override(), "--testmon", "--testmon-noselect")
             )
         else:
             os.environ.pop("TESTMON_DATAFILE", None)
@@ -82,7 +101,7 @@ def _run(args: argparse.Namespace) -> int:
         pytest_args.extend(
             (
                 "-o",
-                TESTMON_DEPENDENCY_OVERRIDE,
+                _testmon_dependency_override(),
                 "--collect-only",
                 "--testmon",
                 "--testmon-nocollect",
