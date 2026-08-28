@@ -69,6 +69,9 @@ class _PlanCacheKey:
     # Multi-pool refit: keep each destination pool's plan distinct so source-only
     # ranks (dst_config=None on every pool) don't alias them. See swap_model_weights.
     pool_index: int = 0
+    # Execution batches are part of the plan, so a different memory limit must
+    # not reuse a cached schedule built with another limit.
+    execution_batch_bytes: int | None = None
 
 
 def _get_parallel_config(core) -> Optional[_ParallelConfig]:
@@ -108,6 +111,7 @@ def _build_plan_cache_key(
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
     pool_index: int = 0,
+    execution_batch_bytes: int | None = None,
 ) -> _PlanCacheKey:
     """Build cache key for reshard plan."""
     # group.rank()/size() support cross-cluster ProcessGroups where members
@@ -123,18 +127,22 @@ def _build_plan_cache_key(
         src_rank_offset=src_rank_offset,
         dst_rank_offset=dst_rank_offset,
         pool_index=pool_index,
+        execution_batch_bytes=execution_batch_bytes,
     )
 
 
 # Module-level cache for refit services to avoid repeated allocations. Services
 # own process-group-specific communicators, so the group identity is part of the
-# key. ``id(group)`` is safe because the cached service retains the group object,
-# preventing its address from being reused while the cache entry exists.
-_service_cache: dict[tuple[str, int | None], CopyService] = {}
+# key; M2N's immutable grouped-submission limit is included as well. ``id(group)``
+# is safe because the cached service retains the group object, preventing its
+# address from being reused while the cache entry exists.
+_service_cache: dict[tuple[str, int | None, int | None], CopyService] = {}
 _plan_cache: dict[_PlanCacheKey, Any] = {}
 
 
-def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
+def get_or_create_service(
+    backend: RefitBackendName, group=None, execution_batch_bytes: int | None = None
+) -> CopyService:
     """Get or create a cached CopyService instance for the given backend.
 
     This avoids expensive repeated allocations (especially for NVSHMEM buffers)
@@ -143,15 +151,19 @@ def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
     Args:
         backend: Backend name ("nccl", "nccl_m2n", "gloo", "nvshmem", or "nixl").
         group: Optional process group for the backend.
+        execution_batch_bytes: Optional soft byte limit for execution staging.
+            For NCCL M2N, this overrides its grouped-submission limit. None
+            preserves M2N's existing environment setting or 256 MiB default.
     """
-    cache_key = (backend, id(group) if group is not None else None)
+    service_batch_bytes = execution_batch_bytes if backend == "nccl_m2n" else None
+    cache_key = (backend, id(group) if group is not None else None, service_batch_bytes)
     if cache_key in _service_cache:
         return _service_cache[cache_key]
 
     if backend == "nccl":
         service = NCCLCopyService(group=group)
     elif backend == "nccl_m2n":
-        service = NCCLM2NCopyService(group=group)
+        service = NCCLM2NCopyService(group=group, max_group_bytes=execution_batch_bytes)
     elif backend == "gloo":
         service = GlooCopyService(group=group)
     elif backend == "nvshmem":
@@ -229,7 +241,14 @@ def _unwrap_model_cores(src_model, target_model):
 
 
 def _build_or_get_plan(
-    src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset, pool_index=0
+    src_core,
+    tgt_core,
+    num_experts,
+    group,
+    src_rank_offset,
+    dst_rank_offset,
+    pool_index=0,
+    execution_batch_bytes: int | None = None,
 ):
     """Return the cached reshard plan, building it (collectively) if not yet cached.
 
@@ -246,6 +265,7 @@ def _build_or_get_plan(
         src_rank_offset=src_rank_offset,
         dst_rank_offset=dst_rank_offset,
         pool_index=pool_index,
+        execution_batch_bytes=execution_batch_bytes,
     )
     if cache_key not in _plan_cache:
         _plan_cache[cache_key] = build_local_reshard_plan(
@@ -255,6 +275,7 @@ def _build_or_get_plan(
             group=group,
             src_rank_offset=src_rank_offset,
             dst_rank_offset=dst_rank_offset,
+            execution_batch_bytes=execution_batch_bytes,
         )
     return _plan_cache[cache_key]
 
@@ -320,6 +341,7 @@ def prepare_swap_model_weights(
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
+    execution_batch_bytes: int | None = None,
 ):
     """Pre-build and cache the reshard plan and any format-conversion transforms.
 
@@ -349,10 +371,19 @@ def prepare_swap_model_weights(
         group: Optional process group for collective communication.
         src_rank_offset: Rank offset for source (training) workers.
         dst_rank_offset: Rank offset for destination (inference) workers.
+        execution_batch_bytes: Optional soft per-rank limit for transient
+            generic-executor staging. A single complete parameter may exceed this
+            value. None keeps the model-wide submission behavior.
     """
     src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
     plan = _build_or_get_plan(
-        src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
+        src_core,
+        tgt_core,
+        num_experts,
+        group,
+        src_rank_offset,
+        dst_rank_offset,
+        execution_batch_bytes=execution_batch_bytes,
     )
 
     # Auto-detect and set up MXFP8 transform on the plan for the target model.
@@ -371,6 +402,7 @@ def swap_model_weights(
     transform: Optional[ReshardTransform] = None,
     num_dst_pools: int = 1,
     dst_pool_index: int = 0,
+    execution_batch_bytes: int | None = None,
 ):
     """
     Orchestrate weight swap/refit.
@@ -396,9 +428,17 @@ def swap_model_weights(
             receives into ``target_model`` only on its own pool's pass
             (``pool == dst_pool_index``) and is a pure source otherwise.
             Defaults ``(1, 0)`` reproduce the single-destination behavior.
+        execution_batch_bytes: Optional soft per-rank limit for transient
+            execution staging. A single complete parameter may exceed this
+            value. With a string ``nccl_m2n`` backend, this overrides M2N's
+            grouped-submission limit; None preserves its existing environment
+            setting or 256 MiB default. Other backends keep the model-wide
+            submission behavior when this is None.
     """
     if isinstance(refit_method, str):
-        service = get_or_create_service(refit_method, group=group)
+        service = get_or_create_service(
+            refit_method, group=group, execution_batch_bytes=execution_batch_bytes
+        )
     elif isinstance(refit_method, CopyService):
         service = refit_method
     else:
@@ -423,7 +463,14 @@ def swap_model_weights(
         if pass_transform is None:
             src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target)
             plan = _build_or_get_plan(
-                src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset, pool
+                src_core,
+                tgt_core,
+                num_experts,
+                group,
+                src_rank_offset,
+                dst_rank_offset,
+                pool_index=pool,
+                execution_batch_bytes=execution_batch_bytes,
             )
             pass_transform = plan.transform
 
@@ -436,6 +483,7 @@ def swap_model_weights(
             dst_rank_offset=dst_rank_offset,
             transform=pass_transform,
             pool_index=pool,
+            execution_batch_bytes=execution_batch_bytes,
         )
 
 
@@ -498,6 +546,7 @@ def reshard_model_weights(
     dst_rank_offset: int = 0,
     transform: Optional[ReshardTransform] = None,
     pool_index: int = 0,
+    execution_batch_bytes: int | None = None,
 ):
     """Reshard and copy model weights from ``src_model`` to ``target_model`` using ``service``.
 
@@ -512,10 +561,20 @@ def reshard_model_weights(
         src_rank_offset / dst_rank_offset: Offsets for mapping local ranks to global ranks
             in independent torch.distributed worlds.
         transform: Optional ReshardTransform for custom format conversion.
+        execution_batch_bytes: Optional soft per-rank limit for transient
+            generic-executor staging. A single complete parameter may exceed this
+            value. None keeps the model-wide submission behavior.
     """
     src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
     plan = _build_or_get_plan(
-        src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset, pool_index
+        src_core,
+        tgt_core,
+        num_experts,
+        group,
+        src_rank_offset,
+        dst_rank_offset,
+        pool_index=pool_index,
+        execution_batch_bytes=execution_batch_bytes,
     )
     _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=group)
     service.set_model_roles(is_source=src_core is not None, is_destination=tgt_core is not None)

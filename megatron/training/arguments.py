@@ -448,6 +448,11 @@ def validate_args(args, defaults={}):
     )
     args.data_parallel_size = args.world_size // total_model_size
 
+    if args.refit_execution_batch_bytes is not None:
+        assert args.refit_execution_batch_bytes > 0, (
+            '--refit-execution-batch-bytes must be a positive integer'
+        )
+
     if args.perform_rl_step:
         assert args.refit_method != 'nccl_m2n', 'nccl_m2n is unsupported by the built-in RL loop'
 
@@ -2917,6 +2922,16 @@ def _add_rl_args(parser):
                              'gloo: use GlooCopyService over CPU; '
                              'nvshmem: use NVSHMEMCopyService; '
                              'nixl: use NixlCopyService.'))
+    group.add_argument(
+        '--refit-execution-batch-bytes',
+        type=int,
+        default=None,
+        help=(
+            'Optional soft per-rank byte limit for ReFIT execution staging. '
+            'The default None preserves one model-wide generic submission and '
+            "NCCL M2N's existing 256 MiB default."
+        ),
+    )
     group.add_argument('--rl-verify-model-weights-swap', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')
