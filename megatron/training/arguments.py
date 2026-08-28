@@ -3305,6 +3305,14 @@ def _add_regularization_args(parser):
         help='Whether to split QKV parameters for Muon optimizer',
     )
     group.add_argument(
+        '--muon-split-qkv-per-head',
+        action='store_true',
+        help='Orthogonalize each Q, gate, K, and V head independently. '
+        'Batched execution requires emerging-optimizers>=0.3.0; older versions '
+        'process heads individually. By default, Q, gate, K, and V projections '
+        'are orthogonalized separately',
+    )
+    group.add_argument(
         '--muon-nesterov',
         action='store_true',
         help='Whether to use Nesterov-style momentum in the internal SGD',
