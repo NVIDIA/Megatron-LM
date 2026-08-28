@@ -71,6 +71,33 @@ if triton is not None:
         tl.store(qweight + offsets, dequantized * (1.0 / scale))
         tl.store(ue8m0_scales + block, exponent + 127.0)
 
+    @triton.jit
+    def _dynamic_block_fp8_quantize_ue8m0(
+        weight,
+        qweight,
+        ue8m0_scales,
+        columns: tl.constexpr,
+        scale_columns: tl.constexpr,
+        BLOCK_ELEMENTS: tl.constexpr,
+    ):
+        block = tl.program_id(0)
+        block_row = block // scale_columns
+        block_col = block - block_row * scale_columns
+        local = tl.arange(0, BLOCK_ELEMENTS)
+        row = block_row * 128 + local // 128
+        column = block_col * 128 + local % 128
+        offsets = row * columns + column
+        values = tl.load(weight + offsets).to(tl.float32)
+        first_amax = tl.maximum(tl.max(tl.abs(values), axis=0), 1.0e-4)
+        first_scale = first_amax / 448.0
+        first_quantized = (values * (1.0 / first_scale)).to(tl.float8e4nv)
+        dequantized = first_quantized.to(tl.float32) * first_scale
+        amax = tl.maximum(tl.max(tl.abs(dequantized), axis=0), 1.0e-4)
+        exponent = tl.ceil(tl.log2(amax / 448.0))
+        scale = tl.exp2(exponent)
+        tl.store(qweight + offsets, dequantized * (1.0 / scale))
+        tl.store(ue8m0_scales + block, exponent + 127.0)
+
 
 @contextmanager
 def _weight_nvtx_range(name: str):
@@ -139,22 +166,12 @@ def _quantize_block_fp8_weight_fused_ue8m0_out(
     qweight: torch.Tensor,
     ue8m0_scales: torch.Tensor,
 ) -> None:
-    scales = torch.empty_like(ue8m0_scales, dtype=torch.float32)
-    _dynamic_block_fp8_quantize[(scales.numel(),)](
+    _dynamic_block_fp8_quantize_ue8m0[(ue8m0_scales.numel(),)](
         weight,
         qweight,
-        scales,
-        columns=weight.shape[1],
-        scale_columns=scales.shape[1],
-        BLOCK_ELEMENTS=BLOCK_SHAPE[0] * BLOCK_SHAPE[1],
-        num_warps=8,
-    )
-    _requantize_block_fp8_to_ue8m0[(scales.numel(),)](
-        qweight,
-        scales,
         ue8m0_scales,
         columns=weight.shape[1],
-        scale_columns=scales.shape[1],
+        scale_columns=ue8m0_scales.shape[1],
         BLOCK_ELEMENTS=BLOCK_SHAPE[0] * BLOCK_SHAPE[1],
         num_warps=8,
     )
