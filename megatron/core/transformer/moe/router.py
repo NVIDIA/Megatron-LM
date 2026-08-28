@@ -9,6 +9,7 @@ import torch
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.mappings import reduce_from_dynamic_cp_subgroup
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
@@ -25,7 +26,7 @@ from megatron.core.transformer.moe.moe_utils import (
     topk_routing_with_score_function,
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig, is_p2p_cp_comm_type
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class _AuxLossGroupConfig:
     metric_reduce_group: Optional[torch.distributed.ProcessGroup]
     metric_avg_group: Optional[torch.distributed.ProcessGroup]
     metric_needs_dp_avg: bool
+    dynamic_cp_parent_group: Optional[torch.distributed.ProcessGroup]
 
     @property
     def metric_pre_reduce_groups(self) -> Optional[Sequence[torch.distributed.ProcessGroup]]:
@@ -71,6 +73,7 @@ class Router(ABC, MegatronModule):
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
         self.tp_dp_cp_group = pg_collection.tp_dp_cp
+        self.dp_cp_group = getattr(pg_collection, 'dp_cp', None)
 
         # Initialize the gate weights.
         # TODO: Add support for GPU initialization, which requires updating the golden values.
@@ -352,6 +355,7 @@ class TopKRouter(Router):
                 routing_map=routing_map,
                 reduce_group=aux_loss_groups.loss_reduce_groups[0],
                 reduce_groups=aux_loss_groups.loss_reduce_groups,
+                dynamic_cp_parent_group=aux_loss_groups.dynamic_cp_parent_group,
                 topk=self.topk,
                 with_padding_mask=with_padding_mask,
             )
@@ -379,6 +383,7 @@ class TopKRouter(Router):
             aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
             aux_loss_scale_num_tokens=total_num_tokens,
+            dynamic_cp_parent_group=aux_loss_groups.dynamic_cp_parent_group,
         )
         return probs
 
@@ -412,6 +417,7 @@ class TopKRouter(Router):
                 routing_map=routing_map,
                 reduce_group=aux_loss_groups.loss_reduce_groups[0],
                 reduce_groups=aux_loss_groups.loss_reduce_groups,
+                dynamic_cp_parent_group=aux_loss_groups.dynamic_cp_parent_group,
                 with_padding_mask=with_padding_mask,
                 topk=self.topk * bsz,
             )
@@ -442,6 +448,7 @@ class TopKRouter(Router):
             aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
             aux_loss_scale_num_tokens=total_num_tokens,
+            dynamic_cp_parent_group=aux_loss_groups.dynamic_cp_parent_group,
         )
         return probs
 
@@ -507,11 +514,20 @@ class TopKRouter(Router):
             and packed_seq_params.local_cp_size is not None
             and packed_seq_params.cp_group is not None
         ):
+            use_parent_group = (
+                getattr(self.config, 'dynamic_context_parallel', False)
+                and getattr(self.config, 'transformer_impl', 'local') == 'transformer_engine'
+                and is_p2p_cp_comm_type(getattr(self.config, 'cp_comm_type', None))
+            )
+            dynamic_cp_parent_group = self.dp_cp_group if use_parent_group else None
+            if use_parent_group and dynamic_cp_parent_group is None:
+                raise RuntimeError("Dynamic CP communicator reuse requires a dp_cp process group.")
             return _AuxLossGroupConfig(
                 loss_reduce_groups=(packed_seq_params.cp_group, self.tp_group),
                 metric_reduce_group=None,
                 metric_avg_group=self.tp_dp_cp_group,
                 metric_needs_dp_avg=False,
+                dynamic_cp_parent_group=dynamic_cp_parent_group,
             )
 
         return _AuxLossGroupConfig(
@@ -519,6 +535,7 @@ class TopKRouter(Router):
             metric_reduce_group=self.tp_cp_group,
             metric_avg_group=None,
             metric_needs_dp_avg=True,
+            dynamic_cp_parent_group=None,
         )
 
     def _get_metric_layer_number(self) -> tuple[int, int]:
@@ -547,6 +564,7 @@ class TopKRouter(Router):
         aux_loss_logging_reduce_groups: Optional[Sequence[torch.distributed.ProcessGroup]] = None,
         aux_loss_scale_reduce_groups: Optional[Sequence[torch.distributed.ProcessGroup]] = None,
         aux_loss_scale_num_tokens: Optional[Union[int, torch.Tensor]] = None,
+        dynamic_cp_parent_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Attach aux loss function to activation and add to logging.
 
@@ -563,6 +581,8 @@ class TopKRouter(Router):
             valid_token_count (int or torch.Tensor, optional): Number of valid tokens excluding
                 padding tokens. Can be a Python int or a torch.Tensor (typically 0-d tensor).
                 If None, uses activation.shape[0]. Defaults to None.
+            dynamic_cp_parent_group (torch.distributed.ProcessGroup, optional): Parent DPxCP
+                communicator used for the first logical dynamic-CP subgroup reduction.
         """
         # When using repeated MTP layers, the loss is counted "mtp_num_layers" times.
         # To avoid accumulating the load balancing loss multiple times, we scale it by
@@ -583,8 +603,13 @@ class TopKRouter(Router):
         metric_value = aux_loss / aux_loss_coeff
         if aux_loss_logging_reduce_groups is not None:
             metric_value = metric_value.detach().clone()
-            for group in aux_loss_logging_reduce_groups:
-                torch.distributed.all_reduce(metric_value, group=group)
+            for group_index, group in enumerate(aux_loss_logging_reduce_groups):
+                if group_index == 0 and dynamic_cp_parent_group is not None:
+                    metric_value = reduce_from_dynamic_cp_subgroup(
+                        metric_value, group, dynamic_cp_parent_group
+                    )
+                else:
+                    torch.distributed.all_reduce(metric_value, group=group)
 
         get_moe_metrics_tracker().record(
             aux_loss_name,
@@ -617,8 +642,13 @@ class TopKRouter(Router):
                 if aux_loss_scale_reduce_groups is None:
                     assert reduce_group is not None, "reduce_group is required for aux-loss scaling"
                     aux_loss_scale_reduce_groups = (reduce_group,)
-                for group in aux_loss_scale_reduce_groups:
-                    torch.distributed.all_reduce(aux_loss_scale_num_tokens, group=group)
+                for group_index, group in enumerate(aux_loss_scale_reduce_groups):
+                    if group_index == 0 and dynamic_cp_parent_group is not None:
+                        aux_loss_scale_num_tokens = reduce_from_dynamic_cp_subgroup(
+                            aux_loss_scale_num_tokens, group, dynamic_cp_parent_group
+                        )
+                    else:
+                        torch.distributed.all_reduce(aux_loss_scale_num_tokens, group=group)
             activation = MoEAuxLossAutoScaler.apply(
                 activation, aux_loss * aux_loss_scale_num_tokens
             )
