@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -256,10 +257,49 @@ def test_config_rejects_context_parallelism():
         _make_config(context_parallel_size=2)
 
 
-def test_config_rejects_fused_backend_in_native_slice():
-    """Fused DSv4 backends belong to the follow-up kernel-integration slice."""
-    with pytest.raises(ValueError, match="requires dsa_kernel_backend='none'"):
-        _make_config(dsa_kernel_backend="cudnn")
+def test_config_accepts_cudnn_backend_for_fused_sbhd():
+    """DSv4 may select the CSA cuDNN adapter while ordinary DSA keeps its own router."""
+    with (
+        patch(
+            'megatron.core.transformer.transformer_config._validate_dsa_kernel_backend_dependencies'
+        ),
+        patch.object(torch.cuda, 'get_device_capability', return_value=(10, 0)),
+    ):
+        config = _make_config(dsa_kernel_backend="cudnn")
+
+    assert config.dsa_kernel_backend == "cudnn"
+
+
+def test_config_rejects_sm90_ratio4_dense_indexer_loss():
+    """SM90 must use sparse indexer loss for the fused ratio-4 CSA path."""
+    with (
+        patch(
+            'megatron.core.transformer.transformer_config._validate_dsa_kernel_backend_dependencies'
+        ),
+        patch.object(torch.cuda, 'get_device_capability', return_value=(9, 0)),
+        pytest.raises(ValueError, match="dense indexer loss is not supported on SM90"),
+    ):
+        _make_config(dsa_kernel_backend="cudnn", dsa_indexer_loss_coeff=0.1)
+
+
+def test_config_rejects_tilelang_backend_for_dsv4():
+    """The main-owned TileLang ordinary-DSA backend is not a CSA implementation."""
+    with pytest.raises(ValueError, match="does not support.*tilelang"):
+        _make_config(dsa_kernel_backend="tilelang")
+
+
+@pytest.mark.parametrize(
+    ("variant", "requested", "expected"),
+    [("dsv4_hybrid", None, "cudnn"), ("dsv4_hybrid", "none", "none"), ("dsa", None, "none")],
+)
+def test_cli_backend_default_preserves_explicit_none(variant, requested, expected):
+    """Only an omitted DSv4 CLI backend selects cuDNN by default."""
+    from megatron.training.argument_utils import _resolve_dsa_kernel_backend_cli_default
+
+    args = SimpleNamespace()
+    kwargs = {'experimental_attention_variant': variant, 'dsa_kernel_backend': requested}
+    _resolve_dsa_kernel_backend_cli_default(args, kwargs)
+    assert kwargs['dsa_kernel_backend'] == expected
 
 
 def test_config_accepts_hybrid_model_ratio_tail():

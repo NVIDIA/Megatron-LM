@@ -1643,11 +1643,31 @@ class TransformerConfig(ModelParallelConfig):
                 self.context_parallel_size == 1
             ), "DSv4 Hybrid Attention does not support context parallelism yet."
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
-            if self.dsa_kernel_backend != "none":
+            if self.dsa_kernel_backend == "tilelang":
                 raise ValueError(
-                    "The native SBHD DSv4 slice requires dsa_kernel_backend='none'; "
-                    "fused DSv4 backends are added by the follow-up kernel integration."
+                    "dsv4_hybrid does not support dsa_kernel_backend='tilelang'; use 'cudnn' "
+                    "for fused CSA kernels or 'none' for the PyTorch fallback."
                 )
+            _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
+            if self.dsa_kernel_backend == "cudnn":
+                sm = torch.cuda.get_device_capability()
+                assert sm[0] >= 9, (
+                    "dsa_kernel_backend='cudnn' requires SM90+ (Hopper or later), "
+                    f"but current device has compute capability {sm[0]}.{sm[1]}."
+                )
+                uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
+                indexer_loss_enabled = (self.dsa_indexer_loss_coeff or 0.0) > 0
+                if (
+                    sm[0] == 9
+                    and uses_ratio4_indexer
+                    and indexer_loss_enabled
+                    and not self.dsa_indexer_use_sparse_loss
+                ):
+                    raise ValueError(
+                        "DSv4 with fused DSA and dense indexer loss is not supported on SM90 "
+                        "because the cuDNN Frontend SM90 dense DSA kernels are not reliable for "
+                        "this path. Use sparse indexer loss or set dsa_kernel_backend='none'."
+                    )
             self.hetereogenous_dist_checkpoint = True
 
         if self.fp8:

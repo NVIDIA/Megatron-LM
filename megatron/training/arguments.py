@@ -2376,6 +2376,7 @@ def _add_network_size_args(parser):
         "moe_layer_freq",
         "linear_attention_freq",
         "csa_compress_ratios",
+        "dsa_kernel_backend",
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
         "cp_comm_type",
@@ -3704,6 +3705,17 @@ def _add_experimental_attention_variant_args(parser):
              '"([0]+[4,128]*2)*3". Valid values are 0, 4, and 128, and the '
              'decoder uses the first num-layers entries. MTP layers use the tail; '
              'HybridModel patterns need one tail entry per inner MTP layer.',
+    )
+    # Defined manually so an omitted flag is distinguishable from an explicit
+    # ``none``. The config bridge resolves omission to ``cudnn`` for DSv4
+    # hybrid launches and to ``none`` for ordinary DSA.
+    group.add_argument(
+        '--dsa-kernel-backend',
+        type=str,
+        choices=['none', 'tilelang', 'cudnn'],
+        default=None,
+        help='Fused DSA kernel backend. When omitted, DSv4 hybrid uses cudnn '
+             'and other attention variants use none.',
     )
     return parser
 
