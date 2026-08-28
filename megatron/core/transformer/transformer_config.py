@@ -15,6 +15,7 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
+    cuda_graph_modules_capture_whole_moe,
     get_deprecated_cuda_graph_modules_migration,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
@@ -3312,7 +3313,7 @@ class TransformerConfig(ModelParallelConfig):
                             and self.use_transformer_engine_op_fuser
                         )
                         assert (
-                            CudaGraphModule.moe not in self.cuda_graph_modules
+                            not cuda_graph_modules_capture_whole_moe(self.cuda_graph_modules)
                             or sync_free_hybridep_moe_graph
                         ), (
                             "moe cuda graph is only supported with drop-padding MoE or "
@@ -3330,10 +3331,15 @@ class TransformerConfig(ModelParallelConfig):
 
             te_whole_moe_paged_stash = (
                 self.cuda_graph_impl == "transformer_engine"
-                and CudaGraphModule.moe in self.cuda_graph_modules
+                and cuda_graph_modules_capture_whole_moe(self.cuda_graph_modules)
                 and self.moe_paged_stash
             )
             if te_whole_moe_paged_stash:
+                if not is_te_min_version("2.19.0"):
+                    raise ValueError(
+                        "Transformer Engine whole-MoE CUDA graphs with paged stash require "
+                        f"Transformer Engine >= 2.19.0, but found {get_te_version()}."
+                    )
                 assert not self.cuda_graph_dynamic_microbatches, (
                     "Transformer Engine whole-MoE CUDA graphs with paged stash require a fixed "
                     "runtime microbatch schedule; cuda_graph_dynamic_microbatches is not "

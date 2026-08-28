@@ -30,6 +30,7 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     is_checkpointing,
 )
+from megatron.core.transformer.cuda_graph_config import cuda_graph_modules_capture_whole_moe
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -2647,6 +2648,20 @@ class TECudaGraphHelper:
 
         self._capture_finished = True
 
+    def _should_enable_paged_stash_capture(self) -> bool:
+        """Whether this rank captures a complete local MoE with paged stash."""
+
+        has_local_moe_layer = any(
+            getattr(module, "is_moe_layer", False)
+            for layer in self.flattened_callables
+            for module in layer.modules()
+        )
+        return (
+            self.config.moe_paged_stash
+            and cuda_graph_modules_capture_whole_moe(self.config.cuda_graph_modules)
+            and has_local_moe_layer
+        )
+
     def create_cudagraphs(self):
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
@@ -2668,14 +2683,12 @@ class TECudaGraphHelper:
                 rng_context = nullcontext()
             from megatron.core.transformer.moe.paged_stash import paged_stash_te_graph_capture
 
-            te_whole_moe_paged_stash = (
-                self.config.moe_paged_stash
-                and CudaGraphModule.moe in self.config.cuda_graph_modules
-            )
             with (
                 rng_context,
                 paged_stash_te_graph_capture(
-                    te_whole_moe_paged_stash, order=kwargs['_order'], config=self.config
+                    self._should_enable_paged_stash_capture(),
+                    order=kwargs['_order'],
+                    config=self.config,
                 ),
             ):
                 graphs = make_graphed_callables(

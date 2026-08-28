@@ -9,7 +9,7 @@ import torch
 from megatron.core._rank_utils import log_single_rank
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.cuda_graph_config import cuda_graph_modules_capture_whole_moe
 from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
     paged_stash_copy_kernel,
@@ -554,12 +554,13 @@ class PagedStashManager:
     ):
         """Allocate stash buffers organized by [dtype][hidden_size]."""
         self.stash_buffers = {}
+        flag_device = self.device if self.device is not None else torch.cuda.current_device()
         if self.overflow is None:
-            self.overflow = torch.zeros(1, dtype=torch.int64, device=self.device)
+            self.overflow = torch.zeros(1, dtype=torch.int64, device=flag_device)
         else:
             self.overflow.zero_()
         if self.host_spill is None:
-            self.host_spill = torch.zeros(1, dtype=torch.int64, device=self.device)
+            self.host_spill = torch.zeros(1, dtype=torch.int64, device=flag_device)
         else:
             self.host_spill.zero_()
 
@@ -1319,7 +1320,7 @@ class PagedStashRunner:
         te_whole_moe_graph_replay = (
             training
             and self.config.cuda_graph_impl == "transformer_engine"
-            and CudaGraphModule.moe in self.config.cuda_graph_modules
+            and cuda_graph_modules_capture_whole_moe(self.config.cuda_graph_modules)
             and self._te_graph_capture_finished
         )
         if not te_whole_moe_graph_replay or (stash_overflow_ranks == 0 and overbudget_ranks == 0):
@@ -1339,7 +1340,7 @@ class PagedStashRunner:
         te_whole_moe_paged_stash_replay = (
             training
             and self.config.cuda_graph_impl == "transformer_engine"
-            and CudaGraphModule.moe in self.config.cuda_graph_modules
+            and cuda_graph_modules_capture_whole_moe(self.config.cuda_graph_modules)
             and self.config.moe_paged_stash
             and self._te_graph_capture_finished
         )

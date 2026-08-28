@@ -84,7 +84,7 @@ mlm = [
 
 dev = [
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
-    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
+    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.20.0",
     "nvidia-resiliency-ext==0.6.0",
     "tqdm",
     "einops~=0.8",
@@ -201,10 +201,11 @@ requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine"
-version = "2.14.0+f031cf87"
+version = "2.19.0+55b2cba7"
 requires-dist = [
     "einops",
     "importlib-metadata",
+    "nvidia-cudnn-frontend>=1.25.0",
     "nvdlfw-inspect",
     "onnx",
     "onnxscript",
@@ -224,7 +225,7 @@ flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "nv_dev" },
 ]
 nvidia-cudnn-frontend = { git = "https://github.com/NVIDIA/cudnn-frontend.git", rev = "0a14b7181d129d30e7bad34b8c3ed0a0c995e23d" }
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "f031cf87bd054c7558b887df7bed93975456667f" }
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "55b2cba79f4d4db144f5789bf0e151447f30a5e7" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "17ae86b64d7f75653351664f5d8c9e466faede00" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.3.0" }
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", rev = "f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }

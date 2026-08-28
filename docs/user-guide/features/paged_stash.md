@@ -19,8 +19,8 @@
 
 Whenever `moe_expert_rank_capacity_factor` is set, a **runner** wraps forward-backward: after each pass it checks **stash overflow** (only with `--moe-paged-stash`) and **token over-budget**. If either hits any rank, the step **reruns once** without capacity padding and without paged stashing.
 
-For Transformer Engine per-layer CUDA graphs, the whole MoE scope
-(`--cuda-graph-impl transformer_engine --cuda-graph-modules moe`) is supported by the sync-free
+For Transformer Engine per-layer CUDA graphs, the whole MoE scope (either
+`--cuda-graph-modules moe` or the default whole-layer scope) is supported by the sync-free
 HybridEP + paged-stash configuration above. Its captured graph is tied to the static expert-rank
 and stash capacities. Before graph capture, and during eager evaluation, capacity overflow can
 still use the dynamic rerun. After graph capture, training fails immediately instead of attempting
@@ -32,9 +32,11 @@ runtime paged-stash schedule remains unchanged. This mode requires a fixed runti
 schedule: `--cuda-graph-dynamic-microbatches` is not supported, the microbatch count may not change
 after capture, and at least two CUDA graph warmup steps are required to record the pipeline
 schedule. Graph capture temporarily expands Transformer Engine's final `_order` into a
-capture-only schedule and restores the recorded runtime schedule afterward. This mode requires a
-Transformer Engine version whose ordered warmup follows `_order`; it does not use per-callable
-cursor hooks. The stash/reload kernels remain inside their corresponding CUDA graphs.
+capture-only schedule and restores the recorded runtime schedule afterward. This mode requires
+Transformer Engine 2.19.0 or later, which includes
+[Transformer Engine #2831](https://github.com/NVIDIA/TransformerEngine/pull/2831) and makes
+ordered warmup follow `_order`; older installs fail configuration validation. It does not use
+per-callable cursor hooks. The stash/reload kernels remain inside their corresponding CUDA graphs.
 
 Because Transformer Engine captures each MoE layer as an independent graph, the auxiliary
 pack/unpack stream must rejoin the graph's capture stream before that graph ends. These joins are

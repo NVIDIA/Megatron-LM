@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import List, Optional, Set, Tuple, Union
+from typing import List, Optional, Sequence, Set, Tuple, Union
 
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 
@@ -22,8 +22,18 @@ ALLOWED_INFERENCE_SCOPES: dict[str, Set[InferenceCudaGraphScope]] = {
 }
 
 
+def cuda_graph_modules_capture_whole_moe(cuda_graph_modules: Sequence[CudaGraphModule]) -> bool:
+    """Whether a per-layer CUDA graph scope captures the complete MoE module.
+
+    An empty normalized scope represents whole-layer capture, while an explicit
+    ``CudaGraphModule.moe`` captures the complete MoE submodule.
+    """
+
+    return not cuda_graph_modules or CudaGraphModule.moe in cuda_graph_modules
+
+
 def normalize_cuda_graph_modules(
-    scopes: Optional[Union[str, CudaGraphModule, List[Union[str, CudaGraphModule]]]]
+    scopes: Optional[Union[str, CudaGraphModule, List[Union[str, CudaGraphModule]]]],
 ) -> Tuple[List[CudaGraphModule], List[Tuple[str, str, object]], bool]:
     """Normalize mixed CUDA graph scope inputs into enum values plus deprecation metadata."""
 

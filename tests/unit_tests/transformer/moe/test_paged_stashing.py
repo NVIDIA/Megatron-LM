@@ -226,10 +226,13 @@ def test_te_graph_capture_joins_auxiliary_streams_per_layer(monkeypatch):
     assert manager._unpack_stream_status == 'reloading'
 
 
-def test_te_whole_moe_graph_overflow_fails_instead_of_dynamic_fallback():
+@pytest.mark.parametrize(
+    "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
+)
+def test_te_whole_moe_graph_overflow_fails_instead_of_dynamic_fallback(cuda_graph_modules):
     runner = PagedStashRunner.__new__(PagedStashRunner)
     runner.config = SimpleNamespace(
-        cuda_graph_impl="transformer_engine", cuda_graph_modules=[CudaGraphModule.moe]
+        cuda_graph_impl="transformer_engine", cuda_graph_modules=cuda_graph_modules
     )
     runner._te_graph_capture_finished = False
 
@@ -259,11 +262,14 @@ def test_te_whole_moe_graph_overflow_fails_instead_of_dynamic_fallback():
     )
 
 
-def test_te_whole_moe_paged_stash_requires_fixed_runtime_microbatch_count():
+@pytest.mark.parametrize(
+    "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
+)
+def test_te_whole_moe_paged_stash_requires_fixed_runtime_microbatch_count(cuda_graph_modules):
     runner = PagedStashRunner.__new__(PagedStashRunner)
     runner.config = SimpleNamespace(
         cuda_graph_impl="transformer_engine",
-        cuda_graph_modules=[CudaGraphModule.moe],
+        cuda_graph_modules=cuda_graph_modules,
         moe_paged_stash=True,
     )
     runner._te_graph_runtime_num_microbatches = None
@@ -279,6 +285,26 @@ def test_te_whole_moe_paged_stash_requires_fixed_runtime_microbatch_count():
     with pytest.raises(RuntimeError, match="expected 2, got 3"):
         runner._validate_te_whole_moe_graph_runtime(training=True, num_microbatches=3)
     runner._validate_te_whole_moe_graph_runtime(training=True, num_microbatches=2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_dense_pipeline_stage_allocates_cuda_overflow_flags_without_local_paged_layers():
+    manager = PagedStashManager.__new__(PagedStashManager)
+    manager.status = 'captured'
+    manager.stash_buffers = None
+    manager.device = None
+    manager.overflow = None
+    manager.host_spill = None
+    manager.max_avg_tokens_across_vp_stages = None
+    manager.max_tokens_across_vp_stages = None
+    manager.paged_tensors_to_stash = []
+    manager.paged_tensors_stash_in_progress = []
+
+    manager.prepare_stash_buffers()
+
+    assert manager.stash_buffers == {}
+    assert manager.overflow.is_cuda
+    assert manager.host_spill.is_cuda
 
 
 def _global_tokens_per_expert_from_local_routing_map(routing_map: torch.Tensor) -> torch.Tensor:

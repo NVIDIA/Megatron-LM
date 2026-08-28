@@ -92,8 +92,8 @@ version = "1.0.0+b7643bd"
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine"
-version = "2.14.0+f031cf87"
-requires-dist = ["einops", "importlib-metadata", "nvdlfw-inspect", "onnx", "onnxscript", "packaging", "pydantic", "torch"]
+version = "2.19.0+55b2cba7"
+requires-dist = ["einops", "importlib-metadata", "nvidia-cudnn-frontend>=1.25.0", "nvdlfw-inspect", "onnx", "onnxscript", "packaging", "pydantic", "torch"]
 
 [[package]]
 name = "absl-py"
@@ -3124,7 +3124,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.6.0" },
     { name = "tqdm", marker = "extra == 'dev'" },
     { name = "tqdm", marker = "extra == 'lts'" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=f031cf87bd054c7558b887df7bed93975456667f" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'dev'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=55b2cba79f4d4db144f5789bf0e151447f30a5e7" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "transformers", marker = "extra == 'training'" },
     { name = "wandb", marker = "extra == 'mlm'" },
@@ -7897,12 +7897,13 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.14.0+f031cf87"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=f031cf87bd054c7558b887df7bed93975456667f#f031cf87bd054c7558b887df7bed93975456667f" }
+version = "2.19.0+55b2cba7"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=55b2cba79f4d4db144f5789bf0e151447f30a5e7#55b2cba79f4d4db144f5789bf0e151447f30a5e7" }
 dependencies = [
     { name = "einops" },
     { name = "importlib-metadata" },
     { name = "nvdlfw-inspect" },
+    { name = "nvidia-cudnn-frontend", version = "1.25.0", source = { git = "https://github.com/NVIDIA/cudnn-frontend.git?rev=0a14b7181d129d30e7bad34b8c3ed0a0c995e23d#0a14b7181d129d30e7bad34b8c3ed0a0c995e23d" } },
     { name = "onnx" },
     { name = "onnxscript" },
     { name = "packaging" },
