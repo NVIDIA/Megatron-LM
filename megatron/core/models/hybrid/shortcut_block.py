@@ -142,21 +142,20 @@ class ShortcutMoEBlock(MegatronModule):
             rotary_pos_emb=rotary_pos_emb,
             sequence_len_offset=sequence_len_offset,
             packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
         )
         if not paired_state:
             raise RuntimeError("Shortcut input projection returned an empty paired state")
         return route_input, route_probs, paired_state
 
     def output_shared(
-        self, *compute_state, inference_context=None, padding_mask=None
+        self, *compute_state, inference_context=None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run output projection and shared experts for the paired compute layer."""
         if not compute_state:
             raise RuntimeError("Shortcut output requires a non-empty paired state")
 
         compute_result = self.compute_layer.forward_output_proj(
-            *compute_state, inference_context=inference_context, padding_mask=padding_mask
+            *compute_state, inference_context=inference_context
         )
         hidden_states = compute_result[0] if isinstance(compute_result, tuple) else compute_result
         shared_expert_output = self._shortcut_shared_experts(hidden_states)
@@ -279,7 +278,7 @@ class ShortcutMoEBlock(MegatronModule):
 
             with quant_context_factory(quant_config, layer_number):
                 projected_hidden, shared_expert_output = self.output_shared(
-                    *paired_state, inference_context=inference_context, padding_mask=padding_mask
+                    *paired_state, inference_context=inference_context
                 )
                 return self._postprocess(projected_hidden, combined_output, shared_expert_output)
 
@@ -291,7 +290,7 @@ class ShortcutMoEBlock(MegatronModule):
         with quant_context_factory(quant_config, layer_number):
             combined_output = self._wait_dispatch_and_launch_combine(dispatch_output)
             projected_hidden, shared_expert_output = self.output_shared(
-                *paired_state, inference_context=inference_context, padding_mask=padding_mask
+                *paired_state, inference_context=inference_context
             )
 
         with quant_context_factory(quant_config, layer_number):
