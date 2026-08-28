@@ -478,6 +478,22 @@ def _benchmark_config_snapshot(cfg: BenchCliConfig) -> dict[str, Any]:
             "nsys_capture_step": os.environ.get("MLITE_NSYS_CAPTURE_STEP"),
             "sync_phases": os.environ.get("MLITE_PROFILE_SYNC_PHASES") == "1",
         },
+        "determinism": {
+            name: os.environ.get(name)
+            for name in (
+                "MEGATRON_LITE_DETERMINISTIC",
+                "VLLM_BATCH_INVARIANT",
+                "VERL_FULL_DETERMINISM",
+                "CUDA_DEVICE_MAX_CONNECTIONS",
+                "CUBLAS_WORKSPACE_CONFIG",
+                "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
+                "NCCL_ALGO",
+            )
+        },
+        "provenance": {
+            "source_sha": os.environ.get("MLITE_SOURCE_SHA"),
+            "container_image": os.environ.get("MLITE_CONTAINER_IMAGE"),
+        },
     }
 
 

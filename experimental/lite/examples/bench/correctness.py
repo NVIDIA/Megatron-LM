@@ -464,7 +464,23 @@ def run_backend(
         "input_fingerprint": input_fingerprint,
         "activation_probes": activation_probes,
         "metadata": {
-            "deterministic": True,
+            "deterministic": os.environ.get("MEGATRON_LITE_DETERMINISTIC") == "1",
+            "determinism_env": {
+                name: os.environ.get(name)
+                for name in (
+                    "MEGATRON_LITE_DETERMINISTIC",
+                    "VLLM_BATCH_INVARIANT",
+                    "VERL_FULL_DETERMINISM",
+                    "CUDA_DEVICE_MAX_CONNECTIONS",
+                    "CUBLAS_WORKSPACE_CONFIG",
+                    "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
+                    "NCCL_ALGO",
+                )
+            },
+            "provenance": {
+                "source_sha": os.environ.get("MLITE_SOURCE_SHA"),
+                "container_image": os.environ.get("MLITE_CONTAINER_IMAGE"),
+            },
             "rank": _distributed_rank(),
             "world_size": _distributed_world_size(),
             "hash_weights": hash_weights,

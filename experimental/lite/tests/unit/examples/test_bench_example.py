@@ -262,6 +262,8 @@ def test_benchmark_snapshot_records_semantic_and_profiling_configuration(monkeyp
 
     monkeypatch.setenv("MLITE_VLLM_BATCHED_GROUPED_WEIGHT_QUANT", "0")
     monkeypatch.setenv("MLITE_PROFILE_SYNC_PHASES", "1")
+    monkeypatch.setenv("MEGATRON_LITE_DETERMINISTIC", "1")
+    monkeypatch.setenv("MLITE_SOURCE_SHA", "abc123")
     snapshot = _benchmark_config_snapshot(
         BenchCliConfig(
             model_name="deepseek_v4",
@@ -288,6 +290,8 @@ def test_benchmark_snapshot_records_semantic_and_profiling_configuration(monkeyp
     assert snapshot["correctness"]["trace_fingerprints"] is True
     assert snapshot["fp8"]["batched_grouped_weight_quant"] == "0"
     assert snapshot["profiling"]["sync_phases"] is True
+    assert snapshot["determinism"]["MEGATRON_LITE_DETERMINISTIC"] == "1"
+    assert snapshot["provenance"]["source_sha"] == "abc123"
 
 
 def test_result_summary_records_allocated_reserved_and_active_memory():
