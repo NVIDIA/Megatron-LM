@@ -134,21 +134,45 @@ def _quantize_block_fp8_weight_fused(
     return CanonicalBlockFP8Weight(qweight, scales)
 
 
-def _quantize_block_fp8_weight_fused_ue8m0(
+def _quantize_block_fp8_weight_fused_ue8m0_out(
     weight: torch.Tensor,
-) -> CanonicalBlockFP8Weight:
-    canonical = _quantize_block_fp8_weight_fused(weight)
-    ue8m0_scales = torch.empty_like(canonical.scales, dtype=torch.uint8)
-    _requantize_block_fp8_to_ue8m0[(canonical.scales.numel(),)](
-        canonical.qweight,
-        canonical.scales,
-        ue8m0_scales,
+    qweight: torch.Tensor,
+    ue8m0_scales: torch.Tensor,
+) -> None:
+    scales = torch.empty_like(ue8m0_scales, dtype=torch.float32)
+    _dynamic_block_fp8_quantize[(scales.numel(),)](
+        weight,
+        qweight,
+        scales,
         columns=weight.shape[1],
-        scale_columns=canonical.scales.shape[1],
+        scale_columns=scales.shape[1],
         BLOCK_ELEMENTS=BLOCK_SHAPE[0] * BLOCK_SHAPE[1],
         num_warps=8,
     )
-    return CanonicalBlockFP8Weight(canonical.qweight, ue8m0_scales)
+    _requantize_block_fp8_to_ue8m0[(scales.numel(),)](
+        qweight,
+        scales,
+        ue8m0_scales,
+        columns=weight.shape[1],
+        scale_columns=scales.shape[1],
+        BLOCK_ELEMENTS=BLOCK_SHAPE[0] * BLOCK_SHAPE[1],
+        num_warps=8,
+    )
+
+
+def _quantize_block_fp8_weight_fused_ue8m0(
+    weight: torch.Tensor,
+) -> CanonicalBlockFP8Weight:
+    qweight = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    ue8m0_scales = torch.empty(
+        (weight.shape[0] // BLOCK_SHAPE[0], weight.shape[1] // BLOCK_SHAPE[1]),
+        dtype=torch.uint8,
+        device=weight.device,
+    )
+    _quantize_block_fp8_weight_fused_ue8m0_out(
+        weight, qweight, ue8m0_scales
+    )
+    return CanonicalBlockFP8Weight(qweight, ue8m0_scales)
 
 
 def quantize_block_fp8_weight(weight: torch.Tensor):
@@ -242,6 +266,43 @@ def _grouped_checkpoint_weights(
     return qweight, torch.stack(scales)
 
 
+def _quantize_grouped_block_fp8_weights_direct(
+    weights: tuple[nn.Parameter, ...],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if (
+        not weights
+        or not weights[0].is_cuda
+        or triton is None
+        or os.environ.get("MLITE_VLLM_FUSED_WEIGHT_QUANT", "1") == "0"
+        or os.environ.get("MLITE_VLLM_FUSED_UE8M0_WEIGHT_QUANT", "1") == "0"
+    ):
+        return None
+    for weight in weights:
+        _validate_weight(weight)
+        if weight.shape != weights[0].shape:
+            raise ValueError("grouped block-FP8 weights must have identical shapes")
+    qweight = torch.empty(
+        (len(weights), *weights[0].shape),
+        dtype=torch.float8_e4m3fn,
+        device=weights[0].device,
+    )
+    scales = torch.empty(
+        (
+            len(weights),
+            weights[0].shape[0] // BLOCK_SHAPE[0],
+            weights[0].shape[1] // BLOCK_SHAPE[1],
+        ),
+        dtype=torch.uint8,
+        device=weights[0].device,
+    )
+    with torch.no_grad():
+        for index, weight in enumerate(weights):
+            _quantize_block_fp8_weight_fused_ue8m0_out(
+                weight.detach(), qweight[index], scales[index]
+            )
+    return qweight, scales
+
+
 def bind_source_scale_to_visible_weight(
     module: nn.Module, parameter_name: str, weight: torch.Tensor
 ):
@@ -281,11 +342,13 @@ def pack_grouped_block_fp8_weight(weights: Iterable[nn.Parameter]):
         raise ValueError("grouped block-FP8 packing requires at least one expert")
     checkpoint_weights = _grouped_checkpoint_weights(weights)
     if checkpoint_weights is None:
-        canonical = tuple(quantize_block_fp8_weight(weight) for weight in weights)
-        checkpoint_weights = (
-            torch.stack([item.qweight for item in canonical]),
-            torch.stack([item.scales for item in canonical]),
-        )
+        checkpoint_weights = _quantize_grouped_block_fp8_weights_direct(weights)
+        if checkpoint_weights is None:
+            canonical = tuple(quantize_block_fp8_weight(weight) for weight in weights)
+            checkpoint_weights = (
+                torch.stack([item.qweight for item in canonical]),
+                torch.stack([item.scales for item in canonical]),
+            )
     qweight, scales = _post_process(*checkpoint_weights)
     return PackedBlockFP8Weight(
         qweight, scales, tuple(_key(weight) for weight in weights)
