@@ -15,6 +15,9 @@ from megatron.core.transformer.moe.replica_planner import (
     ReplicaCuTeDSLWeightBridge,
     ReplicaPlan,
     _collect_replica_projection_specs,
+    _CuTeDSLReplicaProjection,
+    _DirectionalBinding,
+    _WeightDirection,
     map_replica_plan_to_hybridep,
     start_replica_grad_reduce_after_expert_backward,
     start_replica_weight_prefetch_before_combine_backward,
@@ -59,7 +62,7 @@ def test_replica_hybridep_binds_the_cutedsl_bridge(
         def set_replica_weight_bridge(self, value):
             self.bound_bridge = value
 
-    monkeypatch.setattr(token_dispatcher, "HybridEPReplicaWeightBridge", fake_bridge)
+    monkeypatch.setattr(token_dispatcher, "ReplicaCuTeDSLWeightBridge", fake_bridge)
     manager = _ReplicaHybridEPManager.__new__(_ReplicaHybridEPManager)
     manager.group = object()
     manager.semantic_num_experts = 8
@@ -146,8 +149,8 @@ def test_replica_async_collectives_span_transport_backward():
     class FakeBridge:
         source_parameters = (torch.nn.Parameter(torch.ones(())), torch.nn.Parameter(torch.ones(())))
 
-        def start_prefetch(self, current_plan, *, retain_for_grad=False):
-            assert current_plan is plan and retain_for_grad
+        def start_prefetch(self, current_plan, direction=_WeightDirection.FORWARD):
+            assert current_plan is plan and direction is _WeightDirection.BACKWARD
             events.append("start_prefetch")
 
         def wait_prefetch(self, current_plan):
@@ -298,6 +301,59 @@ def _set_main_grad(parameter, dtype=torch.float32):
     parameter.overwrite_main_grad = True
 
 
+def _test_directional_binding(device, num_experts, components=0):
+    return _DirectionalBinding(
+        torch.empty(num_experts, dtype=torch.int64, device=device),
+        (
+            torch.empty(num_experts, dtype=torch.int64, device=device)
+            if components == 2
+            else None
+        ),
+        host_pointer_table=(
+            torch.empty((components, num_experts), dtype=torch.int64, pin_memory=True)
+            if components
+            else None
+        ),
+    )
+
+
+def _test_projection(
+    *,
+    parameters,
+    source_tensors,
+    virtual_weight,
+    virtual_grad,
+    member_shape,
+    forward,
+    backward,
+    weight_format="bf16",
+    scale_shape=None,
+    gtp_native_grad=None,
+    runtime_parameters=None,
+):
+    device = source_tensors[0].device
+    return _CuTeDSLReplicaProjection(
+        name="test projection",
+        device=device,
+        weight_format=weight_format,
+        parameters=parameters,
+        gtp_leader=parameters[0] if gtp_native_grad is not None else None,
+        source_tensors=source_tensors,
+        forward=forward,
+        backward=backward,
+        main_grad_bases=torch.empty(len(parameters), dtype=torch.int64, device=device),
+        member_shape=member_shape,
+        member_numel=member_shape[0] * member_shape[1],
+        rowwise_scale_shape=scale_shape,
+        columnwise_scale_shape=scale_shape,
+        virtual_weight=virtual_weight,
+        virtual_grad=virtual_grad,
+        gtp_native_grad=gtp_native_grad,
+        runtime_parameters=runtime_parameters,
+        runtime_bound=runtime_parameters is not None,
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture requires CUDA")
 @pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) > 1,
@@ -331,19 +387,17 @@ def test_replica_gtp_main_grad_table_ignores_transient_buffers_during_capture():
         runtime_parameter.overwrite_main_grad = True
         runtime_parameters.append(runtime_parameter)
 
-    projection = SimpleNamespace(
-        gtp_leader=source_parameters[0],
+    forward = _test_directional_binding(device, num_local_experts, components=1)
+    backward = _test_directional_binding(device, num_local_experts, components=1)
+    projection = _test_projection(
+        parameters=source_parameters,
         source_tensors=source_tensors,
         gtp_native_grad=native_grad,
-        weight_format="bf16",
-        parameters=source_parameters,
-        member_numel=member_shape[0] * member_shape[1],
-        source_storage_ptrs=None,
-        source_main_grad_ptrs=None,
-        source_bases=torch.empty(num_local_experts, dtype=torch.int64, device=device),
-        main_grad_bases=torch.empty(num_local_experts, dtype=torch.int64, device=device),
         virtual_weight=virtual_weight,
         virtual_grad=virtual_grad,
+        member_shape=member_shape,
+        forward=forward,
+        backward=backward,
         runtime_parameters=tuple(runtime_parameters),
     )
     bridge = ReplicaCuTeDSLWeightBridge.__new__(ReplicaCuTeDSLWeightBridge)
@@ -357,7 +411,9 @@ def test_replica_gtp_main_grad_table_ignores_transient_buffers_during_capture():
     assert projection.source_main_grad_ptrs == stable_ptrs
     # Model the eager/captured GTP buffers that previously replaced the stable
     # destination table. The bridge must not consult them during forward capture.
-    projection.gtp_wgrad_tensors = tuple(torch.empty_like(grad) for grad in native_grad)
+    projection.gtp_leader.gtp_wgrad_tensors = tuple(
+        torch.empty_like(grad) for grad in native_grad
+    )
     capture_probe = torch.zeros(1, dtype=torch.int32, device=device)
     torch.cuda.synchronize(device)
     graph = torch.cuda.CUDAGraph()
@@ -393,57 +449,53 @@ def test_replica_gtp_bf16_weights_bind_directional_stable_buffers():
     runtime_parameters = tuple(
         torch.nn.Parameter(torch.empty_like(weight)) for weight in forward_weights
     )
-    forward_bases = torch.empty(num_local_experts, dtype=torch.int64, device=device)
-    backward_bases = torch.empty_like(forward_bases)
-    projection = SimpleNamespace(
-        member_shape=member_shape,
-        source_tensors=(),
-        source_pointer_staging=tuple(
-            torch.empty(num_local_experts, dtype=torch.int64, pin_memory=True) for _ in range(2)
+    forward = _test_directional_binding(device, num_local_experts, components=1)
+    backward = _test_directional_binding(device, num_local_experts, components=1)
+    projection = _test_projection(
+        parameters=runtime_parameters,
+        gtp_native_grad=torch.empty(
+            (num_local_experts, *member_shape), dtype=torch.float32, device=device
         ),
-        gtp_forward_source_tensors=None,
-        gtp_backward_source_tensors=None,
-        gtp_forward_source_bases=forward_bases,
-        gtp_backward_source_bases=backward_bases,
-        gtp_forward_source_ptrs=None,
-        gtp_backward_source_ptrs=None,
+        member_shape=member_shape,
+        source_tensors=forward_weights,
+        forward=forward,
+        backward=backward,
+        virtual_weight=(),
+        virtual_grad=torch.empty(
+            (0, *member_shape), dtype=torch.float32, device=device
+        ),
         runtime_parameters=runtime_parameters,
     )
-    bridge = ReplicaCuTeDSLWeightBridge.__new__(ReplicaCuTeDSLWeightBridge)
-    bridge.device = device
-    bridge.num_local_experts = num_local_experts
 
     runtime_ids = tuple(id(parameter) for parameter in runtime_parameters)
     capture_probe = torch.zeros(1, dtype=torch.int32, device=device)
     torch.cuda.synchronize(device)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        bridge._bind_materialized_gtp_bf16_weights(
-            projection, forward_weights, retain_for_grad=False
-        )
+        projection.bind_materialized_weights(forward_weights, _WeightDirection.FORWARD)
         capture_probe.add_(1)
     graph.replay()
     torch.cuda.synchronize(device)
 
     forward_ptrs = tuple(weight.data_ptr() for weight in forward_weights)
-    assert projection.gtp_forward_source_ptrs == forward_ptrs
-    assert tuple(forward_bases.cpu().tolist()) == forward_ptrs
+    assert forward.source_ptrs == tuple((ptr,) for ptr in forward_ptrs)
+    assert tuple(forward.data_bases.cpu().tolist()) == forward_ptrs
     assert tuple(parameter.data_ptr() for parameter in runtime_parameters) == forward_ptrs
 
-    bridge._bind_materialized_gtp_bf16_weights(projection, backward_weights, retain_for_grad=True)
+    projection.bind_materialized_weights(backward_weights, _WeightDirection.BACKWARD)
     backward_ptrs = tuple(weight.data_ptr() for weight in backward_weights)
-    assert projection.gtp_backward_source_ptrs == backward_ptrs
-    assert tuple(backward_bases.cpu().tolist()) == backward_ptrs
+    assert backward.source_ptrs == tuple((ptr,) for ptr in backward_ptrs)
+    assert tuple(backward.data_bases.cpu().tolist()) == backward_ptrs
     assert tuple(parameter.data_ptr() for parameter in runtime_parameters) == backward_ptrs
     assert tuple(id(parameter) for parameter in runtime_parameters) == runtime_ids
 
-    bridge._bind_materialized_gtp_bf16_weights(projection, forward_weights, retain_for_grad=False)
+    projection.bind_materialized_weights(forward_weights, _WeightDirection.FORWARD)
     assert tuple(parameter.data_ptr() for parameter in runtime_parameters) == forward_ptrs
     replacement = list(forward_weights)
     replacement[0] = torch.empty_like(replacement[0])
     with pytest.raises(RuntimeError, match="forward all-gather storage changed"):
-        bridge._bind_materialized_gtp_bf16_weights(
-            projection, tuple(replacement), retain_for_grad=False
+        projection.bind_materialized_weights(
+            tuple(replacement), _WeightDirection.FORWARD
         )
 
 
@@ -466,20 +518,15 @@ def test_replica_bf16_runtime_over_64_experts_remains_discrete():
     virtual_grad = torch.empty(
         (num_local_experts, *member_shape), dtype=torch.float32, device=device
     )
-    projection = SimpleNamespace(
-        gtp_leader=None,
-        source_tensors=tuple(parameter.data for parameter in parameters),
-        gtp_native_grad=None,
-        weight_format="bf16",
+    binding = _test_directional_binding(device, num_local_experts)
+    projection = _test_projection(
         parameters=parameters,
-        member_numel=member_shape[0] * member_shape[1],
-        source_storage_ptrs=None,
-        source_main_grad_ptrs=None,
-        source_bases=torch.empty(num_local_experts, dtype=torch.int64, device=device),
-        main_grad_bases=torch.empty(num_local_experts, dtype=torch.int64, device=device),
+        source_tensors=tuple(parameter.data for parameter in parameters),
         virtual_weight=virtual_weight,
         virtual_grad=virtual_grad,
-        runtime_parameters=None,
+        member_shape=member_shape,
+        forward=binding,
+        backward=binding,
     )
     bridge = ReplicaCuTeDSLWeightBridge.__new__(ReplicaCuTeDSLWeightBridge)
     bridge.device = device
@@ -525,34 +572,32 @@ def test_replica_gtp_mxfp8_weights_bind_directly_during_capture():
     destinations = tuple(make_weight() for _ in range(num_local_experts))
     materialized = tuple(make_weight() for _ in range(num_local_experts))
     runtime_parameters = tuple(make_weight() for _ in range(num_local_experts))
-    pointer_tables = tuple(
-        torch.empty(num_local_experts, dtype=torch.int64, device=device) for _ in range(4)
-    )
-    projection = SimpleNamespace(
-        member_shape=member_shape,
-        rowwise_scale_shape=scale_shape,
-        columnwise_scale_shape=scale_shape,
+    forward = _test_directional_binding(device, num_local_experts, components=2)
+    backward = _test_directional_binding(device, num_local_experts, components=2)
+    projection = _test_projection(
+        parameters=destinations,
         source_tensors=destinations,
-        rowwise_data_bases=pointer_tables[0],
-        rowwise_scale_bases=pointer_tables[1],
-        columnwise_data_bases=pointer_tables[2],
-        columnwise_scale_bases=pointer_tables[3],
-        source_pointer_staging=tuple(
-            torch.empty(num_local_experts, dtype=torch.int64, pin_memory=True) for _ in range(4)
+        virtual_weight=(),
+        virtual_grad=torch.empty(
+            (0, *member_shape), dtype=torch.float32, device=device
         ),
-        gtp_rowwise_source_ptrs=None,
-        gtp_columnwise_source_ptrs=None,
+        member_shape=member_shape,
+        forward=forward,
+        backward=backward,
+        weight_format="mxfp8",
+        scale_shape=scale_shape,
+        gtp_native_grad=torch.empty(
+            (num_local_experts, *member_shape), dtype=torch.float32, device=device
+        ),
         runtime_parameters=runtime_parameters,
-        source_storage_ptrs=tuple(_weight_storage_ptrs(weight) for weight in destinations),
     )
-    bridge = ReplicaCuTeDSLWeightBridge.__new__(ReplicaCuTeDSLWeightBridge)
-    bridge.device = device
+    projection.source_storage_ptrs = tuple(_weight_storage_ptrs(w) for w in destinations)
 
     capture_probe = torch.zeros(1, dtype=torch.int32, device=device)
     torch.cuda.synchronize(device)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        bridge._bind_materialized_gtp_mxfp8_weights(projection, materialized, retain_for_grad=False)
+        projection.bind_materialized_weights(materialized, _WeightDirection.FORWARD)
         capture_probe.add_(1)
     graph.replay()
     torch.cuda.synchronize(device)
@@ -561,9 +606,9 @@ def test_replica_gtp_mxfp8_weights_bind_directly_during_capture():
         (weight._rowwise_data.data_ptr(), weight._rowwise_scale_inv.data_ptr())
         for weight in materialized
     )
-    assert projection.gtp_rowwise_source_ptrs == rowwise_ptrs
-    assert tuple(pointer_tables[0].cpu().tolist()) == tuple(ptrs[0] for ptrs in rowwise_ptrs)
-    assert tuple(pointer_tables[1].cpu().tolist()) == tuple(ptrs[1] for ptrs in rowwise_ptrs)
+    assert forward.source_ptrs == rowwise_ptrs
+    assert tuple(forward.data_bases.cpu().tolist()) == tuple(ptrs[0] for ptrs in rowwise_ptrs)
+    assert tuple(forward.scale_bases.cpu().tolist()) == tuple(ptrs[1] for ptrs in rowwise_ptrs)
     for destination, runtime_parameter, source in zip(
         destinations, runtime_parameters, materialized
     ):
@@ -575,12 +620,12 @@ def test_replica_gtp_mxfp8_weights_bind_directly_during_capture():
 
     # Repeated materialization is validation-only: it retains the same aliases
     # and does not enqueue another pointer-table update or weight copy.
-    bridge._bind_materialized_gtp_mxfp8_weights(projection, materialized, retain_for_grad=False)
+    projection.bind_materialized_weights(materialized, _WeightDirection.FORWARD)
     replacement = list(materialized)
     replacement[0] = make_weight()
     with pytest.raises(RuntimeError, match="all-gather storage changed"):
-        bridge._bind_materialized_gtp_mxfp8_weights(
-            projection, tuple(replacement), retain_for_grad=False
+        projection.bind_materialized_weights(
+            tuple(replacement), _WeightDirection.FORWARD
         )
 
 
@@ -786,13 +831,11 @@ def _run_replica_hybridep_full_layer_parity(
             bridge = replica_layer.token_dispatcher._comm_manager._bridge
             assert bridge.workspace.grad_arena.dtype == grad_dtype
             if mxfp8:
-                assert bridge.workspace.rowwise_arena is bridge.workspace.columnwise_arena
-                assert bridge.workspace.rowwise_handle is bridge.workspace.columnwise_handle
+                assert bridge.workspace.weight_arena is not None
+                assert bridge.workspace.weight_handle is not None
                 for projection in bridge.projections:
                     for virtual in projection.virtual_weight:
-                        assert (
-                            virtual._rowwise_data.data_ptr() == virtual._columnwise_data.data_ptr()
-                        )
+                        assert virtual._rowwise_data.data_ptr() == virtual._columnwise_data.data_ptr()
             if gtp and mxfp8:
                 # GTP gather outputs replace these aliases before execution; no
                 # second full native row/column staging allocation is retained.
@@ -1004,7 +1047,8 @@ def _run_replica_hybridep_full_layer_parity(
             # then-virtual wrappers, refresh virtual slots from changed native
             # weights, and prove replay observes unchanged wrapper addresses.
             plan = bridge.last_plan
-            bridge.prefetch(plan)
+            bridge.start_prefetch(plan)
+            bridge.wait_prefetch(plan)
             runtime_weight_tuples = (bridge.runtime_fc1_weights, bridge.runtime_fc2_weights)
             stable_pointers = tuple(
                 tuple(weight.data_ptr() for weight in runtime_weights)
@@ -1056,7 +1100,8 @@ def _run_replica_hybridep_full_layer_parity(
             # actual refresh from the modified optimizer-owned weights.
             bridge.workspace.resident_bridge = None
             bridge.workspace.resident_plan = None
-            bridge.prefetch(plan)
+            bridge.start_prefetch(plan)
+            bridge.wait_prefetch(plan)
             torch.testing.assert_close(
                 plan.experts_to_copy,
                 plan_snapshot,
