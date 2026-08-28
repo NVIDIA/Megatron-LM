@@ -8,15 +8,15 @@ Implements NCCL's requirements on user-allocated communication buffers
 (https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#memory-allocator)
 minimally: VMM allocations at the recommended granularity, exportable handle
 types (POSIX FD, plus FABRIC when supported — dropped on retry if cuMemCreate
-rejects it), and GPUDirect-RDMA-capable physical memory when supported. Unlike
-``ncclMemAlloc``, the memory is mapped only on the allocation's device — the
-requirements ask for no more, and ncclMemAlloc's extra mappings on every
-P2P-visible peer GPU slow CPU-side kernel launching for the whole training
-step (measured at -6% end-to-end throughput at 256 GPUs, recovered by this
-allocator).
+rejects it), and GPUDirect-RDMA-capable physical memory when supported.
 
-NCCL window registration (``ncclCommWindowRegister`` via
-``nccl_allocator.register_mem_pool``) accepts this memory and runs its
+Unlike ``ncclMemAlloc``, the memory is mapped only on the allocation's device
+— the requirements ask for no more, and ncclMemAlloc's extra mappings on every
+P2P-visible peer GPU slow CPU-side kernel launching for the whole training
+step.
+
+Window registration is still delegated to ``nccl_allocator.register_mem_pool``
+(which calls ``ncclCommWindowRegister``), which accepts this memory and runs its
 symmetric kernels on it.
 """
 
