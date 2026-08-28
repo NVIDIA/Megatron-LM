@@ -3393,11 +3393,15 @@ class TextGenerationController:
         self._validate_async_sched_support_for_step(run_async_overlap)
 
         active_request_count = context.total_request_count - context.paused_request_count
-        if context.active_token_count == 0 and active_request_count == 0 and run_async_overlap:
+        if context.active_token_count == 0 and active_request_count == 0:
+            # A lifecycle reset such as RECOMPUTE suspend/resume can remove every
+            # request represented by a pending forward. Discard those stale logits
+            # before the no-overlap path admits and primes the restored requests.
             self._async_sched_logits.clear()
-            return DynamicBatchControllerStepResult(
-                decode_only=DecodeOnly(consumed=None, launched=None)
-            )
+            if run_async_overlap:
+                return DynamicBatchControllerStepResult(
+                    decode_only=DecodeOnly(consumed=None, launched=None)
+                )
 
         if not run_async_overlap or not self._async_sched_logits.is_valid:
             return await self._run_async_sched_step_no_overlap(
