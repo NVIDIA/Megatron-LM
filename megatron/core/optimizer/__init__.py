@@ -676,7 +676,9 @@ def _get_megatron_optimizer_based_on_param_groups(
         optimizer = FullyShardedOptimizer(
             optimizer, config, grad_scaler, init_state_fn, model_chunks=model_chunks
         )
-        setattr(optimizer, 'grad_stats_parallel_group', data_parallel_group)
+        # get_grad_norm divides each rank's contribution by that gradient's replication
+        # factor, so summing it over every rank is correct by construction.
+        setattr(optimizer, 'grad_stats_parallel_group', torch.distributed.group.WORLD)
     elif config.fp16 or config.bf16:
         optimizer = Float16OptimizerWithFloat16Params(optimizer, config, grad_scaler, init_state_fn)
         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
