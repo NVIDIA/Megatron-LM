@@ -9,7 +9,11 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
+from megatron.core.full_cuda_graph import (
+    FullCudaGraphWrapper,
+    clone_tensors_in_struct,
+    get_shared_capture_stream,
+)
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -20,6 +24,27 @@ from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+def test_clone_tensors_in_struct_passes_through_none_static_slots():
+    """A static-buffer slot that was None at capture must accept a later non-None value.
+
+    Full-iteration capture snapshots the first iteration's data dict into static buffers.
+    A field that is None then (e.g. an optional mask) but a Tensor on a later iteration has
+    no captured buffer to copy into; the value must pass through instead of crashing on
+    ``None.copy_``.
+    """
+    value = torch.arange(4, dtype=torch.float32)
+
+    tgt_dict = {"a": torch.zeros(4), "b": None}
+    clone_tensors_in_struct(tgt_dict, {"a": value, "b": value})
+    assert torch.equal(tgt_dict["a"], value)
+    assert torch.equal(tgt_dict["b"], value)
+
+    tgt_list = [torch.zeros(4), None]
+    clone_tensors_in_struct(tgt_list, [value, value])
+    assert torch.equal(tgt_list[0], value)
+    assert torch.equal(tgt_list[1], value)
 
 
 def test_ddp_grad_accumulators_share_full_cuda_graph_stream():

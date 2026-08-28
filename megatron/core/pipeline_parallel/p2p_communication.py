@@ -265,7 +265,10 @@ class P2PCommunicator:
 
             # To protect against race condition when using batch_isend_irecv().
             # should take this out once the bug with batch_isend_irecv is resolved.
-            torch.cuda.synchronize()
+            # Skipped under CUDA graph capture: torch.cuda.synchronize() is illegal during
+            # stream capture and unnecessary (the graph records the comm ops + stream deps).
+            if not torch.cuda.is_current_stream_capturing():
+                torch.cuda.synchronize()
 
         recv_prev_shape = [0, 0, 0]
         if recv_prev_shape_tensor is not None:
@@ -418,9 +421,14 @@ class P2PCommunicator:
                 req.wait()
             reqs = None
 
-        if config.batch_p2p_comm and config.batch_p2p_sync:
+        if (
+            config.batch_p2p_comm
+            and config.batch_p2p_sync
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             # To protect against race condition when using batch_isend_irecv().
-            # User should assert that we have a modern enough PyTorch to not need this
+            # User should assert that we have a modern enough PyTorch to not need this.
+            # Skipped under CUDA graph capture (illegal during stream capture + unnecessary).
             torch.cuda.synchronize()
 
         return tensor_recv_prev, tensor_recv_next, reqs
