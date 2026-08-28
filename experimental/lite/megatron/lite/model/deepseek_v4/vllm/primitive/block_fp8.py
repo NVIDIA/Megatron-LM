@@ -303,6 +303,56 @@ def _quantize_grouped_block_fp8_weights_direct(
     return qweight, scales
 
 
+def _quantize_concatenated_block_fp8_weights_direct(
+    weights: tuple[nn.Parameter, ...],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if (
+        not weights
+        or not weights[0].is_cuda
+        or triton is None
+        or os.environ.get("MLITE_VLLM_FUSED_WEIGHT_QUANT", "1") == "0"
+        or os.environ.get("MLITE_VLLM_FUSED_UE8M0_WEIGHT_QUANT", "1") == "0"
+        or any(
+            getattr(weight, "_fp8_source_scales", None) is not None
+            and getattr(weight, "_fp8_source_scale_version", None) == weight._version
+            for weight in weights
+        )
+    ):
+        return None
+    columns = weights[0].shape[1]
+    for weight in weights:
+        _validate_weight(weight)
+        if weight.shape[1] != columns:
+            raise ValueError("fused block-FP8 weights must have identical K dimensions")
+    qweight = torch.empty(
+        (sum(weight.shape[0] for weight in weights), columns),
+        dtype=torch.float8_e4m3fn,
+        device=weights[0].device,
+    )
+    scales = torch.empty(
+        (
+            sum(weight.shape[0] // BLOCK_SHAPE[0] for weight in weights),
+            columns // BLOCK_SHAPE[1],
+        ),
+        dtype=torch.uint8,
+        device=weights[0].device,
+    )
+    row_offset = 0
+    scale_row_offset = 0
+    with torch.no_grad():
+        for weight in weights:
+            rows = weight.shape[0]
+            scale_rows = rows // BLOCK_SHAPE[0]
+            _quantize_block_fp8_weight_fused_ue8m0_out(
+                weight.detach(),
+                qweight.narrow(0, row_offset, rows),
+                scales.narrow(0, scale_row_offset, scale_rows),
+            )
+            row_offset += rows
+            scale_row_offset += scale_rows
+    return qweight, scales
+
+
 def bind_source_scale_to_visible_weight(
     module: nn.Module, parameter_name: str, weight: torch.Tensor
 ):
@@ -449,11 +499,18 @@ class DeploymentFusedBlockFP8Adapter(DeploymentBlockFP8Adapter):
             with _weight_nvtx_range("fp8_weight/fused_cache_hit"):
                 return self._cached_weight
         with _weight_nvtx_range("fp8_weight/fused_cache_miss"):
-            canonical = tuple(quantize_block_fp8_weight(weight) for weight in weights)
-            qweight, scales = _post_process(
-                torch.cat([item.qweight for item in canonical]),
-                torch.cat([item.scales for item in canonical]),
+            checkpoint_weights = _quantize_concatenated_block_fp8_weights_direct(
+                weights
             )
+            if checkpoint_weights is None:
+                canonical = tuple(
+                    quantize_block_fp8_weight(weight) for weight in weights
+                )
+                checkpoint_weights = (
+                    torch.cat([item.qweight for item in canonical]),
+                    torch.cat([item.scales for item in canonical]),
+                )
+            qweight, scales = _post_process(*checkpoint_weights)
             packed = PackedBlockFP8Weight(qweight, scales, key)
         if self.cache_weight:
             self._cached_weight = packed

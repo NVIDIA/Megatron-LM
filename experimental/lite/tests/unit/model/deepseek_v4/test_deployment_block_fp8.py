@@ -216,6 +216,27 @@ def test_direct_grouped_weight_pack_matches_stacked_vllm_bitwise(
     assert torch.equal(actual.scales, reference.scales)
 
 
+@pytest.mark.gpus(1)
+def test_direct_fused_weight_pack_matches_concatenated_vllm_bitwise(
+    monkeypatch,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires one CUDA GPU")
+    weights = tuple(
+        nn.Parameter(torch.randn(shape, device="cuda", dtype=torch.bfloat16))
+        for shape in ((256, 384), (384, 384))
+    )
+    adapter = DeploymentFusedBlockFP8Adapter(cache_weight=False)
+
+    monkeypatch.setenv("MLITE_VLLM_FUSED_UE8M0_WEIGHT_QUANT", "0")
+    reference = adapter.pack_weight(weights)
+    monkeypatch.setenv("MLITE_VLLM_FUSED_UE8M0_WEIGHT_QUANT", "1")
+    actual = adapter.pack_weight(weights)
+
+    assert torch.equal(actual.qweight, reference.qweight)
+    assert torch.equal(actual.scales, reference.scales)
+
+
 def test_weight_path_calls_vllm_and_packs_official_layout(fake_vllm) -> None:
     master = _weight()
     packed = pack_block_fp8_weight(master)

@@ -76,8 +76,8 @@ def test_gate_logits_use_one_batch_invariant_gemm(tokens: int) -> None:
 @pytest.mark.parametrize(
     ("optimizer", "override", "expected"),
     [
-        ("dist_opt", None, True),
-        ("fsdp2", None, True),
+        ("dist_opt", None, False),
+        ("fsdp2", None, False),
         ("fsdp2", True, True),
         ("dist_opt", False, False),
         (None, None, False),

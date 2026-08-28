@@ -19,7 +19,6 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
 )
 from megatron.lite.model.deepseek_v4.lite.protocol import (
     MODULE_MAP,
-    _optimizer_backend_name,
     build_model_config as build_model_config,
     build_training_backend,
     is_expert_param as is_expert_param,
@@ -74,7 +73,7 @@ class ImplConfig:
 def _deployment_weight_cache_enabled(impl_cfg: ImplConfig) -> bool:
     if impl_cfg.cache_deployment_weights is not None:
         return impl_cfg.cache_deployment_weights
-    return _optimizer_backend_name(impl_cfg.optimizer) in {"fsdp2", "dist_opt"}
+    return False
 
 
 def _local_num_tokens(batch: Any) -> int:
