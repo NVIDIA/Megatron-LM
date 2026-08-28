@@ -324,42 +324,6 @@ class GatedDeltaNet2(_GDNBase):
 
         return norm_out
 
-    def forward_output_proj(
-        self, norm_out: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Apply GDN2's output projection to the normalized recurrence output."""
-        nvtx_range_push(suffix="out_proj")
-        out, out_bias = self.out_proj(norm_out)
-        nvtx_range_pop(suffix="out_proj")
-
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
-
-        return out, out_bias
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        inference_context: BaseInferenceContext | None = None,
-        packed_seq_params: PackedSeqParams | None = None,
-        sequence_len_offset: int | None = None,
-        *,
-        inference_params: BaseInferenceContext | None = None,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run the GDN2 recurrence followed by its output projection."""
-        norm_out = self.forward_pre_output_proj(
-            hidden_states,
-            attention_mask,
-            inference_context=inference_context,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            inference_params=inference_params,
-            **kwargs,
-        )
-        return self.forward_output_proj(norm_out)
-
 
 ####################
 # Torch native gated delta rule 2
