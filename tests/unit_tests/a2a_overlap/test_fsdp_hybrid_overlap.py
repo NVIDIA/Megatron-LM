@@ -33,6 +33,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.ssm.mamba_mixer import HAVE_MAMBA_SSM
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig
 
 try:
     import causal_conv1d  # noqa: F401
@@ -62,10 +63,15 @@ LR = 0.01
 def _hybrid_config(hybrid_layer_pattern, num_moe_experts=8, extra_kwargs=None):
     """Build a TransformerConfig usable by HybridModel + EP overlap."""
     extra_kwargs = dict(extra_kwargs or {})
+    config_cls = TransformerConfig
+    if "+" in hybrid_layer_pattern:
+        # MLA pre-layers: mirror the GPT-side a2a_overlap MLA config (default MLA dims).
+        config_cls = MLATransformerConfig
+        extra_kwargs.setdefault("multi_latent_attention", True)
     # HybridModel derives effective num_layers from the pattern; we still pass
     # the flattened count so TransformerConfig.__post_init__ checks pass.
     flat = hybrid_layer_pattern.replace("[", "").replace("]", "")
-    return TransformerConfig(
+    return config_cls(
         # ``deterministic_mode`` (utils.deterministic_mode) sets
         # ``NVTE_FUSED_ATTN=0`` for reproducibility; the default attention
         # backend ``auto`` asserts that env is unset, so pin it to ``unfused``
@@ -147,7 +153,7 @@ class TestFSDPHybridOverlap:
     )
     @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
     @pytest.mark.parametrize("shared_expert_intermediate_size", [None, 512])
-    @pytest.mark.parametrize("hybrid_layer_pattern", ["[*E][*E]", "[M*E][M*E]"])
+    @pytest.mark.parametrize("hybrid_layer_pattern", ["[*E][*E]", "[M*E][M*E]", "[+E][+E]"])
     def test_fsdp_hybrid_overlap_training_step(
         self, dispatcher_type, shared_expert_intermediate_size, hybrid_layer_pattern
     ):
