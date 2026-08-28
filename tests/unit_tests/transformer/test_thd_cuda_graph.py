@@ -31,6 +31,8 @@ import pytest
 import torch
 
 from megatron.core.datasets.data_schedule import _build_thd_padding_mask
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import (
     PackedSeqParams,
     _resolve_thd_padding_lengths,
@@ -102,6 +104,35 @@ def _build_layer(H, nh, nkv, ffn, max_seqlen, max_num_seqs, tp=1, sp=False):
         .cuda()
         .bfloat16()
     )
+
+
+def _build_chunk(H, nh, nkv, ffn, max_seqlen, max_num_seqs):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=H,
+        num_attention_heads=nh,
+        num_query_groups=nkv,
+        ffn_hidden_size=ffn,
+        max_seqlen_per_dp_cp_rank=max_seqlen,
+        thd_max_packed_sequences=max_num_seqs,
+        bf16=True,
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_granularity="chunk",
+        cuda_graph_modules=[],
+        cuda_graph_dynamic_microbatches=True,
+        sequence_packing_scheduler="dp_balanced",
+        pad_packed_seq_alignment="max",
+        use_cpu_initialization=True,
+    )
+    model_parallel_cuda_manual_seed(42)
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        vocab_size=128,
+        max_sequence_length=max_seqlen,
+        position_embedding_type="rope",
+    ).cuda()
+    return model.decoder
 
 
 # =============================================================================
@@ -1004,6 +1035,28 @@ class TestStaticInputs:
         static_inputs = layer.get_layer_static_inputs(seq_length=256, micro_batch_size=2)
 
         assert static_inputs["input_ids"].shape == (1, 128)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_chunk_static_inputs_and_packed_sequence_round_trip(self):
+        block = _build_chunk(256, 4, 4, 1024, 128, 8)
+
+        static_inputs = block.get_layer_static_inputs(seq_length=128, micro_batch_size=1)
+        assert static_inputs["hidden_states"].shape == (128, 1, 256)
+        assert static_inputs["cu_seqlens_q"].shape == (9,)
+        assert static_inputs["cu_seqlens_kv_padded"].shape == (9,)
+        assert static_inputs["padding_mask"].shape == (1, 128)
+        assert not static_inputs["padding_mask"].any()
+
+        packed_seq_params = _make_psp([64, 32])
+        kwargs = {'packed_seq_params': packed_seq_params}
+        block._decompose_packed_seq_params_to_kwargs(kwargs)
+        block._reconstruct_packed_seq_params_from_kwargs(kwargs)
+
+        reconstructed = kwargs['packed_seq_params']
+        assert reconstructed.pad_between_seqs is True
+        assert reconstructed.max_seqlen_q == 128
+        assert torch.equal(reconstructed.cu_seqlens_q, packed_seq_params.cu_seqlens_q)
 
 
 class TestDynamicMicrobatchSlots:

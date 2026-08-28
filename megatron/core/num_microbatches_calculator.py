@@ -19,6 +19,11 @@ def get_num_microbatches() -> int:
     return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get()
 
 
+def get_max_num_microbatches() -> int:
+    """Get the maximum number of microbatches in the configured batch schedule."""
+    return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get_max()
+
+
 def get_current_global_batch_size() -> int:
     """Get current global batch size."""
     return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get_current_global_batch_size()
@@ -315,6 +320,10 @@ class NumMicroBatchesCalculator(ABC):
         assert self.num_micro_batches is not None
         return self.num_micro_batches
 
+    def get_max(self) -> int:
+        """Get the maximum number of microbatches this calculator can produce."""
+        return self.get()
+
     def get_current_global_batch_size(self) -> int:
         """Get current global batch size."""
         assert self.current_global_batch_size is not None
@@ -564,6 +573,15 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
             else:
                 break
         return batch_size
+
+    def get_max(self) -> int:
+        """Get the largest valid microbatch count in the step schedule."""
+        max_num_microbatches = max(
+            batch_size // self.micro_batch_times_data_parallel_size
+            for _, batch_size in self.schedule
+        )
+        assert max_num_microbatches >= 1
+        return max_num_microbatches
 
     def update(self, consumed_samples: int, consistency_check: bool, verbose: bool = False) -> None:
         """Update number of microbatches based on consumed samples.

@@ -18,6 +18,7 @@ from megatron.core.transformer.moe.paged_stash import (
     PagedStashRunner,
     check_paged_stash_overflow,
     paged_stash_init_chunk_handler,
+    paged_stash_prepare_for_cuda_graph_capture,
     paged_stash_reset,
     paged_stash_te_graph_capture,
 )
@@ -31,6 +32,68 @@ from tests.unit_tests.test_utilities import Utils
 # whole module for the GB200 CI bucket (selection there is marker-driven; see
 # tests/unit_tests/find_test_cases.py and recipes/gb200/unit-tests.yaml).
 pytestmark = pytest.mark.launch_on_gb200
+
+
+def test_runtime_schedule_tracks_microbatch_count_and_chunk_graph_mode():
+    """Runtime keys are used only when the PP order can differ from the captured order."""
+    manager = object.__new__(PagedStashManager)
+    manager.schedule_num_microbatches = None
+    config = SimpleNamespace(
+        cuda_graph_impl="none",
+        cuda_graph_granularity="layer",
+        cuda_graph_dynamic_microbatches=False,
+        moe_paged_stash=True,
+        pipeline_model_parallel_size=2,
+    )
+
+    manager.configure_runtime_schedule(True, config, num_microbatches=2)
+    assert manager.schedule_num_microbatches == 2
+    assert not manager.runtime_schedule
+
+    manager.configure_runtime_schedule(True, config, num_microbatches=4)
+    assert manager.runtime_schedule
+    assert manager.runtime_schedule_stash_activations
+
+    config.cuda_graph_impl = "transformer_engine"
+    config.cuda_graph_granularity = "chunk"
+    config.cuda_graph_dynamic_microbatches = True
+    manager.configure_runtime_schedule(True, config, num_microbatches=2)
+    assert manager.runtime_schedule
+
+    config.pipeline_model_parallel_size = 1
+    manager.configure_runtime_schedule(True, config, num_microbatches=2)
+    assert manager.runtime_schedule
+    assert not manager.runtime_schedule_stash_activations
+
+
+def test_prepare_for_chunk_graph_capture_reallocates_released_buffers(monkeypatch):
+    """A warmup fallback must not leave TE capture without page buffers."""
+    manager = object.__new__(PagedStashManager)
+    manager.enabled = True
+    manager.status = "captured"
+    manager.stash_buffers = None
+    allocations = []
+
+    def allocate_stash_buffers(**kwargs):
+        allocations.append(kwargs)
+        manager.stash_buffers = {}
+
+    manager.allocate_stash_buffers = allocate_stash_buffers
+    monkeypatch.setattr(PagedStashManager, "get_instance", staticmethod(lambda: manager))
+    config = SimpleNamespace(
+        moe_paged_stash_buffer_size_factor_cuda=1.25,
+        moe_paged_stash_buffer_size_factor_cpu=0.5,
+    )
+
+    paged_stash_prepare_for_cuda_graph_capture(config)
+    paged_stash_prepare_for_cuda_graph_capture(config)
+
+    assert allocations == [
+        {
+            "moe_paged_stash_buffer_size_factor_cuda": 1.25,
+            "moe_paged_stash_buffer_size_factor_cpu": 0.5,
+        }
+    ]
 
 
 def _make_schedule_manager(recorded_schedule, vp_size=1):

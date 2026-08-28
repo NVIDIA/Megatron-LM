@@ -19,11 +19,12 @@ That article is a useful conceptual reference, but some examples there still use
 
 ## Overview
 
-CUDA graph behavior is set by three orthogonal flags:
+CUDA graph behavior is set by four orthogonal flags:
 
 | Flag | Values | Purpose |
 |---|---|---|
 | `--cuda-graph-impl` | `none` / `local` / `transformer_engine` / `full_iteration` | Which capture backend or strategy to use |
+| `--cuda-graph-granularity` | `layer` / `chunk` | TE training callable boundary; `chunk` captures one complete local PP/VPP decoder block |
 | `--cuda-graph-modules` | `attn` / `mlp` / `moe` / `moe_router` / `moe_preprocess` / `mamba` | Per-layer **training** capture coverage; multi-valued and only meaningful for `local` and `transformer_engine` |
 | `--inference-cuda-graph-scope` | `none` / `layer` / `block` | Granularity of CUDA graphs during **inference**; only `local` supports non-`none` values |
 
@@ -33,7 +34,7 @@ Supported combinations:
 |---|---|---|---|
 | `none` | — | off | off |
 | `local` | MCore `CudaGraphManager` | per-layer, controlled by `--cuda-graph-modules` | `layer` (default) or `block`, controlled by `--inference-cuda-graph-scope` |
-| `transformer_engine` | TE `make_graphed_callables()` | per-layer, controlled by `--cuda-graph-modules` | not supported (`none` only) |
+| `transformer_engine` | TE `make_graphed_callables()` | per-layer, or one complete PP/VPP chunk with `--cuda-graph-granularity chunk` | not supported (`none` only) |
 | `full_iteration` | MCore `FullCudaGraphWrapper` | one graph per training iteration; `--cuda-graph-modules` must be empty | not supported (`none` only) |
 
 ---
@@ -108,6 +109,30 @@ but custom training scripts must do the same work themselves.
 
 The same training `--cuda-graph-modules` options apply as for `local`, and the default is likewise
 whole-layer training capture when the flag is omitted.
+
+### THD chunk capture
+
+Chunk granularity captures all decoder layers assigned to one PP/VPP model chunk as one TE
+callable. For dynamic THD packing, capture uses the conservative packed-microbatch upper bound
+(`Nmax`) and runtime schedules replay the graph-list prefix `[0, N)`. All callables passed to one
+`make_graphed_callables()` invocation share its CUDA graph memory pool, and TE reuses graph
+input/output buffers according to the PP/VPP schedule.
+
+```bash
+--cuda-graph-impl transformer_engine \
+--cuda-graph-granularity chunk \
+--cuda-graph-dynamic-microbatches \
+--cuda-graph-warmup-steps 3
+```
+
+This mode requires an empty `--cuda-graph-modules` list. It supports full activation recompute,
+fine-grained activation offloading, and Paged Stash with dynamic microbatch counts. Paged Stash
+uses runtime VP/layer/microbatch keys in this mode; for PP > 1 it stashes each forward activation
+and reloads it at the matching backward boundary instead of prefetching from a fixed captured PP
+schedule. This preserves dynamic-schedule correctness at the cost of Paged Stash prefetch overlap.
+Paged Stash requires at least two complete warmup steps to discover its schedule/capacity and run
+once with allocated page buffers before capture; the default of three is recommended.
+Delayed wgrad scheduling and `--overlap-moe-expert-parallel-comm` are not supported.
 
 ---
 

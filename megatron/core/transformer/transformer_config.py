@@ -1160,6 +1160,14 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_modules has no effect when cuda_graph_impl="none" and must be empty when
     cuda_graph_impl="full_iteration"."""
 
+    cuda_graph_granularity: Literal['layer', 'chunk'] = "layer"
+    """Select the callable boundary for Transformer Engine training CUDA graphs.
+
+    ``layer`` preserves the existing per-layer behavior. ``chunk`` captures the local decoder
+    ``TransformerBlock`` for each PP/VPP model chunk as one callable. Chunk granularity uses the
+    THD dynamic-microbatch upper bound as Nmax and replays graph indices ``[0, N)`` at runtime.
+    """
+
     cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
     """Selects training capture coverage within per-layer CUDA graphs (local and
     transformer_engine implementations).
@@ -1236,6 +1244,15 @@ class TransformerConfig(ModelParallelConfig):
     This option is only meaningful for cuda_graph_impl=transformer_engine. For THD sequence
     packing, capture uses a conservative upper bound on the packed microbatch count so graph
     replay can cover iterations whose real packed microbatch count changes."""
+
+    cuda_graph_parallel_prewarm: bool = False
+    """Prewarm THD chunk CUDA Graph kernels independently on every PP rank.
+
+    Before the first pipeline iteration, each rank runs one local forward/backward for every
+    PP/VPP decoder chunk it owns. This initializes lazy kernels without pipeline P2P dependencies,
+    allowing different PP stages to compile concurrently. Training-visible RNG, FP8 metadata,
+    module buffers, gradients, and activation-offload state are restored after the prewarm.
+    """
 
     ####################
     # Hyper-Connection Configuration
@@ -3169,6 +3186,11 @@ class TransformerConfig(ModelParallelConfig):
         # and the deprecated flag migration above:
         # earlier placement would compare unnormalized string module forms and let
         # enable_cuda_graph/external_cuda_graph bypass the gate entirely.
+        is_te_chunk_graph = (
+            self.cuda_graph_impl == "transformer_engine"
+            and self.cuda_graph_granularity == "chunk"
+        )
+
         # Two things about mHC recompute depend on CUDA graphs regardless of the
         # split, and both are wrong-result mechanisms rather than lost savings, so
         # they fail closed whether or not the split is on.
@@ -3178,11 +3200,11 @@ class TransformerConfig(ModelParallelConfig):
         # its forward.
         if (
             use_mhc_recompute
-            and self.cuda_graph_impl == "full_iteration"
+            and (self.cuda_graph_impl == "full_iteration" or is_te_chunk_graph)
             and (self.hidden_dropout != 0.0 or self.attention_dropout != 0.0)
         ):
             raise ValueError(
-                "mHC recompute with cuda_graph_impl='full_iteration' requires "
+                "mHC recompute with full-iteration or TE chunk CUDA Graphs requires "
                 "hidden_dropout=0 and attention_dropout=0: RNG state cannot be "
                 "rewound inside CUDA graph capture, so a captured recompute "
                 "would replay a different dropout mask than its forward pass."
@@ -3221,6 +3243,7 @@ class TransformerConfig(ModelParallelConfig):
             # message recommends (rejected above); hybrid_block emits its own
             # capture-scope warning instead
             and self.cuda_graph_impl == "transformer_engine"
+            and not is_te_chunk_graph
             and list(self.cuda_graph_modules or []) == [CudaGraphModule.attn]
             and list(self.recompute_modules) == ["mhc"]
         ):
@@ -3271,12 +3294,12 @@ class TransformerConfig(ModelParallelConfig):
                     "config claims the split is on. Keep the switch off for "
                     "hybrid models."
                 )
-            if self.cuda_graph_impl != "transformer_engine":
+            if self.cuda_graph_impl != "transformer_engine" or is_te_chunk_graph:
                 raise ValueError(
                     "mhc_recompute_attn_cuda_graph_split requires "
-                    f"cuda_graph_impl='transformer_engine', got "
-                    f"{self.cuda_graph_impl!r}: the split is a Transformer Engine "
-                    "per-layer capture."
+                    "per-layer Transformer Engine capture, got "
+                    f"cuda_graph_impl={self.cuda_graph_impl!r} and "
+                    f"cuda_graph_granularity={self.cuda_graph_granularity!r}."
                 )
             if list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
                 self.recompute_modules
@@ -3348,10 +3371,56 @@ class TransformerConfig(ModelParallelConfig):
                 f"cuda_graph_modules={self.cuda_graph_modules!r})."
             )
 
+        if self.cuda_graph_parallel_prewarm:
+            assert self.cuda_graph_impl == "transformer_engine", (
+                "cuda_graph_parallel_prewarm requires "
+                "cuda_graph_impl='transformer_engine'."
+            )
+            assert self.cuda_graph_granularity == "chunk", (
+                "cuda_graph_parallel_prewarm requires cuda_graph_granularity='chunk'."
+            )
+            assert self.sequence_packing_scheduler is not None, (
+                "cuda_graph_parallel_prewarm currently supports only THD sequence packing."
+            )
+            assert self.pipeline_model_parallel_size > 1, (
+                "cuda_graph_parallel_prewarm requires pipeline_model_parallel_size > 1."
+            )
+
         if self.cuda_graph_impl != "none":
 
             if self.cpu_offloading and self.cuda_graph_impl != "full_iteration":
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
+
+            assert self.cuda_graph_granularity in (
+                "layer",
+                "chunk",
+            ), f"Invalid cuda_graph_granularity: {self.cuda_graph_granularity}"
+            if self.cuda_graph_granularity == "chunk":
+                assert (
+                    self.cuda_graph_impl == "transformer_engine"
+                ), "chunk CUDA graph granularity requires cuda_graph_impl='transformer_engine'."
+                assert not self.cuda_graph_modules, (
+                    "chunk CUDA graph granularity captures the whole decoder chunk and requires "
+                    "an empty cuda_graph_modules list."
+                )
+                assert not self.overlap_moe_expert_parallel_comm, (
+                    "chunk CUDA graph granularity is incompatible with "
+                    "overlap_moe_expert_parallel_comm because that schedule invokes layers "
+                    "individually."
+                )
+                assert (
+                    not self.delay_wgrad_compute
+                ), "chunk CUDA graph granularity does not support delayed wgrad scheduling."
+                if self.moe_paged_stash:
+                    assert self.cuda_graph_warmup_steps >= 2, (
+                        "Paged Stash with chunk CUDA graphs requires at least two warmup steps "
+                        "for schedule discovery and buffer allocation."
+                    )
+                if self.sequence_packing_scheduler is not None:
+                    assert self.cuda_graph_dynamic_microbatches, (
+                        "THD chunk CUDA graphs require cuda_graph_dynamic_microbatches so capture "
+                        "uses the conservative Nmax microbatch count."
+                    )
 
             # Check cuda graph scopes for per-layer implementations.
             if self.cuda_graph_impl in ("local", "transformer_engine"):
@@ -3441,9 +3510,13 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.recompute_granularity:
                 if self.recompute_granularity != "selective":
-                    assert (
-                        self.cuda_graph_impl == "full_iteration"
-                    ), "full recompute is only supported with full iteration CUDA graph."
+                    assert self.cuda_graph_impl == "full_iteration" or (
+                        self.cuda_graph_impl == "transformer_engine"
+                        and self.cuda_graph_granularity == "chunk"
+                    ), (
+                        "full recompute is only supported with full iteration CUDA graph or "
+                        "Transformer Engine chunk CUDA graph."
+                    )
                 else:
                     # The recompute module should be inside or outside of the graph scope.
                     # Recompute module coverring graph scope is not allowed.

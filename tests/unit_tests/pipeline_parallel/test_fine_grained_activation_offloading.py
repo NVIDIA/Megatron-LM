@@ -665,6 +665,7 @@ def _build_gpt_model_with_cuda_graph(
     cuda_graph_impl: str,
     cuda_graph_modules: Optional[List[str]],
     cuda_graph_warmup_steps: int,
+    cuda_graph_granularity: str = "layer",
     delay_offload_until_cuda_graph: bool = False,
     activation_offload_fraction: float = 1.0,
     enable_hyper_connections: bool = False,
@@ -699,6 +700,7 @@ def _build_gpt_model_with_cuda_graph(
         cuda_graph_impl=cuda_graph_impl,
         cuda_graph_modules=cuda_graph_modules,
         cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+        cuda_graph_granularity=cuda_graph_granularity,
         use_te_rng_tracker=True,
         # Hyper Connection settings
         enable_hyper_connections=enable_hyper_connections,
@@ -865,6 +867,8 @@ def _run_iters_with_cuda_graph(
         (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 0.5, True),
         # Test delay_offload_until_cuda_graph parameter
         (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 1.0, False),
+        # Whole-decoder-chunk graph boundary with all offload groups captured.
+        (False, ["core_attn", "attn_proj"], [], 1.0, False),
     ],
 )
 def test_fine_grained_activation_offloading_with_cuda_graph(
@@ -894,7 +898,8 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 
     seed = 123
-    num_experts = 4  # Always MoE model
+    cuda_graph_granularity = "chunk" if not cuda_graph_modules else "layer"
+    num_experts = None if cuda_graph_granularity == "chunk" else 4
     num_layers = 4  # Smaller for faster test with CUDA graphs
     hidden_size = 1024
     num_attention_heads = 8
@@ -928,6 +933,7 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
             cuda_graph_impl="transformer_engine",
             cuda_graph_modules=cuda_graph_modules,
             cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+            cuda_graph_granularity=cuda_graph_granularity,
         ).cuda()
         base_model.train()
 
@@ -961,6 +967,7 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
             cuda_graph_impl="transformer_engine",
             cuda_graph_modules=cuda_graph_modules,
             cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+            cuda_graph_granularity=cuda_graph_granularity,
             delay_offload_until_cuda_graph=delay_offload,
             activation_offload_fraction=activation_offload_fraction,
         ).cuda()

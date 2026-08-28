@@ -3,6 +3,8 @@
 import gc
 import os
 import sys
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -110,6 +112,206 @@ def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
 
 
 class TestCudaGraphConfigAndArguments:
+    def test_parallel_prewarm_order_covers_each_vpp_chunk_once(self):
+        assert TECudaGraphHelper._get_local_prewarm_order(4) == [1, 2, 3, 4, -4, -3, -2, -1]
+
+    def test_parallel_prewarm_arguments_do_not_change_capture_nmax(self, monkeypatch):
+        helper = object.__new__(TECudaGraphHelper)
+        helper.num_model_chunks = 4
+        helper.num_microbatches = 17
+        observed = {}
+
+        def fake_get_sample_arguments(order):
+            observed['order'] = order
+            observed['num_microbatches'] = helper.num_microbatches
+            return [('args',)], [{'kwargs': True}]
+
+        monkeypatch.setattr(helper, '_get_sample_arguments', fake_get_sample_arguments)
+
+        sample_args, sample_kwargs = helper._get_local_prewarm_arguments()
+
+        assert observed == {
+            'order': [1, 2, 3, 4, -4, -3, -2, -1],
+            'num_microbatches': 1,
+        }
+        assert sample_args == [('args',)]
+        assert sample_kwargs == [{'kwargs': True}]
+        assert helper.num_microbatches == 17
+
+    def test_parallel_prewarm_restores_training_state(self, monkeypatch):
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossAutoScaler,
+            DSAIndexerLossLoggingHelper,
+        )
+
+        dsa_tracker = {
+            'values': torch.tensor([7.0]),
+            'agreed_size': 4,
+        }
+
+        class FakeChunk(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(2.0))
+                self.register_buffer('running_value', torch.tensor(3.0))
+                self.is_first_microbatch = True
+                self.input_tensor = 'pipeline-input'
+                self.forward_calls = 0
+
+            def _prepare_pipeline_input_for_chunk_cuda_graph(self, args, kwargs):
+                self.input_tensor = args[0]
+                return tuple(args), dict(kwargs)
+
+            @staticmethod
+            def _reconstruct_packed_seq_params_from_kwargs(kwargs):
+                kwargs.pop('cu_seqlens_q', None)
+
+            def forward(self, hidden_states, attention_mask=None):
+                del attention_mask
+                self.forward_calls += 1
+                self.running_value.add_(1)
+                self.is_first_microbatch = False
+                dsa_tracker['values'].add_(5)
+                dsa_tracker['prewarm_only'] = torch.tensor(1.0)
+                return hidden_states * self.weight
+
+        class FakeModelChunk:
+            @staticmethod
+            def no_sync():
+                return nullcontext()
+
+        chunk = FakeChunk()
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = SimpleNamespace(
+            cuda_graph_granularity='chunk',
+            sequence_packing_scheduler='dp_balanced',
+            moe_paged_stash=False,
+            fp8=None,
+            fp4=None,
+            fine_grained_activation_offloading=False,
+        )
+        helper._capture_finished = False
+        helper.flattened_callables = [chunk]
+        helper.model = [FakeModelChunk()]
+        helper.tp_group = None
+        helper.dp_cp_group = None
+        helper._get_local_prewarm_arguments = lambda: (
+            [(torch.ones(4, requires_grad=True),)],
+            [{'cu_seqlens_q': torch.zeros(1, dtype=torch.int32)}],
+        )
+
+        def reset_after_capture():
+            chunk.weight.grad = None
+
+        helper._reset_after_capture = reset_after_capture
+
+        monkeypatch.setattr(torch.distributed, 'barrier', lambda: None)
+        monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+        monkeypatch.setattr(torch.cuda, 'synchronize', lambda: None)
+        monkeypatch.setattr(torch.cuda, 'empty_cache', lambda: None)
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, 'tracker', dsa_tracker)
+        original_loss_scale = torch.tensor(11.0)
+        monkeypatch.setattr(
+            DSAIndexerLossAutoScaler, 'main_loss_backward_scale', original_loss_scale
+        )
+        monkeypatch.setattr(
+            'megatron.core.tensor_parallel.random._fork_rng', lambda: nullcontext()
+        )
+        monkeypatch.setattr(
+            'megatron.core.transformer.cuda_graphs.log_on_each_pipeline_stage',
+            lambda **kwargs: None,
+        )
+
+        helper.parallel_prewarm_thd_chunks()
+
+        assert chunk.forward_calls == 1
+        assert chunk.running_value.item() == 3.0
+        assert chunk.is_first_microbatch is True
+        assert chunk.input_tensor == 'pipeline-input'
+        assert chunk.weight.grad is None
+        assert set(dsa_tracker) == {'values', 'agreed_size'}
+        assert torch.equal(dsa_tracker['values'], torch.tensor([7.0]))
+        assert dsa_tracker['agreed_size'] == 4
+        assert DSAIndexerLossAutoScaler.main_loss_backward_scale is original_loss_scale
+
+    def test_te_chunk_uses_outer_block_callable(self):
+        config = SimpleNamespace(cuda_graph_granularity='chunk')
+
+        for block_type in (TransformerBlock, HybridStack):
+            block = object.__new__(block_type)
+            object.__setattr__(block, 'config', config)
+            assert isinstance(block, GraphableMegatronModule)
+            assert _layer_is_graphable(block, config)
+            assert not block._should_call_local_cudagraph()
+
+    def test_te_chunk_config_requires_te_and_empty_module_scope(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_granularity='chunk',
+            cuda_graph_modules=[],
+            recompute_granularity='full',
+            recompute_method='uniform',
+            recompute_num_layers=1,
+        )
+        assert cfg.cuda_graph_granularity == 'chunk'
+
+        invalid_configs = (
+            (
+                {'cuda_graph_impl': 'local', 'cuda_graph_modules': []},
+                "requires cuda_graph_impl='transformer_engine'",
+            ),
+            (
+                {
+                    'cuda_graph_impl': 'transformer_engine',
+                    'cuda_graph_modules': [CudaGraphModule.attn],
+                },
+                'empty cuda_graph_modules',
+            ),
+        )
+        for overrides, match in invalid_configs:
+            with pytest.raises(AssertionError, match=match):
+                _base_cuda_graph_config(cuda_graph_granularity='chunk', **overrides)
+
+    def test_te_chunk_granularity_cli(self, monkeypatch):
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch,
+            ['--cuda-graph-impl', 'transformer_engine', '--cuda-graph-granularity', 'chunk'],
+        )
+        assert args.cuda_graph_granularity == 'chunk'
+
+    def test_te_chunk_disables_fp8_for_bf16_boundary_layers(self, monkeypatch):
+        disabled_context = object()
+        fp8_context = object()
+        monkeypatch.setattr(
+            'megatron.core.transformer.transformer_block.get_fp8_disabled_context',
+            lambda config: disabled_context,
+        )
+        monkeypatch.setattr(
+            'megatron.core.transformer.transformer_block.get_fp8_context',
+            lambda config, layer_idx: fp8_context,
+        )
+
+        block = object.__new__(TransformerBlock)
+        object.__setattr__(
+            block,
+            'config',
+            SimpleNamespace(
+                fp8='e4m3',
+                fp4=None,
+                cuda_graph_granularity='chunk',
+                first_last_layers_bf16=True,
+                num_layers=4,
+                num_layers_at_start_in_bf16=1,
+                num_layers_at_end_in_bf16=1,
+            ),
+        )
+
+        assert (
+            block._get_inner_quantization_context(SimpleNamespace(layer_number=1))
+            is disabled_context
+        )
+        assert block._get_inner_quantization_context(SimpleNamespace(layer_number=2)) is fp8_context
+
     def test_local_impl_defaults_to_layer_scope(self):
         cfg = _base_cuda_graph_config(cuda_graph_impl='local')
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
