@@ -42,10 +42,13 @@ class RecomputeSegment:
     """A contiguous group of layers recomputed as one unit.
 
     The initial forward runs under ``no_grad`` and is replayed with grad enabled at the
-    start of the segment's own backward. What survives the forward->backward gap is the
-    segment's input tensor plus the ``_MUTABLE_CHUNK_STATE_FIELDS`` snapshot. Layers left
-    eager under ``block`` keep their activations throughout. The A2A issued by a replay is
-    exposed by design; normal fwd/bwd A2A overlap is preserved.
+    start of the segment's own backward. A segment drops its layers' activations as soon
+    as its own forward is done (``release_activations``) and the replayed ones as each
+    node backwards (``ScheduleNode._release_state``), so only one segment's activations
+    are live at a time and what crosses the forward->backward gap is the segment's input
+    tensor plus the ``_MUTABLE_CHUNK_STATE_FIELDS`` snapshot. Layers left eager under
+    ``block`` keep their activations throughout. The A2A issued by a replay is exposed by
+    design; normal fwd/bwd A2A overlap is preserved.
 
     ``start_index`` is the segment's first layer index within the chunk, for NVTX labels.
     """
@@ -82,6 +85,25 @@ class RecomputeSegment:
             name: _copy_chunk_state_value(getattr(cs, name)) for name in _MUTABLE_CHUNK_STATE_FIELDS
         }
         self.rng_states = _get_all_rng_states()
+
+    def release_activations(self, layer: "TransformerLayerSchedulePlan") -> None:
+        """Drop this segment's forward activations once its tail layer has forwarded.
+
+        Runs while the chunk forward is still going, not at the end of it: the nodes hold
+        their boundary tensors in ``inputs`` / ``output`` / ``detached`` until something
+        unsets them, so deferring this to the end of the chunk would keep one such set
+        alive per recomputed layer for the rest of the forward. The tail layer's output is
+        the caller's ``f_input`` and is what the next segment captures, so it survives.
+
+        Only the Python references are dropped. Resizing the storages (what
+        ``ScheduleNode``'s ``free_input`` path and ``tensor_parallel.random.checkpoint``
+        do) is not usable here: the replay rebuilds the graph on top of these very
+        tensors, and freeing their storage corrupts it.
+        """
+        if layer is not self.layers[-1]:
+            return
+        for seg_layer in self.layers:
+            seg_layer.reset_for_recompute()
 
     def release_input(self, layer: "TransformerLayerSchedulePlan") -> None:
         """Drop the retained input once the head layer has finished its backward."""
@@ -473,6 +495,9 @@ class TransformerLayerSchedulePlan:
                 # reach back into this segment, which needs a grad-tracking leaf.
                 if not f_input.requires_grad:
                     f_input.requires_grad_(True)
+                # The segment is done forwarding and holds no graph; free its nodes now
+                # rather than at the end of the chunk forward.
+                segment.release_activations(f_layer)
 
         # Delay the last pre_dispatch_computation wgrad in backward pass (wgrad
         # of the first layer) for overlapping with the p2p comm.
@@ -741,12 +766,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             self.post_process.model_chunk_state = None
             self.post_process = None
 
-    def release_layer_activations(self):
-        """Free the segments' forward activations, keeping only their input tensors."""
-        for segment in self._recompute_segments:
-            for layer in segment.layers:
-                layer.reset_for_recompute()
-
     @staticmethod
     def run(
         f_schedule_plan,
@@ -877,11 +896,6 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # pre process backward
         if b_schedule_plan is not None:
             b_schedule_plan.pre_process.backward(b_grad)
-
-        # The forward output has been consumed (PP send / post_process), so the
-        # recomputed layers' activations can go; only segment inputs are kept.
-        if f_schedule_plan is not None:
-            f_schedule_plan.release_layer_activations()
 
         if f_schedule_plan:
             f_schedule_plan.wait_current_stream()

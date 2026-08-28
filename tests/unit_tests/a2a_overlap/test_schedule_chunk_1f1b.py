@@ -81,8 +81,9 @@ def run_two_chunk_parity(
     GPTModel.forward/backward, then replays the same inputs through the 1F1B pattern
     (chunk0 fwd -> chunk1 fwd + chunk0 bwd -> chunk1 bwd). ``on_plans_built`` is an
     optional hook for asserting schedule-plan invariants before the overlap run;
-    ``on_forward_done`` runs on chunk 0's plan right after its forward-only pass, i.e.
-    after release_layer_activations().
+    ``on_forward_done`` runs on chunk 0's plan right after its forward-only pass, once per
+    microbatch. With ``microbatches > 1`` both paths accumulate grads over that many
+    identical microbatches and the plans are rebuilt each round, as in a real 1F1B step.
     """
     assert len(layers) == 2, "the 1F1B pattern below is written for exactly two chunks"
 
@@ -235,22 +236,7 @@ class TestA2AOverlap:
         apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
         run_two_chunk_parity(layers, extra_kwargs, use_padding_mask=True)
 
-    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize("mtp_layers", [0, 1])
-    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
-    @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
-    @pytest.mark.parametrize(
-        "recompute_method,recompute_num_layers",
-        [
-            ("uniform", 1),
-            ("uniform", 2),
-            # 'block' leaves trailing layers eager, pinning the recomputed -> eager
-            # hand-off: n=1 keeps layers 1.. eager, n=3 recomputes the whole decoder.
-            ("block", 1),
-            ("block", 3),
-        ],
-    )
-    def test_1f1b_schedule_model_chunk_full_recompute(
+    def _run_full_recompute_parity(
         self,
         mtp_layers,
         dispatcher_type,
@@ -258,6 +244,7 @@ class TestA2AOverlap:
         fp8_flag,
         recompute_method,
         recompute_num_layers,
+        microbatches=1,
     ):
         """Layer-level full recompute matches the non-overlap reference, which checkpoints
         through checkpointed_forward / MTP _checkpointed_forward with the same config.
@@ -289,7 +276,9 @@ class TestA2AOverlap:
             # The point of the feature: after the chunk forward a recomputed layer holds
             # no activation and only its segment's input survives. Gradient parity alone
             # cannot catch a regression here - recompute is numerically transparent, so a
-            # segment that quietly kept its graph would still compare equal.
+            # segment that quietly kept its graph would still compare equal. Re-checked
+            # every microbatch, since the plans are rebuilt each round.
+            assert len(plan._recompute_segments) > 0, "no recompute segments were built"
             for segment in plan._recompute_segments:
                 assert segment.input_tensor is not None, "segment input was not retained"
                 for layer in segment.layers:
@@ -300,6 +289,78 @@ class TestA2AOverlap:
         run_two_chunk_parity(
             [3, 2],
             extra_kwargs,
+            microbatches=microbatches,
             on_plans_built=assert_segments_were_built,
             on_forward_done=assert_activations_were_released,
+        )
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize("mtp_layers", [0, 1])
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
+    @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
+    @pytest.mark.parametrize(
+        "recompute_method,recompute_num_layers",
+        [
+            ("uniform", 1),
+            ("uniform", 2),
+            # 'block' leaves trailing layers eager, pinning the recomputed -> eager
+            # hand-off: n=1 keeps layers 1.. eager, n=3 recomputes the whole decoder.
+            ("block", 1),
+            ("block", 3),
+        ],
+    )
+    def test_1f1b_schedule_model_chunk_full_recompute(
+        self,
+        mtp_layers,
+        dispatcher_type,
+        flex_backend,
+        fp8_flag,
+        recompute_method,
+        recompute_num_layers,
+    ):
+        """Full segmentation matrix, one microbatch."""
+        self._run_full_recompute_parity(
+            mtp_layers,
+            dispatcher_type,
+            flex_backend,
+            fp8_flag,
+            recompute_method,
+            recompute_num_layers,
+        )
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize("mtp_layers", [0, 1])
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
+    @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
+    @pytest.mark.parametrize(
+        "recompute_method,recompute_num_layers", [("uniform", 1), ("block", 1)]
+    )
+    def test_1f1b_schedule_model_chunk_full_recompute_multi_microbatch(
+        self,
+        mtp_layers,
+        dispatcher_type,
+        flex_backend,
+        fp8_flag,
+        recompute_method,
+        recompute_num_layers,
+    ):
+        """Same parity, but over four microbatches, as in a real 1F1B steady state.
+
+        One microbatch never runs the same modules through forward -> recompute ->
+        backward twice, so it cannot catch state that the replay leaves behind and the
+        next microbatch then reads: FP8 scaling metadata, the segments' RNG snapshots, or
+        a node whose ``forward_no_grad`` was not restored. Grads are accumulated across
+        the four microbatches on both paths and compared bitwise, so any per-round drift
+        shows up. The segmentation axis is trimmed to one segment-per-layer case and one
+        recomputed -> eager hand-off case; the matrix above covers the rest at
+        ``microbatches=1``.
+        """
+        self._run_full_recompute_parity(
+            mtp_layers,
+            dispatcher_type,
+            flex_backend,
+            fp8_flag,
+            recompute_method,
+            recompute_num_layers,
+            microbatches=4,
         )

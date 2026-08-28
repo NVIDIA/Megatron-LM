@@ -285,8 +285,13 @@ class TransformerLayerNode(ScheduleNode):
     def reset_for_recompute(self):
         """Release this node's forward activations, keeping it reusable for a replay.
 
-        Under full recompute only each segment's input survives the forward->backward
-        gap; the same node is later re-run with grad enabled to rebuild its state.
+        Called as soon as the node's recompute segment has finished forwarding, so a
+        recomputed layer's boundary tensors do not stay pinned for the rest of the chunk
+        forward; the same node is later re-run with grad enabled to rebuild its state.
+
+        Only the references are dropped. The storages are deliberately left intact: the
+        replay rebuilds the autograd graph on top of these tensors, so resizing them the
+        way ``ScheduleNode``'s ``free_input`` path does corrupts that graph.
         """
         self.inputs = None
         self.output = None
