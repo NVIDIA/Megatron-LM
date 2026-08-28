@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron Core number of microbatches calculators."""
 
@@ -17,6 +17,11 @@ _GLOBAL_NUM_MICROBATCHES_CALCULATOR: Union[
 def get_num_microbatches() -> int:
     """Get number of microbatches."""
     return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get()
+
+
+def get_global_batch_size_upper_bound() -> int:
+    """Get the largest running global batch size this process may use."""
+    return _GLOBAL_NUM_MICROBATCHES_CALCULATOR.get_global_batch_size_upper_bound()
 
 
 def get_current_global_batch_size() -> int:
@@ -331,6 +336,10 @@ class NumMicroBatchesCalculator(ABC):
         assert self.current_running_global_batch_size is not None
         return self.current_running_global_batch_size
 
+    def get_global_batch_size_upper_bound(self) -> int:
+        """Return an upper bound on the running global batch size for this process."""
+        return self.get_current_running_global_batch_size()
+
     @abstractmethod
     def update(self, consumed_samples, consistency_check, verbose=False) -> None:
         """Update number of microbatches."""
@@ -438,6 +447,7 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
         self.data_parallel_size: int = data_parallel_size
         self.rank: int = rank
         self.seq_length: Optional[int] = seq_length
+        self.current_consumed_samples: int = 0
 
         self.micro_batch_times_data_parallel_size: int = micro_batch_size * data_parallel_size
         assert self.micro_batch_times_data_parallel_size > 0
@@ -565,6 +575,15 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
                 break
         return batch_size
 
+    def get_global_batch_size_upper_bound(self) -> int:
+        """Return the maximum batch size at or after the current schedule position."""
+        future_batch_sizes = [
+            batch_size
+            for threshold, batch_size in self.schedule
+            if threshold > self.current_consumed_samples
+        ]
+        return max([self.get_current_running_global_batch_size(), *future_batch_sizes])
+
     def update(self, consumed_samples: int, consistency_check: bool, verbose: bool = False) -> None:
         """Update number of microbatches based on consumed samples.
 
@@ -573,6 +592,7 @@ class StepBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
             consistency_check (bool): Check divisibility constraints.
             verbose (bool): Enable logging.
         """
+        self.current_consumed_samples = consumed_samples
         self.current_global_batch_size = self._get_batch_size_for_samples(consumed_samples)
         assert self.current_global_batch_size is not None
 
