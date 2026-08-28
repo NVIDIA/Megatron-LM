@@ -27,7 +27,7 @@ For PR-label or trigger questions, lead with the exact values:
 - `Run selective unit tests` requests Testmon-based unit-test selection for an
   eligible synthetic PR push. Its first compatible run executes the full unit
   suite, records a PR-scoped baseline, and preserves normal coverage; later
-  descendant commits use that baseline for selection. Unsupported changes or
+  runs use that baseline for selection. Unsupported changes or
   any safety-check failure fall back to the full unit-test buckets.
 - ⚠️ **WARNING — destructive remote write.** `tools/trigger_internal_ci.py`
   **force-pushes the current branch** to the internal GitLab remote as
@@ -85,7 +85,7 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 | **`container::lts`** | Build on the older long-term-support NGC PyTorch base instead of `dev`'s latest — a backward-compat check, not a different test set (combinable with any scope label) |
 | **`Run MBridge tests`** | Also triggers the MBridge L1 test suite |
 | **`Run NeMoRL tests`** | Also triggers NeMo RL's Megatron functional test suite |
-| **`Run selective unit tests`** | Bootstrap a PR-scoped Testmon baseline on the first eligible run, then select tests on later descendant commits. Full-test labels, forced runs, LTS, unsupported changes, and merge queue validation remain exhaustive. |
+| **`Run selective unit tests`** | Bootstrap a PR-scoped Testmon baseline on the first eligible run, then select tests on later runs. Full-test labels, forced runs, LTS, unsupported changes, and merge queue validation remain exhaustive. |
 
 Adding a label does not itself start `cicd-main.yml`; apply it before the next
 synthetic PR push or rerun the workflow after applying it.

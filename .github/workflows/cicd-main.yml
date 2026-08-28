@@ -188,7 +188,6 @@ jobs:
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
       sha:            ${{ steps.resolve-sha.outputs.sha }}
       target_branch:  ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
-      pr_head_sha:    ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').head.sha }}
       unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible }}
     steps:
       - name: Get PR info
@@ -788,7 +787,6 @@ jobs:
           sha: ${{ needs.configure.outputs.sha }}
           unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
           unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
-          unit_testmon_head_sha: ${{ needs.configure.outputs.pr_head_sha }}
 
   cicd-parse-unit-tests-gb200:
     runs-on: ubuntu-latest
@@ -879,7 +877,6 @@ jobs:
           sha: ${{ needs.configure.outputs.sha }}
           unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
           unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
-          unit_testmon_head_sha: ${{ needs.configure.outputs.pr_head_sha }}
 
   # Single source of truth for "should integration tests run?".
   # Encodes two independent gates:

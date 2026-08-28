@@ -216,22 +216,18 @@ def test_cache_bootstraps_a_pr_scoped_baseline():
     assert 'any(. == "Run selective unit tests")' in main
     assert "unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true'" in main
     assert "unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}" in main
-    assert "unit_testmon_head_sha: ${{ needs.configure.outputs.pr_head_sha }}" in main
 
-    assert "git ls-tree -r --full-tree HEAD" in action
-    assert "COMPATIBILITY_HASH" in action
-    assert "unit-testmon-v3-${TARGET_BRANCH_KEY}-${TARGET_BRANCH_HASH}-" in action
+    assert "unit-testmon-${TARGET_BRANCH_KEY}-${PLATFORM}-${BUCKET_HASH}" in action
     assert "uses: actions/cache/restore@" in action
     assert "uses: actions/cache/save@" in action
     assert 'test -s "$CACHE_DIR/prod/.testmondata"' in action
     assert 'test -s "$CACHE_DIR/experimental/.testmondata"' in action
     assert "EXPECTED_RANKS" not in action
-    assert "restore-keys:" in action
-    assert "compare/$PRODUCER_SHA...$CURRENT_HEAD_SHA" in action
-    assert '"ahead" || "$COMPARE_STATUS" == "identical"' in action
+    assert "restore-keys:" not in action
+    assert "outputs.cache-hit" in action
     assert "EFFECTIVE_MODE=bootstrap" in action
-    assert "save_baseline=true" in action
-    assert "steps.unit-testmon.outputs.save_baseline == 'true'" in action
+    assert "steps.unit-testmon.outputs.mode == 'bootstrap'" in action
+    assert "unit_testmon_head_sha" not in action + main
     assert "CREATED_AT" not in action
     assert "unit_testmon_base_sha" not in action
     assert "unit_testmon_pr_number" not in action
