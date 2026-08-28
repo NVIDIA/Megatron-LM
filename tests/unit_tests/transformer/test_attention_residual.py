@@ -483,3 +483,356 @@ class TestAttnResHybridSchedule:
     def test_missing_pattern_with_pp_rejected(self):
         with pytest.raises(ValueError, match="hybrid_layer_pattern"):
             self._hybrid_config(pipeline_model_parallel_size=2, pipeline_dtype=torch.float32)
+
+
+class TestAttnResVppSchedule:
+    """Interleaved-VPP delta-payload widths, padded pack/unpack, and the grad tap."""
+
+    def _vpp_config(self, **overrides):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        kwargs = dict(
+            num_layers=16,
+            hidden_size=16,
+            num_attention_heads=4,
+            enable_attention_residuals=True,
+            attn_res_block_layers=2,
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float32,
+        )
+        kwargs.update(overrides)
+        return TransformerConfig(**kwargs)
+
+    def test_delta_slices_k_divides_chunk(self):
+        """L=16, P=2, V=2, M=4, k=2: every boundary carries exactly W* = 3 slices."""
+        from megatron.core.transformer.attention_residual import (
+            attn_res_boundary_delta_slices,
+            attn_res_uniform_payload_slices,
+        )
+
+        config = self._vpp_config()
+        widths = [attn_res_boundary_delta_slices(config, s % 2, s // 2) for s in range(1, 4)]
+        assert widths == [3, 3, 3]
+        assert attn_res_uniform_payload_slices(config) == 3
+
+    def test_delta_slices_k_not_dividing_chunk(self):
+        """L=16, P=2, V=2, M=4, k=3: the FIRST-round boundary dominates W*."""
+        from megatron.core.transformer.attention_residual import (
+            attn_res_boundary_delta_slices,
+            attn_res_uniform_payload_slices,
+        )
+
+        config = self._vpp_config(attn_res_block_layers=3)
+        widths = [attn_res_boundary_delta_slices(config, s % 2, s // 2) for s in range(1, 4)]
+        assert widths == [3, 2, 2]
+        assert attn_res_uniform_payload_slices(config) == 3
+
+    def test_delta_slices_pp4_vpp2(self):
+        """L=16, P=4, V=2, M=2, k=2: steady width equals the closed form (P-1)M/k+1."""
+        from megatron.core.transformer.attention_residual import (
+            attn_res_boundary_delta_slices,
+            attn_res_uniform_payload_slices,
+        )
+
+        config = self._vpp_config(pipeline_model_parallel_size=4)
+        widths = [attn_res_boundary_delta_slices(config, s % 4, s // 4) for s in range(1, 8)]
+        assert widths == [2, 3, 4, 4, 4, 4, 4]
+        assert attn_res_uniform_payload_slices(config) == 4
+
+    def test_v1_degenerates_to_full_prefix(self):
+        """Without VPP the delta equals today's per-rank full-prefix width."""
+        from megatron.core.transformer.attention_residual import (
+            attn_res_boundary_delta_slices,
+            attn_res_payload_slices_for_pp_rank,
+        )
+
+        config = self._vpp_config(
+            pipeline_model_parallel_size=4, virtual_pipeline_model_parallel_size=None
+        )
+        for pp_rank in range(1, 4):
+            assert attn_res_boundary_delta_slices(
+                config, pp_rank, 0
+            ) == attn_res_payload_slices_for_pp_rank(config, pp_rank)
+
+    def test_hybrid_uneven_segment_delta_slices(self):
+        """Hybrid pattern '|' segments map chunk-major; uneven lengths are allowed."""
+        from megatron.core.transformer.attention_residual import (
+            attn_res_boundary_delta_slices,
+            attn_res_uniform_payload_slices,
+        )
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        config = TransformerConfig(
+            num_layers=13,
+            hidden_size=16,
+            num_attention_heads=4,
+            enable_attention_residuals=True,
+            attn_res_block_layers=2,
+            is_hybrid_model=True,
+            hybrid_layer_pattern="MM*-|M*-|**|M-M-",
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float32,
+        )
+        # Segments (chunk-major): 4, 3, 2, 4 entries; offsets 0, 4, 7, 9.
+        widths = [attn_res_boundary_delta_slices(config, s % 2, s // 2) for s in range(1, 4)]
+        assert widths == [3, 3, 2]
+        assert attn_res_uniform_payload_slices(config) == 3
+
+    def test_padded_pack_unpack_roundtrip(self):
+        torch.manual_seed(11)
+        sources = [torch.randn(4, 2, 8) for _ in range(2)]
+        partial = torch.randn(4, 2, 8)
+        payload = pack_attn_res_payload([*sources, partial], pad_to_slices=5)
+        assert payload.shape == (20, 2, 8)
+        assert payload._base is None
+        torch.testing.assert_close(payload[12:], torch.zeros(8, 2, 8))
+        got_sources, got_partial = unpack_attn_res_payload(payload, 3, padded_slices=5)
+        assert len(got_sources) == 2
+        for got, want in zip(got_sources, sources):
+            torch.testing.assert_close(got, want)
+        torch.testing.assert_close(got_partial, partial)
+
+    def test_padded_unpack_divisible_trap(self):
+        """padded_slices divisible by the real count must not silently mis-chunk."""
+        torch.manual_seed(12)
+        source = torch.randn(4, 2, 8)
+        partial = torch.randn(4, 2, 8)
+        payload = pack_attn_res_payload([source, partial], pad_to_slices=4)
+        got_sources, got_partial = unpack_attn_res_payload(payload, 2, padded_slices=4)
+        torch.testing.assert_close(got_sources[0], source)
+        torch.testing.assert_close(got_partial, partial)
+
+    def test_grad_tap_two_disjoint_graphs(self):
+        """The cache leaf routes later-chunk grads into the producing chunk's graph.
+
+        Emulates two virtual chunks whose graphs must stay disjoint
+        (schedule backward runs with keep_graph=False): chunk A materializes a
+        source, chunk B consumes the cache leaf; B's backward runs first.
+        """
+        from megatron.core.transformer.attention_residual import attn_res_tap_source
+
+        x = torch.randn(4, 3, requires_grad=True)
+        y = x * 3.0  # chunk A's locally formed source
+        in_graph, leaf = attn_res_tap_source(y)
+        out_a = (in_graph * 2.0).sum()  # chunk A's own consumption
+        out_b = (leaf * 5.0).sum()  # chunk B consumes the cache leaf
+
+        out_b.backward()  # later chunk's backward runs FIRST (1F1B ordering)
+        assert leaf.grad is not None
+        out_a.backward()  # tap backward drains leaf.grad into chunk A's graph
+        torch.testing.assert_close(x.grad, torch.full((4, 3), 3.0 * (2.0 + 5.0)))
+        assert leaf.grad is None  # drained exactly once
+
+    def test_source_cache_hygiene(self):
+        from megatron.core.transformer.attention_residual import (
+            AttnResStageSources,
+            attn_res_source_cache_reset,
+            get_attn_res_source_cache,
+        )
+
+        attn_res_source_cache_reset()
+        config = self._vpp_config()
+        embedding = torch.randn(4, 2, 16)
+        state, hidden = AttnResStageSources.enter(
+            config,
+            embedding,
+            layers_before=0,
+            pp_rank=0,
+            vp_stage=0,
+            microbatch_id=0,
+            pre_process=True,
+        )
+        state.append_block_start(hidden)
+        hidden = hidden * 2.0
+        state.append_block_start(hidden)
+        payload = state.exit_pack(hidden * 0.5)
+        # W* = 3 for this config; rank 0 chunk 0 sends the full 2-source prefix.
+        assert payload.shape[0] == 3 * 4
+        assert 0 in get_attn_res_source_cache().sources
+        # Re-entering the same microbatch at vp_stage 0 must trip the staleness assert.
+        with pytest.raises(AssertionError, match="stale"):
+            AttnResStageSources.enter(
+                config,
+                embedding,
+                layers_before=0,
+                pp_rank=0,
+                vp_stage=0,
+                microbatch_id=0,
+                pre_process=True,
+            )
+        attn_res_source_cache_reset()
+        assert not get_attn_res_source_cache().sources
+
+
+class TestAttnResVppPipelineSimulation:
+    """Single-process emulation of the full interleaved pipeline for one microbatch.
+
+    Runs every (rank, chunk) stage through AttnResStageSources with per-rank
+    cache swapping and detached requires-grad payload hand-offs (mimicking the
+    p2p recv leaves), then runs the chunk backwards in reverse stage order
+    (mimicking interleaved 1F1B) with keep_graph=False semantics. Values and
+    input gradients must match a monolithic single-graph reference exactly.
+    """
+
+    def _run(self, pp_size, vp_size, num_layers, block_layers, seed=21):
+        from megatron.core.transformer.attention_residual import (
+            AttnResStageSources,
+            attn_res_source_cache_reset,
+            get_attn_res_source_cache,
+            is_attn_res_block_start,
+        )
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        torch.manual_seed(seed)
+        config = TransformerConfig(
+            num_layers=num_layers,
+            hidden_size=8,
+            num_attention_heads=1,
+            enable_attention_residuals=True,
+            attn_res_block_layers=block_layers,
+            pipeline_model_parallel_size=pp_size,
+            virtual_pipeline_model_parallel_size=vp_size,
+            pipeline_dtype=torch.float32,
+        )
+        num_stages = pp_size * (vp_size or 1)
+        layers_per_stage = num_layers // num_stages
+        embedding = torch.randn(4, 2, 8)
+        # Per-layer coefficients; consuming ALL current sources at every layer
+        # makes any wrong/missing/mixed-up source change the loss.
+        a = [0.9 + 0.01 * l for l in range(num_layers)]
+        b = [0.05 + 0.002 * l for l in range(num_layers)]
+
+        def run_layer(l, partial, sources):
+            return partial * a[l - 1] + sum(sources) * b[l - 1]
+
+        # ---- Monolithic reference (single autograd graph). ----
+        x_ref = embedding.clone().requires_grad_(True)
+        sources_ref = []
+        partial = x_ref
+        for l in range(1, num_layers + 1):
+            if is_attn_res_block_start(l, block_layers):
+                sources_ref.append(partial)
+            partial = run_layer(l, partial, sources_ref)
+        loss_ref = sum((v * (i + 1)).sum() for i, v in enumerate([*sources_ref, partial]))
+        loss_ref.backward()
+
+        # ---- Interleaved pipeline emulation. ----
+        attn_res_source_cache_reset()
+        rank_caches = [dict() for _ in range(pp_size)]
+        x_pipe = embedding.clone().requires_grad_(True)
+        stage_inputs = []  # per stage: the recv leaf (None for stage 0)
+        stage_outputs = []  # per stage: the sent payload (None for the last)
+        carried = x_pipe
+        loss_pipe = None
+        for s in range(num_stages):
+            pp_rank, vp_stage = s % pp_size, s // pp_size
+            get_attn_res_source_cache().sources = rank_caches[pp_rank]
+            if s == 0:
+                recv = None
+                stage_in = carried
+            else:
+                recv = carried.detach().requires_grad_(True)  # p2p recv leaf
+                stage_in = recv
+            stage_inputs.append(recv)
+            state, partial = AttnResStageSources.enter(
+                config,
+                stage_in,
+                layers_before=s * layers_per_stage,
+                pp_rank=pp_rank,
+                vp_stage=vp_stage if vp_size is not None else None,
+                microbatch_id=0,
+                pre_process=(s == 0),
+            )
+            for l in range(s * layers_per_stage + 1, (s + 1) * layers_per_stage + 1):
+                if is_attn_res_block_start(l, block_layers):
+                    state.append_block_start(partial)
+                partial = run_layer(l, partial, state.graph_sources)
+            if s == num_stages - 1:
+                values = state.exit_aggregate_values(partial)
+                loss_pipe = sum((v * (i + 1)).sum() for i, v in enumerate(values))
+                stage_outputs.append(None)
+            else:
+                payload = state.exit_pack(partial)
+                stage_outputs.append(payload)
+                carried = payload
+        # All per-rank caches must have been evicted by each rank's last chunk.
+        for cache in rank_caches:
+            assert not cache
+
+        torch.testing.assert_close(loss_pipe, loss_ref)
+
+        # Backwards in reverse stage order == interleaved 1F1B per-microbatch order.
+        loss_pipe.backward()
+        for s in range(num_stages - 2, -1, -1):
+            grad = stage_inputs[s + 1].grad
+            assert grad is not None, f"no grad reached the recv leaf of stage {s + 1}"
+            torch.autograd.backward(stage_outputs[s], grad_tensors=grad)
+
+        torch.testing.assert_close(x_pipe.grad, x_ref.grad)
+        attn_res_source_cache_reset()
+
+    def test_pp2_vpp2(self):
+        self._run(pp_size=2, vp_size=2, num_layers=16, block_layers=2)
+
+    def test_pp2_vpp2_k_not_dividing(self):
+        self._run(pp_size=2, vp_size=2, num_layers=16, block_layers=3)
+
+    def test_pp4_vpp2(self):
+        self._run(pp_size=4, vp_size=2, num_layers=16, block_layers=2)
+
+    def test_pp2_vpp4(self):
+        self._run(pp_size=2, vp_size=4, num_layers=16, block_layers=2)
+
+    def test_pp4_no_vpp_degeneration(self):
+        self._run(pp_size=4, vp_size=None, num_layers=16, block_layers=2)
+
+
+class TestAttnResVppConfigValidation:
+
+    def _kwargs(self, **overrides):
+        kwargs = dict(
+            num_layers=16,
+            hidden_size=16,
+            num_attention_heads=4,
+            enable_attention_residuals=True,
+            attn_res_block_layers=2,
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float32,
+        )
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_vpp_accepted(self):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        TransformerConfig(**self._kwargs())
+
+    def test_variable_seq_lengths_rejected(self):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(ValueError, match="variable_seq_lengths"):
+            TransformerConfig(**self._kwargs(variable_seq_lengths=True))
+
+    def test_vpp_with_embedding_split_rejected(self):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(ValueError, match="account_for_embedding"):
+            TransformerConfig(**self._kwargs(account_for_embedding_in_pipeline_split=True))
+
+    def test_hybrid_segments_equal_pp_times_vpp_accepted(self):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        TransformerConfig(
+            **self._kwargs(is_hybrid_model=True, hybrid_layer_pattern="M-M*|M-M*|M-M*|M-M*")
+        )
+
+    def test_hybrid_segment_count_mismatch_rejected(self):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(ValueError, match="pipe segments"):
+            TransformerConfig(
+                **self._kwargs(is_hybrid_model=True, hybrid_layer_pattern="M-M*|M-M*")
+            )

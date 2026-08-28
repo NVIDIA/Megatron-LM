@@ -1556,14 +1556,18 @@ class TransformerConfig(ModelParallelConfig):
     def _validate_attention_residuals(self):
         """Validate the Attention Residuals (AttnRes) configuration.
 
-        The MVP supports: eager training with TP/SP/CP/EP, non-interleaved pipeline
-        parallelism (payload concatenated along the sequence dimension), selective
-        recompute of modules that live inside a sublayer (e.g. core_attn), MoE
-        (incl. shared-expert overlap), and MTP in the standard last-stage placement.
-        Everything rejected below either has no mechanism yet (CUDA graphs, VPP,
-        full recompute, EP-overlap fine-grained schedule, offloading) or would
-        silently bypass the AttnRes residual interception (fused residual norms,
-        fp32 residual connection).
+        Supported: eager/compile training with TP/SP/CP/EP, pipeline parallelism
+        (non-interleaved: full depth-source prefix concatenated along the
+        sequence dimension; interleaved VPP: per-boundary deltas padded to a
+        uniform width plus a rank-local source cache — see
+        attention_residual.AttnResStageSources), selective recompute of modules
+        that live inside a sublayer (e.g. core_attn), MoE (incl. shared-expert
+        overlap), and MTP in the standard last-stage placement. Everything
+        rejected below either has no mechanism yet (CUDA graphs, full
+        recompute, EP-overlap fine-grained schedule, offloading, zero-layer
+        virtual chunks) or would silently bypass the AttnRes residual
+        interception (fused residual norms, fp32 residual connection) or the
+        static payload-width reasoning (variable sequence lengths).
         """
         if not self.enable_attention_residuals:
             if self.attn_res_block_layers is not None:
@@ -1589,8 +1593,18 @@ class TransformerConfig(ModelParallelConfig):
                 f"attn_res_impl must be 'eager' or 'compile', got {self.attn_res_impl!r}."
             )
         unsupported = []
-        if self.virtual_pipeline_model_parallel_size is not None:
-            unsupported.append("interleaved (virtual) pipeline parallelism")
+        if self.variable_seq_lengths:
+            # Dynamic shape exchange bypasses the static payload-width
+            # reasoning (and the interleaved schedule's uniform padded width).
+            unsupported.append("variable_seq_lengths (incl. sequence packing)")
+        if self.virtual_pipeline_model_parallel_size is not None and (
+            self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split
+        ):
+            # Zero-layer virtual chunks (standalone embedding/loss stages) are
+            # not covered by the delta-payload window bookkeeping yet.
+            unsupported.append(
+                "interleaved VPP together with account_for_embedding/loss_in_pipeline_split"
+            )
         if self.cuda_graph_impl != "none":
             unsupported.append(f"cuda_graph_impl={self.cuda_graph_impl!r}")
         if self.recompute_granularity == "full":
@@ -1646,12 +1660,14 @@ class TransformerConfig(ModelParallelConfig):
                 main_pattern = self.hybrid_layer_pattern.split('/')[0]
                 if '|' in main_pattern:
                     num_segments = main_pattern.count('|') + 1
-                    if num_segments != self.pipeline_model_parallel_size:
-                        # Segments > pp_size implies pattern-derived interleaved VPP,
-                        # which attention residuals reject like explicit VPP.
+                    expected_segments = self.pipeline_model_parallel_size * (
+                        self.virtual_pipeline_model_parallel_size or 1
+                    )
+                    if num_segments != expected_segments:
                         unsupported.append(
                             f"hybrid pattern with {num_segments} pipe segments != "
-                            f"pipeline_model_parallel_size={self.pipeline_model_parallel_size}"
+                            f"pipeline_model_parallel_size x virtual_pipeline_model_parallel_size "
+                            f"= {expected_segments}"
                         )
         if unsupported:
             raise ValueError(
