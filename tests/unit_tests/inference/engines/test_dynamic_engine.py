@@ -1531,11 +1531,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         finished_records = []
         max_paused_block_count = 0
 
-        # Bound the loop so a scheduling regression fails instead of hanging.
+        # Drive admission through step_modern so async scheduling only mutates the
+        # request rows after consuming the pending forward. Bound the loop so a
+        # scheduling regression fails instead of hanging.
         for _ in range(4000):
             if not env.engine.has_unfinished_requests():
                 break
-            env.engine.schedule_waiting_requests()
             finished_records.extend(env.engine.step_modern()["finished_request_records"])
 
             # Checked at a step boundary, i.e. after the pause/resume/evict lifecycle
@@ -3334,7 +3335,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
             # Drive the engine until the request finishes
             while env.engine.has_unfinished_requests():
-                env.engine.schedule_waiting_requests()
                 env.engine.step_modern()
 
             return req.prompt_log_probs
@@ -3924,7 +3924,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
 
         env.engine._add_request(env.requests[0])
-        env.engine.schedule_waiting_requests()
 
         # Step engine until finished naturally
         # This allows the bookkeeping logic to gracefully truncate the
@@ -4664,7 +4663,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             evicted_before = env.engine.evicted_request_count
 
             # Step the engine
-            env.engine.schedule_waiting_requests()
             env.engine.step_modern()
 
             # Check if any request was evicted during this step
@@ -5869,7 +5867,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         unwrapped_model.compute_mtp_single_step = deterministic_mtp
 
         env.engine._add_request(env.requests[0])
-        env.engine.schedule_waiting_requests()
 
         while env.engine.has_unfinished_requests():
             env.engine.step_modern()
