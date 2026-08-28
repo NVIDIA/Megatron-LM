@@ -473,8 +473,18 @@ def run_backend(
                     "VERL_FULL_DETERMINISM",
                     "CUDA_DEVICE_MAX_CONNECTIONS",
                     "CUBLAS_WORKSPACE_CONFIG",
+                    "CUBLASLT_WORKSPACE_SIZE",
                     "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
                     "NCCL_ALGO",
+                    "NCCL_COLLNET_ENABLE",
+                    "NCCL_LAUNCH_MODE",
+                    "NCCL_MAX_NCHANNELS",
+                    "NCCL_MIN_NCHANNELS",
+                    "NCCL_NTHREADS",
+                    "NCCL_NVLS_ENABLE",
+                    "NCCL_P2P_NET_DISABLE",
+                    "NCCL_PROTO",
+                    "NCCL_SOCKET_NTHREADS",
                 )
             },
             "provenance": {
@@ -509,9 +519,6 @@ def run_backend(
                 ),
                 "fused_ue8m0_weight_quant": os.environ.get(
                     "MLITE_VLLM_FUSED_UE8M0_WEIGHT_QUANT", "1"
-                ),
-                "batched_grouped_weight_quant": os.environ.get(
-                    "MLITE_VLLM_BATCHED_GROUPED_WEIGHT_QUANT", "1"
                 ),
             },
             "fixed_router_replay": fixed_router_replay,

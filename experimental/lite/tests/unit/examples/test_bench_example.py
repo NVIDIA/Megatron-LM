@@ -270,9 +270,9 @@ def test_bench_main_writes_output_json_only_on_rank_zero(tmp_path, monkeypatch):
 def test_benchmark_snapshot_records_semantic_and_profiling_configuration(monkeypatch):
     from examples.bench.bench import BenchCliConfig, _benchmark_config_snapshot
 
-    monkeypatch.setenv("MLITE_VLLM_BATCHED_GROUPED_WEIGHT_QUANT", "0")
     monkeypatch.setenv("MLITE_PROFILE_SYNC_PHASES", "1")
     monkeypatch.setenv("MEGATRON_LITE_DETERMINISTIC", "1")
+    monkeypatch.setenv("NCCL_MAX_NCHANNELS", "1")
     monkeypatch.setenv("MLITE_SOURCE_SHA", "abc123")
     snapshot = _benchmark_config_snapshot(
         BenchCliConfig(
@@ -300,9 +300,9 @@ def test_benchmark_snapshot_records_semantic_and_profiling_configuration(monkeyp
     assert snapshot["recompute"] == ["full"]
     assert snapshot["cache_deployment_weights"] is False
     assert snapshot["correctness"]["trace_fingerprints"] is True
-    assert snapshot["fp8"]["batched_grouped_weight_quant"] == "0"
     assert snapshot["profiling"]["sync_phases"] is True
     assert snapshot["determinism"]["MEGATRON_LITE_DETERMINISTIC"] == "1"
+    assert snapshot["determinism"]["NCCL_MAX_NCHANNELS"] == "1"
     assert snapshot["provenance"]["source_sha"] == "abc123"
 
 
