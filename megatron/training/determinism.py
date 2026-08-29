@@ -21,7 +21,16 @@ import torch
 
 # Maps each arg name to the value it must hold for bit-exact execution;
 # verified by :func:`apply_determinism_to_args`.
-ARG_VALUES_REQUIRED_FOR_DETERMINISM = {"cross_entropy_loss_fusion": False, "tp_comm_overlap": False}
+ARG_VALUES_REQUIRED_FOR_DETERMINISM = {
+    "cross_entropy_loss_fusion": False,
+    "tp_comm_overlap": False,
+}
+
+# Not in the dict above because it inherits: unset means "follow moe_router_fusion".
+# The fused aux loss reaches the backward via MoEAuxLossAutoScaler; the fused TopK routing
+# only selects experts, so it is not required off. Unverified upstream report, not measured
+# here -- this rejects a config, it does not change numerics.
+AUX_LOSS_FUSION_ARG = "moe_router_aux_loss_fusion"
 
 # Env-var defaults required for bit-exact reproducibility.
 DETERMINISM_ENV_VAR_DEFAULTS: dict[str, str] = {
@@ -143,6 +152,14 @@ def apply_determinism_to_args(args) -> None:
         for name, required in ARG_VALUES_REQUIRED_FOR_DETERMINISM.items()
         if (actual := getattr(args, name)) != required
     ]
+
+    # Mirrors TransformerConfig.moe_router_aux_loss_fusion_enabled; no config exists yet here.
+    aux_loss_fusion = getattr(args, AUX_LOSS_FUSION_ARG, None)
+    if aux_loss_fusion is None:
+        aux_loss_fusion = getattr(args, "moe_router_fusion", False)
+    if aux_loss_fusion:
+        mismatched.append(f"{AUX_LOSS_FUSION_ARG}=False (got {aux_loss_fusion!r})")
+
     assert (
         not mismatched
     ), f"--deterministic-mode requires: {', '.join(mismatched)}. Adjust these options to continue."
