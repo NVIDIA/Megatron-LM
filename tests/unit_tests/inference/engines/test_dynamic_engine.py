@@ -1104,9 +1104,7 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
     engine.allow_stale_multimodal_embeddings = False
     engine._vision_embedding_cache = {"media": original_request.image_embeddings}
     engine._vision_embedding_cache_bytes = original_request.image_embeddings.numel() * 4
-    engine.requests = {
-        checkpointed_request.request_id: types.SimpleNamespace(record=record)
-    }
+    engine.requests = {checkpointed_request.request_id: types.SimpleNamespace(record=record)}
     refreshed_embeddings = torch.ones(2, 1, 4, device=device)
     wrapper = types.SimpleNamespace(
         resolve_media_token_id=mock.Mock(return_value=99),

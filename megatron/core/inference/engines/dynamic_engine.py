@@ -545,18 +545,12 @@ class DynamicInferenceEngine(AbstractEngine):
         # Prompt token tensors are persistently stored on the inference device.
         device = request.prompt_tokens.device
         imgs = request.imgs.to(device=device)
-        num_tiles = (
-            request.num_tiles.to(device=device) if request.num_tiles is not None else None
-        )
+        num_tiles = request.num_tiles.to(device=device) if request.num_tiles is not None else None
         imgs_sizes = (
-            request.imgs_sizes.to(device=device)
-            if request.imgs_sizes is not None
-            else None
+            request.imgs_sizes.to(device=device) if request.imgs_sizes is not None else None
         )
         num_frames = (
-            request.num_frames.to(device=device)
-            if request.num_frames is not None
-            else None
+            request.num_frames.to(device=device) if request.num_frames is not None else None
         )
 
         # Re-construct the input mask that provides multimodal embedding injection guidelines
