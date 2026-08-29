@@ -23,19 +23,19 @@ _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
 
 
-class SplitOutputProjection:
-    """Interface for modules whose output projection can be invoked separately."""
+class TwoStageAttentionLayer:
+    """Interface for attention-like modules that expose core and post-core stages."""
 
-    def supports_split_output_projection(self) -> bool:
-        """Return whether this module instance supports split execution."""
+    def supports_two_stage_attention(self) -> bool:
+        """Return whether this module instance supports two-stage execution."""
         return True
 
-    def forward_pre_output_proj(self, *args: Any, **kwargs: Any) -> Any:
-        """Run the module through the input to its output projection."""
+    def forward_pre_attn_and_core_attn(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the pre-attention and core-attention stage."""
         raise NotImplementedError
 
-    def forward_output_proj(self, *args: Any, **kwargs: Any) -> Any:
-        """Run the output projection and the remainder of the module."""
+    def forward_post_core_attn(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the post-core-attention stage."""
         raise NotImplementedError
 
 

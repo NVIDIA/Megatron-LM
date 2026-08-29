@@ -11,7 +11,7 @@ from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
 )
-from megatron.core.transformer.module import SplitOutputProjection
+from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -26,22 +26,22 @@ def _shortcut_config(*, parallel: bool = False, normalization: str = "RMSNorm"):
     )
 
 
-class _FakeCompute(torch.nn.Module, SplitOutputProjection):
-    def __init__(self, config, *, supports_split: bool = True):
+class _FakeCompute(torch.nn.Module, TwoStageAttentionLayer):
+    def __init__(self, config, *, supports_two_stage: bool = True):
         super().__init__()
         self.config = config
         self.layer_number = 1
         self.is_first_layer = True
         self.is_last_layer = False
-        self.supports_split = supports_split
+        self.supports_two_stage = supports_two_stage
 
-    def supports_split_output_projection(self) -> bool:
-        return self.supports_split
+    def supports_two_stage_attention(self) -> bool:
+        return self.supports_two_stage
 
-    def forward_pre_output_proj(self, hidden_states, **kwargs):
+    def forward_pre_attn_and_core_attn(self, hidden_states, **kwargs):
         return (hidden_states,)
 
-    def forward_output_proj(self, hidden_states, **kwargs):
+    def forward_post_core_attn(self, hidden_states, **kwargs):
         return hidden_states
 
 
@@ -169,8 +169,8 @@ def test_parallel_stream_is_initialized_once(monkeypatch):
         ),
         pytest.param(
             LayerSymbols.MAMBA,
-            lambda config: _FakeCompute(config, supports_split=False),
-            "does not support split output projection",
+            lambda config: _FakeCompute(config, supports_two_stage=False),
+            "does not support two-stage attention",
             id="atomic-forward-only",
         ),
     ],
@@ -201,11 +201,11 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             self.input_scale = torch.nn.Parameter(torch.tensor(2.0))
             self.output_scale = torch.nn.Parameter(torch.tensor(3.0))
 
-        def forward_pre_output_proj(self, hidden_states, **kwargs):
+        def forward_pre_attn_and_core_attn(self, hidden_states, **kwargs):
             assert_quant_layer(0)
             return hidden_states * self.input_scale, hidden_states
 
-        def forward_output_proj(self, projected, residual, **kwargs):
+        def forward_post_core_attn(self, projected, residual, **kwargs):
             assert_quant_layer(0)
             return projected * self.output_scale
 

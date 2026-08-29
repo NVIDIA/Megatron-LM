@@ -25,7 +25,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import GraphableMegatronModule, SplitOutputProjection
+from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -57,7 +57,7 @@ class MambaLayerSubmodules:
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
 
 
-class MambaLayer(GraphableMegatronModule, SplitOutputProjection):
+class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
     """
     A single Mamba layer.
 
@@ -120,11 +120,11 @@ class MambaLayer(GraphableMegatronModule, SplitOutputProjection):
         """Returns the Mamba conv and ssm states shapes per request."""
         return self.mixer.mamba_state_shapes_per_request()
 
-    def supports_split_output_projection(self) -> bool:
-        """Return whether the configured sequence mixer supports split execution."""
+    def supports_two_stage_attention(self) -> bool:
+        """Return whether the configured sequence mixer supports two-stage execution."""
         return (
-            isinstance(self.mixer, SplitOutputProjection)
-            and self.mixer.supports_split_output_projection()
+            isinstance(self.mixer, TwoStageAttentionLayer)
+            and self.mixer.supports_two_stage_attention()
         )
 
     def _prepare_mixer_input(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
@@ -137,14 +137,14 @@ class MambaLayer(GraphableMegatronModule, SplitOutputProjection):
         hidden_states = apply_module(self.norm)(hidden_states)
         return hidden_states, residual
 
-    def _apply_mixer_output(self, mixer_out_with_bias, residual: Tensor) -> Tensor:
+    def _apply_mixer_bda(self, mixer_out_with_bias, residual: Tensor) -> Tensor:
         """Apply the layer's bias-dropout-add tail to a projected mixer output."""
         with self.bias_dropout_add_exec_handler():
             return self.mamba_bda(training=self.training, fused=self.config.bias_dropout_fusion)(
                 mixer_out_with_bias, residual, self.hidden_dropout
             )
 
-    def forward_pre_output_proj(
+    def forward_pre_attn_and_core_attn(
         self,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor] = None,  # Not used in MambaLayer
@@ -162,24 +162,25 @@ class MambaLayer(GraphableMegatronModule, SplitOutputProjection):
             hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
                 b is batch size, and h is hidden size.
             attention_mask (Tensor): Mask tensor for self-attention. Not used by this layer.
-            inference_context (BaseInferenceContext, optional): Parameters for inference-time
-                optimizations.
+            inference_context (BaseInferenceContext, optional): Must be ``None`` because two-stage
+                mixer execution is training-only.
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
 
         Returns:
-            Tuple containing the pre-output-projection SSM result and residual.
+            Tuple containing the core SSM result and residual.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        assert inference_context is None, "Two-stage mixer execution does not support inference."
 
         hidden_states, residual = self._prepare_mixer_input(hidden_states)
 
-        ssm_output = self.mixer.forward_pre_output_proj(
-            hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
+        ssm_output = self.mixer.forward_pre_attn_and_core_attn(
+            hidden_states, packed_seq_params=packed_seq_params
         )
         return ssm_output, residual
 
-    def forward_output_proj(
+    def forward_post_core_attn(
         self,
         ssm_output: Tensor,
         residual: Tensor,
@@ -188,8 +189,8 @@ class MambaLayer(GraphableMegatronModule, SplitOutputProjection):
     ):
         """Apply Mamba's output projection and the original residual/BDA operation."""
         del inference_context, padding_mask
-        mixer_out_with_bias = self.mixer.forward_output_proj(ssm_output)
-        return self._apply_mixer_output(mixer_out_with_bias, residual)
+        mixer_out_with_bias = self.mixer.forward_post_core_attn(ssm_output)
+        return self._apply_mixer_bda(mixer_out_with_bias, residual)
 
     def forward(
         self,
@@ -249,7 +250,7 @@ class MambaLayer(GraphableMegatronModule, SplitOutputProjection):
                         packed_seq_params=packed_seq_params,
                         packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                     )
-            return self._apply_mixer_output(mixer_out_with_bias, residual)
+            return self._apply_mixer_bda(mixer_out_with_bias, residual)
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None

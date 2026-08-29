@@ -88,7 +88,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         beta = beta.sigmoid()
         return g, {"beta": beta.contiguous()}
 
-    def forward_pre_output_proj(
+    def forward_pre_attn_and_core_attn(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
