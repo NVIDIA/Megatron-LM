@@ -146,7 +146,7 @@ class GatedDeltaNet2(_GDNBase):
 
         return g, {"b": b.contiguous(), "w": w.contiguous()}
 
-    def forward_pre_output_proj(
+    def forward_pre_attn_and_core_attn(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,

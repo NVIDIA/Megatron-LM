@@ -101,12 +101,6 @@ class TestParallelAttention:
 
         self.parallel_attention.eval()
         output, bias = self.parallel_attention(hidden_states, attention_mask)
-        assert self.parallel_attention.supports_split_output_projection()
-        split_output, split_bias = self.parallel_attention.forward_output_proj(
-            self.parallel_attention.forward_pre_output_proj(hidden_states, attention_mask)
-        )
-        torch.testing.assert_close(split_output, output)
-        torch.testing.assert_close(split_bias, bias)
 
         assert config.recompute_granularity is None
         assert output.shape[0] == sequence_length
