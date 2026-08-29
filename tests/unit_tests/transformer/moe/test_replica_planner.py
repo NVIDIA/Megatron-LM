@@ -1147,6 +1147,9 @@ def _run_replica_hybridep_full_layer_parity(
                     atol=0,
                     msg=lambda msg: f"rank {bridge.rank} virtual isolation check: {msg}",
                 )
+            # The owner-push writes directly into peer virtual arenas. Ensure every
+            # rank has validated the old contents before any rank starts the refresh.
+            torch.distributed.barrier(group=bridge.group)
             plan_snapshot = plan.experts_to_copy.clone()
             # The normal training path may cache this exact plan in the shared
             # workspace.  Evict that cache here so this check exercises an
