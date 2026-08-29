@@ -4,10 +4,12 @@
 This module provides an async utilities which allow to start
 a checkpoint save process in the background.
 """
+
 import gc
 import logging
 import os
 import subprocess
+import traceback
 from abc import ABC, abstractmethod
 from collections import deque
 from contextlib import contextmanager
@@ -346,6 +348,17 @@ class TemporalAsyncCaller(AsyncCaller):
         pass
 
 
+class _AsyncCallResult(NamedTuple):
+    """Completion message sent from a persistent worker to its training process."""
+
+    call_idx: int
+    error: Optional[str] = None
+
+
+class PersistentAsyncWorkerError(RuntimeError):
+    """Raised on every rank when a persistent checkpoint worker fails."""
+
+
 class PersistentAsyncCaller(AsyncCaller):
     """Wrapper around mp.Process that ensures correct semantic of distributed finalization.
 
@@ -355,6 +368,7 @@ class PersistentAsyncCaller(AsyncCaller):
     _persistent_process: mp.Process = None
     _persistent_queue: mp.JoinableQueue = None
     _persistent_preload_q: mp.JoinableQueue = None
+    _persistent_preload_comp_q: mp.Queue = None
     _persistent_comp_q: mp.Queue = None
 
     def __init__(self):
@@ -362,6 +376,7 @@ class PersistentAsyncCaller(AsyncCaller):
         self.start_time: Optional[float] = None
         self.cur_item: Optional[int] = None
         self.cur_idx: int = -1
+        self.worker_error: Optional[str] = None
 
     @classmethod
     def _get_process(
@@ -376,6 +391,7 @@ class PersistentAsyncCaller(AsyncCaller):
             logger.debug(f"PersistentAsyncCaller: {rank}, Starting Async Caller")
             cls._persistent_queue = ctx.JoinableQueue()
             cls._persistent_preload_q = ctx.JoinableQueue()
+            cls._persistent_preload_comp_q = ctx.Queue()
             cls._persistent_comp_q = ctx.Queue()
             cls._persistent_process = ctx.Process(
                 target=PersistentAsyncCaller.async_loop,
@@ -383,6 +399,7 @@ class PersistentAsyncCaller(AsyncCaller):
                     rank,
                     cls._persistent_queue,
                     cls._persistent_preload_q,
+                    cls._persistent_preload_comp_q,
                     cls._persistent_comp_q,
                     logger.getEffectiveLevel(),
                     cpu_priority,
@@ -421,7 +438,26 @@ class PersistentAsyncCaller(AsyncCaller):
         if async_req.preload_fn is not None:
             start_sync = time()
             # Synchronize for pre-staging tensors
-            self._persistent_preload_q.join()
+            while self.worker_error is None:
+                try:
+                    result = self._persistent_preload_comp_q.get(timeout=0.1)
+                except Empty:
+                    if not self.process.is_alive():
+                        self.process.join()
+                        try:
+                            result = self._persistent_preload_comp_q.get(timeout=0.1)
+                        except Empty:
+                            self.worker_error = (
+                                "Persistent checkpoint worker exited during tensor preloading "
+                                f"without reporting completion (exit code {self.process.exitcode})"
+                            )
+                            break
+                        else:
+                            self._handle_preload_result(result, async_req.call_idx)
+                            break
+                else:
+                    self._handle_preload_result(result, async_req.call_idx)
+                    break
             end_sync = time()
             logger.debug(
                 f"rank: {torch.distributed.get_rank()}, "
@@ -455,11 +491,26 @@ class PersistentAsyncCaller(AsyncCaller):
         is_alive: bool = False
 
         if self.process:
-            while self.cur_item is None:
+            while self.cur_item is None and self.worker_error is None:
                 try:
                     # Retrieve comp call_idx without waiting
-                    self.cur_item = self._persistent_comp_q.get_nowait()
+                    result = self._persistent_comp_q.get_nowait()
                 except Empty:
+                    if not self.process.is_alive():
+                        self.process.join()
+                        try:
+                            # A multiprocessing queue can take a moment to flush after its
+                            # producer exits, so check once more before reporting a crash.
+                            result = self._persistent_comp_q.get(timeout=0.1)
+                        except Empty:
+                            self.worker_error = (
+                                "Persistent checkpoint worker exited without reporting "
+                                f"completion (exit code {self.process.exitcode})"
+                            )
+                            break
+                        else:
+                            self._handle_completion_result(result)
+                            break
                     # This method is called after any `AsyncRequest` is pushed to the main loop
                     # So, the background writing is still active
                     # before the worker put call_idx to `comp_q`
@@ -467,6 +518,33 @@ class PersistentAsyncCaller(AsyncCaller):
                         is_alive = True
                         break
                     sleep(0.1)
+                else:
+                    self._handle_completion_result(result)
+
+        if no_dist:
+            if self.worker_error is not None:
+                error = self.worker_error
+                self.close(abort=True)
+                raise PersistentAsyncWorkerError(error)
+            is_done = not is_alive
+        else:
+            status = torch.tensor(
+                [int(is_alive), int(self.worker_error is not None)],
+                dtype=torch.int,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(status)
+            if status[1] > 0:
+                errors = [None] * torch.distributed.get_world_size()
+                rank_error = None
+                if self.worker_error is not None:
+                    rank_error = f"rank {torch.distributed.get_rank()}:\n{self.worker_error}"
+                torch.distributed.all_gather_object(errors, rank_error)
+                failures = [error for error in errors if error is not None]
+                error = "Persistent checkpoint worker failure:\n" + "\n".join(failures)
+                self.close(abort=True)
+                raise PersistentAsyncWorkerError(error)
+            is_done = status[0] == 0
 
         if self.cur_item is not None:
             logger.debug(
@@ -474,7 +552,6 @@ class PersistentAsyncCaller(AsyncCaller):
                 f" is completed, {is_alive}"
             )
 
-        is_done = not is_alive if no_dist else self.sync_all_async_calls(is_alive)
         # This is set to False when blocking == False so this routine is called again
         # to simply call `sync_all_async_calls` to check if other ranks complete the writing
         if is_done:
@@ -487,6 +564,25 @@ class PersistentAsyncCaller(AsyncCaller):
 
         return is_done
 
+    def _handle_completion_result(self, result) -> None:
+        """Record a completion or failure message received from the worker."""
+        if isinstance(result, _AsyncCallResult):
+            self.cur_item = result.call_idx
+            self.worker_error = result.error
+        else:
+            # Backward compatibility for a pre-existing worker started by older code.
+            self.cur_item = result
+
+    def _handle_preload_result(self, result: _AsyncCallResult, expected_call_idx: int) -> None:
+        """Record a preload result and guard against cross-request queue corruption."""
+        if result.call_idx != expected_call_idx:
+            self.worker_error = (
+                f"Persistent checkpoint worker reported preload {result.call_idx}, "
+                f"expected {expected_call_idx}"
+            )
+        else:
+            self.worker_error = result.error
+
     def close(self, abort=False):
         """Wait on the left async requests and terminate the PersistentAsyncCaller
 
@@ -497,19 +593,37 @@ class PersistentAsyncCaller(AsyncCaller):
         """
         logger.debug(f"PersistentAsyncCaller: {safe_get_rank()}, Destroying Async Caller")
         if self.process:
-            if abort:
+            aborting = abort or self.worker_error is not None or not self.process.is_alive()
+            if aborting:
                 log_single_rank(
                     logger, logging.WARNING, f"Persistent worker aborted in rank {safe_get_rank()}"
                 )
-                self.process.kill()
+                if self.process.is_alive():
+                    self.process.kill()
             else:
                 self._persistent_queue.put('DONE')
-                self._persistent_queue.join()
-                self._persistent_process.join()
+            self.process.join()
+
+            queues = (
+                self._persistent_queue,
+                self._persistent_preload_q,
+                self._persistent_preload_comp_q,
+                self._persistent_comp_q,
+            )
+            for queue in queues:
+                if aborting:
+                    queue.cancel_join_thread()
+                queue.close()
+                if not aborting:
+                    queue.join_thread()
+
             self.process = None
+            self.cur_item = None
+            self.worker_error = None
             PersistentAsyncCaller._persistent_process = None
             PersistentAsyncCaller._persistent_queue = None
             PersistentAsyncCaller._persistent_preload_q = None
+            PersistentAsyncCaller._persistent_preload_comp_q = None
             PersistentAsyncCaller._persistent_comp_q = None
 
     def __del__(self):
@@ -521,6 +635,7 @@ class PersistentAsyncCaller(AsyncCaller):
         rank: int,
         queue: mp.JoinableQueue,
         preload_q: mp.JoinableQueue,
+        preload_comp_q: mp.Queue,
         comp_q: mp.Queue,
         log_level: int = logging.INFO,
         cpu_priority: int = 10,
@@ -532,7 +647,7 @@ class PersistentAsyncCaller(AsyncCaller):
         when application calls `close()` explictily
 
         This routine receives `AsyncRequest` and does `preload_fn` first and
-        put the integer value in `preload_q` to inform the trainer to proceed.
+        reports the result through `preload_comp_q` to let the trainer proceed.
         When the `async_fn` from the request` is completed (background saving is done),
         it puts a integer value to `comp_q` to notify the trainer the completion.
 
@@ -542,6 +657,7 @@ class PersistentAsyncCaller(AsyncCaller):
                                       from the training rank
             preload_q (mp.JoinableQueue): a queue to inform trainer that preloading of tensors
                                           from GPU to Host or dedicated location is completed
+            preload_comp_q (mp.Queue): a queue to report preload completion or failure
             comp_q (mp.Queue): a queue to inform the training rank the completion of scheduled
                                async checkpoint request
             log_level (int, Optional): an integer to set log-level in this spawned process
@@ -576,18 +692,35 @@ class PersistentAsyncCaller(AsyncCaller):
                 break
             elif isinstance(item, AsyncRequest):
                 async_fn_args = list(item.async_fn_args)
-                if item.preload_fn is not None:
-                    call_idx = preload_q.get()
-                    # the 2nd arg is state dict
-                    async_fn_args[1] = item.preload_fn()
-                    logger.debug(f"{rank} has completed D2H of {call_idx}")
-                    preload_q.task_done()
-                if item.async_fn is not None:
-                    item.async_fn(*async_fn_args, **item.async_fn_kwargs)
-                logger.debug(f"{rank} has completed saving {item.call_idx}")
-                comp_q.put(item.call_idx)
-                queue.task_done()
-                del async_fn_args
+                worker_failed = False
+                try:
+                    if item.preload_fn is not None:
+                        call_idx = preload_q.get()
+                        try:
+                            # the 2nd arg is state dict
+                            async_fn_args[1] = item.preload_fn()
+                            logger.debug(f"{rank} has completed D2H of {call_idx}")
+                        except Exception:
+                            preload_comp_q.put(_AsyncCallResult(call_idx, traceback.format_exc()))
+                            raise
+                        else:
+                            preload_comp_q.put(_AsyncCallResult(call_idx))
+                        finally:
+                            preload_q.task_done()
+                    if item.async_fn is not None:
+                        item.async_fn(*async_fn_args, **item.async_fn_kwargs)
+                    logger.debug(f"{rank} has completed saving {item.call_idx}")
+                    comp_q.put(_AsyncCallResult(item.call_idx))
+                except Exception:
+                    worker_failed = True
+                    error = traceback.format_exc()
+                    logger.error("Persistent checkpoint worker failed:\n%s", error)
+                    comp_q.put(_AsyncCallResult(item.call_idx, error))
+                finally:
+                    queue.task_done()
+                    del async_fn_args
+                if worker_failed:
+                    break
             del item
             gc.collect()
 
@@ -681,14 +814,23 @@ class AsyncCallsQueue:
             List[int]: list of indices (as returned by `schedule_async_request`)
                 of async calls that have been successfully finalized.
         Raises:
+            PersistentAsyncWorkerError: if a persistent checkpoint worker fails. The error is
+                propagated to every rank before the worker is terminated.
             CheckpointException: if any rank(s) raised an exception during checkpoint
                 writing, the exceptions are wrapped and raised on all ranks.
         """
         call_idx_finalized = []
         while self.async_calls:
-            next_async_done = self.async_calls[0].async_caller.is_current_async_call_done(
-                blocking, no_dist
-            )
+            try:
+                next_async_done = self.async_calls[0].async_caller.is_current_async_call_done(
+                    blocking, no_dist
+                )
+            except PersistentAsyncWorkerError:
+                # The caller has already terminated the failed singleton. Drop requests that
+                # can no longer complete so a later close or restart cannot finalize stale work.
+                self.async_calls.clear()
+                AsyncCallsQueue._persistent_caller = None
+                raise
             if not next_async_done:
                 break
             with debug_time("finalize", logger):
