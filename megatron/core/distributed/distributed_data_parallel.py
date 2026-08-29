@@ -469,13 +469,6 @@ class DistributedDataParallel(_BaseDataParallel):
                         param.register_grad_accum_hook(
                             grad_acc, self._make_backward_post_hook(param)
                         )
-                    elif getattr(param, '_replica_managed_grad', False):
-                        # Replica expert wgrads are written directly into main_grad. Retain
-                        # AccumulateGrad for CUDA-graph connectivity, but let the replica
-                        # bridge invoke DDP's hook after its owner reduction instead of
-                        # returning a parameter-sized dummy gradient through autograd.
-                        param._replica_grad_accum_node = grad_acc
-                        param._replica_grad_accum_hook = self._make_backward_post_hook(param)
                     else:
                         grad_acc.register_hook(self._make_backward_post_hook(param))
                         self.grad_accs.append(grad_acc)
@@ -575,10 +568,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     # GTP_remat keeps its real wgrad in main_grad (via finalize); param.grad here is
                     # throwaway (None or a dummy), so skip this assert and rely on
                     # grad_added_to_main_grad below.
-                    if not (
-                        getattr(param, 'is_gtp_weight_remat', False)
-                        or getattr(param, '_replica_managed_grad', False)
-                    ):
+                    if not getattr(param, 'is_gtp_weight_remat', False):
                         assert (
                             param.grad is not None
                         ), 'param.grad being None is not safe when overlap_grad_reduce is True'
