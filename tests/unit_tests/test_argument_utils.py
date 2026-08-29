@@ -798,6 +798,31 @@ class TestMegatronMLAArgumentGeneration:
 
         assert config.original_max_position_embeddings == 65536
 
+    def test_d_symbol_defaults_to_dsa(self):
+        """The D symbol keeps its existing DSA default when no variant is specified."""
+        argv = [
+            'test_argument_utils.py',
+            '--hybrid-layer-pattern',
+            'D',
+            '--disable-bias-linear',
+            '--hidden-size',
+            '128',
+            '--num-attention-heads',
+            '8',
+            '--micro-batch-size',
+            '1',
+            '--seq-length',
+            '32',
+            '--max-position-embeddings',
+            '32',
+        ]
+        with patch('sys.argv', argv):
+            args = validate_args(parse_args())
+
+        config = core_transformer_config_from_args(args)
+
+        assert config.experimental_attention_variant == 'dsa'
+
     def test_dsv4_hybrid_arguments_reach_mla_config(self):
         """The D symbol must preserve DSv4 mode and its latent-norm epsilon."""
         argv = [
@@ -809,7 +834,7 @@ class TestMegatronMLAArgumentGeneration:
             '--attention-latent-norm-epsilon',
             '1e-5',
             '--csa-compress-ratios',
-            '4',
+            '[4]',
             '--q-lora-rank',
             '32',
             '--hidden-size',
