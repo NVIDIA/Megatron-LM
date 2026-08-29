@@ -870,7 +870,6 @@ class TestFlexDispatcher:
             moe_pad_expert_input_to_capacity=False,
             moe_permute_fusion=permute_fusion,
             hidden_size=1024,
-            use_cpu_initialization=False,
             moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
             moe_permute_fusion_into_hybridep=moe_permute_fusion_into_hybridep,
             test_dtype=torch.bfloat16,
