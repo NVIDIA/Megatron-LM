@@ -182,6 +182,9 @@ linting = [
     "flake8==7.1.0",
     "pylint==3.2.6",
 ]
+selective-testing = [
+    "pytest-impacted[fast]==0.28.0",
+]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
 batch_invariant = ["deep_gemm"]
 no_pypi_wheels = ["flash_mla", "emerging_optimizers", "deep_gemm"]
@@ -189,6 +192,7 @@ no_pypi_wheels = ["flash_mla", "emerging_optimizers", "deep_gemm"]
 [tool.uv]
 managed = true
 default-groups = ["linting", "build", "test"]
+conflicts = [[{ group = "linting" }, { group = "selective-testing" }]]
 no-build-isolation-package = [
     "causal-conv1d",
     "flash_mla",

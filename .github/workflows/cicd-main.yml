@@ -185,7 +185,9 @@ jobs:
       dev:            ${{ steps.configure.outputs.dev }}
       cadence:        ${{ steps.configure.outputs.cadence }}
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
+      selective_tests: ${{ steps.configure.outputs.selective_tests }}
       sha:            ${{ steps.resolve-sha.outputs.sha }}
+      base_sha:       ${{ steps.resolve-sha.outputs.base_sha }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -206,12 +208,16 @@ jobs:
         run: |
           if [[ "$IS_PR" == "true" ]]; then
             SHA='${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}'
+            BASE_SHA='${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}'
           elif [[ "$IS_MERGE_GROUP" == "true" ]]; then
             SHA='${{ github.event.merge_group.head_sha }}'
+            BASE_SHA=''
           else
             SHA='${{ github.sha }}'
+            BASE_SHA=''
           fi
           echo "sha=${SHA}" | tee -a "$GITHUB_OUTPUT"
+          echo "base_sha=${BASE_SHA}" | tee -a "$GITHUB_OUTPUT"
 
       - name: Generate GitHub App token
         id: app-token
@@ -237,6 +243,7 @@ jobs:
 
           HAS_RUN_TESTS=$(echo "$LABELS"      | jq 'any(. == "Run tests")')
           HAS_RUN_FUNCTIONAL=$(echo "$LABELS" | jq 'any(. == "Run functional tests")')
+          HAS_SELECTIVE_TESTS=$(echo "$LABELS" | jq 'any(. == "Run selective unit tests")')
           HAS_LTS=$(echo "$LABELS"            | jq 'any(. == "container::lts")')
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
           HAS_NEMO_RL=$(echo "$LABELS"        | jq 'any(. == "Run NeMoRL tests")')
@@ -318,6 +325,7 @@ jobs:
           echo "dev=$DEV"                       | tee -a $GITHUB_OUTPUT
           echo "cadence=$CADENCE_OUTPUT"        | tee -a $GITHUB_OUTPUT
           echo "cadence_bypass=$CADENCE_BYPASS" | tee -a $GITHUB_OUTPUT
+          echo "selective_tests=$HAS_SELECTIVE_TESTS" | tee -a $GITHUB_OUTPUT
 
           # Pre-compute active row markers for the decision tree
           _MG=$( [ "$IS_MERGE_GROUP" == "true" ]                                                                           && echo "**→**" || echo "" )
@@ -702,11 +710,87 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.configure.outputs.sha }}
+          fetch-depth: 0
+      - name: Setup Python
+        if: needs.configure.outputs.selective_tests == 'true'
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Setup uv
+        if: needs.configure.outputs.selective_tests == 'true'
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          version: 0.7.2
       - name: Parse unit tests
         id: parse-unit-tests
+        shell: bash -e -u -o pipefail {0}
+        env:
+          BASE_SHA: ${{ needs.configure.outputs.base_sha }}
+          CADENCE_BYPASS: ${{ needs.configure.outputs.cadence_bypass }}
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
+          IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
+          IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
+          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push' }}
+          SELECTIVE_TESTS: ${{ needs.configure.outputs.selective_tests }}
         run: |
-          cat tests/test_utils/recipes/h100/unit-tests.yaml | yq -o json '[.products[].test_case[] | { "bucket": .}] | sort_by(.model, .test_case)' | jq -c > unit-tests.json
-          echo "unit-tests=$(cat unit-tests.json)" | tee -a $GITHUB_OUTPUT
+          if [[ "$SELECTIVE_TESTS" != "true" ]]; then
+            yq -o=json '[.products[].test_case[] | {"bucket": ., "unit_test_files": ""}] | sort_by(.bucket)' \
+              tests/test_utils/recipes/h100/unit-tests.yaml > unit-tests.json
+            echo "unit-tests=$(jq -c '.' unit-tests.json)" | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          yq -o=json '[.products[].test_case[] | {"bucket": .}] | sort_by(.bucket)' \
+            tests/test_utils/recipes/h100/unit-tests.yaml > unit-test-buckets.json
+
+          FORCE_FULL_REASON=''
+          if [[ "$IS_MERGE_GROUP" == "true" ]]; then
+            FORCE_FULL_REASON='merge queue validation always runs the full unit-test suite'
+          elif [[ "$IS_CI_WORKLOAD" == "true" ]]; then
+            FORCE_FULL_REASON='scheduled and CI workloads always run the full unit-test suite'
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            FORCE_FULL_REASON='manually dispatched workflows always run the full unit-test suite'
+          elif [[ "$FORCE_RUN_ALL" == "true" ]]; then
+            FORCE_FULL_REASON='pre-flight requested the full test suite'
+          elif [[ "$CADENCE_BYPASS" == "true" ]]; then
+            FORCE_FULL_REASON='a full-test PR label bypassed selective testing'
+          elif [[ "$IS_PR" != "true" ]]; then
+            FORCE_FULL_REASON='selective testing is limited to pull-request pushes'
+          elif [[ -z "$BASE_SHA" || "$BASE_SHA" == "null" ]]; then
+            FORCE_FULL_REASON='the pull-request base SHA is unavailable'
+          fi
+
+          SELECTOR_ARGS=(
+            --buckets-file unit-test-buckets.json
+            --git-mode branch
+            --output unit-test-selection.json
+            --summary unit-test-selection-summary.md
+          )
+          if [[ -n "$FORCE_FULL_REASON" ]]; then
+            SELECTOR_ARGS+=(--force-full "$FORCE_FULL_REASON")
+          else
+            SELECTOR_ARGS+=(--base-ref "$BASE_SHA")
+          fi
+
+          python -m unittest discover \
+            -s .github/scripts -p 'test_select_unit_tests.py' -v
+          if [[ -n "$FORCE_FULL_REASON" ]]; then
+            python .github/scripts/select_unit_tests.py "${SELECTOR_ARGS[@]}"
+          elif ! timeout --signal=TERM --kill-after=30s 7m \
+            uv run --locked --only-group selective-testing \
+            python .github/scripts/select_unit_tests.py "${SELECTOR_ARGS[@]}"; then
+            python .github/scripts/select_unit_tests.py \
+              --buckets-file unit-test-buckets.json \
+              --force-full 'pytest-impacted could not be installed, completed, or started' \
+              --output unit-test-selection.json \
+              --summary unit-test-selection-summary.md
+          fi
+
+          echo "unit-tests=$(jq -c '.matrix' unit-test-selection.json)" | tee -a "$GITHUB_OUTPUT"
+          cat unit-test-selection-summary.md >> "$GITHUB_STEP_SUMMARY"
 
   cicd-unit-tests-latest:
     strategy:
@@ -752,6 +836,7 @@ jobs:
         uses: ./.github/actions
         with:
           test_case: ${{ matrix.bucket }}
+          unit_test_files: ${{ matrix.unit_test_files }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
