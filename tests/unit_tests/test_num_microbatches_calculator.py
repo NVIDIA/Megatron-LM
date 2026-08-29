@@ -74,6 +74,22 @@ def test_get_num_microbatches():
     assert mb_calculator.get_num_microbatches() == 1
 
 
+def test_get_max_num_microbatches_uses_full_step_schedule():
+    mb_calculator.reconfigure_num_microbatches_calculator(
+        rank=0,
+        micro_batch_size=2,
+        data_parallel_size=2,
+        step_batch_size_schedule="0:16 100:64 200:32",
+    )
+
+    assert mb_calculator.get_num_microbatches() == 4
+    assert mb_calculator.get_max_num_microbatches() == 16
+
+    mb_calculator.update_num_microbatches(200)
+    assert mb_calculator.get_num_microbatches() == 8
+    assert mb_calculator.get_max_num_microbatches() == 16
+
+
 def test_get_current_global_batch_size():
     mb_calculator.reconfigure_num_microbatches_calculator(
         rank=0, global_batch_size=16, micro_batch_size=4, data_parallel_size=2

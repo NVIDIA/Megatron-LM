@@ -42,7 +42,10 @@ _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
 # First-party.
 from megatron.core import mpu, nccl_allocator, tensor_parallel
-from megatron.core.datasets.data_schedule import wrap_data_iterator
+from megatron.core.datasets.data_schedule import (
+    prepare_thd_static_batch_for_full_iteration_cuda_graph,
+    wrap_data_iterator,
+)
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -116,7 +119,10 @@ from megatron.core.rerun_state_machine import (
 )
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAIndexerLossLoggingHelper,
+    is_dsa_skip_topk_layer,
+)
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
@@ -383,6 +389,114 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     t.zero_()
     _seqlen_stats_active = False
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
+
+
+def _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, dsa_indexer_topk):
+    """Fraction of dense causal (query, key) pairs that DSA actually attends to.
+
+    A DSA layer scores every past position with the indexer but runs attention
+    only over the ``dsa_indexer_topk`` highest-scoring keys, so its core
+    attention cost is ``sum_i(min(i, topk))`` pairs per sequence instead of the
+    dense causal ``L^2 / 2``. Returns the ratio between the two, i.e. the
+    factor the dense core-attention coefficient must be scaled by.
+
+    The caller only has the batch aggregates ``sum_i(L_i)`` and
+    ``sum_i(L_i ** 2)``, not the individual sequence lengths, so the ratio is
+    evaluated at the length-weighted mean ``sum(L^2) / sum(L)``. That is exact
+    when every sequence in the batch has the same length (the usual packed-THD
+    benchmark case) and, for ragged batches, weights toward the long sequences
+    that dominate attention cost. Collapses to ``1.0`` when the sequences are
+    no longer than ``topk``, where top-k selects everything and attention is
+    dense.
+    """
+    if not dsa_indexer_topk or total_real_tokens <= 0 or seqlen_squared_sum <= 0:
+        return 1.0
+    mean_seqlen = seqlen_squared_sum / total_real_tokens
+    # Average attended KV entries per query: ``min(i, topk)`` averaged over the
+    # sequence, approximated as ``eff * (1 - eff / (2 * L))`` with
+    # ``eff = min(topk, floor(L))``. The exact discrete average has ``eff - 1``
+    # in the correction term; the O(1/L) difference is below the precision of
+    # this estimate.
+    eff = min(dsa_indexer_topk, math.floor(mean_seqlen))
+    attended = eff * (1 - eff / (2 * mean_seqlen))
+    # Dense causal attention averages ~``mean_seqlen / 2`` keys per query.
+    return attended / (mean_seqlen / 2)
+
+
+def _dsa_indexer_flops(
+    *, hidden_size, q_lora_rank, n_heads, head_dim, num_indexer_layers, indexer_loss_coeff
+):
+    """DSA lightning-indexer FLOPs coefficients, fwd/bwd expansion included.
+
+    Counts the indexer's projections (a Q projection off the shared ``q_lora``
+    residual, the ``linear_wk`` key path, and the per-head ``weights_proj``)
+    plus its dense scoring pass of every query against every past token under
+    a causal mask. Scoring is ``O(L^2)`` even though the attention consuming
+    it is sparse. The indexer KL loss (``dsa_indexer_loss_coeff``) and the
+    top-k selection itself are NOT counted: like everywhere else in this file
+    only the model's defining GEMMs enter the estimate, not auxiliary-loss or
+    sorting work.
+
+    Only ``num_indexer_layers`` layers pay: with cross-layer index sharing
+    (``dsa_indexer_topk_freq``) the layers in between reuse the most recent
+    top-k (see ``is_dsa_skip_topk_layer``).
+
+    The indexer does NOT get the global fwd+bwd factor of 3. It is trained
+    only by its own KL loss, so ``DSAttention.forward`` runs it under
+    ``torch.no_grad()`` unless ``dsa_indexer_loss_coeff > 0`` (which defaults
+    to None), and even then ``x`` / ``qr`` are detached so no gradient leaves
+    the indexer:
+
+      * loss off -> forward only, everything is 1x.
+      * loss on  -> the projections (wq_b / wk / weights_proj) read a detached
+        input, so autograd skips their dgrad and they pay fwd + wgrad = 2x.
+        The scoring GEMM has two activation operands that both need gradients
+        to reach those weights, so it pays fwd + dq + dk = 3x.
+
+    Whether the indexer is trained is part of the training procedure rather
+    than the kernel schedule, so it belongs in this model-FLOPs count. (With
+    ``dsa_indexer_use_sparse_loss`` the scoring backward only covers the top-k
+    entries, which the 3x does not model; it defaults to False.)
+
+    Returns ``(token_linear, core)`` INCLUDING the fwd/bwd and FMA factors.
+    Multiply ``token_linear`` by the real token count and ``core`` by
+    ``sum_i(L_i ** 2)``.
+    """
+    if num_indexer_layers <= 0:
+        return 0, 0
+    if q_lora_rank is None:
+        # Mirrors DSAIndexer's own fallback when the model has no q lora rank.
+        q_lora_rank = hidden_size
+    index_dim = n_heads * head_dim
+    token_linear = num_indexer_layers * (
+        q_lora_rank * index_dim  # wq_b
+        + hidden_size * head_dim  # wk
+        + hidden_size * n_heads  # weights_proj
+    )
+    # Scoring each query against every past token under a causal mask (/2).
+    core = num_indexer_layers * index_dim / 2
+    fma_expansion_factor = 2
+    loss_enabled = (indexer_loss_coeff or 0.0) > 0
+    return (
+        (2 if loss_enabled else 1) * fma_expansion_factor * token_linear,
+        (3 if loss_enabled else 1) * fma_expansion_factor * core,
+    )
+
+
+def _num_dsa_indexer_layers(num_layers, skip_topk_offset, topk_freq):
+    """Count layers that compute their own DSA index (the rest reuse one).
+
+    On the standard-model path every layer is a DSA attention layer (MTP
+    layers included -- ``DSAttention.__init__`` numbers them
+    ``layer_number + config.num_layers``, which is exactly how the caller
+    extends ``num_layers``), so the predicate runs over the whole
+    ``1..num_layers`` range.
+    """
+    return sum(
+        1
+        for layer_number in range(1, num_layers + 1)
+        if not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
+    )
 
 
 def _dsv4_hybrid_self_attention_flops(
@@ -781,6 +895,7 @@ def num_floating_point_operations(
         kda_conv_kernel_dim=4,
         vocab_size=256000,
         mtp_num_layers=0,
+        mtp_loss_type="cross_entropy",
         q_lora_rank=None,
         kv_lora_rank=0,
         qk_head_dim=0,
@@ -905,7 +1020,14 @@ def num_floating_point_operations(
             2 * mtp_num_layers * (3 * hidden_size + 2 * hidden_size * hidden_size) * total_tokens
             + 2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers)
         )
-        return flops_fwd * 3
+        # E2E TV projects the frozen backbone once to produce target logits.
+        # This projection has no backward pass because the target distribution
+        # is detached. Softmax/overlap elementwise work is omitted consistently
+        # with the existing cross-entropy FLOPs convention.
+        e2e_tv_target_projection_flops = (
+            2 * total_tokens * hidden_size * vocab_size if mtp_loss_type == "e2e_tv" else 0
+        )
+        return flops_fwd * 3 + e2e_tv_target_projection_flops
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -1094,6 +1216,8 @@ def num_floating_point_operations(
 
         dsv4_hybrid_extra_term = 0
         dsv4_hybrid_extra_core_term = 0
+        dsa_extra_term = 0
+        dsa_extra_core_term = 0
         if is_linear_attention_variant(args.experimental_attention_variant):
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
@@ -1200,6 +1324,51 @@ def num_floating_point_operations(
             dsv4_hybrid_extra_core_term = (
                 forward_backward_expansion_factor * fma_expansion_factor * dsv4_core_term
             )
+        elif args.experimental_attention_variant == "dsa":
+            # DSA (e.g. GLM-5.2). The MLA projections are unchanged -- absorption
+            # relocates the same W_UK/W_UV GEMMs (per-token K/V up-projection
+            # becomes per-token q-side and output-side absorption of identical
+            # cost) -- so the standard token-linear term computed above still
+            # applies. Core attention differs from plain MLA in two ways:
+            #   * DSA always executes the absorbed-MLA path
+            #     (``AbsorbedMLASelfAttention``): ``QK^T`` is formed over the
+            #     compressed KV latent, spanning
+            #     ``kv_lora_rank + qk_pos_emb_head_dim`` per head, and ``AV``
+            #     spans ``kv_lora_rank`` -- not the up-projected
+            #     (``qk_head_dim``, ``v_head_dim``) counted for plain MLA
+            #     above. Each branch counts the form its variant executes.
+            #   * Attention runs over the indexer's top-k keys instead of the
+            #     full causal mask, so the dense causal coefficient is scaled
+            #     down to the top-k pair count.
+            # The indexer itself adds projections plus its own dense O(L^2)
+            # scoring pass; it carries its own (KL-loss-dependent) fwd/bwd
+            # expansion instead of the global factor of 3 -- see
+            # ``_dsa_indexer_flops``.
+            num_linear_attention_layers = 0
+            linear_self_attn_term = 0
+            num_standard_attention_layers = num_layers
+
+            standard_self_attn_core_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
+                * (
+                    args.num_attention_heads * (args.kv_lora_rank + args.qk_pos_emb_head_dim) / 2
+                    + args.num_attention_heads * args.kv_lora_rank / 2
+                )
+                * _dsa_sparse_core_scale(
+                    total_real_tokens_in_batch, seqlen_squared_sum_in_batch, args.dsa_indexer_topk
+                )
+            )
+            dsa_extra_term, dsa_extra_core_term = _dsa_indexer_flops(
+                hidden_size=args.hidden_size,
+                q_lora_rank=args.q_lora_rank,
+                n_heads=args.dsa_indexer_n_heads,
+                head_dim=args.dsa_indexer_head_dim,
+                num_indexer_layers=_num_dsa_indexer_layers(
+                    num_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
+                ),
+                indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+            )
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
@@ -1211,12 +1380,16 @@ def num_floating_point_operations(
             linear_self_attn_term * num_linear_attention_layers
             + standard_self_attn_term * num_standard_attention_layers
             + dsv4_hybrid_extra_term
+            + dsa_extra_term
         )
         # Core attention (L^2) FLOPs. Standard attention has a uniform per-layer
         # coefficient; DSv4 sparse attention varies by layer type and is pre-summed.
+        # For DSA the standard coefficient is already the top-k-scaled absorbed
+        # form, and the extra term carries the indexer's dense scoring.
         self_attn_core_term = (
             standard_self_attn_core_term * num_standard_attention_layers
             + dsv4_hybrid_extra_core_term
+            + dsa_extra_core_term
         )
 
         # Token-linear FLOPs scale with the real (unpadded) token count.
@@ -1268,6 +1441,11 @@ def num_floating_point_operations(
                 * args.hidden_size
                 * args.padded_vocab_size
                 * (mtp_num_layers + 1)  # MTP + final logit
+                # E2E TV target distribution: one frozen forward-only output projection.
+                + fma_expansion_factor
+                * args.hidden_size
+                * args.padded_vocab_size
+                * int(getattr(args, "mtp_loss_type", "cross_entropy") == "e2e_tv")
             )
             # Self Attention (core L^2 part). For BSHD the default
             # ``seqlen_squared_sum_in_batch = batch_size * seq_length^2`` recovers the
@@ -1312,6 +1490,26 @@ def num_floating_point_operations(
                 f"got {num_attn_layers} attention layers but only "
                 f"{dsv4_n_layers_r0 + dsv4_n_layers_r4 + dsv4_n_layers_r128} are W/C/H."
             )
+
+        # DSA accounting (top-k sparse core attention + indexer) is only
+        # implemented on the standard-model path in ``transformer_flops``. A
+        # 'D' pattern here would silently fall through to the dense full-MLA
+        # estimate below -- overcounting core attention at long context and
+        # dropping the indexer entirely -- so fail loud instead. Key off the
+        # layer pattern itself, not just ``args.experimental_attention_variant``:
+        # on the hybrid path a 'D' pattern sets the variant only in the config
+        # kwargs (``arguments.py``/``argument_utils.py`` write it into
+        # ``kw_args``, never back onto ``args``), so the attribute alone misses
+        # exactly the runs this guard exists for.
+        assert (
+            args.experimental_attention_variant != "dsa"
+            and layer_counts[Symbols.DS_ATTENTION] == 0
+        ), (
+            "num_floating_point_operations does not support DSA "
+            "('D' layers / experimental_attention_variant='dsa') on the "
+            "hybrid-model path (--hybrid-layer-pattern); express the model "
+            "without a layer pattern."
+        )
 
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
@@ -1362,6 +1560,7 @@ def num_floating_point_operations(
             kda_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
+            mtp_loss_type=getattr(args, "mtp_loss_type", "cross_entropy"),
             q_lora_rank=args.q_lora_rank,
             kv_lora_rank=args.kv_lora_rank,
             qk_head_dim=args.qk_head_dim,
@@ -2040,6 +2239,13 @@ def pretrain(
 
     if args.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
+
+    if args.cuda_graph_impl == "full_iteration":
+        # Captured graphs (including graph-captured NCCL P2P for PP) must be
+        # destroyed before communicator/process teardown, otherwise interpreter
+        # shutdown can hang until the NCCL watchdog aborts the process.
+        torch.cuda.synchronize()
+        FullCudaGraphWrapper.reset_cuda_graph()
 
     ft_integration.shutdown()
     one_logger_utils.finish()
@@ -4270,10 +4476,22 @@ def train(
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
     if args.cuda_graph_impl == "full_iteration":
+        thd_batch_preparation_fn = None
+        if args.sequence_packing_scheduler is not None:
+            # THD full-iteration graphs require every packed microbatch to be
+            # canonicalized to graph-static shapes outside the captured region
+            # (this path issues TP broadcasts), and a fixed num_microbatches
+            # per step (enforced via the wrapper's capture signature).
+            thd_batch_preparation_fn = functools.partial(
+                prepare_thd_static_batch_for_full_iteration_cuda_graph,
+                config=config,
+                vpp_size=config.virtual_pipeline_model_parallel_size,
+            )
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
+            batch_preparation_fn=thd_batch_preparation_fn,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
@@ -4366,6 +4584,9 @@ def train(
 
     # Initialize CUDA Graphs helper.
     if args.cuda_graph_impl == "transformer_engine":
+        config.thd_max_subsamples_per_item = (
+            1 if args.use_varlen_dataset else args.thd_max_packed_sequences
+        )
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
@@ -4374,6 +4595,8 @@ def train(
             optimizers=[optimizer],
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
         )
+        if config.cuda_graph_parallel_prewarm:
+            cuda_graph_helper.parallel_prewarm_thd_chunks()
 
     # Run training iterations till done.
     buffered_rollouts = None
@@ -4453,6 +4676,8 @@ def train(
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 enable_forward_pre_hook(model)
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
+            if isinstance(forward_backward_func, PagedStashRunner):
+                forward_backward_func.mark_te_graph_captured(num_microbatches)
 
         # Completely skip iteration if needed.
         if (iteration + 1) in args.iterations_to_skip:
@@ -4783,7 +5008,7 @@ def train(
             break
 
     # Destroy CUDA Graphs.
-    if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
+    if args.cuda_graph_impl == "transformer_engine":
         cuda_graph_helper.delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph
@@ -4881,7 +5106,11 @@ def evaluate(
     eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
     if eval_pgc is None:
         eval_pgc = ProcessGroupCollection.use_mpu_process_groups()
-    if args.cuda_graph_impl == "full_iteration":
+    if args.cuda_graph_impl == "full_iteration" and args.sequence_packing_scheduler is None:
+        # THD sequence packing keeps validation eager: a dedicated fixed-shape
+        # validation graph is not implemented yet, and the packed validation
+        # schedule may use a different num_microbatches than the captured
+        # training graph.
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
@@ -4922,7 +5151,7 @@ def evaluate(
             ft_integration.on_eval_step_start()
             if getattr(config, 'sequence_packing_scheduler', None) is not None:
                 try:
-                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                    packed_data_iterator, scheduled_eval_num_microbatches, _, _ = (
                         wrap_data_iterator(data_iterator, config, eval_num_microbatches)
                     )
                 except StopIteration:
@@ -5220,7 +5449,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
     args = get_args()
 
-    (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
+    train_dataloader, valid_dataloaders, test_dataloader = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
 

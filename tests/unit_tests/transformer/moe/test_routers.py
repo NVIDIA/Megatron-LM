@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -29,6 +30,64 @@ try:
     HAVE_ROUTER_FUSION = _fused_topk_with_score_function is not None
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    ("transformer_impl", "cp_comm_type", "expects_parent"),
+    (
+        ("transformer_engine", "p2p", True),
+        ("transformer_engine", None, True),
+        ("transformer_engine", "all_gather", False),
+        ("local", "p2p", False),
+    ),
+)
+def test_dynamic_cp_aux_loss_parent_communicator_reuse(
+    transformer_impl, cp_comm_type, expects_parent
+):
+    """Dynamic CP router reductions follow the attention transport domain."""
+    router = TopKRouter.__new__(TopKRouter)
+    logical_cp_group = object()
+    parent_dp_cp_group = object()
+    object.__setattr__(
+        router,
+        "config",
+        SimpleNamespace(
+            dynamic_context_parallel=True,
+            transformer_impl=transformer_impl,
+            cp_comm_type=cp_comm_type,
+        ),
+    )
+    object.__setattr__(router, "tp_group", object())
+    object.__setattr__(router, "tp_cp_group", object())
+    object.__setattr__(router, "tp_dp_cp_group", object())
+    object.__setattr__(router, "dp_cp_group", parent_dp_cp_group)
+
+    groups = router._get_aux_loss_groups(
+        SimpleNamespace(local_cp_size=2, cp_group=logical_cp_group)
+    )
+
+    expected_parent = parent_dp_cp_group if expects_parent else None
+    assert groups.dynamic_cp_parent_group is expected_parent
+
+
+@pytest.mark.internal
+def test_dynamic_cp_parent_communicator_reuse_requires_dp_cp_group():
+    router = TopKRouter.__new__(TopKRouter)
+    object.__setattr__(
+        router,
+        "config",
+        SimpleNamespace(
+            dynamic_context_parallel=True, transformer_impl="transformer_engine", cp_comm_type="p2p"
+        ),
+    )
+    object.__setattr__(router, "tp_group", object())
+    object.__setattr__(router, "tp_cp_group", object())
+    object.__setattr__(router, "tp_dp_cp_group", object())
+    object.__setattr__(router, "dp_cp_group", None)
+
+    with pytest.raises(RuntimeError, match="requires a dp_cp process group"):
+        router._get_aux_loss_groups(SimpleNamespace(local_cp_size=2, cp_group=object()))
 
 
 class TestTop2Router:

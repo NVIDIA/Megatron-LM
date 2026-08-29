@@ -12,6 +12,7 @@ from typing import Callable, List, Optional
 import numpy as np
 import torch
 
+from megatron.core.dynamic_cp_group import LogicalCPGroup, set_logical_cp_transport_group
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
 from .utils import GlobalMemoryBuffer, is_torch_min_version
@@ -418,22 +419,37 @@ def create_hierarchical_groups(
     return hierarchical_groups, hierarchical_groups_gloo
 
 
-def create_dynamic_dp_cp_groups(rank, ranks, pg_options, min_cp_size=1):
+def create_dynamic_dp_cp_groups(rank, ranks, pg_options, min_cp_size=1, use_logical_groups=False):
     """
     Creates groups required for dynamic DPxCP.
     Creates a new group for every power of 2 from min_cp_size up to len(ranks).
     Returns a dictionary indexed by group size.
+
+    When ``use_logical_groups`` is true, only lightweight topology descriptors are
+    created. Communication for those descriptors must use an existing parent group.
     """
     dynamic_dp_cp_groups = {}
     group_sizes = [2**i for i in range(int(log2(len(ranks)))) if 2**i >= min_cp_size]
+    if use_logical_groups and len(ranks) >= min_cp_size:
+        group_sizes.append(len(ranks))
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
-            group = create_group(
-                ranks[i : i + group_size],
-                pg_options=pg_options,
-                group_desc=f"DYNAMIC_DP_CP_GROUP_{group_size}",
-            )
-            if rank in ranks[i : i + group_size]:
+            group_ranks = ranks[i : i + group_size]
+            if use_logical_groups:
+                if rank not in group_ranks:
+                    continue
+                group = LogicalCPGroup(
+                    ranks=tuple(group_ranks),
+                    cp_size=len(group_ranks),
+                    cp_rank=group_ranks.index(rank),
+                )
+            else:
+                group = create_group(
+                    group_ranks,
+                    pg_options=pg_options,
+                    group_desc=f"DYNAMIC_DP_CP_GROUP_{group_size}",
+                )
+            if rank in group_ranks:
                 assert (
                     group_size not in dynamic_dp_cp_groups
                 ), f"Rank {rank} appears in multiple Dynamic DP CP groups of size {group_size}"
@@ -447,9 +463,7 @@ class RankGenerator(object):
     def __init__(
         self, tp: int, ep: int, dp: int, pp: int, cp: int, order: str, rank_offset: int = 0
     ) -> None:
-        assert (
-            ep == 1 or cp == 1
-        ), "Both EP and CP > 1 in not allow in one rank generator. \
+        assert ep == 1 or cp == 1, "Both EP and CP > 1 in not allow in one rank generator. \
             CP is only included in default RankGenerator, and EP only in expert RankGenerator."
 
         self.tp = tp
@@ -565,6 +579,7 @@ def initialize_model_parallel(
     sharp_enabled_group: Optional[str] = None,
     rank_offset: int = 0,
     local_world_size: Optional[int] = None,
+    use_dynamic_cp_logical_groups: bool = False,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -627,6 +642,10 @@ def initialize_model_parallel(
             all-reduce is required in backward. For simplicity, we piggyback
             GPUs of context parallelism on data parallel group for
             weight gradient all-reduce.
+
+        use_dynamic_cp_logical_groups (bool, default = False):
+            Represent dynamic-CP subgroups as lightweight topology descriptors instead
+            of ProcessGroups. Their communication must use an existing parent group.
 
         expert_model_parallel_size (int, default = 1):
             The number of Mixture of Experts parallel GPUs in each expert
@@ -925,14 +944,17 @@ def initialize_model_parallel(
             assert (
                 len(ranks_with_cp) % 2 == 0
             ), "Dynamic context parallel requires an even number of ranks"
-            _DYNAMIC_DP_CP_GROUPS.update(
-                create_dynamic_dp_cp_groups(
-                    rank,
-                    ranks_with_cp,
-                    get_nccl_options("dp_cp", nccl_comm_cfgs),
-                    min_cp_size=min_dynamic_context_parallel_size,
-                )
+            dynamic_groups = create_dynamic_dp_cp_groups(
+                rank,
+                ranks_with_cp,
+                get_nccl_options("dp_cp", nccl_comm_cfgs),
+                min_cp_size=min_dynamic_context_parallel_size,
+                use_logical_groups=use_dynamic_cp_logical_groups,
             )
+            if use_dynamic_cp_logical_groups:
+                for logical_group in dynamic_groups.values():
+                    set_logical_cp_transport_group(logical_group, _DATA_PARALLEL_GROUP_WITH_CP)
+            _DYNAMIC_DP_CP_GROUPS.update(dynamic_groups)
 
         data_parallel_size_with_cp = data_parallel_size * context_parallel_size
         group_sizes = [
@@ -942,10 +964,22 @@ def initialize_model_parallel(
         ]
         if data_parallel_size_with_cp not in group_sizes:
             group_sizes.append(data_parallel_size_with_cp)
-        for group_size in group_sizes:
-            group = get_dynamic_data_context_parallel_groups(group_size=group_size)
-            torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+        if use_dynamic_cp_logical_groups:
+            # The logical subgroups may issue the first parent operation from only a
+            # subset of ranks. Initialize the one shared parent communicator first.
+            torch.distributed.barrier(
+                group=_DATA_PARALLEL_GROUP_WITH_CP, device_ids=[torch.cuda.current_device()]
+            )
             torch.cuda.synchronize()
+        else:
+            for group_size in group_sizes:
+                # A singleton group has no communication to initialize. Forcing a NCCL
+                # barrier here creates a persistent communicator that CP=1 never uses.
+                if group_size == 1:
+                    continue
+                group = get_dynamic_data_context_parallel_groups(group_size=group_size)
+                torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+                torch.cuda.synchronize()
 
     for ranks in decoder_rank_generator.get_ranks('dp'):
         group = create_group(
@@ -1540,13 +1574,15 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
 
 def get_dynamic_data_context_parallel_groups(check_initialized=True, group_size=None):
     """Get the dynamic context parallel groups the caller rank belongs to."""
+    if group_size in _DYNAMIC_DP_CP_GROUPS:
+        return _DYNAMIC_DP_CP_GROUPS[group_size]
     if get_data_parallel_world_size(with_context_parallel=True) == group_size:
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None
         return _DATA_PARALLEL_GROUP_WITH_CP
     if check_initialized:
         assert _DYNAMIC_DP_CP_GROUPS is not None
-    return _DYNAMIC_DP_CP_GROUPS[group_size]
+    raise KeyError(f"No dynamic context-parallel group of size {group_size} is initialized.")
 
 
 def get_embedding_group(check_initialized=True):

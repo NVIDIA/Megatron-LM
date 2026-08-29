@@ -33,7 +33,11 @@ from megatron.training.arguments import _add_experimental_attention_variant_args
 
 def _index_share_config():
     return SimpleNamespace(
-        dsa_indexer_topk=8, dsa_indexer_topk_freq=4, dsa_indexer_skip_topk_offset=1, kv_channels=16
+        dsa_indexer_topk=8,
+        dsa_indexer_topk_freq=4,
+        dsa_indexer_skip_topk_offset=1,
+        dsa_mtp_index_kv_share=False,
+        kv_channels=16,
     )
 
 
@@ -68,6 +72,7 @@ def test_mtp_layer_number_offsets_index_share_schedule():
         dsa_indexer_topk=4,
         dsa_indexer_topk_freq=4,
         dsa_indexer_skip_topk_offset=1,
+        dsa_mtp_index_kv_share=False,
         kv_channels=16,
     )
     pg_collection = SimpleNamespace(tp=object(), cp=object())
@@ -323,9 +328,19 @@ def test_absorbed_mla_forward_uses_and_restores_dynamic_cp_group():
     v_up_weight = torch.randn(2, 3, 2)
 
     def get_query_key_value_tensors(
-        hidden_states_arg, key_value_states, packed_seq_params, inference_context=None
+        hidden_states_arg,
+        key_value_states,
+        packed_seq_params,
+        inference_context=None,
+        mtp_dsa_context=None,
     ):
-        del hidden_states_arg, key_value_states, packed_seq_params, inference_context
+        del (
+            hidden_states_arg,
+            key_value_states,
+            packed_seq_params,
+            inference_context,
+            mtp_dsa_context,
+        )
         observed_groups.append(pg_collection.cp)
         return q_absorbed, kv_compressed, q_compressed
 
@@ -454,6 +469,135 @@ def test_indexer_loss_tracker_grows_for_mtp_layer_numbers():
         helper.tracker.clear()
 
 
+@pytest.mark.parametrize("calculate_per_token_loss", (False, True))
+def test_dynamic_cp_indexer_logging_uses_physical_parent_group(calculate_per_token_loss):
+    """Dynamic CP metrics must not retain a per-microbatch logical CP group."""
+    helper = dsa_module.DSAIndexerLossLoggingHelper
+    logical_cp_group = object()
+    parent_dp_cp_group = object()
+    helper.tracker.clear()
+    helper.tracker["values"] = torch.zeros(1)
+
+    try:
+        helper.save_loss_to_tracker(
+            loss=torch.tensor(2.0),
+            layer_number=1,
+            num_layers=1,
+            reduce_group=logical_cp_group if calculate_per_token_loss else None,
+            avg_group=None if calculate_per_token_loss else logical_cp_group,
+            dynamic_cp_parent_group=parent_dp_cp_group,
+            configured_cp_size=4,
+            calculate_per_token_loss=calculate_per_token_loss,
+        )
+
+        expected_value = 8.0 if calculate_per_token_loss else 2.0
+        torch.testing.assert_close(helper.tracker["values"], torch.tensor([expected_value]))
+        assert helper.tracker["reduce_group"] is None
+        assert helper.tracker["avg_group"] is parent_dp_cp_group
+        assert helper.tracker["needs_dp_avg"] is False
+    finally:
+        helper.tracker.clear()
+
+
+def test_dynamic_cp_parent_average_preserves_nominal_global_batch_weighting():
+    """Mixed effective CP sizes retain equal sample weight after nominal-MB scaling."""
+    configured_cp_size = 4
+    parent_size = 8
+    configured_dp_size = parent_size // configured_cp_size
+    # The scheduler repacks fourteen nominal samples into four physical microbatches:
+    # eight CP1 samples, four CP2 samples, then two CP8 samples. CP8 intentionally exceeds
+    # the configured/static CP width and proves the multiplier is not effective logical CP.
+    cp1_local_sums = torch.arange(1, 9, dtype=torch.float32)
+    cp2_local_sums = torch.arange(1, 9, dtype=torch.float32)
+    cp8_first_local_sums = torch.arange(1, 9, dtype=torch.float32)
+    cp8_second_local_sums = torch.arange(2, 10, dtype=torch.float32)
+    scheduled_local_sums = (
+        cp1_local_sums,
+        cp2_local_sums,
+        cp8_first_local_sums,
+        cp8_second_local_sums,
+    )
+    expected_sample_sums = torch.cat(
+        (
+            cp1_local_sums,
+            cp2_local_sums.reshape(-1, 2).sum(dim=1),
+            cp8_first_local_sums.sum().reshape(1),
+            cp8_second_local_sums.sum().reshape(1),
+        )
+    )
+
+    tracker_sum = sum(
+        (local_sums * configured_cp_size).sum() / parent_size for local_sums in scheduled_local_sums
+    )
+    nominal_num_microbatches = expected_sample_sums.numel() // configured_dp_size
+
+    torch.testing.assert_close(tracker_sum / nominal_num_microbatches, expected_sample_sums.mean())
+
+
+def test_indexer_logging_preserves_per_microbatch_group_updates():
+    """Shared logging keeps CSA's historical per-microbatch logical-group updates."""
+    helper = dsa_module.DSAIndexerLossLoggingHelper
+    first_group = object()
+    second_group = object()
+    helper.tracker.clear()
+
+    try:
+        helper.save_loss_to_tracker(
+            loss=torch.tensor(1.0), layer_number=1, num_layers=1, avg_group=first_group
+        )
+        helper.save_loss_to_tracker(
+            loss=torch.tensor(1.0), layer_number=1, num_layers=1, avg_group=second_group
+        )
+
+        torch.testing.assert_close(
+            helper.tracker["values"], helper.tracker["values"].new_tensor([2.0])
+        )
+        assert helper.tracker["avg_group"] is second_group
+        assert helper.tracker["needs_dp_avg"] is True
+    finally:
+        helper.tracker.clear()
+
+
+def test_dynamic_cp_indexer_reduction_does_not_average_dp_twice(monkeypatch):
+    """The physical DP x CP parent average already includes the DP dimension."""
+    helper = dsa_module.DSAIndexerLossLoggingHelper
+    pp_group = object()
+    parent_dp_cp_group = object()
+    dp_group = object()
+    calls = []
+    helper.tracker.clear()
+    helper.tracker.update(
+        {
+            "values": torch.tensor([3.0]),
+            "agreed_size": 1,
+            "reduce_group": None,
+            "avg_group": parent_dp_cp_group,
+            "needs_dp_avg": False,
+        }
+    )
+
+    monkeypatch.setattr(
+        dsa_module.parallel_state, "get_pipeline_model_parallel_group", lambda: pp_group
+    )
+    monkeypatch.setattr(
+        dsa_module.parallel_state, "get_data_parallel_group", lambda with_context_parallel: dp_group
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, op=None, group=None: calls.append((group, op)),
+    )
+
+    try:
+        helper.reduce_loss_in_tracker(num_layers=1)
+
+        assert [group for group, _ in calls] == [pp_group, parent_dp_cp_group]
+        assert calls[1][1] == torch.distributed.ReduceOp.AVG
+        assert all(group is not dp_group for group, _ in calls)
+    finally:
+        helper.tracker.clear()
+
+
 def test_dsv4_metric_logging_preserves_graph_groups_and_uses_indexer_layer_count(monkeypatch):
     """CUDA Graph reuse keeps groups, and only ratio-4 DSv4 layers enter the average."""
     helper = dsa_module.DSAIndexerLossLoggingHelper
@@ -465,6 +609,7 @@ def test_dsv4_metric_logging_preserves_graph_groups_and_uses_indexer_layer_count
             "values": torch.tensor([2.0, 0.0, 6.0, 0.0]),
             "reduce_group": reduce_group,
             "avg_group": avg_group,
+            "needs_dp_avg": False,
         }
     )
     recorded = []
@@ -489,5 +634,6 @@ def test_dsv4_metric_logging_preserves_graph_groups_and_uses_indexer_layer_count
         torch.testing.assert_close(helper.tracker["values"], torch.zeros(4))
         assert helper.tracker["reduce_group"] is reduce_group
         assert helper.tracker["avg_group"] is avg_group
+        assert helper.tracker["needs_dp_avg"] is False
     finally:
         helper.tracker.clear()

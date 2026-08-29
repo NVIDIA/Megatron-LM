@@ -16,6 +16,12 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_scoring_plan import (
+    IndexerScoringDecision,
+    IndexerScoringPlan,
+    report_unfused_scoring_once,
+    resolve_indexer_scoring_plan,
+)
 from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
 
 if TYPE_CHECKING:
@@ -153,26 +159,51 @@ def _supports_flash_mla_value_layout(kv_width: int, d_v: int) -> bool:
     return d_v == _FLASH_MLA_REQUIRED_VALUE_DIM and kv_width >= _FLASH_MLA_REQUIRED_VALUE_DIM
 
 
-def _get_multi_packed_cp_thd_metadata(
-    use_local_indexer_varlen: bool,
-    packed_seq_params: Optional["PackedSeqParams"],
-    single_packed_thd_sequence: bool,
-    cp_size: int,
+def _get_packed_thd_metadata(
+    use_local_indexer_varlen: bool, packed_seq_params: Optional["PackedSeqParams"]
 ) -> Tuple[Optional[Tensor], Optional[Tensor], Optional[int], Optional[int]]:
-    """Return packed metadata needed by the cuDNN multi-sequence THD indexer."""
-    if (
-        not use_local_indexer_varlen
-        or packed_seq_params is None
-        or single_packed_thd_sequence
-        or cp_size <= 1
-    ):
+    """Return packed metadata needed by the general cuDNN THD indexer."""
+    if not use_local_indexer_varlen or packed_seq_params is None:
         return None, None, None, None
-    cu_seqlens_q, cu_seqlens_k = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
+    cu_seqlens_q = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
+    if cu_seqlens_q is None:
+        cu_seqlens_q = getattr(packed_seq_params, "cu_seqlens_q", None)
+    cu_seqlens_k = getattr(packed_seq_params, "cu_seqlens_kv_padded", None)
+    if cu_seqlens_k is None:
+        cu_seqlens_k = getattr(packed_seq_params, "cu_seqlens_kv", None)
+    if cu_seqlens_q is None:
+        cu_seqlens_q = cu_seqlens_k
+    if cu_seqlens_k is None:
+        cu_seqlens_k = cu_seqlens_q
+    if cu_seqlens_q is None:
+        return None, None, None, None
     return (
         cu_seqlens_q,
         cu_seqlens_k,
-        packed_seq_params.max_seqlen_q,
-        packed_seq_params.max_seqlen_kv,
+        getattr(packed_seq_params, "max_seqlen_q", None),
+        getattr(packed_seq_params, "max_seqlen_kv", None),
+    )
+
+
+def _resolve_packed_layout_flags(
+    *,
+    use_local_indexer_varlen: bool,
+    single_packed_thd_sequence: bool,
+    packed_thd_causal_identity_layout: Optional[bool],
+    packed_thd_single_sequence: Optional[bool],
+) -> Tuple[bool, bool]:
+    """Prefer the new CP-independent facts while accepting direct legacy calls."""
+    return (
+        (
+            use_local_indexer_varlen
+            if packed_thd_causal_identity_layout is None
+            else packed_thd_causal_identity_layout
+        ),
+        (
+            single_packed_thd_sequence
+            if packed_thd_single_sequence is None
+            else packed_thd_single_sequence
+        ),
     )
 
 
@@ -203,6 +234,8 @@ def run_fused_dsa_attention(
     use_relu: bool,
     use_local_indexer_varlen: bool = False,
     single_packed_thd_sequence: bool = False,
+    packed_thd_causal_identity_layout: Optional[bool] = None,
+    packed_thd_single_sequence: Optional[bool] = None,
     local_packed_cp_rank: int = 0,
     local_packed_cp_query_start: int = 0,
     local_packed_cp_query_len: Optional[int] = None,
@@ -214,29 +247,37 @@ def run_fused_dsa_attention(
     ``use_fused_dsa_kernels`` before calling, so this hook assumes it was selected (matching
     the TileLang backend) and only validates that the requested shapes/layout are supported.
     """
+    use_local_indexer_varlen, single_packed_thd_sequence = _resolve_packed_layout_flags(
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+        packed_thd_causal_identity_layout=packed_thd_causal_identity_layout,
+        packed_thd_single_sequence=packed_thd_single_sequence,
+    )
     _assert_supported_indexer_scoring(use_relu)
     if (
         not absorbed_mla
         or value is not None
         or attn_mask_type != AttnMaskType.causal
+        or indexer_topk <= 0
+        or key.size(0) == 0
         or key.size(2) != 1
     ):
         return None
     if not torch.is_grad_enabled():
         loss_coeff = 0.0
-    # build_dsattention_forward_mask emits explicit varlen bounds even for the plain (non-packed,
-    # non-CP) causal case and flags them via ``varlen_is_plain_causal``. Those bounds are exactly
-    # equivalent to the no-varlen causal path the dense fused indexer loss was written for, so
-    # normalize them back to None: plain causal then takes the same fused path (relying on the
-    # kernel's internal causal masking) it took before that mask change, instead of declining
-    # dense loss and falling back to the slow reference-loss path. The flag carries the mask
-    # builder's structural knowledge, so we avoid the per-forward host/device sync a ``torch.equal``
-    # bounds comparison would force on this common path. Genuine packed/CP/custom-position varlen
-    # is left untouched (``varlen_is_plain_causal`` is False there) and is gated below, where it
-    # would otherwise trip the padded-row assert in FusedIndexerSparseAttnFunc.forward.
-    if cp_size == 1 and packed_seq_params is None and varlen_is_plain_causal:
-        varlen_starts = None
-        varlen_ends = None
+    # Plain causal bounds are equivalent to the no-varlen causal path the dense fused indexer
+    # loss was written for, so normalize them away: plain causal then takes the same fused path
+    # (relying on the kernel's internal causal masking) it took before that mask change, instead
+    # of declining dense loss and falling back to the slow reference-loss path. Genuine
+    # packed/CP/custom-position varlen is left untouched and is gated below, where it would
+    # otherwise trip the padded-row assert in FusedIndexerSparseAttnFunc.forward.
+    varlen_starts, varlen_ends = _normalize_plain_causal_bounds(
+        varlen_starts,
+        varlen_ends,
+        cp_size=cp_size,
+        packed_seq_params=packed_seq_params,
+        varlen_is_plain_causal=varlen_is_plain_causal,
+    )
     has_varlen = varlen_starts is not None or varlen_ends is not None or key_positions is not None
     if has_varlen:
         if varlen_starts is None or varlen_ends is None:
@@ -260,9 +301,7 @@ def run_fused_dsa_attention(
     sq, b, num_heads, _ = query.size()
     kv_full = key.squeeze(2).contiguous()
     packed_cu_seqlens_q, packed_cu_seqlens_k, packed_max_seqlen_q, packed_max_seqlen_k = (
-        _get_multi_packed_cp_thd_metadata(
-            use_local_indexer_varlen, packed_seq_params, single_packed_thd_sequence, cp_size
-        )
+        _get_packed_thd_metadata(use_local_indexer_varlen, packed_seq_params)
     )
     packed_thd_kwargs = {}
     if packed_cu_seqlens_q is not None:
@@ -345,6 +384,16 @@ def _get_topk_alignment() -> int:
     raise RuntimeError(f"cudnn fused DSA requires SM90+ (Hopper or later), got SM{sm[0]}{sm[1]}.")
 
 
+def _get_score_recompute_topk_alignment() -> int:
+    """Minimum top-K alignment required by cuDNN sparse score recompute."""
+    sm = _current_sm()
+    if sm[0] >= 10:
+        return 64
+    if sm[0] >= 9:
+        return 128
+    raise RuntimeError(f"cudnn fused DSA requires SM90+ (Hopper or later), got SM{sm[0]}{sm[1]}.")
+
+
 def _flash_mla_head_padding(num_heads: int) -> Optional[int]:
     """Padded query-head count FlashMLA supports for ``num_heads``, or None if unsupported.
 
@@ -413,6 +462,36 @@ def _bytes_to_chunk_rows(n_rows: int, bytes_per_row: int, max_bytes: int, alignm
 def _causal_seq_lens(q_positions: Tensor, ratio: int, sk: int) -> Tensor:
     """Per-query causal key length under the indexer ``ratio``, clamped to ``sk``."""
     return ((q_positions + 1) // ratio).clamp(max=sk)
+
+
+def _normalize_plain_causal_bounds(
+    starts: Optional[Tensor],
+    ends: Optional[Tensor],
+    *,
+    cp_size: int,
+    packed_seq_params: Optional["PackedSeqParams"],
+    varlen_is_plain_causal: bool,
+) -> Tuple[Optional[Tensor], Optional[Tensor]]:
+    """Drop plain-causal varlen bounds so the single-kernel indexer scorer stays reachable.
+
+    ``build_dsattention_forward_mask`` emits explicit bounds even for the plain
+    (non-packed, non-CP) causal case and flags them via ``varlen_is_plain_causal``.
+    Those bounds are ``starts = 0`` and ``ends = arange(1, sq + 1).clamp(max=sk)``,
+    which is exactly what :func:`_causal_seq_lens` reconstructs internally under
+    ``_INDEXER_RATIO == 1``. Returning ``None`` here is therefore a no-op on
+    semantics, but it lets :func:`_indexer_topk_bshd` take its ``starts is None``
+    branch, which reaches the fused single-kernel ``indexer_forward_wrapper``
+    instead of the per-head scoring loop in
+    :func:`_compute_indexer_scores_chunk_with_global_rows`.
+
+    The flag carries the mask builder's structural knowledge, so we avoid the
+    per-forward host/device sync that a ``torch.equal`` bounds comparison would
+    force on this common path. Genuine packed/CP/custom-position varlen is left
+    untouched (``varlen_is_plain_causal`` is False there).
+    """
+    if cp_size == 1 and packed_seq_params is None and varlen_is_plain_causal:
+        return None, None
+    return starts, ends
 
 
 def _topk_tie_break_bias(positions: Tensor, key_count: int, dtype: torch.dtype) -> Tensor:
@@ -695,7 +774,88 @@ def _pad_topk_result(
     return topk_indices, topk_scores
 
 
-def _indexer_topk_multi_packed_cp_thd(
+def _packed_thd_kernel_applicable(
+    *,
+    b: int,
+    sq: int,
+    sk: int,
+    device: torch.device,
+    packed_cu_seqlens_q: Optional[Tensor],
+    packed_cu_seqlens_k: Optional[Tensor],
+    packed_max_seqlen_q: Optional[int],
+    packed_max_seqlen_k: Optional[int],
+    cp_size: int,
+    cp_rank: int,
+    local_packed_cp_query_start: int,
+    local_packed_cp_query_len: Optional[int],
+) -> bool:
+    """Whether the general THD scorer can safely consume this metadata.
+
+    This check is intentionally limited to structural facts available without reading a
+    CUDA tensor on the host. Value-level validation remains the packed-layout builder's
+    responsibility; doing it here would put a synchronization back in the layer hot path.
+    """
+    if (
+        b != 1
+        or cp_size < 1
+        or not 0 <= cp_rank < cp_size
+        or sk != sq * cp_size
+        or local_packed_cp_query_start != 0
+        or local_packed_cp_query_len not in (None, sq)
+        or packed_cu_seqlens_q is None
+        or packed_cu_seqlens_k is None
+        or packed_max_seqlen_q is None
+        or packed_max_seqlen_k is None
+        or packed_max_seqlen_q <= 0
+        or packed_max_seqlen_k <= 0
+    ):
+        return False
+    if (
+        packed_cu_seqlens_q.ndim != 1
+        or packed_cu_seqlens_k.ndim != 1
+        or packed_cu_seqlens_q.shape != packed_cu_seqlens_k.shape
+        or packed_cu_seqlens_q.numel() < 2
+    ):
+        return False
+    same_view = packed_cu_seqlens_q.device == packed_cu_seqlens_k.device and (
+        packed_cu_seqlens_q is packed_cu_seqlens_k
+        or (
+            packed_cu_seqlens_q.data_ptr() == packed_cu_seqlens_k.data_ptr()
+            and packed_cu_seqlens_q.storage_offset() == packed_cu_seqlens_k.storage_offset()
+            and packed_cu_seqlens_q.stride() == packed_cu_seqlens_k.stride()
+        )
+    )
+    same_boundaries = same_view or (
+        not packed_cu_seqlens_q.is_cuda
+        and not packed_cu_seqlens_k.is_cuda
+        and torch.equal(packed_cu_seqlens_q, packed_cu_seqlens_k)
+    )
+    # The packed scorer restores sequence-local top-k indices with the Q-derived
+    # row bounds. Differing K boundaries would silently map selected columns into
+    # another packed sequence, so decline unless equality is provable without a
+    # CUDA synchronization. Canonical self-attention schedulers preserve aliases.
+    if not same_boundaries:
+        return False
+    if cp_size > 1:
+        return sk % (2 * cp_size) == 0
+
+    # The CP1 path forwards cu-seqlens directly to cuDNN, so prove its stricter
+    # device, dtype, maximum-length, and contiguity requirements as well.
+    if (
+        packed_cu_seqlens_q.device != device
+        or packed_cu_seqlens_k.device != device
+        or packed_cu_seqlens_q.dtype != torch.int32
+        or packed_cu_seqlens_k.dtype != torch.int32
+        or packed_max_seqlen_q != packed_max_seqlen_k
+        or packed_max_seqlen_q > sq
+        or not packed_cu_seqlens_q.is_contiguous()
+        or not packed_cu_seqlens_k.is_contiguous()
+    ):
+        return False
+    return True
+
+
+def _indexer_topk_packed_thd(
     q_bshd: Tensor,
     k_bshd: Tensor,
     w_bsh: Tensor,
@@ -709,72 +869,98 @@ def _indexer_topk_multi_packed_cp_thd(
     packed_max_seqlen_k: int,
     cp_size: int,
     cp_rank: int,
+    local_packed_cp_query_start: int,
+    local_packed_cp_query_len: Optional[int],
 ) -> Tuple[Tensor, Optional[Tensor]]:
-    """Run cuDNN's THD indexer on packed CP front/back query segments."""
+    """Run cuDNN's general THD indexer for packed sequences at any CP size.
+
+    At CP1 the original packed Q/K/W tensors and cu-seqlens are passed directly to
+    cuDNN in one call. CP>1 retains the front/back segmented representation required by
+    zigzag context parallelism. Top-k selection and sequence-local to global index
+    restoration are shared by both representations.
+    """
     b, sq, _idx_nh, _idx_hd = q_bshd.shape
     sk = k_bshd.size(1)
-    if b != 1 or cp_size <= 1 or not 0 <= cp_rank < cp_size:
-        raise RuntimeError("packed CP cuDNN THD indexer requires b=1 and a valid CP rank")
-    if packed_cu_seqlens_q.numel() < 3:
-        raise RuntimeError(
-            "multi-sequence packed CP cuDNN THD indexer requires at least two sequences"
-        )
-    if packed_cu_seqlens_q.shape != packed_cu_seqlens_k.shape:
-        raise RuntimeError("packed CP cuDNN THD query/key cu_seqlens shapes must match")
-    if packed_max_seqlen_q <= 0 or packed_max_seqlen_k <= 0:
-        raise RuntimeError("packed CP cuDNN THD indexer requires positive maximum sequence lengths")
-
-    segment_divisor = 2 * cp_size
-    device = q_bshd.device
-    layout = dsa_layout.build_packed_cp_indexer_layout(
-        packed_cu_seqlens_q.to(device=device),
-        packed_cu_seqlens_k.to(device=device),
+    if not _packed_thd_kernel_applicable(
+        b=b,
+        sq=sq,
+        sk=sk,
+        device=q_bshd.device,
+        packed_cu_seqlens_q=packed_cu_seqlens_q,
+        packed_cu_seqlens_k=packed_cu_seqlens_k,
+        packed_max_seqlen_q=packed_max_seqlen_q,
+        packed_max_seqlen_k=packed_max_seqlen_k,
         cp_size=cp_size,
         cp_rank=cp_rank,
-        key_size=sk,
-    )
-    segmented_k = k_bshd[0].index_select(0, layout.source_indices).contiguous()
+        local_packed_cp_query_start=local_packed_cp_query_start,
+        local_packed_cp_query_len=local_packed_cp_query_len,
+    ):
+        raise RuntimeError("general packed THD scorer received incompatible layout metadata")
 
-    max_segment_q = packed_max_seqlen_q // segment_divisor
-    max_k_half = packed_max_seqlen_k // segment_divisor
-    max_segment_k = max((cp_rank + 1) * max_k_half, packed_max_seqlen_k - cp_rank * max_k_half)
+    device = q_bshd.device
+    if cp_size == 1:
+        score_q = q_bshd[0]
+        score_k = k_bshd[0]
+        score_w = w_bsh[0]
+        score_cu_q = packed_cu_seqlens_q
+        score_cu_k = packed_cu_seqlens_k
+        max_score_q = packed_max_seqlen_q
+        max_score_k = packed_max_seqlen_k
+    else:
+        segment_divisor = 2 * cp_size
+        layout = dsa_layout.build_packed_cp_indexer_layout(
+            packed_cu_seqlens_q.to(device=device),
+            packed_cu_seqlens_k.to(device=device),
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            key_size=sk,
+        )
+        score_q = q_bshd[0]
+        score_k = k_bshd[0].index_select(0, layout.source_indices).contiguous()
+        score_w = w_bsh[0]
+        score_cu_q = layout.segment_cu_q.to(dtype=torch.int32)
+        score_cu_k = layout.segment_cu_k.to(dtype=torch.int32)
+        max_score_q = packed_max_seqlen_q // segment_divisor
+        max_k_half = packed_max_seqlen_k // segment_divisor
+        max_score_k = max((cp_rank + 1) * max_k_half, packed_max_seqlen_k - cp_rank * max_k_half)
+
     scores = _cudnn_dsa.indexer_forward_wrapper(
-        q_bshd[0],
-        segmented_k,
-        w_bsh[0],
+        score_q,
+        score_k,
+        score_w,
         ratio=_INDEXER_RATIO,
         sm_scale=_INDEXER_SOFTMAX_SCALE,
-        cu_seqlens_q=layout.segment_cu_q.to(dtype=torch.int32),
-        cu_seqlens_k=layout.segment_cu_k.to(dtype=torch.int32),
-        max_seqlen_q=max_segment_q,
-        max_seqlen_k=max_segment_k,
+        cu_seqlens_q=score_cu_q,
+        cu_seqlens_k=score_cu_k,
+        max_seqlen_q=max_score_q,
+        max_seqlen_k=max_score_k,
     )["scores"]
 
-    segment_topk = min(topk_k, max_segment_k)
-    if segment_topk == max_segment_k:
+    score_topk = min(topk_k, max_score_k)
+    if score_topk == max_score_k:
         # Ranking is unnecessary when K covers every score column. This also
         # avoids cuDNN FE's vectorized-output restriction for large odd K.
-        topk_indices = torch.arange(segment_topk, dtype=torch.int32, device=device).view(
-            1, 1, segment_topk
+        topk_indices = torch.arange(score_topk, dtype=torch.int32, device=device).view(
+            1, 1, score_topk
         ) + starts.view(1, sq, 1).to(dtype=torch.int32)
-        topk_scores = scores.view(1, sq, segment_topk) if return_topk_scores else None
+        topk_scores = scores.view(1, sq, score_topk) if return_topk_scores else None
         return _pad_topk_result(topk_indices, topk_scores, topk_k)
 
-    local_seq_lens = (ends - starts).clamp(max=max_segment_k).to(torch.int32).contiguous()
-    use_tie_break = _use_dense_indexer_topk_tie_break(scores, segment_topk)
+    local_seq_lens = (ends - starts).clamp(max=max_score_k).to(torch.int32).contiguous()
+    use_tie_break = _use_dense_indexer_topk_tie_break(scores, score_topk)
     scores_for_topk = _add_indexer_topk_tie_break(scores, inplace=True) if use_tie_break else scores
     tk_result = _indexer_top_k_wrapper_chunked(
-        scores_for_topk, local_seq_lens, topk_k=segment_topk, return_topk_scores=return_topk_scores
+        scores_for_topk, local_seq_lens, topk_k=score_topk, return_topk_scores=return_topk_scores
     )
-    topk_indices = tk_result["indices"].view(1, sq, segment_topk)
+    topk_indices = tk_result["indices"].view(1, sq, score_topk)
     topk_scores = None
     if return_topk_scores:
         topk_scores = tk_result["values"]
         if topk_scores is None:
             raise RuntimeError("cuDNN indexer_top_k_wrapper did not return values.")
-        topk_scores = topk_scores.view(1, sq, segment_topk)
+        topk_scores = topk_scores.view(1, sq, score_topk)
         if use_tie_break:
-            topk_scores = _remove_indexer_topk_tie_break(topk_scores, topk_indices, max_segment_k)
+            topk_scores = _remove_indexer_topk_tie_break(topk_scores, topk_indices, max_score_k)
 
     valid = topk_indices >= 0
     topk_indices = torch.where(
@@ -789,6 +975,7 @@ def _indexer_topk_single_packed_cp_segments(
     w_bsh: Tensor,
     topk_k: int,
     return_topk_scores: bool,
+    cp_size: int,
     local_packed_cp_rank: int,
     local_packed_cp_query_start: int = 0,
     local_packed_cp_query_len: Optional[int] = None,
@@ -799,19 +986,28 @@ def _indexer_topk_single_packed_cp_segments(
     local_query_len = local_packed_cp_query_len if local_packed_cp_query_len is not None else sq
     local_query_start = local_packed_cp_query_start
     local_query_end = local_query_start + sq
-    if b != 1 or local_query_len % 2 != 0 or _INDEXER_RATIO != 1:
+    # Halving is what the zigzag context-parallel layout needs: every rank owns a front
+    # and a back chunk of equal length. A rank holding the whole sequence has no zigzag
+    # to undo, so it needs neither the split nor the even length that the split implies.
+    if not _segment_kernel_applicable(
+        b,
+        sq,
+        sk,
+        local_packed_cp_query_len,
+        cp_size,
+        local_packed_cp_rank,
+        local_packed_cp_query_start,
+    ):
         raise RuntimeError(
-            "single packed CP cuDNN fast path requires b=1, even local query length, ratio=1"
-        )
-    if local_query_start < 0 or local_query_end > local_query_len:
-        raise RuntimeError(
-            "single packed CP cuDNN fast path received an invalid query slice: "
-            f"start={local_query_start}, sq={sq}, local_query_len={local_query_len}"
+            "single packed THD segment scorer received incompatible CP/query/key geometry"
         )
 
     half = local_query_len // 2
-    if sk == local_query_len:
-        segment_specs = ((0, half, half), (half, local_query_len, local_query_len))
+    if cp_size == 1:
+        # One causal segment over the whole local sequence; per-row key lengths are still
+        # built from arange inside the loop, so this is the same masking as the split form
+        # and it does not require an even length.
+        segment_specs = ((0, local_query_len, local_query_len),)
     else:
         segment_specs = (
             (0, half, (local_packed_cp_rank + 1) * half),
@@ -828,7 +1024,7 @@ def _indexer_topk_single_packed_cp_segments(
         row_end = row_end_global - local_query_start
         if key_end <= 0 or key_end > sk:
             raise RuntimeError(
-                "single packed CP cuDNN fast path derived invalid key prefix: "
+                "single packed THD segment scorer derived invalid key prefix: "
                 f"key_end={key_end}, sk={sk}, cp_rank={local_packed_cp_rank}, sq={sq}"
             )
         segment_topk = min(topk_k, key_end)
@@ -859,7 +1055,7 @@ def _indexer_topk_single_packed_cp_segments(
 
     if not indices_chunks:
         raise RuntimeError(
-            "single packed CP cuDNN fast path query slice did not intersect any CP segment"
+            "single packed THD segment scorer query slice did not intersect any segment"
         )
 
     return (
@@ -1073,6 +1269,88 @@ def _topk_in_bounds(
     return in_range & valid_bounds
 
 
+def _segment_kernel_applicable(
+    b: int,
+    sq: int,
+    sk: int,
+    local_packed_cp_query_len: Optional[int],
+    cp_size: int,
+    cp_rank: int,
+    local_packed_cp_query_start: int,
+) -> bool:
+    """Whether ``_indexer_topk_single_packed_cp_segments`` can take this shape.
+
+    That kernel raises rather than returning None when its preconditions fail, so the
+    scoring plan has to ask before promising it. Kept next to the kernel so the two
+    cannot drift apart.
+    """
+    local_query_len = local_packed_cp_query_len if local_packed_cp_query_len is not None else sq
+    if (
+        b != 1
+        or _INDEXER_RATIO != 1
+        or cp_size < 1
+        or not 0 <= cp_rank < cp_size
+        or local_query_len <= 0
+        or local_packed_cp_query_start < 0
+        or local_packed_cp_query_start + sq > local_query_len
+    ):
+        return False
+    # An odd local length only rules out the halved zigzag form; a rank holding the whole
+    # sequence takes the single-segment form, which has no parity requirement.
+    expected_key_len = local_query_len if cp_size == 1 else local_query_len * cp_size
+    if sk != expected_key_len:
+        return False
+    whole_sequence_local = cp_size == 1
+    if not whole_sequence_local and local_query_len % 2 != 0:
+        return False
+    if cp_size > 1:
+        half = local_query_len // 2
+        if (cp_rank + 1) * half > sk or sk - cp_rank * half <= 0:
+            return False
+    return True
+
+
+def _resolve_scoring_plan_for_call(
+    *,
+    starts: Optional[Tensor],
+    ends: Optional[Tensor],
+    varlen_is_plain_causal: bool,
+    packed_thd: bool,
+    cp_size: int,
+    use_local_indexer_varlen: bool,
+    single_packed_thd_sequence: bool,
+    packed_metadata_available: bool,
+    segment_kernel_applicable: bool = True,
+) -> IndexerScoringDecision:
+    """Map this call's layout facts onto a scoring plan.
+
+    ``use_local_indexer_varlen`` encodes "packed, causal, identity key positions" -- it
+    is how the caller reports a layout the packed kernels can accept. CP size is an
+    independent geometry fact consumed by the selected executor.
+    It is unpacked here rather than re-tested downstream, so each resolver argument
+    keeps exactly one meaning.
+    """
+    no_explicit_bounds = starts is None and ends is None
+    return resolve_indexer_scoring_plan(
+        bounds_available=no_explicit_bounds or (starts is not None and ends is not None),
+        varlen_is_plain_causal=varlen_is_plain_causal or no_explicit_bounds,
+        packed_thd=packed_thd,
+        cp_size=cp_size,
+        # Non-packed callers cannot report their mask type from here; they are
+        # treated as causal, so a non-causal non-packed layout lands on the generic
+        # "not reconstructible" reason rather than the dedicated non-causal one.
+        # Likewise packed_thd below is inferred from what the packed kernels could
+        # consume, so a packed layout no packed kernel claims is diagnosed with the
+        # non-packed reason. The dispatch outcome (UNFUSED_BOUNDS) is the same in
+        # every such case; only the diagnostic wording is generic.
+        mask_is_causal=use_local_indexer_varlen or not packed_thd,
+        explicit_key_positions=False,
+        single_sequence_pack=single_packed_thd_sequence,
+        packed_metadata_available=packed_metadata_available,
+        segment_kernel_applicable=segment_kernel_applicable,
+    )
+
+
 def _indexer_topk_bshd(
     q_bshd: Tensor,
     k_bsd: Tensor,
@@ -1093,6 +1371,7 @@ def _indexer_topk_bshd(
     packed_max_seqlen_q: Optional[int] = None,
     packed_max_seqlen_k: Optional[int] = None,
     packed_cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
     """BSHD-layout indexer scoring and top-K selection.
 
@@ -1110,10 +1389,9 @@ def _indexer_topk_bshd(
         * ``score_payload``: full scores when ``return_scores=True``, top-k
           scores when ``return_topk_scores=True``, otherwise ``None``.
 
-    ``use_local_indexer_varlen`` is an optimized packed-CP path for a single
-    packed sequence. It scores the local query rows directly instead of
-    scattering them to their global query positions first, then applies the
-    explicit starts/ends mask before top-k selection.
+    ``use_local_indexer_varlen`` identifies a packed causal identity-key layout. The
+    selected packed executor scores compact local query rows directly, then restores
+    sequence-local top-k indices to the global packed key coordinate space.
     """
     _ensure_dsa_namespace()
 
@@ -1140,7 +1418,46 @@ def _indexer_topk_bshd(
 
     k_bshd = k_bsd.unsqueeze(2)  # (b, sk, 1, idx_hd)
 
-    if starts is None:
+    scoring_plan = _resolve_scoring_plan_for_call(
+        segment_kernel_applicable=_segment_kernel_applicable(
+            b,
+            sq,
+            sk,
+            local_packed_cp_query_len,
+            packed_cp_size,
+            local_packed_cp_rank,
+            local_packed_cp_query_start,
+        ),
+        starts=starts,
+        ends=ends,
+        varlen_is_plain_causal=varlen_is_plain_causal,
+        packed_thd=use_local_indexer_varlen or packed_cu_seqlens_q is not None,
+        cp_size=packed_cp_size,
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+        packed_metadata_available=_packed_thd_kernel_applicable(
+            b=b,
+            sq=sq,
+            sk=sk,
+            device=device,
+            packed_cu_seqlens_q=packed_cu_seqlens_q,
+            packed_cu_seqlens_k=packed_cu_seqlens_k,
+            packed_max_seqlen_q=packed_max_seqlen_q,
+            packed_max_seqlen_k=packed_max_seqlen_k,
+            cp_size=packed_cp_size,
+            cp_rank=local_packed_cp_rank,
+            local_packed_cp_query_start=local_packed_cp_query_start,
+            local_packed_cp_query_len=local_packed_cp_query_len,
+        ),
+    )
+    plan = scoring_plan.plan
+    report_unfused_scoring_once(scoring_plan, "indexer scoring")
+    if plan is IndexerScoringPlan.DECLINE:
+        raise RuntimeError(f"invalid DSA scoring dispatch: {scoring_plan.reason}")
+
+    # PLAIN_CAUSAL means the bounds, if any, are the trivial whole-sequence causal ones
+    # that ``_causal_seq_lens`` rebuilds exactly, so the single-kernel scorer applies.
+    if starts is None or plan is IndexerScoringPlan.PLAIN_CAUSAL:
         q_idx = torch.arange(sq, device=device)
         seq_lens = _causal_seq_lens(q_idx, _INDEXER_RATIO, sk).to(torch.int32).repeat(b)
         if not return_scores:
@@ -1155,26 +1472,20 @@ def _indexer_topk_bshd(
             ]  # (b, sq, sk) fp32, -inf on masked positions
     else:
         seq_lens = ends.clamp(max=sk).to(torch.int32).repeat(b)
-        if not return_scores and use_local_indexer_varlen and single_packed_thd_sequence:
+        if not return_scores and plan is IndexerScoringPlan.PACKED_SINGLE_SEGMENTS:
             topk_indices, topk_scores = _indexer_topk_single_packed_cp_segments(
                 q_bshd,
                 k_bshd,
                 w_bsh,
                 topk_k,
                 return_topk_scores,
+                packed_cp_size,
                 local_packed_cp_rank,
                 local_packed_cp_query_start,
                 local_packed_cp_query_len,
             )
-        elif (
-            not return_scores
-            and use_local_indexer_varlen
-            and packed_cu_seqlens_q is not None
-            and packed_cu_seqlens_k is not None
-            and packed_max_seqlen_q is not None
-            and packed_max_seqlen_k is not None
-        ):
-            topk_indices, topk_scores = _indexer_topk_multi_packed_cp_thd(
+        elif not return_scores and plan is IndexerScoringPlan.PACKED_THD_GENERAL:
+            topk_indices, topk_scores = _indexer_topk_packed_thd(
                 q_bshd,
                 k_bshd,
                 w_bsh,
@@ -1188,6 +1499,8 @@ def _indexer_topk_bshd(
                 packed_max_seqlen_k,
                 packed_cp_size,
                 local_packed_cp_rank,
+                local_packed_cp_query_start,
+                local_packed_cp_query_len,
             )
         elif not return_scores:
             topk_indices, topk_scores = _indexer_topk_from_score_chunks(
@@ -1330,8 +1643,17 @@ def run_fused_qk_topk(
     local_packed_cp_query_len: Optional[int] = None,
     packed_seq_params: Optional["PackedSeqParams"] = None,
     cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
+    packed_thd_causal_identity_layout: Optional[bool] = None,
+    packed_thd_single_sequence: Optional[bool] = None,
 ) -> Optional[Tuple[Tensor, Tensor]]:
     """Run the cuDNN fused indexer and return top-k indices for split DSA."""
+    use_local_indexer_varlen, single_packed_thd_sequence = _resolve_packed_layout_flags(
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+        packed_thd_causal_identity_layout=packed_thd_causal_identity_layout,
+        packed_thd_single_sequence=packed_thd_single_sequence,
+    )
     _assert_supported_indexer_scoring(use_relu)
     del block_size
     if q.ndim != 4 or k.ndim != 3 or weights.ndim != 3:
@@ -1340,13 +1662,14 @@ def run_fused_qk_topk(
         return None
     if q.size(2) != weights.size(2) or q.size(3) != k.size(2):
         return None
+    # Bounds the caller could not build at all are a genuine decline, which is a
+    # different thing from bounds that exist but describe a layout a fused kernel can
+    # rebuild for itself. The scoring plan distinguishes the two.
     if starts is None or ends is None:
         return None
 
     packed_cu_seqlens_q, packed_cu_seqlens_k, packed_max_seqlen_q, packed_max_seqlen_k = (
-        _get_multi_packed_cp_thd_metadata(
-            use_local_indexer_varlen, packed_seq_params, single_packed_thd_sequence, cp_size
-        )
+        _get_packed_thd_metadata(use_local_indexer_varlen, packed_seq_params)
     )
     q_bshd, k_bsd, w_bsh = _sbhd_to_bshd_indexer_inputs(q, k, weights)
     topk_indices, topk_length, _score_payload = _indexer_topk_bshd(
@@ -1369,6 +1692,7 @@ def run_fused_qk_topk(
         packed_max_seqlen_q=packed_max_seqlen_q,
         packed_max_seqlen_k=packed_max_seqlen_k,
         packed_cp_size=cp_size,
+        varlen_is_plain_causal=varlen_is_plain_causal,
     )
     return topk_indices, topk_length
 
@@ -1397,8 +1721,17 @@ def run_fused_qk_topk_with_loss(
     local_packed_cp_query_len: Optional[int] = None,
     packed_seq_params: Optional["PackedSeqParams"] = None,
     cp_size: int = 1,
+    varlen_is_plain_causal: bool = False,
+    packed_thd_causal_identity_layout: Optional[bool] = None,
+    packed_thd_single_sequence: Optional[bool] = None,
 ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
     """Run cuDNN fused indexer and sparse indexer loss for split DSA."""
+    use_local_indexer_varlen, single_packed_thd_sequence = _resolve_packed_layout_flags(
+        use_local_indexer_varlen=use_local_indexer_varlen,
+        single_packed_thd_sequence=single_packed_thd_sequence,
+        packed_thd_causal_identity_layout=packed_thd_causal_identity_layout,
+        packed_thd_single_sequence=packed_thd_single_sequence,
+    )
     del block_size
     tp_group = getattr(pg_collection, "tp", None)
     _assert_supported_indexer_scoring(use_relu)
@@ -1416,6 +1749,9 @@ def run_fused_qk_topk_with_loss(
         return None
     if query.size(3) != key.size(3):
         return None
+    # Bounds the caller could not build at all are a genuine decline, which is a
+    # different thing from bounds that exist but describe a layout a fused kernel can
+    # rebuild for itself. The scoring plan distinguishes the two.
     if starts is None or ends is None:
         return None
 
@@ -1428,9 +1764,7 @@ def run_fused_qk_topk_with_loss(
         return None
 
     packed_cu_seqlens_q, packed_cu_seqlens_k, packed_max_seqlen_q, packed_max_seqlen_k = (
-        _get_multi_packed_cp_thd_metadata(
-            use_local_indexer_varlen, packed_seq_params, single_packed_thd_sequence, cp_size
-        )
+        _get_packed_thd_metadata(use_local_indexer_varlen, packed_seq_params)
     )
     return FusedQKTopKWithSparseLossFunc.apply(
         q.contiguous(),
@@ -1443,8 +1777,8 @@ def run_fused_qk_topk_with_loss(
         loss_coeff,
         calculate_per_token_loss,
         latent_v_channels,
-        starts.contiguous(),
-        ends.contiguous(),
+        starts.contiguous() if starts is not None else None,
+        ends.contiguous() if ends is not None else None,
         query_valid_rows,
         use_local_indexer_varlen,
         single_packed_thd_sequence,
@@ -1457,6 +1791,7 @@ def run_fused_qk_topk_with_loss(
         packed_max_seqlen_k,
         cp_size,
         tp_group,
+        varlen_is_plain_causal,
     )
 
 
@@ -1599,6 +1934,14 @@ def _compute_attn_target(
     """
     _ensure_dsa_namespace()
     q_attn_bshd, lse, qhead_per_kv_head = _pad_attn_target_heads(q_attn_bshd, lse)
+    logical_topk = topk_indices.size(-1)
+    if topk_indices.is_cuda:
+        topk_alignment = _get_score_recompute_topk_alignment()
+        padded_topk = round_up_to_nearest_multiple(logical_topk, topk_alignment)
+        if padded_topk != logical_topk:
+            topk_indices = torch.nn.functional.pad(
+                topk_indices, (0, padded_topk - logical_topk), value=-1
+            )
     kwargs = {"qhead_per_kv_head": qhead_per_kv_head, "topk_indices_global": False}
     if topk_length is not None:
         kwargs["topk_length"] = topk_length.to(dtype=torch.int32, device=topk_indices.device)
@@ -1610,7 +1953,7 @@ def _compute_attn_target(
         softmax_scale,
         **kwargs,
     )
-    return result["target"].contiguous()
+    return result["target"][..., :logical_topk].contiguous()
 
 
 def _dense_attn_lse_chunk_rows(b: int, qhead_per_kv_head: int, sk: int, sq: int) -> int:
@@ -2011,9 +2354,9 @@ def _run_sparse_attention_backward(
     d: int,
     skv: int,
     grad_output: Tensor,
-    all_rows_nonempty: bool = False,
+    all_topk_rows_nonempty: bool = False,
 ) -> Tuple[Tensor, Tensor]:
-    """Run sparse attention backward, skipping rows that have no valid top-k entries."""
+    """Run sparse attention backward with fixed-shape handling for empty top-k rows."""
     d_v = out_flat.shape[-1]
     dO_flat = grad_output.reshape(sq * b, num_heads, d_v)
 
@@ -2042,56 +2385,29 @@ def _run_sparse_attention_backward(
         bwd_attn_sink[:num_heads] = attn_sink
 
     _ensure_dsa_namespace()
-    if all_rows_nonempty:
-        attn_bwd = _cudnn_dsa.sparse_attention_backward_wrapper(
-            bwd_q_flat,
-            kv_flat,
-            bwd_out_flat,
-            bwd_dO_flat,
-            bwd_lse,
-            bwd_attn_sink,
-            global_idxs,
-            softmax_scale=softmax_scale,
-            topk_length=topk_length,
-        )
-        grad_query_flat = attn_bwd["dq"]
-        if padded_num_heads != num_heads:
-            grad_query_flat = grad_query_flat[:, :num_heads, :].contiguous()
-        grad_kv_flat = attn_bwd["dkv"]
-        grad_query = grad_query_flat.reshape(sq, b, num_heads, d)
-        grad_kv_full = grad_kv_flat.reshape(skv, b, kv_flat.size(-1))
-        return grad_query, grad_kv_full
-
-    valid_row_indices = torch.nonzero(topk_length > 0, as_tuple=False).flatten()
-    dummy_row_index = torch.full(
-        (1,), bwd_q_flat.size(0), dtype=valid_row_indices.dtype, device=valid_row_indices.device
-    )
-    compact_row_indices = torch.cat((valid_row_indices, dummy_row_index), dim=0)
-
-    # Add one zero-gradient row so the cuDNN wrapper never receives an empty query batch.
-    bwd_q_flat = torch.cat((bwd_q_flat, torch.zeros_like(bwd_q_flat[:1])), dim=0)
-    bwd_out_flat = torch.cat((bwd_out_flat, torch.zeros_like(bwd_out_flat[:1])), dim=0)
-    bwd_dO_flat = torch.cat((bwd_dO_flat, torch.zeros_like(bwd_dO_flat[:1])), dim=0)
-    bwd_lse = torch.cat((bwd_lse, torch.zeros_like(bwd_lse[:1])), dim=0)
-    global_idxs = torch.cat((global_idxs, torch.zeros_like(global_idxs[:1])), dim=0)
-    topk_length = torch.cat((topk_length, torch.ones_like(topk_length[:1])), dim=0)
+    empty_rows = None
+    if not all_topk_rows_nonempty:
+        empty_rows = topk_length <= 0
+        topk_length = topk_length.masked_fill(empty_rows, 1)
+        bwd_dO_flat = bwd_dO_flat.masked_fill(empty_rows[:, None, None], 0)
+        bwd_lse = bwd_lse.masked_fill(empty_rows[:, None], 0)
 
     attn_bwd = _cudnn_dsa.sparse_attention_backward_wrapper(
-        bwd_q_flat.index_select(0, compact_row_indices).contiguous(),
+        bwd_q_flat,
         kv_flat,
-        bwd_out_flat.index_select(0, compact_row_indices).contiguous(),
-        bwd_dO_flat.index_select(0, compact_row_indices).contiguous(),
-        bwd_lse.index_select(0, compact_row_indices).contiguous(),
+        bwd_out_flat,
+        bwd_dO_flat,
+        bwd_lse,
         bwd_attn_sink,
-        global_idxs.index_select(0, compact_row_indices).contiguous(),
+        global_idxs,
         softmax_scale=softmax_scale,
-        topk_length=topk_length.index_select(0, compact_row_indices).contiguous(),
+        topk_length=topk_length,
     )
-    grad_query_valid = attn_bwd["dq"][:-1]
+    grad_query_flat = attn_bwd["dq"]
     if padded_num_heads != num_heads:
-        grad_query_valid = grad_query_valid[:, :num_heads, :].contiguous()
-    grad_query_flat = torch.zeros_like(q_flat)
-    grad_query_flat.index_copy_(0, valid_row_indices, grad_query_valid)
+        grad_query_flat = grad_query_flat[:, :num_heads, :].contiguous()
+    if empty_rows is not None:
+        grad_query_flat.masked_fill_(empty_rows[:, None, None], 0)
     grad_kv_flat = attn_bwd["dkv"]
 
     grad_query = grad_query_flat.reshape(sq, b, num_heads, d)
@@ -2199,6 +2515,23 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             )
         )
 
+        all_topk_rows_nonempty = (
+            effective_topk > 0
+            and skv > 0
+            and query_valid_rows is None
+            and (
+                (varlen_starts is None and varlen_ends is None and key_positions is None)
+                or (
+                    use_local_indexer_varlen
+                    and varlen_starts is not None
+                    and varlen_ends is not None
+                    and key_positions is None
+                )
+            )
+        )
+        if not all_topk_rows_nonempty:
+            global_idxs[:, 0].masked_fill_(topk_length_flat <= 0, 0)
+
         if need_indexer_loss:
             if sparse_loss:
                 if indexer_score_payload is None:
@@ -2282,13 +2615,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         ctx.num_heads = num_heads
         ctx.d = d
         ctx.skv = skv
-        ctx.all_sparse_bwd_rows_nonempty = (
-            query_valid_rows is None
-            and use_local_indexer_varlen
-            and varlen_starts is not None
-            and varlen_ends is not None
-            and key_positions is None
-        )
+        ctx.all_topk_rows_nonempty = all_topk_rows_nonempty
 
         output = out_flat.reshape(sq, b, num_heads, d_v).reshape(sq, b, num_heads * d_v)
         return output, indexer_loss
@@ -2326,7 +2653,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             d=d,
             skv=skv,
             grad_output=grad_output,
-            all_rows_nonempty=ctx.all_sparse_bwd_rows_nonempty,
+            all_topk_rows_nonempty=ctx.all_topk_rows_nonempty,
         )
 
         if ctx.has_precomputed_indexer_grads and grad_loss is not None:
@@ -2391,8 +2718,8 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         loss_coeff: float,
         calculate_per_token_loss: bool,
         d_v: int,
-        varlen_starts: Tensor,
-        varlen_ends: Tensor,
+        varlen_starts: Optional[Tensor],
+        varlen_ends: Optional[Tensor],
         query_valid_rows: Optional[Tensor],
         use_local_indexer_varlen: bool,
         single_packed_thd_sequence: bool,
@@ -2405,6 +2732,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         packed_max_seqlen_k: Optional[int],
         packed_cp_size: int,
         tp_group,
+        varlen_is_plain_causal: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Compute shared attention top-k metadata and sparse indexer loss."""
         _ensure_dsa_namespace()
@@ -2435,6 +2763,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             packed_max_seqlen_q=packed_max_seqlen_q,
             packed_max_seqlen_k=packed_max_seqlen_k,
             packed_cp_size=packed_cp_size,
+            varlen_is_plain_causal=varlen_is_plain_causal,
         )
 
         if indexer_score_payload is None:
@@ -2495,7 +2824,8 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         #   single_packed_thd_sequence, local_packed_cp_rank,
         #   local_packed_cp_query_start, local_packed_cp_query_len,
         #   packed_cu_seqlens_q, packed_cu_seqlens_k, packed_max_seqlen_q,
-        #   packed_max_seqlen_k, packed_cp_size, tp_group.
+        #   packed_max_seqlen_k, packed_cp_size, tp_group,
+        #   varlen_is_plain_causal.
         return (
             grad_q_indexer,
             grad_k_indexer,
@@ -2521,6 +2851,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # varlen_is_plain_causal
         )
 
 
@@ -2536,6 +2867,7 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         softmax_scale: float,
         d_v: int,
         topk_length: Optional[Tensor],
+        all_topk_rows_nonempty: bool,
     ) -> Tensor:
         """Run fused sparse attention for precomputed top-k metadata."""
         sq, b, num_heads, d = query.shape
@@ -2545,6 +2877,8 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
                 query, kv_full, topk_indices, softmax_scale, d_v, topk_length=topk_length
             )
         )
+        if not all_topk_rows_nonempty:
+            global_idxs[:, 0].masked_fill_(topk_length_flat <= 0, 0)
 
         ctx.save_for_backward(q_flat, kv_flat, attn_sink, global_idxs, out_flat, lse)
         ctx.softmax_scale = softmax_scale
@@ -2554,6 +2888,7 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         ctx.num_heads = num_heads
         ctx.d = d
         ctx.skv = skv
+        ctx.all_topk_rows_nonempty = all_topk_rows_nonempty
 
         return out_flat.reshape(sq, b, num_heads, d_v)
 
@@ -2579,9 +2914,10 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
             d=d,
             skv=skv,
             grad_output=grad_output,
+            all_topk_rows_nonempty=ctx.all_topk_rows_nonempty,
         )
 
-        return grad_query, grad_kv_full, None, None, None, None
+        return grad_query, grad_kv_full, None, None, None, None, None
 
 
 def run_fused_absorbed_sparse_attention(
@@ -2591,11 +2927,12 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[Tensor] = None,
+    all_topk_rows_nonempty: bool = False,
 ) -> Optional[Tensor]:
     """Run cuDNN/FlashMLA sparse attention using externally supplied top-k indices."""
     if query.ndim != 4 or key.ndim != 4 or topk_indices.ndim != 3:
         return None
-    if key.size(2) != 1 or v_channels <= 0:
+    if key.size(0) == 0 or key.size(2) != 1 or topk_indices.size(2) == 0 or v_channels <= 0:
         return None
     if query.size(0) != topk_indices.size(1) or query.size(1) != topk_indices.size(0):
         return None
@@ -2608,7 +2945,7 @@ def run_fused_absorbed_sparse_attention(
 
     kv_full = key.squeeze(2).contiguous()
     return FusedSparseAttentionFunc.apply(
-        query, kv_full, topk_indices, softmax_scale, v_channels, topk_length
+        query, kv_full, topk_indices, softmax_scale, v_channels, topk_length, all_topk_rows_nonempty
     )
 
 

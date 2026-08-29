@@ -30,6 +30,12 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_packed_allgather_cp_local_positions_from_host as _build_cp_positions_from_host,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_packed_allgather_cp_query_positions_and_key_reorder_from_host as _cp_reorder_from_host,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -37,6 +43,7 @@ from megatron.core.utils import ensure_params_ready, get_pg_size
 
 logger = logging.getLogger(__name__)
 _DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED = False
+_warned_mtp_sharing_fused_bypass = False
 
 try:
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
@@ -147,6 +154,7 @@ def _run_sparse_attention(
     varlen_ends: Optional[torch.Tensor],
     key_positions: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor] = None,
+    all_topk_rows_nonempty: bool = False,
 ) -> torch.Tensor:
     """Run sparse attention for absorbed and non-absorbed MLA paths."""
     if absorbed_mla:
@@ -174,6 +182,7 @@ def _run_sparse_attention(
                 softmax_scale,
                 latent_v_channels,
                 topk_length=topk_length,
+                all_topk_rows_nonempty=all_topk_rows_nonempty,
             )
         # Fused backends may decline unsupported shapes or layouts by returning
         # None, so keep the absorbed PyTorch path as the authoritative fallback.
@@ -204,6 +213,36 @@ def _run_sparse_attention(
         varlen_starts=varlen_starts,
         varlen_ends=varlen_ends,
         key_positions=key_positions,
+    )
+
+
+def _can_prove_all_topk_rows_nonempty(
+    *,
+    computes_topk: bool,
+    indexer_topk: int,
+    kv_sequence_length: int,
+    attention_mask: Optional[torch.Tensor],
+    query_valid_rows: Optional[torch.Tensor],
+    varlen_is_plain_causal: bool,
+    use_local_indexer_varlen: bool,
+    varlen_starts: Optional[torch.Tensor],
+    varlen_ends: Optional[torch.Tensor],
+    key_positions: Optional[torch.Tensor],
+) -> bool:
+    """Return a host-side certificate that every query row has at least one selected key."""
+    if (
+        not computes_topk
+        or indexer_topk <= 0
+        or kv_sequence_length <= 0
+        or attention_mask is not None
+        or query_valid_rows is not None
+    ):
+        return False
+    return varlen_is_plain_causal or (
+        use_local_indexer_varlen
+        and varlen_starts is not None
+        and varlen_ends is not None
+        and key_positions is None
     )
 
 
@@ -301,6 +340,9 @@ class DSAIndexerLossLoggingHelper:
         num_layers: int,
         reduce_group: torch.distributed.ProcessGroup = None,
         avg_group: torch.distributed.ProcessGroup = None,
+        dynamic_cp_parent_group: torch.distributed.ProcessGroup = None,
+        configured_cp_size: int = 1,
+        calculate_per_token_loss: bool = False,
     ):
         """Save the indexer loss for logging.
 
@@ -310,12 +352,32 @@ class DSAIndexerLossLoggingHelper:
             num_layers: The number of total layers.
             reduce_group: The group for reducing the loss.
             avg_group: The group for averaging the loss.
+            dynamic_cp_parent_group: Physical DP x CP group used to aggregate dynamic-CP
+                metric shards without retaining a per-microbatch logical subgroup.
+            configured_cp_size: Configured/static CP width, i.e. the static CP-SUM factor.
+                Used to preserve the nominal global-batch average when dynamic CP repacks
+                samples into fewer microbatches.
+            calculate_per_token_loss: Whether ``loss`` is a raw local token sum.
         """
         # Skip indexer loss logging if layer_number is None.
         if layer_number is None:
             return
 
         tracker = DSAIndexerLossLoggingHelper.tracker
+        logging_loss = loss.detach()
+        needs_dp_avg = True
+        if dynamic_cp_parent_group is not None:
+            if configured_cp_size < 1:
+                raise ValueError("configured_cp_size must be positive for dynamic CP logging.")
+            # Dynamic CP repacks the nominal N * DP samples into a variable number of
+            # scheduled microbatches. Logging still divides by nominal N. Parent-averaging
+            # each rank's raw token sum times configured CP gives every logical sample weight
+            # 1 / DP regardless of its effective CP size, matching static CP-SUM then DP-AVG.
+            if calculate_per_token_loss:
+                logging_loss = logging_loss * configured_cp_size
+            reduce_group = None
+            avg_group = dynamic_cp_parent_group
+            needs_dp_avg = False
         # Tracker must be at least max(num_layers, layer_number) so hybrid MTP layers
         # (whose layer_number can exceed config.num_layers + config.mtp_num_layers when
         # each MTP depth contains multiple hybrid layers) don't index out of bounds.
@@ -329,9 +391,14 @@ class DSAIndexerLossLoggingHelper:
             )
             grown[: tracker["values"].shape[0]] = tracker["values"]
             tracker["values"] = grown
-        tracker["values"][layer_number - 1] += loss.detach()
+        tracker["values"][layer_number - 1] += logging_loss
+        # Preserve the historical last-writer behavior for callers such as CSA that replace
+        # their logical CP group per microbatch. Ordinary DSA dynamic CP passes a stable parent
+        # DP x CP group here, so its parent reduction metadata remains stable without imposing a
+        # new global invariant on all users of this shared helper.
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
+        tracker["needs_dp_avg"] = needs_dp_avg
 
     @staticmethod
     def clean_loss_in_tracker(preserve_groups: bool = False):
@@ -339,10 +406,12 @@ class DSAIndexerLossLoggingHelper:
         tracker = DSAIndexerLossLoggingHelper.tracker
         reduce_group = tracker.get("reduce_group") if preserve_groups else None
         avg_group = tracker.get("avg_group") if preserve_groups else None
+        needs_dp_avg = tracker.get("needs_dp_avg", True) if preserve_groups else True
         if "values" in tracker:
             tracker["values"].zero_()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
+        tracker["needs_dp_avg"] = needs_dp_avg
 
     @staticmethod
     def reduce_loss_in_tracker(num_layers: Optional[int] = None):
@@ -401,11 +470,12 @@ class DSAIndexerLossLoggingHelper:
             torch.distributed.all_reduce(
                 values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
-        torch.distributed.all_reduce(
-            values,
-            group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-            op=torch.distributed.ReduceOp.AVG,
-        )
+        if tracker.get("needs_dp_avg", True):
+            torch.distributed.all_reduce(
+                values,
+                group=parallel_state.get_data_parallel_group(with_context_parallel=False),
+                op=torch.distributed.ReduceOp.AVG,
+            )
 
     @staticmethod
     def track_indexer_metrics(
@@ -1938,6 +2008,7 @@ class DSAttention(MegatronModule):
     requires_dsa_inputs = True
     _HOLDER_ATTR = "_dsa_index_share_topk_holder"
     _LENGTH_HOLDER_ATTR = "_dsa_index_share_topk_length_holder"
+    _LAYOUT_HOLDER_ATTR = "_dsa_packed_cp_layout_holder"
 
     def __init__(
         self,
@@ -1964,6 +2035,29 @@ class DSAttention(MegatronModule):
         self.skip_topk = self.index_share and is_dsa_skip_topk_layer(
             self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
         )
+        self.mtp_index_share = self.config.dsa_mtp_index_kv_share and is_mtp_layer
+        global _warned_mtp_sharing_fused_bypass
+        if (
+            self.mtp_index_share
+            and dsa_kernels.use_fused_dsa_kernels(self.config)
+            and not _warned_mtp_sharing_fused_bypass
+        ):
+            _warned_mtp_sharing_fused_bypass = True
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "dsa_mtp_index_kv_share=True requires reusable top-k indices, which the "
+                "combined fused DSA kernel does not expose. The repeated MTP layer therefore "
+                "uses the separable top-k and sparse-attention path; configured fused kernels "
+                "for those operations remain eligible. Benchmark this tradeoff for the target "
+                "MTP depth.",
+            )
+        if self.mtp_index_share and self.skip_topk:
+            raise ValueError(
+                "dsa_mtp_index_kv_share requires the repeated MTP layer to compute "
+                "its own top-k. Adjust dsa_indexer_skip_topk_offset/topk_freq so MTP layer "
+                f"{self.layer_number} is a computing layer."
+            )
         self.source_layer = (
             source_dsa_compute_layer(
                 self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
@@ -2023,6 +2117,45 @@ class DSAttention(MegatronModule):
             setattr(carrier, self._LENGTH_HOLDER_ATTR, holder)
         return holder
 
+    def _get_packed_cp_layout_cache(
+        self, packed_seq_params: Optional[PackedSeqParams]
+    ) -> Optional[dict]:
+        """Return the per-microbatch memo for packed-CP layout metadata, or None.
+
+        The CP query positions and key reorder indices depend only on
+        ``cu_seqlens_q``/``cu_seqlens_kv``, ``cp_size``, ``cp_rank`` and the
+        requested output sizes. All of those are identical for every layer in a
+        microbatch, yet each layer rebuilds them, and each rebuild loops
+        ``cp_size`` times over :func:`build_packed_allgather_cp_local_positions`,
+        whose boolean-mask indexing has data-dependent output shapes and so
+        forces a device-to-host size readback.
+
+        ``PackedSeqParams`` is the only carrier used here. It is constructed per
+        microbatch, so a memo hung on it cannot outlive the layout it describes
+        -- which matters under dynamic CP, where the layout changes between
+        microbatches. The index-share top-k holders fall back to
+        ``attention_mask``/``self.config``, but that is only safe because every
+        computing layer overwrites its slot before any sharing layer reads it. A
+        layout memo has no such write-before-read ordering and ``self.config``
+        outlives the microbatch, so caching there could serve a stale layout.
+        """
+        if packed_seq_params is None:
+            return None
+        cache = getattr(packed_seq_params, self._LAYOUT_HOLDER_ATTR, None)
+        if cache is None:
+            cache = {}
+            setattr(packed_seq_params, self._LAYOUT_HOLDER_ATTR, cache)
+        return cache
+
+    @staticmethod
+    def _memoized(cache: Optional[dict], key: tuple, build):
+        """Return ``cache[key]``, building it on first use. No-op when cache is None."""
+        if cache is None:
+            return build()
+        if key not in cache:
+            cache[key] = build()
+        return cache[key]
+
     def backward_dw(self):
         """Compute the deferred weight gradients (delay_wgrad_compute) of the indexer."""
         if self.indexer is not None:
@@ -2041,6 +2174,7 @@ class DSAttention(MegatronModule):
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
         up_v_weight: Optional[torch.Tensor] = None,
+        mtp_dsa_context=None,
     ):
         """
         Forward pass for Sparse Attention.
@@ -2060,6 +2194,18 @@ class DSAttention(MegatronModule):
         Returns:
             output: Output tensor [sq, b, hidden_size]
         """
+        if self.mtp_index_share and mtp_dsa_context is None:
+            raise RuntimeError(
+                "The repeated MTP DSA layer requires an explicit per-iteration sharing context. "
+                "Serial compute_mtp_single_step speculative inference does not provide this "
+                "context; disable dsa_mtp_index_kv_share or speculative decoding."
+            )
+        if not self.mtp_index_share and mtp_dsa_context is not None:
+            raise RuntimeError(
+                "Received an MTP DSA sharing context for an attention layer that is not "
+                "configured for MTP iteration sharing."
+            )
+        reuse_mtp_source = bool(mtp_dsa_context is not None and mtp_dsa_context.reuses_source)
         query, _ = dsa_layout.ensure_sbhd(query, "query")
         key, _ = dsa_layout.ensure_sbhd(key, "key")
         if value is not None:
@@ -2122,11 +2268,21 @@ class DSAttention(MegatronModule):
         nonpacked_query_positions = None
         kv_reorder_idx = None
         single_packed_thd_sequence = False
+        # Layout metadata is identical for every layer in a microbatch; memoize it on
+        # the per-microbatch PackedSeqParams so only the first DSA layer pays for it.
+        layout_cache = self._get_packed_cp_layout_cache(packed_seq_params)
         if packed_thd:
             cu_seqlens_q, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
-            single_packed_thd_sequence = (
-                cp_size > 1 and cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
-            )
+            # Host copies of the compacted cu_seqlens, stored by
+            # prebuild_thd_cp_partition_routes at batch-construction time. When
+            # present, the layout builders below run entirely on the host: no
+            # kernels, no device readbacks, one async copy of the finished table.
+            host_cu_q = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_q", None)
+            host_cu_kv = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_kv", None)
+            # Whether the pack holds one sequence is a fact about the pack, not about
+            # context parallelism; which kernels accept that layout is the scoring
+            # plan's decision. Consumers that genuinely need CP already test cp_size.
+            single_packed_thd_sequence = cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
             packed_query_output_size = (
                 sequence_parallel_tp_full_rows if sequence_parallel_tp else sq
             )
@@ -2137,12 +2293,26 @@ class DSAttention(MegatronModule):
                     row_start, row_start + sq, dtype=torch.int64, device=query.device
                 )
             elif sequence_parallel_tp and cp_size > 1:
-                packed_query_positions_full = dsa_layout.build_packed_allgather_cp_local_positions(
-                    cu_seqlens_q,
-                    cp_size,
-                    cp_rank,
-                    query.device,
-                    output_size=packed_query_output_size,
+                packed_query_positions_full = self._memoized(
+                    layout_cache,
+                    ("local_positions", cp_size, cp_rank, packed_query_output_size),
+                    lambda: (
+                        _build_cp_positions_from_host(
+                            host_cu_q,
+                            cp_size,
+                            cp_rank,
+                            query.device,
+                            output_size=packed_query_output_size,
+                        )
+                        if host_cu_q is not None
+                        else dsa_layout.build_packed_allgather_cp_local_positions(
+                            cu_seqlens_q,
+                            cp_size,
+                            cp_rank,
+                            query.device,
+                            output_size=packed_query_output_size,
+                        )
+                    ),
                 )
                 if sequence_parallel_query_is_local:
                     row_start = sequence_parallel_tp_row_start
@@ -2162,19 +2332,45 @@ class DSAttention(MegatronModule):
                     and isinstance(packed_seq_params.max_seqlen_kv, int)
                     and packed_seq_params.max_seqlen_kv == packed_global_output_size
                 )
-                packed_query_positions, kv_reorder_idx = (
-                    dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_kv=cu_seqlens_kv,
-                        cp_size=cp_size,
-                        cp_rank=cp_rank,
-                        device=query.device,
-                        local_output_size=packed_query_output_size,
-                        key_local_output_size=packed_query_output_size,
-                        global_output_size=packed_global_output_size,
-                        query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
-                        key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
-                    )
+                packed_query_positions, kv_reorder_idx = self._memoized(
+                    layout_cache,
+                    (
+                        "positions_and_reorder",
+                        cp_size,
+                        cp_rank,
+                        packed_query_output_size,
+                        packed_query_output_size,
+                        packed_global_output_size,
+                        query_cu_seqlens_cover_output,
+                        key_cu_seqlens_cover_output,
+                    ),
+                    lambda: (
+                        _cp_reorder_from_host(
+                            host_cu_q,
+                            host_cu_kv,
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
+                            device=query.device,
+                            local_output_size=packed_query_output_size,
+                            key_local_output_size=packed_query_output_size,
+                            global_output_size=packed_global_output_size,
+                            query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                        )
+                        if host_cu_q is not None and host_cu_kv is not None
+                        else dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                            cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_kv,
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
+                            device=query.device,
+                            local_output_size=packed_query_output_size,
+                            key_local_output_size=packed_query_output_size,
+                            global_output_size=packed_global_output_size,
+                            query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                        )
+                    ),
                 )
             if packed_query_positions is not None:
                 packed_query_positions = packed_query_positions.contiguous()
@@ -2182,7 +2378,6 @@ class DSAttention(MegatronModule):
             _validate_nonpacked_cp_uniform_length(
                 sq=sq, skv=key.size(0), cp_size=cp_size, cp_group=cp_group, device=query.device
             )
-
         if sequence_parallel_tp:
             if key.size(0) == local_sequence_rows:
                 key = gather_from_sequence_parallel_region(key, group=tp_group)
@@ -2215,15 +2410,45 @@ class DSAttention(MegatronModule):
             # Gather local-sequence tensors, then undo MCore's zigzag rank order.
             def _build_kv_reorder_idx(local_len):
                 if packed_thd:
-                    _, idx = dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_kv=cu_seqlens_kv,
-                        cp_size=cp_size,
-                        cp_rank=cp_rank,
-                        device=query.device,
-                        local_output_size=local_len,
-                        key_local_output_size=local_len,
-                        global_output_size=local_len * cp_size,
+                    # Same memo key shape as the branch above, so when the output sizes
+                    # coincide this reuses that result instead of rerunning the cp_size loop.
+                    _, idx = self._memoized(
+                        layout_cache,
+                        (
+                            "positions_and_reorder",
+                            cp_size,
+                            cp_rank,
+                            local_len,
+                            local_len,
+                            local_len * cp_size,
+                            False,
+                            False,
+                        ),
+                        lambda: (
+                            _cp_reorder_from_host(
+                                host_cu_q,
+                                host_cu_kv,
+                                cp_size=cp_size,
+                                cp_rank=cp_rank,
+                                device=query.device,
+                                local_output_size=local_len,
+                                key_local_output_size=local_len,
+                                global_output_size=local_len * cp_size,
+                            )
+                            if host_cu_q is not None and host_cu_kv is not None
+                            else (
+                                dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder
+                            )(
+                                cu_seqlens_q=cu_seqlens_q,
+                                cu_seqlens_kv=cu_seqlens_kv,
+                                cp_size=cp_size,
+                                cp_rank=cp_rank,
+                                device=query.device,
+                                local_output_size=local_len,
+                                key_local_output_size=local_len,
+                                global_output_size=local_len * cp_size,
+                            )
+                        ),
                     )
                     return idx
                 return dsa_layout.build_zigzag_allgather_cp_key_reorder(
@@ -2268,6 +2493,11 @@ class DSAttention(MegatronModule):
 
         skv = key.size(0)
 
+        if mtp_dsa_context is not None and mtp_dsa_context.is_source:
+            source_key = key
+        else:
+            source_key = None
+
         if not packed_thd and sequence_parallel_query_is_local:
             nonpacked_query_positions = dsa_layout.extract_query_positions_from_position_ids(
                 position_ids, sq, query.device
@@ -2292,7 +2522,7 @@ class DSAttention(MegatronModule):
         qr = qr.detach()
 
         indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
-        computes_topk = not self.skip_topk
+        computes_topk = not self.skip_topk and not reuse_mtp_source
         use_indexer_loss = (
             self.training and torch.is_grad_enabled() and indexer_loss_coeff > 0 and computes_topk
         )
@@ -2328,9 +2558,11 @@ class DSAttention(MegatronModule):
         )
         use_fused_kernels = dsa_kernels.use_fused_dsa_kernels(self.config)
         sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
+        # Reports a packed causal layout with identity key positions. CP size is an
+        # independent geometry fact; the scoring plan and packed metadata eligibility
+        # decide which executor can safely consume the layout.
         use_local_indexer_varlen = (
             packed_thd
-            and cp_size > 1
             and attn_mask_type == AttnMaskType.causal
             and varlen_starts is not None
             and varlen_ends is not None
@@ -2342,6 +2574,15 @@ class DSAttention(MegatronModule):
         indexer_avg_group = (
             cp_group if cp_size > 1 and not self.config.calculate_per_token_loss else None
         )
+        dynamic_cp_parent_group = None
+        if (
+            use_indexer_loss
+            and packed_seq_params is not None
+            and packed_seq_params.local_cp_size is not None
+        ):
+            dynamic_cp_parent_group = getattr(self.pg_collection, "dp_cp", None)
+            if dynamic_cp_parent_group is None:
+                raise RuntimeError("Dynamic CP indexer logging requires a dp_cp process group.")
 
         topk_holder = (
             self._get_index_share_topk_holder(packed_seq_params, attention_mask)
@@ -2362,7 +2603,15 @@ class DSAttention(MegatronModule):
             local_packed_cp_query_start = sequence_parallel_tp_row_start
             local_packed_cp_query_len = sequence_parallel_tp_full_rows
 
-        if self.skip_topk:
+        if reuse_mtp_source:
+            if mtp_dsa_context.shared_tensors is None:
+                raise RuntimeError(
+                    f"MTP iteration {mtp_dsa_context.iteration} requires iteration-0 "
+                    "DSA KV/top-k tensors."
+                )
+            topk_indices = mtp_dsa_context.shared_tensors.topk_indices
+            topk_length = mtp_dsa_context.shared_tensors.optional_topk_length()
+        elif self.skip_topk:
             assert topk_holder is not None
             if self.source_layer not in topk_holder:
                 raise RuntimeError(
@@ -2438,7 +2687,7 @@ class DSAttention(MegatronModule):
             )
 
         fused_output = None
-        if use_fused_kernels and not self.index_share:
+        if use_fused_kernels and not self.index_share and not self.mtp_index_share:
             assert q is not None and k is not None and weights is not None
             fused_output = dsa_kernels.run_fused_dsa_attention(
                 config=self.config,
@@ -2485,6 +2734,9 @@ class DSAttention(MegatronModule):
                     ),
                     reduce_group=indexer_reduce_group,
                     avg_group=indexer_avg_group,
+                    dynamic_cp_parent_group=dynamic_cp_parent_group,
+                    configured_cp_size=self.config.context_parallel_size,
+                    calculate_per_token_loss=self.config.calculate_per_token_loss,
                 )
                 output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
             return _normalize_dsattention_output_rank(output, x.ndim)
@@ -2555,6 +2807,7 @@ class DSAttention(MegatronModule):
                     local_packed_cp_query_len=local_packed_cp_query_len,
                     packed_seq_params=packed_seq_params,
                     cp_size=cp_size,
+                    varlen_is_plain_causal=varlen_is_plain_causal,
                 )
                 if fused_topk_with_loss is not None:
                     topk_indices, topk_length, indexer_loss = fused_topk_with_loss
@@ -2575,6 +2828,9 @@ class DSAttention(MegatronModule):
                     ),
                     reduce_group=indexer_reduce_group,
                     avg_group=indexer_avg_group,
+                    dynamic_cp_parent_group=dynamic_cp_parent_group,
+                    configured_cp_size=self.config.context_parallel_size,
+                    calculate_per_token_loss=self.config.calculate_per_token_loss,
                 )
         elif topk_indices is None:
             assert q is not None and k is not None and weights is not None
@@ -2601,6 +2857,7 @@ class DSAttention(MegatronModule):
                     local_packed_cp_query_len=local_packed_cp_query_len,
                     packed_seq_params=packed_seq_params,
                     cp_size=cp_size,
+                    varlen_is_plain_causal=varlen_is_plain_causal,
                 )
                 if fused_topk is not None:
                     topk_indices, topk_length = fused_topk
@@ -2627,9 +2884,25 @@ class DSAttention(MegatronModule):
             if topk_length_holder is not None and topk_length is not None:
                 topk_length_holder[self.layer_number] = topk_length
 
+        if mtp_dsa_context is not None and mtp_dsa_context.is_source:
+            assert source_key is not None and topk_indices is not None
+            mtp_dsa_context.capture(source_key, topk_indices, topk_length)
+
         # ===================================
         # Run sparse attention kernel
         # ===================================
+        all_topk_rows_nonempty = _can_prove_all_topk_rows_nonempty(
+            computes_topk=computes_topk,
+            indexer_topk=self.index_topk,
+            kv_sequence_length=skv,
+            attention_mask=attention_mask,
+            query_valid_rows=query_valid_rows,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            use_local_indexer_varlen=use_local_indexer_varlen,
+            varlen_starts=varlen_starts,
+            varlen_ends=varlen_ends,
+            key_positions=key_positions,
+        )
         output = _run_sparse_attention(
             absorbed_mla=absorbed_mla,
             query=query,
@@ -2644,6 +2917,7 @@ class DSAttention(MegatronModule):
             varlen_starts=varlen_starts,
             varlen_ends=varlen_ends,
             key_positions=key_positions,
+            all_topk_rows_nonempty=all_topk_rows_nonempty,
         )
 
         if use_indexer_loss:

@@ -319,7 +319,11 @@ class P2PCommunicator:
         tensor_recv_prev_func = None
         tensor_recv_next_func = None
 
-        if config.variable_seq_lengths or config.mtp_standalone:
+        # THD full-iteration CUDA graph mode uses static P2P shapes, so the
+        # per-step shape handshake is skipped: it is not graph-capturable.
+        if (
+            config.variable_seq_lengths and not config.thd_static_pp_communication
+        ) or config.mtp_standalone:
             recv_prev_shape, recv_next_shape = self._communicate_shapes(
                 tensor_send_next, tensor_send_prev, recv_prev, recv_next
             )

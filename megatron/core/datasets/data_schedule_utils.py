@@ -235,6 +235,7 @@ def _pack_sequences(
     original_lengths: torch.Tensor,
     local_cp_size: Optional[torch.Tensor],
     dev: torch.device,
+    zigzag_cp_min_chunk_size: Optional[int] = None,
 ) -> Dict[str, torch.Tensor]:
     """Pack multiple samples into a single packed sample."""
 
@@ -265,6 +266,10 @@ def _pack_sequences(
 
     if local_cp_size is not None:
         new_sample["local_cp_size"] = local_cp_size
+    if zigzag_cp_min_chunk_size is not None:
+        new_sample["zigzag_cp_min_chunk_size"] = torch.tensor(
+            zigzag_cp_min_chunk_size, dtype=torch.int32, device=dev
+        )
 
     return new_sample
 
@@ -330,7 +335,12 @@ def create_data_iterator(
     ):
         vpp_size = config.virtual_pipeline_model_parallel_size
         if tp_group.rank() == 0:
-            metadata_keys = ["max_seqlen", "cu_seqlens", "cu_seqlens_padded"]
+            metadata_keys = [
+                "max_seqlen",
+                "cu_seqlens",
+                "cu_seqlens_padded",
+                "zigzag_cp_min_chunk_size",
+            ]
             if is_dynamic_cp:
                 metadata_keys.append("local_cp_size")
             new_data_iterator = []
@@ -355,6 +365,22 @@ def create_data_iterator(
     return new_data_iterator
 
 
+def get_data_parallel_gather_group(dp_group, dp_cp_group):
+    """Reuse DPxCP only when it has exactly the same ordered ranks as DP."""
+    if dp_group.size() != dp_cp_group.size():
+        return dp_group
+
+    if dp_group is not dp_cp_group and torch.distributed.is_initialized():
+        dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
+        dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
+        groups_match = dp_ranks == dp_cp_ranks
+    else:
+        groups_match = dp_group.rank() == dp_cp_group.rank()
+    if not groups_match:
+        raise RuntimeError("Equivalent DP and DPxCP groups must use the same rank order.")
+    return dp_cp_group
+
+
 def reroute_samples_to_dcp_ranks(
     batch, global_ids_this_rank, global_id_seqlens, sample_id_groups, offsets, dp_group, dp_cp_group
 ):
@@ -364,7 +390,8 @@ def reroute_samples_to_dcp_ranks(
     Each CP lane gathers the samples from its DP group, then keeps only the
     samples assigned to its DPxCP rank. Gathering within ``dp_group`` avoids
     collecting the identical input held by every CP sibling and avoids the
-    fully connected P2P transport created by NCCL all-to-all.
+    fully connected P2P transport created by NCCL all-to-all. When DP and
+    DPxCP are equivalent, the already-warmed DPxCP communicator is reused.
 
     All ranks in ``dp_group`` must provide the same set of data keys. CP siblings
     that share a non-CP DP rank must additionally provide byte-identical sample
@@ -380,6 +407,7 @@ def reroute_samples_to_dcp_ranks(
     dcp_rank = dp_cp_group.rank()
     dp_rank = dp_group.rank()
     dp_size = dp_group.size()
+    gather_group = get_data_parallel_gather_group(dp_group, dp_cp_group)
 
     # Keep collective ordering independent of dictionary insertion order. Unknown
     # keys require an explicit layout classification rather than being silently dropped.
@@ -462,7 +490,9 @@ def reroute_samples_to_dcp_ranks(
             gathered_tensor = gather_input
         else:
             gathered_tensor = local_tensor.new_empty(dp_size * max_rank_numel)
-            torch.distributed.all_gather_into_tensor(gathered_tensor, gather_input, group=dp_group)
+            torch.distributed.all_gather_into_tensor(
+                gathered_tensor, gather_input, group=gather_group
+            )
 
         for gid in recv_ids:
             start, sample_numel = sample_slices[gid]
@@ -478,6 +508,7 @@ def build_packed_microbatches(
     dcp_rank: int,
     dev: torch.device,
     is_dynamic_cp: bool = False,
+    global_id_seqlens: Optional[List[Tuple[int, int]]] = None,
 ) -> List[Dict[str, torch.Tensor]]:
     """Build packed samples for each microbatch.
 
@@ -488,6 +519,10 @@ def build_packed_microbatches(
         dcp_rank: This rank's index within the DP×CP group.
         dev: Target device.
         is_dynamic_cp: Whether dynamic context parallel is enabled.
+        global_id_seqlens: Optional host mapping from global sample ID to its
+            physical padded length. When present, it emits the minimum zigzag
+            half-chunk size without a model-forward D2H copy; zero means the
+            physical lengths do not admit one-hop certification.
     """
     num_micro_batches = len(sample_id_groups)
     seg_starts: List[int] = [0]
@@ -503,20 +538,16 @@ def build_packed_microbatches(
     ]
 
     local_cp_sizes_gpu = None
+    effective_cp_sizes_cpu: List[int] = []
+    for i in range(num_micro_batches):
+        sample_ids_this_group = sample_id_groups[i][dcp_rank]
+        effective_cp_sizes_cpu.append(
+            len([1 for sample_ids in sample_id_groups[i] if sample_ids_this_group[0] in sample_ids])
+        )
     if is_dynamic_cp:
-        local_cp_sizes_cpu: List[int] = []
-        for i in range(num_micro_batches):
-            sample_ids_this_group = sample_id_groups[i][dcp_rank]
-            local_cp_sizes_cpu.append(
-                len(
-                    [
-                        1
-                        for sample_ids in sample_id_groups[i]
-                        if sample_ids_this_group[0] in sample_ids
-                    ]
-                )
-            )
-        local_cp_sizes_gpu = torch.tensor(local_cp_sizes_cpu, dtype=torch.int32, device=dev)
+        local_cp_sizes_gpu = torch.tensor(effective_cp_sizes_cpu, dtype=torch.int32, device=dev)
+
+    padded_length_by_id = dict(global_id_seqlens) if global_id_seqlens is not None else None
 
     for i in range(num_micro_batches):
         samples = grouped_samples[i]
@@ -533,7 +564,24 @@ def build_packed_microbatches(
         lens_padded = padded_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
         lens_original = original_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
         local_cp_size = local_cp_sizes_gpu[i] if is_dynamic_cp else None
-        new_sample = _pack_sequences(samples, lens_padded, lens_original, local_cp_size, dev)
+        zigzag_cp_min_chunk_size = None
+        if padded_length_by_id is not None:
+            divisor = 2 * effective_cp_sizes_cpu[i]
+            padded_lengths_host = [
+                padded_length_by_id[sample_id] for sample_id in sample_id_groups[i][dcp_rank]
+            ]
+            if any(length % divisor != 0 for length in padded_lengths_host):
+                zigzag_cp_min_chunk_size = 0
+            else:
+                zigzag_cp_min_chunk_size = min(length // divisor for length in padded_lengths_host)
+        new_sample = _pack_sequences(
+            samples,
+            lens_padded,
+            lens_original,
+            local_cp_size,
+            dev,
+            zigzag_cp_min_chunk_size=zigzag_cp_min_chunk_size,
+        )
         new_samples.append(new_sample)
 
     return new_samples
@@ -594,6 +642,7 @@ def next_hdp_group_packing_aware(
     total_gpus: int,
     max_seq_len_per_rank: int,
     min_cp_size: int = 1,
+    max_num_seqs: Optional[int] = None,
 ) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
     """Form one DCP microbatch with packing-aware CP group selection.
 
@@ -607,7 +656,7 @@ def next_hdp_group_packing_aware(
     The scheduler keeps the legacy invariant that each returned microbatch has
     no empty DPxCP rank after the fill step. For non-power-of-two DPxCP layouts,
     it falls back to the full DPxCP group if power-of-two expansion cannot fill
-    every rank.
+    every rank. ``max_num_seqs`` optionally caps the real sequences per subgroup.
     """
     if not sample_seqlens:
         return (
@@ -667,6 +716,11 @@ def next_hdp_group_packing_aware(
 
             for group_id, size in list(group_size.items()):
                 if size != cp_size:
+                    continue
+                if (
+                    max_num_seqs is not None
+                    and len(micro_batches[group_members[group_id][0]]) >= max_num_seqs
+                ):
                     continue
                 if packing_sequence_len.get(group_id, 0) + seq_len / cp_size > max_seq_len_per_rank:
                     continue
@@ -803,7 +857,9 @@ def next_hdp_group_packing_aware(
 
         for sample_id, seq_len in sample_seqlens:
             per_rank_len = seq_len / total_gpus
-            if packed_sequence_len + per_rank_len <= max_seq_len_per_rank:
+            if (
+                max_num_seqs is None or len(selected) < max_num_seqs
+            ) and packed_sequence_len + per_rank_len <= max_seq_len_per_rank:
                 selected.append((sample_id, seq_len))
                 packed_sequence_len += per_rank_len
             else:

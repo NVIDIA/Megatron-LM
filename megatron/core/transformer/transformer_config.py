@@ -15,7 +15,10 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
+    PACKED_DSA_CP_CUDA_GRAPH_ERROR,
     get_deprecated_cuda_graph_modules_migration,
+    is_packed_dsa_cp_cuda_graph_capture_unsupported,
+    is_te_layer_whole_moe_cuda_graph,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
     validate_deprecated_cuda_graph_modules_migration_inputs,
@@ -53,6 +56,12 @@ except ImportError:
     HAVE_PACKAGING = False
 
 
+def is_p2p_cp_comm_type(cp_comm_type: Optional[Union[str, List[str], Tuple[str, ...]]]) -> bool:
+    """Return whether every configured attention CP transport uses P2P."""
+    cp_comm_types = cp_comm_type if isinstance(cp_comm_type, (list, tuple)) else (cp_comm_type,)
+    return all(comm_type in (None, "p2p") for comm_type in cp_comm_types)
+
+
 @dataclass
 @experimental_api
 class TransformerConfig(ModelParallelConfig):
@@ -81,6 +90,14 @@ class TransformerConfig(ModelParallelConfig):
     We compute the average of the MTP losses across all depths, 
     and multiply it the scaling factor to obtain the overall MTP loss, 
     which serves as an additional training objective.
+    """
+
+    mtp_loss_type: str = "cross_entropy"
+    """Training objective for Multi-Token Prediction (MTP) heads.
+
+    Supported values are ``cross_entropy`` and ``e2e_tv``. The end-to-end total
+    variation objective directly optimizes the normalized expected acceptance
+    length under rejection-sampling verification.
     """
 
     mtp_use_repeated_layer: bool = False
@@ -350,6 +367,9 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_skip_topk_offset: int = 0
     """Layer offset for DSA cross-layer top-k sharing."""
+
+    dsa_mtp_index_kv_share: bool = False
+    """Reuse iteration-0 DSA top-k indices and latent KV across repeated MTP iterations."""
 
     dsa_indexer_loss_coeff: Optional[float] = None
     """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
@@ -1160,6 +1180,14 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_modules has no effect when cuda_graph_impl="none" and must be empty when
     cuda_graph_impl="full_iteration"."""
 
+    cuda_graph_granularity: Literal['layer', 'chunk'] = "layer"
+    """Select the callable boundary for Transformer Engine training CUDA graphs.
+
+    ``layer`` preserves the existing per-layer behavior. ``chunk`` captures the local decoder
+    ``TransformerBlock`` for each PP/VPP model chunk as one callable. Chunk granularity uses the
+    THD dynamic-microbatch upper bound as Nmax and replays graph indices ``[0, N)`` at runtime.
+    """
+
     cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
     """Selects training capture coverage within per-layer CUDA graphs (local and
     transformer_engine implementations).
@@ -1236,6 +1264,15 @@ class TransformerConfig(ModelParallelConfig):
     This option is only meaningful for cuda_graph_impl=transformer_engine. For THD sequence
     packing, capture uses a conservative upper bound on the packed microbatch count so graph
     replay can cover iterations whose real packed microbatch count changes."""
+
+    cuda_graph_parallel_prewarm: bool = False
+    """Prewarm THD chunk CUDA Graph kernels independently on every PP rank.
+
+    Before the first pipeline iteration, each rank runs one local forward/backward for every
+    PP/VPP decoder chunk it owns. This initializes lazy kernels without pipeline P2P dependencies,
+    allowing different PP stages to compile concurrently. Training-visible RNG, FP8 metadata,
+    module buffers, gradients, and activation-offload state are restored after the prewarm.
+    """
 
     ####################
     # Hyper-Connection Configuration
@@ -1523,6 +1560,20 @@ class TransformerConfig(ModelParallelConfig):
             normalize_experimental_attention_variant,
         )
 
+        if self.mtp_loss_type not in ("cross_entropy", "e2e_tv"):
+            raise ValueError(
+                "mtp_loss_type must be one of 'cross_entropy' or 'e2e_tv', "
+                f"got {self.mtp_loss_type!r}."
+            )
+        if self.mtp_loss_type == "e2e_tv":
+            if self.mtp_num_layers is None or self.mtp_num_layers < 1:
+                raise ValueError("mtp_loss_type='e2e_tv' requires mtp_num_layers >= 1.")
+            if not self.mtp_detach_heads:
+                raise ValueError(
+                    "mtp_loss_type='e2e_tv' requires mtp_detach_heads=True so the target "
+                    "distribution and shared backbone remain frozen."
+                )
+
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
         if self.fp32_residual_connection and self.pipeline_dtype is not None:
@@ -1745,6 +1796,11 @@ class TransformerConfig(ModelParallelConfig):
                 "Use dsa_kernel_backend='tilelang' or 'none'."
             )
 
+        if self.dsa_mtp_index_kv_share and self.experimental_attention_variant != "dsa":
+            raise ValueError(
+                "dsa_mtp_index_kv_share requires experimental_attention_variant='dsa'."
+            )
+
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if not self.is_hybrid_model:
                 assert (
@@ -1842,6 +1898,11 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
+            if self.dsa_mtp_index_kv_share:
+                if not self.mtp_use_repeated_layer:
+                    raise ValueError("dsa_mtp_index_kv_share requires mtp_use_repeated_layer=True.")
+                if self.mtp_num_layers is None or self.mtp_num_layers <= 1:
+                    raise ValueError("dsa_mtp_index_kv_share requires mtp_num_layers > 1.")
             if self.context_parallel_size > 1:
                 cp_comm_types = (
                     self.cp_comm_type
@@ -2309,6 +2370,17 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.recompute_modules is None:
             self.recompute_modules = ["core_attn"]
+
+        if (
+            self.dsa_mtp_index_kv_share
+            and self.recompute_granularity == "selective"
+            and "core_attn" in self.recompute_modules
+        ):
+            raise ValueError(
+                "dsa_mtp_index_kv_share does not yet support selective recompute with "
+                "'core_attn' in recompute_modules. Use selective 'mla_up_proj' recompute, "
+                "full activation recompute, or disable MTP DSA sharing."
+            )
 
         if self.recompute_granularity == "selective":
             if len(self.recompute_modules) > 0:
@@ -3169,6 +3241,10 @@ class TransformerConfig(ModelParallelConfig):
         # and the deprecated flag migration above:
         # earlier placement would compare unnormalized string module forms and let
         # enable_cuda_graph/external_cuda_graph bypass the gate entirely.
+        is_te_chunk_graph = (
+            self.cuda_graph_impl == "transformer_engine" and self.cuda_graph_granularity == "chunk"
+        )
+
         # Two things about mHC recompute depend on CUDA graphs regardless of the
         # split, and both are wrong-result mechanisms rather than lost savings, so
         # they fail closed whether or not the split is on.
@@ -3178,11 +3254,11 @@ class TransformerConfig(ModelParallelConfig):
         # its forward.
         if (
             use_mhc_recompute
-            and self.cuda_graph_impl == "full_iteration"
+            and (self.cuda_graph_impl == "full_iteration" or is_te_chunk_graph)
             and (self.hidden_dropout != 0.0 or self.attention_dropout != 0.0)
         ):
             raise ValueError(
-                "mHC recompute with cuda_graph_impl='full_iteration' requires "
+                "mHC recompute with full-iteration or TE chunk CUDA Graphs requires "
                 "hidden_dropout=0 and attention_dropout=0: RNG state cannot be "
                 "rewound inside CUDA graph capture, so a captured recompute "
                 "would replay a different dropout mask than its forward pass."
@@ -3221,6 +3297,7 @@ class TransformerConfig(ModelParallelConfig):
             # message recommends (rejected above); hybrid_block emits its own
             # capture-scope warning instead
             and self.cuda_graph_impl == "transformer_engine"
+            and not is_te_chunk_graph
             and list(self.cuda_graph_modules or []) == [CudaGraphModule.attn]
             and list(self.recompute_modules) == ["mhc"]
         ):
@@ -3271,12 +3348,12 @@ class TransformerConfig(ModelParallelConfig):
                     "config claims the split is on. Keep the switch off for "
                     "hybrid models."
                 )
-            if self.cuda_graph_impl != "transformer_engine":
+            if self.cuda_graph_impl != "transformer_engine" or is_te_chunk_graph:
                 raise ValueError(
                     "mhc_recompute_attn_cuda_graph_split requires "
-                    f"cuda_graph_impl='transformer_engine', got "
-                    f"{self.cuda_graph_impl!r}: the split is a Transformer Engine "
-                    "per-layer capture."
+                    "per-layer Transformer Engine capture, got "
+                    f"cuda_graph_impl={self.cuda_graph_impl!r} and "
+                    f"cuda_graph_granularity={self.cuda_graph_granularity!r}."
                 )
             if list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
                 self.recompute_modules
@@ -3330,6 +3407,18 @@ class TransformerConfig(ModelParallelConfig):
             and (not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules)
         )
 
+        if is_packed_dsa_cp_cuda_graph_capture_unsupported(
+            experimental_attention_variant=self.experimental_attention_variant,
+            dsa_kernel_backend=self.dsa_kernel_backend,
+            sequence_packing_scheduler=self.sequence_packing_scheduler,
+            dynamic_context_parallel=self.dynamic_context_parallel,
+            context_parallel_size=self.context_parallel_size,
+            cuda_graph_impl=self.cuda_graph_impl,
+            cuda_graph_modules=self.cuda_graph_modules,
+            inference_cuda_graph_scope=self.inference_cuda_graph_scope,
+        ):
+            raise ValueError(PACKED_DSA_CP_CUDA_GRAPH_ERROR)
+
         cp_layout_conversion_required = is_gated_delta_net_variant(
             self.experimental_attention_variant
         )
@@ -3347,11 +3436,73 @@ class TransformerConfig(ModelParallelConfig):
                 f"cuda_graph_impl={self.cuda_graph_impl!r}, "
                 f"cuda_graph_modules={self.cuda_graph_modules!r})."
             )
+        cuda_graph_preserves_mtp_share_lifetime = self.cuda_graph_impl == "full_iteration" or (
+            self.cuda_graph_impl == "transformer_engine" and self.cuda_graph_granularity == "chunk"
+        )
+        if (
+            self.dsa_mtp_index_kv_share
+            and cuda_graph_captures_attention
+            and not cuda_graph_preserves_mtp_share_lifetime
+        ):
+            raise ValueError(
+                "dsa_mtp_index_kv_share does not support per-layer CUDA graph scopes "
+                "that capture attention. Use a MoE-only scope, a full-iteration graph, "
+                "or a whole-chunk graph that keeps MTP postprocessing eager."
+            )
+
+        if self.cuda_graph_parallel_prewarm:
+            assert self.cuda_graph_impl == "transformer_engine", (
+                "cuda_graph_parallel_prewarm requires " "cuda_graph_impl='transformer_engine'."
+            )
+            assert (
+                self.cuda_graph_granularity == "chunk"
+            ), "cuda_graph_parallel_prewarm requires cuda_graph_granularity='chunk'."
+            assert (
+                self.sequence_packing_scheduler is not None
+            ), "cuda_graph_parallel_prewarm currently supports only THD sequence packing."
+            assert (
+                self.pipeline_model_parallel_size > 1
+            ), "cuda_graph_parallel_prewarm requires pipeline_model_parallel_size > 1."
 
         if self.cuda_graph_impl != "none":
 
             if self.cpu_offloading and self.cuda_graph_impl != "full_iteration":
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
+
+            assert self.cuda_graph_granularity in (
+                "layer",
+                "chunk",
+            ), f"Invalid cuda_graph_granularity: {self.cuda_graph_granularity}"
+            if self.cuda_graph_granularity == "chunk":
+                assert (
+                    self.cuda_graph_impl == "transformer_engine"
+                ), "chunk CUDA graph granularity requires cuda_graph_impl='transformer_engine'."
+                assert not self.cuda_graph_modules, (
+                    "chunk CUDA graph granularity captures the whole decoder chunk and requires "
+                    "an empty cuda_graph_modules list."
+                )
+                assert not self.overlap_moe_expert_parallel_comm, (
+                    "chunk CUDA graph granularity is incompatible with "
+                    "overlap_moe_expert_parallel_comm because that schedule invokes layers "
+                    "individually."
+                )
+                assert (
+                    not self.delay_wgrad_compute
+                ), "chunk CUDA graph granularity does not support delayed wgrad scheduling."
+                if self.moe_paged_stash:
+                    assert self.cuda_graph_warmup_steps >= 2, (
+                        "Paged Stash with chunk CUDA graphs requires at least two warmup steps "
+                        "for schedule discovery and buffer allocation."
+                    )
+                    assert self.cuda_graph_dynamic_microbatches, (
+                        "Paged Stash with chunk CUDA graphs requires "
+                        "cuda_graph_dynamic_microbatches so capture uses runtime schedule keys."
+                    )
+                if self.sequence_packing_scheduler is not None:
+                    assert self.cuda_graph_dynamic_microbatches, (
+                        "THD chunk CUDA graphs require cuda_graph_dynamic_microbatches so capture "
+                        "uses the conservative Nmax microbatch count."
+                    )
 
             # Check cuda graph scopes for per-layer implementations.
             if self.cuda_graph_impl in ("local", "transformer_engine"):
@@ -3398,9 +3549,23 @@ class TransformerConfig(ModelParallelConfig):
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
                     ):
-                        assert (
-                            CudaGraphModule.moe not in self.cuda_graph_modules
-                        ), 'moe cuda graph is only supported with drop-padding MoE.'
+                        sync_free_hybridep_moe_graph = (
+                            self.cuda_graph_impl == "transformer_engine"
+                            and self.moe_token_dispatcher_type == "flex"
+                            and self.moe_flex_dispatcher_backend == "hybridep"
+                            and self.moe_expert_rank_capacity_factor is not None
+                            and self.moe_paged_stash
+                            and self.use_transformer_engine_op_fuser
+                        )
+                        whole_moe_graph = CudaGraphModule.moe in self.cuda_graph_modules or (
+                            self.cuda_graph_impl == "transformer_engine"
+                            and not self.cuda_graph_modules
+                        )
+                        assert not whole_moe_graph or sync_free_hybridep_moe_graph, (
+                            "moe cuda graph is only supported with drop-padding MoE or "
+                            "transformer_engine sync-free HybridEP with rank capacity and "
+                            "paged stash."
+                        )
                         if self.moe_token_dispatcher_type == 'alltoall' and (
                             self.moe_expert_capacity_factor is not None
                             or self.moe_router_padding_for_fp8
@@ -3410,11 +3575,36 @@ class TransformerConfig(ModelParallelConfig):
                                 'DtoH copies and synchronizations in the preprocess step.'
                             )
 
+            te_whole_moe_paged_stash = (
+                is_te_layer_whole_moe_cuda_graph(self) and self.moe_paged_stash
+            )
+            if te_whole_moe_paged_stash:
+                assert not self.cuda_graph_dynamic_microbatches, (
+                    "Transformer Engine whole-MoE CUDA graphs with paged stash require a fixed "
+                    "runtime microbatch schedule; cuda_graph_dynamic_microbatches is not "
+                    "supported."
+                )
+                assert self.cuda_graph_warmup_steps >= 2, (
+                    "Transformer Engine whole-MoE CUDA graphs with paged stash require at least "
+                    "2 cuda_graph_warmup_steps to record the pipeline schedule before capture."
+                )
+
+            if self.cuda_graph_impl == "full_iteration" and self.moe_paged_stash:
+                assert self.cuda_graph_warmup_steps >= 1, (
+                    "Full-iteration CUDA graphs with paged stash require at least one eager "
+                    "warmup step to discover the stash schedule and buffer capacity before "
+                    "capture."
+                )
+
             if self.recompute_granularity:
                 if self.recompute_granularity != "selective":
-                    assert (
-                        self.cuda_graph_impl == "full_iteration"
-                    ), "full recompute is only supported with full iteration CUDA graph."
+                    assert self.cuda_graph_impl == "full_iteration" or (
+                        self.cuda_graph_impl == "transformer_engine"
+                        and self.cuda_graph_granularity == "chunk"
+                    ), (
+                        "full recompute is only supported with full iteration CUDA graph or "
+                        "Transformer Engine chunk CUDA graph."
+                    )
                 else:
                     # The recompute module should be inside or outside of the graph scope.
                     # Recompute module coverring graph scope is not allowed.
@@ -3816,6 +4006,37 @@ class TransformerConfig(ModelParallelConfig):
                 "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
                 f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
             )
+            if self.cuda_graph_impl == "full_iteration":
+                # The full-iteration graph captures the whole forward_backward_func,
+                # so the entire batch path must satisfy the THD static-input
+                # contract: fixed per-rank token capacity, fixed cu_seqlens width,
+                # a fixed num_microbatches per step, and a static CP topology.
+                assert self.sequence_packing_scheduler is not None, (
+                    "THD full-iteration CUDA graph is only supported with a "
+                    "sequence packing scheduler."
+                )
+                assert not self.dynamic_context_parallel, (
+                    "THD full-iteration CUDA graph does not support dynamic context "
+                    "parallel; use a static CP topology."
+                )
+                assert self.max_seqlen_per_dp_cp_rank is not None, (
+                    "THD full-iteration CUDA graph requires --max-seqlen-per-dp-cp-rank "
+                    "to define the static per-rank token capacity."
+                )
+                assert (
+                    self.thd_max_packed_sequences is not None and self.thd_max_packed_sequences > 0
+                ), (
+                    "THD full-iteration CUDA graph requires a positive "
+                    "--thd-max-packed-sequences to define the static cu_seqlens width."
+                )
+                assert not self.mtp_standalone, (
+                    "THD full-iteration CUDA graph does not support standalone MTP: "
+                    "its PP shape handshake is not graph-capturable."
+                )
+                # Batches are canonicalized to the static per-rank token capacity
+                # before entering the graph, so PP communication uses static shapes
+                # instead of the (non-capturable) variable-seq-length handshake.
+                self.thd_static_pp_communication = True
 
         # 'extend_last' THD tail padding with context parallelism requires the
         # global metadata to be extended before CP slicing, which only the
@@ -3831,6 +4052,43 @@ class TransformerConfig(ModelParallelConfig):
                 "supported together with a sequence_packing_scheduler. Either enable a "
                 "sequence_packing_scheduler, or use thd_tail_padding_policy='append_dummy_seq'."
             )
+
+        if self.dynamic_context_parallel and self.cuda_graph_impl != "none":
+            if self.cuda_graph_impl != "transformer_engine":
+                raise ValueError("Dynamic CP supports only Transformer Engine CUDA graphs.")
+            if not self.cuda_graph_dynamic_microbatches:
+                raise ValueError("Dynamic CP CUDA graphs require dynamic microbatch slots.")
+            if self.delay_wgrad_compute or self.overlap_moe_expert_parallel_comm:
+                raise ValueError("Dynamic CP graphs do not support delayed wgrad or EP overlap.")
+            captures_attention = (
+                not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules
+            )
+            if captures_attention and not is_p2p_cp_comm_type(self.cp_comm_type):
+                raise ValueError(
+                    "Dynamic CP CUDA graph attention currently supports cp_comm_type='p2p' "
+                    "only; subgroup a2a/all-gather collectives cannot share the parent graph "
+                    "communicator."
+                )
+            if captures_attention and (
+                (
+                    self.fp8 is not None
+                    and (
+                        self.fp8_dot_product_attention
+                        or self.fp8_multi_head_attention
+                        or self.fp8_recipe == Fp8Recipe.custom
+                    )
+                )
+                or (
+                    self.fp4 is not None
+                    and (self.fp8_dot_product_attention or self.fp4_recipe == Fp4Recipe.custom)
+                )
+            ):
+                raise ValueError(
+                    "Dynamic CP CUDA graph attention does not support FP8 DPA/MHA or custom "
+                    "FP8/FP4 recipes: TE's P2P context-parallel backward can use a "
+                    "logical-subgroup all-to-all that cannot use the shared parent graph "
+                    "communicator."
+                )
 
         if self.sequence_packing_scheduler is not None:
             # Check TE version.

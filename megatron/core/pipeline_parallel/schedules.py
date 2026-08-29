@@ -730,7 +730,9 @@ def forward_backward_no_pipelining(
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
     if getattr(config, "moe_paged_stash", False):
-        paged_stash_reset(enabled=not forward_only, config=config)
+        paged_stash_reset(
+            enabled=not forward_only, config=config, num_microbatches=num_microbatches
+        )
 
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
@@ -1175,7 +1177,9 @@ def forward_backward_pipelining_with_interleaving(
     ), "adjust_tensor_shapes_fn is not supported for interleaved pipeline parallelism"
 
     if getattr(config, "moe_paged_stash", False):
-        paged_stash_reset(enabled=not forward_only, config=config)
+        paged_stash_reset(
+            enabled=not forward_only, config=config, num_microbatches=num_microbatches
+        )
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
@@ -1283,10 +1287,13 @@ def forward_backward_pipelining_with_interleaving(
         # Note: This is a simplified approach - proper VPP support may need more complex logic
         hidden_dim = config.hidden_size * getattr(config, 'num_residual_streams', 1)
 
-    tensor_shape = [seq_length, micro_batch_size, hidden_dim]
-    tensor_shape[0] = tensor_shape[0] // cp_group.size()
-    if config.sequence_parallel:
-        tensor_shape[0] = tensor_shape[0] // tp_group.size()
+    if config.thd_static_pp_communication:
+        tensor_shape = list(_thd_static_pp_tensor_shape(config, tp_group, hidden_dim))
+    else:
+        tensor_shape = [seq_length, micro_batch_size, hidden_dim]
+        tensor_shape[0] = tensor_shape[0] // cp_group.size()
+        if config.sequence_parallel:
+            tensor_shape[0] = tensor_shape[0] // tp_group.size()
 
     # Compute number of warmup and remaining microbatches.
     # seems only used for vpp
@@ -2214,6 +2221,19 @@ def forward_backward_pipelining_with_interleaving(
     return forward_data_store
 
 
+def _thd_static_pp_tensor_shape(config, tp_group, hidden_size):
+    """PP send/recv shape for THD full-iteration CUDA graph mode.
+
+    Packed batches are canonicalized to the static CP-local token capacity
+    before entering the graph, so PP shapes are fixed. The packed batch
+    dimension is always 1.
+    """
+    effective_seq_length = config.max_seqlen_per_dp_cp_rank
+    if config.sequence_parallel:
+        effective_seq_length = effective_seq_length // tp_group.size()
+    return (effective_seq_length, 1, hidden_size)
+
+
 def get_tensor_shapes(
     *,
     seq_length: int,
@@ -2241,6 +2261,9 @@ def get_tensor_shapes(
     tensor_shapes = []
 
     if config.variable_seq_lengths:
+        if config.thd_static_pp_communication:
+            tensor_shapes.append(_thd_static_pp_tensor_shape(config, tp_group, config.hidden_size))
+            return tensor_shapes
         # Shapes exchanged dynamically during P2P communication
         tensor_shapes.append(())
         return tensor_shapes
@@ -2389,7 +2412,9 @@ def forward_backward_pipelining_without_interleaving(
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
     if getattr(config, "moe_paged_stash", False):
-        paged_stash_reset(enabled=not forward_only, config=config)
+        paged_stash_reset(
+            enabled=not forward_only, config=config, num_microbatches=num_microbatches
+        )
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func

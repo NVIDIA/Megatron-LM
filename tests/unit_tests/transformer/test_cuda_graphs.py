@@ -3,6 +3,8 @@
 import gc
 import os
 import sys
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -23,12 +25,17 @@ from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
+)
+from megatron.core.transformer.cuda_graph_config import (
+    is_te_layer_whole_moe_cuda_graph,
+    te_cuda_graph_capture_contains_moe,
 )
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
@@ -40,6 +47,7 @@ from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, Inf
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
+from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -61,6 +69,21 @@ fp8_available, _ = check_fp8_support()
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
     return TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, **kwargs)
+
+
+def _te_whole_moe_paged_stash_config(**overrides) -> TransformerConfig:
+    kwargs = {
+        "cuda_graph_impl": "transformer_engine",
+        "cuda_graph_modules": [CudaGraphModule.moe],
+        "num_moe_experts": 4,
+        "moe_token_dispatcher_type": "flex",
+        "moe_flex_dispatcher_backend": "hybridep",
+        "moe_expert_rank_capacity_factor": 1.2,
+        "moe_paged_stash": True,
+        "use_transformer_engine_op_fuser": True,
+    }
+    kwargs.update(overrides)
+    return _base_cuda_graph_config(**kwargs)
 
 
 def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
@@ -95,6 +118,316 @@ def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
 
 
 class TestCudaGraphConfigAndArguments:
+    @pytest.mark.parametrize(
+        ("granularity", "modules", "capture_contains_moe", "fixed_layer_contract"),
+        [
+            ("layer", [], True, True),
+            ("layer", [CudaGraphModule.moe], True, True),
+            ("layer", [CudaGraphModule.moe_router], False, False),
+            ("chunk", [], True, False),
+        ],
+    )
+    def test_te_moe_capture_scope_predicates(
+        self, granularity, modules, capture_contains_moe, fixed_layer_contract
+    ):
+        config = SimpleNamespace(
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_granularity=granularity,
+            cuda_graph_modules=modules,
+        )
+
+        assert te_cuda_graph_capture_contains_moe(config) is capture_contains_moe
+        assert is_te_layer_whole_moe_cuda_graph(config) is fixed_layer_contract
+
+    def test_parallel_prewarm_order_covers_each_vpp_chunk_once(self):
+        assert TECudaGraphHelper._get_local_prewarm_order(4) == [1, 2, 3, 4, -4, -3, -2, -1]
+
+    def test_parallel_prewarm_arguments_do_not_change_capture_nmax(self, monkeypatch):
+        helper = object.__new__(TECudaGraphHelper)
+        helper.num_model_chunks = 4
+        helper.num_microbatches = 17
+        observed = {}
+
+        def fake_get_sample_arguments(order):
+            observed['order'] = order
+            observed['num_microbatches'] = helper.num_microbatches
+            return [('args',)], [{'kwargs': True}]
+
+        monkeypatch.setattr(helper, '_get_sample_arguments', fake_get_sample_arguments)
+
+        sample_args, sample_kwargs = helper._get_local_prewarm_arguments()
+
+        assert observed == {'order': [1, 2, 3, 4, -4, -3, -2, -1], 'num_microbatches': 1}
+        assert sample_args == [('args',)]
+        assert sample_kwargs == [{'kwargs': True}]
+        assert helper.num_microbatches == 17
+
+    def test_parallel_prewarm_restores_training_state(self, monkeypatch):
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossAutoScaler,
+            DSAIndexerLossLoggingHelper,
+        )
+
+        dsa_tracker = {'values': torch.tensor([7.0]), 'agreed_size': 4}
+
+        class FakeChunk(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(2.0))
+                self.register_buffer('running_value', torch.tensor(3.0))
+                self.is_first_microbatch = True
+                self.input_tensor = 'pipeline-input'
+                self.forward_calls = 0
+
+            def _prepare_pipeline_input_for_chunk_cuda_graph(self, args, kwargs):
+                self.input_tensor = args[0]
+                return tuple(args), dict(kwargs)
+
+            @staticmethod
+            def _reconstruct_packed_seq_params_from_kwargs(kwargs):
+                kwargs.pop('cu_seqlens_q', None)
+
+            def forward(self, hidden_states, attention_mask=None):
+                del attention_mask
+                self.forward_calls += 1
+                self.running_value.add_(1)
+                self.is_first_microbatch = False
+                dsa_tracker['values'].add_(5)
+                dsa_tracker['prewarm_only'] = torch.tensor(1.0)
+                return hidden_states * self.weight
+
+        class FakeModelChunk:
+            @staticmethod
+            def no_sync():
+                return nullcontext()
+
+        chunk = FakeChunk()
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = SimpleNamespace(
+            cuda_graph_granularity='chunk',
+            sequence_packing_scheduler='dp_balanced',
+            dynamic_context_parallel=True,
+            moe_paged_stash=False,
+            fp8=None,
+            fp4=None,
+            fine_grained_activation_offloading=False,
+        )
+        helper._capture_finished = False
+        helper.flattened_callables = [chunk]
+        helper.model = [FakeModelChunk()]
+        helper.tp_group = None
+        helper.dp_cp_group = None
+        dynamic_cp_contexts = []
+        max_cp_context = (4, object())
+        helper._get_dynamic_cp_capture_contexts = lambda: [(2, object()), max_cp_context]
+        helper._set_dynamic_cp_capture_context = dynamic_cp_contexts.append
+
+        def get_local_prewarm_arguments():
+            assert dynamic_cp_contexts == [max_cp_context]
+            return (
+                [(torch.ones(4, requires_grad=True),)],
+                [{'cu_seqlens_q': torch.zeros(1, dtype=torch.int32)}],
+            )
+
+        helper._get_local_prewarm_arguments = get_local_prewarm_arguments
+
+        def reset_after_capture():
+            chunk.weight.grad = None
+
+        helper._reset_after_capture = reset_after_capture
+
+        monkeypatch.setattr(torch.distributed, 'barrier', lambda: None)
+        monkeypatch.setattr(torch.distributed, 'get_rank', lambda: 0)
+        monkeypatch.setattr(torch.cuda, 'synchronize', lambda: None)
+        monkeypatch.setattr(torch.cuda, 'empty_cache', lambda: None)
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, 'tracker', dsa_tracker)
+        original_loss_scale = torch.tensor(11.0)
+        monkeypatch.setattr(
+            DSAIndexerLossAutoScaler, 'main_loss_backward_scale', original_loss_scale
+        )
+        monkeypatch.setattr('megatron.core.tensor_parallel.random._fork_rng', lambda: nullcontext())
+        monkeypatch.setattr(
+            'megatron.core.transformer.cuda_graphs.log_on_each_pipeline_stage',
+            lambda **kwargs: None,
+        )
+
+        helper.parallel_prewarm_thd_chunks()
+
+        assert chunk.forward_calls == 1
+        assert chunk.running_value.item() == 3.0
+        assert chunk.is_first_microbatch is True
+        assert chunk.input_tensor == 'pipeline-input'
+        assert chunk.weight.grad is None
+        assert set(dsa_tracker) == {'values', 'agreed_size'}
+        assert torch.equal(dsa_tracker['values'], torch.tensor([7.0]))
+        assert dsa_tracker['agreed_size'] == 4
+        assert DSAIndexerLossAutoScaler.main_loss_backward_scale is original_loss_scale
+        assert dynamic_cp_contexts == [max_cp_context, None]
+
+    def test_reset_after_capture_cleans_dsa_loss_tracker(self, monkeypatch):
+        from importlib import import_module
+
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossLoggingHelper,
+        )
+        from megatron.core.transformer.moe import moe_logging
+
+        finalize_model_grads_module = import_module(
+            "megatron.core.distributed.finalize_model_grads"
+        )
+
+        reduce_group = object()
+        avg_group = object()
+        dsa_tracker = {
+            'values': torch.tensor([7.0, 11.0]),
+            'reduce_group': reduce_group,
+            'avg_group': avg_group,
+            'agreed_size': 2,
+        }
+        calls = []
+
+        class FakeModelChunk:
+            @staticmethod
+            def zero_grad_buffer():
+                calls.append('zero_grad_buffer')
+
+        class FakeOptimizer:
+            @staticmethod
+            def zero_grad():
+                calls.append('zero_grad')
+
+        helper = object.__new__(TECudaGraphHelper)
+        helper.model = [FakeModelChunk()]
+        helper.optimizers = [FakeOptimizer()]
+        helper.config = SimpleNamespace()
+
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, 'tracker', dsa_tracker)
+        monkeypatch.setattr(
+            moe_logging,
+            'get_moe_metrics_tracker',
+            lambda: SimpleNamespace(clear=lambda: calls.append('clear_moe_tracker')),
+        )
+        monkeypatch.setattr(
+            finalize_model_grads_module,
+            'reset_model_temporary_tensors',
+            lambda config, model: calls.append(('reset_model_temporary_tensors', config, model)),
+        )
+
+        helper._reset_after_capture()
+
+        assert calls[:3] == ['zero_grad_buffer', 'zero_grad', 'clear_moe_tracker']
+        assert calls[3] == ('reset_model_temporary_tensors', helper.config, helper.model)
+        assert torch.equal(dsa_tracker['values'], torch.zeros(2))
+        assert dsa_tracker['reduce_group'] is reduce_group
+        assert dsa_tracker['avg_group'] is avg_group
+        assert dsa_tracker['agreed_size'] == 2
+
+    def test_te_chunk_uses_outer_block_callable(self):
+        config = SimpleNamespace(cuda_graph_granularity='chunk', dynamic_context_parallel=True)
+
+        for block_type in (TransformerBlock, HybridStack):
+            block = object.__new__(block_type)
+            object.__setattr__(block, 'config', config)
+            assert isinstance(block, GraphableMegatronModule)
+            assert _layer_is_graphable(block, config)
+            assert not block._should_call_local_cudagraph()
+
+    def test_dynamic_cp_layer_graphability_requires_runtime_bank_activation(self):
+        from megatron.core.ssm.mamba_layer import MambaLayer
+
+        config = SimpleNamespace(
+            cuda_graph_granularity='layer', dynamic_context_parallel=True, cuda_graph_modules=[]
+        )
+
+        assert _layer_is_graphable(object.__new__(TransformerLayer), config)
+        assert not _layer_is_graphable(object.__new__(MambaLayer), config)
+        assert not _layer_is_graphable(object.__new__(HyperConnectionHybridLayer), config)
+
+    def test_te_chunk_config_requires_te_and_empty_module_scope(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_granularity='chunk',
+            cuda_graph_modules=[],
+            recompute_granularity='full',
+            recompute_method='uniform',
+            recompute_num_layers=1,
+        )
+        assert cfg.cuda_graph_granularity == 'chunk'
+
+        invalid_configs = (
+            (
+                {'cuda_graph_impl': 'local', 'cuda_graph_modules': []},
+                "requires cuda_graph_impl='transformer_engine'",
+            ),
+            (
+                {
+                    'cuda_graph_impl': 'transformer_engine',
+                    'cuda_graph_modules': [CudaGraphModule.attn],
+                },
+                'empty cuda_graph_modules',
+            ),
+        )
+        for overrides, match in invalid_configs:
+            with pytest.raises(AssertionError, match=match):
+                _base_cuda_graph_config(cuda_graph_granularity='chunk', **overrides)
+
+    def test_te_chunk_paged_stash_requires_runtime_schedule_keys(self):
+        kwargs = dict(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_granularity='chunk',
+            cuda_graph_modules=[],
+            cuda_graph_warmup_steps=2,
+            moe_paged_stash=True,
+            moe_flex_dispatcher_backend='hybridep',
+            moe_expert_rank_capacity_factor=1.2,
+            use_transformer_engine_op_fuser=True,
+        )
+        with pytest.raises(AssertionError, match="runtime schedule keys"):
+            _base_cuda_graph_config(cuda_graph_dynamic_microbatches=False, **kwargs)
+
+        config = _base_cuda_graph_config(cuda_graph_dynamic_microbatches=True, **kwargs)
+        assert config.cuda_graph_dynamic_microbatches is True
+
+    def test_te_chunk_granularity_cli(self, monkeypatch):
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch,
+            ['--cuda-graph-impl', 'transformer_engine', '--cuda-graph-granularity', 'chunk'],
+        )
+        assert args.cuda_graph_granularity == 'chunk'
+
+    def test_te_chunk_disables_fp8_for_bf16_boundary_layers(self, monkeypatch):
+        disabled_context = object()
+        fp8_context = object()
+        monkeypatch.setattr(
+            'megatron.core.transformer.transformer_block.get_fp8_disabled_context',
+            lambda config: disabled_context,
+        )
+        monkeypatch.setattr(
+            'megatron.core.transformer.transformer_block.get_fp8_context',
+            lambda config, layer_idx: fp8_context,
+        )
+
+        block = object.__new__(TransformerBlock)
+        object.__setattr__(
+            block,
+            'config',
+            SimpleNamespace(
+                fp8='e4m3',
+                fp4=None,
+                cuda_graph_granularity='chunk',
+                first_last_layers_bf16=True,
+                num_layers=4,
+                num_layers_at_start_in_bf16=1,
+                num_layers_at_end_in_bf16=1,
+            ),
+        )
+
+        assert (
+            block._get_inner_quantization_context(SimpleNamespace(layer_number=1))
+            is disabled_context
+        )
+        assert block._get_inner_quantization_context(SimpleNamespace(layer_number=2)) is fp8_context
+
     def test_local_impl_defaults_to_layer_scope(self):
         cfg = _base_cuda_graph_config(cuda_graph_impl='local')
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
@@ -153,6 +486,65 @@ class TestCudaGraphConfigAndArguments:
                 fine_grained_activation_offloading=True,
                 offload_modules=['mlp_norm'],
                 num_moe_experts=4,
+            )
+
+    def test_te_whole_moe_graph_allows_sync_free_hybridep_paged_stash(self):
+        cfg = _te_whole_moe_paged_stash_config(cuda_graph_warmup_steps=2)
+
+        assert cfg.cuda_graph_modules == [CudaGraphModule.moe]
+
+        whole_layer_cfg = _te_whole_moe_paged_stash_config(
+            cuda_graph_modules=[], cuda_graph_warmup_steps=2
+        )
+        assert whole_layer_cfg.cuda_graph_modules == []
+
+    @pytest.mark.parametrize("cuda_graph_modules", [[], [CudaGraphModule.moe]])
+    def test_te_whole_moe_paged_stash_rejects_dynamic_microbatches(self, cuda_graph_modules):
+        with pytest.raises(AssertionError, match="require a fixed runtime microbatch schedule"):
+            _te_whole_moe_paged_stash_config(
+                cuda_graph_modules=cuda_graph_modules, cuda_graph_dynamic_microbatches=True
+            )
+
+    @pytest.mark.parametrize("cuda_graph_modules", [[], [CudaGraphModule.moe]])
+    @pytest.mark.parametrize("warmup_steps", [0, 1])
+    def test_te_whole_moe_paged_stash_requires_two_warmup_steps(
+        self, cuda_graph_modules, warmup_steps
+    ):
+        with pytest.raises(AssertionError, match="require at least 2 cuda_graph_warmup_steps"):
+            _te_whole_moe_paged_stash_config(
+                cuda_graph_modules=cuda_graph_modules, cuda_graph_warmup_steps=warmup_steps
+            )
+
+    def test_te_moe_router_paged_stash_still_allows_dynamic_microbatches(self):
+        cfg = _te_whole_moe_paged_stash_config(
+            cuda_graph_modules=[CudaGraphModule.moe_router], cuda_graph_dynamic_microbatches=True
+        )
+
+        assert cfg.cuda_graph_dynamic_microbatches
+
+    def test_full_iteration_paged_stash_requires_one_warmup_step(self):
+        with pytest.raises(AssertionError, match="at least one eager warmup step"):
+            _te_whole_moe_paged_stash_config(
+                cuda_graph_impl="full_iteration", cuda_graph_modules=[], cuda_graph_warmup_steps=0
+            )
+
+        cfg = _te_whole_moe_paged_stash_config(
+            cuda_graph_impl="full_iteration", cuda_graph_modules=[], cuda_graph_warmup_steps=1
+        )
+        assert cfg.cuda_graph_warmup_steps == 1
+
+    def test_te_whole_moe_graph_rejects_sync_free_hybridep_without_paged_stash(self):
+        with pytest.raises(
+            AssertionError, match="sync-free HybridEP with rank capacity and paged stash"
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=[CudaGraphModule.moe],
+                num_moe_experts=4,
+                moe_token_dispatcher_type="flex",
+                moe_flex_dispatcher_backend="hybridep",
+                moe_expert_rank_capacity_factor=1.2,
+                use_transformer_engine_op_fuser=True,
             )
 
     def test_full_iteration_impl_requires_empty_scope(self):
@@ -1221,6 +1613,70 @@ class TestTECudaGraphHelper:
         ), f"Order length mismatch: expected {expected_order_length}, got {len(order)}"
 
 
+class TestSlotAliasedVariantOrder:
+    @staticmethod
+    def _dynamic_cp_capture_order():
+        helper = object.__new__(TECudaGraphHelper)
+        helper.flattened_callables = [torch.nn.Identity()]
+        helper.num_microbatches = 1
+        helper.num_layers_per_chunk = [1]
+        helper.num_model_chunks = 1
+        capture_banks = []
+        for cp_size in (4, 2, 1):
+            capture_banks.append(
+                (
+                    cp_size,
+                    None,
+                    ((),),
+                    {'_order': (1, -1), '_reuse_graph_input_output_buffers': True},
+                )
+            )
+        _, _, kwargs = helper._get_dynamic_cp_variant_capture_data(capture_banks)
+        return kwargs['_order']
+
+    def test_capture_uses_minimum_cp_as_canonical(self):
+        assert self._dynamic_cp_capture_order() == [3, -3, 1, -1, 2, -2]
+
+    def test_variant_major_starts_with_canonical_variant(self):
+        order = TECudaGraphHelper._build_slot_aliased_variant_order(
+            [1, 2, -2, -1], num_variants=4, num_model_chunks=2, canonical_variant=3
+        )
+
+        assert order == [7, 8, -8, -7, 1, 2, -2, -1, 3, 4, -4, -3, 5, 6, -6, -5]
+
+    def test_capture_keeps_paged_stash_on_base_order(self, monkeypatch):
+        helper = object.__new__(TECudaGraphHelper)
+        helper.flattened_callables = [torch.nn.Identity()]
+        helper.num_microbatches = 1
+        helper.num_layers_per_chunk = [1]
+        helper.num_model_chunks = 1
+        capture_banks = [
+            (cp_size, None, [()], {'_order': (1, -1), '_reuse_graph_input_output_buffers': True})
+            for cp_size in (4, 2, 1)
+        ]
+        te_orders = []
+        paged_stash_orders = []
+
+        def fake_capture(callables, sample_args, kwargs, *, paged_stash_order=None):
+            del callables
+            te_orders.append(tuple(kwargs['_order']))
+            paged_stash_orders.append(tuple(paged_stash_order))
+            return [object() for _ in sample_args]
+
+        monkeypatch.setattr(helper, "_capture_graph_bank", fake_capture)
+        monkeypatch.setattr(
+            "megatron.core.transformer.cuda_graphs.log_on_each_pipeline_stage",
+            lambda **_kwargs: None,
+        )
+        captured_graphs = {}
+
+        helper._capture_dynamic_cp_variants(capture_banks, captured_graphs)
+
+        assert te_orders == [(3, -3, 1, -1, 2, -2)]
+        assert paged_stash_orders == [(1, -1)]
+        assert set(captured_graphs) == {1, 2, 4}
+
+
 class TestRequiredNumMicrobatchSlots:
     """Pure-Python tests for ``_get_required_num_microbatch_slots_from_order``.
 
@@ -1512,6 +1968,145 @@ class TestPartialCudaGraph:
             self.cuda_graph_helper = None
 
         return torch.tensor(loss_list)
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+    )
+    def test_mtp_thd_partial_cudagraph_replay_changed_boundaries(self):
+        """TE partial replay refreshes same-shape THD boundaries for prepared MTP rows."""
+        self.seq_length = 32
+        self.micro_batch_size = 1
+        self.tp_size = 1
+        self.cp_size = 1
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, context_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        boundaries_per_step = ([0, 8, 16, 32], [0, 4, 16, 32], [0, 8, 16, 32])
+
+        def position_ids_for(boundaries):
+            position_ids = torch.empty(self.seq_length, dtype=torch.int64, device="cuda")
+            for start, end in zip(boundaries, boundaries[1:]):
+                position_ids[start:end] = torch.arange(end - start, device="cuda")
+            return position_ids.unsqueeze(0)
+
+        def run(cuda_graph_impl):
+            args = self.create_test_args(
+                cuda_graph_impl,
+                [CudaGraphModule.attn] if cuda_graph_impl == "transformer_engine" else None,
+                0,
+                1,
+                global_batch_size=torch.distributed.get_world_size(),
+                max_position_embeddings=32,
+                max_seqlen_per_dp_cp_rank=32,
+                mtp_num_layers=3,
+                fp8=None,
+                first_last_layers_bf16=False,
+                create_attention_mask_in_dataloader=False,
+                sequence_packing_scheduler="dp_balanced",
+                moe_token_dispatcher_type="alltoall",
+                pad_packed_seq_alignment="max",
+                thd_max_packed_sequences=3,
+                transformer_impl="transformer_engine",
+            )
+            set_args(args)
+            torch.manual_seed(123)
+            model_parallel_cuda_manual_seed(123)
+            input_ids = torch.arange(self.seq_length, dtype=torch.int64, device="cuda").unsqueeze(0)
+            labels = (input_ids + 1).clone()
+            loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
+            padding_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            gpt_model, optimizer, _ = setup_model_and_optimizer(
+                ModelType.encoder_or_decoder, self.model_provider
+            )
+            assert len(gpt_model) == 1
+            MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+
+            if cuda_graph_impl == "transformer_engine":
+                self.cuda_graph_helper = TECudaGraphHelper(
+                    model=gpt_model,
+                    config=gpt_model[0].config,
+                    seq_length=self.seq_length,
+                    micro_batch_size=self.micro_batch_size,
+                    optimizers=[optimizer],
+                )
+                self.cuda_graph_helper.create_cudagraphs()
+                assert self.cuda_graph_helper.graphs_created()
+
+            named_parameters = tuple(gpt_model[0].named_parameters())
+            mtp_grad_parameters = [
+                next(
+                    param
+                    for name, param in named_parameters
+                    if f"mtp.layers.{depth}." in name and param.requires_grad
+                )
+                for depth in range(3)
+            ]
+            results = []
+            for boundaries in boundaries_per_step:
+                gpt_model[0].zero_grad_buffer()
+                optimizer.zero_grad()
+                set_current_microbatch(gpt_model[0], 0)
+                gpt_model[0].set_is_first_microbatch()
+                cu_seqlens = torch.tensor(boundaries, dtype=torch.int32, device="cuda")
+                packed_seq_params = PackedSeqParams(
+                    qkv_format="thd",
+                    cu_seqlens_q=cu_seqlens.clone(),
+                    cu_seqlens_kv=cu_seqlens.clone(),
+                    cu_seqlens_q_padded=cu_seqlens.clone(),
+                    cu_seqlens_kv_padded=cu_seqlens.clone(),
+                    max_seqlen_q=32,
+                    max_seqlen_kv=32,
+                    pad_between_seqs=True,
+                )
+                output = gpt_model[0].forward(
+                    input_ids=input_ids,
+                    position_ids=position_ids_for(boundaries),
+                    attention_mask=None,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    padding_mask=padding_mask,
+                    packed_seq_params=packed_seq_params,
+                )
+                loss = output.mean()
+                loss.backward()
+                assert all(param.main_grad is not None for param in mtp_grad_parameters)
+                results.append(
+                    (
+                        output.detach().cpu().clone(),
+                        loss.detach().cpu().clone(),
+                        tuple(
+                            param.main_grad.detach().cpu().clone() for param in mtp_grad_parameters
+                        ),
+                    )
+                )
+
+            if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
+                self.cuda_graph_helper.delete_cuda_graphs()
+                self.cuda_graph_helper = None
+            return results
+
+        try:
+            eager_results = run("none")
+            graph_results = run("transformer_engine")
+            for eager, graph in zip(eager_results, graph_results):
+                for eager_value, graph_value in zip(eager[:2], graph[:2]):
+                    assert torch.equal(graph_value, eager_value)
+                for eager_grad, graph_grad in zip(eager[2], graph[2], strict=True):
+                    assert torch.equal(graph_grad, eager_grad)
+            for results in (eager_results, graph_results):
+                assert torch.equal(results[0][0], results[2][0])
+                assert not torch.equal(results[0][0], results[1][0])
+                for depth in range(3):
+                    assert torch.equal(results[0][2][depth], results[2][2][depth])
+                    assert not torch.equal(results[0][2][depth], results[1][2][depth])
+                    assert results[0][2][depth].ne(0).any()
+        finally:
+            if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
+                self.cuda_graph_helper.delete_cuda_graphs()
+                self.cuda_graph_helper = None
+            Utils.destroy_model_parallel()
 
     @pytest.mark.flaky
     @pytest.mark.flaky_in_dev

@@ -204,6 +204,137 @@ def _run_one_iter_and_capture(
     return logits.detach().float().cpu(), grads, peak_bytes
 
 
+def _build_one_layer_vpp_models(*, seed: int) -> List[GPTModel]:
+    """Build PP=2/VPP=2 GPT chunks with exactly one TransformerLayer per chunk."""
+    from megatron.core import parallel_state
+    from megatron.core.enums import ModelType
+
+    model_parallel_cuda_manual_seed(seed)
+    torch.manual_seed(seed)
+    config = TransformerConfig(
+        num_layers=4,
+        hidden_size=128,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        attention_backend=AttnBackend.unfused,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=2,
+        fine_grained_activation_offloading=True,
+        offload_modules=["core_attn", "attn_proj"],
+        min_offloaded_tensor_size=1,
+    )
+
+    models = []
+    for vp_stage in range(2):
+        model = (
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=128,
+                max_sequence_length=32,
+                pre_process=parallel_state.is_pipeline_first_stage(
+                    ignore_virtual=False, vp_stage=vp_stage
+                ),
+                post_process=parallel_state.is_pipeline_last_stage(
+                    ignore_virtual=False, vp_stage=vp_stage
+                ),
+                position_embedding_type="rope",
+                vp_stage=vp_stage,
+                share_embeddings_and_output_weights=False,
+            )
+            .bfloat16()
+            .cuda()
+        )
+        model.model_type = ModelType.encoder_or_decoder
+        model.train()
+        assert len(model.decoder.layers) == 1
+        models.append(model)
+    return models
+
+
+def _run_one_vpp_iteration(models: List[GPTModel]) -> List[Dict[str, torch.Tensor]]:
+    """Run one complete interleaved pipeline forward/backward iteration."""
+    from megatron.core.pipeline_parallel import get_forward_backward_func
+
+    seq_length = 32
+    micro_batch_size = 1
+    num_microbatches = 4
+
+    def forward_step_func(data_iterator, model):
+        next(data_iterator)
+        tokens = torch.arange(seq_length, dtype=torch.long, device="cuda").unsqueeze(0)
+        position_ids = torch.arange(seq_length, dtype=torch.long, device="cuda").unsqueeze(0)
+        labels = tokens.clone()
+        output = model(tokens, position_ids, None, labels=labels)
+
+        def loss_func(output_tensor):
+            loss = output_tensor.float().mean()
+            return loss, {"lm loss": loss.detach()}
+
+        return output, loss_func
+
+    losses = get_forward_backward_func()(
+        forward_step_func=forward_step_func,
+        data_iterator=[iter(range(num_microbatches)) for _ in models],
+        model=models,
+        num_microbatches=num_microbatches,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        forward_only=False,
+    )
+    torch.cuda.synchronize()
+    return losses
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_one_layer_vpp_chunk_runs_full_iteration_with_activation_offload():
+    """Do not advance a one-layer VPP chunk before its later offload group.
+
+    The warmup iteration records the real group layout for four TransformerLayers.
+    The second iteration executes the PP=2/VPP=2 interleaved 1F1B schedule, including
+    the immediate backward whose preceding virtual chunk contains only one layer.
+    """
+    from megatron.core import parallel_state
+
+    if Utils.world_size < 2 or Utils.world_size % 2 != 0:
+        pytest.skip("PP=2 requires an even WORLD_SIZE of at least 2.")
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=2,
+    )
+    off_interface.reset_instance()
+
+    try:
+        models = _build_one_layer_vpp_models(seed=123)
+
+        # Build the real cached ChunkOffloadHandlers, then run one steady-state iteration.
+        _run_one_vpp_iteration(models)
+        for model in models:
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
+        losses = _run_one_vpp_iteration(models)
+
+        grads = [
+            param.grad for model in models for param in model.parameters() if param.grad is not None
+        ]
+        assert grads, "Expected the interleaved schedule to produce parameter gradients."
+        assert all(torch.isfinite(grad).all() for grad in grads)
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            assert len(losses) == 4
+            assert all(torch.isfinite(item["lm loss"]) for item in losses)
+    finally:
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.parametrize(
     "is_moe, is_mla, offload_modules",
@@ -665,6 +796,7 @@ def _build_gpt_model_with_cuda_graph(
     cuda_graph_impl: str,
     cuda_graph_modules: Optional[List[str]],
     cuda_graph_warmup_steps: int,
+    cuda_graph_granularity: str = "layer",
     delay_offload_until_cuda_graph: bool = False,
     activation_offload_fraction: float = 1.0,
     enable_hyper_connections: bool = False,
@@ -699,6 +831,7 @@ def _build_gpt_model_with_cuda_graph(
         cuda_graph_impl=cuda_graph_impl,
         cuda_graph_modules=cuda_graph_modules,
         cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+        cuda_graph_granularity=cuda_graph_granularity,
         use_te_rng_tracker=True,
         # Hyper Connection settings
         enable_hyper_connections=enable_hyper_connections,
@@ -827,6 +960,266 @@ def _run_iters_with_cuda_graph(
     return logits.detach().float().cpu(), grads, peak_bytes
 
 
+def _build_partial_cg_pipeline_model(
+    *, seed: int, num_layers: int, moe_layer_freq, offload_modules: List[str]
+) -> GPTModel:
+    """Build one PP=2 model chunk with graph-scoped attention and eager experts."""
+    from megatron.core import parallel_state
+    from megatron.core.enums import ModelType
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+
+    model_parallel_cuda_manual_seed(seed)
+    torch.manual_seed(seed)
+    config = TransformerConfig(
+        num_layers=num_layers,
+        hidden_size=256,
+        num_attention_heads=8,
+        use_cpu_initialization=True,
+        attention_backend=AttnBackend.unfused,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        pipeline_model_parallel_size=2,
+        recompute_modules=["layernorm", "moe_act"],
+        recompute_granularity="selective",
+        num_moe_experts=4,
+        moe_grouped_gemm=True,
+        moe_layer_freq=moe_layer_freq,
+        fine_grained_activation_offloading=True,
+        offload_modules=offload_modules,
+        min_offloaded_tensor_size=1,
+        delay_offload_until_cuda_graph=False,
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=["attn", "moe_router"],
+        cuda_graph_warmup_steps=3,
+        use_te_rng_tracker=True,
+    )
+    model = (
+        GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_decoder_block_spec(
+                config=config, use_transformer_engine=True
+            ),
+            vocab_size=128,
+            max_sequence_length=128,
+            pre_process=parallel_state.is_pipeline_first_stage(),
+            post_process=parallel_state.is_pipeline_last_stage(),
+            position_embedding_type="rope",
+            share_embeddings_and_output_weights=False,
+        )
+        .bfloat16()
+        .cuda()
+    )
+    model.model_type = ModelType.encoder_or_decoder
+    model.train()
+    model.zero_grad_buffer = lambda: None
+    return model
+
+
+def _run_partial_cg_pipeline_iteration(model: GPTModel) -> List[Dict[str, torch.Tensor]]:
+    """Run one PP=2 pipeline iteration with four live CUDA-graph microbatch slots."""
+    from megatron.core.pipeline_parallel import get_forward_backward_func
+
+    seq_length = 128
+    micro_batch_size = 1
+    num_microbatches = 4
+
+    def forward_step_func(data_iterator, model):
+        microbatch_id = next(data_iterator)
+        tokens = (
+            (torch.arange(seq_length, dtype=torch.long, device="cuda") + microbatch_id)
+            .remainder(128)
+            .unsqueeze(0)
+        )
+        position_ids = torch.arange(seq_length, dtype=torch.long, device="cuda").unsqueeze(0)
+        output = model(tokens, position_ids, None, labels=tokens.clone())
+
+        def loss_func(output_tensor):
+            loss = output_tensor.float().mean()
+            return loss, {"lm loss": loss.detach()}
+
+        return output, loss_func
+
+    return get_forward_backward_func()(
+        forward_step_func=forward_step_func,
+        data_iterator=[iter(range(num_microbatches))],
+        model=[model],
+        num_microbatches=num_microbatches,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        forward_only=False,
+    )
+
+
+def _run_partial_cg_offload_case(
+    *, num_layers: int, moe_layer_freq, offload_modules: List[str]
+) -> None:
+    """Validate one real PP=2 partial-CG/offload configuration."""
+    from megatron.core import parallel_state
+    from megatron.core.num_microbatches_calculator import (
+        destroy_num_microbatches_calculator,
+        init_num_microbatches_calculator,
+    )
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        PipelineOffloadManager,
+    )
+    from megatron.core.tensor_parallel.random import initialize_rng_tracker
+    from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+    from megatron.core.transformer.enums import CudaGraphModule
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
+    os.environ.pop("NVTE_FUSED_ATTN", None)
+    os.environ.pop("NVTE_FLASH_ATTN", None)
+    os.environ.pop("NVTE_UNFUSED_ATTN", None)
+
+    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=2)
+    off_interface.reset_instance()
+    destroy_num_microbatches_calculator()
+    data_parallel_size = parallel_state.get_data_parallel_world_size()
+    init_num_microbatches_calculator(
+        rank=torch.distributed.get_rank(),
+        rampup_batch_size=None,
+        global_batch_size=4 * data_parallel_size,
+        micro_batch_size=1,
+        data_parallel_size=data_parallel_size,
+        decrease_batch_size_if_needed=False,
+    )
+    original_cuda_stream = torch.cuda.current_stream()
+    te_side_stream = torch.cuda.Stream()
+    te_side_stream.wait_stream(original_cuda_stream)
+    torch.cuda.set_stream(te_side_stream)
+
+    try:
+        model = _build_partial_cg_pipeline_model(
+            seed=123,
+            num_layers=num_layers,
+            moe_layer_freq=moe_layer_freq,
+            offload_modules=offload_modules,
+        )
+        local_num_layers = num_layers // 2
+        assert len(model.decoder.layers) == local_num_layers
+
+        if isinstance(moe_layer_freq, int):
+            global_moe_pattern = [
+                1 if layer_idx % moe_layer_freq == 0 else 0 for layer_idx in range(num_layers)
+            ]
+        else:
+            global_moe_pattern = moe_layer_freq
+        local_layer_offset = parallel_state.get_pipeline_model_parallel_rank() * local_num_layers
+        expected_local_moe_pattern = global_moe_pattern[
+            local_layer_offset : local_layer_offset + local_num_layers
+        ]
+        actual_local_moe_pattern = [
+            int(isinstance(layer.mlp, MoELayer)) for layer in model.decoder.layers
+        ]
+        assert actual_local_moe_pattern == expected_local_moe_pattern
+
+        assert model.config.cuda_graph_modules == [CudaGraphModule.attn, CudaGraphModule.moe_router]
+        attention_offload_modules = {"qkv_linear", "core_attn", "attn_proj"}
+        expected_offload_in_graph = bool(attention_offload_modules & set(offload_modules))
+        assert all(
+            layer.offload_module_in_cuda_graph == expected_offload_in_graph
+            for layer in model.decoder.layers
+        )
+        cuda_graph_helper = TECudaGraphHelper(
+            model=[model], config=model.config, seq_length=128, micro_batch_size=1, optimizers=[]
+        )
+
+        # Record real handlers and stabilize grad buffers before graph capture.
+        for _ in range(3):
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
+            eager_losses = _run_partial_cg_pipeline_iteration(model)
+
+        eager_grads = {
+            name: param.grad.detach().float().cpu().clone()
+            for name, param in model.named_parameters()
+            if param.grad is not None
+        }
+        eager_loss_values = [item["lm loss"].float().cpu() for item in eager_losses]
+        offload_summary = PipelineOffloadManager.get_instance().offload_summary_bytes
+        for offload_module in offload_modules:
+            global_offload_bytes = torch.tensor(
+                offload_summary.get(offload_module, 0), dtype=torch.int64, device="cuda"
+            )
+            torch.distributed.all_reduce(global_offload_bytes)
+            assert global_offload_bytes.item() > 0, offload_summary
+
+        cuda_graph_helper.create_cudagraphs()
+        assert cuda_graph_helper.num_microbatches == 4
+        assert cuda_graph_helper.graphs_created()
+
+        for param in model.parameters():
+            if param.grad is not None:
+                param.grad.zero_()
+        losses = _run_partial_cg_pipeline_iteration(model)
+        torch.cuda.synchronize()
+
+        graph_grads = {
+            name: param.grad.detach().float().cpu()
+            for name, param in model.named_parameters()
+            if param.grad is not None
+        }
+        assert graph_grads.keys() == eager_grads.keys()
+        for name, eager_grad in eager_grads.items():
+            assert torch.allclose(graph_grads[name], eager_grad, rtol=1e-2, atol=1e-2), name
+        if parallel_state.is_pipeline_last_stage():
+            assert len(losses) == 4
+            graph_loss_values = [item["lm loss"].float().cpu() for item in losses]
+            assert all(
+                torch.allclose(graph_loss, eager_loss, rtol=1e-2, atol=1e-2)
+                for graph_loss, eager_loss in zip(graph_loss_values, eager_loss_values)
+            )
+    finally:
+        if "cuda_graph_helper" in locals() and cuda_graph_helper.graphs_created():
+            cuda_graph_helper.delete_cuda_graphs()
+        original_cuda_stream.wait_stream(te_side_stream)
+        torch.cuda.set_stream(original_cuda_stream)
+        destroy_num_microbatches_calculator()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.skipif(
+    not is_te_min_version("2.14.0"), reason="Partial CUDA graph offloading requires TE >= 2.14.0"
+)
+def test_partial_cuda_graph_mixed_scope_offload_runs_full_iteration():
+    """Run graph-scoped core_attn and eager moe_act offload in one real iteration."""
+    _run_partial_cg_offload_case(
+        num_layers=4, moe_layer_freq=1, offload_modules=["core_attn", "moe_act"]
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.skipif(
+    not is_te_min_version("2.14.0"), reason="Partial CUDA graph offloading requires TE >= 2.14.0"
+)
+@pytest.mark.parametrize(
+    "offload_modules",
+    [
+        pytest.param(["moe_act"], id="moe-act-only"),
+        pytest.param(["expert_fc1", "moe_act"], id="moe-stack"),
+        pytest.param(["core_attn"], id="attention-core-only"),
+        pytest.param(["qkv_linear", "core_attn", "attn_proj"], id="attention-stack"),
+        pytest.param(["core_attn", "moe_act"], id="attention-and-moe-act"),
+        pytest.param(
+            ["qkv_linear", "core_attn", "attn_proj", "expert_fc1", "moe_act"],
+            id="attention-and-moe-stack",
+        ),
+    ],
+)
+def test_hybrid_dense_moe_partial_cuda_graph_offload_variants(offload_modules: List[str]):
+    """Exercise DeepSeek-V3-like dense-to-MoE layers across offload group subsets."""
+    _run_partial_cg_offload_case(
+        num_layers=6, moe_layer_freq=[0, 0, 1, 1, 1, 1], offload_modules=offload_modules
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.skipif(
     not is_te_min_version("2.14.0"), reason="CUDA Graph with TE RNG tracker requires TE >= 2.13.0"
@@ -865,6 +1258,8 @@ def _run_iters_with_cuda_graph(
         (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 0.5, True),
         # Test delay_offload_until_cuda_graph parameter
         (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 1.0, False),
+        # Whole-decoder-chunk graph boundary with all offload groups captured.
+        (False, ["core_attn", "attn_proj"], [], 1.0, False),
     ],
 )
 def test_fine_grained_activation_offloading_with_cuda_graph(
@@ -894,7 +1289,8 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 
     seed = 123
-    num_experts = 4  # Always MoE model
+    cuda_graph_granularity = "chunk" if not cuda_graph_modules else "layer"
+    num_experts = None if cuda_graph_granularity == "chunk" else 4
     num_layers = 4  # Smaller for faster test with CUDA graphs
     hidden_size = 1024
     num_attention_heads = 8
@@ -928,6 +1324,7 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
             cuda_graph_impl="transformer_engine",
             cuda_graph_modules=cuda_graph_modules,
             cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+            cuda_graph_granularity=cuda_graph_granularity,
         ).cuda()
         base_model.train()
 
@@ -961,6 +1358,7 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
             cuda_graph_impl="transformer_engine",
             cuda_graph_modules=cuda_graph_modules,
             cuda_graph_warmup_steps=cuda_graph_warmup_steps,
+            cuda_graph_granularity=cuda_graph_granularity,
             delay_offload_until_cuda_graph=delay_offload,
             activation_offload_fraction=activation_offload_fraction,
         ).cuda()

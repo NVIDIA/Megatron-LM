@@ -2,6 +2,7 @@
 
 import torch
 
+from megatron.core.dynamic_cp_group import get_process_group_ranks
 from megatron.core.parallel_state import get_global_memory_buffer
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, is_torch_min_version
 
@@ -35,6 +36,49 @@ def _reduce(input_, group):
     torch.distributed.all_reduce(input_, group=group)
 
     return input_
+
+
+def _reduce_dynamic_cp_subgroup_via_parent(input_, subgroup, parent_group):
+    """Sum a logical dynamic-CP subgroup through parent-group P2P operations."""
+    if subgroup is None or parent_group is None:
+        raise RuntimeError("Dynamic-CP parent reduction requires subgroup and parent_group.")
+
+    parent_ranks = get_process_group_ranks(parent_group)
+    subgroup_ranks = get_process_group_ranks(subgroup)
+    if not set(subgroup_ranks).issubset(parent_ranks):
+        raise RuntimeError(
+            "Dynamic-CP subgroup ranks must belong to the parent group: "
+            f"subgroup={subgroup_ranks}, parent={parent_ranks}."
+        )
+
+    cp_size = subgroup.size()
+    if cp_size == 1:
+        return input_.clone()
+
+    cp_rank = subgroup.rank()
+    send_dst = subgroup_ranks[(cp_rank + 1) % cp_size]
+    recv_src = subgroup_ranks[(cp_rank - 1) % cp_size]
+    result = input_.contiguous().clone()
+    send_buffer = input_.contiguous()
+
+    for _ in range(cp_size - 1):
+        recv_buffer = torch.empty_like(send_buffer)
+        requests = torch.distributed.batch_isend_irecv(
+            [
+                torch.distributed.P2POp(
+                    torch.distributed.isend, send_buffer, send_dst, parent_group
+                ),
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, recv_buffer, recv_src, parent_group
+                ),
+            ]
+        )
+        for request in requests:
+            request.wait()
+        result.add_(recv_buffer)
+        send_buffer = recv_buffer
+
+    return result
 
 
 def _split_along_last_dim(input_, group):
@@ -235,6 +279,20 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Backward function."""
         return grad_output, None
+
+
+class _ReduceFromDynamicCPSubgroup(torch.autograd.Function):
+    """Dynamic-CP subgroup sum in forward and identity in backward."""
+
+    @staticmethod
+    def forward(ctx, input_, subgroup, parent_group):
+        """Reduce through parent-group P2P operations."""
+        return _reduce_dynamic_cp_subgroup_via_parent(input_, subgroup, parent_group)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward function."""
+        return grad_output, None, None
 
 
 class _ScatterToModelParallelRegion(torch.autograd.Function):
@@ -544,6 +602,11 @@ def reduce_from_tensor_model_parallel_region(input_, group=None):
     """Wrapper for autograd function: forward: all reduce, backward copy"""
     group = get_tensor_model_parallel_group_if_none(group)
     return _ReduceFromModelParallelRegion.apply(input_, group)
+
+
+def reduce_from_dynamic_cp_subgroup(input_, subgroup, parent_group):
+    """Reduce a dynamic-CP subgroup without creating a subgroup communicator."""
+    return _ReduceFromDynamicCPSubgroup.apply(input_, subgroup, parent_group)
 
 
 def scatter_to_tensor_model_parallel_region(input_, group=None):

@@ -22,8 +22,139 @@ ALLOWED_INFERENCE_SCOPES: dict[str, Set[InferenceCudaGraphScope]] = {
 }
 
 
+def is_te_layer_whole_moe_cuda_graph(config) -> bool:
+    """Return whether a layer-granularity TE graph captures the whole MoE body.
+
+    An empty ``cuda_graph_modules`` list means whole-layer capture, so it includes the MoE
+    body just like an explicit ``CudaGraphModule.moe`` entry.  Chunk granularity has a separate
+    runtime-key schedule and must not inherit the fixed-microbatch layer-graph contract.
+    """
+
+    modules = getattr(config, "cuda_graph_modules", ()) or ()
+    return (
+        getattr(config, "cuda_graph_impl", "none") == "transformer_engine"
+        and getattr(config, "cuda_graph_granularity", "layer") == "layer"
+        and (not modules or CudaGraphModule.moe in modules)
+    )
+
+
+def te_cuda_graph_capture_contains_moe(config) -> bool:
+    """Return whether the current TE callable boundary contains a complete MoE body."""
+
+    modules = getattr(config, "cuda_graph_modules", ()) or ()
+    return getattr(config, "cuda_graph_impl", "none") == "transformer_engine" and (
+        getattr(config, "cuda_graph_granularity", "layer") == "chunk"
+        or not modules
+        or CudaGraphModule.moe in modules
+    )
+
+
+PACKED_DSA_CP_CUDA_GRAPH_ERROR = (
+    "CUDA graph capture is not supported for this packed DSA context-parallel "
+    "configuration: the requested capture path cannot preserve or reconstruct the "
+    "per-sequence CP layout during warmup and replay. Full CUDA Graph support for "
+    "packed DSA+CP is deferred; set cuda_graph_impl='none'. Other unguarded capture "
+    "combinations remain experimental unless separately validated."
+)
+
+
+def is_packed_dsa_cp_cuda_graph_capture_unsupported(
+    *,
+    experimental_attention_variant: Optional[str],
+    dsa_kernel_backend: str,
+    sequence_packing_scheduler: Optional[str],
+    dynamic_context_parallel: bool,
+    context_parallel_size: int,
+    cuda_graph_impl: str,
+    cuda_graph_modules: Optional[List[CudaGraphModule]],
+    inference_cuda_graph_scope: InferenceCudaGraphScope,
+) -> bool:
+    """Return whether a packed DSA+CP graph combination is proven unsupported.
+
+    Keep this predicate limited to configurations covered by GPU evidence. The
+    static validation matrix exercised configured CP=2 and CP=4; the dynamic
+    matrix exercised configured CP=2 only. Combined local attention+MLP,
+    attention+Mamba, and TE attention+MLP scopes were measured only at static
+    CP=2. CP=3 failed during model construction before eager preflight or graph
+    capture, so it is not graph-specific evidence and remains outside this
+    guard. Dynamic CP with configured CP=1 is likewise not inferred from the
+    DP x CP pool because that neighboring topology did not reach capture.
+    Unmeasured MoE/Mamba partial scopes and full-iteration capture also remain
+    available until they are measured.
+    """
+
+    static_packing = sequence_packing_scheduler == "dp_balanced" and not dynamic_context_parallel
+    dynamic_packing = (
+        sequence_packing_scheduler == "default_dynamic_cp" and dynamic_context_parallel
+    )
+    if experimental_attention_variant != "dsa":
+        return False
+    if not (static_packing or dynamic_packing):
+        return False
+
+    # Capture scope execution uses membership checks, so repeated spellings such
+    # as ``attn,attn`` are the same effective scope as ``attn``.
+    modules = frozenset(cuda_graph_modules or [])
+    if dsa_kernel_backend == "cudnn":
+        if cuda_graph_impl == "local":
+            measured_scopes = set()
+            if static_packing and context_parallel_size in (2, 4):
+                measured_scopes.update(
+                    {
+                        frozenset(),
+                        frozenset({CudaGraphModule.attn}),
+                        frozenset({CudaGraphModule.mlp}),
+                    }
+                )
+                if context_parallel_size == 2:
+                    measured_scopes.update(
+                        {
+                            frozenset({CudaGraphModule.attn, CudaGraphModule.mlp}),
+                            frozenset({CudaGraphModule.attn, CudaGraphModule.mamba}),
+                        }
+                    )
+            elif dynamic_packing and context_parallel_size == 2:
+                measured_scopes.update(
+                    {
+                        frozenset(),
+                        frozenset({CudaGraphModule.attn}),
+                        frozenset({CudaGraphModule.mlp}),
+                    }
+                )
+
+            if modules not in measured_scopes:
+                return False
+            if not modules:
+                # ``block`` owns an inference-only TransformerBlock graph and
+                # skips the per-layer whole-scope manager exercised by the
+                # training validation matrix.
+                return inference_cuda_graph_scope == InferenceCudaGraphScope.layer
+            return True
+        if cuda_graph_impl == "transformer_engine":
+            measured_scopes = set()
+            if static_packing and context_parallel_size in (2, 4):
+                measured_scopes.update({frozenset(), frozenset({CudaGraphModule.attn})})
+                if context_parallel_size == 2:
+                    measured_scopes.add(frozenset({CudaGraphModule.attn, CudaGraphModule.mlp}))
+            elif dynamic_packing and context_parallel_size == 2:
+                measured_scopes.update({frozenset(), frozenset({CudaGraphModule.attn})})
+            return modules in measured_scopes
+
+    # The unfused scorer was measured only for static attention-only local
+    # capture. TileLang was unavailable in the validation image, and the
+    # remaining backend-none scopes were not measured, so keep them available.
+    if (
+        dsa_kernel_backend == "none"
+        and static_packing
+        and context_parallel_size == 2
+        and cuda_graph_impl == "local"
+    ):
+        return modules == {CudaGraphModule.attn}
+    return False
+
+
 def normalize_cuda_graph_modules(
-    scopes: Optional[Union[str, CudaGraphModule, List[Union[str, CudaGraphModule]]]]
+    scopes: Optional[Union[str, CudaGraphModule, List[Union[str, CudaGraphModule]]]],
 ) -> Tuple[List[CudaGraphModule], List[Tuple[str, str, object]], bool]:
     """Normalize mixed CUDA graph scope inputs into enum values plus deprecation metadata."""
 

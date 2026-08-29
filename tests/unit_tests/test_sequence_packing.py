@@ -18,6 +18,7 @@ from megatron.core.datasets.data_schedule import (
     wrap_data_iterator,
 )
 from megatron.core.datasets.data_schedule_utils import (
+    build_packed_microbatches,
     next_hdp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
 )
@@ -54,6 +55,38 @@ def test_scheduler_max_real_num_seqs_rejects_dummy_without_capacity():
         _get_scheduler_max_real_num_seqs(config)
 
 
+@pytest.mark.parametrize("dynamic_cp", [False, True])
+@pytest.mark.parametrize(("padded_lengths", "expected_min_chunk"), [((8, 12), 2), ((8, 10), 0)])
+def test_build_packed_microbatches_certifies_zigzag_chunk_size(
+    dynamic_cp, padded_lengths, expected_min_chunk
+):
+    """The host schedule emits one conservative certificate for each packed batch."""
+    samples = {
+        sample_id: {
+            "original_seq_len": torch.tensor([padded_length - 1], dtype=torch.int32),
+            "padded_seq_len": torch.tensor([padded_length], dtype=torch.int32),
+        }
+        for sample_id, padded_length in enumerate(padded_lengths)
+    }
+    sample_id_groups = [[[0, 1], [0, 1]]]
+
+    packed = build_packed_microbatches(
+        samples,
+        sample_id_groups,
+        dcp_rank=0,
+        dev=torch.device("cpu"),
+        is_dynamic_cp=dynamic_cp,
+        global_id_seqlens=list(enumerate(padded_lengths)),
+    )
+
+    assert len(packed) == 1
+    assert packed[0]["zigzag_cp_min_chunk_size"].item() == expected_min_chunk
+    if dynamic_cp:
+        assert packed[0]["local_cp_size"].item() == 2
+    else:
+        assert "local_cp_size" not in packed[0]
+
+
 def test_scheduler_thd_padding_mask_from_cu_seqlens():
     cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
     cu_seqlens_padded = torch.tensor([0, 4, 8], dtype=torch.int32)
@@ -82,7 +115,7 @@ def test_scheduler_sanitizes_thd_padding_values():
     assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
 
 
-def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
+def test_scheduler_reroute_reuses_equivalent_dp_cp_group(monkeypatch):
     class _Group:
         def __init__(self, size, rank):
             self._size = size
@@ -137,6 +170,7 @@ def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
         output.copy_(torch.cat([input_, remote]))
 
     monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: False)
     monkeypatch.setattr(torch.distributed, 'all_gather_into_tensor', _all_gather_into_tensor)
     monkeypatch.setattr(
         torch.distributed,
@@ -161,7 +195,35 @@ def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
     assert torch.equal(received[2]['position_ids'], torch.tensor([0, 1, 2, 3]))
     assert torch.equal(received[2]['original_seq_len'], torch.tensor([4], dtype=torch.int32))
     assert torch.equal(received[2]['padded_seq_len'], torch.tensor([4], dtype=torch.int32))
-    assert gather_groups == [dp_group] * 6
+    assert gather_groups == [dp_cp_group] * 6
+
+    with pytest.raises(RuntimeError, match="must use the same rank order"):
+        reroute_samples_to_dcp_ranks(
+            batch=batch,
+            global_ids_this_rank=torch.tensor([0, 1]),
+            global_id_seqlens=[(0, 2), (1, 1), (2, 4)],
+            sample_id_groups=[[[2], [0, 1]]],
+            offsets=torch.tensor([0, 2, 3]),
+            dp_group=_Group(size=2, rank=1),
+            dp_cp_group=dp_cp_group,
+        )
+
+    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        'get_process_group_ranks',
+        lambda group: [0, 1] if group is dp_group else [0, 2],
+    )
+    with pytest.raises(RuntimeError, match="must use the same rank order"):
+        reroute_samples_to_dcp_ranks(
+            batch=batch,
+            global_ids_this_rank=torch.tensor([0, 1]),
+            global_id_seqlens=[(0, 2), (1, 1), (2, 4)],
+            sample_id_groups=[[[2], [0, 1]]],
+            offsets=torch.tensor([0, 2, 3]),
+            dp_group=dp_group,
+            dp_cp_group=dp_cp_group,
+        )
 
 
 def test_scheduler_reroute_rejects_unsupported_sample_keys():

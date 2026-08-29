@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Optional, Tuple, Union
 
 import torch
@@ -7,8 +7,12 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.dynamic_cp_group import LogicalCPGroup
+
 if TYPE_CHECKING:
     from megatron.core.context_parallel_layout import ThdCpRoute
+
+CPGroup = Union[dist.ProcessGroup, LogicalCPGroup]
 
 
 @dataclass
@@ -30,13 +34,21 @@ class PackedSeqParams:
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
     local_cp_size: int = None
-    cp_group: dist.ProcessGroup = None
+    cp_group: CPGroup = None
     total_tokens: int = None
     seq_idx: Tensor = None
     pad_between_seqs: Optional[bool] = None
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     tokens_per_sample: int = None
     cp_partition_route: Optional["ThdCpRoute"] = None
+    # Host-side certificate produced by the packing scheduler. None leaves
+    # zigzag packed-CP MTP on its established roll path. Zero records that the
+    # scheduler inspected the layout but could not certify one-hop addressing;
+    # a positive value proves the minimum non-empty half-chunk size. The
+    # certificate is runtime transport metadata, not part of a graph signature.
+    zigzag_cp_min_chunk_size: Optional[int] = field(
+        default=None, compare=False, metadata={"cuda_graph_ignore": True}
+    )
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
@@ -51,6 +63,12 @@ class PackedSeqParams:
         cu_seqlens_q_padded[-1] == max_seqlen then this additional sequence index will not be
         included.
         """
+        if self.zigzag_cp_min_chunk_size is not None and (
+            isinstance(self.zigzag_cp_min_chunk_size, bool)
+            or not isinstance(self.zigzag_cp_min_chunk_size, int)
+        ):
+            raise TypeError("zigzag_cp_min_chunk_size must be a host int or None.")
+
         cu_seqlens = (
             self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
         )
@@ -80,8 +98,8 @@ class PackedSeqParams:
 
 
 def resolve_cp_group(
-    static_cp_group: dist.ProcessGroup, packed_seq_params: PackedSeqParams = None
-) -> dist.ProcessGroup:
+    static_cp_group: CPGroup, packed_seq_params: PackedSeqParams = None
+) -> CPGroup:
     """Return the dynamic CP group from packed_seq_params when available, else the static one.
 
     Dynamic CP assigns a per-microbatch CP group that may differ from the
@@ -152,6 +170,36 @@ def _pad_cu_seqlens(cu_seqlens: Optional[Tensor], target_entries: int) -> Option
     )
     padded[:actual_entries] = cu_seqlens
     return padded
+
+
+def _same_tensor_view(a: Optional[Tensor], b: Optional[Tensor]) -> bool:
+    """Return whether two real tensors describe the same logical view."""
+    if not isinstance(a, Tensor) or not isinstance(b, Tensor):
+        return False
+    if a is b:
+        return type(a) is Tensor and not a.is_meta and a.numel() > 0
+    # Distinct tensor subclasses and meta/empty tensors do not provide a
+    # reliable physical-storage identity. Fail closed instead of comparing
+    # sentinel pointers or invoking unsupported storage accessors.
+    if type(a) is not Tensor or type(b) is not Tensor or a.is_meta or b.is_meta:
+        return False
+    if a.numel() == 0 or b.numel() == 0:
+        return False
+    try:
+        if (
+            a.dtype != b.dtype
+            or a.device != b.device
+            or a.shape != b.shape
+            or a.stride() != b.stride()
+            or a.storage_offset() != b.storage_offset()
+        ):
+            return False
+        a_data_ptr = a.data_ptr()
+        b_data_ptr = b.data_ptr()
+    except (RuntimeError, NotImplementedError):
+        # Some nonstandard tensor backends do not expose storage/data pointers.
+        return False
+    return a_data_ptr != 0 and a_data_ptr == b_data_ptr
 
 
 def _append_dummy_seq(cu_seqlens: Optional[Tensor], dummy_end: int) -> Optional[Tensor]:
@@ -310,7 +358,7 @@ def _resolve_thd_padding_lengths(
     target_len: Optional[int],
     alignment: Optional[int],
     padding_mask: Optional[Tensor] = None,
-    cp_group: Optional[dist.ProcessGroup] = None,
+    cp_group: Optional[CPGroup] = None,
     cp_size: Optional[int] = None,
     cp_rank: Optional[int] = None,
 ) -> Tuple[int, int, int, int, torch.device]:
@@ -366,14 +414,8 @@ def _resolve_thd_padding_lengths(
         global_target_len = local_target_len * cp_size
         return local_actual_T, global_actual_T, local_target_len, global_target_len, mask_device
 
-    # Metadata-only path: resolve the global padded endpoint first.
-    global_target_len = (
-        int(target_len) * cp_size
-        if target_len is not None
-        else _round_up_to_alignment(global_actual_T, alignment)
-    )
-
-    # Under CP, ask TE which packed rows this rank would receive.
+    # Metadata-only path: first recover the already-sliced local length. Padding
+    # targets and alignment are CP-local, just as they are in the tensor path.
     if cp_size > 1:
         from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 
@@ -388,23 +430,23 @@ def _resolve_thd_padding_lengths(
                 partition_cu_seqlens, global_actual_T, cp_size, cp_rank
             ).numel()
         )
-        # Do the same for the padded endpoint; THD CP is not simple equal split.
-        local_target_len = int(
-            get_thd_partitioned_indices(
-                partition_cu_seqlens, global_target_len, cp_size, cp_rank
-            ).numel()
-        )
     else:
         # Without CP, local and global metadata lengths are identical.
         local_actual_T = global_actual_T
-        local_target_len = global_target_len
+
+    local_target_len = (
+        int(target_len)
+        if target_len is not None
+        else _round_up_to_alignment(local_actual_T, alignment)
+    )
+    global_target_len = local_target_len * cp_size
 
     return local_actual_T, global_actual_T, local_target_len, global_target_len, mask_device
 
 
 def _resolve_thd_cp_geometry(
     packed_seq_params: PackedSeqParams,
-    cp_group: Optional[dist.ProcessGroup] = None,
+    cp_group: Optional[CPGroup] = None,
     cp_size: Optional[int] = None,
     cp_rank: Optional[int] = None,
 ) -> Tuple[int, int]:
@@ -414,7 +456,7 @@ def _resolve_thd_cp_geometry(
     Falling back to ``parallel_state`` preserves legacy call sites.
     """
     if cp_group is not None:
-        return int(dist.get_world_size(group=cp_group)), int(dist.get_rank(group=cp_group))
+        return int(cp_group.size()), int(cp_group.rank())
 
     if cp_size is not None:
         cp_size = int(cp_size)
@@ -425,7 +467,7 @@ def _resolve_thd_cp_geometry(
 
     if packed_seq_params.cp_group is not None:
         cp_group = packed_seq_params.cp_group
-        return int(dist.get_world_size(group=cp_group)), int(dist.get_rank(group=cp_group))
+        return int(cp_group.size()), int(cp_group.rank())
 
     if cp_size is None and packed_seq_params.local_cp_size is not None:
         cp_size = int(packed_seq_params.local_cp_size)
@@ -454,7 +496,7 @@ def pad_sequence_for_thd(
     max_num_seqs: Optional[int] = None,
     tail_padding_policy: Literal["append_dummy_seq", "extend_last"] = "append_dummy_seq",
     padding_mask: Optional[Tensor] = None,
-    cp_group: Optional[dist.ProcessGroup] = None,
+    cp_group: Optional[CPGroup] = None,
     cp_size: Optional[int] = None,
     cp_rank: Optional[int] = None,
 ) -> Tuple[
@@ -570,6 +612,8 @@ def pad_sequence_for_thd(
     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
     cu_seqlens_q_padded = packed_seq_params.cu_seqlens_q_padded
     cu_seqlens_kv_padded = packed_seq_params.cu_seqlens_kv_padded
+    qkv_valid_share_view = _same_tensor_view(cu_seqlens_q, cu_seqlens_kv)
+    qkv_padded_share_view = _same_tensor_view(cu_seqlens_q_padded, cu_seqlens_kv_padded)
 
     # Represent post-pack padding either as a dummy sequence or as physical
     # padding attached to the final real sequence.
@@ -634,11 +678,21 @@ def pad_sequence_for_thd(
             cu_seqlens_q_padded = cu_seqlens_q
         if cu_seqlens_kv_padded is None:
             cu_seqlens_kv_padded = cu_seqlens_kv
+        # Missing padded metadata inherits the valid-coordinate source. Re-evaluate
+        # the relationship after that inheritance so self-attention Q/K aliases are
+        # not split by the two allocating transforms below.
+        qkv_padded_share_view = qkv_padded_share_view or _same_tensor_view(
+            cu_seqlens_q_padded, cu_seqlens_kv_padded
+        )
         assert (
             cu_seqlens_q_padded is not None or cu_seqlens_kv_padded is not None
         ), "Non-dummy THD tail padding requires metadata for at least one real sequence."
         cu_seqlens_q_padded = _extend_last_padded_sequence(cu_seqlens_q_padded, global_target_len)
-        cu_seqlens_kv_padded = _extend_last_padded_sequence(cu_seqlens_kv_padded, global_target_len)
+        cu_seqlens_kv_padded = (
+            cu_seqlens_q_padded
+            if qkv_padded_share_view
+            else _extend_last_padded_sequence(cu_seqlens_kv_padded, global_target_len)
+        )
         last_padded_q_len = _last_padded_sequence_length(cu_seqlens_q_padded)
         last_padded_kv_len = _last_padded_sequence_length(cu_seqlens_kv_padded)
 
@@ -649,7 +703,28 @@ def pad_sequence_for_thd(
         cu_seqlens_q_padded = _pad_cu_seqlens(cu_seqlens_q_padded, target_cu_entries)
         cu_seqlens_kv_padded = _pad_cu_seqlens(cu_seqlens_kv_padded, target_cu_entries)
 
+    # The packing scheduler intentionally supplies Q/K metadata as matching
+    # views. Preserve that contract across transforms that allocate new tensors,
+    # while keeping independently supplied metadata independent.
+    if qkv_valid_share_view:
+        cu_seqlens_kv = cu_seqlens_q
+    if qkv_padded_share_view:
+        cu_seqlens_kv_padded = cu_seqlens_q_padded
+
     # Rebuild PackedSeqParams with the padded tensor and metadata shapes.
+    zigzag_cp_min_chunk_size = packed_seq_params.zigzag_cp_min_chunk_size
+    if (
+        zigzag_cp_min_chunk_size is not None
+        and has_dummy_padding_seq
+        and packed_seq_params.cp_partition_mode == "zigzag"
+    ):
+        # The divisibility assertion above makes this an exact physical
+        # half-chunk length. Empty fixed-capacity cu_seqlens slots do not reduce
+        # the scheduler certificate.
+        dummy_chunk_size = dummy_seq_len // (2 * cp_size)
+        if dummy_chunk_size > 0:
+            zigzag_cp_min_chunk_size = min(zigzag_cp_min_chunk_size, dummy_chunk_size)
+
     padded_params = PackedSeqParams(
         qkv_format=packed_seq_params.qkv_format,
         cu_seqlens_q=cu_seqlens_q,
@@ -690,6 +765,7 @@ def pad_sequence_for_thd(
                 else (True if has_non_dummy_padding_tail else packed_seq_params.pad_between_seqs)
             )
         ),
+        zigzag_cp_min_chunk_size=zigzag_cp_min_chunk_size,
     )
 
     # True marks padded local token slots for routing/loss paths.

@@ -599,10 +599,8 @@ class PipelineOffloadManager:
         for chunk in self._cached_chunks_backward:
             for group in chunk.offload_groups:
                 if group.offload and keep_on_gpu_bytes > 0:
-                    debug_rank(
-                        f"group {group._name} offload {group.offload} \
-                        keep_on_gpu_bytes {keep_on_gpu_bytes}"
-                    )
+                    debug_rank(f"group {group._name} offload {group.offload} \
+                        keep_on_gpu_bytes {keep_on_gpu_bytes}")
                     keep_on_gpu_bytes -= group.total_offload_bytes
                     group.offload = False
         # Disable the later groups to meet the activation offload fraction.
@@ -918,18 +916,10 @@ class ChunkOffloadHandler:
         return self._max_group_size == 0
 
     def finish_all_groups(self, name=None) -> bool:
-        """Finish all groups."""
+        """Return whether this handler has no remaining group named ``name``."""
         debug_rank(
             f"------finish_all_groups {self} {self._max_group_size} {self._offloaded_group_index}"
         )
-        # TODO: check if this is correct
-        # Mark it as finished when there are no groups to offload or reload
-        if (
-            len(self._groups_to_reload) == 0
-            and len(self._groups_to_offload) == 0
-            and self._offloaded_group_index > 0
-        ):
-            return True
         assert name is not None, "Name is required"
         return (
             self.find_group_with_name(self.offload_groups, name, self._offloaded_group_index)
@@ -1355,6 +1345,21 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
         return (grad_output,)
 
 
+class FineGrainedOffloadingBackwardCaptureStartFunction(torch.autograd.Function):
+    """Fork the H2D stream when a whole-module CUDA graph starts backward."""
+
+    @staticmethod
+    def forward(ctx, tensor) -> torch.Tensor:
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if torch.cuda.is_current_stream_capturing():
+            mgr = PipelineOffloadManager.get_instance()
+            mgr.h2d_stream.wait_stream(torch.cuda.current_stream())
+        return (grad_output,)
+
+
 class FineGrainedActivationOffloadingInterface:
     """Interface for fine-grained activation offloading."""
 
@@ -1432,9 +1437,32 @@ class FineGrainedActivationOffloadingInterface:
         torch.cuda.current_stream().wait_stream(mgr.d2h_stream)
 
     @staticmethod
+    def forward_capture_start() -> None:
+        """Fork the D2H stream from a whole-module CUDA graph capture."""
+        if not torch.cuda.is_current_stream_capturing():
+            return
+        mgr = PipelineOffloadManager.get_instance()
+        mgr.d2h_stream.wait_stream(torch.cuda.current_stream())
+
+    @staticmethod
     def backward_record(tensor) -> torch.Tensor:
         """Record the backward event for cuda graph capture."""
         return FineGrainedOffloadingBackwardRecordFunction.apply(tensor)
+
+    @staticmethod
+    def backward_capture_start(output):
+        """Attach the H2D-stream fork to the primary output's backward edge."""
+        if isinstance(output, tuple):
+            return (
+                FineGrainedOffloadingBackwardCaptureStartFunction.apply(output[0]),
+                *output[1:],
+            )
+        if isinstance(output, list):
+            return [
+                FineGrainedOffloadingBackwardCaptureStartFunction.apply(output[0]),
+                *output[1:],
+            ]
+        return FineGrainedOffloadingBackwardCaptureStartFunction.apply(output)
 
     @staticmethod
     def reset():

@@ -21,6 +21,7 @@ from typing_extensions import override
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.dynamic_cp_group import get_process_group_ranks
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.extensions.transformer_engine_int4_fake_qat import (
     maybe_fake_quantize_int4_weight_tensors,
@@ -52,7 +53,7 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.torch_norm import LayerNormInterface
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig, is_p2p_cp_comm_type
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     is_layer_window_attention,
@@ -1586,6 +1587,31 @@ class TERowParallelLinear(TELinear):
             super().backward_dw()
 
 
+def _get_cp_p2p_transport_group_setter():
+    """Load TE's optional logical-to-transport group registration API."""
+    try:
+        from transformer_engine.pytorch.attention.dot_product_attention.context_parallel import (
+            set_cp_p2p_transport_group,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "Dynamic CP parent-communicator reuse requires Transformer Engine's "
+            "set_cp_p2p_transport_group API."
+        ) from error
+
+    return set_cp_p2p_transport_group
+
+
+def _set_dynamic_cp_p2p_transport_group(cp_group, transport_group, cp_comm_type) -> None:
+    """Route a logical dynamic-CP ring through a parent TE P2P communicator."""
+    if not is_p2p_cp_comm_type(cp_comm_type):
+        return
+    if transport_group is None:
+        raise RuntimeError("Dynamic CP communicator reuse requires a dp_cp process group.")
+
+    _get_cp_p2p_transport_group_setter()(cp_group, transport_group)
+
+
 class TEDotProductAttention(te.pytorch.DotProductAttention):
     """Wrapper for the Transformer-Engine's `DotProductAttention` layer
     that also has "flash attention" enabled.
@@ -1664,6 +1690,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     pg_collection, "hcp"
                 ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
         self._tp_group = pg_collection.tp
+        self._dynamic_cp_parent_group = getattr(pg_collection, "dp_cp", None)
 
         if is_te_min_version("0.10.0"):
             extra_kwargs["attention_type"] = attention_type
@@ -1756,13 +1783,13 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         # These fields are MCore-only and should not be forwarded to TE attention.
         # total_tokens and seq_idx are only for Mamba; tokens_per_sample is only for
-        # MoE sequence-level aux loss reshaping; cp_partition_mode and cp_partition_route
-        # are MCore CP metadata.
+        # MoE sequence-level aux loss reshaping; the remaining fields are MCore CP metadata.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_partition_mode")
         self.kept_packed_seq_params.discard("cp_partition_route")
+        self.kept_packed_seq_params.discard("zigzag_cp_min_chunk_size")
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later
@@ -1815,11 +1842,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                         packed_seq_params.cp_group is not None
                     ), "cp_group is not set in packed_seq_params for dynamic CP"
                     self.cp_group = packed_seq_params.cp_group
+                    _set_dynamic_cp_p2p_transport_group(
+                        self.cp_group, self._dynamic_cp_parent_group, self.cp_comm_type
+                    )
                     if TEDotProductAttention.cp_stream is None:
                         TEDotProductAttention.cp_stream = torch.cuda.Stream()
                     super().set_context_parallel_group(
                         self.cp_group,
-                        torch.distributed.get_process_group_ranks(self.cp_group),
+                        list(get_process_group_ranks(self.cp_group)),
                         TEDotProductAttention.cp_stream,
                         self.cp_comm_type,
                     )

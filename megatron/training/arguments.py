@@ -1570,6 +1570,11 @@ def validate_args(args, defaults={}):
             f'min_dynamic_context_parallel_size ({args.min_dynamic_context_parallel_size}) '
             f'must be <= dp_size * cp_size ({dp_cp_size})'
         )
+        if (
+            args.cuda_graph_impl == 'transformer_engine'
+            and args.step_batch_size_schedule is not None
+        ):
+            raise ValueError('Dynamic CP CUDA graphs do not support step_batch_size_schedule.')
 
         import warnings
 
@@ -2418,6 +2423,15 @@ def _add_inference_args(parser):
         'to the new API in validate_args.',
     )
     group.add_argument(
+        '--cuda-graph-granularity',
+        type=str,
+        default='layer',
+        choices=['layer', 'chunk'],
+        help='Select the Transformer Engine training CUDA graph callable boundary. '
+        '"layer" keeps per-layer graphs; "chunk" captures one decoder TransformerBlock per '
+        'PP/VPP model chunk and requires an empty --cuda-graph-modules list.',
+    )
+    group.add_argument(
         '--use-legacy-static-engine',
         action='store_true',
         default=False,
@@ -2762,6 +2776,7 @@ def _add_network_size_args(parser):
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
         "cp_comm_type",
+        "cuda_graph_granularity",
         "cuda_graph_modules",
         "cuda_graph_scope",  # deprecated alias; handled manually by --cuda-graph-scope flag
         # no CLI argument exists for these
@@ -3288,6 +3303,14 @@ def _add_regularization_args(parser):
         default=True,
         dest='muon_split_qkv',
         help='Whether to split QKV parameters for Muon optimizer',
+    )
+    group.add_argument(
+        '--muon-split-qkv-per-head',
+        action='store_true',
+        help='Orthogonalize each Q, gate, K, and V head independently. '
+        'Batched execution requires emerging-optimizers>=0.3.0; older versions '
+        'process heads individually. By default, Q, gate, K, and V projections '
+        'are orthogonalized separately',
     )
     group.add_argument(
         '--muon-nesterov',

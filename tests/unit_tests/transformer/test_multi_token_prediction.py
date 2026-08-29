@@ -10,12 +10,14 @@ from torch import Tensor
 
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.models.gpt import gpt_model as gpt_model_module
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.hybrid import hybrid_model as hybrid_model_module
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
@@ -24,16 +26,20 @@ from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.hyper_connection import learned_output_contract
-from megatron.core.transformer.multi_token_prediction import (
+from megatron.core.transformer.mtp_sequence_roll import (
     ContiguousPackedCPRollContext,
     ContiguousPackedCPRollHalos,
     ContiguousPackedSeqRollPlan,
+    LocalRollContext,
+    MTPSequenceRollField,
+    prepare_mtp_sequence_roll_context,
+    roll_tensor,
+)
+from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
     _mtp_logits_are_vocab_sharded,
-    prepare_mtp_sequence_roll_context,
     process_mtp_loss,
-    roll_tensor,
 )
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -1221,6 +1227,573 @@ class TestMultiTokenPrediction:
         assert seen['labels'] is not None, "loss should be computed in RL mode"
         assert torch.equal(seen['labels'], torch.tensor([[30, 40, 50, 0, 0]], dtype=torch.long))
 
+    @pytest.mark.parametrize("derived_labels", [False, True])
+    def test_process_mtp_loss_aligned_rows_match_cumulative_roll(self, derived_labels):
+        """Absolute CE alignment preserves SFT and RL cumulative-roll semantics."""
+        config = TransformerConfig(
+            hidden_size=4, num_layers=2, num_attention_heads=2, mtp_num_layers=2
+        )
+        config.mtp_loss_scaling_factor = 1.0
+        sequence_length = 6
+        hidden_states = torch.arange(
+            (1 + config.mtp_num_layers) * sequence_length * config.hidden_size, dtype=torch.float32
+        ).view((1 + config.mtp_num_layers) * sequence_length, 1, config.hidden_size)
+        input_ids = torch.tensor([[10, 20, 30, 40, 50, 60]], dtype=torch.long)
+        labels = torch.tensor([[11, 21, 31, 41, 51, 61]], dtype=torch.long)
+        loss_mask = torch.tensor([[1, 1, 1, 1, 0, 0]], dtype=torch.float32)
+        source = input_ids if derived_labels else labels
+        label_key = "input_ids" if derived_labels else "labels"
+        max_offset = config.mtp_num_layers + int(derived_labels)
+
+        bare_context = prepare_mtp_sequence_roll_context(source, None, None)
+        assert bare_context is not None
+        prepared_context = bare_context.prepare_fields(
+            (
+                MTPSequenceRollField(label_key, source, -1, 0, 0),
+                MTPSequenceRollField("loss_mask", loss_mask, -1, 0, 0),
+            ),
+            max_offset=max_offset,
+        )
+
+        class OutputLayer:
+            gather_output = True
+
+            def __call__(self, hidden, weight=None, runtime_gather_output=None):
+                del weight, runtime_gather_output
+                return hidden, None
+
+        def run(context):
+            seen_labels = []
+
+            def compute_language_model_loss(current_labels, logits):
+                seen_labels.append(current_labels.clone())
+                return torch.ones_like(current_labels, dtype=logits.dtype)
+
+            process_mtp_loss(
+                hidden_states=hidden_states.clone(),
+                labels=None if derived_labels else labels,
+                loss_mask=loss_mask,
+                output_layer=OutputLayer(),
+                output_weight=None,
+                runtime_gather_output=None,
+                is_training=False,
+                compute_language_model_loss=compute_language_model_loss,
+                config=config,
+                input_ids=input_ids if derived_labels else None,
+                sequence_roll_context=context,
+            )
+            return seen_labels
+
+        fallback_labels = run(None)
+        addressed_labels = run(prepared_context)
+        assert len(addressed_labels) == config.mtp_num_layers
+        for actual, expected in zip(addressed_labels, fallback_labels):
+            assert torch.equal(actual, expected)
+
+        first_offset = 2 if derived_labels else 1
+        for depth, actual in enumerate(addressed_labels):
+            offset = first_offset + depth
+            expected = torch.zeros_like(source)
+            expected[:, : sequence_length - offset] = source[:, offset:]
+            assert torch.equal(actual, expected)
+
+    @pytest.mark.parametrize("derived_labels", [False, True])
+    def test_e2e_tv_aligned_rows_match_cumulative_roll_gradient(self, derived_labels):
+        """Direct TV target addressing preserves SFT/RL loss and gradient semantics."""
+        torch.manual_seed(_SEED)
+        config = TransformerConfig(
+            hidden_size=4, num_layers=2, num_attention_heads=2, mtp_num_layers=2
+        )
+        config.mtp_loss_scaling_factor = 0.5
+        config.mtp_loss_type = "e2e_tv"
+        sequence_length = 6
+        input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
+        labels = torch.tensor([[2, 3, 4, 5, 6, 0]], dtype=torch.long)
+        loss_mask = torch.tensor([[1, 1, 1, 1, 0, 0]], dtype=torch.float32)
+        output_weight = torch.randn(7, config.hidden_size)
+
+        source = input_ids if derived_labels else labels
+        bare_context = prepare_mtp_sequence_roll_context(source, None, None)
+        assert bare_context is not None
+
+        class OutputLayer:
+            gather_output = True
+
+            def __call__(self, hidden, weight=None, runtime_gather_output=None):
+                del runtime_gather_output
+                return torch.matmul(hidden, weight.t()), None
+
+        def run(context):
+            local_hidden = torch.randn(
+                (1 + config.mtp_num_layers) * sequence_length,
+                1,
+                config.hidden_size,
+                generator=torch.Generator().manual_seed(_SEED + 1),
+                requires_grad=True,
+            )
+            result = process_mtp_loss(
+                hidden_states=local_hidden,
+                labels=None if derived_labels else labels,
+                loss_mask=loss_mask,
+                output_layer=OutputLayer(),
+                output_weight=output_weight,
+                runtime_gather_output=None,
+                is_training=False,
+                compute_language_model_loss=lambda *_: pytest.fail(
+                    "CE must not run for the TV objective"
+                ),
+                config=config,
+                input_ids=input_ids if derived_labels else None,
+                sequence_roll_context=context,
+            )
+            result.sum().backward()
+            return local_hidden.grad
+
+        fallback_grad = run(None)
+        addressed_grad = run(bare_context)
+        torch.testing.assert_close(addressed_grad, fallback_grad, rtol=1e-6, atol=1e-6)
+
+    def test_mtp_block_aligned_rows_are_atomic_and_pre_aligned(self):
+        """The block materializes all forward fields before entering any MTP depth."""
+
+        class FakeLayer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+
+            def forward(self, hidden_states, input_ids, position_ids, padding_mask, **kwargs):
+                self.calls.append(
+                    (
+                        input_ids.clone(),
+                        position_ids.clone(),
+                        padding_mask.clone(),
+                        kwargs["_inputs_pre_aligned"],
+                    )
+                )
+                return hidden_states, input_ids, position_ids, padding_mask
+
+        config = types.SimpleNamespace(
+            pipeline_model_parallel_size=1,
+            mtp_num_layers=2,
+            mtp_detach_heads=False,
+            dsa_mtp_index_kv_share=False,
+        )
+        block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
+        torch.nn.Module.__init__(block)
+        block.config = config
+        block.vp_stage = None
+        block.mtp_use_repeated_layer = False
+        block.layers = torch.nn.ModuleList((FakeLayer(), FakeLayer()))
+
+        input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+        position_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+        padding_mask = torch.tensor([[False, False, False, False]])
+        bare_context = prepare_mtp_sequence_roll_context(input_ids, None, None)
+        assert bare_context is not None
+        context = bare_context.prepare_fields(
+            (
+                MTPSequenceRollField("input_ids", input_ids, -1, 0, 0),
+                MTPSequenceRollField("position_ids", position_ids, -1, 0, 0),
+                MTPSequenceRollField("padding_mask", padding_mask, -1, 0, True),
+            ),
+            max_offset=2,
+        )
+
+        class Embedding:
+            add_position_embedding = True
+
+        block.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=torch.zeros(4, 1, 4),
+            attention_mask=torch.ones(1, 1, 4, 4, dtype=torch.bool),
+            padding_mask=padding_mask,
+            sequence_roll_padding_mask=padding_mask,
+            sequence_roll_context=context,
+            embedding=Embedding(),
+        )
+
+        expected_inputs = context.materialize_all("input_ids")
+        expected_positions = context.materialize_all("position_ids")
+        expected_padding = context.materialize_all("padding_mask")
+        for depth, layer in enumerate(block.layers):
+            seen_input, seen_position, seen_padding, pre_aligned = layer.calls[0]
+            assert pre_aligned
+            assert torch.equal(seen_input, expected_inputs[depth])
+            assert torch.equal(seen_position, expected_positions[depth])
+            assert torch.equal(seen_padding, expected_padding[depth])
+
+        stale_context = bare_context.prepare_fields(
+            (
+                MTPSequenceRollField("input_ids", input_ids + 100, -1, 0, 0),
+                MTPSequenceRollField("position_ids", position_ids + 100, -1, 0, 0),
+                MTPSequenceRollField("padding_mask", ~padding_mask, -1, 0, True),
+            ),
+            max_offset=2,
+        )
+        for layer in block.layers:
+            layer.calls.clear()
+        block.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=torch.zeros(4, 1, 4),
+            attention_mask=torch.ones(1, 1, 4, 4, dtype=torch.bool),
+            padding_mask=padding_mask,
+            sequence_roll_padding_mask=padding_mask,
+            sequence_roll_context=stale_context,
+            embedding=Embedding(),
+        )
+        for depth, layer in enumerate(block.layers):
+            seen_input, seen_position, seen_padding, pre_aligned = layer.calls[0]
+            assert pre_aligned
+            assert torch.equal(seen_input, expected_inputs[depth])
+            assert torch.equal(seen_position, expected_positions[depth])
+            assert torch.equal(seen_padding, expected_padding[depth])
+
+    def test_mtp_block_padding_sources_are_atomic(self):
+        """A consumer never mixes addressed token rows with cumulative padding rolls."""
+
+        class RecordingLayer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.call = None
+
+            def forward(self, input_ids, position_ids, hidden_states, padding_mask, **kwargs):
+                self.call = (input_ids, position_ids, padding_mask, kwargs["_inputs_pre_aligned"])
+                return hidden_states, input_ids, position_ids, padding_mask
+
+        config = types.SimpleNamespace(
+            pipeline_model_parallel_size=1,
+            mtp_num_layers=1,
+            mtp_detach_heads=False,
+            dsa_mtp_index_kv_share=False,
+        )
+        block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
+        torch.nn.Module.__init__(block)
+        block.config = config
+        block.vp_stage = None
+        block.mtp_use_repeated_layer = False
+        block.layers = torch.nn.ModuleList((RecordingLayer(),))
+
+        input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+        position_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+        padding_mask = torch.tensor([[False, False, False, True]])
+        context = prepare_mtp_sequence_roll_context(input_ids, None, None).prepare_fields(
+            (
+                MTPSequenceRollField("input_ids", input_ids, -1, 0, 0),
+                MTPSequenceRollField("position_ids", position_ids, -1, 0, 0),
+                MTPSequenceRollField("padding_mask", padding_mask, -1, 0, True),
+            ),
+            max_offset=1,
+        )
+        embedding = types.SimpleNamespace(add_position_embedding=True)
+
+        block.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=torch.zeros(4, 1, 4),
+            attention_mask=None,
+            padding_mask=padding_mask,
+            sequence_roll_context=context,
+            embedding=embedding,
+        )
+        seen_input, seen_position, seen_padding, pre_aligned = block.layers[0].call
+        assert not pre_aligned
+        assert seen_input is input_ids
+        assert seen_position is position_ids
+        assert seen_padding is padding_mask
+
+        with pytest.raises(ValueError, match="sequence_roll_padding_mask requires"):
+            block.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=torch.zeros(4, 1, 4),
+                attention_mask=None,
+                padding_mask=None,
+                sequence_roll_padding_mask=padding_mask,
+                sequence_roll_context=context,
+                embedding=embedding,
+            )
+
+    @pytest.mark.parametrize(
+        (
+            "mtp_in_postprocess",
+            "post_process",
+            "labels_present",
+            "loss_mask_present",
+            "padding_present",
+            "expected_keys",
+            "expected_max_offset",
+            "expect_mtp",
+            "expect_loss",
+        ),
+        (
+            (
+                True,
+                False,
+                True,
+                True,
+                True,
+                ("input_ids", "position_ids", "padding_mask"),
+                2,
+                True,
+                False,
+            ),
+            (
+                True,
+                True,
+                True,
+                True,
+                True,
+                ("input_ids", "position_ids", "labels", "loss_mask", "padding_mask"),
+                2,
+                True,
+                True,
+            ),
+            (
+                True,
+                True,
+                True,
+                False,
+                False,
+                ("input_ids", "position_ids", "labels"),
+                2,
+                True,
+                True,
+            ),
+            (False, True, True, True, True, ("labels", "loss_mask"), 2, False, True),
+            (False, True, False, False, False, ("input_ids",), 3, False, True),
+            (True, True, False, False, False, ("input_ids", "position_ids"), 3, True, True),
+        ),
+    )
+    def test_gpt_model_entry_prepares_only_stage_owned_mtp_fields(
+        self,
+        monkeypatch,
+        mtp_in_postprocess,
+        post_process,
+        labels_present,
+        loss_mask_present,
+        padding_present,
+        expected_keys,
+        expected_max_offset,
+        expect_mtp,
+        expect_loss,
+    ):
+        """GPT prepares one immutable field group matching its forward/loss ownership."""
+        input_ids = torch.arange(6, dtype=torch.long).view(1, 6)
+        position_ids = torch.arange(6, dtype=torch.long).view(1, 6)
+        labels = input_ids + 1 if labels_present else None
+        loss_mask = torch.ones_like(input_ids, dtype=torch.float32) if loss_mask_present else None
+        padding_mask = torch.zeros_like(input_ids, dtype=torch.bool) if padding_present else None
+        hidden_states = torch.zeros(6, 1, 4)
+
+        preparation = {}
+        prepared_context = object()
+
+        class BareContext:
+            def prepare_fields(self, fields, *, max_offset):
+                preparation["keys"] = tuple(field.key for field in fields)
+                preparation["max_offset"] = max_offset
+                return prepared_context
+
+        monkeypatch.setattr(
+            gpt_model_module, "prepare_mtp_sequence_roll_context", lambda **_kwargs: BareContext()
+        )
+        seen_mtp_contexts = []
+        seen_mtp_sequence_roll_padding_masks = []
+        seen_loss_contexts = []
+
+        def mtp(**kwargs):
+            seen_mtp_contexts.append(kwargs["sequence_roll_context"])
+            seen_mtp_sequence_roll_padding_masks.append(kwargs["sequence_roll_padding_mask"])
+            return kwargs["hidden_states"]
+
+        def process_loss(**kwargs):
+            seen_loss_contexts.append(kwargs["sequence_roll_context"])
+            return kwargs["hidden_states"]
+
+        monkeypatch.setattr(gpt_model_module, "process_mtp_loss", process_loss)
+        model = types.SimpleNamespace(
+            config=types.SimpleNamespace(mtp_num_layers=2, use_mup=False),
+            post_process=post_process,
+            pg_collection=types.SimpleNamespace(cp=None),
+            embedding=types.SimpleNamespace(add_position_embedding=True),
+            share_embeddings_and_output_weights=False,
+            mtp=mtp,
+            output_layer=object(),
+            training=True,
+            compute_language_model_loss=object(),
+            tp_group=None,
+        )
+
+        GPTModel._postprocess(
+            model,
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            rotary_pos_emb=None,
+            rotary_pos_cos=None,
+            rotary_pos_sin=None,
+            mtp_in_postprocess=mtp_in_postprocess,
+            loss_mask=loss_mask,
+            attention_mask=None,
+            padding_mask=padding_mask,
+            mtp_padding_mask=padding_mask,
+            output_processor=lambda **kwargs: kwargs["hidden_states"],
+        )
+
+        assert preparation == {"keys": expected_keys, "max_offset": expected_max_offset}
+        assert seen_mtp_contexts == ([prepared_context] if expect_mtp else [])
+        assert seen_mtp_sequence_roll_padding_masks == ([padding_mask] if expect_mtp else [])
+        assert seen_loss_contexts == ([prepared_context] if expect_loss else [])
+
+    @pytest.mark.parametrize(
+        (
+            "mtp_process",
+            "post_process",
+            "labels_present",
+            "loss_mask_present",
+            "padding_present",
+            "expected_keys",
+            "expected_max_offset",
+            "expect_loss",
+        ),
+        (
+            (
+                True,
+                False,
+                True,
+                True,
+                True,
+                ("input_ids", "position_ids", "padding_mask"),
+                2,
+                False,
+            ),
+            (
+                True,
+                True,
+                True,
+                True,
+                True,
+                ("input_ids", "position_ids", "labels", "loss_mask", "padding_mask"),
+                2,
+                True,
+            ),
+            (True, True, True, False, False, ("input_ids", "position_ids", "labels"), 2, True),
+            (True, True, False, False, False, ("input_ids", "position_ids"), 3, True),
+            (False, True, True, True, True, None, None, False),
+        ),
+    )
+    def test_hybrid_model_entry_prepares_only_stage_owned_mtp_fields(
+        self,
+        monkeypatch,
+        mtp_process,
+        post_process,
+        labels_present,
+        loss_mask_present,
+        padding_present,
+        expected_keys,
+        expected_max_offset,
+        expect_loss,
+    ):
+        """Hybrid shares one prepared context between its local MTP forward and loss."""
+        input_ids = torch.arange(6, dtype=torch.long).view(1, 6)
+        position_ids = torch.arange(6, dtype=torch.long).view(1, 6)
+        labels = input_ids + 1 if labels_present else None
+        loss_mask = torch.ones_like(input_ids, dtype=torch.float32) if loss_mask_present else None
+        padding_mask = torch.zeros_like(input_ids, dtype=torch.bool) if padding_present else None
+        hidden_states = torch.zeros(6, 1, 4)
+
+        preparation = {}
+        prepared_context = object()
+
+        class BareContext:
+            def prepare_fields(self, fields, *, max_offset):
+                preparation["keys"] = tuple(field.key for field in fields)
+                preparation["max_offset"] = max_offset
+                return prepared_context
+
+        prepare_calls = []
+
+        def prepare_context(**kwargs):
+            prepare_calls.append(kwargs)
+            return BareContext()
+
+        monkeypatch.setattr(
+            hybrid_model_module, "prepare_mtp_sequence_roll_context", prepare_context
+        )
+        seen_mtp_contexts = []
+        seen_mtp_sequence_roll_padding_masks = []
+        seen_loss_contexts = []
+
+        def mtp(**kwargs):
+            seen_mtp_contexts.append(kwargs["sequence_roll_context"])
+            seen_mtp_sequence_roll_padding_masks.append(kwargs["sequence_roll_padding_mask"])
+            return kwargs["hidden_states"]
+
+        def process_loss(**kwargs):
+            seen_loss_contexts.append(kwargs["sequence_roll_context"])
+            return kwargs["hidden_states"]
+
+        monkeypatch.setattr(hybrid_model_module, "process_mtp_loss", process_loss)
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            del weight, runtime_gather_output
+            return hidden, None
+
+        model = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                fine_grained_activation_offloading=False,
+                moe_paged_stash=False,
+                sequence_parallel=False,
+                multi_latent_attention=False,
+                moe_n_hash_layers=0,
+                mtp_num_layers=2,
+                use_mup=False,
+            ),
+            pre_process=False,
+            post_process=post_process,
+            mtp_process=mtp_process,
+            position_embedding_type="none",
+            decoder=lambda **kwargs: kwargs["hidden_states"],
+            share_embeddings_and_output_weights=False,
+            pg_collection=types.SimpleNamespace(cp=None, tp=None),
+            embedding=types.SimpleNamespace(add_position_embedding=True),
+            mtp=mtp,
+            output_layer=output_layer,
+            _scale_logits=lambda logits: logits,
+            training=True,
+            compute_language_model_loss=lambda labels, logits: torch.zeros_like(
+                labels, dtype=logits.dtype
+            ),
+            tp_group=None,
+        )
+
+        HybridModel.forward(
+            model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=None,
+            decoder_input=hidden_states,
+            labels=labels,
+            loss_mask=loss_mask,
+            padding_mask=padding_mask,
+        )
+
+        if expected_keys is None:
+            assert prepare_calls == []
+            assert preparation == {}
+            assert seen_mtp_contexts == []
+            assert seen_mtp_sequence_roll_padding_masks == []
+            assert seen_loss_contexts == []
+        else:
+            assert len(prepare_calls) == 1
+            assert preparation == {"keys": expected_keys, "max_offset": expected_max_offset}
+            assert seen_mtp_contexts == [prepared_context]
+            assert seen_mtp_sequence_roll_padding_masks == [padding_mask]
+            assert seen_loss_contexts == ([prepared_context] if expect_loss else [])
+
     @pytest.mark.parametrize("cp", [1, 2])
     def test_roll_tensor_with_packed_sequences(self, cp):
         """Test roll_tensor function with packed sequences, with and without CP.
@@ -1469,7 +2042,7 @@ class TestMultiTokenPrediction:
 
     @pytest.mark.parametrize(("cp_size", "partition_mode"), [(1, "contiguous"), (2, "zigzag")])
     def test_prepare_mtp_sequence_roll_context_skips_other_layouts(self, cp_size, partition_mode):
-        """CP1 and zigzag keep their existing roll paths without prepared state."""
+        """CP1 gains local geometry while zigzag keeps the existing roll path."""
 
         class FakeCPGroup:
             def size(self):
@@ -1490,7 +2063,10 @@ class TestMultiTokenPrediction:
             tensor=tokens, cp_group=FakeCPGroup(), packed_seq_params=packed_seq_params
         )
 
-        assert sequence_roll_context is None
+        if cp_size == 1:
+            assert isinstance(sequence_roll_context, LocalRollContext)
+        else:
+            assert sequence_roll_context is None
 
     @pytest.mark.parametrize("cp", [1, 2])
     def test_roll_tensor_with_packed_sequences_odd_seqlen(self, cp):
