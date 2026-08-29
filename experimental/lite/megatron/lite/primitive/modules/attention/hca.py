@@ -62,5 +62,5 @@ class HyperConnection(nn.Module):
     ) -> torch.Tensor:
         dtype = x.dtype
         placed = post.to(dtype).unsqueeze(-1) * x.unsqueeze(-2)
-        mixed = torch.matmul(comb.to(dtype), residual.to(dtype))
+        mixed = torch.matmul(comb.to(dtype).transpose(-1, -2), residual.to(dtype))
         return placed + mixed
