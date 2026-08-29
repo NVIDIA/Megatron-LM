@@ -964,6 +964,8 @@ class TestHybridTECudaGraphDiscovery:
         class Config:
             recompute_granularity = None
             recompute_modules = []
+            fp8 = False
+            first_last_layers_bf16 = False
 
         inner = TransformerLayer.__new__(TransformerLayer)
         torch.nn.Module.__init__(inner)
@@ -989,6 +991,53 @@ class TestHybridTECudaGraphDiscovery:
         assert '_te_cuda_graph_group_tail' not in head._modules
         assert tuple(head.state_dict()) == state_dict_keys
         assert any(param is tail.capture_weight for param in head.parameters())
+
+        head.cuda_graphs = [object()]
+        head.train()
+        assert head._get_active_te_cuda_graph_group_tail() is tail
+        head.eval()
+        assert head._get_active_te_cuda_graph_group_tail() is None
+
+    def test_capture_group_does_not_cross_first_last_bf16_boundary(self):
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        class Config:
+            recompute_granularity = None
+            recompute_modules = []
+            fp8 = True
+            first_last_layers_bf16 = True
+            num_layers_at_start_in_bf16 = 1
+            num_layers_at_end_in_bf16 = 1
+            num_layers = 4
+
+        inner = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(inner)
+        inner.self_attention = torch.nn.Linear(2, 2)
+        inner.cross_attention = IdentityOp()
+        inner.mlp = IdentityOp()
+        inner.is_mtp_layer = False
+
+        head = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(head)
+        head.config = Config()
+        head.inner_layer = inner
+
+        tail = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(tail)
+        object.__setattr__(tail, '_inner_is_partial_moe_capture', lambda: True)
+
+        head.layer_number, tail.layer_number = 1, 2
+        assert not head._can_group_te_cuda_graph_with(tail)
+
+        head.layer_number, tail.layer_number = 2, 3
+        assert head._can_group_te_cuda_graph_with(tail)
+
+        head.layer_number, tail.layer_number = 3, 4
+        assert not head._can_group_te_cuda_graph_with(tail)
+
+        inner.is_mtp_layer = True
+        head.layer_number, tail.layer_number = 1, 2
+        assert head._can_group_te_cuda_graph_with(tail)
 
 
 # Global storage for comparing unique buffer counts across different num_microbatches,

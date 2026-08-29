@@ -17,7 +17,7 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp8_utils import get_fp8_context, is_first_last_bf16_layer
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
@@ -224,6 +224,14 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             return False
         if not isinstance(self.inner_layer, TransformerLayer):
             return False
+        if (
+            self.config.fp8
+            and self.config.first_last_layers_bf16
+            and not getattr(self.inner_layer, 'is_mtp_layer', False)
+            and is_first_last_bf16_layer(self.config, self.layer_number - 1)
+            != is_first_last_bf16_layer(self.config, next_layer.layer_number - 1)
+        ):
+            return False
         is_attention_only = not (
             isinstance(self.inner_layer.self_attention, IdentityOp)
             and isinstance(self.inner_layer.cross_attention, IdentityOp)
@@ -240,6 +248,12 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
     def _get_te_cuda_graph_group_tail(self) -> Optional['HyperConnectionHybridLayer']:
         """Return the capture-only MoE tail, if discovery grouped this layer."""
         return getattr(self, '_te_cuda_graph_group_tail', None)
+
+    def _get_active_te_cuda_graph_group_tail(self) -> Optional['HyperConnectionHybridLayer']:
+        """Return the grouped tail only while this layer is replaying training graphs."""
+        if self.training and getattr(self, 'cuda_graphs', None):
+            return self._get_te_cuda_graph_group_tail()
+        return None
 
     def parameters(self, recurse: bool = True):
         """Expose grouped-prefix parameters to TE without registering the group tail.
@@ -1071,10 +1085,8 @@ class HybridStack(MegatronModule):
                                 packed_seq_params=packed_seq_params,
                             )
 
-                    if isinstance(layer, HyperConnectionHybridLayer) and getattr(
-                        layer, 'cuda_graphs', None
-                    ):
-                        grouped_tail_to_skip = layer._get_te_cuda_graph_group_tail()
+                    if isinstance(layer, HyperConnectionHybridLayer):
+                        grouped_tail_to_skip = layer._get_active_te_cuda_graph_group_tail()
 
                     # The attention layer (currently a simplified transformer layer)
                     # outputs a tuple of (hidden_states, context). Context is intended
