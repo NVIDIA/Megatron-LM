@@ -5,14 +5,13 @@
 import os
 from functools import partial
 
-from tests.unit_tests.test_utilities import Utils
-
 from megatron.core.dist_checkpointing.strategies.async_utils import (
     AsyncCallsQueue,
     AsyncRequest,
     PersistentAsyncCaller,
     PersistentAsyncWorkerError,
 )
+from tests.unit_tests.test_utilities import Utils
 
 
 def _fail_on_rank(rank: int, failing_rank: int) -> None:
