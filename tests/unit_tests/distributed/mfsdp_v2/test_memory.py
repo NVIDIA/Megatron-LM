@@ -97,12 +97,16 @@ def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
     if main_params_dtype == dtype:
         # Model and main weights alias, leaving only one BF16 weight buffer and one
         # BF16 main-gradient buffer per child.
-        assert all(
-            group.model_weight is group.main_weight
-            and group.post_optimizer_model_weight is group.model_weight
-            for layer in model.layers
-            for group in layer.parameter_groups
-        )
+        for layer_index, layer in enumerate(model.layers):
+            for group_index, group in enumerate(layer.parameter_groups):
+                assert group.model_weight is group.main_weight, (
+                    f"Layer {layer_index}, parameter group {group_index} should alias "
+                    "model and main weights."
+                )
+                assert group.post_optimizer_model_weight is group.model_weight, (
+                    f"Layer {layer_index}, parameter group {group_index} should alias "
+                    "post-optimizer and model weights."
+                )
         expected_per_child_nbytes = 2 * child_weight_nbytes
     else:
         # FP32 main weights require a distinct buffer in addition to the BF16 model
@@ -204,6 +208,7 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     loss.backward()
     optimizer.step()
     assert parameter_group.model_weight.placements == (Replicate(),)
+    assert parameter_group.post_optimizer_model_weight.placements == (Flat(),)
 
     actual_optimizer_size = sum(
         state["exp_avg"].to_local().nbytes + state["exp_avg_sq"].to_local().nbytes

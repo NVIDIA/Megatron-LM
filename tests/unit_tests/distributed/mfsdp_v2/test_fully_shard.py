@@ -719,8 +719,8 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
         torch.testing.assert_close(second_loss, first_loss)
 
 
-def test_mixed_precision_rejects_optimizer_range_larger_than_model_range(distributed_setup):
-    """Mixed precision requires the optimizer-layout slice to fit the model-weight owner."""
+def test_rejects_optimizer_placements_larger_than_model_weight_placements(distributed_setup):
+    """Optimizer placements must fit within the model-weight placements."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
