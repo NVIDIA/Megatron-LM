@@ -147,7 +147,16 @@ def test_replica_async_collectives_span_transport_backward():
     plan = object()
 
     class FakeBridge:
-        source_parameters = (torch.nn.Parameter(torch.ones(())), torch.nn.Parameter(torch.ones(())))
+        source_parameters = (
+            torch.nn.Parameter(torch.ones(())),
+            torch.nn.Parameter(torch.ones(())),
+        )
+
+        def __init__(self):
+            self.source_grads = tuple(
+                torch.full_like(parameter, index + 1)
+                for index, parameter in enumerate(self.source_parameters)
+            )
 
         def start_prefetch(self, current_plan, direction=_WeightDirection.FORWARD):
             assert current_plan is plan and direction is _WeightDirection.BACKWARD
@@ -164,6 +173,7 @@ def test_replica_async_collectives_span_transport_backward():
         def wait_grad_reduce(self, current_plan):
             assert current_plan is plan
             events.append("wait_grad_reduce")
+            return self.source_grads
 
     class BackwardMarker(torch.autograd.Function):
         @staticmethod
@@ -196,7 +206,37 @@ def test_replica_async_collectives_span_transport_backward():
         "dispatch_backward",
         "wait_grad_reduce",
     ]
-    assert all(parameter.grad is None for parameter in bridge.source_parameters)
+    for index, parameter in enumerate(bridge.source_parameters):
+        torch.testing.assert_close(
+            parameter.grad, torch.full_like(parameter, index + 1), rtol=0, atol=0
+        )
+        assert parameter.grad.data_ptr() != bridge.source_grads[index].data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_replica_fused_wgrad_handoff_preserves_fp32():
+    """Accumulate an FP32 replica wgrad before returning a BF16 dummy."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    parameter = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16, device=device))
+    parameter.main_grad = torch.zeros(4, dtype=torch.float32, device=device)
+    parameter.grad_added_to_main_grad = False
+    external_wgrad = torch.full((4,), 1.0001, dtype=torch.float32, device=device)
+    plan = object()
+
+    class FakeBridge:
+        source_parameters = (parameter,)
+
+        @staticmethod
+        def wait_grad_reduce(current_plan):
+            assert current_plan is plan
+            return (external_wgrad,)
+
+    hidden = torch.ones((), device=device, requires_grad=True)
+    wait_replica_grad_reduce_after_dispatch_backward(hidden, FakeBridge(), plan).backward()
+
+    torch.testing.assert_close(parameter.main_grad, external_wgrad, rtol=0, atol=0)
+    assert parameter.grad_added_to_main_grad
+    assert parameter.grad.dtype == torch.bfloat16
 
 
 def test_replica_planner_slots_preserve_two_outstanding_forwards(monkeypatch):
@@ -244,6 +284,7 @@ def test_replica_planner_slots_preserve_two_outstanding_forwards(monkeypatch):
 
         def wait_grad_reduce(self, plan):
             self.reduced.append(plan)
+            return ()
 
     monkeypatch.setattr(
         token_dispatcher.ReplicaPlannerWorkspace,
@@ -332,6 +373,13 @@ def _test_projection(
     runtime_parameters=None,
 ):
     device = source_tensors[0].device
+    native_grad = (
+        gtp_native_grad
+        if gtp_native_grad is not None
+        else torch.empty(
+            (len(parameters), *member_shape), dtype=virtual_grad.dtype, device=device
+        )
+    )
     return _CuTeDSLReplicaProjection(
         name="test projection",
         device=device,
@@ -341,14 +389,14 @@ def _test_projection(
         source_tensors=source_tensors,
         forward=forward,
         backward=backward,
-        main_grad_bases=torch.empty(len(parameters), dtype=torch.int64, device=device),
+        native_grad_bases=torch.empty(len(parameters), dtype=torch.int64, device=device),
         member_shape=member_shape,
         member_numel=member_shape[0] * member_shape[1],
         rowwise_scale_shape=scale_shape,
         columnwise_scale_shape=scale_shape,
         virtual_weight=virtual_weight,
         virtual_grad=virtual_grad,
-        gtp_native_grad=gtp_native_grad,
+        native_grad=native_grad,
         runtime_parameters=runtime_parameters,
         runtime_bound=runtime_parameters is not None,
     )
@@ -359,8 +407,8 @@ def _test_projection(
     int(os.environ.get("WORLD_SIZE", "1")) > 1,
     reason="Process-local CUDA graph probe must run outside distributed parity tests",
 )
-def test_replica_gtp_main_grad_table_ignores_transient_buffers_during_capture():
-    """Keep replica reduction bound to bridge staging when GTP scratch changes."""
+def test_replica_native_grad_table_ignores_transient_gtp_buffers_during_capture():
+    """Keep replica reduction bound to native staging when GTP scratch changes."""
     device = torch.device("cuda", torch.cuda.current_device())
     num_local_experts = 2
     member_shape = (4, 4)
@@ -408,7 +456,7 @@ def test_replica_gtp_main_grad_table_ignores_transient_buffers_during_capture():
     bridge.prepare_runtime_parameters()
 
     stable_ptrs = tuple(grad.data_ptr() for grad in native_grad)
-    assert projection.source_main_grad_ptrs == stable_ptrs
+    assert projection.native_grad_ptrs == stable_ptrs
     # Model the eager/captured GTP buffers that previously replaced the stable
     # destination table. The bridge must not consult them during forward capture.
     projection.gtp_leader.gtp_wgrad_tensors = tuple(
@@ -423,8 +471,8 @@ def test_replica_gtp_main_grad_table_ignores_transient_buffers_during_capture():
     graph.replay()
     torch.cuda.synchronize(device)
 
-    assert projection.source_main_grad_ptrs == stable_ptrs
-    assert tuple(projection.main_grad_bases.cpu().tolist()) == stable_ptrs
+    assert projection.native_grad_ptrs == stable_ptrs
+    assert tuple(projection.native_grad_bases.cpu().tolist()) == stable_ptrs
     torch.testing.assert_close(capture_probe, torch.ones_like(capture_probe), rtol=0, atol=0)
 
 
@@ -896,11 +944,8 @@ def _run_replica_hybridep_full_layer_parity(
             ):
                 assert len(runtime_weights) == bridge.num_runtime_experts
                 native_weights = projection.source_tensors
-                if projection.gtp_leader is not None:
-                    assert projection.gtp_native_grad is not None
-                    native_grads = tuple(projection.gtp_native_grad)
-                else:
-                    native_grads = tuple(parameter.main_grad for parameter in projection.parameters)
+                assert projection.native_grad is not None
+                native_grads = tuple(projection.native_grad)
                 for index, runtime_weight in enumerate(runtime_weights):
                     if index < bridge.num_local_experts:
                         expected_weight = native_weights[index]
@@ -924,7 +969,15 @@ def _run_replica_hybridep_full_layer_parity(
                 _assert_replica_mxfp8_prefetch_exact(replica_bridge, "rowwise")
             output.float().sum().backward()
             if replica_bridge is not None:
-                assert all(parameter.grad is None for parameter in replica_bridge.source_parameters)
+                for projection in replica_bridge.projections:
+                    if projection.gtp_leader is not None:
+                        for parameter in projection.parameters:
+                            parameter.grad = None
+                        continue
+                    assert all(parameter.grad is not None for parameter in projection.parameters)
+                    for parameter in projection.parameters:
+                        assert parameter.grad_added_to_main_grad
+                        parameter.grad = None
                 assert all(
                     runtime_parameter.grad is None
                     for projection in replica_bridge.projections
@@ -1094,6 +1147,9 @@ def _run_replica_hybridep_full_layer_parity(
                     atol=0,
                     msg=lambda msg: f"rank {bridge.rank} virtual isolation check: {msg}",
                 )
+            # The owner-push writes directly into peer virtual arenas. Ensure every
+            # rank has validated the old contents before any rank starts the refresh.
+            torch.distributed.barrier(group=bridge.group)
             plan_snapshot = plan.experts_to_copy.clone()
             # The normal training path may cache this exact plan in the shared
             # workspace.  Evict that cache here so this check exercises an
