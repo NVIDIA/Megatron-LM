@@ -281,13 +281,9 @@ class FsdpParameterGroup:
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
         if self._model_weight_is_stale:
-            # This persistent owner may also back parameter views saved by autograd.
-            # Preserve its version counter while the optimizer-layout alias all-gathers
-            # directly into it.
-            with torch.autograd._unsafe_preserve_version_counter(self.model_weight.local_buffer):
-                self.post_optimizer_model_weight.redistribute(
-                    self.model_weight.placements, out=self.model_weight
-                )
+            self.post_optimizer_model_weight.redistribute(
+                self.model_weight.placements, out=self.model_weight
+            )
             self._model_weight_is_stale = False
         if self.model_weight.placements == self._unsharded_model_weight.placements:
             unsharded_model_weight = self.model_weight
