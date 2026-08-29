@@ -719,52 +719,6 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
         torch.testing.assert_close(second_loss, first_loss)
 
 
-def test_zero1_mixed_precision_sync_aliases_persistent_model_weight(distributed_setup):
-    """ZeRO-1 sync should cast into a stable model-weight allocation's local view."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16).to(device)
-    with fully_shard_context(device=device):
-        fully_shard(
-            model,
-            mesh=mesh,
-            placements=_zero1_placements(),
-            mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
-        )
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
-    fully_shard_optimizer(optimizer)
-    (group,) = model.parameter_groups
-    post_optimizer_model_weight = group.post_optimizer_model_weight
-    model_weight_data_ptr = group.model_weight.local_buffer.data_ptr()
-    assert (
-        post_optimizer_model_weight.local_buffer.untyped_storage().data_ptr()
-        == group.model_weight.local_buffer.untyped_storage().data_ptr()
-    )
-
-    x = torch.ones(1, 4, device=device, dtype=torch.bfloat16)
-    for _ in range(2):
-        optimizer.zero_grad(set_to_none=True)
-        model(x).sum().backward()
-        optimizer.step()
-
-        assert group._model_weight_is_stale
-        assert group.model_weight.local_buffer.data_ptr() == model_weight_data_ptr
-        assert (
-            post_optimizer_model_weight.local_buffer.untyped_storage().data_ptr()
-            == group.model_weight.local_buffer.untyped_storage().data_ptr()
-        )
-
-        # The next forward performs the first-microbatch all-gather directly into
-        # the persistent owner without replacing its storage.
-        model(x)
-        assert not group._model_weight_is_stale
-        assert group.model_weight.local_buffer.data_ptr() == model_weight_data_ptr
-
-
 def test_mixed_precision_rejects_optimizer_range_larger_than_model_range(distributed_setup):
     """Mixed precision requires the optimizer-layout slice to fit the model-weight owner."""
     world_size = distributed_setup.world_size

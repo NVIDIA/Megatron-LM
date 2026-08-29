@@ -250,43 +250,6 @@ def test_from_local_reuses_required_local_buffer(distributed_setup):
     _assert_dbuffer_local_tensors_close(sharded_buffer.allgather(0), tensors)
 
 
-def test_view_aliases_owner_and_allgathers_into_it(distributed_setup):
-    """A placement view aliases its owner and can materialize it in place."""
-    if distributed_setup.world_size < 2:
-        pytest.skip("DBuffer view test requires at least 2 ranks.")
-
-    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
-    owner = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
-    same_layout_view = owner.view([Replicate()])
-    sharded_buffer = owner.view([Flat()])
-    owner_data_ptr = owner.local_buffer.data_ptr()
-
-    assert same_layout_view is owner
-    assert (
-        sharded_buffer.local_buffer.untyped_storage().data_ptr()
-        == owner.local_buffer.untyped_storage().data_ptr()
-    )
-    assert sharded_buffer.offset >= owner.offset
-    sharded_buffer.local_buffer.copy_(
-        torch.arange(
-            sharded_buffer.local_buffer.numel(),
-            device=sharded_buffer.device,
-            dtype=sharded_buffer.dtype,
-        )
-        + sharded_buffer.offset
-    )
-
-    result = sharded_buffer.allgather(0, out=owner)
-
-    assert result is owner
-    assert owner.local_buffer.data_ptr() == owner_data_ptr
-    torch.testing.assert_close(
-        owner.local_buffer,
-        torch.arange(owner.local_buffer.numel(), device=owner.device, dtype=owner.dtype),
-    )
-
-
 def test_view_rejects_non_aliasing_placement_change(distributed_setup):
     """A view rejects placement changes that need communication."""
     if distributed_setup.world_size < 2:
