@@ -3232,9 +3232,7 @@ def load_biencoder_checkpoint(
     with maybe_msc.open(tracker_filename, 'r') as f:
         iteration = int(f.read().strip())
 
-    checkpoint_name = get_checkpoint_name(
-        load_path, iteration, args.use_distributed_optimizer, release=False
-    )
+    checkpoint_name = get_checkpoint_name(load_path, iteration, release=False)
 
     if mpu.get_data_parallel_rank() == 0:
         print(
