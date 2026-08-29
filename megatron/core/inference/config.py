@@ -79,10 +79,12 @@ class MambaInferenceStateConfig:
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_config_list = getattr(decoder, "layer_config_list", None)
         if layer_config_list is not None:
-            has_mamba = layer_utils.contains_layer_symbol(
-                layer_utils.Symbols.MAMBA, layer_config_list
+            has_mamba = layer_utils.contains_layer_config(
+                layer_utils.MambaLayerConfig, layer_config_list
             )
-            has_gdn = layer_utils.contains_layer_symbol(layer_utils.Symbols.GDN, layer_config_list)
+            has_gdn = layer_utils.contains_layer_config(
+                layer_utils.GDNLayerConfig, layer_config_list
+            )
             if has_mamba and has_gdn:
                 raise ValueError(
                     "Dynamic inference does not support mixing Mamba and GDN layers; "
@@ -90,7 +92,7 @@ class MambaInferenceStateConfig:
                     "and chunk size."
                 )
             if any(
-                layer_utils.get_layer_symbol_from_config(layer_config) == layer_utils.Symbols.GDN
+                type(layer_config) is layer_utils.GDNLayerConfig
                 and layer_config.experimental_attention_variant == "gdn2"
                 for layer_config in layer_config_list
             ):

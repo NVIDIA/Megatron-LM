@@ -120,18 +120,20 @@ class TestGetLayerSymbolFromConfig:
 
 
 @pytest.mark.internal
-class TestContainsLayerSymbol:
+class TestContainsLayerConfig:
 
-    @pytest.mark.parametrize(("layer_symbol", "config_type"), _EXPECTED_LAYER_CONFIG_TYPES)
-    def test_returns_true_when_symbol_is_present(self, layer_symbol, config_type):
+    @pytest.mark.parametrize(
+        "config_type", [config_type for _, config_type in _EXPECTED_LAYER_CONFIG_TYPES]
+    )
+    def test_returns_true_when_config_type_is_present(self, config_type):
         layer_config = config_type.from_config(_make_transformer_config())
 
-        assert layer_utils.contains_layer_symbol(layer_symbol, [layer_config])
+        assert layer_utils.contains_layer_config(config_type, [layer_config])
 
-    def test_returns_false_when_symbol_is_absent(self):
+    def test_returns_false_when_config_type_is_absent(self):
         layer_config = MambaLayerConfig.from_config(_make_transformer_config())
 
-        assert not layer_utils.contains_layer_symbol(layer_utils.Symbols.GDN, [layer_config])
+        assert not layer_utils.contains_layer_config(layer_utils.GDNLayerConfig, [layer_config])
 
     def test_preserves_exact_config_type_lookup(self):
         class CustomMambaLayerConfig(MambaLayerConfig):
@@ -142,7 +144,16 @@ class TestContainsLayerSymbol:
         with pytest.raises(
             ValueError, match="Unexpected hybrid layer config type: CustomMambaLayerConfig"
         ):
-            layer_utils.contains_layer_symbol(layer_utils.Symbols.MAMBA, [layer_config])
+            layer_utils.contains_layer_config(layer_utils.MambaLayerConfig, [layer_config])
+
+    def test_rejects_unregistered_requested_config_type(self):
+        class CustomMambaLayerConfig(MambaLayerConfig):
+            pass
+
+        with pytest.raises(
+            ValueError, match="Unexpected hybrid layer config type: CustomMambaLayerConfig"
+        ):
+            layer_utils.contains_layer_config(CustomMambaLayerConfig, [])
 
 
 @pytest.mark.internal

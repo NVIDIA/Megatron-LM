@@ -1019,22 +1019,37 @@ class TestGetLayerMapsFromLayerTypeList:
 class TestGetLayerMapsFromLayerConfigList:
     """Tests for get_layer_maps_from_layer_config_list."""
 
-    def test_matches_symbol_derived_maps(self):
-        """Config-derived maps match symbol-derived maps for every layer type."""
-        layer_symbols = list(_EXPECTED_LAYER_CONFIG_CLASSES)
+    def test_maps_are_keyed_by_exact_config_type(self):
+        """Config-derived maps are keyed and indexed by exact config type."""
+        layer_config_types = list(_EXPECTED_LAYER_CONFIG_CLASSES.values())
         layer_configs = [
-            _EXPECTED_LAYER_CONFIG_CLASSES[layer_symbol](
-                num_layers=1, hidden_size=64, num_attention_heads=4
-            )
-            for layer_symbol in layer_symbols
+            layer_config_type(num_layers=1, hidden_size=64, num_attention_heads=4)
+            for layer_config_type in layer_config_types
         ]
 
-        assert get_layer_maps_from_layer_config_list(
-            layer_configs
-        ) == get_layer_maps_from_layer_type_list(layer_symbols)
+        assert get_layer_maps_from_layer_config_list(layer_configs) == {
+            layer_config_type: {global_layer_idx: 0}
+            for global_layer_idx, layer_config_type in enumerate(layer_config_types)
+        }
+
+    def test_repeated_config_types_use_type_local_indices(self):
+        """Repeated config types receive consecutive type-local indices."""
+        config_kwargs = {"num_layers": 1, "hidden_size": 64, "num_attention_heads": 4}
+        layer_configs = [
+            MambaLayerConfig(**config_kwargs),
+            AttentionLayerConfig(**config_kwargs),
+            MambaLayerConfig(**config_kwargs),
+        ]
+
+        maps = get_layer_maps_from_layer_config_list(layer_configs)
+
+        assert maps[MambaLayerConfig] == {0: 0, 2: 1}
+        assert maps[AttentionLayerConfig] == {1: 0}
+        assert maps[GDNLayerConfig] == {}
+        assert maps[DSALayerConfig] == {}
 
     def test_rejects_config_subclasses(self):
-        """Unregistered config subclasses do not inherit their parent's symbol."""
+        """Unregistered config subclasses are not implicitly supported."""
 
         class CustomMambaLayerConfig(MambaLayerConfig):
             pass
