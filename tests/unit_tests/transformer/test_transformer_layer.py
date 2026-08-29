@@ -812,6 +812,21 @@ class TestMHCWithCudaGraph:
             f"HyperConnectionTransformerLayer must override get_layer_static_inputs."
         )
 
+    def test_mhc_post_mlp_tolerates_cleared_norm_manager(self, monkeypatch):
+        """Partial graph replay does not retain a no-op capture manager."""
+        layer, _ = self._create_mhc_layer()
+        hidden_states = torch.randn((4, 1, 64), device="cuda", requires_grad=True)
+        monkeypatch.setattr(
+            layer, "_forward_mhc_mlp_post_core", lambda *_args, **_kwargs: hidden_states
+        )
+
+        layer.mlp_norm_manager = None
+        output = layer._forward_post_mlp_with_fused_hyper_connection(
+            (hidden_states, None), hidden_states, hidden_states, hidden_states
+        )
+
+        assert torch.equal(output, hidden_states)
+
     def test_mhc_recompute_attention_graph_starts_from_one_stream_aggregate(self):
         """The split attention graph input is the eager mHC aggregate [s, b, C]."""
         layer, config = self._create_mhc_layer(
