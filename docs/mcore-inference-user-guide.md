@@ -85,28 +85,24 @@ This focus drives the major design benefits:
 
 ## Rollout Performance
 
-Megatron Inference is optimized for the generation (rollout) phase of the RL
-loop. Its rollout performance is *on par with popular inference frameworks*,
-so you get the training and inference consistency benefits of staying in MCore
-without giving up generation speed.
+In an August 2026 Nemotron Ultra V3 SWE rollout benchmark, Megatron Inference
+delivered **12.30 rollouts/GPU-hour versus 8.47 for vLLM (45% higher
+throughput)**. It reduced mean wall-clock time by 31% and end-to-end trajectory
+latency by 20% at p50, 21% at p90, and 18% at p99, while reward remained within
+the observed run-to-run variation.
 
-The plots below show a sample comparison of decode step times against vLLM
-during rollouts (lower is better). The two engines track each other closely
-across batch sizes, with MCore comparable or slightly faster at larger batch
-sizes:
+The comparison used the same Ultra V3 model, SWE validation set, 60-turn agent
+limit, 64-request concurrency, and 16 GPUs per run; only the generation engine
+differed. Results are averages over five runs and 1,600 trajectories per engine.
+The batches ran six days apart on the same cluster, so node-level variation was
+not controlled.
 
-<!-- TODO: These decode-step plots predate async scheduling, which has since
-landed as the opt-in `async_sched_mode='async'` (see the Async Scheduling
-section). Refresh them with async scheduling enabled, and add a prefill-perf
-analysis section. -->
-<!-- TODO: Add a "Benchmark setup" note documenting the versions benched with
-(vLLM version, MCore commit/version, GPU/hardware, model sizes). -->
-
-<img src="images/inference_performance/ultra-performance.png" alt="Sample rollout decode step times — Nemotron 3 Ultra" width="600">
-
-<img src="images/inference_performance/super-performance.png" alt="Sample rollout decode step times — Nemotron 3 Super" width="600">
-
-You do not trade away rollout performance to gain the training and inference consistency benefits of MCore inference.
+Performance maturity varies by model family. Most optimization work to date has
+focused on hybrid models. In a representative Qwen 30B EP4 run on GB200
+(batch size 256, output sequence length 256), Megatron Core reached about
+24,000 generated tokens/s versus 34,000 tokens/s for vLLM, a gap of
+approximately 29%. Additional Qwen optimizations are under active development
+and are expected to narrow this gap as they are merged.
 
 ---
 
