@@ -25,7 +25,14 @@ MAX_INLINE_FINDINGS = 30
 MAX_GENERAL_FINDINGS = 10
 MAX_VALID_LINES = 20_000
 FAILURE_REASONS = frozenset(
-    {"none", "context_incomplete", "budget_exhausted", "timeout", "analysis_failed", "invalid_output"}
+    {
+        "none",
+        "context_incomplete",
+        "budget_exhausted",
+        "timeout",
+        "analysis_failed",
+        "invalid_output",
+    }
 )
 SEVERITIES = frozenset({"critical", "important", "suggestion"})
 SIDES = frozenset({"LEFT", "RIGHT"})
@@ -35,6 +42,7 @@ TRUSTED_CODE_PATHS = (
     ".github/scripts/claude_review/common.py",
     ".github/scripts/claude_review/prepare.py",
     ".github/scripts/claude_review/context.py",
+    ".github/scripts/claude_review/server.py",
     ".github/scripts/claude_review/publisher.py",
     ".github/scripts/claude_review/cli.py",
 )
@@ -90,7 +98,9 @@ def parse_trigger(body: str) -> tuple[str, str | None] | None:
     return mode, match.group(2).lower() if match.group(2) else None
 
 
-def actor_authorized(actor: dict[str, Any], permission: str, bot_allowlist: Iterable[str] = ()) -> bool:
+def actor_authorized(
+    actor: dict[str, Any], permission: str, bot_allowlist: Iterable[str] = ()
+) -> bool:
     """Apply the explicit repository reviewer policy."""
 
     login = actor.get("login")
@@ -123,7 +133,9 @@ class GitHubAPI:
         if payload is not None:
             data = json.dumps(payload, separators=(",", ":")).encode()
             headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(self.api_url + path, data=data, headers=headers, method=method)
+        request = urllib.request.Request(
+            self.api_url + path, data=data, headers=headers, method=method
+        )
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 raw = response.read(4 * 1024 * 1024 + 1)

@@ -45,7 +45,10 @@ def _run(repo: Path, args: list[str], *, text: bool = True) -> str | bytes:
 
 def _run_limited(repo: Path, args: list[str], limit: int) -> tuple[bytes, bool]:
     process = subprocess.Popen(
-        ["git", "-c", "core.hooksPath=/dev/null", *args], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        ["git", "-c", "core.hooksPath=/dev/null", *args],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
     assert process.stdout is not None
     data = process.stdout.read(limit + 1)
@@ -54,7 +57,9 @@ def _run_limited(repo: Path, args: list[str], limit: int) -> tuple[bytes, bool]:
         process.kill()
     _, stderr = process.communicate(timeout=30)
     if not truncated and process.returncode != 0:
-        raise ReviewError(f"read-only git command failed: {args[0]}: {stderr[:1000].decode(errors='replace')}")
+        raise ReviewError(
+            f"read-only git command failed: {args[0]}: {stderr[:1000].decode(errors='replace')}"
+        )
     return data[:limit], truncated
 
 
@@ -71,12 +76,19 @@ def _tree(repo: Path, revision: str) -> dict[str, dict[str, Any]]:
             raise ReviewError("unexpected ls-tree record")
         mode, kind, oid, size = parts
         path = _safe_path(raw_path.decode("utf-8", errors="strict"))
-        result[path] = {"mode": mode, "kind": kind, "oid": oid, "size": None if size == "-" else int(size)}
+        result[path] = {
+            "mode": mode,
+            "kind": kind,
+            "oid": oid,
+            "size": None if size == "-" else int(size),
+        }
     return result
 
 
 def _name_status(repo: Path, merge_base: str, head: str) -> list[tuple[str, str | None, str]]:
-    raw = _run(repo, ["diff", "--name-status", "-z", "--find-renames", merge_base, head], text=False)
+    raw = _run(
+        repo, ["diff", "--name-status", "-z", "--find-renames", merge_base, head], text=False
+    )
     assert isinstance(raw, bytes)
     fields = raw.split(b"\0")
     changes: list[tuple[str, str | None, str]] = []
@@ -96,7 +108,9 @@ def _name_status(repo: Path, merge_base: str, head: str) -> list[tuple[str, str 
     return changes
 
 
-def _diff_stats(repo: Path, merge_base: str, head: str, paths: list[str]) -> tuple[int | None, int | None]:
+def _diff_stats(
+    repo: Path, merge_base: str, head: str, paths: list[str]
+) -> tuple[int | None, int | None]:
     raw = _run(repo, ["diff", "--numstat", merge_base, head, "--", *paths])
     assert isinstance(raw, str)
     additions = deletions = 0
@@ -153,10 +167,21 @@ def build_context(repo: Path, metadata_path: Path, output_dir: Path) -> dict[str
     changes: list[dict[str, Any]] = []
     for status, old_path, path in statuses[:MAX_CHANGED_FILES]:
         paths = [old_path, path] if old_path else [path]
-        additions, deletions = _diff_stats(repo, merge_base, head_sha, [item for item in paths if item])
+        additions, deletions = _diff_stats(
+            repo, merge_base, head_sha, [item for item in paths if item]
+        )
         patch_bytes, patch_truncated = _run_limited(
             repo,
-            ["diff", "--no-ext-diff", "--no-textconv", "--unified=0", merge_base, head_sha, "--", *paths],
+            [
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--unified=0",
+                merge_base,
+                head_sha,
+                "--",
+                *paths,
+            ],
             2 * 1024 * 1024,
         )
         patch = patch_bytes.decode("utf-8", errors="replace")
@@ -165,7 +190,8 @@ def build_context(repo: Path, metadata_path: Path, output_dir: Path) -> dict[str
         new_entry = head_tree.get(path)
         binary = additions is None or deletions is None
         special = any(
-            entry and entry["mode"] not in {"100644", "100755", "120000", "160000"} for entry in (old_entry, new_entry)
+            entry and entry["mode"] not in {"100644", "100755", "120000", "160000"}
+            for entry in (old_entry, new_entry)
         )
         changes.append(
             {
@@ -175,8 +201,12 @@ def build_context(repo: Path, metadata_path: Path, output_dir: Path) -> dict[str
                 "additions": additions,
                 "deletions": deletions,
                 "binary": binary,
-                "submodule": any(entry and entry["mode"] == "160000" for entry in (old_entry, new_entry)),
-                "symlink": any(entry and entry["mode"] == "120000" for entry in (old_entry, new_entry)),
+                "submodule": any(
+                    entry and entry["mode"] == "160000" for entry in (old_entry, new_entry)
+                ),
+                "symlink": any(
+                    entry and entry["mode"] == "120000" for entry in (old_entry, new_entry)
+                ),
                 "special": special,
                 "old": old_entry,
                 "new": new_entry,
@@ -185,10 +215,14 @@ def build_context(repo: Path, metadata_path: Path, output_dir: Path) -> dict[str
                 "line_map_truncated": lines_truncated or patch_truncated,
             }
         )
-        context_complete = context_complete and not special and not lines_truncated and not patch_truncated
+        context_complete = (
+            context_complete and not special and not lines_truncated and not patch_truncated
+        )
 
     diff, diff_truncated = _run_limited(
-        repo, ["diff", "--no-ext-diff", "--no-textconv", "--find-renames", merge_base, head_sha], MAX_DIFF_BYTES
+        repo,
+        ["diff", "--no-ext-diff", "--no-textconv", "--find-renames", merge_base, head_sha],
+        MAX_DIFF_BYTES,
     )
     (output_dir / "diff.patch").write_bytes(diff)
     context_complete = context_complete and not diff_truncated
@@ -218,14 +252,20 @@ def build_context(repo: Path, metadata_path: Path, output_dir: Path) -> dict[str
         else:
             record["available"] = False
         trusted_manifest.append(record)
-    (trusted_dir / "manifest.json").write_text(json.dumps(trusted_manifest, indent=2, sort_keys=True) + "\n")
+    (trusted_dir / "manifest.json").write_text(
+        json.dumps(trusted_manifest, indent=2, sort_keys=True) + "\n"
+    )
 
-    history_raw = str(_run(repo, ["log", "-100", "--format=%H%x00%P%x00%aI%x00%an%x00%s", base_sha]))
+    history_raw = str(
+        _run(repo, ["log", "-100", "--format=%H%x00%P%x00%aI%x00%an%x00%s", base_sha])
+    )
     history = []
     for line in history_raw.splitlines():
         fields = line.split("\0")
         if len(fields) == 5:
-            history.append(dict(zip(("sha", "parents", "authored_at", "author", "subject"), fields)))
+            history.append(
+                dict(zip(("sha", "parents", "authored_at", "author", "subject"), fields))
+            )
 
     metadata.update(
         {
@@ -246,7 +286,9 @@ def build_context(repo: Path, metadata_path: Path, output_dir: Path) -> dict[str
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
     (output_dir / "changes.json").write_text(json.dumps(changes, indent=2, sort_keys=True) + "\n")
     (output_dir / "history.json").write_text(json.dumps(history, indent=2, sort_keys=True) + "\n")
-    (output_dir / "trees.json").write_text(json.dumps({"base": base_tree, "head": head_tree}, sort_keys=True) + "\n")
+    (output_dir / "trees.json").write_text(
+        json.dumps({"base": base_tree, "head": head_tree}, sort_keys=True) + "\n"
+    )
     return metadata
 
 
@@ -302,7 +344,11 @@ class ContextStore:
         if name == "list_changes":
             offset = max(0, int(arguments.get("offset", 0)))
             limit = min(200, max(1, int(arguments.get("limit", 100))))
-            return {"items": self.changes[offset : offset + limit], "offset": offset, "total": len(self.changes)}
+            return {
+                "items": self.changes[offset : offset + limit],
+                "offset": offset,
+                "total": len(self.changes),
+            }
         if name == "read_file":
             return self._member(
                 str(arguments.get("revision")),
@@ -330,11 +376,18 @@ class ContextStore:
             if selected is None:
                 return {"base_sha": self.metadata["base_sha"], "inventory": manifest}
             selected = _safe_path(selected)
-            allowed = next((item for item in manifest if item["path"] == selected and item.get("available")), None)
+            allowed = next(
+                (item for item in manifest if item["path"] == selected and item.get("available")),
+                None,
+            )
             if not allowed:
                 raise ReviewError("trusted instruction is unavailable")
             raw = (self.root / "trusted" / selected).read_bytes()
-            return {"path": selected, "base_sha": self.metadata["base_sha"], "content": raw.decode(errors="replace")}
+            return {
+                "path": selected,
+                "base_sha": self.metadata["base_sha"],
+                "content": raw.decode(errors="replace"),
+            }
         if name == "trusted_history":
             if self.metadata["mode"] != "strict":
                 raise ReviewError("trusted history is available only in strict mode")
@@ -364,120 +417,20 @@ class ContextStore:
                     for number, line in enumerate(raw.splitlines(), 1):
                         if query_bytes in line:
                             matches.append(
-                                {"path": member.name, "line": number, "text": line[:1000].decode(errors="replace")}
+                                {
+                                    "path": member.name,
+                                    "line": number,
+                                    "text": line[:1000].decode(errors="replace"),
+                                }
                             )
                             if len(matches) >= max_matches:
-                                return {"matches": matches, "truncated": True, "scanned_bytes": scanned}
+                                return {
+                                    "matches": matches,
+                                    "truncated": True,
+                                    "scanned_bytes": scanned,
+                                }
             return {"matches": matches, "truncated": False, "scanned_bytes": scanned}
         raise ReviewError(f"unknown repository tool: {name}")
 
 
-TOOLS = [
-    {
-        "name": "review_metadata",
-        "description": "Read normalized immutable PR metadata and coverage limits.",
-        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
-    },
-    {
-        "name": "list_changes",
-        "description": "List bounded changed-file metadata and valid inline line maps.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "offset": {"type": "integer", "minimum": 0},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
-            },
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "read_file",
-        "description": "Read a bounded inert base/head file; symlinks, binaries, submodules and special files are never followed or executed.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "revision": {"enum": ["base", "head"]},
-                "path": {"type": "string"},
-                "offset": {"type": "integer", "minimum": 0},
-                "max_bytes": {"type": "integer", "minimum": 1, "maximum": MAX_FILE_READ},
-            },
-            "required": ["revision", "path"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "read_diff",
-        "description": "Retrieve the immutable three-dot diff incrementally by byte window.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "offset": {"type": "integer", "minimum": 0},
-                "max_bytes": {"type": "integer", "minimum": 1, "maximum": MAX_FILE_READ},
-            },
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "search_repository",
-        "description": "Perform bounded literal repository-wide search in an inert revision archive.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "revision": {"enum": ["base", "head"]},
-                "query": {"type": "string", "minLength": 1, "maxLength": 128},
-                "max_matches": {"type": "integer", "minimum": 1, "maximum": 100},
-            },
-            "required": ["revision", "query"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "trusted_instructions",
-        "description": "List or read instructions and actual mcore-prefixed skills captured only from BASE_SHA.",
-        "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}, "additionalProperties": False},
-    },
-    {
-        "name": "trusted_history",
-        "description": "Read bounded trusted-base history in strict mode.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100}},
-            "additionalProperties": False,
-        },
-    },
-]
-
-
-def serve(context_dir: Path) -> None:
-    store = ContextStore(context_dir)
-    for raw in sys.stdin:
-        try:
-            request = json.loads(raw)
-            method = request.get("method")
-            if method == "initialize":
-                result = {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": "megatron-review-context", "version": "1"},
-                }
-            elif method == "notifications/initialized":
-                continue
-            elif method == "tools/list":
-                result = {"tools": TOOLS}
-            elif method == "tools/call":
-                params = request.get("params") or {}
-                value = store.call(str(params.get("name")), params.get("arguments") or {})
-                result = {
-                    "content": [{"type": "text", "text": json.dumps(value, separators=(",", ":"))}],
-                    "isError": False,
-                }
-            else:
-                raise ReviewError(f"unsupported MCP method: {method}")
-            response = {"jsonrpc": "2.0", "id": request.get("id"), "result": result}
-        except Exception as error:  # MCP must encode deterministic tool failures.
-            response = {
-                "jsonrpc": "2.0",
-                "id": request.get("id") if isinstance(request, dict) else None,
-                "error": {"code": -32000, "message": str(error)[:1000]},
-            }
-        print(json.dumps(response, separators=(",", ":")), flush=True)
+from .server import TOOLS, serve  # noqa: E402,F401

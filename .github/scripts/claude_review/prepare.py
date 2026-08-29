@@ -10,7 +10,14 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
-from .common import GitHubAPI, ReviewError, _full_sha, _normalise_text, actor_authorized, parse_trigger  # isort: skip
+from .common import (  # isort: skip
+    GitHubAPI,
+    ReviewError,
+    _full_sha,
+    _normalise_text,
+    actor_authorized,
+    parse_trigger,
+)
 
 
 def _write_outputs(values: dict[str, Any]) -> None:
@@ -40,15 +47,22 @@ def prepare_event(event_path: Path, output_path: Path, acknowledge: bool) -> dic
     if not isinstance(repository, str) or not isinstance(pr_number, int):
         raise ReviewError("invalid issue_comment event")
 
-    api = GitHubAPI(os.environ.get("GITHUB_TOKEN", ""), os.environ.get("GITHUB_API_URL", "https://api.github.com"))
+    api = GitHubAPI(
+        os.environ.get("GITHUB_TOKEN", ""),
+        os.environ.get("GITHUB_API_URL", "https://api.github.com"),
+    )
     bot_allowlist = os.environ.get("CLAUDE_REVIEW_BOT_ALLOWLIST", "").split(",")
     login = str(actor.get("login", ""))
     is_bot = actor.get("type") == "Bot" or login.endswith("[bot]")
     if is_bot:
-        permission = "bot-allowlist" if login in {name.strip() for name in bot_allowlist} else "none"
+        permission = (
+            "bot-allowlist" if login in {name.strip() for name in bot_allowlist} else "none"
+        )
     else:
         quoted_login = urllib.parse.quote(login, safe="")
-        permission_data = api.request("GET", f"/repos/{repository}/collaborators/{quoted_login}/permission")
+        permission_data = api.request(
+            "GET", f"/repos/{repository}/collaborators/{quoted_login}/permission"
+        )
         permission = str(permission_data.get("permission", "none"))
     if not actor_authorized(actor, permission, bot_allowlist):
         _write_outputs({"triggered": True, "authorized": False, "mode": mode})
@@ -62,7 +76,9 @@ def prepare_event(event_path: Path, output_path: Path, acknowledge: bool) -> dic
     base_ref = base.get("ref")
     head_ref = head.get("ref")
     head_sha = _full_sha(head.get("sha"), "HEAD_SHA")
-    if not all(isinstance(item, str) and item for item in (base_repo, head_repo, base_ref, head_ref)):
+    if not all(
+        isinstance(item, str) and item for item in (base_repo, head_repo, base_ref, head_ref)
+    ):
         raise ReviewError("pull request repository references are incomplete")
     ref_path = urllib.parse.quote(base_ref, safe="")
     base_data = api.request("GET", f"/repos/{base_repo}/git/ref/heads/{ref_path}")
@@ -77,7 +93,9 @@ def prepare_event(event_path: Path, output_path: Path, acknowledge: bool) -> dic
                     "body": "Claude review was not started: the requested revision does not match the current PR head. Re-run the command with the current full SHA."
                 },
             )
-        _write_outputs({"triggered": True, "authorized": True, "revision_match": False, "mode": mode})
+        _write_outputs(
+            {"triggered": True, "authorized": True, "revision_match": False, "mode": mode}
+        )
         return None
 
     metadata = {

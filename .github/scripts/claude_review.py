@@ -10,7 +10,9 @@ from pathlib import Path
 
 _PACKAGE_DIR = Path(__file__).with_suffix("")
 _SPEC = importlib.util.spec_from_file_location(
-    "megatron_claude_review", _PACKAGE_DIR / "__init__.py", submodule_search_locations=[str(_PACKAGE_DIR)]
+    "megatron_claude_review",
+    _PACKAGE_DIR / "__init__.py",
+    submodule_search_locations=[str(_PACKAGE_DIR)],
 )
 if _SPEC is None or _SPEC.loader is None:
     raise ImportError("isolated review package is unavailable")

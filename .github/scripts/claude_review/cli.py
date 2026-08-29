@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 from .common import ReviewError, parse_trigger
@@ -38,7 +39,9 @@ def main(argv: list[str] | None = None) -> int:
     publish_parser.add_argument("--context-dir", type=Path, required=True)
     publish_parser.add_argument("--report", type=Path)
     publish_parser.add_argument(
-        "--analysis-result", choices=["success", "failed", "invalid", "timed_out"], default="success"
+        "--analysis-result",
+        choices=["success", "failed", "invalid", "timed_out"],
+        default="success",
     )
     subparsers.add_parser("schema")
     args = parser.parse_args(argv)
@@ -48,7 +51,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "prepare-event":
             prepare_event(args.event, args.output, args.acknowledge)
         elif args.command == "build-context":
-            print(json.dumps(build_context(args.repo, args.metadata, args.output_dir), sort_keys=True))
+            print(
+                json.dumps(build_context(args.repo, args.metadata, args.output_dir), sort_keys=True)
+            )
         elif args.command == "serve":
             serve(args.context_dir)
         elif args.command == "validate":
@@ -57,7 +62,13 @@ def main(argv: list[str] | None = None) -> int:
             print(publish(args.context_dir, args.report, args.analysis_result))
         elif args.command == "schema":
             print(json.dumps(report_schema(), separators=(",", ":")))
-    except (ReviewError, OSError, ValueError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
+    except (
+        ReviewError,
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+        subprocess.TimeoutExpired,
+    ) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     return 0

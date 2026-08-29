@@ -38,7 +38,9 @@ def _bounded_string(value: Any, name: str, minimum: int, maximum: int) -> str:
     return value
 
 
-def validate_report(report: Any, context: dict[str, Any], changes: list[dict[str, Any]]) -> dict[str, Any]:
+def validate_report(
+    report: Any, context: dict[str, Any], changes: list[dict[str, Any]]
+) -> dict[str, Any]:
     report = _exact_keys(
         report,
         {
@@ -69,10 +71,21 @@ def validate_report(report: Any, context: dict[str, Any], changes: list[dict[str
 
     coverage = _exact_keys(
         report["coverage"],
-        {"changed_files_total", "changed_files_reviewed", "diff_bytes_total", "diff_bytes_reviewed", "skipped"},
+        {
+            "changed_files_total",
+            "changed_files_reviewed",
+            "diff_bytes_total",
+            "diff_bytes_reviewed",
+            "skipped",
+        },
         "coverage",
     )
-    integers = ("changed_files_total", "changed_files_reviewed", "diff_bytes_total", "diff_bytes_reviewed")
+    integers = (
+        "changed_files_total",
+        "changed_files_reviewed",
+        "diff_bytes_total",
+        "diff_bytes_reviewed",
+    )
     if any(not isinstance(coverage[key], int) or coverage[key] < 0 for key in integers):
         raise ReviewError("coverage counts must be non-negative integers")
     if (
@@ -92,23 +105,42 @@ def validate_report(report: Any, context: dict[str, Any], changes: list[dict[str
         _safe_path(skipped["path"])
         _bounded_string(skipped["reason"], "skip reason", 1, 300)
 
-    if not isinstance(report["inline_findings"], list) or len(report["inline_findings"]) > MAX_INLINE_FINDINGS:
+    if (
+        not isinstance(report["inline_findings"], list)
+        or len(report["inline_findings"]) > MAX_INLINE_FINDINGS
+    ):
         raise ReviewError("too many inline findings")
-    if not isinstance(report["general_findings"], list) or len(report["general_findings"]) > MAX_GENERAL_FINDINGS:
+    if (
+        not isinstance(report["general_findings"], list)
+        or len(report["general_findings"]) > MAX_GENERAL_FINDINGS
+    ):
         raise ReviewError("too many general findings")
     by_path = {change["path"]: change for change in changes}
     for finding in report["inline_findings"]:
-        _exact_keys(finding, {"path", "side", "line", "severity", "category", "body"}, "inline finding")
+        _exact_keys(
+            finding, {"path", "side", "line", "severity", "category", "body"}, "inline finding"
+        )
         path = _safe_path(finding["path"])
         change = by_path.get(path)
         if change is None:
             raise ReviewError("inline finding path is not in the captured diff")
-        if finding["side"] not in SIDES or not isinstance(finding["line"], int) or finding["line"] < 1:
+        if (
+            finding["side"] not in SIDES
+            or not isinstance(finding["line"], int)
+            or finding["line"] < 1
+        ):
             raise ReviewError("invalid inline side or line")
-        valid = change["valid_left_lines"] if finding["side"] == "LEFT" else change["valid_right_lines"]
+        valid = (
+            change["valid_left_lines"] if finding["side"] == "LEFT" else change["valid_right_lines"]
+        )
         if finding["line"] not in valid:
             raise ReviewError("inline finding line is not a changed line on the selected side")
-        if change["binary"] or change["submodule"] or change["special"] or change["line_map_truncated"]:
+        if (
+            change["binary"]
+            or change["submodule"]
+            or change["special"]
+            or change["line_map_truncated"]
+        ):
             raise ReviewError("inline finding targets an unsafe or incompletely mapped change")
         if finding["severity"] not in SEVERITIES:
             raise ReviewError("invalid finding severity")
@@ -146,7 +178,9 @@ def _load_context(context_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any
     )
 
 
-def validate_report_file(report_path: Path, context_dir: Path, output_path: Path | None) -> dict[str, Any]:
+def validate_report_file(
+    report_path: Path, context_dir: Path, output_path: Path | None
+) -> dict[str, Any]:
     context, changes = _load_context(context_dir)
     report = validate_report(json.loads(report_path.read_text(encoding="utf-8")), context, changes)
     if output_path:
@@ -180,7 +214,11 @@ def _oidc_bot_api(context: dict[str, Any]) -> GitHubAPI:
     request = urllib.request.Request(
         exchange_url,
         data=json.dumps(payload).encode(),
-        headers={"Authorization": f"Bearer {jwt}", "Content-Type": "application/json", "Accept": "application/json"},
+        headers={
+            "Authorization": f"Bearer {jwt}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=30) as response:
@@ -222,7 +260,9 @@ def _status_body(report: dict[str, Any]) -> str:
         f"Critical: {counts['critical']} · Important: {counts['important']} · Suggestions: {counts['suggestion']}",
     ]
     for finding in report["general_findings"]:
-        lines.extend(["", f"- **[{finding['severity'].upper()} {finding['category']}]** {finding['body']}"])
+        lines.extend(
+            ["", f"- **[{finding['severity'].upper()} {finding['category']}]** {finding['body']}"]
+        )
     lines.extend(
         [
             "",
@@ -264,7 +304,9 @@ def publish(context_dir: Path, report_path: Path | None, analysis_result: str) -
         kind, report = "failed", None
     else:
         try:
-            report = validate_report(json.loads(report_path.read_text(encoding="utf-8")), context, changes)
+            report = validate_report(
+                json.loads(report_path.read_text(encoding="utf-8")), context, changes
+            )
             kind = "incomplete" if report["status"] == "incomplete" else "valid"
         except (ReviewError, ValueError, OSError, json.JSONDecodeError):
             kind, report = "invalid", None
@@ -312,7 +354,11 @@ def report_schema() -> dict[str, Any]:
     }
     inline = json.loads(json.dumps(finding))
     inline["properties"].update(
-        {"path": {"type": "string"}, "side": {"enum": sorted(SIDES)}, "line": {"type": "integer", "minimum": 1}}
+        {
+            "path": {"type": "string"},
+            "side": {"enum": sorted(SIDES)},
+            "line": {"type": "integer", "minimum": 1},
+        }
     )
     inline["required"] = ["path", "side", "line", "severity", "category", "body"]
     return {
@@ -355,7 +401,11 @@ def report_schema() -> dict[str, Any]:
                 "additionalProperties": False,
             },
             "inline_findings": {"type": "array", "maxItems": MAX_INLINE_FINDINGS, "items": inline},
-            "general_findings": {"type": "array", "maxItems": MAX_GENERAL_FINDINGS, "items": finding},
+            "general_findings": {
+                "type": "array",
+                "maxItems": MAX_GENERAL_FINDINGS,
+                "items": finding,
+            },
             "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
             "clean": {"type": "boolean"},
             "failure_reason": {"enum": sorted(FAILURE_REASONS)},
