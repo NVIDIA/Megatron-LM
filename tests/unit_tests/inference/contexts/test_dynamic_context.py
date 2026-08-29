@@ -114,12 +114,11 @@ class TestDynamicContext:
             mamba_conv_states_shape = (544, 4)
             mamba_ssm_states_shape = (8, 64, 16)
             mamba_inference_state_config = MambaInferenceStateConfig(
-                None,
+                layer_config_list,
                 mamba_conv_states_shape,
                 mamba_ssm_states_shape,
                 params_dtype,
                 params_dtype,
-                layer_config_list=layer_config_list,
             )
         else:
             mamba_inference_state_config = None
@@ -2014,25 +2013,19 @@ class TestDynamicContext:
 
         if rank == 0:
             mamba_inference_state_config = MambaInferenceStateConfig(
-                None,
+                make_layer_configs(*([MambaLayerConfig] + [AttentionLayerConfig] * 4)),
                 mamba_conv_states_shape,
                 mamba_ssm_states_shape,
                 params_dtype,
                 params_dtype,
-                layer_config_list=make_layer_configs(
-                    *([MambaLayerConfig] + [AttentionLayerConfig] * 4)
-                ),
             )
         else:
             mamba_inference_state_config = MambaInferenceStateConfig(
-                None,
+                make_layer_configs(*([MambaLayerConfig] * 4 + [AttentionLayerConfig])),
                 mamba_conv_states_shape,
                 mamba_ssm_states_shape,
                 params_dtype,
                 params_dtype,
-                layer_config_list=make_layer_configs(
-                    *([MambaLayerConfig] * 4 + [AttentionLayerConfig])
-                ),
             )
 
         context = DynamicInferenceContext(
@@ -2180,12 +2173,11 @@ class TestDynamicContext:
         mamba_conv_states_shape = (544, 4)
         mamba_ssm_states_shape = (8, 64, 16)
         mamba_config = MambaInferenceStateConfig(
-            None,
+            layer_config_list,
             mamba_conv_states_shape,
             mamba_ssm_states_shape,
             params_dtype,
             params_dtype,
-            layer_config_list=layer_config_list,
         )
 
         context = DynamicInferenceContext(
@@ -2263,12 +2255,11 @@ class TestDynamicContext:
         mamba_conv_states_shape = (544, 4)
         mamba_ssm_states_shape = (8, 64, 16)
         mamba_config = MambaInferenceStateConfig(
-            None,
+            layer_config_list,
             mamba_conv_states_shape,
             mamba_ssm_states_shape,
             params_dtype,
             params_dtype,
-            layer_config_list=layer_config_list,
         )
 
         context = DynamicInferenceContext(

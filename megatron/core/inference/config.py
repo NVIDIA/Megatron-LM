@@ -7,9 +7,6 @@ from typing import List, Literal, Optional, Sequence, Tuple
 
 import torch
 
-from megatron.core.models.hybrid.hybrid_layer_allocation import (
-    get_layer_type_list_from_layer_config_list,
-)
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
@@ -27,10 +24,8 @@ class MambaInferenceStateConfig:
     mixing these. Once the kernels have been updated we can simplify this code.
     """
 
-    layer_type_list: List[str] | None
-    """
-    Deprecated layer symbols retained for callers that construct this config directly.
-    """
+    layer_config_list: Sequence[TransformerConfig]
+    """Per-layer configs used to derive dynamic inference cache indexing."""
 
     conv_states_shape: Tuple[int]
     """Recurrent mixer's conv state shape per request."""
@@ -67,20 +62,7 @@ class MambaInferenceStateConfig:
     model has none. Sizes the GDP chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
 
-    layer_config_list: Sequence[TransformerConfig] | None = None
-    """Per-layer configs used to derive dynamic inference cache indexing."""
-
     def __post_init__(self):
-        if self.layer_config_list is not None:
-            derived_layer_type_list = get_layer_type_list_from_layer_config_list(
-                self.layer_config_list
-            )
-            if self.layer_type_list is None:
-                self.layer_type_list = derived_layer_type_list
-            elif self.layer_type_list != derived_layer_type_list:
-                raise ValueError("layer_type_list does not match layer_config_list")
-        elif self.layer_type_list is None:
-            raise ValueError("One of layer_type_list or layer_config_list must be provided")
         if self.ssm_chunk_alignment is None:
             self.ssm_chunk_alignment = self.mamba_chunk_size
 
@@ -150,7 +132,6 @@ class MambaInferenceStateConfig:
                 ssm_chunk_alignment = chunking.inference_chunk_size
                 gdp_num_householder = chunking.num_householder
             return cls(
-                layer_type_list=None,
                 layer_config_list=list(layer_config_list),
                 conv_states_shape=mamba_conv_states_shape,
                 ssm_states_shape=mamba_ssm_states_shape,

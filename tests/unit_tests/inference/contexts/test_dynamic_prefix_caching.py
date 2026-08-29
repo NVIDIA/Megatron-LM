@@ -51,7 +51,6 @@ class PrefixCachingTestBase:
         from megatron.core.inference.config import MambaInferenceStateConfig
 
         return MambaInferenceStateConfig(
-            layer_type_list=None,
             layer_config_list=[
                 object.__new__(AttentionLayerConfig),
                 object.__new__(MambaLayerConfig),

@@ -21,7 +21,6 @@ from megatron.core.inference.config import (
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
@@ -364,7 +363,6 @@ class TestInferenceConfig:
         mamba_state_config = MambaInferenceStateConfig.from_model(model)
 
         assert mamba_state_config is not None
-        assert mamba_state_config.layer_type_list == [Symbols.ATTENTION, Symbols.MAMBA]
         assert mamba_state_config.layer_config_list[0] is attention_config
         assert mamba_state_config.layer_config_list[1] is mamba_layer_config
         assert mamba_state_config.conv_states_shape == (4, 8)
@@ -376,19 +374,6 @@ class TestInferenceConfig:
         decoder.layer_config_list = [attention_config]
         decoder.layers = decoder.layers[:1]
         assert MambaInferenceStateConfig.from_model(model) is None
-
-    def test_mamba_state_config_accepts_legacy_layer_type_list(self):
-        """Direct callers can continue constructing inference state from layer symbols."""
-        config = MambaInferenceStateConfig(
-            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION],
-            conv_states_shape=(4, 8),
-            ssm_states_shape=(8, 32, 16),
-            conv_states_dtype=torch.bfloat16,
-            ssm_states_dtype=torch.bfloat16,
-        )
-
-        assert config.layer_type_list == [Symbols.MAMBA, Symbols.ATTENTION]
-        assert config.layer_config_list is None
 
 
 def _ssm_model(mixers):
@@ -494,7 +479,6 @@ class TestSSMChunkAlignment:
     def test_alignment_defaults_to_the_mamba_chunk_size(self):
         """Hand-built configs that predate the field keep their old behaviour."""
         config = MambaInferenceStateConfig(
-            layer_type_list=None,
             layer_config_list=[object.__new__(MambaLayerConfig)],
             conv_states_shape=(16, 4),
             ssm_states_shape=(2, 8, 16),

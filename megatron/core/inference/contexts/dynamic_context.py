@@ -35,7 +35,6 @@ from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_e
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
     get_layer_maps_from_layer_config_list,
-    get_layer_maps_from_layer_type_list,
 )
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
@@ -455,15 +454,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Mamba and GDN use the same slot-indexed recurrent-state cache contract. Build
             # one map in global layer order; independently generated per-symbol maps both
             # start at zero and would alias if they were simply unioned.
-            if mamba_inference_state_config.layer_config_list is not None:
-                layer_maps = get_layer_maps_from_layer_config_list(
-                    mamba_inference_state_config.layer_config_list
-                )
-            else:
-                assert mamba_inference_state_config.layer_type_list is not None
-                layer_maps = get_layer_maps_from_layer_type_list(
-                    mamba_inference_state_config.layer_type_list
-                )
+            layer_maps = get_layer_maps_from_layer_config_list(
+                mamba_inference_state_config.layer_config_list
+            )
             attention_layer_map = layer_maps[Symbols.ATTENTION]
             dsa_layer_map = layer_maps[Symbols.DS_ATTENTION]
             recurrent_global_layer_indices = (
