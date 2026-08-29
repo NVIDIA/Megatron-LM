@@ -226,7 +226,7 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
             dist.barrier(group=group, device_ids=[device.index])
             launch_replica_grad_reduce(
                 arena=grad_arena,
-                main_grads=main_grads,
+                native_grads=main_grads,
                 peer_bases=grad_handle.buffer_ptrs_dev,
                 signal_bases=grad_handle.signal_pad_ptrs_dev,
                 experts_to_copy=plan,
@@ -843,7 +843,7 @@ def test_replica_weight_kernels_production_profile():
         torch.cuda.nvtx.range_push("replica_grad_reduce_profile")
         launch_replica_grad_reduce(
             arena=grad_arena,
-            main_grads=main_grads,
+            native_grads=main_grads,
             peer_bases=grad_handle.buffer_ptrs_dev,
             signal_bases=grad_handle.signal_pad_ptrs_dev,
             experts_to_copy=experts_to_copy,
