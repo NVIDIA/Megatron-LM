@@ -714,17 +714,25 @@ class TEGroupedMLP(MegatronModule):
                 f"got {hidden_states.dtype}."
             )
 
+        # NCCL EP bootstraps on the TP×EP group. TE MoeDispatch compares EpConfig.ep_group
+        # by object identity to that group, so do not use pg_collection.ep even when TP=1.
+        ep_group = te.pytorch.ep.get_ep_group()
+        if ep_group is None:
+            raise RuntimeError(
+                "fused_moe_forward requires NCCL EP to be bootstrapped before MoeDispatch."
+            )
+        drop_on_overflow = te.pytorch.ep.get_ep_drop_on_overflow()
         ep_config = te.pytorch.ep.EpConfig(
             top_k=ep_buffer.top_k,
             max_tokens_per_rank=ep_buffer.max_tokens_per_rank,
             recv_capacity_per_rank=ep_buffer.recv_capacity_per_rank,
             hidden_dim=ep_buffer.hidden_dim,
             num_local_experts=ep_buffer.num_local_experts,
-            ep_group=self.ep_group,
+            ep_group=ep_group,
             alignment=ep_buffer.alignment,
             payload_dtype=ep_buffer.payload_dtype,
             zero_copy=ep_buffer.zero_copy,
-            drop_on_overflow=self.drop_on_overflow,
+            drop_on_overflow=drop_on_overflow,
         )
         ops = self._make_fused_ops(
             ep_buffer=ep_buffer,
