@@ -262,8 +262,7 @@ def test_view_aliases_owner_and_allgathers_into_it(distributed_setup):
     sharded_buffer = owner.view([Flat()])
     owner_data_ptr = owner.local_buffer.data_ptr()
 
-    assert same_layout_view is not owner
-    assert same_layout_view.local_buffer.data_ptr() == owner_data_ptr
+    assert same_layout_view is owner
     assert (
         sharded_buffer.local_buffer.untyped_storage().data_ptr()
         == owner.local_buffer.untyped_storage().data_ptr()

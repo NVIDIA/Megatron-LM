@@ -237,13 +237,7 @@ class DBuffer:
 
         changed_axis = changed_mesh_axis(self.placements, placements)
         if changed_axis is None:
-            return DBuffer.from_local(
-                self.local_buffer,
-                self.mesh,
-                placements,
-                self.layout.tensor_shapes,
-                allocation_stream=self.allocation_stream,
-            )
+            return self
         if isinstance(self.placements[changed_axis], Replicate) and isinstance(
             placements[changed_axis], Flat
         ):

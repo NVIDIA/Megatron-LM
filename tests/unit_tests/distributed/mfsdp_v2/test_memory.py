@@ -99,7 +99,7 @@ def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
         # BF16 main-gradient buffer per child.
         assert all(
             group.model_weight is group.main_weight
-            and group.post_optimizer_model_weight is not group.model_weight
+            and group.post_optimizer_model_weight is group.model_weight
             for layer in model.layers
             for group in layer.parameter_groups
         )
