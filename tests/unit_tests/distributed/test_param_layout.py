@@ -25,9 +25,12 @@ from megatron.core.distributed.param_and_grad_buffer import (
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.param_layout import (
     BufferKey,
+    order_params_for_layout,
     pad_bucket_end,
     pad_param_start,
     pad_to_divisor,
+    params_share_gapless_storage,
+    shared_storage_group_key,
 )
 
 # ---------------------------------------------------------------------------
@@ -48,9 +51,37 @@ def _make_param_with_attrs(shape, dtype=torch.bfloat16, **attrs):
     return param
 
 
+def _make_shared_params(count, numel, dtype=torch.bfloat16):
+    storage = torch.randn(count, numel, dtype=dtype)
+    return [torch.nn.Parameter(storage[index]) for index in range(count)]
+
+
 # ---------------------------------------------------------------------------
 # Tests for shared padding utilities
 # ---------------------------------------------------------------------------
+
+
+def test_order_params_preserves_gapless_shared_storage_group():
+    dense_before, dense_after = _make_params((5,), (6,))
+    experts = _make_shared_params(3, 7)
+
+    ordered = order_params_for_layout([dense_before, *experts, dense_after])
+
+    assert ordered == [dense_after, *experts, dense_before]
+    assert shared_storage_group_key(experts[0]) is not None
+    assert shared_storage_group_key(_make_params((7,))[0]) is None
+    assert params_share_gapless_storage(experts[0], experts[1])
+
+
+def test_order_params_does_not_group_shared_storage_views_with_gaps():
+    storage = torch.randn(21, dtype=torch.bfloat16)
+    first = torch.nn.Parameter(storage[:7])
+    second = torch.nn.Parameter(storage[14:])
+
+    ordered = order_params_for_layout([first, second])
+
+    assert ordered == [second, first]
+    assert not params_share_gapless_storage(first, second)
 
 
 class TestPaddingUtilities:
@@ -169,6 +200,29 @@ class TestGroupParamsForBuffers:
 
 class TestDefaultParamLayout:
 
+    def test_shared_storage_group_is_gapless_and_not_split(self):
+        experts = _make_shared_params(3, 7)
+
+        layout = _compute_default_per_buffer_param_layout(experts, bucket_size=10)
+
+        assert [layout.param_index_map[param] for param in experts] == [
+            (0, 7, 0),
+            (7, 14, 0),
+            (14, 21, 0),
+        ]
+        assert layout.bucket_indices == [(0, 21)]
+
+    def test_shared_storage_views_with_gaps_are_not_grouped(self):
+        storage = torch.randn(21, dtype=torch.bfloat16)
+        first = torch.nn.Parameter(storage[:7])
+        second = torch.nn.Parameter(storage[14:])
+
+        layout = _compute_default_per_buffer_param_layout([first, second], bucket_size=7)
+
+        assert layout.param_index_map[second] == (0, 7, 0)
+        assert layout.param_index_map[first] == (7, 14, 1)
+        assert layout.bucket_indices == [(0, 7), (7, 14)]
+
     def test_single_bucket_no_padding(self):
         """With bucket_size=None, all params go in one bucket with no padding."""
         params = _make_params((100, 100), (50, 50))
@@ -242,6 +296,36 @@ class TestDistOptParamLayout:
             start, end, _ = layout.param_index_map[param]
             assert start % 64 == 0, f"Start {start} should be 64-aligned"
             assert end - start == param.numel()
+
+    def test_shared_storage_group_is_gapless_and_keeps_param_indices_aligned(self):
+        dense_before, dense_after = _make_params((5,), (6,))
+        experts = _make_shared_params(3, 64)
+        params = [dense_before, *experts, dense_after]
+        ddp_config = self._make_ddp_config()
+
+        layout = DistributedOptimizer._compute_per_buffer_param_layout(
+            params,
+            bucket_size=10,
+            data_parallel_world_size=2,
+            ddp_config=ddp_config,
+            param_indices=list(range(len(params))),
+        )
+
+        starts = [layout.param_index_map[param][0] for param in experts]
+        assert starts == [64, 128, 192]
+        assert len({layout.param_index_map[param][2] for param in experts}) == 1
+        assert layout.param_indices == list(range(len(params)))
+
+    def test_shared_storage_group_does_not_override_param_alignment(self):
+        experts = _make_shared_params(3, 7)
+        ddp_config = self._make_ddp_config()
+
+        layout = DistributedOptimizer._compute_per_buffer_param_layout(
+            experts, bucket_size=None, data_parallel_world_size=2, ddp_config=ddp_config
+        )
+
+        starts = [layout.param_index_map[param][0] for param in experts]
+        assert starts == [0, 64, 128]
 
     def test_bucket_end_dp_divisible(self):
         """Each bucket end should be divisible by lcm(dp_size, 128)."""

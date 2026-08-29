@@ -42,6 +42,75 @@ def pad_bucket_end(
     )
 
 
+def shared_storage_group_key(
+    param: torch.nn.Parameter,
+) -> Optional[Tuple[torch.device, torch.dtype, int]]:
+    """Identify a plain parameter that is a view into a larger shared storage.
+
+    Some modules expose several independently named parameters to training and checkpointing,
+    while deliberately allocating their data as adjacent views of one tensor. The parameter
+    buffer must preserve that structural relationship so consumers can recover a fused view
+    after DDP remaps the parameters.
+
+    This intentionally uses storage identity rather than an attribute set out-of-band by the
+    module. Standalone parameters and non-strided or meta tensors are not grouped.
+    """
+    data = param.data
+    if data.device.type == "meta" or data.layout != torch.strided or not data.is_contiguous():
+        return None
+    storage = data.untyped_storage()
+    if storage.nbytes() <= data.numel() * data.element_size():
+        return None
+    return (data.device, data.dtype, storage.data_ptr())
+
+
+def params_share_gapless_storage(first: torch.nn.Parameter, second: torch.nn.Parameter) -> bool:
+    """Return whether two parameters are consecutive views of one storage."""
+    first_key = shared_storage_group_key(first)
+    return (
+        first_key is not None
+        and first_key == shared_storage_group_key(second)
+        and first.data.storage_offset() + first.numel() == second.data.storage_offset()
+    )
+
+
+def order_params_for_layout(params: List[torch.nn.Parameter]) -> List[torch.nn.Parameter]:
+    """Return reverse-registration order while preserving adjacent shared-storage groups.
+
+    DDP normally packs parameters in reverse registration order. Reversing each member of a
+    shared allocation would destroy its layout, so a gapless run of views into one storage is
+    kept in ascending storage-offset order. The groups themselves remain in normal reverse
+    registration order.
+    """
+    reversed_params = list(params)[::-1]
+    ordered: List[torch.nn.Parameter] = []
+    index = 0
+    while index < len(reversed_params):
+        group_key = shared_storage_group_key(reversed_params[index])
+        if group_key is None:
+            ordered.append(reversed_params[index])
+            index += 1
+            continue
+
+        run_end = index + 1
+        while (
+            run_end < len(reversed_params)
+            and shared_storage_group_key(reversed_params[run_end]) == group_key
+        ):
+            run_end += 1
+
+        run = reversed_params[index:run_end]
+        ascending = sorted(run, key=lambda param: param.data.storage_offset())
+        is_gapless_group = len(ascending) > 1 and all(
+            params_share_gapless_storage(first, second)
+            for first, second in zip(ascending, ascending[1:])
+        )
+
+        ordered.extend(ascending if is_gapless_group else run)
+        index = run_end
+    return ordered
+
+
 @dataclass(frozen=True)
 class BufferKey:
     """Identifies a distinct parameter buffer.

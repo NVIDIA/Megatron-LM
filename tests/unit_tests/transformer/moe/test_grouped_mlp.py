@@ -16,7 +16,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.transformer.module import Float16Module
-from megatron.core.transformer.moe.experts import TEGroupedMLP
+from megatron.core.transformer.moe.experts import InferenceGroupedMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -42,6 +42,58 @@ def test_op_fuser_transformer_config_args_are_exposed():
     assert args.use_transformer_engine_op_fuser is True
     assert args.moe_mlp_glu_interleave_size == 16
     assert args.moe_use_grouped_tensor is True
+
+
+def _make_inference_grouped_mlp_stub(num_local_experts=3):
+    module = InferenceGroupedMLP.__new__(InferenceGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.num_local_experts = num_local_experts
+    for linear_name in ("linear_fc1", "linear_fc2"):
+        linear = torch.nn.Module()
+        for expert_idx in range(num_local_experts):
+            linear.register_parameter(
+                f"weight{expert_idx}", torch.nn.Parameter(torch.full((2, 4), float(expert_idx + 1)))
+            )
+        setattr(module, linear_name, linear)
+    return module
+
+
+def test_inference_grouped_mlp_fuses_storage_without_changing_parameter_schema():
+    module = _make_inference_grouped_mlp_stub()
+
+    module._fuse_expert_weight_storage()
+
+    for linear in (module.linear_fc1, module.linear_fc2):
+        params = [getattr(linear, f"weight{i}") for i in range(module.num_local_experts)]
+        assert list(linear.state_dict()) == [f"weight{i}" for i in range(module.num_local_experts)]
+        assert len({param.untyped_storage().data_ptr() for param in params}) == 1
+        for expert_idx, param in enumerate(params):
+            assert param.storage_offset() == expert_idx * param.numel()
+            torch.testing.assert_close(param, torch.full_like(param, float(expert_idx + 1)))
+
+
+def test_inference_grouped_mlp_serving_view_aliases_fused_parameters():
+    module = _make_inference_grouped_mlp_stub()
+    module._fuse_expert_weight_storage()
+
+    module._build_concatenated_weights()
+
+    assert module._fc1_weight.shape == (module.num_local_experts, 2, 4)
+    assert module._fc1_weight.data_ptr() == module.linear_fc1.weight0.data_ptr()
+    with torch.no_grad():
+        module.linear_fc1.weight1.add_(5)
+    torch.testing.assert_close(module._fc1_weight[1], module.linear_fc1.weight1)
+
+
+def test_inference_grouped_mlp_rejects_layout_lost_after_ddp():
+    module = _make_inference_grouped_mlp_stub()
+    for linear in (module.linear_fc1, module.linear_fc2):
+        for expert_idx in range(module.num_local_experts):
+            param = getattr(linear, f"weight{expert_idx}")
+            param.main_grad = torch.empty_like(param)
+
+    with pytest.raises(RuntimeError, match="lost their shared layout during DDP"):
+        module._build_concatenated_weights()
 
 
 def test_op_fuser_enables_grouped_tensor():

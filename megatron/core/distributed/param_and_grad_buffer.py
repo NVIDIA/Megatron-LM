@@ -1002,8 +1002,9 @@ def _compute_default_per_buffer_param_layout(
 ) -> 'PerBufferParamLayout':
     """Compute parameter layout for the non-distributed-optimizer case.
 
-    No padding is applied. Parameters are iterated in reverse order (backprop order)
-    and grouped into buckets of approximately `bucket_size` elements.
+    No padding is applied. Parameters are iterated in reverse order (backprop order), except
+    gapless shared-storage groups retain their storage order, and are grouped into buckets of
+    approximately `bucket_size` elements.
 
     Args:
         params: List of parameters to lay out.
@@ -1012,7 +1013,11 @@ def _compute_default_per_buffer_param_layout(
     Returns:
         PerBufferParamLayout with the computed mapping.
     """
-    from ..optimizer.param_layout import PerBufferParamLayout
+    from ..optimizer.param_layout import (
+        PerBufferParamLayout,
+        order_params_for_layout,
+        params_share_gapless_storage,
+    )
 
     param_index_map = {}
     bucket_indices = []
@@ -1023,13 +1028,21 @@ def _compute_default_per_buffer_param_layout(
     bucket_params = set()
     bucket_id = 0
 
-    for param in params[::-1]:
+    ordered_params = order_params_for_layout(params)
+    for position, param in enumerate(ordered_params):
+        grouped_with_next = position + 1 < len(ordered_params) and params_share_gapless_storage(
+            param, ordered_params[position + 1]
+        )
         this_numel = param.data.nelement()
         param_end_index = param_start_index + this_numel
         param_index_map[param] = (param_start_index, param_end_index, bucket_id)
         bucket_params.add(param)
 
-        if bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size:
+        if (
+            not grouped_with_next
+            and bucket_size is not None
+            and (param_end_index - bucket_start_index) >= bucket_size
+        ):
             per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
             bucket_indices.append((bucket_start_index, param_end_index))
             bucket_start_index = param_end_index

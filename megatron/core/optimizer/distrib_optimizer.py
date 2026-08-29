@@ -70,7 +70,14 @@ from .optimizer import (
     param_group_identifier_keys,
 )
 from .optimizer_config import OptimizerConfig
-from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
+from .param_layout import (
+    FullParamLayout,
+    PerBufferParamLayout,
+    order_params_for_layout,
+    pad_bucket_end,
+    pad_param_start,
+    params_share_gapless_storage,
+)
 
 logger = getLogger(__name__)
 
@@ -521,9 +528,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     ) -> 'PerBufferParamLayout':
         """Compute how parameters should be laid out in the contiguous buffer.
 
-        Iterates params in reverse order (backprop order), applies 64-byte param
-        alignment, bucket-end padding for DP divisibility, and shared-embedding
-        bucket splitting.
+        Iterates params in reverse order (backprop order), except gapless shared-storage groups
+        retain their storage order. Applies 64-element parameter alignment, bucket-end padding
+        for DP divisibility, and shared-embedding bucket splitting.
 
         Args:
             params: List of parameters to lay out.
@@ -558,8 +565,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             bucket_indices.append((bucket_start_index, bucket_end_index))
             return bucket_end_index, bucket_id + 1
 
-        for param in params[::-1]:
-            param_start_index = pad_param_start(param_start_index)
+        ordered_params = order_params_for_layout(params)
+        for position, param in enumerate(ordered_params):
+            grouped_with_previous = (
+                position > 0
+                and params_share_gapless_storage(ordered_params[position - 1], param)
+                and ordered_params[position - 1].numel() % 64 == 0
+            )
+            grouped_with_next = (
+                position + 1 < len(ordered_params)
+                and params_share_gapless_storage(param, ordered_params[position + 1])
+                and param.numel() % 64 == 0
+            )
+            if not grouped_with_previous:
+                param_start_index = pad_param_start(param_start_index)
 
             # Split shared embedding params into separate bucket.
             if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
@@ -574,9 +593,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             param_index_map[param] = (param_start_index, param_end_index, bucket_id)
             bucket_params.add(param)
 
-            if (
-                bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
-            ) or _does_param_require_new_bucket(param):
+            if not grouped_with_next and (
+                (bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size)
+                or _does_param_require_new_bucket(param)
+            ):
                 bucket_start_index, bucket_id = _finalize_bucket(
                     param_end_index, bucket_start_index, bucket_id
                 )

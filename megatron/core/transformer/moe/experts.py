@@ -1160,6 +1160,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
             name=name,
         )
 
+        # The serving kernels consume one [expert, out, in] tensor, while TE and checkpointing
+        # expose one named parameter per expert. Give those parameters shared, gapless storage
+        # before checkpoint loading or DDP construction. DDP recognizes that structural layout
+        # and preserves it when remapping the parameters into its own buffer.
+        self._fuse_expert_weight_storage()
+
         # Concatenated weights are built lazily on first forward to ensure
         # checkpoint loading has already populated the per-expert parameters.
         self._concatenated_weights_built = False
@@ -1171,6 +1177,33 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
+
+    @torch.no_grad()
+    def _fuse_expert_weight_storage(self) -> None:
+        """Make each linear's per-expert parameters views of one allocation.
+
+        Parameter objects and names remain unchanged, so TE bookkeeping and the legacy
+        ``weight0..weightN`` checkpoint schema are preserved. Only their initial storage is
+        replaced, before any distributed wrapper can own it.
+        """
+        for linear in (self.linear_fc1, self.linear_fc2):
+            params = [
+                getattr(linear, f'weight{expert_idx}', None)
+                for expert_idx in range(self.num_local_experts)
+            ]
+            if not all(isinstance(param, torch.nn.Parameter) for param in params):
+                raise RuntimeError("InferenceGroupedMLP requires one Parameter per local expert.")
+
+            first = params[0]
+            if any(param.shape != first.shape or param.dtype != first.dtype for param in params):
+                raise RuntimeError("Grouped expert weights must have matching shapes and dtypes.")
+
+            fused = torch.empty(
+                (self.num_local_experts, *first.shape), device=first.device, dtype=first.dtype
+            )
+            for expert_idx, param in enumerate(params):
+                fused[expert_idx].copy_(param.data)
+                param.data = fused[expert_idx]
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1304,19 +1337,35 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
-        """Create big contiguous weight tensors that share storage with TE's per-expert parameters.
+        """Expose fused serving views over the expert parameters' shared storage.
 
-        Creates _fc1_weight and _fc2_weight as contiguous tensors of shape
-        [num_experts, out_features, in_features]. Instead of replacing TE's parameters
-        (which breaks TE's internal bookkeeping), we redirect each parameter's .data
-        to be a view into the contiguous buffer. The nn.Parameter objects themselves
-        remain untouched in TE's module, preserving FP8 scaling state, etc.
-
-        This allows:
-        - TE's forward to work correctly (same Parameter objects, same internal state)
-        - Training updates to flow through (param.data is a view into the big tensor)
-        - torch.nn.functional.grouped_mm / FlashInfer to use the big tensor directly
+        The normal path is zero-copy both before and after DDP construction. A copied fallback
+        remains for dedicated, non-DDP inference models with nonstandard parameter storage.
+        Falling back after DDP would detach serving from optimizer-owned storage, so it fails
+        closed instead.
         """
+        fc1_view = self._stacked_view_over_group(self.linear_fc1)
+        fc2_view = self._stacked_view_over_group(self.linear_fc2)
+        if (fc1_view is None) != (fc2_view is None):
+            raise RuntimeError(
+                "InferenceGroupedMLP requires FC1 and FC2 to use the same storage layout."
+            )
+        if fc1_view is not None:
+            self.register_buffer('_fc1_weight', fc1_view, persistent=False)
+            self.register_buffer('_fc2_weight', fc2_view, persistent=False)
+            return
+
+        discrete_params = [
+            getattr(linear, f'weight{i}')
+            for linear in (self.linear_fc1, self.linear_fc2)
+            for i in range(self.num_local_experts)
+        ]
+        if any(getattr(param, 'main_grad', None) is not None for param in discrete_params):
+            raise RuntimeError(
+                "InferenceGroupedMLP expert weights lost their shared layout during DDP "
+                "construction; refusing to create detached serving storage."
+            )
+
         # Get device/dtype from existing TE weights
         device = self.linear_fc1.weight0.device
         dtype = self.linear_fc1.weight0.dtype
@@ -1345,6 +1394,32 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # Register big tensors as non-persistent buffers (for .to() device movement, not saved)
         self.register_buffer('_fc1_weight', _fc1_weight, persistent=False)
         self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
+
+    def _stacked_view_over_group(self, linear: torch.nn.Module) -> Optional[torch.Tensor]:
+        """Return a contiguous expert-axis view when all named weights share storage."""
+        params = [getattr(linear, f'weight{i}', None) for i in range(self.num_local_experts)]
+        if not all(isinstance(param, torch.nn.Parameter) for param in params):
+            return None
+
+        first = params[0].data
+        storage = first.untyped_storage()
+        member_numel = first.numel()
+        base_offset = first.storage_offset()
+        for expert_idx, param in enumerate(params):
+            data = param.data
+            if (
+                data.dtype != first.dtype
+                or data.device != first.device
+                or data.shape != first.shape
+                or not data.is_contiguous()
+                or data.untyped_storage().data_ptr() != storage.data_ptr()
+                or data.storage_offset() != base_offset + expert_idx * member_numel
+            ):
+                return None
+
+        return torch.empty(0, dtype=first.dtype, device=first.device).set_(
+            storage, base_offset, (self.num_local_experts, *first.shape)
+        )
 
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
