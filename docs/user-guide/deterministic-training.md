@@ -30,6 +30,9 @@ Each variable may be set by the launcher or left unset. If set, the value must b
 | `NCCL_ALGO` | subset of `{Ring, CollnetDirect, CollnetChain, ^NVLS}` | `Ring` | Conservative default — `Ring`'s reduction order is fixed by topology, so it is bit-exact across runs on every supported NCCL version |
 | `NVTE_ALLOW_NONDETERMINISTIC_ALGO` | `0` | `0` | Forces Transformer Engine to use deterministic algorithms |
 | `CUBLAS_WORKSPACE_CONFIG` | `:4096:8` or `:16:8` | `:4096:8` | Deterministic cuBLAS workspace (both sizes are reproducible per NVIDIA docs; `:4096:8` is faster, `:16:8` uses less memory) |
+| `TRITON_CACHE_AUTOTUNING` | `0` or `1` | *(none — opt-in)* | Persists each Triton autotune winner so every rank reuses one choice instead of re-timing it. Left unset, deterministic mode instead pins the cheapest config, which needs no cache — see [Triton autotuning](#triton-autotuning) |
+| `TRITON_CACHE_DIR` | any shared-filesystem path | *(none — required only with `TRITON_CACHE_AUTOTUNING=1`)* | No safe default exists: unset, Triton uses a node-local directory and each node autotunes on its own. Required rather than filled in |
+| `TRITON_PRINT_AUTOTUNING` | `1` | *(none — recommended, not set)* | Logs the config each rank selected. Changes no numerics, so it is recommended rather than forced; when `TRITON_CACHE_AUTOTUNING=1` and this is unset, a startup line reminds you. See [Verifying kernel-config agreement](#verifying-kernel-config-agreement) |
 | `MAMBA_DETERMINISTIC` | any string starting with `'1'` | *(none — SSM auto-detects)* | Mamba SSM auto-follows `torch.are_deterministic_algorithms_enabled()` when unset; only an explicit non-deterministic override is rejected |
 | `CAUSAL_CONV1D_DETERMINISTIC` | any string starting with `'1'` | *(none — the kernel auto-detects)* | causal_conv1d ≥ 1.6.0 auto-follows `torch.are_deterministic_algorithms_enabled()` when unset, reducing the conv weight/bias gradients through a workspace instead of `atomicAdd`; the Mamba and GDP mixers reject a deterministic run without it |
 
@@ -46,6 +49,23 @@ Checked against the parsed `args` Namespace in `apply_determinism_to_args`. Inco
 | `torch.use_deterministic_algorithms` | Set to `True` |
 
 Flash attention is permitted: Transformer Engine's flash-attention backend is deterministic when `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` (see the [Transformer Engine docs](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html)).
+
+## Triton autotuning
+
+Triton picks a kernel config by timing its candidates, so the winner depends on the machine at that instant and ranks can disagree. Deterministic mode offers two ways to remove that variance:
+
+| Strategy | How to select it | Determinism rests on |
+|---|---|---|
+| **Pinned config** (default) | leave `TRITON_CACHE_AUTOTUNING` unset | Nothing external. `autotune_configs` picks the cheapest config by a pure function of the candidate list, so every rank computes the same answer without timing anything. Slower, since the pinned config is not necessarily the fastest one. |
+| **Cached autotuning** | `TRITON_CACHE_AUTOTUNING=1` **and** `TRITON_CACHE_DIR=<shared path>` | Every rank reading one warm cache. Autotuning still runs and still picks fast configs, but a rank that misses the cache re-times the selection on its own and can pick differently. |
+
+Cached autotuning is opt-in because its determinism is conditional: the pinned default holds by construction, the cached path holds only while the shared cache does. Setting `TRITON_CACHE_AUTOTUNING=1` without `TRITON_CACHE_DIR` is rejected — unset, Triton falls back to a node-local directory, which is exactly the case the cache is meant to prevent.
+
+## Verifying kernel-config agreement
+
+Applies to cached autotuning; the pinned default has nothing to compare. `TRITON_PRINT_AUTOTUNING=1` makes each rank log the config it selects per kernel; group those lines by kernel and key across the per-rank logs, and every group should hold exactly one distinct config.
+
+Note the limit: a rank only logs when it *tunes*, so a run where some ranks hit the cache and others miss cannot be compared this way — the hitting ranks log nothing.
 
 ## Verifying determinism
 
