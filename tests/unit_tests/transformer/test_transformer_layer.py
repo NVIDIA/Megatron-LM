@@ -118,7 +118,7 @@ class TestParallelTransformerLayer:
         output, context = parallel_transformer_layer(
             hidden_states=hidden_states, attention_mask=attention_mask
         )
-        assert not parallel_transformer_layer.supports_split_output_projection()
+        assert not parallel_transformer_layer.supports_two_stage_attention()
         assert context is None
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size

@@ -76,12 +76,6 @@ class TestMambaMixer:
         hidden_states = torch.ones((sequence_length, micro_batch_size, mixer.config.hidden_size))
         hidden_states = hidden_states.cuda()
         output, bias = mixer(hidden_states)
-        assert mixer.supports_split_output_projection()
-        split_output, split_bias = mixer.forward_output_proj(
-            mixer.forward_pre_output_proj(hidden_states)
-        )
-        torch.testing.assert_close(split_output, output)
-        assert split_bias is bias
         assert mixer.config.mamba_num_heads == None
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size

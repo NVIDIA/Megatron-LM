@@ -290,14 +290,8 @@ class TestGDPPackedSequence:
 
         with torch.no_grad():
             ref_out = mixer_cp1(hidden_full, packed_seq_params=psp)
-            split_ref_out = mixer_cp1.forward_output_proj(
-                mixer_cp1.forward_pre_output_proj(hidden_full, packed_seq_params=psp)
-            )
         ref_out = ref_out[0] if isinstance(ref_out, tuple) else ref_out
-        split_ref_out = split_ref_out[0] if isinstance(split_ref_out, tuple) else split_ref_out
-        assert mixer_cp1.supports_split_output_projection()
         assert ref_out.shape == hidden_full.shape
-        torch.testing.assert_close(split_ref_out, ref_out, atol=5e-2, rtol=5e-2)
 
         idx = tex.thd_get_partitioned_indices(
             psp.cu_seqlens_q, total_tokens, cp_group.size(), cp_rank

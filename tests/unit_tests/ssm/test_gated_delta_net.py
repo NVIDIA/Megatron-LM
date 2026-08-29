@@ -46,12 +46,6 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
         attention_mask = None
 
         output, bias = gdn(hidden_states, attention_mask)
-        assert gdn.supports_split_output_projection()
-
-        norm_out = gdn.forward_pre_output_proj(hidden_states, attention_mask)
-        split_output, split_bias = gdn.forward_output_proj(norm_out)
-        torch.testing.assert_close(split_output, output)
-        assert split_bias is bias is None
 
         assert output.dim() == 3, f"Output too many dimensions ({output.shape=})"
         assert output.shape[0] == seq_length // self.sp_size // self.cp_size, (

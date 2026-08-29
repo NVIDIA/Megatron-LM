@@ -31,7 +31,7 @@ from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule, SplitOutputProjection
+from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -91,7 +91,7 @@ class GatedDeltaRuleInterface(Protocol):
     ) -> tuple[torch.Tensor, torch.Tensor | None]: ...
 
 
-class _GDNBase(MegatronModule, SplitOutputProjection):
+class _GDNBase(MegatronModule, TwoStageAttentionLayer):
     """Common base class for the Gated Delta Net (GDN) family of layers.
 
     Hosts everything the GDN variants share: the fused input projection, causal
@@ -287,11 +287,11 @@ class _GDNBase(MegatronModule, SplitOutputProjection):
         )
         self.reset_parameters()
 
-    def supports_split_output_projection(self) -> bool:
+    def supports_two_stage_attention(self) -> bool:
         """Output-norm recomputation requires the original atomic forward path."""
         return not self.recompute_norm_out
 
-    def forward_output_proj(
+    def forward_post_core_attn(
         self, norm_out: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Apply a GDN variant's output projection to its normalized recurrence output."""
@@ -358,7 +358,7 @@ class _GDNBase(MegatronModule, SplitOutputProjection):
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run a GDN variant's recurrence followed by its output projection."""
-        norm_out = self.forward_pre_output_proj(
+        norm_out = self.forward_pre_attn_and_core_attn(
             hidden_states,
             attention_mask,
             inference_context=inference_context,
@@ -367,7 +367,7 @@ class _GDNBase(MegatronModule, SplitOutputProjection):
             inference_params=inference_params,
             **kwargs,
         )
-        return self.forward_output_proj(norm_out)
+        return self.forward_post_core_attn(norm_out)
 
     def _gated_norm_and_a2a(
         self,

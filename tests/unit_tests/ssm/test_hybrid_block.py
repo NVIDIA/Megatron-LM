@@ -427,6 +427,38 @@ def test_hybrid_stack_rejects_same_named_config_type():
             post_process=False,
             pg_collection=_make_pg_collection(),
         )
+TWO_STAGE_ATTENTION_CASES = [
+    pytest.param(Symbols.MAMBA, hybrid_stack_spec, {}, id="mamba"),
+    pytest.param(
+        Symbols.GDN,
+        hybrid_stack_spec,
+        {
+            "bf16": True,
+            "params_dtype": torch.bfloat16,
+            "activation_func": torch.nn.functional.silu,
+        },
+        marks=pytest.mark.skipif(not HAVE_GDN, reason="FLA is not installed"),
+        id="gdn",
+    ),
+    pytest.param(Symbols.ATTENTION, hybrid_stack_spec, {}, id="attention"),
+    pytest.param(
+        Symbols.MAMBA,
+        gated_delta_product_stack_spec,
+        {
+            "bf16": True,
+            "params_dtype": torch.bfloat16,
+            "mamba_num_heads": 4,
+            "mamba_head_dim": 64,
+            "mamba_num_groups": 4,
+            "mamba_state_dim": 16,
+        },
+        marks=pytest.mark.skipif(
+            not (HAVE_GDP and HAVE_GDP_MAMBA),
+            reason="GDP dependencies are not installed",
+        ),
+        id="gdp",
+    ),
+]
 
 
 @pytest.mark.internal
@@ -655,37 +687,56 @@ class TestHybridBlock:
 
     @pytest.mark.parametrize(
         ("compute_symbol", "stack_spec", "compute_config"),
-        [
-            pytest.param(Symbols.MAMBA, hybrid_stack_spec, {}, id="mamba"),
-            pytest.param(
-                Symbols.GDN,
-                hybrid_stack_spec,
-                {
-                    "bf16": True,
-                    "params_dtype": torch.bfloat16,
-                    "activation_func": torch.nn.functional.silu,
-                },
-                marks=pytest.mark.skipif(not HAVE_GDN, reason="FLA is not installed"),
-                id="gdn",
-            ),
-            pytest.param(Symbols.ATTENTION, hybrid_stack_spec, {}, id="attention"),
-            pytest.param(
-                Symbols.MAMBA,
-                gated_delta_product_stack_spec,
-                {
-                    "bf16": True,
-                    "params_dtype": torch.bfloat16,
-                    "mamba_num_heads": 4,
-                    "mamba_head_dim": 64,
-                    "mamba_num_groups": 4,
-                    "mamba_state_dim": 16,
-                },
-                marks=pytest.mark.skipif(
-                    not (HAVE_GDP and HAVE_GDP_MAMBA), reason="GDP dependencies are not installed"
-                ),
-                id="gdp",
-            ),
-        ],
+        TWO_STAGE_ATTENTION_CASES,
+    )
+    def test_two_stage_attention_matches_atomic_forward_bitwise(
+        self, compute_symbol, stack_spec, compute_config
+    ):
+        block = self.get_hybrid_block(
+            compute_symbol,
+            stack_spec=stack_spec,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            **compute_config,
+        ).cuda()
+        layer = block.layers[0]
+        layer.train()
+        assert layer.supports_two_stage_attention()
+
+        hidden_states = torch.randn(16, 2, block.config.hidden_size, device="cuda")
+        attention_mask = None
+        if compute_symbol == Symbols.ATTENTION:
+            attention_mask = torch.triu(
+                torch.ones(1, 1, 16, 16, dtype=torch.bool, device="cuda"), diagonal=1
+            )
+
+        with torch.no_grad():
+            model_parallel_cuda_manual_seed(123)
+            atomic_output = layer(hidden_states, attention_mask=attention_mask)
+
+            model_parallel_cuda_manual_seed(123)
+            stage_one_state = layer.forward_pre_attn_and_core_attn(
+                hidden_states, attention_mask=attention_mask
+            )
+            two_stage_output = layer.forward_post_core_attn(*stage_one_state)
+
+        def assert_bitwise_equal(actual, expected):
+            assert type(actual) is type(expected)
+            if isinstance(actual, tuple):
+                assert len(actual) == len(expected)
+                for actual_item, expected_item in zip(actual, expected):
+                    assert_bitwise_equal(actual_item, expected_item)
+            elif actual is None:
+                assert expected is None
+            else:
+                assert torch.equal(actual, expected)
+
+        assert_bitwise_equal(two_stage_output, atomic_output)
+
+    @pytest.mark.parametrize(
+        ("compute_symbol", "stack_spec", "compute_config"),
+        TWO_STAGE_ATTENTION_CASES,
     )
     @pytest.mark.parametrize("parallel", [False, True], ids=["serial", "overlap"])
     def test_shortcut_pair_eager_forward_backward(
@@ -712,7 +763,6 @@ class TestHybridBlock:
         shortcut = block.layers[0]
         assert isinstance(shortcut, ShortcutMoEBlock)
         assert shortcut.overlap_mode is parallel
-        assert shortcut.compute_layer.supports_split_output_projection()
         assert isinstance(shortcut.moe_layer, TransformerLayer)
         state_keys = set(block.state_dict())
         assert any(key.startswith("layers.0.compute_layer.") for key in state_keys)
@@ -732,7 +782,6 @@ class TestHybridBlock:
                 torch.ones(1, 1, 16, 16, dtype=torch.bool, device=hidden_states.device), diagonal=1
             )
             compute_layer = shortcut.compute_layer
-            assert compute_layer.supports_split_output_projection()
 
             def fail_if_mlp_runs(*args, **kwargs):
                 pytest.fail("attention shortcut output projection must not execute an MLP")

@@ -35,7 +35,7 @@ from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.module import MegatronModule, SplitOutputProjection
+from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -164,7 +164,7 @@ class GatedDeltaProductMixerSubmodules:
     chunkwise_cp_backend: Union[ModuleSpec, type] = FLAGatedDeltaProductCPBackend
 
 
-class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, SplitOutputProjection):
+class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLayer):
     """Gated Delta Product (GDP) sequence mixer for hybrid models.
 
     The mixer accepts hidden states with shape ``[sequence, batch, hidden]`` and returns
@@ -496,7 +496,15 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, SplitOutp
             self.nheads_local_cp = self.nheads_local_tp
             self.ngroups_local_cp = self.ngroups_local_tp
 
-    def forward_pre_output_proj(
+    def forward_pre_attn_and_core_attn(self, hidden_states, *, packed_seq_params=None):
+        """Run the training pre-attention and core-attention stage."""
+        return self._gdp_chunk(hidden_states, packed_seq_params=packed_seq_params)
+
+    def forward_post_core_attn(self, y):
+        """Apply GDP's output projection to a recurrence output."""
+        return self.out_proj(y)
+
+    def forward(
         self,
         hidden_states,
         inference_context=None,
@@ -505,7 +513,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, SplitOutp
         packed_seq_params=None,
         packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
     ):
-        """Run GDP through its normalized recurrence output, before output projection."""
+        """Run GDP's recurrence followed by its output projection."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if self.chunkwise_context_parallel and inference_context is not None:
@@ -553,19 +561,14 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, SplitOutp
                 # The states are updated in place.
                 return self._static_decode(hidden_states, conv_state, ssm_state)
 
-        if packed_seq_params is not None:
-            # ``hidden_states`` is [seq_len, batch, dim]; THD requires batch=1.
-            assert batch_size == 1, "Packed sequences require batch=1 (THD/varlen format)."
-
-        y = self._gdp_chunk_forward(
+        y = self._gdp_chunk(
             hidden_states,
             conv_state=conv_state,
             ssm_state=ssm_state,
             packed_seq_params=packed_seq_params,
             packed_sequence_cp_metadata=packed_sequence_cp_metadata,
         )
-
-        return y
+        return self.out_proj(y)
 
     def _packed_metadata(self, packed_seq_params):
         """Return sequence indices and cumulative lengths for packed input."""
@@ -573,7 +576,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, SplitOutp
             return None, None
         return packed_seq_params.seq_idx, get_cu_seqlens(packed_seq_params)
 
-    def _gdp_chunk_forward(
+    def _gdp_chunk(
         self,
         hidden_states,
         conv_state=None,
@@ -589,6 +592,11 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, SplitOutp
         Prefill passes conv_state and ssm_state so the trailing conv window and the final
         recurrent state are cached for the decode steps.
         """
+        if packed_seq_params is not None:
+            # ``hidden_states`` is [seq_len, batch, dim]; THD requires batch=1.
+            _, batch_size, _ = hidden_states.shape
+            assert batch_size == 1, "Packed sequences require batch=1 (THD/varlen format)."
+
         if self.recompute_in_proj:
             # Checkpoint the input projection and its preprocessing, discard the z, VKQ,
             # and ba outputs after the forward pass, and recompute them in the backward
@@ -1021,28 +1029,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, SplitOutp
             y = self.norm(y, z)
         return y
 
-    def forward_output_proj(self, y):
-        """Apply GDP's output projection to a recurrence output."""
-        return self.out_proj(y)
-
-    def forward(
-        self,
-        hidden_states,
-        inference_context=None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
-        packed_seq_params=None,
-    ):
-        """Run GDP's recurrence followed by its output projection."""
-        y = self.forward_pre_output_proj(
-            hidden_states, inference_context=inference_context, packed_seq_params=packed_seq_params
-        )
-        if inference_context is not None and (
-            inference_context.is_dynamic_batching() or inference_context.seqlen_offset > 0
-        ):
-            return y
-        return self.forward_output_proj(y)
-
     # ==================================================================
     # Static / eager inference
     #
@@ -1050,7 +1036,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, SplitOutp
     # deliberately kept separate from the dynamic inference hooks below so that
     # static-batching bookkeeping does not pollute the interface defined by
     # ``SSMDynamicInferenceMixin``. Static-batching prefill instead shares
-    # ``_gdp_chunk_forward`` with training, seeding the conv/SSM state when the
+    # ``_gdp_chunk`` with training, seeding the conv/SSM state when the
     # caches are present. Mirrors ``MambaMixer._static_decode``.
     # ==================================================================
     def _static_decode(

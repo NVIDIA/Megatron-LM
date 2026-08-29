@@ -34,7 +34,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule, SplitOutputProjection
+from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.typed_torch import apply_module, copy_signature, not_none
@@ -285,7 +285,7 @@ class CrossAttentionSubmodules:
     linear_proj: LinearProjBuilder
 
 
-class Attention(MegatronModule, SplitOutputProjection, ABC):
+class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
     """Attention layer abstract class.
 
     This layer only contains common modules required for the "self attn" and
@@ -1302,11 +1302,11 @@ class Attention(MegatronModule, SplitOutputProjection, ABC):
 
         return output_total
 
-    def supports_split_output_projection(self) -> bool:
+    def supports_two_stage_attention(self) -> bool:
         """Specialized attention subclasses retain their atomic forward path."""
         return type(self).forward is Attention.forward
 
-    def forward_pre_output_proj(
+    def forward_pre_attn_and_core_attn(
         self,
         hidden_states: Tensor,
         attention_mask: Tensor,
@@ -1650,7 +1650,7 @@ class Attention(MegatronModule, SplitOutputProjection, ABC):
 
         return core_attn_out
 
-    def forward_output_proj(self, core_attn_out: Tensor) -> tuple[Tensor, Tensor | None]:
+    def forward_post_core_attn(self, core_attn_out: Tensor) -> tuple[Tensor, Tensor | None]:
         """Apply the attention output projection to a core-attention result."""
         nvtx_range_push(suffix="linear_proj")
         attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
@@ -1661,10 +1661,10 @@ class Attention(MegatronModule, SplitOutputProjection, ABC):
 
         return output, bias
 
-    @copy_signature(forward_pre_output_proj)
+    @copy_signature(forward_pre_attn_and_core_attn)
     def forward(self, *args, **kwargs):
         """Run core attention followed by the output projection."""
-        return self.forward_output_proj(self.forward_pre_output_proj(*args, **kwargs))
+        return self.forward_post_core_attn(self.forward_pre_attn_and_core_attn(*args, **kwargs))
 
     @jit_fuser
     def _apply_output_gate(self, x, gate):
