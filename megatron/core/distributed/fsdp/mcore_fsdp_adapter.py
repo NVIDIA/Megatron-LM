@@ -29,13 +29,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
-
-try:
-    from torch.distributed import DeviceMesh
-
-    HAVE_DTENSOR = True
-except ImportError:
-    HAVE_DTENSOR = False
+from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Shard
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
@@ -55,7 +50,6 @@ try:
         MixedPrecisionPolicy,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-        Flat,
         Placements,
         fully_shard,
         fully_shard_context,
@@ -349,12 +343,6 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         """
         Initialize the distributed index for the module.
         """
-        if not HAVE_DTENSOR:
-            raise ImportError(
-                "This module requires PyTorch with DTensor support. "
-                "Please install a compatible version of PyTorch."
-            )
-
         enable_hsdp = self.ddp_config.num_distributed_optimizer_instances > 1
         if pg_collection is None:
             tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -572,7 +560,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("expert_dp",)
             )
         placements = Placements(
-            dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()]
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
         )
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
@@ -635,6 +623,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not support disabling bucketing.")
         if not hasattr(pg_collection, 'dp_cp'):
             raise ValueError("MFSDP v2 requires an explicit dp_cp process group.")
+
+        if config.mtp_detach_heads:
+            # Detached MTP heads are tagged into a separate gradient-norm group, which
+            # the shared helpers reduce with get_grad_norm_fp32. That path derives a
+            # data-parallel group from the gradients' DTensor mesh and reduces over it
+            # in addition to the grad-stats group, double-counting for MFSDP v2 whose
+            # mesh already is the grad-stats group. Reject it rather than report a
+            # silently inflated norm.
+            raise ValueError("MFSDP v2 does not currently support mtp_detach_heads.")
 
         unsupported_parallelisms = [
             "tensor_model_parallel_size",
