@@ -714,8 +714,6 @@ class TEGroupedMLP(MegatronModule):
                 f"got {hidden_states.dtype}."
             )
 
-        # NCCL EP bootstraps on the TP×EP group. TE MoeDispatch compares EpConfig.ep_group
-        # by object identity to that group, so do not use pg_collection.ep even when TP=1.
         ep_group = te.pytorch.ep.get_ep_group()
         if ep_group is None:
             raise RuntimeError(

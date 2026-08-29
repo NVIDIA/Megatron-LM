@@ -118,6 +118,13 @@ def test_fused_moe_config_enables_grouped_tensor():
     assert config.moe_use_grouped_tensor
 
 
+def test_fused_moe_mxfp8_enables_mxfp8_wire_dtypes():
+    config = _fused_moe_config(fp8="e4m3", fp8_recipe="mxfp8")
+
+    assert config.moe_dispatch_fwd_dtype == 'mxfp8'
+    assert config.moe_combine_bwd_dtype == 'mxfp8'
+
+
 @pytest.mark.parametrize(
     "override,error",
     [

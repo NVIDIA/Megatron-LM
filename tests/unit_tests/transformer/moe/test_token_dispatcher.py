@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import dataclasses
+import os
 
 import pytest
 import torch
@@ -800,6 +801,17 @@ class TestFlexDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 4)])
     def test_fused_moe_sequential(self, tp_size, ep_size):
+        previous_single_param = os.environ.get("NVTE_GROUPED_LINEAR_SINGLE_PARAM")
+        os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = "1"
+        try:
+            self._run_fused_moe_sequential(tp_size, ep_size)
+        finally:
+            if previous_single_param is None:
+                os.environ.pop("NVTE_GROUPED_LINEAR_SINGLE_PARAM", None)
+            else:
+                os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = previous_single_param
+
+    def _run_fused_moe_sequential(self, tp_size, ep_size):
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,

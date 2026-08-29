@@ -1870,6 +1870,11 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_use_transformer_engine_fused_moe supports only the MXFP8 FP8 recipe."
                 )
+            if self.fp8:
+                # TE MoeDispatch/MoeCombine take MXFP8 comms from the autocast quantizer
+                # role and require matching EpBuffer recipes.
+                self.moe_dispatch_fwd_dtype = 'mxfp8'
+                self.moe_combine_bwd_dtype = 'mxfp8'
             incompatible = {
                 "overlap_moe_expert_parallel_comm": self.overlap_moe_expert_parallel_comm,
                 "moe_shared_expert_overlap": self.moe_shared_expert_overlap,
