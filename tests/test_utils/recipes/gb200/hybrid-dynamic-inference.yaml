@@ -7,15 +7,15 @@ spec:
   model: hybrid
   build: mcore-pyt-{environment}
   nodes: 1
-  gpus: 1
+  gpus: 4
   n_repeat: 1
-  platforms: dgx_a100
+  platforms: dgx_gb200
   script_setup: |
     set -euo pipefail
     unset https_proxy
     umask 077
-    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
-    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> /root/.netrc
+    trap 'rm -f /root/.netrc; unset RO_API_TOKEN' EXIT
 
     # Checkout latest
     cd /opt
@@ -35,14 +35,15 @@ spec:
     git checkout $MCORE_BACKWARDS_COMMIT
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
-    rm -f "$HOME/.netrc"
+    rm -f /root/.netrc
     unset RO_API_TOKEN
   script: |-
-    rm -f "${{HOME}}/.netrc"
+    rm -f /root/.netrc
     unset RO_API_TOKEN
     set -euo pipefail
     ls
     cd /opt/megatron-lm
+    export GPUS_PER_NODE={gpus}
 
     ARGUMENTS=(
         "CHECKPOINT_LOAD_PATH=/mnt/artifacts"
@@ -63,28 +64,8 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [hybrid_dynamic_inference_tp1_pp1_dp8_583m]
+  - test_case: [hybrid_gdp_dynamic_inference_tp1_pp1_dp4_800m]
     products:
       - environment: [dev]
         scope: [mr, mr-github]
-        platforms: [dgx_h100]
-  - test_case: [hybrid_dynamic_inference_tp1_pp1_dp8_583m_chunked_prefill]
-    products:
-      - environment: [dev]
-        scope: [mr, mr-github]
-        platforms: [dgx_h100]
-  - test_case: [hybrid_dynamic_inference_tp1_pp1_dp8_583m_flashinfer]
-    products:
-      - environment: [dev]
-        scope: [mr, mr-github]
-        platforms: [dgx_h100]
-  - test_case: [hybrid_dynamic_inference_tp1_pp1_dp8_583m_mamba_bf16_states]
-    products:
-      - environment: [dev]
-        scope: [mr, mr-github]
-        platforms: [dgx_h100]
-  - test_case: [hybrid_gdp_dynamic_inference_tp1_pp1_dp8_800m]
-    products:
-      - environment: [dev]
-        scope: [mr, mr-github]
-        platforms: [dgx_h100]
+        platforms: [dgx_gb200]
