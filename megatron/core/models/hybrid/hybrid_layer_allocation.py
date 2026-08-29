@@ -509,8 +509,8 @@ def get_layer_maps_from_layer_config_list(
 ) -> dict[str, dict[int, int]]:
     """Return per-type layer maps for a list of layer configs.
 
-    Config subclasses are normalized to their canonical layer symbol before delegating
-    to ``get_layer_maps_from_layer_type_list`` so both APIs share one indexing implementation.
+    Configs are projected to their canonical layer symbols before delegating to
+    ``get_layer_maps_from_layer_type_list`` so both APIs share one indexing implementation.
 
     Args:
         layer_config_list: Per-layer configs in global layer order.

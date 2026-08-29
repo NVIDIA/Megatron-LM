@@ -110,7 +110,11 @@ class MambaInferenceStateConfig:
                     "the recurrent-state cache and prefill metadata use one shared shape "
                     "and chunk size."
                 )
-            if has_gdn and model.config.experimental_attention_variant == "gdn2":
+            if any(
+                type(layer_config) is GDNLayerConfig
+                and layer_config.experimental_attention_variant == "gdn2"
+                for layer_config in layer_config_list
+            ):
                 raise NotImplementedError("GDN2 does not support dynamic inference.")
 
             if not (has_mamba or has_gdn):

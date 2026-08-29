@@ -83,18 +83,29 @@ class TestInferenceConfig:
             resolve_mxfp8_backend(grouped_gemm_backend)
 
     @staticmethod
-    def _hybrid_model(layer_config_types, experimental_attention_variant="gdn"):
+    def _hybrid_model(
+        layer_config_types,
+        model_experimental_attention_variant="gdn",
+        gdn_layer_experimental_attention_variant="gdn",
+    ):
+        layer_config_list = [
+            object.__new__(layer_config_type) for layer_config_type in layer_config_types
+        ]
+        for layer_config in layer_config_list:
+            if type(layer_config) is GDNLayerConfig:
+                layer_config.experimental_attention_variant = (
+                    gdn_layer_experimental_attention_variant
+                )
         return SimpleNamespace(
             config=SimpleNamespace(
                 params_dtype=torch.bfloat16,
                 batch_invariant_mode=False,
-                experimental_attention_variant=experimental_attention_variant,
+                experimental_attention_variant=model_experimental_attention_variant,
             ),
             decoder=SimpleNamespace(
-                layer_config_list=[
-                    object.__new__(layer_config_type) for layer_config_type in layer_config_types
-                ],
-                layers=[],
+                layer_config_list=layer_config_list,
+                layers=[SimpleNamespace() for _ in layer_config_list],
+                mamba_state_shapes_per_request=lambda: ((4, 8), (8, 32, 16)),
             ),
         )
 
@@ -107,10 +118,24 @@ class TestInferenceConfig:
 
     def test_mamba_inference_state_config_rejects_gdn2(self):
         """GDN2 should fail explicitly instead of missing the GDN inference hooks."""
-        model = self._hybrid_model([GDNLayerConfig], experimental_attention_variant="gdn2")
+        model = self._hybrid_model(
+            [GDNLayerConfig],
+            model_experimental_attention_variant="gdn",
+            gdn_layer_experimental_attention_variant="gdn2",
+        )
 
         with pytest.raises(NotImplementedError, match="GDN2"):
             MambaInferenceStateConfig.from_model(model)
+
+    def test_mamba_inference_state_config_uses_gdn_layer_variant(self):
+        """A stale root GDN2 setting must not override the dispatched layer config."""
+        model = self._hybrid_model(
+            [GDNLayerConfig],
+            model_experimental_attention_variant="gdn2",
+            gdn_layer_experimental_attention_variant="gdn",
+        )
+
+        assert MambaInferenceStateConfig.from_model(model) is not None
 
     def test_mutual_exclusivity_with_transformer_config(self):
         """

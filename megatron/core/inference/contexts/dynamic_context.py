@@ -464,8 +464,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 layer_maps = get_layer_maps_from_layer_type_list(
                     mamba_inference_state_config.layer_type_list
                 )
-            attention_layer_map = layer_maps[Symbols.ATTENTION]
-            dsa_layer_map = layer_maps[Symbols.DS_ATTENTION]
+            attention_symbols = [
+                symbol
+                for symbol in (Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MLA)
+                if layer_maps[symbol]
+            ]
+            if len(attention_symbols) > 1:
+                raise NotImplementedError(
+                    "Dynamic inference does not support mixing Attention, DSA, and MLA layers."
+                )
+            attention_layer_map = layer_maps[attention_symbols[0]] if attention_symbols else {}
             recurrent_global_layer_indices = (
                 layer_maps[Symbols.MAMBA].keys() | layer_maps[Symbols.GDN].keys()
             )
@@ -476,9 +484,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
             }
 
-            self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
+            self.num_attention_layers = len(attention_layer_map)
             self.num_mamba_layers = len(recurrent_layer_map)
-            self.layer_map = attention_layer_map | dsa_layer_map | recurrent_layer_map
+            self.layer_map = attention_layer_map | recurrent_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
             # Use the same per-PP-rank layer count as TransformerBlock (handles

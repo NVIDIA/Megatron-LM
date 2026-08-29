@@ -24,6 +24,7 @@ from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -211,6 +212,45 @@ class TestDynamicContext:
         assert dynamic_context.num_attention_layers == 1
         assert dynamic_context.num_mamba_layers == 1
         assert dynamic_context.layer_map == {0: 0, 1: 0}
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_hybrid_cache_maps_support_mla(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=True,
+            layer_config_list=make_layer_configs(MambaLayerConfig, MLALayerConfig),
+        )
+
+        assert dynamic_context.num_attention_layers == 1
+        assert dynamic_context.num_mamba_layers == 1
+        assert dynamic_context.layer_map == {0: 0, 1: 0}
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_hybrid_cache_maps_reject_mixed_attention_families(self):
+        with pytest.raises(NotImplementedError, match="mixing Attention, DSA, and MLA"):
+            self._get_dynamic_context(
+                params_dtype=torch.float32,
+                num_layers=3,
+                kv_channels=8,
+                num_attention_heads=2,
+                max_sequence_length=512,
+                buffer_size_gb=0.03,
+                block_size_tokens=128,
+                max_tokens=None,
+                is_hybrid_model=True,
+                layer_config_list=make_layer_configs(
+                    MambaLayerConfig, DSALayerConfig, MLALayerConfig
+                ),
+            )
 
     @pytest.mark.internal
     @rounder_override(64)
