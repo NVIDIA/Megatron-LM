@@ -57,6 +57,11 @@ from megatron.core.transformer.moe.replica_weight_cutedsl import (
 from megatron.core.utils import nvtx_decorator
 
 try:
+    from transformer_engine.pytorch.module.base import get_dummy_wgrad
+except ImportError:
+    get_dummy_wgrad = None
+
+try:
     import triton
     import triton.language as tl
 
@@ -73,7 +78,7 @@ except ImportError:
 
 
 def _discard_runtime_parameter_grad(parameter: torch.nn.Parameter) -> None:
-    """Drop TE's throwaway leaf grad after its fused wgrad reaches ``main_grad``."""
+    """Drop TE's throwaway leaf grad after its fused wgrad reaches runtime staging."""
     parameter.grad = None
 
 
@@ -464,7 +469,12 @@ class _PrefetchResources:
 
 @dataclass(slots=True)
 class _CuTeDSLReplicaProjection:
-    """One projection and its stable native/virtual runtime storage."""
+    """One projection and its stable native/virtual runtime storage.
+
+    Expert backward writes native and replica wgrads into bridge-owned staging.
+    The replica reduction accumulates the virtual contributions into the native
+    staging, which is then handed to the optimizer parameters through autograd.
+    """
 
     name: str
     device: torch.device
@@ -474,17 +484,17 @@ class _CuTeDSLReplicaProjection:
     source_tensors: tuple[torch.Tensor, ...]
     forward: _DirectionalBinding
     backward: _DirectionalBinding
-    main_grad_bases: torch.Tensor
+    native_grad_bases: torch.Tensor
     member_shape: tuple[int, int]
     member_numel: int
     rowwise_scale_shape: tuple[int, ...] | None
     columnwise_scale_shape: tuple[int, ...] | None
     virtual_weight: tuple[torch.Tensor, ...]
     virtual_grad: torch.Tensor
-    gtp_native_grad: torch.Tensor | None = None
+    native_grad: torch.Tensor | None = None
     runtime_parameters: tuple[torch.nn.Parameter, ...] | None = None
     source_storage_ptrs: tuple[tuple[int, ...], ...] | None = None
-    source_main_grad_ptrs: tuple[int, ...] | None = None
+    native_grad_ptrs: tuple[int, ...] | None = None
     runtime_bound: bool = False
 
     def binding(self, direction: _WeightDirection) -> _DirectionalBinding:
@@ -588,18 +598,10 @@ class _CuTeDSLReplicaProjection:
                 updated[expert][component_offset : component_offset + 2] = ptrs
             self.source_storage_ptrs = tuple(tuple(ptrs) for ptrs in updated)
 
-    def _main_grads(self) -> tuple[torch.Tensor, ...]:
-        if self.gtp_leader is not None:
-            if self.gtp_native_grad is None:
-                raise RuntimeError(f"Replica CuTeDSL {self.name} lost GTP gradient staging.")
-            return tuple(self.gtp_native_grad)
-        grads = tuple(getattr(parameter, "main_grad", None) for parameter in self.parameters)
-        if any(grad is None for grad in grads):
-            raise RuntimeError(
-                "Replica CuTeDSL weights require gradient-accumulation fusion and "
-                "initialized parameter.main_grad buffers."
-            )
-        return grads
+    def _native_grads(self) -> tuple[torch.Tensor, ...]:
+        if self.native_grad is None:
+            raise RuntimeError(f"Replica CuTeDSL {self.name} lost native gradient staging.")
+        return tuple(self.native_grad)
 
     def prepare_runtime_parameters(self, grad_dtype: torch.dtype) -> None:
         """Bind final DDP/GTP storage once, then validate pointer stability."""
@@ -654,9 +656,9 @@ class _CuTeDSLReplicaProjection:
                 "this would invalidate CUDA-graph source pointers."
             )
 
-        main_grads = self._main_grads()
-        main_grad_ptrs = []
-        for index, grad in enumerate(main_grads):
+        native_grads = self._native_grads()
+        native_grad_ptrs = []
+        for index, grad in enumerate(native_grads):
             if (
                 grad.dtype != grad_dtype
                 or grad.device != self.device
@@ -664,26 +666,26 @@ class _CuTeDSLReplicaProjection:
                 or not grad.is_contiguous()
             ):
                 raise ValueError(
-                    f"Replica CuTeDSL {self.name} main_grad {index} must be contiguous "
+                    f"Replica CuTeDSL {self.name} native grad {index} must be contiguous "
                     f"{grad_dtype} with {self.member_numel} elements on {self.device}; got "
                     f"dtype={grad.dtype}, shape={tuple(grad.shape)}, device={grad.device}."
                 )
-            main_grad_ptrs.append(grad.data_ptr())
-        main_grad_ptrs = tuple(main_grad_ptrs)
-        if self.source_main_grad_ptrs is None:
-            self.source_main_grad_ptrs = main_grad_ptrs
-            self.main_grad_bases.copy_(
-                torch.tensor(main_grad_ptrs, dtype=torch.int64, device=self.device)
+            native_grad_ptrs.append(grad.data_ptr())
+        native_grad_ptrs = tuple(native_grad_ptrs)
+        if self.native_grad_ptrs is None:
+            self.native_grad_ptrs = native_grad_ptrs
+            self.native_grad_bases.copy_(
+                torch.tensor(native_grad_ptrs, dtype=torch.int64, device=self.device)
             )
-        elif main_grad_ptrs != self.source_main_grad_ptrs:
+        elif native_grad_ptrs != self.native_grad_ptrs:
             raise RuntimeError(
-                f"Replica CuTeDSL {self.name} main-grad storage changed after binding; "
+                f"Replica CuTeDSL {self.name} native-grad storage changed after binding; "
                 "this would invalidate CUDA-graph destination pointers."
             )
 
         self.source_tensors = sources
         weights = sources + tuple(self.virtual_weight)
-        grads = main_grads + tuple(self.virtual_grad)
+        grads = native_grads + tuple(self.virtual_grad)
         if not self.runtime_bound:
             self.bind_runtime_parameters(weights, grads)
         else:
@@ -696,7 +698,7 @@ class _CuTeDSLReplicaProjection:
             parameter = torch.nn.Parameter(weight, requires_grad=True)
             parameter.main_grad = grad
             parameter.grad_added_to_main_grad = True
-            parameter.overwrite_main_grad = self.gtp_leader is not None
+            parameter.overwrite_main_grad = True
             parameter.register_post_accumulate_grad_hook(_discard_runtime_parameter_grad)
             runtime_parameters.append(parameter)
         self.runtime_parameters = tuple(runtime_parameters)
@@ -727,18 +729,12 @@ class _CuTeDSLReplicaProjection:
                 )
             runtime_grad = getattr(parameter, "main_grad", None)
             if runtime_grad is None or runtime_grad.data_ptr() != grad.data_ptr():
-                if self.gtp_leader is None:
-                    raise RuntimeError(
-                        f"Replica CuTeDSL {self.name} runtime main-grad storage changed after "
-                        "binding."
-                    )
-                parameter.main_grad = grad
+                raise RuntimeError(
+                    f"Replica CuTeDSL {self.name} runtime main-grad storage changed after "
+                    "binding."
+                )
             parameter.grad_added_to_main_grad = True
-            parameter.overwrite_main_grad = self.gtp_leader is not None
-
-    def finalize_gtp_grads(self) -> None:
-        if self.gtp_leader is not None:
-            self.gtp_leader.finalize_group_grads(list(self._main_grads()))
+            parameter.overwrite_main_grad = True
 
     def destroy(self) -> None:
         if self.runtime_parameters is not None:
@@ -861,7 +857,7 @@ class _ReplicaCuTeDSLWorkspace:
         self.resident_bridge = None
         self.resident_plan = None
         self.resident_orientation = None
-        self._gtp_native_projection_grad_storage = {}
+        self._native_projection_grad_storage = {}
         self._destroyed = False
 
         device_index = device.index
@@ -952,16 +948,16 @@ class _ReplicaCuTeDSLWorkspace:
             virtual_grad,
         )
 
-    def gtp_native_projection_grad_view(self, projection_index: int) -> torch.Tensor:
-        """Return shared full-gradient staging for one GTP projection."""
-        cached = self._gtp_native_projection_grad_storage.get(projection_index)
+    def native_projection_grad_view(self, projection_index: int) -> torch.Tensor:
+        """Return shared full-gradient staging for one projection."""
+        cached = self._native_projection_grad_storage.get(projection_index)
         if cached is None:
             cached = torch.empty(
                 (self.num_local_experts, *self.member_shapes[projection_index]),
                 dtype=self.grad_dtype,
                 device=self.device,
             )
-            self._gtp_native_projection_grad_storage[projection_index] = cached
+            self._native_projection_grad_storage[projection_index] = cached
         return cached
 
     def destroy(self) -> None:
@@ -972,7 +968,7 @@ class _ReplicaCuTeDSLWorkspace:
         self.resident_bridge = None
         self.resident_plan = None
         self.resident_orientation = None
-        self._gtp_native_projection_grad_storage.clear()
+        self._native_projection_grad_storage.clear()
         # Handles own NCCL window registrations. Drop them before their backing
         # tensors and, critically, before model-parallel process-group teardown.
         self.weight_handle = None
@@ -1065,13 +1061,6 @@ class ReplicaCuTeDSLWeightBridge:
             num_local_experts=self.num_local_experts,
             backend_name="Replica-CuTeDSL",
         )
-        # Replica wgrads are produced directly into ``main_grad`` and therefore
-        # must not flow through PyTorch's leaf ``AccumulateGrad``. DDP sees this
-        # marker during construction and retains a manually-triggered grad-ready
-        # hook instead of registering the ordinary leaf hook.
-        for spec in projection_specs:
-            for parameter in spec.parameters:
-                parameter._replica_managed_grad = True
         member_shapes = tuple(spec.member_shape for spec in projection_specs)
         self.weight_format = projection_specs[0].weight_format
         rowwise_scale_shapes = (
@@ -1110,11 +1099,7 @@ class ReplicaCuTeDSLWeightBridge:
         self.projections: list[_CuTeDSLReplicaProjection] = []
         for projection_index, spec in enumerate(projection_specs):
             virtual_storage, virtual_grad = self.workspace.projection_views(projection_index)
-            gtp_native_grad = (
-                self.workspace.gtp_native_projection_grad_view(projection_index)
-                if spec.gtp_leader is not None
-                else None
-            )
+            native_grad = self.workspace.native_projection_grad_view(projection_index)
             # GTP MXFP8 gather storage is stable and is bound directly before
             # runtime construction. Bootstrap distinct native wrappers over
             # the replica views instead of retaining an unused full weight copy.
@@ -1178,7 +1163,7 @@ class ReplicaCuTeDSLWeightBridge:
                 components = 2 if spec.gtp_leader is not None else 0
                 forward = binding(pointer_table(), pointer_table(), components)
                 backward = binding(pointer_table(), pointer_table(), components)
-            main_grad_bases = pointer_table()
+            native_grad_bases = pointer_table()
             self.projections.append(
                 _CuTeDSLReplicaProjection(
                     name=f"FC{projection_index + 1}",
@@ -1193,14 +1178,14 @@ class ReplicaCuTeDSLWeightBridge:
                     ),
                     forward=forward,
                     backward=backward,
-                    main_grad_bases=main_grad_bases,
+                    native_grad_bases=native_grad_bases,
                     member_shape=spec.member_shape,
                     member_numel=math.prod(spec.member_shape),
                     rowwise_scale_shape=spec.rowwise_scale_shape,
                     columnwise_scale_shape=spec.columnwise_scale_shape,
                     virtual_weight=virtual_weight,
                     virtual_grad=virtual_grad,
-                    gtp_native_grad=gtp_native_grad,
+                    native_grad=native_grad,
                 )
             )
         _replica_cutedsl_bridges.add(self)
@@ -1396,7 +1381,7 @@ class ReplicaCuTeDSLWeightBridge:
     @torch.no_grad()
     @nvtx_decorator(message="replica_cutedsl_grad_reduce_start")
     def start_grad_reduce(self, plan: ReplicaPlan) -> None:
-        """Enqueue direct peer reduction after expert wgrad production."""
+        """Enqueue replica-gradient reduction into native wgrad staging."""
         if self._grad_reduce_plan is not None:
             raise RuntimeError("Replica CuTeDSL gradient reduction is already outstanding.")
         self._validate_plan(plan)
@@ -1407,7 +1392,9 @@ class ReplicaCuTeDSLWeightBridge:
         with torch.cuda.stream(self.workspace.grad_stream):
             launch_replica_grad_reduce(
                 arena=self.workspace.grad_arena,
-                main_grads=tuple(projection.main_grad_bases for projection in self.projections),
+                native_grads=tuple(
+                    projection.native_grad_bases for projection in self.projections
+                ),
                 peer_bases=self.workspace.grad_handle.buffer_ptrs_dev,
                 signal_bases=self.workspace.grad_handle.signal_pad_ptrs_dev,
                 experts_to_copy=plan.experts_to_copy,
@@ -1419,15 +1406,12 @@ class ReplicaCuTeDSLWeightBridge:
                 num_sms=self.workspace.num_sms,
             )
             self.grad_reduce_done.record(self.workspace.grad_stream)
-        for projection in self.projections:
-            for parameter in projection.parameters:
-                parameter.grad_added_to_main_grad = True
         self._grad_reduce_plan = plan
 
     @torch.no_grad()
     @nvtx_decorator(message="replica_cutedsl_grad_reduce_wait")
-    def wait_grad_reduce(self, plan: ReplicaPlan) -> None:
-        """Finish replica reduction and notify DDP without materializing leaf grads."""
+    def wait_grad_reduce(self, plan: ReplicaPlan) -> tuple[torch.Tensor | None, ...]:
+        """Finish replica reduction and return source-parameter wgrads."""
         if self._grad_reduce_plan is None:
             self.start_grad_reduce(plan)
         elif self._grad_reduce_plan is not plan:
@@ -1435,25 +1419,31 @@ class ReplicaCuTeDSLWeightBridge:
         torch.cuda.current_stream(self.device).wait_event(self.grad_reduce_done)
         self._grad_reduce_plan = None
 
+        reduced_gtp_grads = [None] * len(self.projections)
         # Expert backward computes FC2 before FC1. Preserve that reverse order
         # when handing full wgrads to GTP so its linked RS cascade remains valid.
-        for projection in reversed(self.projections):
-            projection.finalize_gtp_grads()
-
-        # GTP finalization invokes its retained DDP hooks itself. Ordinary
-        # replica parameters need the equivalent notification here because
-        # their real gradients were already accumulated into ``main_grad`` by
-        # the replica reduction. Returning full-sized zero tensors through
-        # autograd would make AccumulateGrad issue one memcpy/add per expert.
-        for projection in self.projections:
-            if projection.gtp_leader is not None:
+        for projection_index in reversed(range(len(self.projections))):
+            projection = self.projections[projection_index]
+            if projection.gtp_leader is None:
                 continue
-            for parameter in projection.parameters:
-                parameter.grad = None
-                parameter.grad_added_to_main_grad = True
-                hook = getattr(parameter, "_replica_grad_accum_hook", None)
-                if hook is not None:
-                    hook()
+            reduced_gtp_grads[projection_index] = projection.gtp_leader.wgrad_reduce_scatter(
+                list(projection._native_grads())
+            )
+
+        source_grads = []
+        for projection_index, projection in enumerate(self.projections):
+            if projection.gtp_leader is None:
+                source_grads.extend(projection._native_grads())
+                continue
+            reduced_grads = reduced_gtp_grads[projection_index]
+            if not isinstance(reduced_grads, (list, tuple)):
+                reduced_grads = (reduced_grads,)
+            if len(reduced_grads) != len(projection.parameters):
+                raise RuntimeError(
+                    "GTP returned a different number of reduced wgrads than source parameters."
+                )
+            source_grads.extend(reduced_grads)
+        return tuple(source_grads)
 
     def destroy(self) -> None:
         """Detach layer-owned TE parameters from the shared symmetric arenas."""
@@ -1532,8 +1522,43 @@ class _ReplicaWaitGradReduce(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_hidden_states):
-        ctx.bridge.wait_grad_reduce(ctx.plan)
-        return (grad_hidden_states, *(None,) * ctx.num_source_parameters, None, None)
+        source_grads = ctx.bridge.wait_grad_reduce(ctx.plan)
+        if len(source_grads) != ctx.num_source_parameters:
+            raise RuntimeError(
+                "Replica CuTeDSL returned a different number of wgrads than source parameters."
+            )
+
+        autograd_grads = []
+        for parameter, source_grad in zip(ctx.bridge.source_parameters, source_grads):
+            if source_grad is None or getattr(parameter, "is_gtp_weight_remat", False):
+                autograd_grads.append(source_grad)
+                continue
+
+            main_grad = getattr(parameter, "main_grad", None)
+            if main_grad is None or not hasattr(parameter, "grad_added_to_main_grad"):
+                # AccumulateGrad may retain its input as parameter.grad. Give it
+                # independent storage because the bridge reuses native staging.
+                autograd_grads.append(source_grad.clone())
+                continue
+
+            if get_dummy_wgrad is None:
+                raise RuntimeError(
+                    "Replica CuTeDSL fused wgrad accumulation requires Transformer Engine."
+                )
+            # Accumulate the completed wgrad directly in main_grad's dtype. Return a
+            # parameter-dtype dummy so AccumulateGrad still invokes DDP's grad-ready hook;
+            # grad_added_to_main_grad prevents DDP from accumulating the dummy again.
+            main_grad.add_(source_grad)
+            parameter.grad_added_to_main_grad = True
+            autograd_grads.append(
+                get_dummy_wgrad(
+                    list(parameter.shape),
+                    parameter.dtype,
+                    zero=getattr(parameter, "zero_out_wgrad", False),
+                )
+            )
+
+        return grad_hidden_states, *autograd_grads, None, None
 
 
 def start_replica_weight_prefetch_before_combine_backward(

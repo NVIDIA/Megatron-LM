@@ -3,9 +3,10 @@
 """CuTeDSL kernels for direct intra-node replica weight movement.
 
 Only virtual weights and gradients occupy PyTorch native symmetric memory.
-Native weights remain in DDP-owned storage: each owner pushes them directly
-into destination virtual slots, and replica gradients are accumulated directly
-into the owner's existing ``main_grad``. No activation transport is involved.
+Source weights remain in parameter or GTP-gather storage: each owner pushes them
+directly into destination virtual slots, and replica gradients are accumulated into
+stable native-wgrad staging before autograd/DDP or GTP finalization. No activation
+transport is involved.
 """
 
 import functools
@@ -654,8 +655,8 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
     def __call__(
         self,
         arena_ptr: cute.Pointer,
-        fc1_main_grad_bases_ptr: cute.Pointer,
-        fc2_main_grad_bases_ptr: cute.Pointer,
+        fc1_native_grad_bases_ptr: cute.Pointer,
+        fc2_native_grad_bases_ptr: cute.Pointer,
         peer_base_ptr: cute.Pointer,
         signal_base_ptr: cute.Pointer,
         experts_ptr: cute.Pointer,
@@ -666,15 +667,15 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
         fc1_numel = cutlass.const_expr(self.num_local_experts * self.fc1_member_numel)
         fc2_numel = cutlass.const_expr(self.num_local_experts * self.fc2_member_numel)
         arena = _tensor_1d(arena_ptr, fc1_numel + fc2_numel)
-        fc1_main_grad_bases = _tensor_1d(fc1_main_grad_bases_ptr, self.num_local_experts)
-        fc2_main_grad_bases = _tensor_1d(fc2_main_grad_bases_ptr, self.num_local_experts)
+        fc1_native_grad_bases = _tensor_1d(fc1_native_grad_bases_ptr, self.num_local_experts)
+        fc2_native_grad_bases = _tensor_1d(fc2_native_grad_bases_ptr, self.num_local_experts)
         peer_bases = _tensor_1d(peer_base_ptr, self.world_size)
         signal_bases = _tensor_1d(signal_base_ptr, self.world_size)
         experts = _tensor_1d(experts_ptr, self.world_size * self.num_local_experts)
         self.kernel(
             arena,
-            fc1_main_grad_bases,
-            fc2_main_grad_bases,
+            fc1_native_grad_bases,
+            fc2_native_grad_bases,
             peer_bases,
             signal_bases,
             experts,
@@ -692,8 +693,8 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
     def kernel(
         self,
         arena: cute.Tensor,
-        fc1_main_grad_bases: cute.Tensor,
-        fc2_main_grad_bases: cute.Tensor,
+        fc1_native_grad_bases: cute.Tensor,
+        fc2_native_grad_bases: cute.Tensor,
         peer_bases: cute.Tensor,
         signal_bases: cute.Tensor,
         experts: cute.Tensor,
@@ -779,13 +780,13 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
             member_chunks = cutlass.const_expr(self.fc1_member_chunks)
             member_numel = cutlass.const_expr(self.fc1_member_numel)
             virtual_projection_base = Int64(0)
-            main_grad_bases = fc1_main_grad_bases
+            native_grad_bases = fc1_native_grad_bases
             if is_fc2:
                 projection_work = work - fc1_chunks
                 member_chunks = cutlass.const_expr(self.fc2_member_chunks)
                 member_numel = cutlass.const_expr(self.fc2_member_numel)
                 virtual_projection_base = Int64(virtual_fc1_numel)
-                main_grad_bases = fc2_main_grad_bases
+                native_grad_bases = fc2_native_grad_bases
             local_expert = projection_work // member_chunks
             member_chunk = projection_work - local_expert * member_chunks
             member_offset = Int64(member_chunk * self.CHUNK_ELEMENTS)
@@ -821,14 +822,14 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                     if matches[local_expert * self.world_size + destination] >= Int32(0):
                         source_count += Int32(1)
                 if source_count > Int32(0):
-                    main_destination = cute.make_ptr(
+                    native_destination = cute.make_ptr(
                         self.grad_type,
-                        main_grad_bases[local_expert],
+                        native_grad_bases[local_expert],
                         cute.AddressSpace.gmem,
                         assumed_align=16,
                     )
-                    main_destination = _tensor_1d(
-                        main_destination + member_offset, self.CHUNK_ELEMENTS
+                    native_destination = _tensor_1d(
+                        native_destination + member_offset, self.CHUNK_ELEMENTS
                     )
                     if cutlass.const_expr(self.is_bf16):
                         consumer_thread = tid - Int32(32)
@@ -839,7 +840,7 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                         accumulator = cute.make_rmem_tensor((thread_elements,), Float32)
                         for register in cutlass.range_constexpr(thread_elements):
                             element = consumer_thread + register * consumer_threads
-                            accumulator[register] = Float32(main_destination[element])
+                            accumulator[register] = Float32(native_destination[element])
                         for _source_index in cutlass.range(source_count, unroll=1):
                             load_pipe.consumer_wait(consume_state)
                             stage = stage_smem[(None, consume_state.index)]
@@ -852,7 +853,7 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                         # storage remain BF16 while local additions use FP32.
                         for register in cutlass.range_constexpr(thread_elements):
                             element = consumer_thread + register * consumer_threads
-                            main_destination[element] = BFloat16(accumulator[register])
+                            native_destination[element] = BFloat16(accumulator[register])
                     else:
                         for _source_index in cutlass.range(source_count, unroll=1):
                             load_pipe.consumer_wait(consume_state)
@@ -861,7 +862,7 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                                     stage = stage_smem[(None, consume_state.index)]
                                     _cp_reduce_async_bulk_add_f32(
                                         stage.iterator + bulk * self.BULK_ELEMENTS,
-                                        main_destination.iterator + bulk * self.BULK_ELEMENTS,
+                                        native_destination.iterator + bulk * self.BULK_ELEMENTS,
                                         self.BULK_ELEMENTS * 4,
                                     )
                                 cute.arch.cp_async_bulk_commit_group()
@@ -1187,7 +1188,7 @@ def _as_pointer_table(
         or not tensor.is_contiguous()
     ):
         raise ValueError(
-            "Replica CuTeDSL sources and main grads must be contiguous CUDA tensors "
+            "Replica CuTeDSL sources and native grads must be contiguous CUDA tensors "
             f"with shape [{num_local_experts}, ...] and dtype {dtype}."
         )
     return torch.tensor(
@@ -1285,7 +1286,7 @@ def launch_replica_weight_prefetch(
 def launch_replica_grad_reduce(
     *,
     arena: torch.Tensor,
-    main_grads: tuple[torch.Tensor, torch.Tensor],
+    native_grads: tuple[torch.Tensor, torch.Tensor],
     peer_bases: torch.Tensor,
     signal_bases: torch.Tensor,
     experts_to_copy: torch.Tensor,
@@ -1296,7 +1297,7 @@ def launch_replica_grad_reduce(
     member_numels: tuple[int, int],
     num_sms: int,
 ) -> None:
-    """Accumulate virtual gradients into native main-grad and clear used slots."""
+    """Accumulate virtual gradients into native wgrad staging and clear used slots."""
     device_index = arena.device.index
     if device_index is None:
         raise ValueError("Replica CuTeDSL grad arena must be a CUDA tensor.")
@@ -1319,14 +1320,14 @@ def launch_replica_grad_reduce(
         arena.dtype,
     )
     stream = cuda.CUstream(torch.cuda.current_stream(arena.device).cuda_stream)
-    main_grad_bases = tuple(
-        _as_pointer_table(main_grad, num_local_experts, dtype=arena.dtype)
-        for main_grad in main_grads
+    native_grad_bases = tuple(
+        _as_pointer_table(native_grad, num_local_experts, dtype=arena.dtype)
+        for native_grad in native_grads
     )
     compiled(
         _runtime_ptr(pointer_type, arena),
-        _runtime_ptr(Int64, main_grad_bases[0], assumed_align=8),
-        _runtime_ptr(Int64, main_grad_bases[1], assumed_align=8),
+        _runtime_ptr(Int64, native_grad_bases[0], assumed_align=8),
+        _runtime_ptr(Int64, native_grad_bases[1], assumed_align=8),
         _runtime_ptr(Int64, peer_bases, assumed_align=8),
         _runtime_ptr(Int64, signal_bases, assumed_align=8),
         _runtime_ptr(Int32, experts_to_copy),
