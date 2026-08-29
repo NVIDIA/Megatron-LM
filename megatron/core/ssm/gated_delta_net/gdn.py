@@ -161,9 +161,7 @@ class GatedDeltaNet(_GDNBase):
             (
                 packed_seq_params is not None
                 and packed_seq_params.qkv_format == "thd"
-                and getattr(
-                    packed_seq_params, "cp_partition_mode", self.config.cp_partition_mode
-                )
+                and getattr(packed_seq_params, "cp_partition_mode", self.config.cp_partition_mode)
                 != "zigzag"
             )
             or (
