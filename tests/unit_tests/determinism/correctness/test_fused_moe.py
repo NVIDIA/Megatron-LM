@@ -39,14 +39,19 @@ def _is_megamoe_available() -> bool:
     if not HAVE_TE_EP or not torch.cuda.is_available():
         return False
     try:
-        from transformer_engine.pytorch.ops import Combine, Dispatch, GroupedLinear, ScaledSwiGLU
+        from transformer_engine.pytorch.ops import (
+            GroupedLinear,
+            MoeCombine,
+            MoeDispatch,
+            ScaledSwiGLU,
+        )
         from transformer_engine.pytorch.ops.fused.moe_ep import (
             _cudnn_megamoe_supported,
             _import_cudnn_moe_ep,
         )
     except ImportError:
         return False
-    del Combine, Dispatch, GroupedLinear, ScaledSwiGLU
+    del GroupedLinear, MoeCombine, MoeDispatch, ScaledSwiGLU
     return (
         torch.cuda.get_device_capability() == (10, 7)
         and _cudnn_megamoe_supported()

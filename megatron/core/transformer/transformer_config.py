@@ -1004,7 +1004,7 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_use_transformer_engine_fused_moe: bool = False
     """Build routed experts as one Transformer Engine
-    ``Sequential(Dispatch, FC1, SwiGLU, FC2, Combine)``. Transformer Engine uses the cuDNN
+    ``Sequential(MoeDispatch, FC1, SwiGLU, FC2, MoeCombine)``. Transformer Engine uses the cuDNN
     MegaMOE kernel when its runtime capability checks pass and otherwise executes the same
     sequence with the unfused NCCL-EP operations. This experimental path currently supports only
     the standard (non-overlapped, non-CUDA-graph) NCCL-EP execution."""
@@ -1880,6 +1880,7 @@ class TransformerConfig(ModelParallelConfig):
                     self.overlap_dispatch_backward_with_experts_wgrad
                 ),
                 "fine_grained_activation_offloading": self.fine_grained_activation_offloading,
+                "moe_ncclep_zero_copy": self.moe_ncclep_zero_copy,
             }
             active = [name for name, enabled in incompatible.items() if enabled]
             if active:

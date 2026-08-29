@@ -300,11 +300,11 @@ class MoEModelTestContainer:
             (sequence,) = fused.experts._last_fused_moe_ops
             op_names = [type(op).__name__ for op in sequence]
             assert op_names == [
-                "Dispatch",
+                "MoeDispatch",
                 "GroupedLinear",
                 "ScaledSwiGLU",
                 "GroupedLinear",
-                "Combine",
+                "MoeCombine",
             ]
             forward_ops = sequence._module_groups[0]._forward_ops
             is_megamoe = any(
@@ -614,7 +614,8 @@ def is_fused_moe_sequential_available():
     if not is_nccl_ep_available() or not is_op_fuser_available():
         return False
     try:
-        from transformer_engine.pytorch.ops import Combine, Dispatch  # noqa: F401
+        from transformer_engine.pytorch.ep import EpConfig  # noqa: F401
+        from transformer_engine.pytorch.ops import MoeCombine, MoeDispatch  # noqa: F401
     except ImportError:
         return False
     return True

@@ -208,6 +208,7 @@ class TEGroupedMLP(MegatronModule):
 
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
+        self.drop_on_overflow = self.config.moe_expert_rank_capacity_factor is not None
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
@@ -392,7 +393,7 @@ class TEGroupedMLP(MegatronModule):
             return False  # Transformer Engine version is too old
         if self.config.moe_use_transformer_engine_fused_moe:
             try:
-                from transformer_engine.pytorch.ops import Combine, Dispatch  # noqa: F401
+                from transformer_engine.pytorch.ops import MoeCombine, MoeDispatch  # noqa: F401
             except ImportError:
                 return False  # Transformer Engine does not provide fusible NCCL-EP ops
 
@@ -464,13 +465,13 @@ class TEGroupedMLP(MegatronModule):
     def _make_fused_ops(
         self,
         ep_buffer=None,
+        ep_config=None,
     ) -> torch.nn.Module:
         """Construct the TE operation-fuser module.
 
-        When ``ep_buffer`` is provided, dispatch and combine are included around
-        the grouped MLP. The routing metadata is connected through internal
-        channels so Transformer Engine can replace the five-op sequence with
-        MegaMOE when its runtime gates pass.
+        When ``ep_buffer`` and ``ep_config`` are provided, dispatch and combine
+        are included around the grouped MLP. Expert counts and routing weights
+        use internal channels, while routing state remains in ``ep_buffer``.
         """
 
         assert HAVE_TE, "_make_fused_ops requires Transformer Engine."
@@ -508,7 +509,9 @@ class TEGroupedMLP(MegatronModule):
         op_list = []
         dispatch_op = None
         if ep_buffer is not None:
-            dispatch_op = te.pytorch.ops.Dispatch(ep_buffer)
+            if ep_config is None:
+                raise ValueError("ep_config is required when ep_buffer is provided.")
+            dispatch_op = te.pytorch.ops.MoeDispatch(ep_config)
             op_list.append(dispatch_op)
 
         # Check if there are 1 or "num_gemms" params in the GroupedLinear module.
@@ -674,7 +677,7 @@ class TEGroupedMLP(MegatronModule):
         fc2_op = op
 
         if ep_buffer is not None:
-            combine_op = te.pytorch.ops.Combine()
+            combine_op = te.pytorch.ops.MoeCombine(ep_config)
             op_list.append(combine_op)
             dispatch_op.set_extra_output_channel(
                 0, "tokens_per_expert", output_to_caller=False
@@ -682,16 +685,9 @@ class TEGroupedMLP(MegatronModule):
             dispatch_op.set_extra_output_channel(
                 1, "routing_weights", output_to_caller=False
             )
-            dispatch_op.set_extra_output_channel(2, "ep_handle", output_to_caller=False)
-            dispatch_op.set_extra_output_channel(
-                3, "routing_indices", output_to_caller=False
-            )
             fc1_op.set_extra_input_channel(0, "tokens_per_expert")
             activation_op.set_extra_input_channel(0, "routing_weights")
             fc2_op.set_extra_input_channel(0, "tokens_per_expert")
-            combine_op.set_extra_input_channel(0, "ep_handle")
-            combine_op.set_extra_input_channel(1, "tokens_per_expert")
-            combine_op.set_extra_input_channel(2, "routing_indices")
 
         ops = te.pytorch.ops.Sequential(*op_list)
 
@@ -718,13 +714,34 @@ class TEGroupedMLP(MegatronModule):
                 f"got {hidden_states.dtype}."
             )
 
+        ep_config = te.pytorch.ep.EpConfig(
+            top_k=ep_buffer.top_k,
+            max_tokens_per_rank=ep_buffer.max_tokens_per_rank,
+            recv_capacity_per_rank=ep_buffer.recv_capacity_per_rank,
+            hidden_dim=ep_buffer.hidden_dim,
+            num_local_experts=ep_buffer.num_local_experts,
+            ep_group=self.ep_group,
+            alignment=ep_buffer.alignment,
+            payload_dtype=ep_buffer.payload_dtype,
+            zero_copy=ep_buffer.zero_copy,
+            drop_on_overflow=self.drop_on_overflow,
+        )
         ops = self._make_fused_ops(
             ep_buffer=ep_buffer,
+            ep_config=ep_config,
         )
         # Keep the most recent sequence available for diagnostics without
         # registering duplicate parameter aliases as child modules.
         self._last_fused_moe_ops = (ops,)
-        return ops(hidden_states, topk_idx, topk_weights.float())
+        return ops(
+            hidden_states,
+            topk_idx,
+            topk_weights.float(),
+            op_kwargs={
+                0: {"buffer": ep_buffer},
+                4: {"buffer": ep_buffer},
+            },
+        )
 
     def _make_fused_impl_pre_forward_hook(self) -> Callable:
         """Make function that calls submodule pre-forward callback hooks.
@@ -1184,7 +1201,7 @@ class TEGroupedMLP(MegatronModule):
                 fused_children = list(seq.children())
                 if self.config.moe_use_transformer_engine_fused_moe:
                     assert len(fused_children) == 5, (
-                        "expected Dispatch, FC1, activation, FC2, Combine in fused TE ops"
+                        "expected MoeDispatch, FC1, activation, FC2, MoeCombine in fused TE ops"
                     )
                     fc1_idx, fc2_idx = 1, 3
                 else:
