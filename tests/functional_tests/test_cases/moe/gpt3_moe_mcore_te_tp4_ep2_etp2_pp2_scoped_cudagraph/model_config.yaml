@@ -44,6 +44,9 @@ MODEL_ARGS:
   --moe-router-topk: 2
   --moe-router-dtype: fp32
   --moe-router-fusion: true
+  # --deterministic-mode refuses the fused aux loss: it reaches the backward via
+  # MoEAuxLossAutoScaler. Fused TopK routing above only selects experts, so it stays on.
+  --no-moe-router-aux-loss-fusion: true
   --moe-router-enable-expert-bias: true
   --moe-router-score-function: sigmoid
   --moe-router-pre-softmax: true
