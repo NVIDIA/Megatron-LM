@@ -120,6 +120,32 @@ class TestGetLayerSymbolFromConfig:
 
 
 @pytest.mark.internal
+class TestContainsLayerSymbol:
+
+    @pytest.mark.parametrize(("layer_symbol", "config_type"), _EXPECTED_LAYER_CONFIG_TYPES)
+    def test_returns_true_when_symbol_is_present(self, layer_symbol, config_type):
+        layer_config = config_type.from_config(_make_transformer_config())
+
+        assert layer_utils.contains_layer_symbol(layer_symbol, [layer_config])
+
+    def test_returns_false_when_symbol_is_absent(self):
+        layer_config = MambaLayerConfig.from_config(_make_transformer_config())
+
+        assert not layer_utils.contains_layer_symbol(layer_utils.Symbols.GDN, [layer_config])
+
+    def test_preserves_exact_config_type_lookup(self):
+        class CustomMambaLayerConfig(MambaLayerConfig):
+            pass
+
+        layer_config = CustomMambaLayerConfig.from_config(_make_transformer_config())
+
+        with pytest.raises(
+            ValueError, match="Unexpected hybrid layer config type: CustomMambaLayerConfig"
+        ):
+            layer_utils.contains_layer_symbol(layer_utils.Symbols.MAMBA, [layer_config])
+
+
+@pytest.mark.internal
 class TestValidateTpCommOverlap:
 
     @pytest.mark.parametrize(

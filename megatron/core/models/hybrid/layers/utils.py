@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from typing import Sequence
+
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
@@ -88,6 +90,24 @@ def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
         if type(layer_config) is config_type:
             return symbol
     raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")
+
+
+def contains_layer_symbol(
+    layer_symbol: str, layer_config_list: Sequence[TransformerConfig]
+) -> bool:
+    """Return whether a layer config list contains a layer symbol.
+
+    Args:
+        layer_symbol: Layer symbol to find.
+        layer_config_list: Per-layer configs to search.
+
+    Returns:
+        Whether an exact config type corresponding to ``layer_symbol`` is present.
+    """
+    return any(
+        get_layer_symbol_from_config(layer_config) == layer_symbol
+        for layer_config in layer_config_list
+    )
 
 
 def validate_tp_comm_overlap(
