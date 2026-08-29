@@ -91,14 +91,12 @@ try:
     from importlib.metadata import PackageNotFoundError
     from importlib.metadata import version as _get_dist_version
 
-    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
     from packaging.version import Version as _Version
 
-    try:
-        HAVE_FA4 = _Version(_get_dist_version("flash-attn-4")) >= _Version(_MIN_FA4_VERSION)
-    except PackageNotFoundError:
-        HAVE_FA4 = False
-except ImportError:
+    HAVE_FA4 = _Version(_get_dist_version("flash-attn-4")) >= _Version(_MIN_FA4_VERSION)
+    if HAVE_FA4:
+        from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+except (ImportError, PackageNotFoundError):
     HAVE_FA4 = False
 
 try:
