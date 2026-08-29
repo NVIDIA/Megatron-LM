@@ -769,10 +769,29 @@ class MoELayer(BaseMoELayer):
                     "The selected MoE megakernel backend does not support partial MoE "
                     "CUDA-graph capture; remove moe_router/moe_preprocess from cuda_graph_modules"
                 )
-            probs, routing_map = self.route(
-                hidden_states, padding_mask, input_ids, packed_seq_params
-            )
-            output = apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+
+            def megakernel_forward(hidden_states, padding_mask):
+                probs, routing_map = self.route(
+                    hidden_states, padding_mask, input_ids, packed_seq_params
+                )
+                return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+
+            if self.moe_layer_recompute and self.training:
+                if self.config.fp8 or self.config.fp4:
+                    output = te_checkpoint(
+                        megakernel_forward,
+                        False,
+                        tensor_parallel.random.get_cuda_rng_tracker,
+                        self.tp_group,
+                        hidden_states,
+                        padding_mask,
+                    )
+                else:
+                    output = tensor_parallel.checkpoint(
+                        megakernel_forward, False, hidden_states, padding_mask
+                    )
+            else:
+                output = megakernel_forward(hidden_states, padding_mask)
             return output, None
 
         # MoE forward: route -> dispatch -> compute -> combine

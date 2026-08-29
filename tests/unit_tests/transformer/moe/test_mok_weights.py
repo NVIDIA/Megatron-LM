@@ -113,6 +113,8 @@ def test_mok_backend_rejects_mxfp8_without_fp8_parameters():
         {"moe_layer_recompute": True},
     ],
 )
-def test_mok_backend_rejects_whole_moe_recompute(overrides):
-    with pytest.raises(ValueError, match="whole-MoE activation recomputation"):
-        _mok_transformer_config(**overrides)
+def test_mok_backend_accepts_whole_moe_recompute(overrides):
+    config = _mok_transformer_config(**overrides)
+
+    assert config.recompute_granularity == "selective"
+    assert "moe" in config.recompute_modules

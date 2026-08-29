@@ -2246,23 +2246,14 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
                 raise ValueError("MOK currently requires TP=1 and expert TP=1")
-            if self.expert_model_parallel_size not in (4, 8, 16, 32, 64):
-                raise ValueError("MOK requires EP in {4, 8, 16, 32, 64}")
+            if self.expert_model_parallel_size not in (1, 4, 8, 16, 32, 64):
+                raise ValueError("MOK requires EP in {1, 4, 8, 16, 32, 64}")
             if self.moe_shared_expert_intermediate_size is None:
                 raise ValueError("MOK requires a shared expert")
             if self.moe_shared_expert_gate or self.moe_shared_expert_overlap:
                 raise ValueError("MOK does not support the MCore shared-expert gate/overlap")
             if self.moe_latent_size is not None:
                 raise ValueError("MOK does not support latent MoE")
-            if self.moe_layer_recompute or (
-                self.recompute_granularity == "selective"
-                and self.recompute_modules is not None
-                and "moe" in self.recompute_modules
-            ):
-                raise ValueError(
-                    "MOK does not yet support whole-MoE activation recomputation; "
-                    "disable moe_layer_recompute and remove moe from recompute_modules"
-                )
             if not self.gated_linear_unit or self.activation_func != F.silu:
                 raise ValueError("MOK currently requires SwiGLU")
 
