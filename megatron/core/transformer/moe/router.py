@@ -559,7 +559,6 @@ class TopKRouter(Router):
             valid_token_count=local_num_tokens * bsz,
             aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
-            aux_loss_scale_num_tokens=total_num_tokens,
         )
         return probs
 
