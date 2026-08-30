@@ -2046,7 +2046,7 @@ class TextGenerationController:
         range_push("active_request_mask")
         sampled_tokens_cpu = sampled_tokens_cpu_view.clone()
         context.commit_sampled_tokens(sampled_tokens_cpu)
-        (active_request_ids, finished_request_ids, active_request_mask, survivor_idxs) = (
+        active_request_ids, finished_request_ids, active_request_mask, survivor_idxs = (
             self._build_async_sched_request_state(sampled_tokens_cpu)
         )
         range_pop()
@@ -2757,7 +2757,7 @@ class TextGenerationController:
                 if sampling_params.num_tokens_to_generate > 0:
                     # Check end of generation status for each tensor
                     # and update generated sequence lengths
-                    (is_generation_done_tensor, generated_sequence_lengths) = (
+                    is_generation_done_tensor, generated_sequence_lengths = (
                         self.update_generation_status(
                             updated_prompts_tokens=batch_prompt_tokens,
                             generation_started=generation_started,

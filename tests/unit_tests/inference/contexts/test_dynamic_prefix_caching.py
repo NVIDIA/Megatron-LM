@@ -599,7 +599,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         # no prefill skipping
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
+        matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3 and prefix_skip == 0 and eff_chunk == len(prompt)
 
         ctx.add_request(req2)
@@ -730,7 +730,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 3)[:1])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 1
-        (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
+        matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3 and prefix_skip == bs and eff_chunk == len(prompt) - bs
 
         # no mamba match means no skip
@@ -739,7 +739,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx2.add_request(self._req(ctx2, p2.clone()))
         req2b = self._req(ctx2, p2.clone(), request_id=2)
         req2b._mamba_num_matched_blocks = 0
-        (m2, _, _, _, ps2, ec2) = ctx2._compute_prefix_match(req2b, len(p2))
+        m2, _, _, _, ps2, ec2 = ctx2._compute_prefix_match(req2b, len(p2))
         assert len(m2) == 3 and ps2 == 0 and ec2 == len(p2)
 
         # zero prefill for hybrid (mamba-cached, block-aligned)
@@ -749,7 +749,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx3, self._block_ids(ctx3, 0, 3))
         req3 = self._req(ctx3, p3.clone(), request_id=2)
         req3._mamba_num_matched_blocks = 3
-        (m3, _, _, _, ps3, ec3) = ctx3._compute_prefix_match(req3, len(p3))
+        m3, _, _, _, ps3, ec3 = ctx3._compute_prefix_match(req3, len(p3))
         assert len(m3) == 3 and ps3 == 2 * bs and ec3 == bs
 
         # KV-only prefix skip with non-block-aligned prompt: all 3 full blocks
@@ -761,7 +761,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req4a = self._req(ctx4, p4.clone())
         ctx4.add_request(req4a)
         req4b = self._req(ctx4, p4.clone(), request_id=2)
-        (m4, _, _, _, ps4, ec4) = ctx4._compute_prefix_match(req4b, len(p4))
+        m4, _, _, _, ps4, ec4 = ctx4._compute_prefix_match(req4b, len(p4))
         assert len(m4) == 3 and ps4 == 3 * bs4 and ec4 == tail
         ctx4.add_request(req4b)
 
@@ -790,7 +790,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 4)[:2])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 2
-        (matched, _, _, overall, prefix_skip, _) = ctx._compute_prefix_match(req2, len(prompt))
+        matched, _, _, overall, prefix_skip, _ = ctx._compute_prefix_match(req2, len(prompt))
         # Copy block IDs to slot 1 so compute_and_store_offsets can resolve EOS block
         ctx.request_to_kv_block_ids[1] = ctx.request_to_kv_block_ids[0]
         msa.compute_and_store_offsets(
@@ -1394,7 +1394,7 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
 
         # request 2 shares the first 4 blocks, adds 2 new blocks
         req2 = self._req(ctx, self._prompt(bs * 6), request_id=2)
-        (matched, _, _, _, prefix_skip, _) = ctx._compute_prefix_match(req2, bs * 6)
+        matched, _, _, _, prefix_skip, _ = ctx._compute_prefix_match(req2, bs * 6)
         assert len(matched) == 4 and prefix_skip == bs * 4
         ctx.add_request(req2)
 
