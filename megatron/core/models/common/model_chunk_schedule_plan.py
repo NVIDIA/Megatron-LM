@@ -6,6 +6,7 @@ from typing import Any, Callable, Optional
 import torch
 from torch import Tensor
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import (
@@ -15,6 +16,29 @@ from megatron.core.pipeline_parallel.utils import (
     get_comp_stream,
 )
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+
+
+def _resolve_fsdp_root(model: Any) -> Optional[FsdpModule]:
+    """Return the outermost ``FsdpModule`` (root unit) for a schedule model.
+
+    An M-FSDP v2 model chunk wraps the root model as ``adapter ->
+    Float16Module(FsdpModule) -> GPTModel``. The schedule plan is built on the
+    inner ``GPTModel``, so walking ``.module`` downward never reaches the FSDP
+    root unit (which owns the embedding, final norm, and lm head). Every
+    ``FsdpModule`` descendant shares one ``FsdpContext`` whose forward order
+    always begins with the root unit, so we resolve it from there.
+    """
+    if isinstance(model, FsdpModule):
+        return model
+    if model is None:
+        return None
+    for submodule in model.modules():
+        if isinstance(submodule, FsdpModule):
+            for candidate in submodule.context.forward_order:
+                if candidate.is_root():
+                    return candidate
+            return None
+    return None
 
 
 class ModelChunkState:
@@ -258,9 +282,22 @@ class TransformerLayerSchedulePlan:
             Functions or values for next iteration's computation
         """
 
+        if b_layer and isinstance(b_layer.layer, FsdpModule):
+            # The fine-grained schedule invokes layer submodules directly and
+            # splits their backward into separate GraphTasks. Start every nested
+            # FSDP unit explicitly so delayed weight-gradient computation still
+            # sees its full compute parameters. In particular, MoE experts are a
+            # child FSDP unit distinct from the TransformerLayer that owns them.
+            for fsdp_module in b_layer.layer.modules():
+                if isinstance(fsdp_module, FsdpModule):
+                    fsdp_module.pre_backward()
+
         if b_layer is not None:
             b_grad = b_layer.mtp_post_process.backward(b_grad)
             b_grad = b_layer.moe_combine.backward(b_grad)
+
+        if f_layer and isinstance(f_layer.layer, FsdpModule):
+            f_layer.layer.pre_forward()
 
         if f_layer is not None:
             with f_layer.get_fp8_context():
@@ -299,6 +336,11 @@ class TransformerLayerSchedulePlan:
         # of the first layer) for overlapping with the p2p comm.
         if b_layer is not None and not is_last_layer_in_bwd:
             b_layer.pre_dispatch_computation.backward_dw()
+
+        # Delay releasing forward-layer parameters. The forward and backward layers may
+        # be the same, and backward pre-dispatch still needs to read those parameters.
+        if f_layer and isinstance(f_layer.layer, FsdpModule):
+            f_layer.layer.post_forward()
 
         return f_input, b_grad
 
@@ -540,6 +582,17 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         Returns:
             The output of the forward pass.
         """
+        f_model = f_schedule_plan.state.model if f_schedule_plan else None
+        b_model = b_schedule_plan.state.model if b_schedule_plan else None
+
+        # The schedule model may be an adapter; resolve its root FSDP module.
+        root_fsdp = _resolve_fsdp_root(f_model) or _resolve_fsdp_root(b_model)
+
+        # The root owns shared parameters used by both interleaved passes. Initialize
+        # its lifecycle once so it remains unsharded until all root gradients are ready.
+        if root_fsdp is not None:
+            root_fsdp.pre_backward()
+
         f_input = None
         if f_schedule_plan:
             # pp output send/receive sync
@@ -623,9 +676,15 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # post process forward
         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
             f_input = f_schedule_plan.post_process.forward(f_input)
+
         # pre process backward
         if b_schedule_plan is not None:
             b_schedule_plan.pre_process.backward(b_grad)
+
+        # Order gradient consumers (optimizer) after the root unit's finalize
+        # reduce-scatter, which the parameter-readiness counter launched.
+        if root_fsdp is not None:
+            root_fsdp.context.current_stream().wait_stream(root_fsdp.context.reduce_scatter_stream)
 
         if f_schedule_plan:
             f_schedule_plan.wait_current_stream()

@@ -219,22 +219,36 @@ class FsdpParameterGroup:
             if parameter.is_meta:
                 # A meta Parameter cannot set .data to a real tensor because their
                 # TensorImpl types are incompatible, so swap in a materialized Parameter.
-                # This may be problematic if attributes from the original Parameter need
-                # to be copied to the unsharded Parameter.
+                # swap_tensors also swaps __dict__, so preserve module-specific parameter
+                # metadata such as TE's delayed-wgrad ``skip_backward_post_hook`` marker.
+                parameter_attributes = parameter.__dict__.copy()
                 materialized_parameter = nn.Parameter(
                     unsharded_tensor, requires_grad=parameter.requires_grad
                 )
                 torch.utils.swap_tensors(parameter, materialized_parameter)
+                parameter.__dict__.update(parameter_attributes)
             else:
                 parameter.data = unsharded_tensor
                 parameter.grad = None
+            # TE's delayed-wgrad (skip_backward_post_hook) path computes the
+            # weight gradient in FP32 (fused grouped-GEMM backward_dw) and assigns it directly
+            # to the FP32 main-weight view, which PyTorch's grad_dtype check (BF16, from
+            # main_grads_dtype) would otherwise reject (RuntimeError: float grad to BF16
+            # grad_dtype).
+            if getattr(parameter, "skip_backward_post_hook", False):
+                parameter.grad_dtype = None
             # Parameter-owned markers must not retain their FSDP module tree.
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
-            if main_grad_dtype:
+            # Same as above -- for delayed-wgrad params the fused grouped-GEMM
+            # backward_dw assigns an FP32 wgrad to this FP32 view, so we relax grad_dtype to
+            # None to avoid the BF16 grad_dtype rejection.
+            if getattr(parameter, "skip_backward_post_hook", False):
+                sharded_parameter.grad_dtype = None
+            elif main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
             setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
             fsdp_parameters.append(
@@ -351,9 +365,15 @@ class FsdpParameterGroup:
             fsdp_parameter.unsharded.grad = None
 
     def _has_sharded_grads(self) -> bool:
+        # Delayed-wgrad parameters (TE's ``skip_backward_post_hook``) materialize
+        # their gradient in ``backward_dw()`` on a separate stream and are consumed
+        # from ``unsharded.grad``; their ``sharded.grad`` is legitimately ``None``
+        # at reduce time, so exclude them from the all-set-or-all-None invariant.
         has_any_grad = False
         has_any_missing_grad = False
         for fsdp_parameter in self.fsdp_parameters:
+            if getattr(fsdp_parameter.unsharded, "skip_backward_post_hook", False):
+                continue
             if fsdp_parameter.sharded.grad is None:
                 has_any_missing_grad = True
             else:

@@ -4364,11 +4364,17 @@ def train(
     config.timers = timers
     if isinstance(
         model[0], (FullyShardedDataParallelV1, FullyShardedDataParallelV2, DDP)
-    ) and args.overlap_grad_reduce:
-        assert config.no_sync_func is None, (
-            'When overlap_grad_reduce is True, config.no_sync_func must be None; '
-            'a custom no_sync_func is not supported when overlapping grad-reduce'
-        )
+    ) and (
+        args.overlap_grad_reduce or args.overlap_moe_expert_parallel_comm
+    ):
+        # For MFSDP v2 the 1F1B EP-overlap schedule needs no_sync to toggle
+        # is_last_microbatch so gradient reduce-scatters accumulate across
+        # non-final microbatches instead of finalizing on every backward.
+        if config.no_sync_func is not None and args.overlap_grad_reduce:
+            raise ValueError(
+                'When overlap_grad_reduce is True, config.no_sync_func must be None; '
+                'a custom no_sync_func is not supported when overlapping grad-reduce'
+            )
         config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:
             config.no_sync_func = config.no_sync_func[0]
