@@ -3,6 +3,7 @@
 import dataclasses
 import subprocess
 import sys
+import warnings
 from argparse import ArgumentParser
 from types import SimpleNamespace
 
@@ -21,6 +22,7 @@ from megatron.core.inference.config import (
 )
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
@@ -135,6 +137,87 @@ class TestInferenceConfig:
         )
 
         assert MambaInferenceStateConfig.from_model(model) is not None
+
+    def test_deprecated_layer_type_list_is_normalized_to_layer_configs(self):
+        """Legacy positional construction produces complete, independent layer configs."""
+        root_config = TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4)
+
+        with pytest.warns(
+            DeprecationWarning,
+            match=r"DEPRECATED\(layer_type_list\): please use `layer_config_list` instead",
+        ):
+            state_config = MambaInferenceStateConfig(
+                [Symbols.MAMBA, Symbols.ATTENTION],
+                (16, 4),
+                (2, 8, 16),
+                torch.bfloat16,
+                torch.bfloat16,
+            )
+
+        layer_config_list = state_config.normalize_layer_config_list(root_config)
+
+        assert [type(layer_config) for layer_config in layer_config_list] == [
+            MambaLayerConfig,
+            AttentionLayerConfig,
+        ]
+        assert all(
+            layer_config.hidden_size == root_config.hidden_size
+            for layer_config in layer_config_list
+        )
+        assert all(layer_config is not root_config for layer_config in layer_config_list)
+        assert len({id(layer_config) for layer_config in layer_config_list}) == 2
+        assert state_config.layer_config_list is layer_config_list
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            assert state_config.normalize_layer_config_list(root_config) is layer_config_list
+
+    def test_layer_config_list_is_preserved_without_deprecation_warning(self):
+        """The config-list path preserves the supplied config objects."""
+        root_config = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
+        layer_config_list = [MambaLayerConfig.from_config(root_config)]
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            state_config = MambaInferenceStateConfig(
+                layer_type_list=None,
+                conv_states_shape=(16, 4),
+                ssm_states_shape=(2, 8, 16),
+                conv_states_dtype=torch.bfloat16,
+                ssm_states_dtype=torch.bfloat16,
+                layer_config_list=layer_config_list,
+            )
+
+        assert state_config.normalize_layer_config_list(root_config) is layer_config_list
+
+    @pytest.mark.parametrize(
+        ("layer_type_list", "layer_config_list"),
+        [(None, None), ([Symbols.MAMBA], [object.__new__(MambaLayerConfig)])],
+    )
+    def test_layer_inputs_are_mutually_exclusive(self, layer_type_list, layer_config_list):
+        """Exactly one layer representation must be supplied."""
+        with pytest.raises(
+            ValueError, match="Exactly one of layer_type_list or layer_config_list must be provided"
+        ):
+            MambaInferenceStateConfig(
+                layer_type_list=layer_type_list,
+                conv_states_shape=(16, 4),
+                ssm_states_shape=(2, 8, 16),
+                conv_states_dtype=torch.bfloat16,
+                ssm_states_dtype=torch.bfloat16,
+                layer_config_list=layer_config_list,
+            )
+
+    @pytest.mark.parametrize("layer_type_list", [[Symbols.MAMBA * 2], [1]])
+    def test_deprecated_layer_type_list_requires_single_character_symbols(self, layer_type_list):
+        """Malformed legacy entries fail before normalization."""
+        with pytest.raises(ValueError, match="Each entry in layer_type_list must be a single"):
+            MambaInferenceStateConfig(
+                layer_type_list=layer_type_list,
+                conv_states_shape=(16, 4),
+                ssm_states_shape=(2, 8, 16),
+                conv_states_dtype=torch.bfloat16,
+                ssm_states_dtype=torch.bfloat16,
+            )
 
     def test_mutual_exclusivity_with_transformer_config(self):
         """
@@ -479,6 +562,7 @@ class TestSSMChunkAlignment:
     def test_alignment_defaults_to_the_mamba_chunk_size(self):
         """Hand-built configs that predate the field keep their old behaviour."""
         config = MambaInferenceStateConfig(
+            layer_type_list=None,
             layer_config_list=[object.__new__(MambaLayerConfig)],
             conv_states_shape=(16, 4),
             ssm_states_shape=(2, 8, 16),

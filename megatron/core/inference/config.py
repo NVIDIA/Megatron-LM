@@ -7,6 +7,7 @@ from typing import List, Literal, Optional, Sequence, Tuple
 
 import torch
 
+from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
@@ -24,8 +25,12 @@ class MambaInferenceStateConfig:
     mixing these. Once the kernels have been updated we can simplify this code.
     """
 
-    layer_config_list: Sequence[TransformerConfig]
-    """Per-layer configs used to derive dynamic inference cache indexing."""
+    layer_type_list: List[str] | None
+    """Deprecated list of layer symbols retained for backwards compatibility.
+
+    Use ``layer_config_list`` instead. Legacy symbols are converted to independent
+    per-layer configs when dynamic inference is initialized with the model config.
+    """
 
     conv_states_shape: Tuple[int]
     """Recurrent mixer's conv state shape per request."""
@@ -62,9 +67,42 @@ class MambaInferenceStateConfig:
     model has none. Sizes the GDP chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
 
+    layer_config_list: Sequence[TransformerConfig] | None = None
+    """Per-layer configs used to derive dynamic inference cache indexing."""
+
     def __post_init__(self):
+        if (self.layer_type_list is None) == (self.layer_config_list is None):
+            raise ValueError("Exactly one of layer_type_list or layer_config_list must be provided")
+        if self.layer_type_list is not None:
+            if any(
+                not isinstance(layer_symbol, str) or len(layer_symbol) != 1
+                for layer_symbol in self.layer_type_list
+            ):
+                raise ValueError("Each entry in layer_type_list must be a single layer symbol")
+            warnings.warn(
+                "DEPRECATED(layer_type_list): please use `layer_config_list` instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if self.ssm_chunk_alignment is None:
             self.ssm_chunk_alignment = self.mamba_chunk_size
+
+    def normalize_layer_config_list(self, config: TransformerConfig) -> Sequence[TransformerConfig]:
+        """Return per-layer configs, converting deprecated layer symbols once if needed.
+
+        Args:
+            config: Normalized model config to copy into each converted layer config.
+
+        Returns:
+            Per-layer configs in layer order.
+        """
+        if self.layer_config_list is None:
+            if self.layer_type_list is None:
+                raise ValueError(
+                    "Exactly one of layer_type_list or layer_config_list must be provided"
+                )
+            self.layer_config_list = validate_segment_layers(''.join(self.layer_type_list), config)
+        return self.layer_config_list
 
     @classmethod
     def from_model(
@@ -134,6 +172,7 @@ class MambaInferenceStateConfig:
                 ssm_chunk_alignment = chunking.inference_chunk_size
                 gdp_num_householder = chunking.num_householder
             return cls(
+                layer_type_list=None,
                 layer_config_list=list(layer_config_list),
                 conv_states_shape=mamba_conv_states_shape,
                 ssm_states_shape=mamba_ssm_states_shape,

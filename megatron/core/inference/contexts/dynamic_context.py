@@ -429,6 +429,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.is_hybrid_model = mamba_inference_state_config is not None
         self.gdp_num_householder = 0
         if self.is_hybrid_model:
+            layer_config_list = mamba_inference_state_config.normalize_layer_config_list(
+                model_config
+            )
             self.mamba_conv_states_shape = mamba_inference_state_config.conv_states_shape
             self.mamba_ssm_states_shape = mamba_inference_state_config.ssm_states_shape
             self.mamba_conv_states_dtype = mamba_inference_state_config.conv_states_dtype
@@ -454,9 +457,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Mamba and GDN use the same slot-indexed recurrent-state cache contract. Build
             # one map in global layer order; independently generated per-symbol maps both
             # start at zero and would alias if they were simply unioned.
-            layer_maps = get_layer_maps_from_layer_config_list(
-                mamba_inference_state_config.layer_config_list
-            )
+            layer_maps = get_layer_maps_from_layer_config_list(layer_config_list)
             attention_layer_map = layer_maps[Symbols.ATTENTION]
             dsa_layer_map = layer_maps[Symbols.DS_ATTENTION]
             recurrent_global_layer_indices = (

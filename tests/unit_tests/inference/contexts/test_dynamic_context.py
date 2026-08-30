@@ -18,6 +18,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
@@ -100,6 +101,7 @@ class TestDynamicContext:
         max_tokens,
         is_hybrid_model=False,
         layer_config_list=None,
+        layer_type_list=None,
         paused_buffer_size_gb=None,
         num_cuda_graphs=None,
         num_speculative_tokens=0,
@@ -107,18 +109,19 @@ class TestDynamicContext:
         max_requests: int = None,
     ):
         if is_hybrid_model:
-            if layer_config_list is None:
+            if layer_config_list is None and layer_type_list is None:
                 layer_config_list = make_layer_configs(
                     MambaLayerConfig, MLPLayerConfig, AttentionLayerConfig, MLPLayerConfig
                 )
             mamba_conv_states_shape = (544, 4)
             mamba_ssm_states_shape = (8, 64, 16)
             mamba_inference_state_config = MambaInferenceStateConfig(
-                layer_config_list,
-                mamba_conv_states_shape,
-                mamba_ssm_states_shape,
-                params_dtype,
-                params_dtype,
+                layer_type_list=layer_type_list,
+                conv_states_shape=mamba_conv_states_shape,
+                ssm_states_shape=mamba_ssm_states_shape,
+                conv_states_dtype=params_dtype,
+                ssm_states_dtype=params_dtype,
+                layer_config_list=layer_config_list,
             )
         else:
             mamba_inference_state_config = None
@@ -206,6 +209,31 @@ class TestDynamicContext:
             is_hybrid_model=True,
             layer_config_list=make_layer_configs(MambaLayerConfig, DSALayerConfig, MoELayerConfig),
         )
+
+        assert dynamic_context.num_attention_layers == 1
+        assert dynamic_context.num_mamba_layers == 1
+        assert dynamic_context.layer_map == {0: 0, 1: 0}
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_hybrid_cache_maps_normalize_deprecated_layer_type_list(self):
+        """Dynamic inference converts legacy symbols before deriving cache maps."""
+        with pytest.warns(
+            DeprecationWarning,
+            match=r"DEPRECATED\(layer_type_list\): please use `layer_config_list` instead",
+        ):
+            dynamic_context = self._get_dynamic_context(
+                params_dtype=torch.float32,
+                num_layers=3,
+                kv_channels=8,
+                num_attention_heads=2,
+                max_sequence_length=512,
+                buffer_size_gb=0.03,
+                block_size_tokens=128,
+                max_tokens=None,
+                is_hybrid_model=True,
+                layer_type_list=[Symbols.MAMBA, Symbols.DS_ATTENTION, Symbols.MOE],
+            )
 
         assert dynamic_context.num_attention_layers == 1
         assert dynamic_context.num_mamba_layers == 1
@@ -2013,19 +2041,25 @@ class TestDynamicContext:
 
         if rank == 0:
             mamba_inference_state_config = MambaInferenceStateConfig(
-                make_layer_configs(*([MambaLayerConfig] + [AttentionLayerConfig] * 4)),
-                mamba_conv_states_shape,
-                mamba_ssm_states_shape,
-                params_dtype,
-                params_dtype,
+                layer_type_list=None,
+                conv_states_shape=mamba_conv_states_shape,
+                ssm_states_shape=mamba_ssm_states_shape,
+                conv_states_dtype=params_dtype,
+                ssm_states_dtype=params_dtype,
+                layer_config_list=make_layer_configs(
+                    *([MambaLayerConfig] + [AttentionLayerConfig] * 4)
+                ),
             )
         else:
             mamba_inference_state_config = MambaInferenceStateConfig(
-                make_layer_configs(*([MambaLayerConfig] * 4 + [AttentionLayerConfig])),
-                mamba_conv_states_shape,
-                mamba_ssm_states_shape,
-                params_dtype,
-                params_dtype,
+                layer_type_list=None,
+                conv_states_shape=mamba_conv_states_shape,
+                ssm_states_shape=mamba_ssm_states_shape,
+                conv_states_dtype=params_dtype,
+                ssm_states_dtype=params_dtype,
+                layer_config_list=make_layer_configs(
+                    *([MambaLayerConfig] * 4 + [AttentionLayerConfig])
+                ),
             )
 
         context = DynamicInferenceContext(
@@ -2173,11 +2207,12 @@ class TestDynamicContext:
         mamba_conv_states_shape = (544, 4)
         mamba_ssm_states_shape = (8, 64, 16)
         mamba_config = MambaInferenceStateConfig(
-            layer_config_list,
-            mamba_conv_states_shape,
-            mamba_ssm_states_shape,
-            params_dtype,
-            params_dtype,
+            layer_type_list=None,
+            conv_states_shape=mamba_conv_states_shape,
+            ssm_states_shape=mamba_ssm_states_shape,
+            conv_states_dtype=params_dtype,
+            ssm_states_dtype=params_dtype,
+            layer_config_list=layer_config_list,
         )
 
         context = DynamicInferenceContext(
@@ -2255,11 +2290,12 @@ class TestDynamicContext:
         mamba_conv_states_shape = (544, 4)
         mamba_ssm_states_shape = (8, 64, 16)
         mamba_config = MambaInferenceStateConfig(
-            layer_config_list,
-            mamba_conv_states_shape,
-            mamba_ssm_states_shape,
-            params_dtype,
-            params_dtype,
+            layer_type_list=None,
+            conv_states_shape=mamba_conv_states_shape,
+            ssm_states_shape=mamba_ssm_states_shape,
+            conv_states_dtype=params_dtype,
+            ssm_states_dtype=params_dtype,
+            layer_config_list=layer_config_list,
         )
 
         context = DynamicInferenceContext(
