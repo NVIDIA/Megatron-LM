@@ -23,6 +23,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
     AsyncScheduleMode,
+    CudaGraphSizingDistribution,
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
@@ -348,6 +349,10 @@ class DynamicEngineTestConfig:
     num_cuda_graphs: int = None
     use_cuda_graphs_for_non_decode_steps: bool = True
     cuda_graph_all_prefills: bool = False
+    # Defaults to the production default (HYBRID: exponential prefill/mixed graphs,
+    # linear decode-only graphs). Tests that assert on exact token counts can pin a
+    # single distribution here.
+    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = CudaGraphSizingDistribution.HYBRID
     fp8: bool = False
     model_provider: str = "gpt"
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
@@ -528,6 +533,7 @@ class DynamicInferenceEngineTestBase:
                     test_config.use_cuda_graphs_for_non_decode_steps
                 ),
                 cuda_graph_all_prefills=test_config.cuda_graph_all_prefills,
+                cuda_graph_sizing_distribution=test_config.cuda_graph_sizing_distribution,
                 buffer_size_gb=test_config.context_buffer_size_gb,
                 paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
                 block_size_tokens=test_config.context_block_size_tokens,
@@ -1695,7 +1701,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     def test_cuda_graph_token_counts(self, use_non_decode: bool) -> None:
         """Test initialization of `cuda_graph_token_counts` in dynamic context."""
 
-        # Exponential-decay graph distribution (halve from max down to tp_size).
+        # Exponential-decay graph distribution (halve from max down to tp_size). Pinned
+        # explicitly below: the production default is HYBRID, which spaces the
+        # decode-only family linearly instead and so yields different token counts.
         # decode-only path: cuda_graph_max_tokens = max_requests * (spec+1) = 80.
         # non-decode path: cuda_graph_max_tokens = self.max_tokens (DEFAULT 16384);
         # most large prefill sizes are filtered by is_valid because
@@ -1729,6 +1737,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     num_cuda_graphs=num_cuda_graphs,
                     use_cuda_graphs_for_non_decode_steps=use_non_decode,
                     cuda_graph_all_prefills=use_non_decode,
+                    cuda_graph_sizing_distribution=CudaGraphSizingDistribution.EXPONENTIAL,
                 )
             )
             actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts
