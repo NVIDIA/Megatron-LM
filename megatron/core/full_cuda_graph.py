@@ -216,6 +216,32 @@ class FullCudaGraphWrapper:
         training_str = 'training' if training else 'validation'
         curr_iteration = self.curr_iter(training_str)
         if curr_iteration == self.cuda_graph_warmup_steps:
+            from megatron.core.transformer.cuda_graphs import (
+                _prepare_dsa_metric_tracker_for_capture,
+                _restore_metric_tracker,
+                _snapshot_metric_tracker,
+            )
+            from megatron.core.transformer.experimental_attention_variant.dsa import (
+                DSAIndexerLossLoggingHelper,
+            )
+
+            pg_collection = kwargs.get('pg_collection')
+            prepare_dsa_tracker = True
+            if pg_collection is not None and hasattr(
+                pg_collection, "get_language_model_collection"
+            ):
+                prepare_dsa_tracker = pg_collection.has_language_model()
+                pp_group = (
+                    pg_collection.get_language_model_collection().pp
+                    if prepare_dsa_tracker
+                    else None
+                )
+            else:
+                pp_group = getattr(pg_collection, "pp", None)
+            if prepare_dsa_tracker:
+                _prepare_dsa_metric_tracker_for_capture(model, pp_group)
+            dsa_metric_tracker = DSAIndexerLossLoggingHelper.tracker
+            dsa_metric_snapshot = _snapshot_metric_tracker(dsa_metric_tracker)
             logger.info(f'Capture CUDA graph for {training_str}!!!')
             if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
                 torch.autograd.graph.set_override_stale_capture_stream(True)
@@ -251,6 +277,20 @@ class FullCudaGraphWrapper:
                 )
             torch.cuda.synchronize()
             torch.distributed.barrier()
+            captured_reduction_metadata = {
+                key: dsa_metric_tracker[key]
+                for key in ("reduce_group", "avg_group")
+                if key in dsa_metric_tracker
+            }
+            # Recording executes the graph body once. Restore the pre-capture metric values
+            # before the replay below so the capture iteration is accounted exactly once while
+            # retaining the storage referenced by the graph. With zero eager warmup, reduction
+            # groups are first discovered by Python during capture and must survive because
+            # replay only executes the recorded GPU work.
+            _restore_metric_tracker(dsa_metric_tracker, dsa_metric_snapshot)
+            for key, value in captured_reduction_metadata.items():
+                if dsa_metric_snapshot[1].get(key) is None:
+                    dsa_metric_tracker[key] = value
             logger.info(f'CUDA graph capture done for {training_str}!!!')
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)

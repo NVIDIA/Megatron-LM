@@ -4,6 +4,7 @@ import gc
 import os
 import sys
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -40,6 +41,9 @@ from megatron.core.transformer.cuda_graphs import (
     TECudaGraphHelper,
     _CudagraphGlobalRecord,
     _layer_is_graphable,
+    _prepare_dsa_metric_tracker_for_capture,
+    _restore_metric_tracker,
+    _snapshot_metric_tracker,
 )
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -115,6 +119,134 @@ def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
 
 
 class TestCudaGraphConfigAndArguments:
+    def test_graph_capture_preallocates_pp_agreed_dsa_tracker(self, monkeypatch):
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossLoggingHelper,
+        )
+
+        class MetricModule(torch.nn.Module):
+            logs_dsa_indexer_loss = True
+
+            def __init__(self):
+                super().__init__()
+                self.layer_number = 5
+                self.config = SimpleNamespace(num_layers=2, mtp_num_layers=1)
+
+        model = torch.nn.Module()
+        model.add_module("metric", MetricModule())
+        pp_group = object()
+        calls = []
+        tracker = {"values": torch.zeros(2, device="cuda"), "agreed_size": 2}
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", tracker)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+        def pp_max(tensor, op=None, group=None):
+            calls.append((op, group))
+            tensor.fill_(7)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", pp_max)
+
+        assert _prepare_dsa_metric_tracker_for_capture([model], pp_group) == 7
+        assert calls == [(torch.distributed.ReduceOp.MAX, pp_group)]
+        assert tracker["values"].shape == (7,)
+        assert tracker["agreed_size"] == 7
+        assert tracker["capture_prepared_size"] == 7
+
+        captured_storage = tracker["values"]
+        assert _prepare_dsa_metric_tracker_for_capture([model], pp_group) == 7
+        assert tracker["values"] is captured_storage
+        assert len(calls) == 1
+
+    def test_local_capture_restores_existing_metric_tracker_in_place(self):
+        reduce_group = object()
+        values = torch.tensor([3.0, 5.0])
+        tracker = {"values": values, "reduce_group": reduce_group, "agreed_size": 2}
+        snapshot = _snapshot_metric_tracker(tracker)
+
+        tracker["values"].add_(7.0)
+        tracker["reduce_group"] = object()
+        tracker["capture_only"] = True
+        _restore_metric_tracker(tracker, snapshot)
+
+        assert tracker["values"] is values
+        torch.testing.assert_close(values, torch.tensor([3.0, 5.0]))
+        assert tracker["reduce_group"] is reduce_group
+        assert tracker["agreed_size"] == 2
+        assert "capture_only" not in tracker
+
+    def test_local_capture_zeros_new_metric_tracker_storage(self):
+        tracker = {}
+        snapshot = _snapshot_metric_tracker(tracker)
+
+        values = torch.tensor([7.0, 11.0])
+        avg_group = object()
+        tracker.update({"values": values, "avg_group": avg_group})
+        _restore_metric_tracker(tracker, snapshot)
+
+        assert tracker["values"] is values
+        torch.testing.assert_close(values, torch.zeros(2))
+        assert tracker["avg_group"] is avg_group
+
+    def test_reset_after_capture_cleans_dsa_loss_tracker(self, monkeypatch):
+        from importlib import import_module
+
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossLoggingHelper,
+        )
+        from megatron.core.transformer.moe import moe_logging
+
+        finalize_model_grads_module = import_module(
+            "megatron.core.distributed.finalize_model_grads"
+        )
+
+        reduce_group = object()
+        avg_group = object()
+        values = torch.tensor([7.0, 11.0])
+        dsa_tracker = {
+            'values': values,
+            'reduce_group': reduce_group,
+            'avg_group': avg_group,
+            'agreed_size': 2,
+        }
+        calls = []
+
+        class FakeModelChunk:
+            @staticmethod
+            def zero_grad_buffer():
+                calls.append('zero_grad_buffer')
+
+        class FakeOptimizer:
+            @staticmethod
+            def zero_grad():
+                calls.append('zero_grad')
+
+        helper = object.__new__(TECudaGraphHelper)
+        helper.model = [FakeModelChunk()]
+        helper.optimizers = [FakeOptimizer()]
+        helper.config = SimpleNamespace()
+
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, 'tracker', dsa_tracker)
+        monkeypatch.setattr(
+            moe_logging,
+            'get_moe_metrics_tracker',
+            lambda: SimpleNamespace(clear=lambda: calls.append('clear_moe_tracker')),
+        )
+        monkeypatch.setattr(
+            finalize_model_grads_module,
+            'reset_model_temporary_tensors',
+            lambda config, model: calls.append(('reset_model_temporary_tensors', config, model)),
+        )
+
+        helper._reset_after_capture()
+
+        assert calls[:3] == ['zero_grad_buffer', 'zero_grad', 'clear_moe_tracker']
+        assert calls[3] == ('reset_model_temporary_tensors', helper.config, helper.model)
+        assert dsa_tracker['values'] is values
+        assert torch.equal(dsa_tracker['values'], torch.zeros(2))
+        assert dsa_tracker['reduce_group'] is reduce_group
+        assert dsa_tracker['avg_group'] is avg_group
+        assert dsa_tracker['agreed_size'] == 2
+
     def test_local_impl_defaults_to_layer_scope(self):
         cfg = _base_cuda_graph_config(cuda_graph_impl='local')
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer

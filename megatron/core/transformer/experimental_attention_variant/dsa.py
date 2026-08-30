@@ -295,6 +295,19 @@ class DSAIndexerLossLoggingHelper:
     tracker = {}
 
     @staticmethod
+    def ensure_tracker_size(num_layers: int) -> None:
+        """Ensure the tracker uses one storage large enough for all indexed layers."""
+        tracker = DSAIndexerLossLoggingHelper.tracker
+        if "values" not in tracker:
+            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        elif tracker["values"].shape[0] < num_layers:
+            grown = torch.zeros(
+                num_layers, device=tracker["values"].device, dtype=tracker["values"].dtype
+            )
+            grown[: tracker["values"].shape[0]] = tracker["values"]
+            tracker["values"] = grown
+
+    @staticmethod
     def save_loss_to_tracker(
         loss: torch.Tensor,
         layer_number: int,
@@ -321,14 +334,7 @@ class DSAIndexerLossLoggingHelper:
         # each MTP depth contains multiple hybrid layers) don't index out of bounds.
         # Grow lazily; with PP=1 every rank takes the same path, so sizes stay consistent.
         needed = max(num_layers, layer_number)
-        if "values" not in tracker:
-            tracker["values"] = torch.zeros(needed, device=torch.cuda.current_device())
-        elif tracker["values"].shape[0] < needed:
-            grown = torch.zeros(
-                needed, device=tracker["values"].device, dtype=tracker["values"].dtype
-            )
-            grown[: tracker["values"].shape[0]] = tracker["values"]
-            tracker["values"] = grown
+        DSAIndexerLossLoggingHelper.ensure_tracker_size(needed)
         tracker["values"][layer_number - 1] += loss.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
@@ -345,7 +351,11 @@ class DSAIndexerLossLoggingHelper:
         tracker["avg_group"] = avg_group
 
     @staticmethod
-    def reduce_loss_in_tracker(num_layers: Optional[int] = None):
+    def reduce_loss_in_tracker(
+        num_layers: Optional[int] = None,
+        dynamic_cp_parent_group: Optional[torch.distributed.ProcessGroup] = None,
+        configured_cp_size: Optional[int] = None,
+    ):
         """Collect and reduce the indexer losses across ranks.
 
         Cross-PP `all_reduce` must be invoked on every rank in the pipeline-parallel group,
@@ -356,9 +366,19 @@ class DSAIndexerLossLoggingHelper:
         Args:
             num_layers: Total number of decoder layers; required to lazily initialize the
                 tracker on ranks where no indexer layer ran.
+            dynamic_cp_parent_group: Stable physical DP x CP group for Dynamic-CP metrics.
+                Supplying it on every PP rank makes stages without indexer layers use the
+                same reduction domain after the PP reduction.
+            configured_cp_size: Configured/static CP width. Dynamic CP accumulates raw local
+                token sums, so multiplying by this value before the physical DP x CP average
+                preserves the nominal global-batch weighting of static CP-SUM then DP-AVG.
         """
         tracker = DSAIndexerLossLoggingHelper.tracker
         pp_group = parallel_state.get_pipeline_model_parallel_group()
+        if dynamic_cp_parent_group is not None and (
+            configured_cp_size is None or configured_cp_size < 1
+        ):
+            raise ValueError("configured_cp_size must be positive for Dynamic CP logging.")
 
         # Agree on a consistent tracker size across the PP group BEFORE the collective.
         # Ranks owning indexer layers may have grown the tracker via save_loss_to_tracker
@@ -394,18 +414,24 @@ class DSAIndexerLossLoggingHelper:
         values = tracker["values"]
 
         torch.distributed.all_reduce(values, group=pp_group)
-        # Reduce indexer losses across ranks.
-        if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-        if tracker.get('avg_group') is not None:
+        if dynamic_cp_parent_group is not None:
+            values.mul_(configured_cp_size)
             torch.distributed.all_reduce(
-                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                values, group=dynamic_cp_parent_group, op=torch.distributed.ReduceOp.AVG
             )
-        torch.distributed.all_reduce(
-            values,
-            group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-            op=torch.distributed.ReduceOp.AVG,
-        )
+        else:
+            # Reduce indexer losses across ranks.
+            if tracker.get('reduce_group') is not None:
+                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+            if tracker.get('avg_group') is not None:
+                torch.distributed.all_reduce(
+                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                )
+            torch.distributed.all_reduce(
+                values,
+                group=parallel_state.get_data_parallel_group(with_context_parallel=False),
+                op=torch.distributed.ReduceOp.AVG,
+            )
 
     @staticmethod
     def track_indexer_metrics(
@@ -418,6 +444,8 @@ class DSAIndexerLossLoggingHelper:
         num_layers: Optional[int] = None,
         num_indexer_layers: Optional[int] = None,
         preserve_groups: bool = False,
+        dynamic_cp_parent_group: Optional[torch.distributed.ProcessGroup] = None,
+        configured_cp_size: Optional[int] = None,
     ):
         """Track the sparse attention indexer metrics for logging.
 
@@ -432,8 +460,16 @@ class DSAIndexerLossLoggingHelper:
             num_indexer_layers: Number of layers that own an indexer. Defaults to
                 the tracker size when every tracked layer owns one.
             preserve_groups: Keep reduction groups after logging for CUDA Graph runs.
+            dynamic_cp_parent_group: Stable physical DP x CP group used by every PP rank
+                when Dynamic CP is enabled.
+            configured_cp_size: Configured/static CP width used to normalize Dynamic-CP
+                raw local token sums.
         """
-        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(num_layers=num_layers)
+        DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
+            num_layers=num_layers,
+            dynamic_cp_parent_group=dynamic_cp_parent_group,
+            configured_cp_size=configured_cp_size,
+        )
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
             return
@@ -1936,6 +1972,7 @@ class DSAttention(MegatronModule):
 
     consumes_absorbed_v_up_projection = True
     requires_dsa_inputs = True
+    logs_dsa_indexer_loss = True
     _HOLDER_ATTR = "_dsa_index_share_topk_holder"
     _LENGTH_HOLDER_ATTR = "_dsa_index_share_topk_length_holder"
 
