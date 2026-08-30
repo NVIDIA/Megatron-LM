@@ -23,7 +23,6 @@ class MLPLayer(TransformerLayer):
         add_layer_offset: bool = True,
         name: str | None = None,
     ):
-        layer_name = name
         super().__init__(
             config=config,
             submodules=submodules,
@@ -31,5 +30,5 @@ class MLPLayer(TransformerLayer):
             hidden_dropout=hidden_dropout,
             pg_collection=pg_collection,
             add_layer_offset=add_layer_offset,
-            name=layer_name,
+            name=name,
         )
