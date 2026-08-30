@@ -234,3 +234,40 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
             fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     assert model.inner.context is first_context
+
+
+def test_custom_forward_backward_hooks_skips_module_hooks(distributed_setup):
+    """A custom schedule may drive the lifecycle; module-level hooks are suppressed.
+
+    ``custom_forward_backward_hooks`` is the integration flag: when set, the
+    standard module-level forward/backward hooks are suppressed so a schedule
+    (e.g. the MCore 1F1B EP-overlap adapter) can drive the FSDP lifecycle itself.
+    The state-dict load hook is always registered.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Sequential(nn.Linear(4, 4, bias=False)).to(device)
+
+    with fully_shard_context(device=device, custom_forward_backward_hooks=True):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    assert not model._forward_pre_hooks
+    assert not model._forward_hooks
+    assert not model._backward_pre_hooks
+    assert not model._backward_hooks
+    assert model._load_state_dict_pre_hooks
+
+
+def test_custom_forward_backward_hooks_relaxes_phase_transitions(distributed_setup):
+    """A custom schedule may transition phases that the strict invariants forbid."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Sequential(nn.Linear(4, 4, bias=False)).to(device)
+
+    with fully_shard_context(device=device, custom_forward_backward_hooks=True):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+        # An interleaved schedule drives pre_backward/pre_forward in an order the
+        # strict pairwise invariants reject; the flag must relax the check.
+        model.phase = model.Phase.FORWARD
+        model.phase = model.Phase.BACKWARD
+        assert model.phase is model.Phase.BACKWARD

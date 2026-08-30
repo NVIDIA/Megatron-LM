@@ -139,6 +139,41 @@ class TestMcoreAdapterDense:
 
         assert fully_shard_context_calls == [True]
 
+    def test_no_sync_toggles_is_last_microbatch(self):
+        """``no_sync`` suspends per-microbatch gradient finalization."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        layer = _build_layer(config)
+        model = torch.nn.Sequential(layer, torch.nn.Linear(config.hidden_size, config.hidden_size))
+        model = model.to(device="cuda", dtype=config.params_dtype)
+
+        wrapped = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=model,
+            fsdp_unit_modules=[TransformerLayer],
+            pg_collection=self.pg_collection,
+        )
+
+        context = wrapped.module.context
+        assert context.is_last_microbatch is True
+        with wrapped.no_sync():
+            assert context.is_last_microbatch is False
+        assert context.is_last_microbatch is True
+
     @pytest.mark.parametrize("optimizer_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
     def test_build_train_and_step(self, optimizer_cuda_graph):
         config = TransformerConfig(
