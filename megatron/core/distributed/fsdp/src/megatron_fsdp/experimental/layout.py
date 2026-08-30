@@ -21,9 +21,8 @@ from typing import TypeAlias
 
 import torch
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
-
-from .placement import Flat
 
 Shape: TypeAlias = torch.Size | Iterable[int]
 
@@ -35,9 +34,10 @@ class GlobalLayout:
     tensor_shapes: tuple[torch.Size, ...]
     tensor_to_offset: tuple[int, ...]
     size: int
+    block_size: int = 1
 
     @classmethod
-    def build(cls, shapes: Iterable[Shape], dp_size: int) -> "GlobalLayout":
+    def build(cls, shapes: Iterable[Shape], dp_size: int, *, block_size: int = 1) -> "GlobalLayout":
         """Compute global tensor element offsets and padded size.
 
         This is a DBuffer-specific reimplementation of
@@ -46,13 +46,13 @@ class GlobalLayout:
         size is a multiple of ``chunk_size``; DBuffer derives rank-local slices
         later through DTensor placements.
 
-        The computed layout is compatible with Flat, TensorAtomic, and BlockAtomic,
-        even though the latter two are not implemented.
+        The computed layout is compatible with Flat and BlockAtomic.
 
-        ``chunk_size`` is the least common multiple of each tensor's row size
-        (``shape[1:].numel()``). For example, with shapes P0=(2, 6), P1=(4, 4),
-        P2=(4, 4), P3=(1, 2), P4=(1, 6), ``chunk_size = LCM(6, 4, 4, 2, 6) = 12``
-        and a 5-rank DP layout has equal-size rank shards:
+        ``chunk_size`` is the least common multiple of each tensor's block size
+        (``block_size * shape[1:].numel()``). For example, with ``block_size=1``
+        and shapes P0=(2, 6), P1=(4, 4), P2=(4, 4), P3=(1, 2), P4=(1, 6),
+        ``chunk_size = LCM(6, 4, 4, 2, 6) = 12`` and a 5-rank DP layout has
+        equal-size rank shards:
 
         ```
         rank 0 [ 0, 12): | P0 row 0              | P0 row 1               |
@@ -63,21 +63,23 @@ class GlobalLayout:
         ```
 
         The diagram uses four character columns per element; segment widths are
-        proportional. Every chunk boundary is aligned to each tensor's row size,
-        so each DP shard owns full rows even when fragments fill regular-tensor
-        padding gaps.
+        proportional. Every chunk boundary is aligned to each tensor's block size,
+        so each DP shard owns full rows for Flat and whole row blocks for BlockAtomic,
+        even when fragments fill regular-tensor padding gaps.
 
         Args:
             shapes: Logical tensor shapes in tensor-id order.
             dp_size: Data-parallel shard count for this global layout.
+            block_size: Number of dim-0 rows that BlockAtomic keeps together.
 
         Returns:
-            Global layout with row-aligned tensor offsets and a total size padded
-            to a multiple of ``chunk_size * dp_size``, so every rank-local shard
-            length is a multiple of ``chunk_size``.
+            Global layout with block-aligned tensor offsets and a total size padded
+            to a multiple of ``chunk_size * dp_size``.
         """
         if dp_size <= 0:
             raise ValueError(f"DP size must be positive, got {dp_size}.")
+        if block_size <= 0:
+            raise ValueError(f"Block size must be positive, got {block_size}.")
 
         tensor_shapes = tuple(torch.Size(shape) for shape in shapes)
         chunk_size = 1
@@ -87,10 +89,16 @@ class GlobalLayout:
                 raise ValueError(
                     f"Cannot compute a layout for zero-sized non-leading dims: {shape}."
                 )
-            chunk_size = math.lcm(chunk_size, row_size)
+            # Match Transformer Engine MXFP8's whole-block requirement:
+            # https://github.com/NVIDIA/TransformerEngine/blob/0ae8996c9a23901ea55b162c414ecff4ce15b5d2/transformer_engine/pytorch/tensor/mxfp8_tensor.py#L129-L132
+            if shape[0] % block_size != 0:
+                raise ValueError(
+                    f"Tensor dim 0 ({shape[0]}) must be divisible by block size {block_size}."
+                )
+            chunk_size = math.lcm(chunk_size, block_size * row_size)
 
-        # chunk_size is the packing granularity. Since every tensor row size divides it,
-        # DP shard boundaries that are multiples of chunk_size avoid splitting dim-0 rows.
+        # chunk_size is the packing granularity. Since every tensor block size divides it,
+        # DP shard boundaries that are multiples of chunk_size avoid splitting row blocks.
         UNASSIGNED_OFFSET = -1
         tensor_to_offset: list[int] = [UNASSIGNED_OFFSET] * len(tensor_shapes)
         fragment_items = []
@@ -146,11 +154,13 @@ class GlobalLayout:
                 next_offset += (conjugate_numel // chunk_size) * chunk_size
 
             # Fill any remaining gap with fragments, keeping each fragment aligned to
-            # its own row size so dim-0 rows remain contiguous within DP shards.
+            # its block size so row blocks remain contiguous within DP shards.
             for fragment in fragment_items[:]:
                 frag_id, frag_shape = fragment
                 frag_numel = frag_shape.numel()
-                aligned_gap_offset = _pad_to_multiple(gap_offset, non_leading_numel(frag_shape))
+                aligned_gap_offset = _pad_to_multiple(
+                    gap_offset, block_size * non_leading_numel(frag_shape)
+                )
                 if aligned_gap_offset + frag_numel > fragment_gap_end:
                     continue
                 tensor_to_offset[frag_id] = aligned_gap_offset
@@ -159,7 +169,7 @@ class GlobalLayout:
 
         # Fragments that did not fit into regular-tensor gaps are appended at the tail.
         for frag_id, frag_shape in fragment_items:
-            next_offset = _pad_to_multiple(next_offset, non_leading_numel(frag_shape))
+            next_offset = _pad_to_multiple(next_offset, block_size * non_leading_numel(frag_shape))
             tensor_to_offset[frag_id] = next_offset
             next_offset += frag_shape.numel()
 
@@ -167,6 +177,7 @@ class GlobalLayout:
             tensor_shapes=tensor_shapes,
             tensor_to_offset=tuple(tensor_to_offset),
             size=_pad_to_multiple(next_offset, chunk_size * dp_size),
+            block_size=block_size,
         )
 
     def __post_init__(self) -> None:
@@ -198,9 +209,10 @@ class GlobalLayout:
             row_size = non_leading_numel(shape)
             if row_size <= 0:
                 raise AssertionError(f"Tensor {tensor_id} has invalid row size {row_size}.")
-            if start % row_size != 0:
+            alignment = self.block_size * row_size
+            if start % alignment != 0:
                 raise AssertionError(
-                    f"Tensor {tensor_id} offset {start} is not aligned to row size {row_size}."
+                    f"Tensor {tensor_id} offset {start} is not aligned to block size {alignment}."
                 )
 
             end = start + shape.numel()
@@ -228,12 +240,12 @@ class GlobalLayout:
         offset = 0
         numel = self.size
         for axis, placement in reversed(tuple(enumerate(placements))):
-            if not isinstance(placement, Flat):
+            if not isinstance(placement, Shard):
                 continue
             axis_size = mesh.size(axis)
             if numel % axis_size != 0:
                 raise ValueError(
-                    f"Local range size {numel} is not divisible by Flat axis size {axis_size}."
+                    f"Local range size {numel} is not divisible by sharded axis size {axis_size}."
                 )
             shard_size = numel // axis_size
             offset += mesh.get_local_rank(axis) * shard_size
