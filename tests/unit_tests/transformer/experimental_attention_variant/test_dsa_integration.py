@@ -454,8 +454,8 @@ def test_indexer_loss_tracker_grows_for_mtp_layer_numbers():
         helper.tracker.clear()
 
 
-def test_indexer_loss_tracker_weights_mixed_cp_before_parent_average():
-    """A mixed-CP iteration weights subgroup sums for one parent average."""
+def test_indexer_loss_tracker_accumulates_mixed_cp_before_parent_average():
+    """A mixed-CP iteration accumulates local sums before one parent average."""
     helper = dsa_module.DSAIndexerLossLoggingHelper
     reduce_group = object()
     parent_group = object()
@@ -468,18 +468,16 @@ def test_indexer_loss_tracker_weights_mixed_cp_before_parent_average():
             num_layers=1,
             reduce_group=reduce_group,
             dynamic_cp_parent_group=parent_group,
-            dynamic_cp_size=2,
         )
         helper.save_loss_to_tracker(
             loss=torch.tensor(1.0),
             layer_number=1,
             num_layers=1,
             dynamic_cp_parent_group=parent_group,
-            dynamic_cp_size=1,
         )
 
         torch.testing.assert_close(
-            helper.tracker["values"], helper.tracker["values"].new_tensor([7.0])
+            helper.tracker["values"], helper.tracker["values"].new_tensor([4.0])
         )
         assert helper.tracker["dynamic_cp_parent_group"] is parent_group
     finally:
@@ -487,14 +485,14 @@ def test_indexer_loss_tracker_weights_mixed_cp_before_parent_average():
 
 
 def test_indexer_loss_tracker_uses_one_dynamic_cp_parent_average(monkeypatch):
-    """Weighted mixed-CP losses use one stable parent AVG after PP reduction."""
+    """Mixed-CP losses use one stable parent AVG after PP reduction."""
     helper = dsa_module.DSAIndexerLossLoggingHelper
     pp_group = object()
     parent_group = object()
     dp_group = object()
     helper.tracker.clear()
     helper.tracker.update(
-        {"values": torch.tensor([7.0]), "dynamic_cp_parent_group": parent_group, "agreed_size": 1}
+        {"values": torch.tensor([4.0]), "dynamic_cp_parent_group": parent_group, "agreed_size": 1}
     )
     reductions = []
 
@@ -514,7 +512,7 @@ def test_indexer_loss_tracker_uses_one_dynamic_cp_parent_average(monkeypatch):
     try:
         helper.reduce_loss_in_tracker()
 
-        torch.testing.assert_close(helper.tracker["values"], torch.tensor([7.0]))
+        torch.testing.assert_close(helper.tracker["values"], torch.tensor([4.0]))
         assert reductions == [
             (pp_group, None),
             (parent_group, torch.distributed.ReduceOp.AVG),

@@ -1806,7 +1806,7 @@ class CompressedSparseAttention(MegatronModule):
         if self.indexer is not None:
             self.indexer.backward_dw()
 
-    def _save_indexer_loss(self, loss, reduce_group=None, cp_size=1):
+    def _save_indexer_loss(self, loss, reduce_group=None):
         """Save an indexer metric with the stable DCP parent when configured."""
         cp_parent_group = None
         if getattr(self.config, "dynamic_context_parallel", False):
@@ -1819,7 +1819,6 @@ class CompressedSparseAttention(MegatronModule):
             num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
             reduce_group=reduce_group,
             dynamic_cp_parent_group=cp_parent_group,
-            dynamic_cp_size=cp_size,
         )
 
     # ------------------------------------------------------------------
@@ -2892,7 +2891,7 @@ class CompressedSparseAttention(MegatronModule):
                     *indexer_loss_args, tp_group=indexer.pg_collection.tp
                 )
             if indexer_loss_coeff > 0:
-                self._save_indexer_loss(indexer_loss, reduce_group=cp_group, cp_size=cp_size)
+                self._save_indexer_loss(indexer_loss, reduce_group=cp_group)
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
             return output.unsqueeze(1)
 

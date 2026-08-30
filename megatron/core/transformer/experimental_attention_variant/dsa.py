@@ -298,7 +298,6 @@ class DSAIndexerLossLoggingHelper:
         reduce_group: torch.distributed.ProcessGroup = None,
         avg_group: torch.distributed.ProcessGroup = None,
         dynamic_cp_parent_group: torch.distributed.ProcessGroup = None,
-        dynamic_cp_size: int = 1,
     ):
         """Save the indexer loss for logging.
 
@@ -309,7 +308,6 @@ class DSAIndexerLossLoggingHelper:
             reduce_group: The group for reducing the loss.
             avg_group: The group for averaging the loss.
             dynamic_cp_parent_group: Shared parent group for mixed-CP logging.
-            dynamic_cp_size: Runtime CP size used to weight sum-reduced losses.
         """
         # Skip indexer loss logging if layer_number is None.
         if layer_number is None:
@@ -330,8 +328,6 @@ class DSAIndexerLossLoggingHelper:
             grown[: tracker["values"].shape[0]] = tracker["values"]
             tracker["values"] = grown
         tracked_loss = loss.detach()
-        if dynamic_cp_parent_group is not None and reduce_group is not None:
-            tracked_loss = tracked_loss * dynamic_cp_size
         if dynamic_cp_parent_group is not None:
             existing_parent = tracker.get("dynamic_cp_parent_group")
             if existing_parent is not None and existing_parent is not dynamic_cp_parent_group:
@@ -2283,7 +2279,6 @@ class DSAttention(MegatronModule):
                     reduce_group=indexer_reduce_group,
                     avg_group=indexer_avg_group,
                     dynamic_cp_parent_group=dynamic_cp_parent_group,
-                    dynamic_cp_size=cp_size,
                 )
                 output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
             return _normalize_dsattention_output_rank(output, x.ndim)
@@ -2375,7 +2370,6 @@ class DSAttention(MegatronModule):
                     reduce_group=indexer_reduce_group,
                     avg_group=indexer_avg_group,
                     dynamic_cp_parent_group=dynamic_cp_parent_group,
-                    dynamic_cp_size=cp_size,
                 )
         elif topk_indices is None:
             assert q is not None and k is not None and weights is not None
