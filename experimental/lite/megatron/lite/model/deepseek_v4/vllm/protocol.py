@@ -270,8 +270,9 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     selected_layers = tuple(model.layer_indices)
     attention_builders = None
     from vllm.config import VllmConfig
+    from vllm.config.device import DeviceConfig
 
-    vllm_config = VllmConfig()
+    vllm_config = VllmConfig(device_config=DeviceConfig(device="cuda"))
 
     def ensure_runtime_assets():
         nonlocal attention_builders

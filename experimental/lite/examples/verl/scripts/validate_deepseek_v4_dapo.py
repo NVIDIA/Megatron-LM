@@ -18,10 +18,10 @@ from packaging.version import Version
 
 
 EXACT_DEPENDENCIES = {
-    "vllm": "0.26.1rc1.dev631+g5426311d9",
+    "vllm": "0.26.1rc1.dev682+g7aa248fcf",
     "flashinfer-python": "0.6.16.post3",
     "nvidia-cutlass-dsl": "4.6.2",
-    "nvidia-nvshmem-cu13": "3.6.5",
+    "nvidia-nvshmem-cu13": "3.4.5",
     "nvidia-resiliency-ext": "0.6.0",
     "tilelang": "0.1.12",
 }
@@ -77,9 +77,9 @@ def validate_environment() -> None:
     import transformer_engine.pytorch as te
     from cudnn import DSA
 
-    if not torch.__version__.startswith("2.12.0a0") or torch.version.cuda != "13.2":
+    if not torch.__version__.startswith("2.13.0") or torch.version.cuda != "13.0":
         raise SystemExit(
-            "DS4 requires PyTorch 2.12 nv26.05 / CUDA 13.2, "
+            "DS4 requires PyTorch 2.13 nv26.07 / CUDA 13.0, "
             f"got torch={torch.__version__} cuda={torch.version.cuda}"
         )
     if "q_causal_offsets" not in inspect.signature(

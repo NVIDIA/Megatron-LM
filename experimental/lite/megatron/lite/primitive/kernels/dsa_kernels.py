@@ -53,12 +53,11 @@ def _ensure_flash_mla():
         return
 
     try:
-        from flash_mla import flash_mla_sparse_fwd as _fwd
+        from .flash_mla_compat import flash_mla_sparse_fwd as _fwd
     except ImportError as e:
         raise ImportError(
-            "FlashMLA is required for DSA sparse attention forward. "
-            "Install from https://github.com/deepseek-ai/FlashMLA/tree/nv_dev "
-            "so that `from flash_mla import flash_mla_sparse_fwd` succeeds."
+            "The pinned vLLM FlashMLA interface is required for DSA sparse "
+            "attention forward."
         ) from e
     _flash_mla_sparse_fwd = _fwd
 
