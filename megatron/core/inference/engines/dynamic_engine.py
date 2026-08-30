@@ -1945,7 +1945,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
             # Process finished requests (adds FINISH events and returns records).
-            (active_request_ids, finished_request_records) = self.post_process_requests(
+            active_request_ids, finished_request_records = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
                 evict_request_ids,
