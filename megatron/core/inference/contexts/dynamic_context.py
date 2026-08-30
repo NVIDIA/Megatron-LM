@@ -995,6 +995,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         _tok_int32_bytes = self.max_tokens * 4
         # Request-level fields are all 4 bytes wide (5 int32 + 2 float32 = 7 fields).
         _req_4byte_bytes = self.max_requests * 4
+        # Scalar real-token count shared with ContextGPUView. MoE inference uses
+        # this fixed-address value to exclude CUDA-graph padding tokens.
+        _real_token_count_bytes = 4
         # MHA section: 5 fields (int32) shared between GraphedMHAMetadata and
         # NonGraphedMHAMetadata. max_bs == max_requests.
         _mha_query_lengths_bytes = self.max_requests * 4
@@ -1006,6 +1009,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             3 * _tok_int64_bytes
             + 3 * _tok_int32_bytes
             + 7 * _req_4byte_bytes
+            + _real_token_count_bytes
             + _mha_query_lengths_bytes
             + _mha_cu_query_seq_lengths_bytes
             + _mha_kv_seq_lengths_bytes
@@ -1132,6 +1136,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         ].view(torch.int32)
         _off += _req_4byte_bytes
 
+        self._staging_real_token_count = self._cpu_bookkeeping_buf[
+            _off : _off + _real_token_count_bytes
+        ].view(torch.int32)
+        _off += _real_token_count_bytes
+
         # Static tensor addresses to make `last_token_logits` graphable with speculative decoding.
         max_logit_idxs = self.max_requests * (self.num_speculative_tokens + 1)
         self.active_logit_idxs = torch.zeros(
@@ -1223,6 +1232,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
         )
+        self._bookkeeping_h2d_done_event = torch.cuda.Event()
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
@@ -2051,7 +2061,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         *,
         construct_graph_dimensions: Optional[InferenceBatchDimensions] = None,
         is_expert_parallel_dummy_cuda_graph_step: bool = False,
-    ) -> None:
+        transfer_bookkeeping_to_gpu: bool = True,
+        record_bookkeeping_done_event: bool = False,
+    ) -> Optional[torch.cuda.Event]:
         """Initialize attention state so that every layer can use it.
 
         Args:
@@ -2059,8 +2071,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                 The graph config to use for constructing the cuda graphs.
             is_expert_parallel_dummy_cuda_graph_step (bool):
                 Whether this is a dummy expert model parallel step.
-        Return:
-            None.
+            transfer_bookkeeping_to_gpu (bool): Whether to publish the prepared
+                CPU bookkeeping snapshot to GPU before returning. Legacy
+                callers publish immediately; async scheduling binds the GPU
+                views here and publishes their values later.
+            record_bookkeeping_done_event (bool): Whether to record an event
+                after the bookkeeping H2D transfer.
+
+        Returns:
+            Optional[torch.cuda.Event]: Event marking bookkeeping H2D
+                completion, or ``None`` when no event was requested or no
+                transfer was performed.
         """
         # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
         # overlap with the CPU work below.  These are non-blocking GPU kernels.
@@ -2298,12 +2319,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # No-op when the queue is already empty (regular non-warmup steps).
         self._execute_pending_mamba_ops()
 
-        # Run the H2D transfer here so callers that bypass the controller
-        # (e.g. unit tests that call `model.forward()` directly after
-        # `initialize_attention_state()`) see populated GPU bookkeeping. The
-        # text-generation controller still calls `transfer_bookkeeping_to_gpu`
-        # explicitly; that second call is a cheap idempotent re-copy.
-        self.transfer_bookkeeping_to_gpu()
+        # Preserve the existing behavior for callers that do not publish explicitly.
+        if transfer_bookkeeping_to_gpu:
+            return self.transfer_bookkeeping_to_gpu(record_done_event=record_bookkeeping_done_event)
+        return None
 
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
@@ -2329,18 +2348,27 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
 
-    def transfer_bookkeeping_to_gpu(self) -> None:
+    def transfer_bookkeeping_to_gpu(
+        self, skip_token_input_ids: bool = False, record_done_event: bool = False
+    ) -> Optional[torch.cuda.Event]:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
-        Called after initialize_attention_state() and before the forward pass.
-        All copies use non_blocking=True with pinned CPU memory. CUDA stream
-        ordering guarantees the forward pass sees completed transfers.
+        Legacy steps call this from ``initialize_attention_state``. Async
+        scheduling delays publication until after preparation and the GPU
+        sample-to-input copy. Legacy transfers block because the pinned CPU
+        source is re-staged in place; async callers request an event-tracked
+        non-blocking copy and synchronize that event before reusing the source.
 
-        The bookkeeping fields are backed by one contiguous pinned CPU buffer
-        and one contiguous GPU buffer; a single cudaMemcpyAsync suffices.
-        Request-level staging slots are refreshed from the persistent CPU
-        tensors immediately before the H2D (GPU reads them at `[:n_active]`
-        while CPU bookkeeping keeps them at `[paused_count:total_count)`).
+        Args:
+            skip_token_input_ids (bool): If true, leave
+                ``gpu_view.token_to_input_ids`` unchanged while copying the rest
+                of the bookkeeping buffer.
+            record_done_event (bool): Whether to record and return an event after
+                an asynchronous bookkeeping transfer.
+
+        Returns:
+            Optional[torch.cuda.Event]: Event marking H2D completion, or ``None``
+                when no event was requested.
         """
         n_active = self.total_request_count - self.paused_request_count
         active_slice = slice(self.paused_request_count, self.total_request_count)
@@ -2374,11 +2402,21 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._staging_request_query_lengths[n_active:padded_active] = 0
             self._staging_request_kv_length_offsets[n_active:padded_active] = 0
 
-        # Coalesced H2D: one cudaMemcpyAsync for the entire bookkeeping buffer.
-        # Copying the whole (max_tokens + max_requests)-sized buffer including
-        # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
-        # 8 redundant launch overheads vs. the prior per-field copies.
-        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        self._staging_real_token_count.fill_(
+            0 if self._bookkeeping_no_real_work else self.batch_dimensions.token_count
+        )
+
+        # Coalesced H2D: one copy for the entire bookkeeping buffer. Async
+        # decode steps preserve the GPU-resident sampled token IDs. Only
+        # event-tracked callers may leave the copy in flight.
+        token_to_input_ids_offset = (
+            self.token_to_input_ids.numel() * self.token_to_input_ids.element_size()
+            if skip_token_input_ids
+            else 0
+        )
+        self.gpu_view._buf[token_to_input_ids_offset:].copy_(
+            self._cpu_bookkeeping_buf[token_to_input_ids_offset:], non_blocking=record_done_event
+        )
 
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
@@ -2388,6 +2426,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
             self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
             self._pending_mamba_transfer = None
+
+        done_event = None
+        if record_done_event:
+            done_event = self._bookkeeping_h2d_done_event
+            done_event.record(torch.cuda.current_stream())
+        return done_event
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""
