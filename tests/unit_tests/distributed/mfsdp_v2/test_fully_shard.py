@@ -723,8 +723,6 @@ def test_rejects_optimizer_placements_larger_than_model_weight_placements(distri
     """Optimizer placements must fit within the model-weight placements."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
-    if world_size < 2:
-        pytest.skip("This test requires at least 2 ranks.")
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16).to(device)
