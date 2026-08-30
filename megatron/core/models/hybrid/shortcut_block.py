@@ -7,11 +7,21 @@ from typing import Sequence
 import torch
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
+
+
+def _get_offloading_interface():
+    """Get the fine-grained activation offloading interface lazily."""
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        FineGrainedActivationOffloadingInterface,
+    )
+
+    return FineGrainedActivationOffloadingInterface
 
 
 def group_layers_into_shortcut_blocks(
@@ -98,6 +108,16 @@ class ShortcutMoEBlock(MegatronModule):
         self.tp_group = moe_layer.mlp.tp_group
         self.compute_layer = compute_layer
         self.moe_layer = moe_layer
+        self.recompute_shortcut_pre_mlp_layernorm = (
+            self.config.recompute_granularity == "selective"
+            and "shortcut_pre_mlp_layernorm" in (self.config.recompute_modules or [])
+        )
+        self.offload_shortcut_post_norm = (
+            self.config.fine_grained_activation_offloading
+            and "shortcut_post_norm" in (self.config.offload_modules or [])
+        )
+        self.off_interface = _get_offloading_interface()
+        self.shortcut_pre_mlp_layernorm_checkpoint = None
 
         # The shortcut path uses the same normalization implementation and configuration as
         # the MoE path, but owns an independent parameter.
@@ -117,7 +137,13 @@ class ShortcutMoEBlock(MegatronModule):
 
     def _moe_router_preprocess(self, shortcut_hidden, padding_mask=None):
         """Run shortcut normalization, routing, and dispatch preprocessing."""
-        shortcut_input = apply_module(self.shortcut_pre_mlp_layernorm)(shortcut_hidden)
+        if self.recompute_shortcut_pre_mlp_layernorm:
+            self.shortcut_pre_mlp_layernorm_checkpoint = CheckpointWithoutOutput()
+            shortcut_input = self.shortcut_pre_mlp_layernorm_checkpoint.checkpoint(
+                apply_module(self.shortcut_pre_mlp_layernorm), shortcut_hidden
+            )
+        else:
+            shortcut_input = apply_module(self.shortcut_pre_mlp_layernorm)(shortcut_hidden)
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
         probs, routing_map = self.moe_layer.mlp.route(shortcut_input, padding_mask)
@@ -132,7 +158,13 @@ class ShortcutMoEBlock(MegatronModule):
         """Join routed/shared output, apply shortcut post-norm, and finish residual/BDA."""
         residual = hidden_states.float() if self.config.fp32_residual_connection else hidden_states
         output = self.moe_layer.mlp.postprocess(combined_output, shared_expert_output)
-        output = self.shortcut_post_norm(output)
+        post_norm_input = output
+        post_norm_manager = self.off_interface(
+            self.offload_shortcut_post_norm, post_norm_input, "shortcut_post_norm"
+        )
+        with post_norm_manager as post_norm_input:
+            output = self.shortcut_post_norm(post_norm_input)
+        output = post_norm_manager.group_offload(output, forced_released_tensors=[post_norm_input])
         output = self.moe_layer._apply_mlp_bda_step((output, None), residual)
         return output[0] if isinstance(output, tuple) else output
 
@@ -153,7 +185,7 @@ class ShortcutMoEBlock(MegatronModule):
             return self.moe_layer.mlp.dispatch(hidden_states, probs)
 
     def _wait_dispatch(
-        self, dispatched_input: torch.Tensor, dispatched_probs: torch.Tensor,
+        self, dispatched_input: torch.Tensor, dispatched_probs: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Wait for dispatch and return its outputs on the main stream."""
         assert self.overlap_mode
@@ -178,7 +210,6 @@ class ShortcutMoEBlock(MegatronModule):
         """Wait for the asynchronous combine and return its output on the main stream."""
         torch.cuda.current_stream().wait_stream(self._get_a2a_overlap_stream())
         combined_output.record_stream(torch.cuda.current_stream())
-        set_tensor_grad_fn_sequence_sr(combined_output, torch.iinfo(torch.int).max)
         return combined_output
 
     def forward(
@@ -221,10 +252,14 @@ class ShortcutMoEBlock(MegatronModule):
                 dispatch_output = self._wait_dispatch(dispatched_input, dispatched_probs)
 
             output, _ = self.moe_layer.mlp.routed_experts_compute(
-                dispatched_input,
-                dispatched_probs,
+                dispatched_input, dispatched_probs
             )
             combined_output = self._launch_combine(output, async_op=self.overlap_mode)
+            if self.shortcut_pre_mlp_layernorm_checkpoint is not None:
+                self.shortcut_pre_mlp_layernorm_checkpoint.discard_output_and_register_recompute(
+                    combined_output
+                )
+                self.shortcut_pre_mlp_layernorm_checkpoint = None
 
         # launch the output layer of the attention layer
         with quant_context_factory(quant_config, self.attn_layer_num):
@@ -238,4 +273,6 @@ class ShortcutMoEBlock(MegatronModule):
             if self.overlap_mode:
                 combined_output = self._wait_combine(combined_output)
 
+            # Ensure the combine autograd node is scheduled first before shared_experts
+            set_tensor_grad_fn_sequence_sr(combined_output, torch.iinfo(torch.int).max)
             return self._postprocess(attn_layer_output, combined_output, shared_expert_output)
