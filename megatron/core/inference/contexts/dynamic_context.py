@@ -2440,6 +2440,47 @@ class DynamicInferenceContext(BaseInferenceContext):
             done_event.record(torch.cuda.current_stream())
         return done_event
 
+    def copy_async_sched_sample_to_forward(
+        self, sampled_tokens_cuda: Tensor, sampled_mtp_tokens_cuda: Optional[Tensor] = None
+    ) -> None:
+        """Populate GPU input token IDs from sampled CUDA tokens for async scheduling.
+
+        Async scheduling keeps sampled tokens GPU-resident for the next decode
+        forward. CPU bookkeeping is prepared independently and published later;
+        this direct GPU copy populates the live input-ID view without waiting
+        for the sample's CPU copy.
+
+        Args:
+            sampled_tokens_cuda (Tensor): 1D CUDA tensor containing one sampled
+                token per active decode request.
+            sampled_mtp_tokens_cuda (Optional[Tensor]): MTP draft tokens with shape
+                ``[num_speculative_tokens, active_request_count]``.
+        """
+        active_request_count = self.total_request_count - self.paused_request_count
+
+        if self.num_speculative_tokens > 0:
+            expected_shape = (self.num_speculative_tokens, active_request_count)
+            if sampled_mtp_tokens_cuda is None or tuple(sampled_mtp_tokens_cuda.shape) != (
+                expected_shape
+            ):
+                actual_shape = (
+                    None if sampled_mtp_tokens_cuda is None else sampled_mtp_tokens_cuda.shape
+                )
+                raise RuntimeError(
+                    f"Expected MTP draft token shape {expected_shape}, got {actual_shape}."
+                )
+
+        tokens_per_request = self.num_speculative_tokens + 1
+        token_count = active_request_count * tokens_per_request
+        grouped_tokens = self.gpu_view.token_to_input_ids[:token_count].view(
+            active_request_count, tokens_per_request
+        )
+        grouped_tokens[:, 0].copy_(sampled_tokens_cuda, non_blocking=True)
+        if sampled_mtp_tokens_cuda is not None:
+            grouped_tokens[:, 1:].copy_(sampled_mtp_tokens_cuda.transpose(0, 1), non_blocking=True)
+        if token_count < self.padded_active_token_count:
+            self.gpu_view.token_to_input_ids[token_count : self.padded_active_token_count].zero_()
+
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""
 

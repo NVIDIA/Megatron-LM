@@ -7,6 +7,7 @@ import logging
 import pytest
 import torch
 from torch import nn
+from torch.autograd import DeviceType
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.profiler import ProfilerActivity, profile
@@ -356,7 +357,9 @@ def test_overlaps_communication_and_compute(distributed_setup):
     # NCCL emits both a device kernel and a linked CUDA annotation for each
     # collective. Keep the device kernel only so each collective is counted once.
     cuda_events = [
-        event for event in prof.events() if event.is_legacy and not event.is_user_annotation
+        event
+        for event in prof.events()
+        if event.device_type == DeviceType.CUDA and not event.is_user_annotation
     ]
     all_gather_events = [
         event
