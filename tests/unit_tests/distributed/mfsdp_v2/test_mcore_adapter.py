@@ -10,6 +10,8 @@ import pytest
 import torch
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
+from torch.distributed.distributed_c10d import _world
+
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
@@ -46,6 +48,19 @@ def _build_block(config: TransformerConfig) -> TransformerBlock:
     )
 
 
+def _destroy_model_parallel():
+    """Utils.destroy_model_parallel, plus the groups it leaves behind.
+
+    It clears Megatron's references but frees only a few of the groups; c10d holds its own
+    reference to the rest, so their NCCL communicators -- and, with NVLS enabled, their
+    multicast reservations -- would outlive the test. See #6897.
+    """
+    Utils.destroy_model_parallel()
+    for group in list(_world.pg_map):
+        if group is not torch.distributed.group.WORLD:
+            torch.distributed.destroy_process_group(group)
+
+
 class TestMcoreAdapterDense:
     """Exercise a dense MCore transformer block over two data-parallel ranks."""
 
@@ -55,7 +70,7 @@ class TestMcoreAdapterDense:
         model_parallel_cuda_manual_seed(1234)
 
     def teardown_method(self):
-        Utils.destroy_model_parallel()
+        _destroy_model_parallel()
 
     def test_wraps_fsdp_unit_modules_before_root(self):
         config = TransformerConfig(
@@ -430,8 +445,7 @@ class TestMcoreAdapterExpertParallel:
         model_parallel_cuda_manual_seed(1234)
 
     def teardown_method(self):
-        torch.distributed.destroy_process_group(self.reference_group)
-        Utils.destroy_model_parallel()
+        _destroy_model_parallel()
 
     def test_build_train_step_and_clip(self):
         """Shard experts over expert-DP and clip their combined gradients."""
@@ -579,7 +593,7 @@ class TestMcoreAdapterHybrid:
     """Exercise MFSDP v2 over a hybrid data-parallel domain (an outer DP axis)."""
 
     def teardown_method(self):
-        Utils.destroy_model_parallel()
+        _destroy_model_parallel()
 
     @staticmethod
     def _config() -> TransformerConfig:
@@ -688,7 +702,7 @@ class TestMcoreAdapterHybrid:
         # topologies means initializing twice. teardown_method destroys the second.
         Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=1)
         reference = self._train(config, instances=1, outer_strategy="no_shard")
-        Utils.destroy_model_parallel()
+        _destroy_model_parallel()
 
         Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
         hybrid = self._train(config, instances=2, outer_strategy=outer_strategy)
