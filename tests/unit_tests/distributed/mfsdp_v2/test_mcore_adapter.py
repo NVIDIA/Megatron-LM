@@ -8,9 +8,8 @@ from dataclasses import replace
 
 import pytest
 import torch
-from torch.distributed.tensor import DTensor, Replicate, Shard
-
 from torch.distributed.distributed_c10d import _world
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
