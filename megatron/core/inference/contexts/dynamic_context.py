@@ -700,6 +700,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate GPU state.
         self.is_tensor_state_allocated = False
+        self._bookkeeping_no_real_work = False
         self.initialize_all_tensors()
 
         # Print info.
@@ -2318,6 +2319,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         # this function ran; this call covers ops queued during the function.
         # No-op when the queue is already empty (regular non-warmup steps).
         self._execute_pending_mamba_ops()
+
+        # CUDA-graph capture and dummy EP steps do not produce real output, so
+        # publish a zero real-token count and mask every padded routing row.
+        self._bookkeeping_no_real_work = (
+            construct_graph_dimensions is not None or is_expert_parallel_dummy_cuda_graph_step
+        )
 
         # Preserve the existing behavior for callers that do not publish explicitly.
         if transfer_bookkeeping_to_gpu:
