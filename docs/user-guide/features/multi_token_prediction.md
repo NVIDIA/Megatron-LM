@@ -29,6 +29,7 @@ The following table summarizes MTP configuration fields:
 | `mtp_loss_scaling_factor` | Weight for the MTP loss term. The implementation averages MTP losses across depths, multiplies by this factor, and adds the result to the training objective. Default: `0.1`. |
 | `mtp_use_repeated_layer` | Reuse one physical MTP layer for every prediction depth. Parameters are shared, while the hidden state, shifted token input, and query are recomputed at each iteration. Default: `False`. |
 | `dsa_mtp_index_kv_share` | For repeated-layer DSA MTP, compute latent KV and indexer top-k at iteration 0 and reuse them at later iterations. Queries and sparse attention are still evaluated at every iteration. The indexer loss is computed and tracked only at iteration 0, so `dsa_indexer_loss_coeff` may need retuning when switching from non-sharing. Default: `False`. |
+| `mtp_loss_type` | MTP training objective: `cross_entropy` or `e2e_tv`. Default: `cross_entropy`. |
 
 ## Repeated DSA MTP IndexShare and KVShare
 
@@ -41,6 +42,15 @@ Because the shared indexer runs only at iteration 0, its auxiliary loss is also 
 Selective activation recomputation with `core_attn` in `recompute_modules` is not supported when `dsa_mtp_index_kv_share` is enabled. Capturing the source key inside the core-attention checkpoint would detach consumer-iteration gradients, so use selective `mla_up_proj` recomputation, full activation recomputation, or disable sharing.
 
 The current implementation uses the split indexer-top-k and sparse-attention path because the combined DSA kernel does not expose top-k for reuse. When an eligible fused DSA backend is configured, enabling sharing logs a rank-0 warning that the combined kernel is bypassed; fused top-k and fused sparse-attention kernels remain available independently. Per-layer CUDA graph scopes that capture attention are not supported with MTP iteration sharing because they split the producer-consumer lifetime across separate graphs. MoE-only scopes and graph scopes that contain the complete MTP producer-consumer chain are compatible, subject to the prerequisites of the selected CUDA graph implementation.
+
+## End-to-End TV Loss
+
+Set `mtp_loss_type: e2e_tv` and `mtp_detach_heads: true` to enable the end-to-end
+TV objective. This mode requires `mtp_num_layers >= 1` and uses
+`mtp_loss_scaling_factor` to scale the auxiliary loss. To train only MTP parameters,
+the optimizer must additionally freeze the base model or select only MTP parameters;
+`mtp_detach_heads` does not change the optimizer parameter set. See
+[Bebop](https://arxiv.org/abs/2606.12370) for the objective definition.
 
 ## Pipeline Parallel Layout for MTP
 
