@@ -146,6 +146,99 @@ def _set_warmup_end():
     _IS_GRAPH_WARMUP = False
 
 
+def _snapshot_metric_tracker(tracker):
+    """Clone a tensor-valued metric tracker before graph warmup and capture."""
+    values = tracker.get("values")
+    metadata = {key: value for key, value in tracker.items() if key != "values"}
+    return (values.clone() if values is not None else None), metadata
+
+
+def _restore_metric_tracker(tracker, snapshot):
+    """Restore captured metric values in place so recorded graph storage stays live."""
+    cached_values, cached_metadata = snapshot
+    values = tracker.get("values")
+    if cached_values is None:
+        # A tracker first initialized during capture has no eager values to preserve. Keep its
+        # captured storage and reduction metadata, but discard warmup/capture contributions.
+        if values is not None:
+            values.zero_()
+        return
+    if values is None or values.shape != cached_values.shape:
+        raise RuntimeError("Metric tracker shape changed during CUDA Graph capture.")
+    values.copy_(cached_values)
+    for key in tuple(tracker):
+        if key != "values" and key not in cached_metadata:
+            del tracker[key]
+    tracker.update(cached_metadata)
+
+
+def _get_local_dsa_metric_tracker_size(model=None):
+    """Return the storage size required by local DSA/CSA modules before graph capture."""
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossLoggingHelper,
+    )
+
+    values = DSAIndexerLossLoggingHelper.tracker.get("values")
+    required_size = values.shape[0] if values is not None else 0
+    if model is None:
+        model_chunks = ()
+    elif isinstance(model, (list, tuple)):
+        model_chunks = model
+    else:
+        model_chunks = (model,)
+    for model_chunk in model_chunks:
+        for module in model_chunk.modules():
+            if not getattr(module, "logs_dsa_indexer_loss", False):
+                continue
+            layer_number = getattr(module, "layer_number", None)
+            if layer_number is not None:
+                required_size = max(required_size, layer_number)
+            config = getattr(module, "config", None)
+            if config is not None:
+                required_size = max(required_size, config.num_layers + (config.mtp_num_layers or 0))
+    return required_size
+
+
+def _prepare_dsa_metric_tracker_for_capture(model=None, pp_group=None):
+    """PP-negotiate and allocate the final DSA tracker storage before recording graphs."""
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossLoggingHelper,
+    )
+
+    tracker = DSAIndexerLossLoggingHelper.tracker
+    local_required_size = _get_local_dsa_metric_tracker_size(model)
+    capture_prepared_size = tracker.get("capture_prepared_size")
+    if capture_prepared_size is not None:
+        if local_required_size > capture_prepared_size:
+            raise RuntimeError(
+                "DSA metric tracker discovered a larger layer index after PP size agreement."
+            )
+        if capture_prepared_size > 0:
+            DSAIndexerLossLoggingHelper.ensure_tracker_size(capture_prepared_size)
+        return capture_prepared_size
+
+    # ``agreed_size`` may have been cached by an earlier eager metric reduction. It reflects
+    # only layers that wrote a loss in that step, whereas the model scan deliberately includes
+    # every potential graph writer. Negotiate once more at capture time instead of treating the
+    # eager value as final.
+    local_required_size = max(local_required_size, tracker.get("agreed_size") or 0)
+    size = local_required_size
+    if torch.distributed.is_initialized():
+        if pp_group is None and parallel_state.model_parallel_is_initialized():
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+        size_tensor = torch.tensor(
+            [local_required_size], device=torch.cuda.current_device(), dtype=torch.long
+        )
+        torch.distributed.all_reduce(size_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group)
+        size = int(size_tensor.item())
+
+    if size > 0:
+        DSAIndexerLossLoggingHelper.ensure_tracker_size(size)
+    tracker["agreed_size"] = size
+    tracker["capture_prepared_size"] = size
+    return size
+
+
 @dataclass
 class CudagraphBufferMetadata:
     """
@@ -381,6 +474,11 @@ class _CudagraphGlobalRecord:
                 "were already created!",
             )
             return
+
+        # Local capture follows one complete eager step, so the local tracker already reflects
+        # every local hybrid/MTP index. Negotiate its final size before any PP stage records a
+        # graph; otherwise the first metric reduction could grow another stage's captured tensor.
+        _prepare_dsa_metric_tracker_for_capture()
 
         # No cudagraphs have been created or recorded, so do nothing
         if len(cls.cudagraph_record) == 0:
@@ -847,6 +945,16 @@ class _CudaGraphRunner(torch.nn.Module):
             for name, entry in moe_metrics_tracker.metrics.items():
                 cached_aux_losses[name] = entry.values.clone()
 
+        # DSA indexer metrics are also accumulated from the forward path. Unlike MoE metrics,
+        # their tracker is shared across transformer layers, so every runner restores the exact
+        # eager state after its warmup/capture passes.
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossLoggingHelper,
+        )
+
+        dsa_metric_tracker = DSAIndexerLossLoggingHelper.tracker
+        dsa_metric_snapshot = _snapshot_metric_tracker(dsa_metric_tracker)
+
         self.fwd_graph = torch.cuda.CUDAGraph()
 
         # For cases with multiple active RNG states, e.g. TP.
@@ -1043,6 +1151,8 @@ class _CudaGraphRunner(torch.nn.Module):
                     name in moe_metrics_tracker.metrics
                 ), "cached metrics must be found in the tracker."
                 moe_metrics_tracker.metrics[name].values.copy_(cached_values)
+
+        _restore_metric_tracker(dsa_metric_tracker, dsa_metric_snapshot)
 
     def create_bwd_graph(self):
         """Create a bwd cudagraph for this runner. Should be called inside
@@ -2659,6 +2769,9 @@ class TECudaGraphHelper:
         Reset the model and optimizer state after capturing CUDA Graphs.
         """
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossLoggingHelper,
+        )
         from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 
         for model_chunk in self.model:
@@ -2666,6 +2779,8 @@ class TECudaGraphHelper:
         for optimizer in self.optimizers:
             optimizer.zero_grad()
         get_moe_metrics_tracker().clear()
+        if DSAIndexerLossLoggingHelper.tracker:
+            DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
         reset_model_temporary_tensors(self.config, self.model)
 
     def _finish_capturing(self, start_time):
@@ -2715,6 +2830,10 @@ class TECudaGraphHelper:
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
         validate_moe_cuda_graph_support(self.config)
+        # TE supports capture without eager warmup. Scan the full local model (including
+        # non-graphable hybrid/MTP internals), then PP-negotiate one final tracker storage before
+        # any layer graph records a pointer to it.
+        _prepare_dsa_metric_tracker_for_capture(self.model, self.pp_group)
         start_time = self._start_capturing()
 
         if not self.flattened_callables:

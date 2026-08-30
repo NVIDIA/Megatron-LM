@@ -1712,6 +1712,8 @@ class CompressedSparseAttention(MegatronModule):
     * ``ratio == 128``: window + 128x compressed, attend to all (compressor built only)
     """
 
+    logs_dsa_indexer_loss = True
+
     def __init__(
         self,
         config: TransformerConfig,

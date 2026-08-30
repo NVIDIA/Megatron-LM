@@ -3493,6 +3493,11 @@ def training_log(
     # Track sparse attention indexer loss.
     if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
         indexer_loss_scale = 1 / get_num_microbatches()
+        dynamic_cp_parent_group = None
+        if args.dynamic_context_parallel:
+            dynamic_cp_parent_group = getattr(pg_collection, "dp_cp", None)
+            if dynamic_cp_parent_group is None:
+                dynamic_cp_parent_group = mpu.get_data_parallel_group(with_context_parallel=True)
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
             iteration=iteration,
@@ -3506,6 +3511,8 @@ def training_log(
                 else None
             ),
             preserve_groups=args.cuda_graph_impl != "none",
+            dynamic_cp_parent_group=dynamic_cp_parent_group,
+            configured_cp_size=args.context_parallel_size,
         )
 
     # Dump memory snapshot and print metrics to stdout.

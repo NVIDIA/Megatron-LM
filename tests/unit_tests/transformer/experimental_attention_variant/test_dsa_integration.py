@@ -454,6 +454,169 @@ def test_indexer_loss_tracker_grows_for_mtp_layer_numbers():
         helper.tracker.clear()
 
 
+def test_dynamic_cp_parent_average_preserves_nominal_global_batch_weighting():
+    """Mixed effective CP sizes retain equal sample weight after nominal-MB scaling."""
+    configured_cp_size = 4
+    parent_size = 8
+    configured_dp_size = parent_size // configured_cp_size
+    # The scheduler repacks fourteen nominal samples into four physical microbatches:
+    # eight CP1 samples, four CP2 samples, then two CP8 samples. CP8 intentionally exceeds
+    # the configured/static CP width and proves the multiplier is not effective logical CP.
+    cp1_local_sums = torch.arange(1, 9, dtype=torch.float32)
+    cp2_local_sums = torch.arange(1, 9, dtype=torch.float32)
+    cp8_first_local_sums = torch.arange(1, 9, dtype=torch.float32)
+    cp8_second_local_sums = torch.arange(2, 10, dtype=torch.float32)
+    scheduled_local_sums = (
+        cp1_local_sums,
+        cp2_local_sums,
+        cp8_first_local_sums,
+        cp8_second_local_sums,
+    )
+    expected_sample_sums = torch.cat(
+        (
+            cp1_local_sums,
+            cp2_local_sums.reshape(-1, 2).sum(dim=1),
+            cp8_first_local_sums.sum().reshape(1),
+            cp8_second_local_sums.sum().reshape(1),
+        )
+    )
+
+    tracker_sum = sum(
+        (local_sums * configured_cp_size).sum() / parent_size for local_sums in scheduled_local_sums
+    )
+    nominal_num_microbatches = expected_sample_sums.numel() // configured_dp_size
+
+    torch.testing.assert_close(tracker_sum / nominal_num_microbatches, expected_sample_sums.mean())
+
+
+def test_static_indexer_logging_preserves_group_updates():
+    """Static logging retains its historical last-writer group behavior."""
+    helper = dsa_module.DSAIndexerLossLoggingHelper
+    first_group = object()
+    second_group = object()
+    helper.tracker.clear()
+
+    try:
+        helper.save_loss_to_tracker(
+            loss=torch.tensor(1.0, device="cuda"),
+            layer_number=1,
+            num_layers=1,
+            avg_group=first_group,
+        )
+        helper.save_loss_to_tracker(
+            loss=torch.tensor(1.0, device="cuda"),
+            layer_number=1,
+            num_layers=1,
+            avg_group=second_group,
+        )
+
+        torch.testing.assert_close(
+            helper.tracker["values"], helper.tracker["values"].new_tensor([2.0])
+        )
+        assert helper.tracker["avg_group"] is second_group
+    finally:
+        helper.tracker.clear()
+
+
+def test_dynamic_cp_indexer_reduction_ignores_stale_logical_groups(monkeypatch):
+    """Dynamic reduction always uses the stable parent rather than last-writer metadata."""
+    helper = dsa_module.DSAIndexerLossLoggingHelper
+    pp_group = object()
+    parent_dp_cp_group = object()
+    stale_logical_cp_group = object()
+    dp_group = object()
+    calls = []
+    helper.tracker.clear()
+    helper.tracker.update(
+        {
+            "values": torch.tensor([3.0]),
+            "agreed_size": 1,
+            # Dynamic reduction must ignore last-writer metadata from either DSA or CSA.
+            "reduce_group": stale_logical_cp_group,
+            "avg_group": stale_logical_cp_group,
+        }
+    )
+
+    monkeypatch.setattr(
+        dsa_module.parallel_state, "get_pipeline_model_parallel_group", lambda: pp_group
+    )
+    monkeypatch.setattr(
+        dsa_module.parallel_state, "get_data_parallel_group", lambda with_context_parallel: dp_group
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, op=None, group=None: calls.append((group, op)),
+    )
+
+    try:
+        helper.reduce_loss_in_tracker(
+            num_layers=1, dynamic_cp_parent_group=parent_dp_cp_group, configured_cp_size=4
+        )
+
+        torch.testing.assert_close(helper.tracker["values"], torch.tensor([12.0]))
+        assert [group for group, _ in calls] == [pp_group, parent_dp_cp_group]
+        assert calls[1][1] == torch.distributed.ReduceOp.AVG
+        assert all(group is not dp_group for group, _ in calls)
+        assert all(group is not stale_logical_cp_group for group, _ in calls)
+    finally:
+        helper.tracker.clear()
+
+
+def test_dynamic_cp_indexer_reduction_initializes_empty_pp_stage(monkeypatch):
+    """A PP stage without indexer layers contributes a correctly shaped zero tensor."""
+    helper = dsa_module.DSAIndexerLossLoggingHelper
+    pp_group = object()
+    parent_dp_cp_group = object()
+    calls = []
+    helper.tracker.clear()
+
+    monkeypatch.setattr(
+        dsa_module.parallel_state, "get_pipeline_model_parallel_group", lambda: pp_group
+    )
+
+    def all_reduce(tensor, op=None, group=None):
+        calls.append((group, op, tuple(tensor.shape)))
+        if op == torch.distributed.ReduceOp.MAX:
+            tensor.fill_(3)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    try:
+        helper.reduce_loss_in_tracker(
+            num_layers=2, dynamic_cp_parent_group=parent_dp_cp_group, configured_cp_size=4
+        )
+
+        assert calls == [
+            (pp_group, torch.distributed.ReduceOp.MAX, (1,)),
+            (pp_group, None, (3,)),
+            (parent_dp_cp_group, torch.distributed.ReduceOp.AVG, (3,)),
+        ]
+        torch.testing.assert_close(
+            helper.tracker["values"], torch.zeros_like(helper.tracker["values"])
+        )
+        assert helper.tracker["agreed_size"] == 3
+    finally:
+        helper.tracker.clear()
+
+
+@pytest.mark.parametrize("configured_cp_size", (None, 0))
+def test_dynamic_cp_indexer_reduction_rejects_invalid_configured_cp_size(
+    monkeypatch, configured_cp_size
+):
+    """The Dynamic-CP normalization factor must be a positive configured CP width."""
+    helper = dsa_module.DSAIndexerLossLoggingHelper
+    helper.tracker.clear()
+    monkeypatch.setattr(
+        dsa_module.parallel_state, "get_pipeline_model_parallel_group", lambda: object()
+    )
+
+    with pytest.raises(ValueError, match="configured_cp_size must be positive"):
+        helper.reduce_loss_in_tracker(
+            num_layers=1, dynamic_cp_parent_group=object(), configured_cp_size=configured_cp_size
+        )
+
+
 def test_dsv4_metric_logging_preserves_graph_groups_and_uses_indexer_layer_count(monkeypatch):
     """CUDA Graph reuse keeps groups, and only ratio-4 DSv4 layers enter the average."""
     helper = dsa_module.DSAIndexerLossLoggingHelper
@@ -474,13 +637,27 @@ def test_dsv4_metric_logging_preserves_graph_groups_and_uses_indexer_layer_count
         def add_scalar(name, value, iteration):
             recorded.append((name, value.clone(), iteration))
 
-    monkeypatch.setattr(helper, "reduce_loss_in_tracker", lambda num_layers=None: None)
+    reduced_with = []
+    monkeypatch.setattr(
+        helper,
+        "reduce_loss_in_tracker",
+        lambda num_layers=None, dynamic_cp_parent_group=None, configured_cp_size=None: reduced_with.append(
+            (dynamic_cp_parent_group, configured_cp_size)
+        ),
+    )
 
     try:
         helper.track_indexer_metrics(
-            loss_scale=0.5, iteration=7, writer=Writer(), num_indexer_layers=2, preserve_groups=True
+            loss_scale=0.5,
+            iteration=7,
+            writer=Writer(),
+            num_indexer_layers=2,
+            preserve_groups=True,
+            dynamic_cp_parent_group=avg_group,
+            configured_cp_size=4,
         )
 
+        assert reduced_with == [(avg_group, 4)]
         assert len(recorded) == 1
         name, value, iteration = recorded[0]
         assert name == "indexer loss"
