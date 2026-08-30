@@ -1920,42 +1920,52 @@ def test_cudnn_attention_backward_sanitizes_ignored_topk_slots(monkeypatch, sour
     def fake_flash_mla(q, kv, topk_idxs, softmax_scale, d_v, attn_sink, topk_length):
         seen["fwd_topk"] = topk_idxs.detach().clone()
         seen["fwd_topk_length"] = topk_length.detach().clone()
+        seen["fwd_topk_length_tensor"] = topk_length
         return torch.zeros((2, 1, d_v), dtype=q.dtype), torch.zeros((2, 1), dtype=torch.float32)
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_dsa_fwd_flash_mla", fake_flash_mla)
 
-    if source == "full_fusion":
-        query = torch.zeros((2, 1, 1, 1), dtype=torch.bfloat16, requires_grad=True)
-        monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_topk_bshd", fake_indexer_topk)
-        output, _indexer_loss = dsa_cudnn_kernels.fused_indexer_sparse_attn(
-            query,
-            torch.zeros((4, 1, 1), dtype=torch.bfloat16, requires_grad=True),
-            torch.zeros((2, 1, 1, 1), dtype=torch.bfloat16),
-            torch.zeros((4, 1, 1), dtype=torch.bfloat16),
-            torch.zeros((2, 1, 1), dtype=torch.bfloat16),
-            indexer_topk=4,
-            softmax_scale=1.0,
-            loss_coeff=0.0,
-            sparse_loss=True,
-            calculate_per_token_loss=False,
-            d_v=1,
-        )
-        expected_fwd_topk = torch.tensor([[-1, -1, -1, -1], [1, 2, -1, -1]], dtype=torch.int32)
-        expected_bwd_topk = torch.tensor([[1, 2, 0, 0], [0, 0, 0, 0]], dtype=torch.int32)
-    else:
-        value_dim = 512
-        query = torch.zeros((2, 1, 1, value_dim), dtype=torch.bfloat16, requires_grad=True)
-        key = torch.zeros((4, 1, 1, value_dim), dtype=torch.bfloat16, requires_grad=True)
-        output = dsa_cudnn_kernels.run_fused_absorbed_sparse_attention(
-            query=query,
-            key=key,
-            topk_indices=torch.tensor([[[-1, -1, -1], [2, -1, 1]]], dtype=torch.int32),
-            softmax_scale=1.0,
-            v_channels=value_dim,
-        )
-        assert output is not None
-        expected_fwd_topk = torch.tensor([[-1, -1, -1], [1, 2, -1]], dtype=torch.int32)
-        expected_bwd_topk = torch.tensor([[1, 2, 0], [0, 0, 0]], dtype=torch.int32)
+    packed = []
+
+    def pack(tensor):
+        packed.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        if source == "full_fusion":
+            query = torch.zeros((2, 1, 1, 1), dtype=torch.bfloat16, requires_grad=True)
+            monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_topk_bshd", fake_indexer_topk)
+            output, _indexer_loss = dsa_cudnn_kernels.fused_indexer_sparse_attn(
+                query,
+                torch.zeros((4, 1, 1), dtype=torch.bfloat16, requires_grad=True),
+                torch.zeros((2, 1, 1, 1), dtype=torch.bfloat16),
+                torch.zeros((4, 1, 1), dtype=torch.bfloat16),
+                torch.zeros((2, 1, 1), dtype=torch.bfloat16),
+                indexer_topk=4,
+                softmax_scale=1.0,
+                loss_coeff=0.0,
+                sparse_loss=True,
+                calculate_per_token_loss=False,
+                d_v=1,
+            )
+            expected_fwd_topk = torch.tensor([[-1, -1, -1, -1], [1, 2, -1, -1]], dtype=torch.int32)
+            expected_bwd_topk = torch.tensor([[1, 2, 0, 0], [0, 0, 0, 0]], dtype=torch.int32)
+        else:
+            value_dim = 512
+            query = torch.zeros((2, 1, 1, value_dim), dtype=torch.bfloat16, requires_grad=True)
+            key = torch.zeros((4, 1, 1, value_dim), dtype=torch.bfloat16, requires_grad=True)
+            output = dsa_cudnn_kernels.run_fused_absorbed_sparse_attention(
+                query=query,
+                key=key,
+                topk_indices=torch.tensor([[[-1, -1, -1], [2, -1, 1]]], dtype=torch.int32),
+                softmax_scale=1.0,
+                v_channels=value_dim,
+            )
+            assert output is not None
+            expected_fwd_topk = torch.tensor([[-1, -1, -1], [1, 2, -1]], dtype=torch.int32)
+            expected_bwd_topk = torch.tensor([[1, 2, 0], [0, 0, 0]], dtype=torch.int32)
+
+    assert any(tensor.data_ptr() == seen["fwd_topk_length_tensor"].data_ptr() for tensor in packed)
 
     output.float().sum().backward()
 

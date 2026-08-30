@@ -2270,13 +2270,13 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             global_idxs,
             out_flat,
             lse,
+            topk_length_flat,
             precomputed_grad_q_indexer,
             precomputed_grad_k_indexer,
             precomputed_grad_weights,
         )
         ctx.has_precomputed_indexer_grads = need_indexer_loss
         ctx.softmax_scale = softmax_scale
-        ctx.topk_length = topk_length_flat
         ctx.sq = sq
         ctx.b = b
         ctx.num_heads = num_heads
@@ -2303,6 +2303,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             global_idxs,
             out_flat,
             lse,
+            topk_length,
             precomputed_grad_q_indexer,
             precomputed_grad_k_indexer,
             precomputed_grad_weights,
@@ -2318,7 +2319,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             global_idxs=global_idxs,
             out_flat=out_flat,
             lse=lse,
-            topk_length=ctx.topk_length,
+            topk_length=topk_length,
             softmax_scale=ctx.softmax_scale,
             sq=sq,
             b=b,
@@ -2546,9 +2547,10 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
             )
         )
 
-        ctx.save_for_backward(q_flat, kv_flat, attn_sink, global_idxs, out_flat, lse)
+        ctx.save_for_backward(
+            q_flat, kv_flat, attn_sink, global_idxs, out_flat, lse, topk_length_flat
+        )
         ctx.softmax_scale = softmax_scale
-        ctx.topk_length = topk_length_flat
         ctx.sq = sq
         ctx.b = b
         ctx.num_heads = num_heads
@@ -2560,7 +2562,7 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Run sparse attention backward for saved cuDNN graph inputs."""
-        q_flat, kv_flat, attn_sink, global_idxs, out_flat, lse = ctx.saved_tensors
+        q_flat, kv_flat, attn_sink, global_idxs, out_flat, lse, topk_length = ctx.saved_tensors
 
         sq, b, num_heads, d = ctx.sq, ctx.b, ctx.num_heads, ctx.d
         skv = ctx.skv
@@ -2571,7 +2573,7 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
             global_idxs=global_idxs,
             out_flat=out_flat,
             lse=lse,
-            topk_length=ctx.topk_length,
+            topk_length=topk_length,
             softmax_scale=ctx.softmax_scale,
             sq=sq,
             b=b,
