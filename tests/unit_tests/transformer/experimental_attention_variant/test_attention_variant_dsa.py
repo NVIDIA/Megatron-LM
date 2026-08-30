@@ -18,7 +18,10 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.cuda_graph_config import (
+    is_packed_dsa_cp_cuda_graph_capture_unsupported,
+)
+from megatron.core.transformer.enums import AttnMaskType, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.experimental_attention_variant import dsa_indexer_loss, dsa_kernels
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
@@ -40,8 +43,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     unfused_dsa_fn,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_packed_allgather_cp_all_rank_positions,
     build_packed_allgather_cp_local_positions,
+    build_packed_allgather_cp_local_positions_from_host,
     build_packed_allgather_cp_query_positions_and_key_reorder,
+    build_packed_allgather_cp_query_positions_and_key_reorder_from_host,
     build_zigzag_allgather_cp_key_reorder,
     extract_query_positions_from_position_ids,
     get_cp_positions_from_layout,
@@ -586,7 +592,9 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
         is expected_topk
     )
     assert seen["topk_kwargs"]["use_local_indexer_varlen"] is False
-    assert seen["topk_kwargs"]["single_packed_thd_sequence"] is True
+    assert seen["topk_kwargs"]["single_packed_thd_sequence"] is False
+    assert seen["topk_kwargs"]["packed_thd_causal_identity_layout"] is False
+    assert seen["topk_kwargs"]["packed_thd_single_sequence"] is True
     assert seen["topk_kwargs"]["local_packed_cp_rank"] == 3
     assert (
         dsa_kernels.run_fused_qk_topk_with_loss(
@@ -612,8 +620,10 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     )
     assert seen["loss_kwargs"]["config"] is Config
     assert seen["loss_kwargs"]["calculate_per_token_loss"] is True
-    assert seen["loss_kwargs"]["use_local_indexer_varlen"] is True
-    assert seen["loss_kwargs"]["single_packed_thd_sequence"] is True
+    assert seen["loss_kwargs"]["use_local_indexer_varlen"] is False
+    assert seen["loss_kwargs"]["single_packed_thd_sequence"] is False
+    assert seen["loss_kwargs"]["packed_thd_causal_identity_layout"] is True
+    assert seen["loss_kwargs"]["packed_thd_single_sequence"] is True
     assert seen["loss_kwargs"]["local_packed_cp_rank"] == 2
 
     topk_length = torch.ones((1, 1), dtype=torch.int32)
@@ -657,6 +667,8 @@ def test_dsa_kernel_hooks_dispatch_to_backend(monkeypatch):
     assert seen["full_kwargs"]["varlen_starts"] is starts
     assert seen["full_kwargs"]["use_relu"] is False
     assert seen["full_kwargs"]["varlen_is_plain_causal"] is True
+    assert seen["full_kwargs"]["use_local_indexer_varlen"] is False
+    assert seen["full_kwargs"]["packed_thd_causal_identity_layout"] is True
 
 
 def test_dsa_kernel_dependency_validation(monkeypatch):
@@ -3994,6 +4006,350 @@ class TestDSAModuleSpecDispatch:
                 experimental_attention_variant="dsa", context_parallel_size=2, cp_comm_type="p2p"
             )
 
+    def _make_packed_dsa_graph_config(self, monkeypatch, **overrides):
+        monkeypatch.setattr(
+            "megatron.core.transformer.transformer_config."
+            "_validate_dsa_kernel_backend_dependencies",
+            lambda _backend: None,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.transformer_config.is_te_min_version", lambda _version: True
+        )
+        kwargs = {
+            "experimental_attention_variant": "dsa",
+            "dsa_kernel_backend": "cudnn",
+            "sequence_packing_scheduler": "dp_balanced",
+            "max_seqlen_per_dp_cp_rank": 128,
+            "pad_packed_seq_alignment": "max",
+            "thd_max_packed_sequences": 4,
+            "context_parallel_size": 2,
+            "cp_comm_type": "allgather",
+            "cuda_graph_impl": "local",
+            "cuda_graph_modules": [CudaGraphModule.attn],
+        }
+        kwargs.update(overrides)
+        return self._make_dsa_config(**kwargs)
+
+    @pytest.mark.parametrize(
+        ("context_parallel_size", "cuda_graph_impl", "cuda_graph_modules"),
+        [
+            (2, "local", []),
+            (2, "local", [CudaGraphModule.attn]),
+            (2, "local", [CudaGraphModule.attn, CudaGraphModule.attn]),
+            (2, "local", [CudaGraphModule.mlp]),
+            (2, "local", [CudaGraphModule.mlp, CudaGraphModule.mlp]),
+            (2, "local", [CudaGraphModule.attn, CudaGraphModule.mlp]),
+            (2, "local", [CudaGraphModule.attn, CudaGraphModule.mamba]),
+            (2, "transformer_engine", [CudaGraphModule.attn]),
+            (2, "transformer_engine", [CudaGraphModule.attn, CudaGraphModule.attn]),
+            (2, "transformer_engine", []),
+            (2, "transformer_engine", [CudaGraphModule.attn, CudaGraphModule.mlp]),
+            (4, "local", []),
+            (4, "local", [CudaGraphModule.attn]),
+            (4, "local", [CudaGraphModule.mlp]),
+            (4, "transformer_engine", [CudaGraphModule.attn]),
+            (4, "transformer_engine", []),
+        ],
+        ids=[
+            "cp2_local_whole_layer",
+            "cp2_local_attention",
+            "cp2_local_attention_repeated",
+            "cp2_local_mlp_only",
+            "cp2_local_mlp_only_repeated",
+            "cp2_local_attention_mlp",
+            "cp2_local_attention_mamba",
+            "cp2_te_attention",
+            "cp2_te_attention_repeated",
+            "cp2_te_whole_layer",
+            "cp2_te_attention_mlp",
+            "cp4_local_whole_layer",
+            "cp4_local_attention",
+            "cp4_local_mlp_only",
+            "cp4_te_attention",
+            "cp4_te_whole_layer",
+        ],
+    )
+    def test_packed_cudnn_dsa_cp_rejects_measured_cuda_graph_scopes(
+        self, monkeypatch, context_parallel_size, cuda_graph_impl, cuda_graph_modules
+    ):
+        """Reject only packed CP graph scopes whose failure was reproduced on GPU."""
+        with pytest.raises(ValueError, match="packed DSA context-parallel configuration"):
+            self._make_packed_dsa_graph_config(
+                monkeypatch,
+                context_parallel_size=context_parallel_size,
+                cuda_graph_impl=cuda_graph_impl,
+                cuda_graph_modules=cuda_graph_modules,
+            )
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {
+                "cuda_graph_impl": "none",
+                "enable_cuda_graph": True,
+                "cuda_graph_modules": [CudaGraphModule.attn],
+            },
+            {
+                "cuda_graph_impl": "none",
+                "external_cuda_graph": True,
+                "cuda_graph_modules": [CudaGraphModule.attn],
+            },
+            {"cuda_graph_impl": "local", "cuda_graph_modules": "attn"},
+            {"cuda_graph_impl": "local", "cuda_graph_modules": "attn,attn"},
+        ],
+        ids=[
+            "deprecated_local_flag",
+            "deprecated_te_flag",
+            "string_scope",
+            "repeated_string_scope",
+        ],
+    )
+    def test_packed_cudnn_dsa_cp_graph_guard_follows_normalized_legacy_inputs(
+        self, monkeypatch, overrides
+    ):
+        """Legacy graph flags and string scopes must not bypass the measured guard."""
+        with pytest.raises(ValueError, match="packed DSA context-parallel configuration"):
+            self._make_packed_dsa_graph_config(monkeypatch, **overrides)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"context_parallel_size": 1, "cp_comm_type": None},
+            {"experimental_attention_variant": None},
+            {
+                "sequence_packing_scheduler": None,
+                "max_seqlen_per_dp_cp_rank": None,
+                "pad_packed_seq_alignment": None,
+                "thd_max_packed_sequences": None,
+            },
+            {"cuda_graph_impl": "none"},
+            {"cuda_graph_impl": "transformer_engine", "cuda_graph_modules": [CudaGraphModule.mlp]},
+            {
+                "sequence_packing_scheduler": "default_dynamic_cp",
+                "dynamic_context_parallel": True,
+                "cuda_graph_impl": "transformer_engine",
+                "cuda_graph_modules": [CudaGraphModule.mlp],
+            },
+            {
+                "context_parallel_size": 1,
+                "cp_comm_type": None,
+                "sequence_packing_scheduler": "default_dynamic_cp",
+                "dynamic_context_parallel": True,
+            },
+            {"context_parallel_size": 3},
+            {
+                "context_parallel_size": 4,
+                "cuda_graph_impl": "transformer_engine",
+                "cuda_graph_modules": [CudaGraphModule.mlp],
+            },
+            {
+                "context_parallel_size": 4,
+                "cuda_graph_modules": [CudaGraphModule.attn, CudaGraphModule.mlp],
+            },
+            {
+                "context_parallel_size": 4,
+                "dsa_kernel_backend": "none",
+                "cuda_graph_modules": [CudaGraphModule.attn],
+            },
+            {"sequence_packing_scheduler": "default_dynamic_cp"},
+            {"cuda_graph_modules": [], "inference_cuda_graph_scope": InferenceCudaGraphScope.block},
+            {"cuda_graph_impl": "local", "cuda_graph_modules": [CudaGraphModule.mamba]},
+            {"cuda_graph_impl": "full_iteration", "cuda_graph_modules": []},
+        ],
+        ids=[
+            "cp1",
+            "non_dsa",
+            "nonpacked",
+            "cuda_graph_disabled",
+            "te_mlp",
+            "dynamic_te_mlp",
+            "dynamic_configured_cp1",
+            "configured_cp3_unmeasured",
+            "configured_cp4_te_mlp_passed",
+            "configured_cp4_combined_unmeasured",
+            "configured_cp4_unfused_unmeasured",
+            "dynamic_scheduler_without_dynamic_cp_unmeasured",
+            "block_inference_whole_scope_unmeasured",
+            "local_mamba_unmeasured",
+            "full_iteration_unmeasured",
+        ],
+    )
+    def test_packed_cudnn_dsa_cp_cuda_graph_guard_is_narrow(self, monkeypatch, overrides):
+        """Changing any measured guard dimension leaves the neighboring config available."""
+        config = self._make_packed_dsa_graph_config(monkeypatch, **overrides)
+        assert isinstance(config, MLATransformerConfig)
+
+    def test_packed_cudnn_dsa_preserves_legacy_block_inference_scope(self, monkeypatch):
+        """The deprecated spelling maps to an unmeasured block-inference graph."""
+        with pytest.warns(DeprecationWarning, match="full_iteration_inference"):
+            config = self._make_packed_dsa_graph_config(
+                monkeypatch, cuda_graph_impl="local", cuda_graph_modules="full_iteration_inference"
+            )
+        assert config.cuda_graph_modules == []
+        assert config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"dsa_kernel_backend": "none"},
+            {
+                "dsa_kernel_backend": "none",
+                "cuda_graph_modules": [CudaGraphModule.attn, CudaGraphModule.attn],
+            },
+            {"sequence_packing_scheduler": "default_dynamic_cp", "dynamic_context_parallel": True},
+            {
+                "sequence_packing_scheduler": "default_dynamic_cp",
+                "dynamic_context_parallel": True,
+                "cuda_graph_modules": [],
+            },
+            {
+                "sequence_packing_scheduler": "default_dynamic_cp",
+                "dynamic_context_parallel": True,
+                "cuda_graph_modules": [CudaGraphModule.mlp],
+            },
+            {
+                "sequence_packing_scheduler": "default_dynamic_cp",
+                "dynamic_context_parallel": True,
+                "cuda_graph_impl": "transformer_engine",
+            },
+            {
+                "sequence_packing_scheduler": "default_dynamic_cp",
+                "dynamic_context_parallel": True,
+                "cuda_graph_impl": "transformer_engine",
+                "cuda_graph_modules": [],
+            },
+        ],
+        ids=[
+            "static_unfused_local_attention",
+            "static_unfused_local_attention_repeated",
+            "dynamic_cudnn_local_attention",
+            "dynamic_cudnn_local_whole_layer",
+            "dynamic_cudnn_local_mlp",
+            "dynamic_cudnn_te_attention",
+            "dynamic_cudnn_te_whole_layer",
+        ],
+    )
+    def test_packed_dsa_cp_rejects_additional_measured_graph_configs(self, monkeypatch, overrides):
+        with pytest.raises(ValueError, match="packed DSA context-parallel configuration"):
+            self._make_packed_dsa_graph_config(monkeypatch, **overrides)
+
+    @pytest.mark.parametrize(
+        (
+            "context_parallel_size",
+            "dsa_kernel_backend",
+            "sequence_packing_scheduler",
+            "dynamic_context_parallel",
+            "cuda_graph_impl",
+            "cuda_graph_modules",
+        ),
+        [
+            (2, "none", "dp_balanced", False, "local", []),
+            (2, "none", "dp_balanced", False, "local", [CudaGraphModule.mlp]),
+            (2, "none", "dp_balanced", False, "transformer_engine", [CudaGraphModule.attn]),
+            (2, "none", "default_dynamic_cp", True, "local", [CudaGraphModule.attn]),
+            (4, "none", "dp_balanced", False, "local", [CudaGraphModule.attn]),
+            (2, "tilelang", "dp_balanced", False, "local", [CudaGraphModule.attn]),
+            (
+                2,
+                "cudnn",
+                "dp_balanced",
+                False,
+                "local",
+                [CudaGraphModule.mlp, CudaGraphModule.mamba],
+            ),
+            (
+                4,
+                "cudnn",
+                "dp_balanced",
+                False,
+                "local",
+                [CudaGraphModule.attn, CudaGraphModule.mlp],
+            ),
+            (2, "cudnn", "dp_balanced", False, "local", [CudaGraphModule.moe]),
+            (2, "cudnn", "dp_balanced", False, "local", [CudaGraphModule.moe_router]),
+            (
+                2,
+                "cudnn",
+                "dp_balanced",
+                False,
+                "local",
+                [CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
+            ),
+            (2, "cudnn", "dp_balanced", False, "local", [CudaGraphModule.mamba]),
+            (2, "cudnn", "dp_balanced", False, "transformer_engine", [CudaGraphModule.mlp]),
+            (2, "cudnn", "dp_balanced", False, "transformer_engine", [CudaGraphModule.moe]),
+            (2, "cudnn", "dp_balanced", False, "full_iteration", []),
+        ],
+        ids=[
+            "cp2_backend_none_whole_layer",
+            "cp2_backend_none_mlp",
+            "cp2_backend_none_te_attention",
+            "cp2_backend_none_dynamic_attention",
+            "cp4_backend_none_attention",
+            "cp2_backend_tilelang",
+            "cp2_local_mlp_mamba_combined",
+            "cp4_local_attention_mlp_combined",
+            "cp2_local_moe",
+            "cp2_local_moe_router",
+            "cp2_local_moe_preprocess",
+            "cp2_local_mamba",
+            "cp2_te_mlp",
+            "cp2_te_moe",
+            "cp2_full_iteration",
+        ],
+    )
+    def test_packed_dsa_cp_cuda_graph_predicate_preserves_unmeasured_neighbors(
+        self,
+        context_parallel_size,
+        dsa_kernel_backend,
+        sequence_packing_scheduler,
+        dynamic_context_parallel,
+        cuda_graph_impl,
+        cuda_graph_modules,
+    ):
+        """Do not turn static reasoning about unmeasured neighbors into prohibitions."""
+        assert not is_packed_dsa_cp_cuda_graph_capture_unsupported(
+            experimental_attention_variant="dsa",
+            dsa_kernel_backend=dsa_kernel_backend,
+            sequence_packing_scheduler=sequence_packing_scheduler,
+            dynamic_context_parallel=dynamic_context_parallel,
+            context_parallel_size=context_parallel_size,
+            cuda_graph_impl=cuda_graph_impl,
+            cuda_graph_modules=cuda_graph_modules,
+            inference_cuda_graph_scope=InferenceCudaGraphScope.layer,
+        )
+
+    @pytest.mark.parametrize(
+        ("context_parallel_size", "sequence_packing_scheduler", "dynamic_context_parallel"),
+        [
+            (3, "dp_balanced", False),
+            (3, "default_dynamic_cp", True),
+            (4, "default_dynamic_cp", True),
+            (2, "dp_balanced", True),
+            (2, "default_dynamic_cp", False),
+        ],
+        ids=[
+            "static_cp3",
+            "dynamic_cp3",
+            "dynamic_cp4",
+            "dynamic_flag_static_scheduler",
+            "dynamic_scheduler_without_flag",
+        ],
+    )
+    def test_packed_dsa_cuda_graph_predicate_preserves_unmeasured_topologies(
+        self, context_parallel_size, sequence_packing_scheduler, dynamic_context_parallel
+    ):
+        assert not is_packed_dsa_cp_cuda_graph_capture_unsupported(
+            experimental_attention_variant="dsa",
+            dsa_kernel_backend="cudnn",
+            sequence_packing_scheduler=sequence_packing_scheduler,
+            dynamic_context_parallel=dynamic_context_parallel,
+            context_parallel_size=context_parallel_size,
+            cuda_graph_impl="local",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            inference_cuda_graph_scope=InferenceCudaGraphScope.layer,
+        )
+
     def test_get_dsa_module_spec_for_backend(self):
         """get_dsa_module_spec_for_backend returns the correct full spec structure."""
         from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
@@ -4019,3 +4375,264 @@ class TestDSAModuleSpecDispatch:
         config = self._make_dsa_config(qk_l2_norm=True)
         with pytest.raises(AssertionError, match="qk_l2_norm is not supported"):
             get_dsa_module_spec_for_backend(config, backend=None)
+
+
+class TestPackedCPAllRankPositions:
+    """The batched CP position builder must match the per-rank loop exactly."""
+
+    @staticmethod
+    def _cu_seqlens(seq_lens, cp_size):
+        """Pad each sequence to a multiple of 2 * cp_size and return cu_seqlens."""
+        multiple = 2 * cp_size
+        padded = [0 if s == 0 else -(-s // multiple) * multiple for s in seq_lens]
+        offsets = [0]
+        for p in padded:
+            offsets.append(offsets[-1] + p)
+        return torch.tensor(offsets, dtype=torch.int32)
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 8, 16, 64])
+    @pytest.mark.parametrize(
+        "seq_lens", [[512], [512, 1024], [256, 256, 512], [128, 384, 640, 896], [1024, 0, 2048]]
+    )
+    @pytest.mark.parametrize("cover", [True, False])
+    def test_matches_per_rank_loop(self, cp_size, seq_lens, cover):
+        """Row r of the batched build equals the single-rank build for cp_rank=r."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens(seq_lens, cp_size)
+        total = int(cu_seqlens[-1])
+        if total == 0:
+            pytest.skip("degenerate all-empty case")
+        output_size = total // cp_size
+
+        expected = torch.stack(
+            [
+                build_packed_allgather_cp_local_positions(
+                    cu_seqlens,
+                    cp_size,
+                    rank,
+                    device,
+                    output_size=output_size,
+                    cu_seqlens_cover_output=cover,
+                )
+                for rank in range(cp_size)
+            ],
+            dim=0,
+        )
+        actual = build_packed_allgather_cp_all_rank_positions(
+            cu_seqlens, cp_size, device, output_size=output_size, cu_seqlens_cover_output=cover
+        )
+        assert actual.shape == expected.shape
+        assert torch.equal(actual, expected)
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 8])
+    def test_padded_output_size(self, cp_size):
+        """Rows still match when output_size exceeds the packed token count."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens([512, 1024], cp_size)
+        output_size = int(cu_seqlens[-1]) // cp_size + 2 * cp_size
+        expected = torch.stack(
+            [
+                build_packed_allgather_cp_local_positions(
+                    cu_seqlens, cp_size, rank, device, output_size=output_size
+                )
+                for rank in range(cp_size)
+            ],
+            dim=0,
+        )
+        actual = build_packed_allgather_cp_all_rank_positions(
+            cu_seqlens, cp_size, device, output_size=output_size
+        )
+        assert torch.equal(actual, expected)
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 16])
+    def test_key_reorder_unchanged(self, cp_size):
+        """The public reorder index is unchanged by the batched build."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens([512, 1024], cp_size)
+        total = int(cu_seqlens[-1])
+        output_size = total // cp_size
+
+        _, key_reorder_idx = build_packed_allgather_cp_query_positions_and_key_reorder(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cp_size=cp_size,
+            cp_rank=0,
+            device=device,
+            local_output_size=output_size,
+            key_local_output_size=output_size,
+            global_output_size=total,
+        )
+        reference = torch.argsort(
+            torch.cat(
+                [
+                    build_packed_allgather_cp_local_positions(
+                        cu_seqlens, cp_size, rank, device, output_size=output_size
+                    )
+                    for rank in range(cp_size)
+                ],
+                dim=0,
+            )
+        )
+        assert torch.equal(key_reorder_idx, reference)
+
+
+class TestHostSidePackedCpLayoutBuilders:
+    """The host builders must be bit-equal to the device builders they replace.
+
+    The host path consumes the compacted cu_seqlens list that
+    prebuild_thd_cp_partition_routes stores on PackedSeqParams; the device path
+    consumes the raw device tensor. e2e loss cannot discriminate here (the
+    training workload is not run-to-run reproducible), so bit equality of the
+    produced tables is the correctness contract.
+    """
+
+    @staticmethod
+    def _cu_seqlens(seq_lens, cp_size):
+        multiple = 2 * cp_size
+        padded = [0 if s == 0 else -(-s // multiple) * multiple for s in seq_lens]
+        offsets = [0]
+        for p in padded:
+            offsets.append(offsets[-1] + p)
+        return torch.tensor(offsets, dtype=torch.int32)
+
+    @staticmethod
+    def _host_list(cu_seqlens):
+        """Compacted host list, matching _compact_thd_cu_seqlens_to_list semantics."""
+        values = cu_seqlens.tolist()
+        compact = [values[0]]
+        for v in values[1:]:
+            if v != compact[-1]:
+                compact.append(v)
+        return compact
+
+    @pytest.mark.parametrize("cp_size", [1, 2, 4, 8, 16])
+    @pytest.mark.parametrize(
+        "seq_lens", [[512], [512, 1024], [256, 256, 512], [128, 384, 640, 896], [1024, 0, 2048]]
+    )
+    @pytest.mark.parametrize("cover", [True, False])
+    def test_local_positions_match_device_builder(self, cp_size, seq_lens, cover):
+        """Every rank's host-built positions equal the device builder's output."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens(seq_lens, cp_size)
+        total = int(cu_seqlens[-1])
+        if total == 0:
+            pytest.skip("degenerate all-empty case")
+        output_size = total // cp_size
+        host_cu = self._host_list(cu_seqlens)
+        for rank in range(cp_size):
+            expected = build_packed_allgather_cp_local_positions(
+                cu_seqlens,
+                cp_size,
+                rank,
+                device,
+                output_size=output_size,
+                cu_seqlens_cover_output=cover,
+            )
+            actual = build_packed_allgather_cp_local_positions_from_host(
+                host_cu,
+                cp_size,
+                rank,
+                device,
+                output_size=output_size,
+                cu_seqlens_cover_output=cover,
+            )
+            assert torch.equal(actual, expected), f"rank {rank} differs"
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 8])
+    @pytest.mark.parametrize("seq_lens", [[512], [256, 256, 512], [1024, 0, 2048]])
+    def test_padded_local_positions_match_device_builder(self, cp_size, seq_lens):
+        """Rows still match when output_size exceeds the packed token count."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens(seq_lens, cp_size)
+        total = int(cu_seqlens[-1])
+        output_size = total // cp_size + 64
+        host_cu = self._host_list(cu_seqlens)
+        for rank in range(cp_size):
+            expected = build_packed_allgather_cp_local_positions(
+                cu_seqlens, cp_size, rank, device, output_size=output_size
+            )
+            actual = build_packed_allgather_cp_local_positions_from_host(
+                host_cu, cp_size, rank, device, output_size=output_size
+            )
+            assert torch.equal(actual, expected), f"rank {rank} differs"
+
+    @pytest.mark.parametrize("seq_lens", [[5], [7, 3], [1]])
+    def test_cp1_odd_lengths_match_device_identity(self, seq_lens):
+        """cp_size=1 has no zigzag halving, so odd lengths must stay identity.
+
+        The span form floors seq_len // 2 and would silently drop the middle token;
+        the builders take a dedicated identity path instead, mirroring the device
+        builder's cp_size <= 1 branch.
+        """
+        device = torch.device("cpu")
+        offsets = [0]
+        for length in seq_lens:
+            offsets.append(offsets[-1] + length)
+        cu_seqlens = torch.tensor(offsets, dtype=torch.int32)
+        host_cu = offsets
+        total = offsets[-1]
+        expected = build_packed_allgather_cp_local_positions(
+            cu_seqlens, 1, 0, device, output_size=total
+        )
+        actual = build_packed_allgather_cp_local_positions_from_host(
+            host_cu, 1, 0, device, output_size=total
+        )
+        assert torch.equal(actual, expected)
+        _, reorder = build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
+            host_cu,
+            host_cu,
+            cp_size=1,
+            cp_rank=0,
+            device=device,
+            local_output_size=total,
+            key_local_output_size=total,
+        )
+        assert torch.equal(reorder, torch.arange(total, dtype=torch.int64))
+
+    @pytest.mark.parametrize("cp_size", [2, 4])
+    def test_non_divisible_lengths_raise_on_host(self, cp_size):
+        """Host builders reject lengths not divisible by 2*cp_size instead of
+        silently dropping tokens; the check is free on host integers."""
+        bad_cu = [0, 2 * cp_size + 1]
+        with pytest.raises(ValueError, match="divisible"):
+            build_packed_allgather_cp_local_positions_from_host(
+                bad_cu, cp_size, 0, torch.device("cpu")
+            )
+
+    @pytest.mark.parametrize("cp_size", [2, 4, 8, 16])
+    @pytest.mark.parametrize("seq_lens", [[512], [512, 1024], [256, 256, 512], [1024, 0, 2048]])
+    @pytest.mark.parametrize("pad", [0, 64])
+    def test_query_and_reorder_match_device_wrapper(self, cp_size, seq_lens, pad):
+        """The host wrapper (direct inverse, no argsort) equals the device wrapper."""
+        device = torch.device("cpu")
+        cu_seqlens = self._cu_seqlens(seq_lens, cp_size)
+        total = int(cu_seqlens[-1])
+        if total == 0:
+            pytest.skip("degenerate all-empty case")
+        local = total // cp_size + pad
+        host_cu = self._host_list(cu_seqlens)
+        for rank in range(cp_size):
+            expected_q, expected_r = build_packed_allgather_cp_query_positions_and_key_reorder(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                cp_size=cp_size,
+                cp_rank=rank,
+                device=device,
+                local_output_size=local,
+                key_local_output_size=local,
+                global_output_size=local * cp_size,
+            )
+            actual_q, actual_r = (
+                build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
+                    host_cu,
+                    host_cu,
+                    cp_size=cp_size,
+                    cp_rank=rank,
+                    device=device,
+                    local_output_size=local,
+                    key_local_output_size=local,
+                    global_output_size=local * cp_size,
+                )
+            )
+            assert torch.equal(actual_q, expected_q), f"rank {rank} query positions differ"
+            assert torch.equal(actual_r, expected_r), f"rank {rank} key reorder differs"
