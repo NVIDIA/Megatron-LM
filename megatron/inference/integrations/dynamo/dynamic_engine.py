@@ -1,12 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Dynamo-specific dynamic inference engine extensions."""
+"""Dynamo-specific dynamic inference engine type."""
 
-from megatron.core.inference.disaggregation.inference_state_handoff import (
-    InferenceStateHandoffMixin,
-)
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+from megatron.core.inference.disaggregation.engine import StateHandoffDynamicInferenceEngine
 
 
-class DynamoDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInferenceEngine):
+class DynamoDynamicInferenceEngine(StateHandoffDynamicInferenceEngine):
     """Dynamic inference engine with Dynamo KV/state handoff support."""

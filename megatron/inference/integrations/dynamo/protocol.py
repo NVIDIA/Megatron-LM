@@ -4,28 +4,11 @@
 
 from __future__ import annotations
 
+from megatron.core.inference.engine_endpoint import InferenceEngineCapabilities
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 
-def engine_metadata(engine, role: str) -> dict:
+
+def engine_metadata(engine: DynamicInferenceEngine, role: str) -> dict[str, int | bool | str]:
     """Return the capabilities Dynamo needs to configure this engine."""
 
-    allocator = engine.context.kv_block_allocator
-    tokenizer = engine.controller.tokenizer
-    bos_token_id = next(
-        (
-            int(value)
-            for name in ("bos", "bos_token_id", "eod")
-            if (value := getattr(tokenizer, name, None)) is not None
-        ),
-        0,
-    )
-    return {
-        "context_length": int(engine.context.max_sequence_length),
-        "kv_cache_block_size": int(engine.context.block_size_tokens),
-        "total_kv_blocks": max(0, int(allocator.pool_size) - 1),
-        "max_num_seqs": int(engine.context.max_requests),
-        "max_num_batched_tokens": int(engine.context.max_tokens),
-        "role": role,
-        "bos_token_id": bos_token_id,
-        "enable_prefix_caching": bool(engine.context.enable_prefix_caching),
-        "logical_data_parallel_size": 1,
-    }
+    return {**InferenceEngineCapabilities.from_engine(engine).to_dict(), "role": role}

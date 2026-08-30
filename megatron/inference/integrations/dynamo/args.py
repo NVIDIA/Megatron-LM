@@ -36,6 +36,7 @@ class Config:
     engine_start_timeout: float = 1800.0
     engine_shutdown_timeout: float = 30.0
     parent_event_host: str = "127.0.0.1"
+    endpoint_types: str = "chat,completions"
 
 
 def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -48,9 +49,7 @@ def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
 def add_engine_service_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add arguments shared by the Dynamo parent and Megatron child service."""
 
-    parser.add_argument(
-        "--role", choices=["aggregated", "prefill", "decode"], default="aggregated"
-    )
+    parser.add_argument("--role", choices=["aggregated", "prefill", "decode"], default="aggregated")
     parser.add_argument("--coordinator-host", default=None)
     parser.add_argument("--coordinator-port", type=int, default=None)
     return parser
@@ -67,6 +66,15 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--namespace", default="dynamo")
     parser.add_argument("--component", default=None)
     parser.add_argument("--endpoint", default="generate")
+    parser.add_argument(
+        "--endpoint-types",
+        choices=["chat", "completions", "chat,completions"],
+        default="chat,completions",
+        help=(
+            "OpenAI endpoint surfaces advertised to Dynamo. Use 'completions' "
+            "for base models that do not define a chat template."
+        ),
+    )
     parser.add_argument("--discovery-backend", default="etcd")
     parser.add_argument("--request-plane", default="nats")
     parser.add_argument("--event-plane", default="nats")
@@ -112,11 +120,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
         parser.error("--launcher slurm requires --master-addr and --master-port")
     if args.master_port is not None and not 1 <= args.master_port <= 65535:
         parser.error("--master-port must be between 1 and 65535")
-    if args.launcher == "slurm" and args.nnodes > 1 and args.parent_event_host in {
-        "127.0.0.1",
-        "::1",
-        "localhost",
-    }:
+    if (
+        args.launcher == "slurm"
+        and args.nnodes > 1
+        and args.parent_event_host in {"127.0.0.1", "::1", "localhost"}
+    ):
         parser.error(
             "multi-node --launcher slurm requires --parent-event-host to be a routable "
             "address on the Dynamo parent host"
@@ -158,4 +166,5 @@ def parse_args(argv: list[str] | None = None) -> Config:
         engine_start_timeout=args.engine_start_timeout,
         engine_shutdown_timeout=args.engine_shutdown_timeout,
         parent_event_host=args.parent_event_host,
+        endpoint_types=args.endpoint_types,
     )

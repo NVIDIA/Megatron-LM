@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -57,6 +57,7 @@ def _slurm_argv():
 def test_parse_args_splits_dynamo_and_megatron_arguments():
     config = parse_args(_argv())
     assert config.component == "backend"
+    assert config.endpoint_types == "chat,completions"
     assert config.nproc_per_node == 2
     assert config.megatron_argv == [
         "--load",
@@ -165,17 +166,44 @@ def test_slurm_engine_command_launches_one_torchrun_agent_per_node():
 
 
 @pytest.mark.asyncio
-async def test_from_args_is_side_effect_free(monkeypatch):
+async def test_from_args_resolves_only_registration_metadata(monkeypatch):
     async def fail_create_subprocess(*args, **kwargs):
         raise AssertionError("from_args must not start a process")
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fail_create_subprocess)
+    fetch_model = AsyncMock(return_value="/cache/model-meta")
+    monkeypatch.setattr(
+        "megatron.inference.integrations.dynamo.llm_engine.fetch_model", fetch_model
+    )
     engine, worker = await MegatronLLMEngine.from_args(_argv())
 
     assert engine._process is None
     assert engine.client is None
     assert worker.component == "backend"
-    assert worker.model_name == "model-meta"
+    assert worker.model_name == "/cache/model-meta"
+    assert engine.registration_model == "/cache/model-meta"
+    fetch_model.assert_awaited_once_with("model-meta", ignore_weights=True)
+
+
+@pytest.mark.asyncio
+async def test_from_args_preserves_local_registration_model(tmp_path, monkeypatch):
+    fetch_model = AsyncMock()
+    monkeypatch.setattr(
+        "megatron.inference.integrations.dynamo.llm_engine.fetch_model", fetch_model
+    )
+    argv = _argv()
+    argv[argv.index("model-meta")] = str(tmp_path)
+    argv[argv.index("--nproc-per-node") : argv.index("--nproc-per-node")] = [
+        "--endpoint-types",
+        "completions",
+    ]
+
+    engine, worker = await MegatronLLMEngine.from_args(argv)
+
+    assert worker.model_name == str(tmp_path.resolve())
+    assert worker.endpoint_types == "completions"
+    assert engine.registration_model == str(tmp_path.resolve())
+    fetch_model.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -21,15 +21,24 @@ import zmq
 import zmq.asyncio
 from dynamo._core import Context
 from dynamo.common.backend.disagg import require_prefill_result
-from dynamo.common.backend.engine import EngineConfig, GenerateChunk, GenerateRequest, LLMEngine
+from dynamo.common.backend.engine import (
+    EngineConfig,
+    GenerateChunk,
+    GenerateRequest,
+    LLMEngine,
+    LlmRegistration,
+)
 from dynamo.common.backend.health_check import build_health_check_payload, is_probe
+from dynamo.common.backend.logprobs import parse_logprob_options
 from dynamo.common.backend.publisher import KvEventSource, PushSource
 from dynamo.common.backend.worker import WorkerConfig
 from dynamo.common.constants import DisaggregationMode
+from dynamo.common.model_fetch import fetch_model
 from dynamo.llm import KvEventPublisher, ModelInput
 
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient, InferenceRequestError
+from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.inference.integrations.dynamo.args import Config, parse_args
 from megatron.inference.integrations.dynamo.telemetry import EngineEventReceiver
@@ -38,6 +47,13 @@ logger = logging.getLogger(__name__)
 
 
 def build_sampling_params(request: GenerateRequest) -> SamplingParams:
+    """Translate one Dynamo generation request to Megatron sampling parameters.
+
+    Dynamo's selected generated-token log probabilities are supported with
+    ``logprobs=0``. Prompt and top-N log probabilities are rejected because
+    Megatron's current wire representation cannot satisfy Dynamo's schema.
+    """
+
     sampling = request.get("sampling_options") or {}
     stop = request.get("stop_conditions") or {}
     params = SamplingParams()
@@ -62,16 +78,16 @@ def build_sampling_params(request: GenerateRequest) -> SamplingParams:
                 len(stop_token_ids) - 1,
             )
     output = request.get("output_options") or {}
-    token_logprobs = output.get("logprobs")
-    prompt_logprobs = output.get("prompt_logprobs")
-    requested_logprob_counts = {
-        int(value) for value in (token_logprobs, prompt_logprobs) if value is not None
-    }
-    if len(requested_logprob_counts) > 1:
-        raise ValueError("Megatron requires logprobs and prompt_logprobs to use the same count")
-    params.top_n_logprobs = next(iter(requested_logprob_counts), 0)
-    params.return_log_probs = token_logprobs is not None or prompt_logprobs is not None
-    params.skip_prompt_log_probs = prompt_logprobs is None
+    token_logprobs, prompt_logprobs = parse_logprob_options(output)
+    if prompt_logprobs is not None:
+        raise ValueError("Megatron Dynamo backend does not support prompt_logprobs")
+    if token_logprobs not in (None, 0):
+        raise ValueError(
+            "Megatron Dynamo backend supports selected-token logprobs only; use logprobs=0"
+        )
+    params.top_n_logprobs = 0
+    params.return_log_probs = token_logprobs == 0
+    params.skip_prompt_log_probs = True
     params.add_attributes({})
     if params.temperature == 0.0:
         params.top_k = 1
@@ -82,11 +98,9 @@ def build_sampling_params(request: GenerateRequest) -> SamplingParams:
 class MegatronLLMEngine(LLMEngine):
     """Unified Dynamo backend for one self-owned Megatron DP replica."""
 
-    def __init__(
-        self,
-        config: Config,
-    ) -> None:
+    def __init__(self, config: Config, registration_model: str | None = None) -> None:
         self.config = config
+        self.registration_model = registration_model or config.model
         self.client: Any = None
         self._process: Optional[asyncio.subprocess.Process] = None
         self._process_monitor: Optional[asyncio.Task] = None
@@ -109,10 +123,19 @@ class MegatronLLMEngine(LLMEngine):
         cls, argv: list[str] | None = None
     ) -> tuple["MegatronLLMEngine", WorkerConfig]:
         config = parse_args(argv)
-        return cls(config), cls.worker_config(config)
+        # Dynamo builds model cards independently from WorkerConfig.model_name
+        # and EngineConfig.model. Resolve both to one metadata-only snapshot so
+        # a Megatron-owned engine never downloads a second copy of its weights.
+        model_path = Path(config.model)
+        registration_model = (
+            str(model_path.resolve())
+            if model_path.exists()
+            else str(await fetch_model(config.model, ignore_weights=True))
+        )
+        return cls(config, registration_model), cls.worker_config(config, registration_model)
 
     @staticmethod
-    def worker_config(config: Config) -> WorkerConfig:
+    def worker_config(config: Config, registration_model: str | None = None) -> WorkerConfig:
         mode = {
             "aggregated": DisaggregationMode.AGGREGATED,
             "prefill": DisaggregationMode.PREFILL,
@@ -122,9 +145,10 @@ class MegatronLLMEngine(LLMEngine):
             namespace=config.namespace,
             component=config.component,
             endpoint=config.endpoint,
-            model_name=config.model,
+            model_name=registration_model or config.model,
             served_model_name=config.served_model_name,
             model_input=ModelInput.Tokens,
+            endpoint_types=config.endpoint_types,
             discovery_backend=config.discovery_backend,
             request_plane=config.request_plane,
             event_plane=config.event_plane,
@@ -135,18 +159,15 @@ class MegatronLLMEngine(LLMEngine):
     async def start(self, worker_id: int) -> EngineConfig:
         self.worker_id = int(worker_id)
         if not os.path.isdir(self.config.megatron_root):
-            raise FileNotFoundError(
-                f"Megatron root does not exist: {self.config.megatron_root}"
-            )
+            raise FileNotFoundError(f"Megatron root does not exist: {self.config.megatron_root}")
 
-        self._event_receiver = EngineEventReceiver(
-            self._on_engine_event,
-            self.config.parent_event_host,
-        )
-        parent_event_address = self._event_receiver.start()
-        command = self._engine_command(parent_event_address)
-        logger.info("Launching owned Megatron engine: %s", " ".join(command))
         try:
+            self._event_receiver = EngineEventReceiver(
+                self._on_engine_event, self.config.parent_event_host
+            )
+            parent_event_address = self._event_receiver.start()
+            command = self._engine_command(parent_event_address)
+            logger.info("Launching owned Megatron engine: %s", " ".join(command))
             self._process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=self.config.megatron_root,
@@ -154,21 +175,25 @@ class MegatronLLMEngine(LLMEngine):
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
             )
-        except Exception:
-            self._event_receiver.stop()
-            self._event_receiver = None
+            assert self._process.stdout is not None
+            assert self._process.stderr is not None
+            self._log_tasks = [
+                asyncio.create_task(self._forward_logs(self._process.stdout, logging.INFO)),
+                asyncio.create_task(self._forward_logs(self._process.stderr, logging.WARNING)),
+            ]
+            return await self._complete_startup()
+        except BaseException:
+            try:
+                await self.cleanup()
+            except Exception:
+                logger.exception("Failed to clean up after Megatron engine startup error")
             raise
-        assert self._process.stdout is not None
-        assert self._process.stderr is not None
-        self._log_tasks = [
-            asyncio.create_task(self._forward_logs(self._process.stdout, logging.INFO)),
-            asyncio.create_task(self._forward_logs(self._process.stderr, logging.WARNING)),
-        ]
+
+    async def _complete_startup(self) -> EngineConfig:
+        """Finish startup after the owned engine subprocess has launched."""
 
         readiness = await self._wait_for_readiness()
-        self.client = InferenceClient(
-            str(readiness["coordinator_address"]), deserialize=False
-        )
+        self.client = InferenceClient(str(readiness["coordinator_address"]), deserialize=False)
         self.client.start(
             loop=asyncio.get_running_loop(),
             connect_timeout_seconds=min(30.0, self.config.engine_start_timeout),
@@ -192,28 +217,24 @@ class MegatronLLMEngine(LLMEngine):
             os.replace(temporary, path)
 
         return EngineConfig(
-            model=self.config.model,
+            model=self.registration_model,
             served_model_name=self.config.served_model_name,
-            context_length=int(self._metadata["context_length"]),
-            kv_cache_block_size=int(self._metadata["kv_cache_block_size"]),
-            total_kv_blocks=int(self._metadata["total_kv_blocks"]),
-            max_num_seqs=int(self._metadata["max_num_seqs"]),
-            max_num_batched_tokens=int(self._metadata["max_num_batched_tokens"]),
-            data_parallel_size=1,
-            data_parallel_start_rank=0,
             runtime_data={"role": self.config.role, "worker_id": self.worker_id},
+            llm=LlmRegistration(
+                context_length=int(self._metadata["context_length"]),
+                kv_cache_block_size=int(self._metadata["kv_cache_block_size"]),
+                total_kv_blocks=int(self._metadata["total_kv_blocks"]),
+                max_num_seqs=int(self._metadata["max_num_seqs"]),
+                max_num_batched_tokens=int(self._metadata["max_num_batched_tokens"]),
+                data_parallel_size=1,
+                data_parallel_start_rank=0,
+            ),
         )
 
     def _engine_command(self, parent_event_address: str) -> list[str]:
-        command = [
-            sys.executable,
-            "-m",
-            "torch.distributed.run",
-        ]
+        command = [sys.executable, "-m", "torch.distributed.run"]
         if self.config.launcher == "local":
-            command.extend(
-                ["--standalone", f"--nproc-per-node={self.config.nproc_per_node}"]
-            )
+            command.extend(["--standalone", f"--nproc-per-node={self.config.nproc_per_node}"])
         else:
             command.extend(
                 [
@@ -235,18 +256,12 @@ class MegatronLLMEngine(LLMEngine):
             ]
         )
         if self.config.coordinator_host is not None:
-            command.extend(
-                ["--coordinator-host", self.config.coordinator_host]
-            )
+            command.extend(["--coordinator-host", self.config.coordinator_host])
         if self.config.coordinator_port is not None:
-            command.extend(
-                ["--coordinator-port", str(self.config.coordinator_port)]
-            )
+            command.extend(["--coordinator-port", str(self.config.coordinator_port)])
         command.extend(self.config.megatron_argv)
         if self.config.launcher == "slurm":
-            shell_command = shlex.join(command).replace(
-                "__SLURM_NODE_RANK__", '"${SLURM_NODEID}"'
-            )
+            shell_command = shlex.join(command).replace("__SLURM_NODE_RANK__", '"${SLURM_NODEID}"')
             srun_command = [
                 "srun",
                 f"--nodes={self.config.nnodes}",
@@ -260,9 +275,7 @@ class MegatronLLMEngine(LLMEngine):
             return srun_command + ["bash", "-c", f"exec {shell_command}"]
         return command
 
-    async def _forward_logs(
-        self, stream: asyncio.StreamReader, level: int
-    ) -> None:
+    async def _forward_logs(self, stream: asyncio.StreamReader, level: int) -> None:
         while line := await stream.readline():
             logger.log(level, "[megatron-engine] %s", line.decode(errors="replace").rstrip())
 
@@ -363,10 +376,7 @@ class MegatronLLMEngine(LLMEngine):
             disagg = prefill.get("disaggregated_params") or {}
             release = disagg.get("release") or {}
             stream = self.client.add_request_with_kv_handoff_streaming(
-                token_ids,
-                params,
-                disagg.get("kv_meta") or {},
-                list(disagg.get("block_ids") or []),
+                token_ids, params, disagg.get("kv_meta") or {}, list(disagg.get("block_ids") or [])
             )
         else:
             stream = self.client.add_request_streaming(token_ids, params)
@@ -405,16 +415,26 @@ class MegatronLLMEngine(LLMEngine):
         try:
             async for item in stream:
                 if "partial" in item:
-                    tokens = list(item["partial"].get("new_tokens") or [])
+                    partial = item["partial"]
+                    tokens = list(partial.get("new_tokens") or [])
+                    log_probs = list(partial.get("new_log_probs") or [])
+                    self._validate_log_probs(tokens, log_probs, params)
                     completion_tokens += len(tokens)
-                    yield {"token_ids": tokens, "index": 0}
+                    chunk: GenerateChunk = {"token_ids": tokens, "index": 0}
+                    if params.return_log_probs:
+                        chunk["log_probs"] = log_probs
+                    yield chunk
                     continue
 
                 final = item.get("final")
                 if final is None:
                     continue
+                final = unwrap_serialized_tensors(final)
                 all_tokens = list(final.get("generated_tokens") or [])
+                all_log_probs = list(final.get("generated_log_probs") or [])
                 tokens = all_tokens[completion_tokens:]
+                log_probs = all_log_probs[completion_tokens:]
+                self._validate_log_probs(tokens, log_probs, params)
                 completion_tokens = len(all_tokens)
                 max_tokens = params.num_tokens_to_generate
                 chunk: GenerateChunk = {
@@ -431,6 +451,8 @@ class MegatronLLMEngine(LLMEngine):
                         "total_tokens": len(prompt_token_ids) + completion_tokens,
                     },
                 }
+                if params.return_log_probs:
+                    chunk["log_probs"] = log_probs
                 completed = True
                 yield chunk
                 return
@@ -438,6 +460,19 @@ class MegatronLLMEngine(LLMEngine):
         finally:
             if not completed:
                 await stream.aclose()
+
+    @staticmethod
+    def _validate_log_probs(
+        token_ids: list[int], log_probs: list[float], params: SamplingParams
+    ) -> None:
+        """Keep Dynamo's token and selected-logprob arrays position-aligned."""
+
+        if params.return_log_probs and len(log_probs) != len(token_ids):
+            raise RuntimeError(
+                "Megatron returned "
+                f"{len(log_probs)} selected log probabilities for "
+                f"{len(token_ids)} generated tokens"
+            )
 
     async def _release_remote_handoff(self, address: str, request_id: int) -> None:
         async with self._release_lock:
@@ -462,9 +497,7 @@ class MegatronLLMEngine(LLMEngine):
                     raise RuntimeError("Unexpected handoff release coordinator reply")
                 self._release_sockets[address] = socket
             await socket.send(
-                msgpack.packb(
-                    [Headers.RELEASE_KV.value, int(request_id)], use_bin_type=True
-                )
+                msgpack.packb([Headers.RELEASE_KV.value, int(request_id)], use_bin_type=True)
             )
 
     async def _release_handoff_from_meta_async(self, release: dict[str, Any]) -> bool:
@@ -534,9 +567,7 @@ class MegatronLLMEngine(LLMEngine):
         if process is None:
             return
         try:
-            await asyncio.wait_for(
-                process.wait(), timeout=self.config.engine_shutdown_timeout
-            )
+            await asyncio.wait_for(process.wait(), timeout=self.config.engine_shutdown_timeout)
         except asyncio.TimeoutError:
             logger.warning("Terminating unresponsive Megatron engine process group")
             try:
