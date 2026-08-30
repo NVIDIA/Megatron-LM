@@ -9,26 +9,6 @@ import yaml
 from tests.test_utils.python_scripts import recipe_parser
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
-TRIAGE_LOG_PATH = "jet_workload.log"
-TRIAGE_REPORT_PATH = "error_report.json"
-
-
-def build_test_script(command: str) -> str:
-    """Wrap a workload command with non-blocking error extraction."""
-    return "\n".join(
-        [
-            "set +e",
-            "set -o pipefail",
-            f"{command} 2>&1 | tee {TRIAGE_LOG_PATH}",
-            'exit_code=${PIPESTATUS[0]}',
-            "set -e",
-            (
-                f"extract-errors {TRIAGE_LOG_PATH} --output {TRIAGE_REPORT_PATH} "
-                '--exit-code "$exit_code" || true'
-            ),
-            'exit "$exit_code"',
-        ]
-    )
 
 
 @click.command()
@@ -90,11 +70,6 @@ def build_test_script(command: str) -> str:
         "Empty/unset disables the cadence filter."
     ),
 )
-@click.option(
-    "--enable-error-extraction/--no-enable-error-extraction",
-    default=False,
-    help="Extract a structured error report from GitLab child-job output.",
-)
 def main(
     scope: str,
     environment: str,
@@ -116,8 +91,7 @@ def main(
     enable_lightweight_mode: bool = False,
     enable_warmup: Optional[bool] = None,
     cadence: Optional[str] = None,
-    enable_error_extraction: bool = False,
-) -> None:
+):
     # Treat empty string as "no cadence filter" so callers can wire shell
     # variables in directly without conditional flag emission.
     cadence_arg = cadence or None
@@ -243,20 +217,14 @@ def main(
                 elif warmup_job != "":
                     needs.append({"job": warmup_job})
 
-            test_script = " ".join(script)
-            artifact_paths = ["results/"]
-            if enable_error_extraction:
-                test_script = build_test_script(test_script)
-                artifact_paths.extend([TRIAGE_LOG_PATH, TRIAGE_REPORT_PATH])
-
             gitlab_pipeline[test_case['spec']['test_case']] = {
                 "stage": f"{test_case['spec']['model']}",
                 "image": f"{container_image}:{container_tag}",
                 "tags": job_tags,
                 "timeout": "7 days",
                 "needs": needs,
-                "script": [test_script],
-                "artifacts": {"paths": artifact_paths, "when": "always"},
+                "script": [" ".join(script)],
+                "artifacts": {"paths": ["results/"], "when": "always"},
                 "allow_failure": test_case["spec"].get("allow_failure", False)
                 or test_case["spec"]["model"] == "gpt-nemo",
                 "retry": {
