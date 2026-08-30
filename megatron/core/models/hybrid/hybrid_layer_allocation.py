@@ -2,46 +2,17 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import log_on_each_pipeline_stage, log_single_rank
 
+Symbols = layer_utils.Symbols
+
 logger = logging.getLogger(__name__)
-
-
-class Symbols:
-    """Symbols for different layer types and pattern separators."""
-
-    MAMBA = "M"
-    GDN = 'G'
-    KDA = 'K'
-    ATTENTION = "*"
-    DS_ATTENTION = "D"
-    MLA = "+"
-    CSA = "C"  # DSv4 Compressed Sparse Attention (compress_ratio=4)
-    HCA = "H"  # DSv4 Heavily Compressed Attention (compress_ratio=128)
-    WINDOW = "W"  # DSv4 sliding-window-only attention (compress_ratio=0; no compressor/indexer)
-    MLP = "-"
-    MOE = 'E'
-    PIPE = '|'
-    MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, KDA, ATTENTION, DS_ATTENTION, MLA, CSA, HCA, WINDOW, MLP, MOE}
-    # MLA-based attention layers (incompatible with standard '*' attention in one model).
-    MLA_ATTENTION = {MLA, DS_ATTENTION, CSA, HCA, WINDOW}
-
-    @classmethod
-    def name_sorted_valid_layer_symbols(cls) -> list[str]:
-        """Return the valid layer symbols sorted lexicographically by their public attribute
-        name.
-        """
-        valid_layer_attrs = []
-        for name, value in vars(cls).items():
-            if not name.startswith('_') and value in cls.VALID_LAYERS:
-                valid_layer_attrs.append((name, value))
-        valid_layer_attrs.sort()
-        return [value for (_, value) in valid_layer_attrs]
 
 
 @dataclass
@@ -144,7 +115,7 @@ def get_hybrid_total_layer_count(pattern: str) -> int:
         Total number of layers in the main decoder pattern.
     """
     main_pattern = pattern.split(Symbols.MTP_SEPARATOR)[0]
-    _validate_pattern(main_pattern, "main", allow_pipe=True)
+    _validate_pattern(main_pattern, allow_pipe=True)
     return len(main_pattern.replace(Symbols.PIPE, ''))
 
 
@@ -176,14 +147,14 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
 
     Returns:
         Dictionary mapping layer symbol to count. Keys are all valid layer symbols
-            (Symbols.VALID_LAYERS).
+            (the keys of ``Symbols.LAYER_CONFIG_MAP``).
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
-        {'*': 2, 'C': 0, 'D': 0, 'G': 0, 'H': 0, 'K': 0, 'M': 2, '+': 0, '-': 0, 'E': 0, 'W': 0}
+        {'*': 2, 'D': 0, 'G': 0, 'M': 2, '+': 0, '-': 0, 'E': 0}
 
         >>> get_hybrid_layer_counts("M-M-|M-M*-/MM/MM")
-        {'*': 1, 'C': 0, 'D': 0, 'G': 0, 'H': 0, 'K': 0, 'M': 8, '+': 0, '-': 4, 'E': 0, 'W': 0}
+        {'*': 1, 'D': 0, 'G': 0, 'M': 8, '+': 0, '-': 4, 'E': 0}
     """
     parsed = parse_hybrid_pattern(pattern)
     counts = {symbol: 0 for symbol in Symbols.name_sorted_valid_layer_symbols()}
@@ -244,13 +215,13 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     if len(parts) == 1:
         # No MTP separator found - pattern is main decoder only
         main_pattern = parts[0]
-        _validate_pattern(main_pattern, "main", allow_pipe=True)
+        _validate_pattern(main_pattern, allow_pipe=True)
         return ParsedHybridPattern(main_pattern=main_pattern, mtp_pattern=None, mtp_num_depths=0)
 
     # First part is main decoder pattern
     main_pattern = parts[0]
     if main_pattern:
-        _validate_pattern(main_pattern, "main", allow_pipe=True)
+        _validate_pattern(main_pattern, allow_pipe=True)
 
     # Remaining parts are MTP patterns (one per depth)
     mtp_parts = parts[1:]
@@ -271,7 +242,7 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
                 f"Full pattern: '{pattern}'"
             )
 
-    _validate_pattern(mtp_pattern, "MTP", allow_pipe=False)
+    _validate_pattern(mtp_pattern)
 
     return ParsedHybridPattern(
         main_pattern=main_pattern if main_pattern else None,
@@ -280,74 +251,66 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     )
 
 
-def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False) -> None:
+def _validate_pattern(pattern: str, allow_pipe: bool = False) -> None:
     """Validate that a pattern contains only valid layer symbols.
 
     Args:
         pattern: Layer pattern string to validate
-        pattern_name: Name of pattern for error messages (e.g., "main" or "MTP")
         allow_pipe: Whether to allow the pipe '|' separator (for main patterns)
 
     Raises:
         ValueError: If pattern contains invalid symbols
     """
-    valid_chars = Symbols.VALID_LAYERS | {Symbols.PIPE} if allow_pipe else Symbols.VALID_LAYERS
     for char in pattern:
-        if char not in valid_chars:
+        if not layer_utils.is_valid_symbol(char, allow_pipe=allow_pipe):
             raise ValueError(
-                f"In {pattern_name} pattern, '{char}' is not a valid layer symbol. "
-                f"Valid symbols are: {valid_chars}"
+                f"'{char}' is not a valid layer symbol. "
+                f"Valid symbols are: {Symbols.LAYER_CONFIG_MAP.keys()}"
             )
 
-    # Disallow standard Attention ('*') mixed with any MLA-based attention (+/D/C/H/W).
-    # MLA variants (DSA / CSA / HCA / Window) may freely coexist with each other.
-    if Symbols.ATTENTION in pattern and any(s in pattern for s in Symbols.MLA_ATTENTION):
-        raise ValueError(
-            "Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in one model"
-        )
+    # Disallow Attention + MLA/DSA hybridity.
+    if Symbols.ATTENTION in pattern and (Symbols.DS_ATTENTION in pattern or Symbols.MLA in pattern):
+        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
 
 
-def validate_segment_layers(segment: str) -> List[str]:
-    """Validate and convert a single pipeline segment pattern to a layer type list.
+def validate_segment_layers(segment: str, config: TransformerConfig) -> List[TransformerConfig]:
+    """Validate and convert a single pipeline segment pattern to layer configs.
 
     This is used after the main pattern has been split by '|' into segments.
     Each segment should contain only valid layer symbols (no '|').
 
+    Each layer config is copied from the source config without running ``__post_init__``
+    a second time.
+
     Args:
         segment: A single pipeline segment pattern string (e.g., "M-M*-")
+        config: Normalized stack-level config to copy for each layer.
 
     Returns:
-        List of layer type characters.
+        List of independent per-layer configs.
 
     Raises:
         ValueError: If segment contains invalid layer symbols.
     """
-    layer_type_list = list(segment)
-    for layer_char in layer_type_list:
-        if layer_char not in Symbols.VALID_LAYERS:
-            raise ValueError(
-                f"In hybrid layer pattern segment, '{layer_char}' is not "
-                f"one of {Symbols.VALID_LAYERS}"
-            )
+    _validate_pattern(segment)
 
-    # Disallow standard Attention ('*') mixed with any MLA-based attention (+/D/C/H/W).
-    if Symbols.ATTENTION in segment and any(s in segment for s in Symbols.MLA_ATTENTION):
-        raise ValueError(
-            "Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in one model"
-        )
+    layer_configs: list[TransformerConfig] = []
+    for layer_symbol in segment:
+        layer_configs.append(layer_utils.create_layer_config(config, layer_symbol))
 
-    return layer_type_list
+    return layer_configs
 
 
 def select_pipeline_segment(
     main_pattern: str,
+    config: TransformerConfig,
     pp_group: Optional[torch.distributed.ProcessGroup],
     vp_stage: Optional[int],
     first_stage_layers: Optional[int] = None,
     last_stage_layers: Optional[int] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> Tuple[List[str], int]:
+) -> Tuple[List[TransformerConfig], int]:
     """Select and validate the pipeline segment for the given PP rank and VP stage.
 
     When the main pattern contains '|' pipe separators, splits by '|' into
@@ -360,6 +323,7 @@ def select_pipeline_segment(
     Args:
         main_pattern: Main decoder pattern (may contain '|' separators).
             Empty string is allowed (produces one empty segment).
+        config: Normalized stack-level config to copy for each selected layer.
         pp_group: Pipeline parallel process group, or None if not using PP.
         vp_stage: Virtual pipeline stage, or None if not using VPP.
         first_stage_layers: Number of layers on the first pipeline stage for
@@ -370,8 +334,8 @@ def select_pipeline_segment(
         dp_cp_group: Optional data/context-parallel process group used for per-stage logging.
 
     Returns:
-        Tuple of (layer_type_list, layer_offset) where layer_type_list is
-        the list of layer type characters for this segment, and layer_offset
+        Tuple of (layer_config_list, layer_offset) where layer_config_list is
+        the list of independent configs for this segment, and layer_offset
         is the sum of layer counts from all preceding segments.
 
     Raises:
@@ -410,8 +374,8 @@ def select_pipeline_segment(
             "Example: 'M*M*M*M*' with pp_size=2 should become 'M*M*|M*M*'.",
         )
         full_pattern = segments[0]
-        layer_type_list = validate_segment_layers(full_pattern)
-        num_layers = len(layer_type_list)
+        _validate_pattern(full_pattern)
+        num_layers = len(full_pattern)
 
         if first_stage_layers is not None or last_stage_layers is not None:
             first = first_stage_layers or 0
@@ -454,12 +418,14 @@ def select_pipeline_segment(
             offset = pp_rank * layers_per_rank
             count = layers_per_rank
 
-        selected = layer_type_list[offset : offset + count]
+        selected_pattern = full_pattern[offset : offset + count]
+        layer_utils.validate_tp_comm_overlap(config, selected_pattern)
+        selected = validate_segment_layers(selected_pattern, config)
         log_on_each_pipeline_stage(
             logger,
             logging.INFO,
             f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_stage}, "
-            f"layers='{''.join(selected)}' ({len(selected)} layers), "
+            f"layers='{selected_pattern}' ({len(selected)} layers), "
             f"layer_offset={offset} (auto-split)",
             tp_group=tp_group,
             dp_cp_group=dp_cp_group,
@@ -488,26 +454,27 @@ def select_pipeline_segment(
     layer_offset = sum(len(segments[i]) for i in range(segment_index))
     my_segment = segments[segment_index]
 
-    layer_type_list = validate_segment_layers(my_segment)
+    layer_utils.validate_tp_comm_overlap(config, my_segment)
+    layer_config_list = validate_segment_layers(my_segment, config)
 
     log_on_each_pipeline_stage(
         logger,
         logging.INFO,
         f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_rel}, "
         f"segment_index={segment_index}/{len(segments)}, "
-        f"layers='{my_segment}' ({len(layer_type_list)} layers), "
+        f"layers='{my_segment}' ({len(layer_config_list)} layers), "
         f"layer_offset={layer_offset}",
         tp_group=tp_group,
         dp_cp_group=dp_cp_group,
     )
 
-    return layer_type_list, layer_offset
+    return layer_config_list, layer_offset
 
 
 def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> dict[str, dict[int, int]]:
     """
     Returns maps from global layer index to the corresponding layer index
-    for each valid layer type (those in Symbols.VALID_LAYERS) given a layer type list.
+    for each valid layer type (the keys of Symbols.LAYER_CONFIG_MAP) given a layer type list.
     """
     layer_types = [symbol for symbol in Symbols.name_sorted_valid_layer_symbols()]
     layer_maps = {layer_type: {} for layer_type in layer_types}
@@ -516,3 +483,22 @@ def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> dict[str,
         local_layer_idx = len(layer_map)
         layer_map[global_layer_idx] = local_layer_idx
     return layer_maps
+
+
+def get_layer_type_list_from_layer_config_list(
+    layer_config_list: Sequence[TransformerConfig],
+) -> list[str]:
+    """Return the layer symbols corresponding to a sequence of layer configs.
+
+    This compatibility projection keeps ``layer_config_list`` as the source of truth while
+    supporting callers that still read ``HybridStack.layer_type_list``.
+
+    Args:
+        layer_config_list: Per-layer configs in layer order.
+
+    Returns:
+        The canonical layer symbol for each config.
+    """
+    return [
+        layer_utils.get_layer_symbol_from_config(layer_config) for layer_config in layer_config_list
+    ]

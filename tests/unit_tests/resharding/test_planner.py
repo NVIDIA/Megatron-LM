@@ -16,6 +16,7 @@ import torch
 import megatron.core.resharding.planner as planner
 from megatron.core.resharding.planner import (
     _build_descriptors_for_param,
+    _build_execution_batch_ids,
     _build_tensor_reshard_specs,
     _finalize_dp_transfers,
     _plan_tp,
@@ -722,10 +723,15 @@ def _plan_edges(plans):
     return sends, recvs
 
 
-def _build_all(gathered_pairs):
+def _build_all(gathered_pairs, execution_batch_bytes=None):
     """Build every rank's plan from a rank-ordered list of (src_meta, dst_meta)."""
     dst_by_rank, src_by_name = index_metadata_rosters(gathered_pairs)
-    return {rank: build_plan_from_rosters(dst_by_rank, src_by_name, rank) for rank in dst_by_rank}
+    return {
+        rank: build_plan_from_rosters(
+            dst_by_rank, src_by_name, rank, execution_batch_bytes=execution_batch_bytes
+        )
+        for rank in dst_by_rank
+    }
 
 
 def _recv_sig(plan):
@@ -777,6 +783,52 @@ class TestBuildPlanFromRosters:
         assert {(s, d) for _, s, d in sends} == {(0, 1), (0, 2)}
         assert len({tid for tid, _, _ in sends}) == 2
 
+    def test_execution_batches_match_across_ranks(self):
+        """Large complete parameters are split without separating their slices."""
+        num_elements = 40_000_000  # 160 MB at float32
+        gathered = [
+            (
+                [
+                    _meta(
+                        name=name, shape=(num_elements,), owner_rank=0, tp_ranks=[0], dp_ranks=[0]
+                    )
+                    for name in ("first", "second")
+                ],
+                [],
+            ),
+            (
+                [],
+                [
+                    _meta(
+                        name=name, shape=(num_elements,), owner_rank=1, tp_ranks=[1], dp_ranks=[1]
+                    )
+                    for name in ("first", "second")
+                ],
+            ),
+        ]
+
+        default_plans = _build_all(gathered)
+        assert {plan.num_batches for plan in default_plans.values()} == {1}
+        assert {plan.execution_batch_bytes for plan in default_plans.values()} == {None}
+
+        plans = _build_all(gathered, execution_batch_bytes=256 * 1024 * 1024)
+
+        assert {plan.num_batches for plan in plans.values()} == {2}
+        assert {plan.execution_batch_bytes for plan in plans.values()} == {256 * 1024 * 1024}
+        send_batches = {op.task_id: op.batch_id for op in plans[0].send_ops}
+        recv_batches = {op.task_id: op.batch_id for op in plans[1].recv_ops}
+        assert send_batches == recv_batches == {0: 0, 1: 1}
+
+        dst_by_rank, src_by_name = index_metadata_rosters(gathered)
+        larger_limit_plans = {
+            rank: build_plan_from_rosters(
+                dst_by_rank, src_by_name, rank, execution_batch_bytes=400_000_000
+            )
+            for rank in dst_by_rank
+        }
+        assert {plan.num_batches for plan in larger_limit_plans.values()} == {1}
+        assert {plan.execution_batch_bytes for plan in larger_limit_plans.values()} == {400_000_000}
+
     def test_node_add_keeps_existing_task_ids_stable(self):
         """Appending a rank rebuilds locally without renumbering existing transfers."""
         base = [
@@ -800,6 +852,71 @@ class TestBuildPlanFromRosters:
         assert {(s, d) for _, s, d in sends_after} == {(0, 1), (0, 2), (0, 3)}
 
 
+def test_execution_batch_ids_keep_replicas_together():
+    """All replicas of a logical parameter receive one global batch ID."""
+    dst_by_rank = {
+        2: {
+            "first": _meta(name="first", shape=(2,), owner_rank=2),
+            "second": _meta(name="second", shape=(2,), owner_rank=2),
+        },
+        3: {"first": _meta(name="first", shape=(2,), owner_rank=3)},
+    }
+    src_by_name = {
+        "first": [
+            _meta(name="first", shape=(2,), owner_rank=0),
+            _meta(name="first", shape=(2,), owner_rank=1),
+        ],
+        "second": [_meta(name="second", shape=(2,), owner_rank=0)],
+    }
+
+    batch_ids, num_batches = _build_execution_batch_ids(
+        dst_by_rank, src_by_name, max_batch_bytes=12
+    )
+
+    assert batch_ids == {"first": 0, "second": 1}
+    assert num_batches == 2
+
+
+@pytest.mark.parametrize(
+    ("gathered_limits", "local_limit", "expected_limit"),
+    [([200, 100], 200, 100), ([None, None], None, None), ([None, 100], None, 100)],
+)
+def test_local_plan_resolves_rank_execution_batch_bytes(
+    monkeypatch, gathered_limits, local_limit, expected_limit
+):
+    """Ranks agree on the smallest configured limit or preserve the unset default."""
+    sentinel = object()
+    forwarded = {}
+
+    class FakeGroup:
+        def rank(self):
+            return 0
+
+        def size(self):
+            return 2
+
+    monkeypatch.setattr(planner, "_extract_module_metadata", lambda *_args: [])
+
+    def fake_all_gather_object(output, _local_entry, group):
+        assert isinstance(group, FakeGroup)
+        output[:] = [([], [], limit) for limit in gathered_limits]
+
+    def fake_build(dst_by_rank, src_by_name, rank, execution_batch_bytes):
+        forwarded["args"] = (dst_by_rank, src_by_name, rank)
+        forwarded["execution_batch_bytes"] = execution_batch_bytes
+        return sentinel
+
+    monkeypatch.setattr(planner.dist, "all_gather_object", fake_all_gather_object)
+    monkeypatch.setattr(planner, "build_plan_from_rosters", fake_build)
+
+    result = planner.build_local_reshard_plan(
+        None, None, group=FakeGroup(), execution_batch_bytes=local_limit
+    )
+
+    assert result is sentinel
+    assert forwarded == {"args": ({0: {}, 1: {}}, {}, 0), "execution_batch_bytes": expected_limit}
+
+
 def test_centralized_planner_compatibility_wrapper(monkeypatch):
     """The previous public planner name warns and forwards every argument."""
     sentinel = object()
@@ -813,13 +930,25 @@ def test_centralized_planner_compatibility_wrapper(monkeypatch):
     monkeypatch.setattr(planner, "build_local_reshard_plan", fake_local)
     with pytest.warns(DeprecationWarning, match="build_local_reshard_plan"):
         result = planner.build_centralized_reshard_plan(
-            "src", "dst", num_experts=8, group="group", src_rank_offset=3, dst_rank_offset=7
+            "src",
+            "dst",
+            num_experts=8,
+            group="group",
+            src_rank_offset=3,
+            dst_rank_offset=7,
+            execution_batch_bytes=123,
         )
 
     assert result is sentinel
     assert forwarded == {
         "args": ("src", "dst"),
-        "kwargs": {"num_experts": 8, "group": "group", "src_rank_offset": 3, "dst_rank_offset": 7},
+        "kwargs": {
+            "num_experts": 8,
+            "group": "group",
+            "src_rank_offset": 3,
+            "dst_rank_offset": 7,
+            "execution_batch_bytes": 123,
+        },
     }
 
 
