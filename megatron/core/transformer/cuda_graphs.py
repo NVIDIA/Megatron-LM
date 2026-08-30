@@ -21,7 +21,6 @@ import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core import parallel_state
-from megatron.core.dynamic_cp_group import get_process_group_ranks
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.packed_seq_params import resolve_thd_tail_padding_policy
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1718,6 +1717,7 @@ class _DynamicCPCaptureCallable(torch.nn.Module):
         self.training = module.training
 
     def forward(self, *args, **kwargs):
+        """Apply the capture context and run the wrapped module."""
         self._context_setter(self._capture_context)
         outputs = self.module(*args, **kwargs)
         mlp_norm_manager = getattr(self.module, 'mlp_norm_manager', None)
@@ -2935,7 +2935,7 @@ class TECudaGraphHelper:
             if cp_group is None or cp_size is None or cp_size <= 1:
                 continue
 
-            group_ranks = get_process_group_ranks(cp_group)
+            group_ranks = torch.distributed.get_process_group_ranks(cp_group)
             if len(group_ranks) != cp_size:
                 raise RuntimeError(
                     f"Dynamic-CP group has {len(group_ranks)} ranks, expected cp_size={cp_size}."
@@ -3366,6 +3366,12 @@ class TECudaGraphHelper:
         for optimizer in self.optimizers:
             optimizer.zero_grad()
         get_moe_metrics_tracker().clear()
+        if self.config.experimental_attention_variant in ('dsa', 'dsv4_hybrid'):
+            from megatron.core.transformer.experimental_attention_variant.dsa import (
+                DSAIndexerLossLoggingHelper,
+            )
+
+            DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
         reset_model_temporary_tensors(self.config, self.model)
 
     def _finish_capturing(self, start_time):

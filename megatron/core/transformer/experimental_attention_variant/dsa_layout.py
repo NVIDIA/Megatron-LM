@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.mappings import gather_from_dynamic_cp_subgroup
 from megatron.core.utils import get_pg_size
 
 __all__ = [
@@ -95,6 +96,7 @@ def get_cp_positions_from_layout(
     cp_comm_type: Optional[str],
     device: torch.device,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    cp_parent_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Infer query/key global token positions under CP allgather layout."""
     if cp_size <= 1:
@@ -122,9 +124,15 @@ def get_cp_positions_from_layout(
         and get_pg_size(cp_group) == cp_size
     ):
         local_len = torch.tensor([sq], device=device, dtype=torch.int64)
-        all_lens = [torch.empty_like(local_len) for _ in range(cp_size)]
-        torch.distributed.all_gather(all_lens, local_len, group=cp_group)
-        query_offset = int(torch.stack(all_lens[:cp_rank]).sum().item()) if cp_rank > 0 else 0
+        if cp_parent_group is not None:
+            all_lens = gather_from_dynamic_cp_subgroup(
+                local_len, cp_group, cp_parent_group, output_grad=False
+            )
+        else:
+            gathered_lens = [torch.empty_like(local_len) for _ in range(cp_size)]
+            torch.distributed.all_gather(gathered_lens, local_len, group=cp_group)
+            all_lens = torch.cat(gathered_lens)
+        query_offset = int(all_lens[:cp_rank].sum().item()) if cp_rank > 0 else 0
 
     query_pos = torch.arange(sq, device=device, dtype=torch.int64) + query_offset
     key_pos = torch.arange(skv, device=device, dtype=torch.int64)

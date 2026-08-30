@@ -1084,6 +1084,7 @@ class TestCPCommunicationOverlap:
                 None,
             )
             cp_group = FakeGroup()
+            cp_parent_group = None
             compressed_kv_start = 2
             indexer_k_reduce_scatter_state = indexer_state
             compressed_kv_reduce_scatter_state = compressed_kv_state

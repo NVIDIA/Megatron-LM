@@ -928,6 +928,35 @@ class TestTECudaGraphHelper:
         # Note: _unique_buffer_counts is intentionally NOT cleared here so we can
         # compare values across parametrized test runs
 
+    def test_reset_after_capture_clears_dsa_tracker_values(self, monkeypatch):
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossLoggingHelper,
+        )
+        from megatron.core.transformer.moe import moe_logging
+
+        reduce_group = object()
+        avg_group = object()
+        parent_group = object()
+        tracker = dict(
+            values=torch.ones(2),
+            reduce_group=reduce_group,
+            avg_group=avg_group,
+            dynamic_cp_parent_group=parent_group,
+        )
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, 'tracker', tracker)
+        monkeypatch.setattr(moe_logging, 'get_moe_metrics_tracker', lambda: {})
+
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = type('Config', (), {'experimental_attention_variant': 'dsv4_hybrid'})()
+        helper.model = []
+        helper.optimizers = []
+        helper._reset_after_capture()
+
+        assert torch.count_nonzero(tracker['values']) == 0
+        assert tracker['reduce_group'] is reduce_group
+        assert tracker['avg_group'] is avg_group
+        assert tracker['dynamic_cp_parent_group'] is parent_group
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_mhc_static_input_aliasing_requires_disjoint_liveness_windows(self):
         config = _base_cuda_graph_config(

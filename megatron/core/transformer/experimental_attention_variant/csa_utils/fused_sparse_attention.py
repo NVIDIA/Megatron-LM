@@ -28,7 +28,10 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from megatron.core.tensor_parallel.mappings import async_reduce_scatter_along_first_dim
+from megatron.core.tensor_parallel.mappings import (
+    async_reduce_scatter_along_first_dim,
+    async_reduce_scatter_dynamic_cp_subgroup,
+)
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 from .csa_teacher_lse import can_use_fused_csa_teacher_lse, fused_csa_teacher_lse
@@ -1944,6 +1947,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         indexer_rank_map: Optional[Tensor] = None,
         indexer_k_reduce_scatter_state: Optional[_DeferredReduceScatterState] = None,
         compressed_kv_reduce_scatter_state: Optional[_DeferredReduceScatterState] = None,
+        cp_parent_group=None,
     ) -> Tuple[Tensor, Tensor]:
         """Run fused sparse attention using caller-supplied top-k indices."""
         _ensure_dsa_namespace()
@@ -2129,6 +2133,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             indexer_rank_map = torch.empty(0, dtype=torch.int32, device=query.device)
 
         ctx.cp_group = cp_group
+        ctx.cp_parent_group = cp_parent_group
         ctx.compressed_kv_start = int(compressed_kv_start)
         ctx.indexer_k_reduce_scatter_state = indexer_k_reduce_scatter_state
         ctx.compressed_kv_reduce_scatter_state = compressed_kv_reduce_scatter_state
@@ -2225,9 +2230,14 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                     f"got {grad_compressed_kv.shape[0]} rows, expected {expected_rows}."
                 )
             nvtx_range_push("dsv4_cp_attention_kv_reduce_scatter_launch")
-            compressed_kv_reduce_scatter = async_reduce_scatter_along_first_dim(
-                grad_compressed_kv, group=cp_group
-            )
+            if ctx.cp_parent_group is not None:
+                compressed_kv_reduce_scatter = async_reduce_scatter_dynamic_cp_subgroup(
+                    grad_compressed_kv, cp_group, ctx.cp_parent_group
+                )
+            else:
+                compressed_kv_reduce_scatter = async_reduce_scatter_along_first_dim(
+                    grad_compressed_kv, group=cp_group
+                )
             nvtx_range_pop("dsv4_cp_attention_kv_reduce_scatter_launch")
 
             # Both reductions launch after the main sparse-attention backward,
@@ -2235,9 +2245,14 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             # its consumer branch is newer in autograd and runs first; Indexer-K
             # can then remain in flight during the attention compressor backward.
             nvtx_range_push("dsv4_cp_indexer_k_reduce_scatter_launch")
-            indexer_reduce_scatter = async_reduce_scatter_along_first_dim(
-                grad_k_indexer_rank_major, group=cp_group
-            )
+            if ctx.cp_parent_group is not None:
+                indexer_reduce_scatter = async_reduce_scatter_dynamic_cp_subgroup(
+                    grad_k_indexer_rank_major, cp_group, ctx.cp_parent_group
+                )
+            else:
+                indexer_reduce_scatter = async_reduce_scatter_along_first_dim(
+                    grad_k_indexer_rank_major, group=cp_group
+                )
             nvtx_range_pop("dsv4_cp_indexer_k_reduce_scatter_launch")
 
             if ctx.indexer_k_reduce_scatter_state is not None:
@@ -2282,6 +2297,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             None,
             grad_local_k_indexer,
             grad_local_compressed_kv,
+            None,
             None,
             None,
             None,

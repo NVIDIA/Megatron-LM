@@ -273,11 +273,17 @@ class DSv4HybridAttention(Attention):
 
         boundary_hidden = None
         if use_thd_cp:
+            cp_parent_group = None
+            if getattr(self.config, "dynamic_context_parallel", False):
+                cp_parent_group = getattr(self.pg_collection, "dp_cp", None)
+                if cp_parent_group is None:
+                    raise RuntimeError("Dynamic-CP CSA requires a dp_cp parent process group.")
             boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
                 hidden_states,
                 self._dsv4_compress_ratio,
                 self.config.csa_window_size,
                 self.pg_collection.cp,
+                cp_parent_group,
             )
 
         # =====================
