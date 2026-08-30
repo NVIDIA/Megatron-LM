@@ -337,11 +337,9 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             INVERSE=inverse,
             REMOVE_INTERLEAVING=remove_interleaving,
         )
-        ctx.save_for_backward(cos, sin, *(() if position_ids is None else (position_ids,)))
-        ctx.has_position_ids = position_ids is not None
+        ctx.save_for_backward(cos, sin, position_ids, cu_seqlens_q)
         ctx.nope_dim = nope_dim
         ctx.emb_dim = emb_dim
-        ctx.cu_seqlens_q = cu_seqlens_q
         ctx.rotary_interleaved = rotary_interleaved
         ctx.inverse = inverse
         ctx.remove_interleaving = remove_interleaving
@@ -360,21 +358,17 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             grad: [seq_len, batch_size, head_num, nope_dim + emb_dim]
                 or [total_seq_len, head_num, nope_dim + emb_dim]
         """
-        if ctx.has_position_ids:
-            cos, sin, position_ids = ctx.saved_tensors
-        else:
-            cos, sin = ctx.saved_tensors
-            position_ids = None
+        cos, sin, position_ids, cu_seqlens_q = ctx.saved_tensors
         max_seqlen = None
         batch_size = None
         seq_num = None
-        if ctx.cu_seqlens_q is None:
+        if cu_seqlens_q is None:
             max_seqlen, batch_size, nheads, headdim = grad.shape
             grad = grad.contiguous().view(-1, nheads, headdim)
             total_seqlen = grad.shape[0]
         else:
-            seq_num = len(ctx.cu_seqlens_q) - 1
-            if ctx.has_position_ids:
+            seq_num = len(cu_seqlens_q) - 1
+            if position_ids is not None:
                 grad = grad.contiguous()
             total_seqlen, nheads, headdim = grad.shape
         assert grad.stride(-1) == 1
@@ -389,7 +383,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             nheads,
             batch_size,
             seq_num,
-            ctx.cu_seqlens_q,
+            cu_seqlens_q,
             position_ids,
             grad.stride(0),
             grad.stride(1),
@@ -400,7 +394,7 @@ class _FusedMLARoPEInplace(torch.autograd.Function):
             INVERSE=ctx.inverse,
             REMOVE_INTERLEAVING=ctx.remove_interleaving,
         )
-        if ctx.cu_seqlens_q is None:
+        if cu_seqlens_q is None:
             grad = grad.view(max_seqlen, batch_size, nheads, headdim)
         return grad, None, None, None, None, None, None, None, None, None, None, None
 

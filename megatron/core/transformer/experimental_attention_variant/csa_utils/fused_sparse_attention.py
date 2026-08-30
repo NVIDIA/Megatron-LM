@@ -728,9 +728,8 @@ class CSASparseAttnFunc(torch.autograd.Function):
             indexer_topk=indexer_topk,
         )
 
-        ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
+        ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse, topk_length)
         ctx.softmax_scale = softmax_scale
-        ctx.topk_length = topk_length
         return out, lse, lse_indexer
 
     @staticmethod
@@ -738,7 +737,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
         """Compute sparse-attention backward via cuDNN DSA wrapper."""
         _ensure_dsa_namespace()
 
-        q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
+        q, kv, attn_sink, topk_idxs, out, lse, topk_length = ctx.saved_tensors
 
         result = _DSA.sparse_attention_backward_wrapper(
             q,
@@ -749,7 +748,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
             attn_sink,
             topk_idxs,
             softmax_scale=ctx.softmax_scale,
-            topk_length=ctx.topk_length,
+            topk_length=topk_length,
         )
         dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
         return dq, dkv, d_sink, None, None, None, None
@@ -1799,10 +1798,10 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             precomputed_grad_q_indexer,
             precomputed_grad_k_indexer,
             precomputed_grad_weights,
+            padding_row_mask,
         )
         ctx.softmax_scale = softmax_scale
         ctx.is_thd = is_thd
-        ctx.padding_row_mask = padding_row_mask
         ctx.np_ = np_
         ctx.d = d
         if is_thd:
@@ -1834,6 +1833,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             precomputed_grad_q_indexer,
             precomputed_grad_k_indexer,
             precomputed_grad_weights,
+            padding_row_mask,
         ) = ctx.saved_tensors
 
         is_thd = ctx.is_thd
@@ -1847,9 +1847,9 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             sq, b, skv = ctx.sq, ctx.b, ctx.skv
             dO_flat = grad_output.reshape(sq * b, np_, d_v)
 
-        if ctx.padding_row_mask is not None:
-            dO_flat = dO_flat.masked_fill(ctx.padding_row_mask[:, None, None], 0)
-            lse = lse.masked_fill(ctx.padding_row_mask[:, None], 0)
+        if padding_row_mask is not None:
+            dO_flat = dO_flat.masked_fill(padding_row_mask[:, None, None], 0)
+            lse = lse.masked_fill(padding_row_mask[:, None], 0)
 
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
             q_flat,
@@ -2146,9 +2146,9 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             saved_grad_k_indexer,
             saved_grad_weights,
             indexer_rank_map,
+            q_padding_mask,
         )
         ctx.softmax_scale = softmax_scale
-        ctx.q_padding_mask = q_padding_mask
 
         return out_flat.reshape(total_q, np_ * out_flat.shape[-1]), indexer_loss
 
@@ -2168,6 +2168,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             saved_grad_k_indexer,
             saved_grad_weights,
             indexer_rank_map,
+            q_padding_mask,
         ) = ctx.saved_tensors
 
         cp_group = ctx.cp_group
@@ -2189,9 +2190,9 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                 grad_k_indexer_rank_major = grad_k_indexer
 
         dO_flat = grad_output.reshape(query.shape[0], query.shape[1], out_flat.shape[-1])
-        if ctx.q_padding_mask is not None:
-            dO_flat = dO_flat.masked_fill(ctx.q_padding_mask[:, None, None], 0)
-            lse = lse.masked_fill(ctx.q_padding_mask[:, None], 0)
+        if q_padding_mask is not None:
+            dO_flat = dO_flat.masked_fill(q_padding_mask[:, None, None], 0)
+            lse = lse.masked_fill(q_padding_mask[:, None], 0)
         nvtx_range_push("dsv4_cp_sparse_attention_backward")
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
             query,
