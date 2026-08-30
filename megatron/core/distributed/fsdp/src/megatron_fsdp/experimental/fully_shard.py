@@ -64,6 +64,7 @@ def fully_shard_context(
     *,
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
+    custom_forward_backward_hooks: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -78,6 +79,9 @@ def fully_shard_context(
         unify_communication_stream: Whether all-gathers and reduce-scatters share one
             communication stream to reduce peak transient memory. See
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
+        custom_forward_backward_hooks: Whether a custom schedule (e.g. the 1F1B
+            EP-overlap) drives the module lifecycle with its own forward-backward
+            hooks. When True, the strict phase-transition check is relaxed.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
@@ -90,6 +94,7 @@ def fully_shard_context(
         device=device,
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
+        custom_forward_backward_hooks=custom_forward_backward_hooks,
     )
     token = _FSDP_CONTEXT.set(context)
     try:

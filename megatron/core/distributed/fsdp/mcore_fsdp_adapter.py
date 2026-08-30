@@ -14,6 +14,7 @@
 
 import logging
 import random
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple, Type
 
 __all__ = ["FullyShardedDataParallel"]
@@ -54,6 +55,7 @@ try:
         fully_shard,
         fully_shard_context,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -565,7 +567,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
-        with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
+        with fully_shard_context(
+            device=device,
+            use_symmetric_memory=ddp_config.nccl_ub,
+            custom_forward_backward_hooks=config.overlap_moe_expert_parallel_comm,
+        ):
+            # The 1F1B EP-overlap schedule drives the FsdpModule lifecycle explicitly
+            # (pre_forward/pre_backward/post_forward) and calls submodules directly, so
+            # the context's custom_forward_backward_hooks flag suppresses the module's
+            # own forward/backward hooks to avoid double-driving.
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
                 # Their gradients need the EP divisor because the same expert receives
@@ -594,6 +604,18 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             fully_shard(
                 module, mesh=dp_mesh, placements=placements, mixed_precision_policy=self.mp_policy
             )
+
+        if config.overlap_moe_expert_parallel_comm:
+            # The 1F1B EP-overlap schedule interleaves forward and backward work in
+            # the same step, so the autograd-GraphTask recompute detection in
+            # FsdpModule.pre_forward/post_forward can misfire and wrongly suppress
+            # forward prefetch or parameter resharding. Activation recomputation is
+            # forbidden with the overlap schedule (see TransformerConfig validation),
+            # so disable the detection on every unit while the schedule switch is on.
+            for submodule in module.modules():
+                if isinstance(submodule, FsdpModule):
+                    submodule._disable_recompute_detection = True
+
         super().__init__(config=config, module=module)
 
     @staticmethod
@@ -627,10 +649,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             # silently inflated norm.
             raise ValueError("MFSDP v2 does not currently support mtp_detach_heads.")
 
-        unsupported_parallelisms = [
-            "tensor_model_parallel_size",
-            "context_parallel_size",
-        ]
+        unsupported_parallelisms = ["tensor_model_parallel_size", "context_parallel_size"]
         if any(getattr(config, parallelism) != 1 for parallelism in unsupported_parallelisms):
             raise ValueError(
                 "MFSDP v2 does not currently support: "
@@ -714,6 +733,24 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 gradient reduction is complete when backward returns."""
+
+    @contextmanager
+    def no_sync(self):
+        """Suppress gradient finalization for non-final microbatches.
+
+        Toggles ``is_last_microbatch`` on this model's ``FsdpContext`` so gradient
+        reduce-scatters accumulate between microbatches rather than finalizing on
+        every backward. Called by the training loop via ``config.no_sync_func``
+        and the 1F1B overlap schedule.
+        """
+        self.module.context.ensure_finalized()
+        context = self.module.context
+        previous_state = context.is_last_microbatch
+        context.is_last_microbatch = False
+        try:
+            yield
+        finally:
+            context.is_last_microbatch = previous_state
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""

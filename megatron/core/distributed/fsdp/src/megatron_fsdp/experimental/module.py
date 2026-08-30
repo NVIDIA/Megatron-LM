@@ -46,6 +46,11 @@ class FsdpContext:
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool
+    # The 1F1B EP-overlap schedule drives the FsdpModule forward/backward lifecycle
+    # explicitly (custom forward-backward hooks), so the standard RESTING/FORWARD/
+    # BACKWARD phase-transition invariants do not hold. When set, the phase check in
+    # FsdpModule.set_phase() is relaxed (this is the 1F1B EP-overlap path).
+    custom_forward_backward_hooks: bool
     # Static orders used to drive all-gather prefetch. We may want to switch to
     # capturing runtime order if static module order proves too fragile. Each
     # FsdpModule tracks its own materialized state via ``FsdpModule._unshard_event``.
@@ -57,6 +62,7 @@ class FsdpContext:
         device: torch.device,
         use_symmetric_memory: bool = False,
         unify_communication_stream: bool = False,
+        custom_forward_backward_hooks: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -66,10 +72,14 @@ class FsdpContext:
                 communication staging buffers from PyTorch's NCCL symmetric-memory pool.
             unify_communication_stream: Whether all-gathers and reduce-scatters share one
                 communication stream to reduce peak transient memory.
+            custom_forward_backward_hooks: Whether a custom schedule (e.g. the 1F1B
+                EP-overlap) drives the module lifecycle with its own forward-backward
+                hooks. When True, the strict phase-transition check is relaxed.
         """
         self.is_last_microbatch = True
         self.use_symmetric_memory = use_symmetric_memory
         self.unify_communication_stream = unify_communication_stream
+        self.custom_forward_backward_hooks = custom_forward_backward_hooks
         self.forward_order = IndexedOrder()
         self.backward_order = IndexedOrder()
         # Construction-only; empty after finalization.
@@ -156,7 +166,6 @@ class FsdpModule:
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext
     _num_ready_grad_parameters: int
-    _manual_backward_finalize: bool
     _is_root: bool
     _num_trainable_parameters: int
     # Event recorded after this FsdpModule's full parameters are materialized.
@@ -213,7 +222,6 @@ class FsdpModule:
             )
         self._parameter_groups = tuple(parameter_groups)
         self._num_ready_grad_parameters = 0
-        self._manual_backward_finalize = False
         self._num_trainable_parameters = sum(
             len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
         )
@@ -232,15 +240,25 @@ class FsdpModule:
 
     @phase.setter
     def phase(self, phase: Phase) -> None:
-        """Transition this module between its valid lifecycle phases."""
+        """Transition this module between its valid lifecycle phases.
+
+        The 1F1B EP-overlap schedule drives the lifecycle explicitly with custom
+        forward-backward hooks, so its RESTING/FORWARD/BACKWARD transitions do not
+        follow the strict pairwise invariants defined here. When the context has
+        ``custom_forward_backward_hooks`` set (the 1F1B EP-overlap path), the
+        transition check is relaxed.
+        """
         allowed_transitions = {
             (FsdpModule.Phase.RESTING, FsdpModule.Phase.FORWARD),
             (FsdpModule.Phase.FORWARD, FsdpModule.Phase.RESTING),
             (FsdpModule.Phase.RESTING, FsdpModule.Phase.BACKWARD),
             (FsdpModule.Phase.BACKWARD, FsdpModule.Phase.RESTING),
         }
-        if (self._phase, phase) not in allowed_transitions:
-            raise RuntimeError(f"Invalid FSDP module phase transition: {self._phase} -> {phase}.")
+        if not self.context.custom_forward_backward_hooks:
+            if (self._phase, phase) not in allowed_transitions:
+                raise RuntimeError(
+                    f"Invalid FSDP module phase transition: {self._phase} -> {phase}."
+                )
         self._phase = phase
 
     @property
@@ -258,24 +276,25 @@ class FsdpModule:
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
         module.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
-        # Use PyTorch's callback module argument instead of capturing self so
-        # these hooks do not retain a deleted FSDP module.
-        module.register_forward_pre_hook(
-            lambda hooked_module, _args: cast(FsdpModule, hooked_module).pre_forward()
-        )
-        module.register_forward_hook(
-            lambda hooked_module, _args, _output: cast(FsdpModule, hooked_module).post_forward()
-        )
-        module.register_full_backward_pre_hook(
-            lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
-        )
-        if self._num_trainable_parameters == 0:
-            module.register_full_backward_hook(
-                lambda hooked_module, _grad_input, _grad_output: cast(
-                    FsdpModule, hooked_module
-                ).post_backward()
+        if not self.context.custom_forward_backward_hooks:
+            # Use PyTorch's callback module argument instead of capturing self so
+            # these hooks do not retain a deleted FSDP module.
+            module.register_forward_pre_hook(
+                lambda hooked_module, _args: cast(FsdpModule, hooked_module).pre_forward()
             )
-            return
+            module.register_forward_hook(
+                lambda hooked_module, _args, _output: cast(FsdpModule, hooked_module).post_forward()
+            )
+            module.register_full_backward_pre_hook(
+                lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
+            )
+            if self._num_trainable_parameters == 0:
+                module.register_full_backward_hook(
+                    lambda hooked_module, _grad_input, _grad_output: cast(
+                        FsdpModule, hooked_module
+                    ).post_backward()
+                )
+                return
 
         # Gradient reduction for trainable parameters is parameter-completion
         # based: once every owned Parameter has accumulated its grad, this
@@ -288,10 +307,7 @@ class FsdpModule:
             if module is None:
                 return
             module._num_ready_grad_parameters += 1
-            if (
-                module._num_ready_grad_parameters == module._num_trainable_parameters
-                and not module._manual_backward_finalize
-            ):
+            if module._num_ready_grad_parameters == module._num_trainable_parameters:
                 module.post_backward()
 
         for group in self._parameter_groups:
@@ -300,11 +316,15 @@ class FsdpModule:
             for fsdp_parameter in group.fsdp_parameters:
                 parameter = fsdp_parameter.unsharded
                 # ``skip_backward_post_hook`` is TE's delayed-wgrad contract: these
-                # gradients are materialized by ``backward_dw()``, not autograd.
+                # gradients are materialized by ``backward_dw()``, not autograd, so
+                # the readiness counter must be driven by the delayed-wgrad hook
+                # (register_wgrad_accumulation_and_reduce_hooks), which fires inside
+                # backward_dw() -- i.e. AFTER the gradient actually exists. Using the
+                # normal post_accumulate_grad_hook here would complete the counter
+                # before backward_dw() populates the grad (stale/None at reduce time).
                 if not getattr(parameter, "skip_backward_post_hook", False):
                     parameter.register_post_accumulate_grad_hook(grad_hook)
                     continue
-
                 module_fqn, _, _ = fsdp_parameter.fqns[0].rpartition(".")
                 parameter_module = module.get_submodule(module_fqn) if module_fqn else module
                 parameter_module.register_wgrad_accumulation_and_reduce_hooks(
@@ -343,11 +363,15 @@ class FsdpModule:
         context.ensure_finalized()
         # A reentrant checkpoint recomputes before the child module's backward-pre
         # hook runs. The active autograd GraphTask identifies that recomputation.
-        is_recomputing = self.phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
+        # Integrations whose schedules interleave forwards and backwards (such as
+        # the MCore 1F1B EP-overlap adapter) set ``_disable_recompute_detection``
+        # on the unit so every call is treated as a genuine forward.
+        is_recomputing = self.phase is FsdpModule.Phase.BACKWARD or (
+            not getattr(self, "_disable_recompute_detection", False) and _is_in_backward()
+        )
         if self.phase is not FsdpModule.Phase.BACKWARD:
             self.phase = FsdpModule.Phase.FORWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
-        self._num_ready_grad_parameters = 0
         allgather_stream = context.allgather_stream
         current_stream = context.current_stream()
 
@@ -390,7 +414,9 @@ class FsdpModule:
         # Recomputed parameters are consumed immediately by this module's
         # backward. Keep them materialized to avoid an unnecessary all-gather;
         # post_backward() will reshard them after gradient reduction.
-        is_recomputing = self.phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
+        is_recomputing = self.phase is FsdpModule.Phase.BACKWARD or (
+            not getattr(self, "_disable_recompute_detection", False) and _is_in_backward()
+        )
         if not is_recomputing:
             self._reshard_parameter_groups()
         if self.phase is FsdpModule.Phase.FORWARD:
@@ -415,30 +441,19 @@ class FsdpModule:
                 group.release_unsharded_storage()
             self._unshard_event = None
 
-    def pre_backward(self, manual_finalize: bool = False) -> None:
-        """Prepare full parameters and prefetch the next FsdpModule in backward order.
-
-        Args:
-            manual_finalize: Whether a segmented backward schedule will explicitly call
-                :meth:`finalize_backward`. This suppresses both the autograd final callback
-                and parameter-readiness finalization for this module.
-        """
-        # A segmented schedule may start an FSDP unit explicitly before launching
-        # the unit's autograd GraphTask. The regular full-backward pre-hook then
-        # observes the same unit a second time. Its parameters are already ready;
-        # preserve the stronger finalization request and avoid a duplicate phase
-        # transition/all-gather.
-        if self.phase is FsdpModule.Phase.BACKWARD:
-            self._manual_backward_finalize |= manual_finalize
-            return
-
-        self._manual_backward_finalize = manual_finalize
+    def pre_backward(self) -> None:
+        """Prepare full parameters and prefetch the next FsdpModule in backward order."""
         self.phase = FsdpModule.Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
         current_stream = context.current_stream()
         if self.is_root():
-            if not manual_finalize:
+            # The autograd final callback can only be installed during a backward
+            # GraphTask. A schedule driving pre_backward explicitly is not inside a
+            # backward (it launches its own GraphTasks), so suppress it there; the
+            # caller coordinates the reducer stream instead. Skip the callback also
+            # when hooks are skipped (the 1F1B overlap path).
+            if not self.context.custom_forward_backward_hooks:
                 context.register_post_backward_final_callback()
             # Fork the reduce-scatter stream from the current stream once, at the
             # start of backward, so every module's post-backward reduce-scatter is
@@ -458,32 +473,24 @@ class FsdpModule:
             next_module._unshard_parameter_groups()
 
     def post_backward(self) -> None:
-        """Reduce gradients and return parameters to their sharded resting state."""
+        """Reduce gradients and return parameters to their sharded resting state.
+
+        ``post_backward`` is invoked when this unit's backward pass has completed (the
+        parameter-readiness counter in ``grad_hook`` once every owned parameter's grad has
+        accumulated). It reduces the gradients and reshard/releases the parameters, then
+        re-arms the grad-readiness counter for the next backward. Callers only invoke it
+        while the unit is in its BACKWARD pass; ``set_phase`` enforces phase transitions
+        (relaxed only by ``custom_forward_backward_hooks`` for the 1F1B EP-overlap path).
+        """
         self._reshard_parameter_groups()
         self._reduce_gradient_groups()
-        self._manual_backward_finalize = False
         self.phase = FsdpModule.Phase.RESTING
+        # 1F1B cooldown can run consecutive backward passes without an intervening
+        # pre_forward(), so reset the grad-readiness counter as soon as this pass
+        # is finalized (re-arms every sub-unit, incl. the MoE experts, for the next
+        # backward -- otherwise the expert units never re-complete it and freeze).
+        self._num_ready_grad_parameters = 0
         torch.cuda.nvtx.range_pop()
-
-    def finalize_backward(self) -> None:
-        """Finalize a root after a manually segmented backward schedule.
-
-        Schedule nodes execute separate autograd GraphTasks, so the root cannot use an
-        autograd final callback as its completion boundary. Finalize all units that remain
-        in backward, then order the current stream after their reduce-scatters.
-        """
-        if not self.is_root():
-            raise RuntimeError("Only a root FsdpModule can finalize a segmented backward.")
-
-        for fsdp_module in reversed(list(cast(nn.Module, self).modules())):
-            if not isinstance(fsdp_module, FsdpModule):
-                continue
-            if fsdp_module.phase is not FsdpModule.Phase.BACKWARD:
-                continue
-            fsdp_module.post_backward()
-            fsdp_module._num_ready_grad_parameters = 0
-
-        self.context.current_stream().wait_stream(self.context.reduce_scatter_stream)
 
     def _reduce_gradient_groups(self) -> None:
         """Pack gradients and immediately launch their reduce-scatters."""
