@@ -506,28 +506,24 @@ def get_layer_type_list_from_layer_config_list(
 
 def get_layer_maps_from_layer_config_list(
     layer_config_list: Sequence[TransformerConfig],
-) -> dict[type[TransformerConfig], dict[int, int]]:
+) -> dict[str, dict[int, int]]:
     """Return per-type layer maps for a list of layer configs.
 
-    Configs are indexed directly by their exact types. This keeps the per-layer configs as
-    the source of truth instead of projecting them back to layer symbols.
+    Configs are inspected directly and no layer type list is materialized. This keeps the
+    per-layer configs as the source of truth while exposing readable layer-symbol keys.
 
     Args:
         layer_config_list: Per-layer configs in global layer order.
 
     Returns:
-        Maps from global layer index to type-local layer index, keyed by layer config type.
+        Maps from global layer index to type-local layer index, keyed by layer symbol.
 
     Raises:
         ValueError: If a config's exact type is unsupported.
     """
-    layer_maps: dict[type[TransformerConfig], dict[int, int]] = {
-        layer_config_type: {} for layer_config_type in Symbols.LAYER_CONFIG_MAP.values()
-    }
+    layer_maps = {layer_symbol: {} for layer_symbol in Symbols.LAYER_CONFIG_MAP}
     for global_layer_idx, layer_config in enumerate(layer_config_list):
-        layer_config_type = type(layer_config)
-        if layer_config_type not in layer_maps:
-            raise ValueError(f"Unexpected hybrid layer config type: {layer_config_type.__name__}")
-        layer_map = layer_maps[layer_config_type]
+        layer_symbol = layer_utils.get_layer_symbol_from_config(layer_config)
+        layer_map = layer_maps[layer_symbol]
         layer_map[global_layer_idx] = len(layer_map)
     return layer_maps
