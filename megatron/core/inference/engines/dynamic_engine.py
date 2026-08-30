@@ -486,7 +486,7 @@ class DynamicInferenceEngine(AbstractEngine):
     def _raise_kv_handoff_not_enabled(operation: str) -> None:
         raise RuntimeError(
             f"{operation} requires KV handoff, but it is not enabled. "
-            "Use DisaggDynamicInferenceEngine with KV transfer configured."
+            "Use a StateHandoffDynamicInferenceEngine subclass with KV transfer configured."
         )
 
     def reset(self) -> None:

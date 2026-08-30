@@ -9,7 +9,10 @@ import pytest
 
 from megatron.core.inference.config import AsyncScheduleMode
 from megatron.core.inference.contexts.dynamic_context import DynamoHelper
-from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine
+from megatron.core.inference.disaggregation.engine import (
+    DisaggDynamicInferenceEngine,
+    StateHandoffDynamicInferenceEngine,
+)
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
@@ -405,8 +408,14 @@ def test_base_engine_rejects_kv_handoff_commands():
 
 
 def test_disagg_engine_resolves_handoff_methods_from_mixin():
-    assert DisaggDynamicInferenceEngine.mro()[:3] == [
+    assert StateHandoffDynamicInferenceEngine.mro()[:3] == [
+        StateHandoffDynamicInferenceEngine,
+        InferenceStateHandoffMixin,
+        DynamicInferenceEngine,
+    ]
+    assert DisaggDynamicInferenceEngine.mro()[:4] == [
         DisaggDynamicInferenceEngine,
+        StateHandoffDynamicInferenceEngine,
         InferenceStateHandoffMixin,
         DynamicInferenceEngine,
     ]

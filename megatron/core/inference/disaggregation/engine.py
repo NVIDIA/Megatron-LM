@@ -12,11 +12,20 @@ from megatron.core.inference.headers import Headers
 from megatron.core.utils import internal_api
 
 
-class DisaggDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInferenceEngine):
+class StateHandoffDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInferenceEngine):
+    """Dynamic engine with control-plane-neutral KV/state handoff behavior.
+
+    External control planes can use this class directly and configure the
+    transfer role with :meth:`setup_kv_transfer`. It intentionally does not
+    install the coordinator-native registration protocol below.
+    """
+
+
+class DisaggDynamicInferenceEngine(StateHandoffDynamicInferenceEngine):
     """Dynamic inference engine with prefill/decode state hand-off support.
 
-    Used by both control planes: the Dynamo integration and the
-    coordinator-native 2-hop mode.
+    This subclass adds the coordinator-native registration callbacks. External
+    control planes should use :class:`StateHandoffDynamicInferenceEngine`.
     """
 
     @internal_api
