@@ -132,6 +132,7 @@ class TestDSAIndexShareHelpers:
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            dsa_mtp_index_kv_share=False,
             kv_channels=16,
         )
 
@@ -154,6 +155,7 @@ class TestDSAIndexShareHelpers:
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            dsa_mtp_index_kv_share=False,
             kv_channels=16,
         )
         attention = DSAttention(
@@ -180,6 +182,7 @@ class TestDSAIndexShareHelpers:
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            dsa_mtp_index_kv_share=False,
             kv_channels=16,
         )
         attention = DSAttention(
