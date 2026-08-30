@@ -1072,6 +1072,9 @@ class TransformerConfig(ModelParallelConfig):
     and P2P communications in high-level CP groups (e.g., via IBLink).
     """
 
+    linear_cp_mode: Literal["headwise", "chunkwise"] = "headwise"
+    """Context-parallel algorithm for recurrent and linear-attention layers."""
+
     linear_cp_layout: CPLayout = "zigzag"
     """CP layout for linear-attention layers."""
 
@@ -1481,16 +1484,8 @@ class TransformerConfig(ModelParallelConfig):
 
     def _validate_cp_layouts(self) -> None:
         """Validate context-parallel layout settings."""
-        if self.linear_cp_layout not in ("contiguous", "zigzag"):
-            raise ValueError(
-                "linear_cp_layout must be either 'contiguous' or 'zigzag', "
-                f"got {self.linear_cp_layout!r}"
-            )
-        if self.attention_cp_layout not in ("contiguous", "zigzag"):
-            raise ValueError(
-                "attention_cp_layout must be either 'contiguous' or 'zigzag', "
-                f"got {self.attention_cp_layout!r}"
-            )
+        if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
+            raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
         if self.context_parallel_size > 1 and self.attention_cp_layout == "contiguous":
             raise ValueError(
                 "attention_cp_layout='contiguous' is not yet supported with context parallelism."
