@@ -697,20 +697,15 @@ class MoELayer(BaseMoELayer):
                     hidden_states, probs = intermediate_tensors
 
                 if self.config.moe_use_transformer_engine_fused_moe:
-                    ep_buffer, topk_idx, topk_weights = (
+                    ep_config, topk_idx, topk_weights = (
                         self.token_dispatcher.prepare_fused_moe_sequential()
                     )
-                    completed = False
-                    try:
-                        output = self.experts.fused_moe_forward(
-                            hidden_states,
-                            topk_idx,
-                            topk_weights,
-                            ep_buffer,
-                        )
-                        completed = True
-                    finally:
-                        self.token_dispatcher.finish_fused_moe_sequential(completed=completed)
+                    output = self.experts.fused_moe_forward(
+                        hidden_states,
+                        topk_idx,
+                        topk_weights,
+                        ep_config,
+                    )
                     mlp_bias = None
                 else:
                     dispatched_input, probs = self.dispatch(hidden_states, probs)

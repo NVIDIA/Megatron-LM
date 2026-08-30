@@ -114,6 +114,8 @@ class MoEModelTestContainer:
             activation_func=kwargs.get("activation_func", F.gelu),
             fp8=kwargs.get("fp8", None),
             fp8_recipe=kwargs.get("fp8_recipe", "delayed"),
+            fp8_param=kwargs.get("fp8_param", False),
+            moe_mlp_glu_interleave_size=kwargs.get("moe_mlp_glu_interleave_size", None),
             calculate_per_token_loss=kwargs.get("calculate_per_token_loss", False),
         )
 
@@ -122,7 +124,10 @@ class MoEModelTestContainer:
 
     def new_moe_layer(self, **kargs):
         new_config = dataclasses.replace(self.config, **kargs)
-        if new_config.use_transformer_engine_op_fuser:
+        if (
+            new_config.use_transformer_engine_op_fuser
+            or new_config.moe_use_transformer_engine_fused_moe
+        ):
             # op-fuser needs the TE grouped-MLP experts (they accept output_buffer/grad_input_buffer
             # for the ncclEP zero-copy path); the local spec yields SequentialMLP, which does not.
             mlp_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -130,8 +135,8 @@ class MoEModelTestContainer:
             ).submodules.mlp
         else:
             mlp_spec = get_gpt_layer_local_submodules(
-                num_experts=self.config.num_moe_experts,
-                moe_grouped_gemm=self.config.moe_grouped_gemm,
+                num_experts=new_config.num_moe_experts,
+                moe_grouped_gemm=new_config.moe_grouped_gemm,
             ).mlp
         submodules = get_submodules(mlp_spec)
         assert isinstance(submodules, MoESubmodules)
@@ -257,6 +262,14 @@ class MoEModelTestContainer:
         """Compare MXFP8 MegaMoE with Megatron's split BF16 NCCL-EP path."""
         from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
 
+        try:
+            from transformer_engine.pytorch.ops.fused.moe_ep import _cudnn_megamoe_supported
+        except ImportError:
+            pytest.skip("FusedMoeEp is unavailable")
+
+        if torch.cuda.get_device_capability() != (10, 7) or not _cudnn_megamoe_supported():
+            pytest.skip("FusedMoeEp is unavailable")
+
         torch.manual_seed(42)
         x = torch.randn((16, 4, self.config.hidden_size), dtype=self.test_dtype).cuda()
         dy = (torch.randn_like(x, dtype=torch.float32) * 0.1).to(self.test_dtype)
@@ -285,6 +298,9 @@ class MoEModelTestContainer:
             # NCCL-EP transports MXFP8 gradients as E4M3; HYBRID would select E5M2 in backward.
             fp8="e4m3",
             fp8_recipe="mxfp8",
+            fp8_param=True,
+            moe_mlp_glu_interleave_size=32,
+            moe_expert_rank_capacity_factor=8.0,
         )
         fused.load_state_dict(reference.state_dict())
         try:
@@ -298,7 +314,7 @@ class MoEModelTestContainer:
             for name in grads_ref:
                 torch.testing.assert_close(grads_fused[name], grads_ref[name], **tolerances)
 
-            (sequence,) = fused.experts._last_fused_moe_ops
+            (sequence,) = fused.experts._fused_moe_ops
             op_names = [type(op).__name__ for op in sequence]
             assert op_names == [
                 "MoeDispatch",
@@ -311,16 +327,11 @@ class MoEModelTestContainer:
             is_megamoe = any(
                 type(op).__name__ == "FusedMoeEp" for group in forward_ops for op in group
             )
-            try:
-                from transformer_engine.pytorch.ops.fused.moe_ep import _cudnn_megamoe_supported
-            except ImportError:
-                megamoe_supported = False
-            else:
-                megamoe_supported = (
-                    torch.cuda.get_device_capability() == (10, 7)
-                    and _cudnn_megamoe_supported()
-                )
-            assert is_megamoe == megamoe_supported
+            assert is_megamoe
+
+            sequence_before = fused.experts._fused_moe_ops[0]
+            run(fused)
+            assert fused.experts._fused_moe_ops[0] is sequence_before
         finally:
             nccl_ep_finalize()
 
@@ -822,7 +833,6 @@ class TestFlexDispatcher:
             moe_token_dispatcher_type="flex",
             moe_flex_dispatcher_backend="ncclep",
             moe_grouped_gemm=True,
-            use_transformer_engine_op_fuser=True,
             moe_single_grouped_weight=True,
             gated_linear_unit=True,
             activation_func=F.silu,

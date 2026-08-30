@@ -81,12 +81,16 @@ def _fused_moe_config(**overrides) -> TransformerConfig:
         moe_token_dispatcher_type="flex",
         moe_flex_dispatcher_backend="ncclep",
         moe_grouped_gemm=True,
-        use_transformer_engine_op_fuser=True,
         moe_single_grouped_weight=True,
         gated_linear_unit=True,
         activation_func=F.silu,
         add_bias_linear=False,
         bf16=True,
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+        moe_mlp_glu_interleave_size=32,
+        moe_expert_rank_capacity_factor=2.0,
         moe_use_transformer_engine_fused_moe=True,
     )
     kwargs.update(overrides)
@@ -116,10 +120,11 @@ def test_fused_moe_config_enables_grouped_tensor():
     config = _fused_moe_config()
 
     assert config.moe_use_grouped_tensor
+    assert not config.use_transformer_engine_op_fuser
 
 
 def test_fused_moe_mxfp8_enables_mxfp8_wire_dtypes():
-    config = _fused_moe_config(fp8="e4m3", fp8_recipe="mxfp8")
+    config = _fused_moe_config()
 
     assert config.moe_dispatch_fwd_dtype == 'mxfp8'
     assert config.moe_combine_bwd_dtype == 'mxfp8'
@@ -131,15 +136,23 @@ def test_fused_moe_mxfp8_enables_mxfp8_wire_dtypes():
         ({"moe_token_dispatcher_type": "alltoall"}, "moe_token_dispatcher_type='flex'"),
         ({"moe_flex_dispatcher_backend": "deepep"}, "moe_flex_dispatcher_backend='ncclep'"),
         ({"moe_single_grouped_weight": False}, "moe_single_grouped_weight=True"),
+        ({"bf16": False}, "bf16=True"),
         ({"moe_shared_expert_overlap": True}, "moe_shared_expert_overlap"),
-        ({"cuda_graph_impl": "local"}, "CUDA graphs"),
         ({"moe_paged_stash": True}, "moe_paged_stash"),
-        ({"fp4": "nvfp4"}, "does not support FP4"),
+        ({"delay_wgrad_compute": True}, "delay_wgrad_compute"),
+        ({"fp4": "nvfp4"}, "fp4 and fp8 cannot be used simultaneously"),
     ],
 )
 def test_fused_moe_config_rejects_incompatible_modes(override, error):
     with pytest.raises(ValueError, match=error):
         _fused_moe_config(**override)
+
+
+@pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
+def test_fused_moe_config_accepts_cuda_graphs(cuda_graph_impl):
+    config = _fused_moe_config(cuda_graph_impl=cuda_graph_impl)
+
+    assert config.cuda_graph_impl == cuda_graph_impl
 
 
 def test_mxfp8_wire_dtypes_accept_valid_ncclep_config():

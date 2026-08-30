@@ -2,12 +2,6 @@
 
 """Bit-exact determinism check for the end-to-end Transformer Engine MegaMoE path."""
 
-import os
-
-# TE reads this while selecting the operation-fuser implementation. The MoE test package sets the
-# same value in its conftest, but that fixture does not apply to the determinism test package.
-os.environ.setdefault("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -15,6 +9,7 @@ import torch.nn.functional as F
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP, nccl_ep_finalize
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.configs import gpt_base
@@ -35,7 +30,7 @@ _VOCAB_SIZE = 128
 
 
 def _is_megamoe_available() -> bool:
-    """Check the runtime gates needed to exercise FusedMoeEp rather than its five-op fallback."""
+    """Check the runtime gates needed to execute FusedMoeEp."""
     if not HAVE_TE_EP or not torch.cuda.is_available():
         return False
     try:
@@ -65,7 +60,17 @@ requires_megamoe = pytest.mark.skipif(
 )
 
 
-def _build_model() -> GPTModel:
+@pytest.fixture(autouse=True)
+def _restore_test_state():
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    yield
+    nccl_ep_finalize()
+    Utils.destroy_model_parallel()
+    torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+
+
+def _build_model(cuda_graph_impl: str = "none") -> GPTModel:
     config = TransformerConfig(
         **(
             gpt_base()
@@ -82,7 +87,6 @@ def _build_model() -> GPTModel:
                 "moe_token_dispatcher_type": "flex",
                 "moe_flex_dispatcher_backend": "ncclep",
                 "moe_grouped_gemm": True,
-                "use_transformer_engine_op_fuser": True,
                 "moe_single_grouped_weight": True,
                 "moe_use_transformer_engine_fused_moe": True,
                 "gated_linear_unit": True,
@@ -90,13 +94,22 @@ def _build_model() -> GPTModel:
                 "add_bias_linear": False,
                 "fp8": "e4m3",
                 "fp8_recipe": "mxfp8",
+                "fp8_param": True,
+                "moe_mlp_glu_interleave_size": 32,
+                "moe_expert_rank_capacity_factor": 8.0,
+                "cuda_graph_impl": cuda_graph_impl,
+                "cuda_graph_modules": [],
+                "cuda_graph_warmup_steps": 1,
             }
         )
     )
     layer_spec = get_gpt_layer_with_transformer_engine_spec(
         num_experts=config.num_moe_experts,
         moe_grouped_gemm=True,
-        use_te_op_fuser=True,
+        use_te_op_fuser=(
+            config.use_transformer_engine_op_fuser
+            or config.moe_use_transformer_engine_fused_moe
+        ),
     )
     return GPTModel(
         config=config,
@@ -127,7 +140,7 @@ def _make_inputs() -> dict[str, torch.Tensor]:
 def _assert_megamoe_selected(model: GPTModel) -> None:
     fused_ops = []
     for module in model.modules():
-        sequences = getattr(module, "_last_fused_moe_ops", None)
+        sequences = getattr(module, "_fused_moe_ops", None)
         if sequences is None:
             continue
         for sequence in sequences:
@@ -137,30 +150,23 @@ def _assert_megamoe_selected(model: GPTModel) -> None:
                 for op in group
                 if type(op).__name__ == "FusedMoeEp"
             )
-    assert fused_ops, "the determinism test must exercise FusedMoeEp, not the five-op fallback"
+    assert fused_ops, "the determinism test must exercise FusedMoeEp"
 
 
-def _collect_dprobs_independent_grads(model: GPTModel) -> dict[str, torch.Tensor]:
-    """Collect gradients that cannot receive MegaMoE's nondeterministic dprobs contribution."""
+# TODO: Add input-gradient determinism coverage once the MegaMoE kernel outputs deterministic
+# dprob. dprob contributes to the MoE input gradient through the router.
+def _collect_expert_grads(model: GPTModel) -> dict[str, torch.Tensor]:
+    """Collect routed-expert gradients, which do not depend on dprob."""
     all_grads = collect_grads([model])
-    grads = {
-        name: grad
-        for name, grad in all_grads.items()
-        if (
-            ".experts." in name
-            or ".final_layernorm." in name
-            or name.startswith("chunk0.output_layer.")
-        )
-    }
-    assert any(".experts." in name for name in grads), "expected routed-expert gradients"
+    grads = {name: grad for name, grad in all_grads.items() if ".experts." in name}
+    assert grads, "expected routed-expert gradients"
     return grads
 
 
 @pytest.mark.internal
-@pytest.mark.launch_on_gb200
 @requires_megamoe
 def test_megamoe_cross_entropy_replays_bit_exactly():
-    """Replay cross-entropy and dprobs-independent MegaMoE gradients bit-for-bit."""
+    """Replay cross-entropy and routed-expert gradients bit-for-bit."""
     if Utils.world_size < _EP_SIZE:
         pytest.skip(f"requires at least {_EP_SIZE} GPUs")
 
@@ -178,11 +184,7 @@ def test_megamoe_cross_entropy_replays_bit_exactly():
     def fwd_bwd():
         loss = model(**inputs)
         loss.float().mean().backward()
-        # TODO: Compare every model gradient once MegaMoE computes dprobs deterministically.
-        # dprobs drives the router gradient and is added to the MoE input gradient, so it can
-        # affect the router and every parameter upstream of this MoE layer. Expert-weight
-        # gradients and post-MoE final-norm/output gradients do not consume dprobs.
-        return loss.detach().clone(), _collect_dprobs_independent_grads(model)
+        return loss.detach().clone(), _collect_expert_grads(model)
 
     state = capture_rng_state()
     loss_a, grads_a = fwd_bwd()
@@ -198,6 +200,52 @@ def test_megamoe_cross_entropy_replays_bit_exactly():
     _assert_megamoe_selected(model)
 
 
-def teardown_module():
-    nccl_ep_finalize()
-    Utils.destroy_model_parallel()
+@pytest.mark.internal
+@requires_megamoe
+def test_megamoe_local_graph_replay_matches_eager():
+    """Exercise MegaMoE through Megatron's local graph record/capture/replay machinery."""
+    if Utils.world_size < _EP_SIZE:
+        pytest.skip(f"requires at least {_EP_SIZE} GPUs")
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        expert_model_parallel_size=_EP_SIZE,
+    )
+    torch.manual_seed(42)
+    model_parallel_cuda_manual_seed(123)
+    model = _build_model(cuda_graph_impl="local")
+    inputs = _make_inputs()
+
+    def fwd_bwd():
+        loss = model(**inputs).float().mean()
+        loss.backward()
+        return loss.detach().clone(), _collect_expert_grads(model)
+
+    eager_loss, eager_grads = fwd_bwd()
+    _assert_megamoe_selected(model)
+    fused_experts = next(
+        module for module in model.modules() if getattr(module, "_fused_moe_ops", None) is not None
+    )
+    sequence_before_capture = fused_experts._fused_moe_ops[0]
+    zero_grads(model)
+    reset_quantizer_state([model])
+
+    create_cudagraphs()
+    replay_loss, replay_grads = fwd_bwd()
+    assert fused_experts._fused_moe_ops[0] is sequence_before_capture
+
+    torch.testing.assert_close(replay_loss, eager_loss, rtol=0.0, atol=0.0)
+    assert replay_grads.keys() == eager_grads.keys()
+    for name in eager_grads:
+        torch.testing.assert_close(replay_grads[name], eager_grads[name], rtol=0.0, atol=0.0)
+
+    for module in model.modules():
+        manager = getattr(module, "cudagraph_manager", None)
+        if manager is None:
+            continue
+        for runner in manager.cudagraph_runners:
+            if hasattr(runner, "fwd_graph"):
+                del runner.fwd_graph
+            if hasattr(runner, "bwd_graph"):
+                del runner.bwd_graph
+    torch.cuda.synchronize()

@@ -284,14 +284,24 @@ class TEGroupedMLP(MegatronModule):
 
             set_save_original_input(self.linear_fc1)
 
-        # Fused implementation with Transformer Engine op fuser API
-        if self.config.use_transformer_engine_op_fuser:
+        # The end-to-end MoE Sequential uses the op-fuser internally without requiring the
+        # model-wide op-fuser option.
+        use_op_fuser = (
+            self.config.use_transformer_engine_op_fuser
+            or self.config.moe_use_transformer_engine_fused_moe
+        )
+        if (
+            self.config.use_transformer_engine_op_fuser
+            and not self.config.moe_use_transformer_engine_fused_moe
+        ):
             assert (
                 self._is_fused_impl_supported()
             ), "Fused GroupedMLP is not supported for this configuration."
-        self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
+        self._with_fused_impl: bool = use_op_fuser
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
-        self._last_fused_moe_ops: Optional[Tuple[torch.nn.Module]] = None
+        # Retain the end-to-end Sequential. FusedMoeEp owns a fixed pool of in-flight training
+        # slots (NVTE_MEGAMOE_TRAINING_SLOT_COUNT) for the same module lifetime.
+        self._fused_moe_ops: Optional[Tuple[torch.nn.Module]] = None
         if (
             self.config.gated_linear_unit
             and self.config.moe_mlp_glu_interleave_size is not None
@@ -391,12 +401,6 @@ class TEGroupedMLP(MegatronModule):
             from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
         except ImportError:
             return False  # Transformer Engine version is too old
-        if self.config.moe_use_transformer_engine_fused_moe:
-            try:
-                from transformer_engine.pytorch.ops import MoeCombine, MoeDispatch  # noqa: F401
-            except ImportError:
-                return False  # Transformer Engine does not provide fusible NCCL-EP ops
-
         if not is_te_min_version("2.14.0"):
             return False
 
@@ -464,14 +468,12 @@ class TEGroupedMLP(MegatronModule):
 
     def _make_fused_ops(
         self,
-        ep_buffer=None,
         ep_config=None,
     ) -> torch.nn.Module:
         """Construct the TE operation-fuser module.
 
-        When ``ep_buffer`` and ``ep_config`` are provided, dispatch and combine
-        are included around the grouped MLP. Expert counts and routing weights
-        use internal channels, while routing state remains in ``ep_buffer``.
+        When ``ep_config`` is provided, dispatch and combine are included around
+        the grouped MLP. Expert counts and routing weights use internal channels.
         """
 
         assert HAVE_TE, "_make_fused_ops requires Transformer Engine."
@@ -508,9 +510,7 @@ class TEGroupedMLP(MegatronModule):
         # before Sequential constructs an OperationFuser and locks it.
         op_list = []
         dispatch_op = None
-        if ep_buffer is not None:
-            if ep_config is None:
-                raise ValueError("ep_config is required when ep_buffer is provided.")
+        if ep_config is not None:
             dispatch_op = te.pytorch.ops.MoeDispatch(ep_config)
             op_list.append(dispatch_op)
 
@@ -676,7 +676,7 @@ class TEGroupedMLP(MegatronModule):
         op_list.append(op)
         fc2_op = op
 
-        if ep_buffer is not None:
+        if ep_config is not None:
             combine_op = te.pytorch.ops.MoeCombine(ep_config)
             op_list.append(combine_op)
             dispatch_op.set_extra_output_channel(
@@ -701,9 +701,9 @@ class TEGroupedMLP(MegatronModule):
         hidden_states: torch.Tensor,
         topk_idx: torch.Tensor,
         topk_weights: torch.Tensor,
-        ep_buffer,
+        ep_config,
     ) -> torch.Tensor:
-        """Run dispatch, routed experts, and combine in one TE Sequential."""
+        """Run dispatch, routed experts, and combine in the persistent TE Sequential."""
         if not self.config.moe_use_transformer_engine_fused_moe:
             raise RuntimeError(
                 "fused_moe_forward requires moe_use_transformer_engine_fused_moe=True."
@@ -714,40 +714,35 @@ class TEGroupedMLP(MegatronModule):
                 f"got {hidden_states.dtype}."
             )
 
-        ep_group = te.pytorch.ep.get_ep_group()
-        if ep_group is None:
-            raise RuntimeError(
-                "fused_moe_forward requires NCCL EP to be bootstrapped before MoeDispatch."
+        if self._fused_moe_ops is None:
+            ops = self._make_fused_ops(ep_config=ep_config)
+            # Store in a tuple so the TE op shells, which share the existing GroupedLinear
+            # parameters, are retained without registering duplicate parameter aliases.
+            self._fused_moe_ops = (ops,)
+        (ops,) = self._fused_moe_ops
+
+        def ensure_fused_moe_selected() -> None:
+            module_groups = getattr(ops, "_module_groups", None)
+            selected = bool(
+                module_groups
+                and len(module_groups) == 1
+                and len(getattr(module_groups[0], "_forward_ops", ())) == 1
+                and type(module_groups[0]._forward_ops[0][0]).__name__ == "FusedMoeEp"
             )
-        drop_on_overflow = te.pytorch.ep.get_ep_drop_on_overflow()
-        ep_config = te.pytorch.ep.EpConfig(
-            top_k=ep_buffer.top_k,
-            max_tokens_per_rank=ep_buffer.max_tokens_per_rank,
-            recv_capacity_per_rank=ep_buffer.recv_capacity_per_rank,
-            hidden_dim=ep_buffer.hidden_dim,
-            num_local_experts=ep_buffer.num_local_experts,
-            ep_group=ep_group,
-            alignment=ep_buffer.alignment,
-            payload_dtype=ep_buffer.payload_dtype,
-            zero_copy=ep_buffer.zero_copy,
-            drop_on_overflow=drop_on_overflow,
-        )
-        ops = self._make_fused_ops(
-            ep_buffer=ep_buffer,
-            ep_config=ep_config,
-        )
-        # Keep the most recent sequence available for diagnostics without
-        # registering duplicate parameter aliases as child modules.
-        self._last_fused_moe_ops = (ops,)
-        return ops(
-            hidden_states,
-            topk_idx,
-            topk_weights.float(),
-            op_kwargs={
-                0: {"buffer": ep_buffer},
-                4: {"buffer": ep_buffer},
-            },
-        )
+            if not selected:
+                raise RuntimeError(
+                    "moe_use_transformer_engine_fused_moe=True requires Transformer Engine to "
+                    "select FusedMoeEp, but the operation fuser found no eligible implementation "
+                    "for the current device, recipe, weights, or MoE configuration."
+                )
+
+        try:
+            output = ops(hidden_states, topk_idx, topk_weights.float())
+        except Exception:
+            ensure_fused_moe_selected()
+            raise
+        ensure_fused_moe_selected()
+        return output
 
     def _make_fused_impl_pre_forward_hook(self) -> Callable:
         """Make function that calls submodule pre-forward callback hooks.
@@ -1192,31 +1187,16 @@ class TEGroupedMLP(MegatronModule):
         If an error occurs during execution, it is caught and re-raised with a
         descriptive message.
         """
-        # Match the wrapper's combined delay-wgrad mode used in _make_fused_ops so that
-        # `overlap_dispatch_backward_with_experts_wgrad`-driven runs invoke the deferred
-        # wgrad pass through the fused children instead of falling through to no-op
-        # backward_dw() on linear_fc{1,2} (whose forward never ran in the fused path).
         if self._with_fused_impl and self.linear_fc1.delay_wgrad_compute:
-            ops = (
-                self._last_fused_moe_ops
-                if self.config.moe_use_transformer_engine_fused_moe
-                else self._fused_ops
-            )
+            ops = self._fused_ops
             if ops is not None:
                 (seq,) = ops
                 fused_children = list(seq.children())
-                if self.config.moe_use_transformer_engine_fused_moe:
-                    assert len(fused_children) == 5, (
-                        "expected MoeDispatch, FC1, activation, FC2, MoeCombine in fused TE ops"
-                    )
-                    fc1_idx, fc2_idx = 1, 3
-                else:
-                    assert len(fused_children) == 3, (
-                        "expected FC1, activation, FC2 in fused TE ops"
-                    )
-                    fc1_idx, fc2_idx = 0, 2
-                fused_children[fc2_idx].backward_dw()
-                fused_children[fc1_idx].backward_dw()
+                assert len(fused_children) == 3, (
+                    "expected FC1, activation, FC2 in fused TE ops"
+                )
+                fused_children[2].backward_dw()
+                fused_children[0].backward_dw()
                 # DDP registers wgrad hooks on the original linear_fc1/fc2 module objects
                 # (those are in the nn.Module tree), but backward_dw() is called on the
                 # NEW GroupedLinear instances created by _make_fused_ops().  We must
