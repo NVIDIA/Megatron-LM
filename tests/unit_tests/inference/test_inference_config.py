@@ -138,7 +138,7 @@ class TestInferenceConfig:
 
         assert MambaInferenceStateConfig.from_model(model) is not None
 
-    def test_deprecated_layer_type_list_is_normalized_to_layer_configs(self):
+    def test_deprecated_layer_type_list_is_converted_to_layer_configs(self):
         """Legacy positional construction produces complete, independent layer configs."""
         root_config = TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4)
 
@@ -154,7 +154,7 @@ class TestInferenceConfig:
                 torch.bfloat16,
             )
 
-        layer_config_list = state_config.normalize_layer_config_list(root_config)
+        layer_config_list = state_config.convert_layer_type_list(root_config)
 
         assert [type(layer_config) for layer_config in layer_config_list] == [
             MambaLayerConfig,
@@ -167,9 +167,6 @@ class TestInferenceConfig:
         assert all(layer_config is not root_config for layer_config in layer_config_list)
         assert len({id(layer_config) for layer_config in layer_config_list}) == 2
         assert state_config.layer_config_list is layer_config_list
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", DeprecationWarning)
-            assert state_config.normalize_layer_config_list(root_config) is layer_config_list
 
     def test_layer_config_list_is_preserved_without_deprecation_warning(self):
         """The config-list path preserves the supplied config objects."""
@@ -187,7 +184,7 @@ class TestInferenceConfig:
                 layer_config_list=layer_config_list,
             )
 
-        assert state_config.normalize_layer_config_list(root_config) is layer_config_list
+        assert state_config.layer_config_list is layer_config_list
 
     @pytest.mark.parametrize(
         ("layer_type_list", "layer_config_list"),

@@ -87,21 +87,24 @@ class MambaInferenceStateConfig:
         if self.ssm_chunk_alignment is None:
             self.ssm_chunk_alignment = self.mamba_chunk_size
 
-    def normalize_layer_config_list(self, config: TransformerConfig) -> Sequence[TransformerConfig]:
-        """Return per-layer configs, converting deprecated layer symbols once if needed.
+    def convert_layer_type_list(self, config: TransformerConfig) -> Sequence[TransformerConfig]:
+        """Convert deprecated layer symbols to independent per-layer configs.
 
         Args:
             config: Normalized model config to copy into each converted layer config.
 
         Returns:
-            Per-layer configs in layer order.
+            Converted per-layer configs in layer order.
+
+        Raises:
+            ValueError: If there is no legacy layer type list to convert or the layer config list
+                is already populated.
         """
-        if self.layer_config_list is None:
-            if self.layer_type_list is None:
-                raise ValueError(
-                    "Exactly one of layer_type_list or layer_config_list must be provided"
-                )
-            self.layer_config_list = validate_segment_layers(''.join(self.layer_type_list), config)
+        if self.layer_type_list is None:
+            raise ValueError("layer_type_list must be provided for conversion")
+        if self.layer_config_list is not None:
+            raise ValueError("layer_config_list is already populated")
+        self.layer_config_list = validate_segment_layers(''.join(self.layer_type_list), config)
         return self.layer_config_list
 
     @classmethod

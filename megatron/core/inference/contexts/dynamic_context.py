@@ -429,9 +429,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.is_hybrid_model = mamba_inference_state_config is not None
         self.gdp_num_householder = 0
         if self.is_hybrid_model:
-            layer_config_list = mamba_inference_state_config.normalize_layer_config_list(
-                model_config
-            )
+            layer_config_list = mamba_inference_state_config.layer_config_list
+            if layer_config_list is None:
+                # MambaInferenceStateConfig historically accepted layer_type_list directly.
+                # Convert that deprecated input here for backwards compatibility, where the
+                # model config is available, so all inference logic below uses layer configs.
+                layer_config_list = mamba_inference_state_config.convert_layer_type_list(
+                    model_config
+                )
             self.mamba_conv_states_shape = mamba_inference_state_config.conv_states_shape
             self.mamba_ssm_states_shape = mamba_inference_state_config.ssm_states_shape
             self.mamba_conv_states_dtype = mamba_inference_state_config.conv_states_dtype
