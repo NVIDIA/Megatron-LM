@@ -37,10 +37,10 @@ def _reduce(input_, group):
     return input_
 
 
-def _reduce_dynamic_cp_subgroup_via_parent(input_, subgroup, parent_group):
-    """Reduce a contiguous dynamic-CP subgroup through one parent communicator."""
+def _dynamic_cp_subgroup_geometry(subgroup, parent_group):
+    """Validate a DCP subgroup and return its rank geometry within the parent."""
     if subgroup is None or parent_group is None:
-        raise RuntimeError("Dynamic-CP parent reduction requires subgroup and parent_group.")
+        raise RuntimeError("Dynamic-CP parent communication requires subgroup and parent_group.")
 
     parent_ranks = torch.distributed.get_process_group_ranks(parent_group)
     subgroup_ranks = torch.distributed.get_process_group_ranks(subgroup)
@@ -50,6 +50,12 @@ def _reduce_dynamic_cp_subgroup_via_parent(input_, subgroup, parent_group):
             "Dynamic-CP subgroup ranks must be a contiguous slice of the parent group: "
             f"subgroup={subgroup_ranks}, parent={parent_ranks}."
         )
+    return subgroup_ranks, parent_ranks, subgroup_start
+
+
+def _reduce_dynamic_cp_subgroup_via_parent(input_, subgroup, parent_group):
+    """Reduce a contiguous dynamic-CP subgroup through one parent communicator."""
+    _, parent_ranks, subgroup_start = _dynamic_cp_subgroup_geometry(subgroup, parent_group)
 
     # Every dynamic-CP variant uses this parent-sized shape. Distinct subgroups write
     # distinct lanes, so ranks may replay different CP-size graphs in the same step.
@@ -57,6 +63,140 @@ def _reduce_dynamic_cp_subgroup_via_parent(input_, subgroup, parent_group):
     reduction_lanes[subgroup_start].copy_(input_)
     torch.distributed.all_reduce(reduction_lanes, group=parent_group)
     return reduction_lanes[subgroup_start].clone()
+
+
+class _DynamicCPRingAllGatherWork:
+    """Equal-split all-gather over a dynamic subgroup using parent P2P."""
+
+    def __init__(self, input_, subgroup, parent_group):
+        self.input = input_.contiguous()
+        self.ranks, _, _ = _dynamic_cp_subgroup_geometry(subgroup, parent_group)
+        self.size = len(self.ranks)
+        self.rank = subgroup.rank()
+        self.parent_group = parent_group
+        self.rows = self.input.shape[0]
+        output_shape = list(self.input.shape)
+        output_shape[0] *= self.size
+        self.output = torch.empty(output_shape, dtype=input_.dtype, device=input_.device)
+        self.output.narrow(0, self.rank * self.rows, self.rows).copy_(self.input)
+        self.step = 0
+        self.requests = None
+        self._launch_step()
+
+    def _launch_step(self):
+        if self.step >= self.size - 1:
+            self.requests = None
+            return
+        send_index = (self.rank - self.step) % self.size
+        recv_index = (self.rank - self.step - 1) % self.size
+        self.requests = torch.distributed.batch_isend_irecv(
+            [
+                torch.distributed.P2POp(
+                    torch.distributed.isend,
+                    self.output.narrow(0, send_index * self.rows, self.rows),
+                    self.ranks[(self.rank + 1) % self.size],
+                    self.parent_group,
+                ),
+                torch.distributed.P2POp(
+                    torch.distributed.irecv,
+                    self.output.narrow(0, recv_index * self.rows, self.rows),
+                    self.ranks[(self.rank - 1) % self.size],
+                    self.parent_group,
+                ),
+            ]
+        )
+
+    def wait(self):
+        """Complete all ring steps."""
+        while self.requests is not None:
+            for request in self.requests:
+                request.wait()
+            self.step += 1
+            self._launch_step()
+        return True
+
+
+class _DynamicCPRingReduceScatterWork:
+    """Equal-split reduce-scatter over a dynamic subgroup using parent P2P."""
+
+    def __init__(self, input_, subgroup, parent_group):
+        self.input = input_.contiguous()
+        self.ranks, _, _ = _dynamic_cp_subgroup_geometry(subgroup, parent_group)
+        self.size = len(self.ranks)
+        self.rank = subgroup.rank()
+        self.parent_group = parent_group
+        if self.input.shape[0] % self.size != 0:
+            raise RuntimeError(
+                "Dynamic-CP reduce-scatter requires equal first-dimension splits: "
+                f"input_rows={self.input.shape[0]}, subgroup_size={self.size}."
+            )
+        self.rows = self.input.shape[0] // self.size
+        output_shape = list(self.input.shape)
+        output_shape[0] = self.rows
+        self.output = torch.empty(output_shape, dtype=input_.dtype, device=input_.device)
+        self.step = 0
+        self.requests = None
+        self.recv = None
+        if self.size == 1:
+            self.output.copy_(self.input)
+            return
+        self.send = self.input.narrow(
+            0, ((self.rank - 1) % self.size) * self.rows, self.rows
+        ).contiguous()
+        self.temporaries = (torch.empty_like(self.output), torch.empty_like(self.output))
+        self._launch_step()
+
+    def _launch_step(self):
+        if self.step >= self.size - 1:
+            self.requests = None
+            return
+        self.recv = (
+            self.output
+            if self.step == self.size - 2
+            else self.temporaries[self.step % len(self.temporaries)]
+        )
+        self.requests = torch.distributed.batch_isend_irecv(
+            [
+                torch.distributed.P2POp(
+                    torch.distributed.isend,
+                    self.send,
+                    self.ranks[(self.rank + 1) % self.size],
+                    self.parent_group,
+                ),
+                torch.distributed.P2POp(
+                    torch.distributed.irecv,
+                    self.recv,
+                    self.ranks[(self.rank - 1) % self.size],
+                    self.parent_group,
+                ),
+            ]
+        )
+
+    def wait(self):
+        """Complete all ring steps."""
+        while self.requests is not None:
+            for request in self.requests:
+                request.wait()
+            recv_index = (self.rank - self.step - 2) % self.size
+            self.recv.add_(self.input.narrow(0, recv_index * self.rows, self.rows))
+            self.send = self.recv
+            self.step += 1
+            self._launch_step()
+        return True
+
+
+def _gather_dynamic_cp_subgroup_via_parent(input_, subgroup, parent_group):
+    """Gather equal first-dimension splits over a parent-communicator P2P ring."""
+    work = _DynamicCPRingAllGatherWork(input_, subgroup, parent_group)
+    work.wait()
+    return work.output
+
+
+def _reduce_scatter_dynamic_cp_subgroup_via_parent(input_, subgroup, parent_group):
+    """Reduce-scatter equal first-dimension splits over a parent P2P ring."""
+    work = _DynamicCPRingReduceScatterWork(input_, subgroup, parent_group)
+    work.wait()
+    return work.output
 
 
 def _split_along_last_dim(input_, group):
@@ -273,6 +413,30 @@ class _ReduceFromDynamicCPSubgroup(torch.autograd.Function):
         return grad_output, None, None
 
 
+class _GatherFromDynamicCPSubgroup(torch.autograd.Function):
+    """Dynamic-CP subgroup gather routed through its parent communicator."""
+
+    @staticmethod
+    def forward(ctx, input_, subgroup, parent_group, output_grad):
+        """Gather equal first-dimension splits over the parent P2P ring."""
+        ctx.subgroup = subgroup
+        ctx.parent_group = parent_group
+        ctx.output_grad = output_grad
+        return _gather_dynamic_cp_subgroup_via_parent(input_, subgroup, parent_group)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Reduce-scatter gradients, or select the local split for replicated output."""
+        if ctx.output_grad:
+            grad_input = _reduce_scatter_dynamic_cp_subgroup_via_parent(
+                grad_output, ctx.subgroup, ctx.parent_group
+            )
+        else:
+            rows = grad_output.shape[0] // ctx.subgroup.size()
+            grad_input = grad_output.narrow(0, ctx.subgroup.rank() * rows, rows).contiguous()
+        return grad_input, None, None, None
+
+
 class _ScatterToModelParallelRegion(torch.autograd.Function):
     """Split the input and keep only the corresponding chuck to the rank."""
 
@@ -433,6 +597,29 @@ class _GatherFromSequenceParallelRegionAsync(torch.autograd.Function):
         return grad_input, None, None, None
 
 
+class _GatherFromDynamicCPSubgroupAsync(torch.autograd.Function):
+    """Launch a dynamic-CP gather over its parent without waiting for it."""
+
+    @staticmethod
+    def forward(ctx, input_, subgroup, parent_group, handle):
+        """Launch the parent-ring gather and publish its work through ``handle``."""
+        ctx.subgroup = subgroup
+        ctx.parent_group = parent_group
+
+        work = _DynamicCPRingAllGatherWork(input_, subgroup, parent_group)
+        handle._input_buffer = work.input
+        handle.work = work
+        return work.output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Reduce-scatter gathered gradients over the same parent-ring transport."""
+        grad_input = _reduce_scatter_dynamic_cp_subgroup_via_parent(
+            grad_output, ctx.subgroup, ctx.parent_group
+        )
+        return grad_input, None, None, None
+
+
 class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
     """Reduce scatter the input from the model parallel region."""
 
@@ -587,6 +774,11 @@ def reduce_from_dynamic_cp_subgroup(input_, subgroup, parent_group):
     return _ReduceFromDynamicCPSubgroup.apply(input_, subgroup, parent_group)
 
 
+def gather_from_dynamic_cp_subgroup(input_, subgroup, parent_group, output_grad=True):
+    """Gather a DCP subgroup through its parent communicator without using subgroup NCCL."""
+    return _GatherFromDynamicCPSubgroup.apply(input_, subgroup, parent_group, output_grad)
+
+
 def scatter_to_tensor_model_parallel_region(input_, group=None):
     """Wrapper for autograd function: forward: RS, backward: AG <last dim>"""
     group = get_tensor_model_parallel_group_if_none(group)
@@ -640,6 +832,18 @@ def async_gather_from_sequence_parallel_region(
     return handle
 
 
+def async_gather_from_dynamic_cp_subgroup(input_, subgroup, parent_group):
+    """Launch a DCP subgroup all-gather over parent P2P and return its handle."""
+    handle = _AsyncCollectiveHandle()
+    if subgroup.size() == 1:
+        handle.tensor = input_
+        return handle
+    handle.tensor = _GatherFromDynamicCPSubgroupAsync.apply(
+        input_, subgroup, parent_group, handle
+    )
+    return handle
+
+
 def async_reduce_scatter_along_first_dim(input_, group=None):
     """Launch an equal-split first-dimension reduce-scatter and return a handle.
 
@@ -664,6 +868,16 @@ def async_reduce_scatter_along_first_dim(input_, group=None):
     handle.work = dist_reduce_scatter_func(
         handle.tensor, handle._input_buffer, group=group, async_op=True
     )
+    return handle
+
+
+def async_reduce_scatter_dynamic_cp_subgroup(input_, subgroup, parent_group):
+    """Launch a DCP subgroup reduce-scatter over parent P2P and return its handle."""
+    work = _DynamicCPRingReduceScatterWork(input_, subgroup, parent_group)
+    handle = _AsyncCollectiveHandle()
+    handle.tensor = work.output
+    handle._input_buffer = work.input
+    handle.work = work
     return handle
 
 

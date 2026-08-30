@@ -14,7 +14,9 @@ from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import (
+    async_gather_from_dynamic_cp_subgroup,
     async_gather_from_sequence_parallel_region,
+    gather_from_dynamic_cp_subgroup,
     gather_from_sequence_parallel_region,
 )
 from megatron.core.transformer.enums import AttnMaskType
@@ -1804,6 +1806,21 @@ class CompressedSparseAttention(MegatronModule):
         if self.indexer is not None:
             self.indexer.backward_dw()
 
+    def _save_indexer_loss(self, loss, reduce_group=None):
+        """Save an indexer metric with the stable DCP parent when configured."""
+        cp_parent_group = None
+        if getattr(self.config, "dynamic_context_parallel", False):
+            cp_parent_group = getattr(self.pg_collection, "dp_cp", None)
+            if cp_parent_group is None:
+                raise RuntimeError("Dynamic-CP CSA requires a dp_cp parent process group.")
+        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+            loss=loss,
+            layer_number=self.layer_number,
+            num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
+            reduce_group=reduce_group,
+            dynamic_cp_parent_group=cp_parent_group,
+        )
+
     # ------------------------------------------------------------------
     # Private helpers – each owns one logical slice of the forward pass.
     # ------------------------------------------------------------------
@@ -1899,11 +1916,7 @@ class CompressedSparseAttention(MegatronModule):
                         non_compressed_lse,
                     )
                     if indexer_loss_coeff > 0:
-                        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                            loss=indexer_loss,
-                            layer_number=self.layer_number,
-                            num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
-                        )
+                        self._save_indexer_loss(indexer_loss)
                 else:
                     _, topk_indices_compressed = self.indexer(
                         x_det, qr_det, mask=causal_mask, packed_seq_params=packed_seq_params
@@ -2053,11 +2066,7 @@ class CompressedSparseAttention(MegatronModule):
         nvtx_range_pop("sparse_attn_kernel")
 
         if indexer_loss_coeff > 0:
-            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                loss=indexer_loss,
-                layer_number=self.layer_number,
-                num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
-            )
+            self._save_indexer_loss(indexer_loss)
         return output, indexer_loss
 
     # ------------------------------------------------------------------
@@ -2263,11 +2272,7 @@ class CompressedSparseAttention(MegatronModule):
                     )
 
                     if indexer_loss_coeff > 0:
-                        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                            loss=indexer_loss,
-                            layer_number=self.layer_number,
-                            num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
-                        )
+                        self._save_indexer_loss(indexer_loss)
                 else:
                     _, topk_indices_cmp = self.indexer(
                         x_det, qr_det, mask=None, packed_seq_params=packed_seq_params
@@ -2526,11 +2531,7 @@ class CompressedSparseAttention(MegatronModule):
         )
 
         if indexer_loss_coeff > 0:
-            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                loss=indexer_loss,
-                layer_number=self.layer_number,
-                num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
-            )
+            self._save_indexer_loss(indexer_loss)
         output = output.unsqueeze(1)
         return output, indexer_loss
 
@@ -2553,6 +2554,11 @@ class CompressedSparseAttention(MegatronModule):
         cp_group = self.pg_collection.cp
         cp_size = cp_group.size()
         cp_rank = cp_group.rank()
+        cp_parent_group = None
+        if getattr(self.config, "dynamic_context_parallel", False):
+            cp_parent_group = getattr(self.pg_collection, "dp_cp", None)
+            if cp_parent_group is None:
+                raise RuntimeError("Dynamic-CP CSA requires a dp_cp parent process group.")
 
         l_local = query.shape[0]
         if l_local != key.shape[0]:
@@ -2647,9 +2653,14 @@ class CompressedSparseAttention(MegatronModule):
                 # Launch before the attention compressor and local indexer
                 # projections so NCCL can overlap with both independent paths.
                 nvtx_range_push("dsv4_cp_indexer_k_all_gather_launch")
-                k_indexer_gather = async_gather_from_sequence_parallel_region(
-                    indexer_compressed_local.squeeze(1), group=cp_group
-                )
+                if cp_parent_group is not None:
+                    k_indexer_gather = async_gather_from_dynamic_cp_subgroup(
+                        indexer_compressed_local.squeeze(1), cp_group, cp_parent_group
+                    )
+                else:
+                    k_indexer_gather = async_gather_from_sequence_parallel_region(
+                        indexer_compressed_local.squeeze(1), group=cp_group
+                    )
                 nvtx_range_pop("dsv4_cp_indexer_k_all_gather_launch")
 
             # ---- Step 5: attention compressed KV path -------------------------
@@ -2674,9 +2685,14 @@ class CompressedSparseAttention(MegatronModule):
                 # collective ordering remains identical across the group while
                 # both gathers can overlap independent local work.
                 nvtx_range_push("dsv4_cp_attention_kv_all_gather_launch")
-                compressed_kv_gather = async_gather_from_sequence_parallel_region(
-                    compressed_kv_local.squeeze(1), group=cp_group
-                )
+                if cp_parent_group is not None:
+                    compressed_kv_gather = async_gather_from_dynamic_cp_subgroup(
+                        compressed_kv_local.squeeze(1), cp_group, cp_parent_group
+                    )
+                else:
+                    compressed_kv_gather = async_gather_from_sequence_parallel_region(
+                        compressed_kv_local.squeeze(1), group=cp_group
+                    )
                 nvtx_range_pop("dsv4_cp_attention_kv_all_gather_launch")
 
                 # Local indexer Q/W projections run here: after both RS edges
@@ -2750,9 +2766,14 @@ class CompressedSparseAttention(MegatronModule):
                 compressed_kv_rank_major = compressed_kv_gather.wait()
                 nvtx_range_pop("dsv4_cp_attention_kv_all_gather_wait")
             else:
-                compressed_kv_rank_major = gather_from_sequence_parallel_region(
-                    compressed_kv_local.squeeze(1), group=cp_group
-                )
+                if cp_parent_group is not None:
+                    compressed_kv_rank_major = gather_from_dynamic_cp_subgroup(
+                        compressed_kv_local.squeeze(1), cp_group, cp_parent_group
+                    )
+                else:
+                    compressed_kv_rank_major = gather_from_sequence_parallel_region(
+                        compressed_kv_local.squeeze(1), group=cp_group
+                    )
 
         use_indexer_loss = training_with_grad and compressed_topk is not None
         # ``use_indexer_loss`` implies the RS consumer edges above were built,
@@ -2863,18 +2884,14 @@ class CompressedSparseAttention(MegatronModule):
                     seq_to_rank_row if not sparse_indexer_loss else None,
                     indexer_k_rs_state,
                     compressed_kv_rs_state,
+                    cp_parent_group,
                 )
             else:
                 output, indexer_loss = _unfused_indexer_sparse_attn_from_topk(
                     *indexer_loss_args, tp_group=indexer.pg_collection.tp
                 )
             if indexer_loss_coeff > 0:
-                DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                    loss=indexer_loss,
-                    layer_number=self.layer_number,
-                    num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
-                    reduce_group=cp_group,
-                )
+                self._save_indexer_loss(indexer_loss, reduce_group=cp_group)
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
             return output.unsqueeze(1)
 

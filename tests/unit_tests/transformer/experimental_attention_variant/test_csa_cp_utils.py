@@ -50,7 +50,8 @@ def _sequence_positions(cu_seqlens, rows):
     return torch.where((rows >= starts) & (rows < ends), rows - starts, 0)
 
 
-def test_thd_cp_left_boundary_exchange_forward_backward():
+@pytest.mark.parametrize("use_parent_transport", [False, True])
+def test_thd_cp_left_boundary_exchange_forward_backward(use_parent_transport):
     """Validate distributed CP boundary exchange forward/backward.
 
     Expected: forward receives the previous rank's tail window, and backward
@@ -61,15 +62,21 @@ def test_thd_cp_left_boundary_exchange_forward_backward():
     if Utils.world_size < 2:
         pytest.skip("Distributed CP boundary exchange requires at least 2 ranks.")
 
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        context_parallel_size=Utils.world_size,
-    )
+    init_kwargs = dict(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    if use_parent_transport:
+        init_kwargs.update(context_parallel_size=2, dynamic_context_parallel=True)
+    else:
+        init_kwargs["context_parallel_size"] = Utils.world_size
+    Utils.initialize_model_parallel(**init_kwargs)
     try:
-        cp_group = ProcessGroupCollection.use_mpu_process_groups().cp
-        cp_rank = parallel_state.get_context_parallel_rank()
-        cp_size = parallel_state.get_context_parallel_world_size()
+        cp_parent_group = None
+        if use_parent_transport:
+            cp_group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=2)
+            cp_parent_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        else:
+            cp_group = ProcessGroupCollection.use_mpu_process_groups().cp
+        cp_rank = cp_group.rank()
+        cp_size = cp_group.size()
         d_window = 2
         local_len = 4
         width = 3
@@ -80,7 +87,7 @@ def test_thd_cp_left_boundary_exchange_forward_backward():
         ).reshape(local_len, width)
         local = values.detach().clone().requires_grad_(True)
 
-        boundary = exchange_cp_boundary_hidden(local, 0, d_window, cp_group)
+        boundary = exchange_cp_boundary_hidden(local, 0, d_window, cp_group, cp_parent_group)
         if cp_rank == 0:
             expected_boundary = torch.zeros_like(boundary)
         else:

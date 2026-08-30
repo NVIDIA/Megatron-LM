@@ -84,6 +84,54 @@ def test_ReduceFromMixedDynamicCPSubgroupsViaParent():
 
 
 @pytest.mark.internal
+def test_GatherFromMixedDynamicCPSubgroupsViaParent():
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=2,
+        dynamic_context_parallel=True,
+    )
+    try:
+        parent_group = torch.distributed.group.WORLD
+        parent_rank = parent_group.rank()
+        if parent_group.size() >= 8:
+            subgroup_size = 4 if parent_rank < 4 else 2 if parent_rank < 6 else 1
+        else:
+            subgroup_size = 2 if parent_rank < 2 else 1
+        subgroup = parallel_state.get_dynamic_data_context_parallel_groups(group_size=subgroup_size)
+        subgroup_ranks = torch.distributed.get_process_group_ranks(subgroup)
+
+        input_data = torch.tensor([parent_rank + 1.0], device="cuda", requires_grad=True)
+        actual = mappings.gather_from_dynamic_cp_subgroup(input_data, subgroup, parent_group)
+        expected = input_data.new_tensor([rank + 1.0 for rank in subgroup_ranks])
+        torch.testing.assert_close(actual, expected)
+
+        actual.sum().backward()
+        torch.testing.assert_close(input_data.grad, torch.full_like(input_data, subgroup_size))
+
+        async_input = torch.tensor([parent_rank + 11.0], device="cuda", requires_grad=True)
+        gathered = mappings.async_gather_from_dynamic_cp_subgroup(
+            async_input, subgroup, parent_group
+        ).wait()
+        expected = async_input.new_tensor([rank + 11.0 for rank in subgroup_ranks])
+        torch.testing.assert_close(gathered, expected)
+        gathered.sum().backward()
+        torch.testing.assert_close(async_input.grad, torch.full_like(async_input, subgroup_size))
+
+        chunks = torch.arange(subgroup_size * 2, device="cuda", dtype=torch.float32).view(
+            subgroup_size, 2
+        )
+        reduce_scatter_input = chunks + 100 * parent_rank
+        reduced = mappings.async_reduce_scatter_dynamic_cp_subgroup(
+            reduce_scatter_input, subgroup, parent_group
+        ).wait()
+        expected = chunks[subgroup.rank()] * subgroup_size + 100 * sum(subgroup_ranks)
+        torch.testing.assert_close(reduced, expected.unsqueeze(0))
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
 @pytest.mark.parametrize("subgroup,parent_group", ((None, object()), (object(), None)))
 def test_ReduceFromDynamicCPSubgroupRejectsMissingGroups(subgroup, parent_group):
     with pytest.raises(RuntimeError, match="requires subgroup and parent_group"):

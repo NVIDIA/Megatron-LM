@@ -306,6 +306,41 @@ class TestFusedApplyMLARope:
 @pytest.mark.internal
 @pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_fused_mla_rope_inplace_saves_thd_cu_seqlens():
+    """Keep generated packed-sequence metadata in the saved-tensor lifecycle."""
+    total_seqlen = 16
+    num_heads = 2
+    nope_dim = 16
+    emb_dim = 64
+    dtype = torch.bfloat16
+    cu_seqlens = torch.tensor([0, 8, total_seqlen], dtype=torch.int32, device="cuda")
+    yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=total_seqlen)
+    freqs, mscale = yarn_rope(total_seqlen, 0)
+    cos = (torch.cos(freqs) * mscale).to(dtype)
+    sin = (torch.sin(freqs) * mscale).to(dtype)
+    input_ = torch.randn(
+        total_seqlen, num_heads, nope_dim + emb_dim, dtype=dtype, device="cuda", requires_grad=True
+    )
+    packed = []
+
+    def pack(tensor):
+        packed.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        output = fused_mla_rope_inplace(
+            input_, cos, sin, nope_dim, emb_dim, cu_seqlens_q=cu_seqlens, remove_interleaving=True
+        )
+
+    assert any(tensor.data_ptr() == cu_seqlens.data_ptr() for tensor in packed)
+    output.backward(torch.randn_like(output).contiguous())
+    assert input_.grad is not None
+
+
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("input_format", ["sbhd", "thd"])
 def test_out_of_place_inverse_rope_preserves_upstream_saved_output(input_format):
     """Post-attention inverse RoPE must not overwrite an output saved for backward."""

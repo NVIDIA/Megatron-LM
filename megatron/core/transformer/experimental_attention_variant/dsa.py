@@ -15,7 +15,10 @@ from megatron.core.models.common.embeddings import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_dynamic_cp_subgroup,
+    gather_from_sequence_parallel_region,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
     dsa_indexer_loss,
@@ -223,6 +226,7 @@ def _validate_nonpacked_cp_uniform_length(
     cp_size: int,
     cp_group: Optional[torch.distributed.ProcessGroup],
     device: torch.device,
+    cp_parent_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
     """Validate the uniform-length precondition for non-packed allgather CP."""
     expected_skv = sq * cp_size
@@ -233,9 +237,14 @@ def _validate_nonpacked_cp_uniform_length(
         and get_pg_size(cp_group) == cp_size
     ):
         local_len = torch.tensor([sq], device=device, dtype=torch.int64)
-        all_lens = [torch.empty_like(local_len) for _ in range(cp_size)]
-        torch.distributed.all_gather(all_lens, local_len, group=cp_group)
-        all_lens = torch.cat(all_lens)
+        if cp_parent_group is not None:
+            all_lens = gather_from_dynamic_cp_subgroup(
+                local_len, cp_group, cp_parent_group, output_grad=False
+            )
+        else:
+            gathered_lens = [torch.empty_like(local_len) for _ in range(cp_size)]
+            torch.distributed.all_gather(gathered_lens, local_len, group=cp_group)
+            all_lens = torch.cat(gathered_lens)
         if not torch.all(all_lens == sq):
             raise RuntimeError(
                 "Non-packed DSA allgather CP expects uniform per-rank sequence lengths; "
@@ -248,6 +257,13 @@ def _validate_nonpacked_cp_uniform_length(
             "Non-packed DSA allgather CP expects uniform per-rank sequence lengths; "
             f"got local query length {sq} and key length {skv} for cp_size={cp_size}."
         )
+
+
+def _gather_cp_sequence(input_, cp_group, cp_parent_group=None):
+    """Gather CP rows, using the shared parent communicator for dynamic CP."""
+    if cp_parent_group is not None:
+        return gather_from_dynamic_cp_subgroup(input_, cp_group, cp_parent_group)
+    return gather_from_sequence_parallel_region(input_, group=cp_group)
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -281,6 +297,7 @@ class DSAIndexerLossLoggingHelper:
         num_layers: int,
         reduce_group: torch.distributed.ProcessGroup = None,
         avg_group: torch.distributed.ProcessGroup = None,
+        dynamic_cp_parent_group: torch.distributed.ProcessGroup = None,
     ):
         """Save the indexer loss for logging.
 
@@ -290,6 +307,7 @@ class DSAIndexerLossLoggingHelper:
             num_layers: The number of total layers.
             reduce_group: The group for reducing the loss.
             avg_group: The group for averaging the loss.
+            dynamic_cp_parent_group: Shared parent group for mixed-CP logging.
         """
         # Skip indexer loss logging if layer_number is None.
         if layer_number is None:
@@ -309,7 +327,14 @@ class DSAIndexerLossLoggingHelper:
             )
             grown[: tracker["values"].shape[0]] = tracker["values"]
             tracker["values"] = grown
-        tracker["values"][layer_number - 1] += loss.detach()
+        tracked_loss = loss.detach()
+        if dynamic_cp_parent_group is not None:
+            existing_parent = tracker.get("dynamic_cp_parent_group")
+            if existing_parent is not None and existing_parent is not dynamic_cp_parent_group:
+                raise RuntimeError("DSA indexer tracker observed multiple dynamic-CP parents.")
+            tracker["dynamic_cp_parent_group"] = dynamic_cp_parent_group
+
+        tracker["values"][layer_number - 1] += tracked_loss
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
@@ -319,10 +344,14 @@ class DSAIndexerLossLoggingHelper:
         tracker = DSAIndexerLossLoggingHelper.tracker
         reduce_group = tracker.get("reduce_group") if preserve_groups else None
         avg_group = tracker.get("avg_group") if preserve_groups else None
+        dynamic_cp_parent_group = (
+            tracker.get("dynamic_cp_parent_group") if preserve_groups else None
+        )
         if "values" in tracker:
             tracker["values"].zero_()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
+        tracker["dynamic_cp_parent_group"] = dynamic_cp_parent_group
 
     @staticmethod
     def reduce_loss_in_tracker(num_layers: Optional[int] = None):
@@ -374,13 +403,17 @@ class DSAIndexerLossLoggingHelper:
         values = tracker["values"]
 
         torch.distributed.all_reduce(values, group=pp_group)
-        # Reduce indexer losses across ranks.
-        if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-        if tracker.get('avg_group') is not None:
+        if tracker.get("dynamic_cp_parent_group") is not None:
             torch.distributed.all_reduce(
-                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                values, group=tracker["dynamic_cp_parent_group"], op=torch.distributed.ReduceOp.AVG
             )
+        else:
+            if tracker.get('reduce_group') is not None:
+                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+            if tracker.get('avg_group') is not None:
+                torch.distributed.all_reduce(
+                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                )
         torch.distributed.all_reduce(
             values,
             group=parallel_state.get_data_parallel_group(with_context_parallel=False),
@@ -1849,6 +1882,11 @@ class DSAttention(MegatronModule):
         cp_group = getattr(self.pg_collection, "cp", None)
         cp_size = get_pg_size(cp_group)
         cp_rank = cp_group.rank() if cp_group is not None else 0
+        dynamic_cp_parent_group = None
+        if getattr(self.config, "dynamic_context_parallel", False):
+            dynamic_cp_parent_group = getattr(self.pg_collection, "dp_cp", None)
+            if dynamic_cp_parent_group is None:
+                raise RuntimeError("Dynamic-CP DSA requires a dp_cp parent process group.")
         tp_group = getattr(self.pg_collection, "tp", None)
         tp_size = get_pg_size(tp_group)
         sequence_parallel_tp = self.config.sequence_parallel and tp_size > 1
@@ -1928,7 +1966,12 @@ class DSAttention(MegatronModule):
                 packed_query_positions = packed_query_positions.contiguous()
         elif cp_size > 1:
             _validate_nonpacked_cp_uniform_length(
-                sq=sq, skv=key.size(0), cp_size=cp_size, cp_group=cp_group, device=query.device
+                sq=sq,
+                skv=key.size(0),
+                cp_size=cp_size,
+                cp_group=cp_group,
+                cp_parent_group=dynamic_cp_parent_group,
+                device=query.device,
             )
 
         if sequence_parallel_tp:
@@ -1984,7 +2027,7 @@ class DSAttention(MegatronModule):
                 local_cp_kv_len = key.size(0)
                 if kv_reorder_idx is None:
                     kv_reorder_idx = _build_kv_reorder_idx(local_cp_kv_len)
-                key = gather_from_sequence_parallel_region(key, group=cp_group)
+                key = _gather_cp_sequence(key, cp_group, dynamic_cp_parent_group)
                 gathered_cp_key = True
             if value is not None and value.size(0) in local_cp_kv_lens:
                 if local_cp_kv_len is None:
@@ -1996,7 +2039,7 @@ class DSAttention(MegatronModule):
                         "DSA local key/value sequence length mismatch before CP gather: "
                         f"key_len={local_cp_kv_len}, value_len={value.size(0)}"
                     )
-                value = gather_from_sequence_parallel_region(value, group=cp_group)
+                value = _gather_cp_sequence(value, cp_group, dynamic_cp_parent_group)
                 gathered_cp_value = True
             if kv_reorder_idx is not None:
                 if gathered_cp_key:
@@ -2029,6 +2072,7 @@ class DSAttention(MegatronModule):
                     cp_comm_type=self.cp_comm_type,
                     device=query.device,
                     cp_group=cp_group,
+                    cp_parent_group=dynamic_cp_parent_group,
                 )
                 row_start = sequence_parallel_tp_row_start
                 nonpacked_query_positions = full_query_positions[
@@ -2059,6 +2103,7 @@ class DSAttention(MegatronModule):
                 cp_rank=cp_rank,
                 cp_comm_type=self.cp_comm_type,
                 cp_group=cp_group,
+                cp_parent_group=dynamic_cp_parent_group,
                 attn_mask_type=attn_mask_type,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -2133,7 +2178,7 @@ class DSAttention(MegatronModule):
                 if cp_size > 1 and k.size(0) in local_cp_kv_lens:
                     if kv_reorder_idx is None:
                         kv_reorder_idx = _build_kv_reorder_idx(k.size(0))
-                    k = gather_from_sequence_parallel_region(k, group=cp_group)
+                    k = _gather_cp_sequence(k, cp_group, dynamic_cp_parent_group)
                     if k.size(0) != kv_reorder_idx.numel():
                         raise RuntimeError(
                             "DSA gathered indexer-key length mismatch: "
@@ -2233,6 +2278,7 @@ class DSAttention(MegatronModule):
                     ),
                     reduce_group=indexer_reduce_group,
                     avg_group=indexer_avg_group,
+                    dynamic_cp_parent_group=dynamic_cp_parent_group,
                 )
                 output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
             return _normalize_dsattention_output_rank(output, x.ndim)
@@ -2323,6 +2369,7 @@ class DSAttention(MegatronModule):
                     ),
                     reduce_group=indexer_reduce_group,
                     avg_group=indexer_avg_group,
+                    dynamic_cp_parent_group=dynamic_cp_parent_group,
                 )
         elif topk_indices is None:
             assert q is not None and k is not None and weights is not None

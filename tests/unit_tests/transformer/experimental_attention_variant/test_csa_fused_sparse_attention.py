@@ -1081,8 +1081,10 @@ class TestCPCommunicationOverlap:
                 saved_grad_k_indexer,
                 saved_grad_weights,
                 indexer_rank_map,
+                None,
             )
             cp_group = FakeGroup()
+            cp_parent_group = None
             compressed_kv_start = 2
             indexer_k_reduce_scatter_state = indexer_state
             compressed_kv_reduce_scatter_state = compressed_kv_state
@@ -1090,7 +1092,6 @@ class TestCPCommunicationOverlap:
             local_k_indexer_rows = 2
             local_compressed_kv_rows = 2
             softmax_scale = 0.5
-            q_padding_mask = None
             num_forward_inputs = 25
 
         gradients = FusedCSAIndexerSparseAttnFromTopkFunc.backward(
@@ -1332,6 +1333,50 @@ class TestDsaSparseAttn:
         assert torch.equal(kv.grad, dkv_kernel.reshape(skv, b, d)), "(b) kv.grad mis-reshaped"
         assert torch.equal(attn_sink.grad, d_sink_kernel), "(b) attn_sink.grad mismatch"
         fake_dsa.sparse_attention_backward_wrapper.assert_called_once()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_topk_length_uses_saved_tensor_hooks(self, reset_lazy_kernel_state):
+        """Protect compact lengths with the same saved-tensor lifecycle as indices."""
+        total_q, np_, d, n_kv = 4, 2, 512, 6
+        topk = _get_topk_alignment()
+        query = torch.randn(
+            total_q, np_, d, dtype=torch.bfloat16, device="cuda", requires_grad=True
+        )
+        kv = torch.randn(n_kv, d, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+        attn_sink = torch.zeros(np_, dtype=torch.float32, device="cuda", requires_grad=True)
+        topk_idxs = torch.zeros(total_q, topk, dtype=torch.int32, device="cuda")
+        topk_length = torch.full((total_q,), topk, dtype=torch.int32, device="cuda")
+
+        dk._flash_mla_sparse_fwd = _make_flash_mla_stub(d_v=d)
+        fake_dsa = MagicMock()
+        fake_dsa.sparse_attention_backward_wrapper.return_value = {
+            "dq": torch.zeros_like(query),
+            "dkv": torch.zeros_like(kv),
+            "d_sink": torch.zeros_like(attn_sink),
+        }
+        dk._DSA = fake_dsa
+
+        packed = []
+
+        def pack(tensor):
+            packed.append(tensor)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            out = csa_sparse_attn(
+                query,
+                kv,
+                attn_sink,
+                topk_idxs,
+                softmax_scale=0.5,
+                topk_length=topk_length,
+                is_thd=True,
+            )
+
+        assert any(tensor.data_ptr() == topk_length.data_ptr() for tensor in packed)
+        out.sum().backward()
+        passed_length = fake_dsa.sparse_attention_backward_wrapper.call_args.kwargs["topk_length"]
+        assert passed_length.data_ptr() == topk_length.data_ptr()
 
 
 # ---------------------------------------------------------------------------
@@ -2257,22 +2302,31 @@ class TestFusedIndexerSparseAttnFromTopk:
         monkeypatch.setattr(dk, '_csa_fwd_flash_mla', fake_flash)
         monkeypatch.setattr(dk, '_DSA', FakeDSA)
 
-        output, loss = FusedCSAIndexerSparseAttnFromTopkFunc.apply(
-            *inputs.values(),
-            1.0,
-            1.0,
-            0.0,
-            float(total_q),
-            True,
-            2,
-            total_q,
-            (
-                torch.tensor([0, total_q], dtype=torch.int32),
-                torch.tensor([0, inputs['k_indexer'].shape[0]], dtype=torch.int32),
-                torch.tensor([0], dtype=torch.int32),
-            ),
-            q_padding_mask,
-        )
+        packed = []
+
+        def pack(tensor):
+            packed.append(tensor)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            output, loss = FusedCSAIndexerSparseAttnFromTopkFunc.apply(
+                *inputs.values(),
+                1.0,
+                1.0,
+                0.0,
+                float(total_q),
+                True,
+                2,
+                total_q,
+                (
+                    torch.tensor([0, total_q], dtype=torch.int32),
+                    torch.tensor([0, inputs['k_indexer'].shape[0]], dtype=torch.int32),
+                    torch.tensor([0], dtype=torch.int32),
+                ),
+                q_padding_mask,
+            )
+
+        assert any(tensor.data_ptr() == q_padding_mask.data_ptr() for tensor in packed)
         (output.sum() + loss).backward()
 
         torch.testing.assert_close(
@@ -3843,8 +3897,20 @@ class TestThdPaddingRowMasking:
         padded, cu_q_unpadded = self._build_per_seg_padded(
             real, self.SEG_LENS_PADDED, self.SHAPES, dev, fill_pad_random=False
         )
-        _, loss_with_pad = self._run_fused(
-            padded, self.SHAPES, sparse_loss=sparse_loss, cu_seqlens_q_unpadded=cu_q_unpadded
+        padded['q_indexer'] = padded['q_indexer'].detach().requires_grad_(True)
+        packed = []
+
+        def pack(tensor):
+            packed.append(tensor)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            _, loss_with_pad = self._run_fused(
+                padded, self.SHAPES, sparse_loss=sparse_loss, cu_seqlens_q_unpadded=cu_q_unpadded
+            )
+
+        assert any(
+            tensor.dtype == torch.bool and tensor.shape == (padded['total_q'],) for tensor in packed
         )
 
         assert torch.allclose(loss_with_pad, loss_no_pad, atol=5e-2, rtol=1e-1), (

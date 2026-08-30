@@ -125,11 +125,28 @@ class _LeftBoundaryExchange(torch.autograd.Function):
     """Exchange fixed left-boundary windows and scatter gradients back to senders."""
 
     @staticmethod
-    def forward(ctx, tensor: torch.Tensor, d_window: int, cp_group: torch.distributed.ProcessGroup):
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        d_window: int,
+        cp_group: torch.distributed.ProcessGroup,
+        cp_parent_group: Optional[torch.distributed.ProcessGroup],
+    ):
         """Receive fixed left-boundary hidden rows needed by this CP rank."""
         cp_size = cp_group.size()
         cp_rank = cp_group.rank()
+        cp_ranks = dist.get_process_group_ranks(cp_group)
+        transport_group = cp_parent_group if cp_parent_group is not None else cp_group
+        if cp_parent_group is not None:
+            parent_ranks = dist.get_process_group_ranks(cp_parent_group)
+            if not set(cp_ranks).issubset(parent_ranks):
+                raise RuntimeError(
+                    "DSv4 CP boundary subgroup must belong to its parent group: "
+                    f"subgroup={cp_ranks}, parent={parent_ranks}."
+                )
         ctx.cp_group = cp_group
+        ctx.cp_transport_group = transport_group
+        ctx.cp_ranks = cp_ranks
         ctx.d_window = d_window
         ctx.input_shape = tensor.shape
         if tensor.shape[0] < d_window:
@@ -141,18 +158,10 @@ class _LeftBoundaryExchange(torch.autograd.Function):
 
         ops = []
         if cp_rank > 0:
-            ops.append(
-                dist.P2POp(
-                    dist.irecv, boundary, dist.get_global_rank(cp_group, cp_rank - 1), cp_group
-                )
-            )
+            ops.append(dist.P2POp(dist.irecv, boundary, cp_ranks[cp_rank - 1], transport_group))
         if cp_rank + 1 < cp_size:
             send_tail = tensor[-d_window:].contiguous()
-            ops.append(
-                dist.P2POp(
-                    dist.isend, send_tail, dist.get_global_rank(cp_group, cp_rank + 1), cp_group
-                )
-            )
+            ops.append(dist.P2POp(dist.isend, send_tail, cp_ranks[cp_rank + 1], transport_group))
         for req in dist.batch_isend_irecv(ops):
             req.wait()
         return boundary
@@ -163,29 +172,23 @@ class _LeftBoundaryExchange(torch.autograd.Function):
         cp_group = ctx.cp_group
         cp_size = cp_group.size()
         cp_rank = cp_group.rank()
+        cp_ranks = ctx.cp_ranks
+        transport_group = ctx.cp_transport_group
         d_window = ctx.d_window
         grad_input = grad_boundary.new_zeros(ctx.input_shape)
 
         ops = []
         if cp_rank > 0:
             send_grad = grad_boundary.contiguous()
-            ops.append(
-                dist.P2POp(
-                    dist.isend, send_grad, dist.get_global_rank(cp_group, cp_rank - 1), cp_group
-                )
-            )
+            ops.append(dist.P2POp(dist.isend, send_grad, cp_ranks[cp_rank - 1], transport_group))
         if cp_rank + 1 < cp_size:
             recv_grad = grad_boundary.new_empty(grad_boundary.shape)
-            ops.append(
-                dist.P2POp(
-                    dist.irecv, recv_grad, dist.get_global_rank(cp_group, cp_rank + 1), cp_group
-                )
-            )
+            ops.append(dist.P2POp(dist.irecv, recv_grad, cp_ranks[cp_rank + 1], transport_group))
         for req in dist.batch_isend_irecv(ops):
             req.wait()
         if cp_rank + 1 < cp_size:
             grad_input[-d_window:] = recv_grad
-        return grad_input, None, None
+        return grad_input, None, None, None
 
 
 def exchange_cp_boundary_hidden(
@@ -193,12 +196,13 @@ def exchange_cp_boundary_hidden(
     compress_ratio: int,
     csa_window_size: int,
     cp_group: torch.distributed.ProcessGroup,
+    cp_parent_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
     """Exchange hidden-state rows immediately left of this rank's token block."""
     d_comp = 8 if compress_ratio == 4 else compress_ratio if compress_ratio > 1 else 0
     d_window = max(int(csa_window_size), d_comp)
     hidden_flat = hidden_states.view(hidden_states.shape[0], -1)
-    boundary_hidden = _LeftBoundaryExchange.apply(hidden_flat, d_window, cp_group)
+    boundary_hidden = _LeftBoundaryExchange.apply(hidden_flat, d_window, cp_group, cp_parent_group)
     return boundary_hidden.reshape((d_window,) + tuple(hidden_states.shape[1:]))
 
 

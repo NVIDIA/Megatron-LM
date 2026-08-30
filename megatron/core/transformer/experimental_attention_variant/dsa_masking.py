@@ -411,6 +411,7 @@ def build_dsattention_forward_mask(
     packed_seq_params: Optional[PackedSeqParams],
     packed_query_positions: Optional[torch.Tensor] = None,
     nonpacked_query_positions: Optional[torch.Tensor] = None,
+    cp_parent_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tuple[
     Optional[torch.Tensor],
     Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
@@ -447,6 +448,7 @@ def build_dsattention_forward_mask(
                     cp_comm_type=cp_comm_type,
                     device=device,
                     cp_group=cp_group,
+                    cp_parent_group=cp_parent_group,
                 )
             else:
                 query_idx = torch.arange(sq, dtype=torch.int64, device=device)
@@ -474,6 +476,7 @@ def build_dsattention_forward_mask(
                     cp_comm_type=cp_comm_type,
                     device=device,
                     cp_group=cp_group,
+                    cp_parent_group=cp_parent_group,
                 )
             varlen_starts = torch.zeros_like(query_pos, dtype=torch.int64, device=device)
             varlen_ends = (query_pos.to(dtype=torch.int64) + 1).clamp(max=skv)

@@ -454,6 +454,74 @@ def test_indexer_loss_tracker_grows_for_mtp_layer_numbers():
         helper.tracker.clear()
 
 
+def test_indexer_loss_tracker_accumulates_mixed_cp_before_parent_average():
+    """A mixed-CP iteration accumulates local sums before one parent average."""
+    helper = dsa_module.DSAIndexerLossLoggingHelper
+    reduce_group = object()
+    parent_group = object()
+    helper.tracker.clear()
+
+    try:
+        helper.save_loss_to_tracker(
+            loss=torch.tensor(3.0),
+            layer_number=1,
+            num_layers=1,
+            reduce_group=reduce_group,
+            dynamic_cp_parent_group=parent_group,
+        )
+        helper.save_loss_to_tracker(
+            loss=torch.tensor(1.0),
+            layer_number=1,
+            num_layers=1,
+            dynamic_cp_parent_group=parent_group,
+        )
+
+        torch.testing.assert_close(
+            helper.tracker["values"], helper.tracker["values"].new_tensor([4.0])
+        )
+        assert helper.tracker["dynamic_cp_parent_group"] is parent_group
+    finally:
+        helper.tracker.clear()
+
+
+def test_indexer_loss_tracker_uses_one_dynamic_cp_parent_average(monkeypatch):
+    """Mixed-CP losses use one stable parent AVG after PP reduction."""
+    helper = dsa_module.DSAIndexerLossLoggingHelper
+    pp_group = object()
+    parent_group = object()
+    dp_group = object()
+    helper.tracker.clear()
+    helper.tracker.update(
+        {"values": torch.tensor([4.0]), "dynamic_cp_parent_group": parent_group, "agreed_size": 1}
+    )
+    reductions = []
+
+    def fake_all_reduce(values, group=None, op=None):
+        reductions.append((group, op))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(
+        dsa_module.parallel_state, "get_pipeline_model_parallel_group", lambda: pp_group
+    )
+    monkeypatch.setattr(
+        dsa_module.parallel_state,
+        "get_data_parallel_group",
+        lambda with_context_parallel=False: dp_group,
+    )
+
+    try:
+        helper.reduce_loss_in_tracker()
+
+        torch.testing.assert_close(helper.tracker["values"], torch.tensor([4.0]))
+        assert reductions == [
+            (pp_group, None),
+            (parent_group, torch.distributed.ReduceOp.AVG),
+            (dp_group, torch.distributed.ReduceOp.AVG),
+        ]
+    finally:
+        helper.tracker.clear()
+
+
 def test_dsv4_metric_logging_preserves_graph_groups_and_uses_indexer_layer_count(monkeypatch):
     """CUDA Graph reuse keeps groups, and only ratio-4 DSv4 layers enter the average."""
     helper = dsa_module.DSAIndexerLossLoggingHelper
