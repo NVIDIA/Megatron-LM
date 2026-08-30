@@ -228,9 +228,7 @@ def test_zero1_memory_uses_sharded_optimizer_and_replicated_weight(distributed_s
     # Resting memory holds one replicated BF16 model weight, one sharded BF16
     # main gradient, and three sharded FP32 buffers: main weight and two Adam states.
     expected_resting_nbytes = (
-        full_bf16_weight_nbytes
-        + sharded_bf16_weight_nbytes
-        + 3 * sharded_fp32_weight_nbytes
+        full_bf16_weight_nbytes + sharded_bf16_weight_nbytes + 3 * sharded_fp32_weight_nbytes
     )
     # Peak memory additionally holds the casted gradient and the sqrt and division
     # intermediates in ``denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)``.
