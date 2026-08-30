@@ -43,3 +43,30 @@ def test_capabilities_validate_registration_limits():
 
     with pytest.raises(ValueError, match="max_num_seqs must be positive"):
         InferenceEngineCapabilities.from_dict(values)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "message"),
+    [
+        ("context_length", "8192", "context_length must be an integer"),
+        ("enable_prefix_caching", 1, "enable_prefix_caching must be a boolean"),
+    ],
+)
+def test_capabilities_reject_coerced_wire_types(field_name, invalid_value, message):
+    values = InferenceEngineCapabilities.from_engine(
+        _engine(SimpleNamespace(bos_token_id=1))
+    ).to_dict()
+    values[field_name] = invalid_value
+
+    with pytest.raises(TypeError, match=message):
+        InferenceEngineCapabilities.from_dict(values)
+
+
+def test_endpoint_rejects_non_string_coordinator_address():
+    endpoint = InferenceEngineEndpoint.from_engine(
+        "tcp://127.0.0.1:5000", _engine(SimpleNamespace(eod=2))
+    ).to_dict()
+    endpoint["coordinator_address"] = None
+
+    with pytest.raises(TypeError, match="coordinator_address must be a string"):
+        InferenceEngineEndpoint.from_dict(endpoint)

@@ -9,6 +9,7 @@ import pytest
 
 pytest.importorskip("dynamo")
 
+from megatron.core.inference.engine_endpoint import InferenceEngineEndpoint
 from megatron.core.inference.headers import Headers
 from megatron.inference.integrations.dynamo.args import Config
 from megatron.inference.integrations.dynamo.llm_engine import (
@@ -35,6 +36,24 @@ def _config(role="aggregated"):
         megatron_root="/opt/megatron-lm",
         drain_timeout=0.1,
         megatron_argv=["--load", "/checkpoint"],
+    )
+
+
+def _endpoint(address="tcp://127.0.0.1:5555"):
+    return InferenceEngineEndpoint.from_dict(
+        {
+            "coordinator_address": address,
+            "capabilities": {
+                "context_length": 8192,
+                "kv_cache_block_size": 64,
+                "total_kv_blocks": 100,
+                "max_num_seqs": 32,
+                "max_num_batched_tokens": 4096,
+                "bos_token_id": 1,
+                "enable_prefix_caching": True,
+                "logical_data_parallel_size": 1,
+            },
+        }
     )
 
 
@@ -78,22 +97,9 @@ async def test_start_uses_parent_event_socket_and_base_client(tmp_path):
         return 0
 
     process = SimpleNamespace(stdout=stdout, stderr=stderr, returncode=None, wait=wait_for_process)
-    metadata = {
-        "context_length": 8192,
-        "kv_cache_block_size": 64,
-        "total_kv_blocks": 100,
-        "max_num_seqs": 32,
-        "max_num_batched_tokens": 4096,
-    }
     client = SimpleNamespace(start=MagicMock())
     event_receiver = SimpleNamespace(start=MagicMock(return_value="tcp://127.0.0.1:5556"))
-    engine._wait_for_readiness = AsyncMock(
-        return_value={
-            "version": 3,
-            "coordinator_address": "tcp://127.0.0.1:5555",
-            "engine": metadata,
-        }
-    )
+    engine._wait_for_readiness = AsyncMock(return_value=_endpoint().to_dict())
 
     try:
         with (
@@ -210,6 +216,42 @@ async def test_decode_health_probe_bypasses_kv_handoff():
     assert chunks[-1]["token_ids"] == []
     assert chunks[-1]["finish_reason"] == "stop"
     assert not handoff_called
+
+
+@pytest.mark.asyncio
+async def test_prefill_release_uses_registered_engine_endpoint():
+    class Stream:
+        request_id = 36
+        done = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.done:
+                raise StopAsyncIteration
+            self.done = True
+            return {
+                "final": {
+                    "request_id": self.request_id,
+                    "disaggregated_params": {"block_ids": [4, 5]},
+                }
+            }
+
+        async def aclose(self):
+            return None
+
+    engine = MegatronLLMEngine(_config("prefill"))
+    engine._engine_endpoint = _endpoint("tcp://prefill:5000")
+    engine.client = SimpleNamespace(add_request_streaming=lambda *_args, **_kwargs: Stream())
+    request = {"token_ids": [1], "sampling_options": {}, "stop_conditions": {"max_tokens": 1}}
+
+    chunks = [chunk async for chunk in engine.generate(request, _Context())]
+
+    assert chunks[-1]["disaggregated_params"]["release"] == {
+        "coordinator_addr": "tcp://prefill:5000",
+        "request_id": 36,
+    }
 
 
 @pytest.mark.asyncio

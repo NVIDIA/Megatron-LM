@@ -36,6 +36,7 @@ from dynamo.common.constants import DisaggregationMode
 from dynamo.common.model_fetch import fetch_model
 from dynamo.llm import KvEventPublisher, ModelInput
 
+from megatron.core.inference.engine_endpoint import InferenceEngineEndpoint
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient, InferenceRequestError
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
@@ -106,7 +107,7 @@ class MegatronLLMEngine(LLMEngine):
         self._process_monitor: Optional[asyncio.Task] = None
         self._log_tasks: list[asyncio.Task] = []
         self._shutting_down = False
-        self._metadata: dict[str, Any] = {}
+        self._engine_endpoint: InferenceEngineEndpoint | None = None
         self._ready_messages: queue.Queue[dict] = queue.Queue(maxsize=1)
         self._kv_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
         self._publisher: Optional[KvEventPublisher] = None
@@ -193,13 +194,13 @@ class MegatronLLMEngine(LLMEngine):
         """Finish startup after the owned engine subprocess has launched."""
 
         readiness = await self._wait_for_readiness()
-        self.client = InferenceClient(str(readiness["coordinator_address"]), deserialize=False)
+        endpoint = InferenceEngineEndpoint.from_dict(readiness)
+        self.client = InferenceClient(endpoint.coordinator_address, deserialize=False)
         self.client.start(
             loop=asyncio.get_running_loop(),
             connect_timeout_seconds=min(30.0, self.config.engine_start_timeout),
         )
-        self._metadata = dict(readiness["engine"])
-        self._metadata["coordinator_address"] = str(readiness["coordinator_address"])
+        self._engine_endpoint = endpoint
         self._process_monitor = asyncio.create_task(self._monitor_process())
         identity = {
             "worker_id": self.worker_id,
@@ -216,17 +217,18 @@ class MegatronLLMEngine(LLMEngine):
             temporary.write_text(json.dumps(identity, sort_keys=True) + "\n")
             os.replace(temporary, path)
 
+        capabilities = endpoint.capabilities
         return EngineConfig(
             model=self.registration_model,
             served_model_name=self.config.served_model_name,
             runtime_data={"role": self.config.role, "worker_id": self.worker_id},
             llm=LlmRegistration(
-                context_length=int(self._metadata["context_length"]),
-                kv_cache_block_size=int(self._metadata["kv_cache_block_size"]),
-                total_kv_blocks=int(self._metadata["total_kv_blocks"]),
-                max_num_seqs=int(self._metadata["max_num_seqs"]),
-                max_num_batched_tokens=int(self._metadata["max_num_batched_tokens"]),
-                data_parallel_size=1,
+                context_length=capabilities.context_length,
+                kv_cache_block_size=capabilities.kv_cache_block_size,
+                total_kv_blocks=capabilities.total_kv_blocks,
+                max_num_seqs=capabilities.max_num_seqs,
+                max_num_batched_tokens=capabilities.max_num_batched_tokens,
+                data_parallel_size=capabilities.logical_data_parallel_size,
                 data_parallel_start_rank=0,
             ),
         )
@@ -334,6 +336,9 @@ class MegatronLLMEngine(LLMEngine):
             }
             return
         if self.config.role == "prefill" and not probe:
+            endpoint = self._engine_endpoint
+            if endpoint is None:
+                raise RuntimeError("Megatron engine endpoint is not initialized")
             params.do_kv_handoff = True
             params.num_tokens_to_generate = 0
             stream = self.client.add_request_streaming(token_ids, params)
@@ -348,7 +353,7 @@ class MegatronLLMEngine(LLMEngine):
                     raise RuntimeError("Megatron prefill stream ended without a result")
                 disagg = dict(final.get("disaggregated_params") or {})
                 disagg["release"] = {
-                    "coordinator_addr": self._metadata["coordinator_address"],
+                    "coordinator_addr": endpoint.coordinator_address,
                     "request_id": int(
                         disagg.get("request_id", final.get("request_id", stream.request_id))
                     ),
@@ -535,6 +540,7 @@ class MegatronLLMEngine(LLMEngine):
             self._release_context = None
         client = self.client
         self.client = None
+        self._engine_endpoint = None
         if client is not None:
             try:
                 client.pause_engines()
@@ -587,14 +593,16 @@ class MegatronLLMEngine(LLMEngine):
             self._process = None
 
     async def health_check_payload(self) -> dict[str, Any] | None:
-        if self.client is None:
+        endpoint = self._engine_endpoint
+        if self.client is None or endpoint is None:
             return None
-        return build_health_check_payload(int(self._metadata.get("bos_token_id", 0)))
+        return build_health_check_payload(endpoint.capabilities.bos_token_id)
 
     async def kv_event_sources(self) -> list[KvEventSource]:
-        if self.config.role == "decode" or self.client is None:
+        endpoint = self._engine_endpoint
+        if self.config.role == "decode" or self.client is None or endpoint is None:
             return []
-        if not self._metadata.get("enable_prefix_caching", False):
+        if not endpoint.capabilities.enable_prefix_caching:
             return []
         return [PushSource(on_ready=self._set_publisher, dp_rank=0)]
 

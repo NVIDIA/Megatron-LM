@@ -13,6 +13,7 @@ are not registered as Dynamo workers.
 
 ```text
 megatron/inference/integrations/dynamo/             adapter and engine protocol
+megatron/core/inference/engine_endpoint.py           shared endpoint contract
 megatron/core/inference/disaggregation/            reusable KV/state handoff
 tests/unit_tests/inference/dynamo/                  adapter unit tests
 ```
@@ -106,7 +107,7 @@ Adapter tests require an environment containing both Megatron and Dynamo:
 
 ```bash
 pytest -q tests/unit_tests/inference/dynamo
-pytest -q tests/unit_tests/inference/test_dynamo_engine_service.py
+pytest -q tests/unit_tests/inference/test_engine_endpoint.py
 pytest -q tests/unit_tests/inference/test_kv_transfer_backends.py
 ```
 

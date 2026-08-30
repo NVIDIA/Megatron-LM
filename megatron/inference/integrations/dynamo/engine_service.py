@@ -9,11 +9,11 @@ import asyncio
 import torch
 import torch.distributed as dist
 
+from megatron.core.inference.engine_endpoint import InferenceEngineEndpoint
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.utils import get_pg_size
 from megatron.inference.integrations.dynamo.args import add_engine_service_args
 from megatron.inference.integrations.dynamo.dynamic_engine import DynamoDynamicInferenceEngine
-from megatron.inference.integrations.dynamo.protocol import engine_metadata
 from megatron.inference.integrations.dynamo.telemetry import EngineEventReporter
 from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
 from megatron.post_training.arguments import add_modelopt_args
@@ -55,21 +55,15 @@ async def _serve() -> None:
     reporter = EngineEventReporter(engine, args.dynamo_parent_event_address)
     reporter.start()
 
-    metadata = engine_metadata(engine, args.role)
-
-    def ready(coordinator_address):
-        reporter.observe(
-            "ready",
-            {"coordinator_address": coordinator_address, "engine": metadata},
-        )
-
     try:
         address = await engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=args.coordinator_port,
-            hostname=args.coordinator_host,
+            inference_coordinator_port=args.coordinator_port, hostname=args.coordinator_host
         )
         if dist.get_rank() == 0:
-            ready(address)
+            endpoint = InferenceEngineEndpoint.from_engine(
+                address, engine, logical_data_parallel_size=replica_count
+            )
+            reporter.observe("ready", endpoint.to_dict())
         await engine.engine_loop_task
     finally:
         reporter.stop()
@@ -77,8 +71,7 @@ async def _serve() -> None:
 
 def main() -> None:
     parse_and_validate_args(
-        extra_args_provider=_extra_args,
-        args_defaults={"no_load_rng": True, "no_load_optim": True},
+        extra_args_provider=_extra_args, args_defaults={"no_load_rng": True, "no_load_optim": True}
     )
     initialize_megatron()
     try:
