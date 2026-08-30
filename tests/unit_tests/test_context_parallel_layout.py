@@ -11,17 +11,18 @@ from megatron.core.context_parallel_layout import (
     CpPartitionModeConverter,
     ThdCpRoute,
     convert_module_input_tensors_cp_partition_mode,
+    finalize_packed_seq_params,
     prebuild_thd_cp_partition_routes,
 )
 from megatron.core.context_parallel_layout.routes import (
     build_thd_cp_partition_route,
     get_thd_cp_partition_route,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from tests.unit_tests.test_utilities import Utils
 
 
 class _FakeGroup:
-
     def __init__(self, size, rank):
         self._size = size
         self._rank = rank
@@ -40,9 +41,9 @@ def _make_sequence_tensor(total_seq_len, seq_dim, device):
         shape = (3, total_seq_len, 5)
     else:
         raise ValueError(f"Unsupported test seq_dim {seq_dim}.")
-    return torch.arange(torch.prod(torch.tensor(shape)), device=device, dtype=torch.float32).view(
-        *shape
-    )
+    return torch.arange(
+        torch.prod(torch.tensor(shape)), device=device, dtype=torch.float32
+    ).view(*shape)
 
 
 def _get_sequence_parallel_shard(tensor, seq_dim, tp_group):
@@ -56,12 +57,16 @@ def _get_sbhd_tensor_on_this_cp_rank(tensor, seq_dim, cp_group, cp_partition_mod
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
     if cp_partition_mode == "zigzag":
-        cp_idx = torch.tensor([cp_rank, 2 * cp_size - cp_rank - 1], device=tensor.device)
+        cp_idx = torch.tensor(
+            [cp_rank, 2 * cp_size - cp_rank - 1], device=tensor.device
+        )
     elif cp_partition_mode == "contiguous":
         cp_idx = torch.tensor([2 * cp_rank, 2 * cp_rank + 1], device=tensor.device)
     else:
         raise ValueError(f"Unsupported test CP partition mode {cp_partition_mode!r}.")
-    tensor = tensor.view(*tensor.shape[:seq_dim], 2 * cp_size, -1, *tensor.shape[(seq_dim + 1) :])
+    tensor = tensor.view(
+        *tensor.shape[:seq_dim], 2 * cp_size, -1, *tensor.shape[(seq_dim + 1) :]
+    )
     tensor = tensor.index_select(seq_dim, cp_idx)
     return tensor.view(*tensor.shape[:seq_dim], -1, *tensor.shape[(seq_dim + 2) :])
 
@@ -93,7 +98,8 @@ def _get_test_thd_token_indices(cu_seqlens, cp_size, cp_rank, cp_partition_mode)
 
 
 @pytest.mark.parametrize(
-    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
+    ("source_layout", "target_layout"),
+    [("zigzag", "contiguous"), ("contiguous", "zigzag")],
 )
 @pytest.mark.parametrize(
     ("cp_size", "tp_size", "group_rank_by_logical_rank"),
@@ -109,16 +115,22 @@ def test_sbhd_layout_redistribution_plan_reassembles_target_segments(
     for logical_rank, group_rank in enumerate(group_rank_by_logical_rank):
         cp_rank, tp_rank = divmod(logical_rank, tp_size)
         source_ids = context_parallel_layout_conversion._local_sbhd_segment_ids(
-            layout=source_layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
-        )
-        plan = context_parallel_layout_conversion._build_sbhd_layout_redistribution_plan(
-            source_layout=source_layout,
-            target_layout=target_layout,
+            layout=source_layout,
             cp_size=cp_size,
             cp_rank=cp_rank,
             tp_size=tp_size,
             tp_rank=tp_rank,
-            group_rank_by_logical_rank=group_rank_by_logical_rank,
+        )
+        plan = (
+            context_parallel_layout_conversion._build_sbhd_layout_redistribution_plan(
+                source_layout=source_layout,
+                target_layout=target_layout,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                group_rank_by_logical_rank=group_rank_by_logical_rank,
+            )
         )
         plans[group_rank] = plan
         packed_ids = tuple(source_ids[slot] for slot in plan.send_slots)
@@ -137,7 +149,11 @@ def test_sbhd_layout_redistribution_plan_reassembles_target_segments(
         )
         output_ids = tuple(received_ids[index] for index in plan.receive_permutation)
         assert output_ids == context_parallel_layout_conversion._local_sbhd_segment_ids(
-            layout=target_layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
+            layout=target_layout,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
         )
 
 
@@ -147,7 +163,8 @@ def test_sbhd_layout_redistribution_rejects_odd_tensor_parallel_size():
 
 
 @pytest.mark.parametrize(
-    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
+    ("source_layout", "target_layout"),
+    [("zigzag", "contiguous"), ("contiguous", "zigzag")],
 )
 @pytest.mark.parametrize(
     ("cu_seqlens", "cp_size"),
@@ -168,7 +185,10 @@ def test_thd_cp_partition_route_reassembles_target_layout(
         _get_test_thd_token_indices(cu_seqlens, cp_size, rank, target_layout)
         for rank in range(cp_size)
     ]
-    routes = [build_thd_cp_partition_route(cu_seqlens, cp_size, rank) for rank in range(cp_size)]
+    routes = [
+        build_thd_cp_partition_route(cu_seqlens, cp_size, rank)
+        for rank in range(cp_size)
+    ]
     if source_layout == "zigzag" and target_layout == "contiguous":
         selected_routes = [
             (
@@ -221,13 +241,18 @@ def test_thd_cp_partition_route_reassembles_target_layout(
 
 
 def test_thd_cp_partition_route_stores_bidirectional_layout_views():
-    route = build_thd_cp_partition_route(torch.tensor([0, 8, 12, 16]), cp_size=2, cp_rank=0)
+    cu_seqlens = torch.tensor([0, 8, 12, 16])
+    route = build_thd_cp_partition_route(cu_seqlens, cp_size=2, cp_rank=0)
 
     assert isinstance(route, ThdCpRoute)
     assert route.zigzag_index is None
     assert route.zigzag_split_sizes == [4, 4]
     assert route.contiguous_index.tolist() == [0, 1, 6, 7, 2, 3, 4, 5]
     assert route.contiguous_split_sizes == [4, 4]
+    assert route.cu_seqlens == (0, 8, 12, 16)
+    assert route.cp_size == 2
+    assert route.cp_rank == 0
+    assert route.source_cu_seqlens_id == id(cu_seqlens)
 
     c2z_send_index = route.contiguous_index
     c2z_recv_index = route.zigzag_index
@@ -257,7 +282,8 @@ def test_build_thd_cp_partition_route_rejects_decreasing_boundaries():
 
 @pytest.mark.internal
 @pytest.mark.parametrize(
-    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
+    ("source_layout", "target_layout"),
+    [("zigzag", "contiguous"), ("contiguous", "zigzag")],
 )
 @pytest.mark.parametrize("seq_dim", [0, 1])
 def test_sbhd_convert_cp_partition_mode_matches_direct_target_shard(
@@ -267,7 +293,9 @@ def test_sbhd_convert_cp_partition_mode_matches_direct_target_shard(
         pytest.skip("SBHD CP partition-mode conversion needs at least two CUDA ranks.")
 
     cp_size = 2
-    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp_size)
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, context_parallel_size=cp_size
+    )
     try:
         cp_group = parallel_state.get_context_parallel_group()
         full_tensor = _make_sequence_tensor(
@@ -326,9 +354,15 @@ def test_sbhd_convert_cp_partition_mode_backward_matches_direct_source_shard(
     )
     try:
         cp_group = parallel_state.get_context_parallel_group()
-        tp_group = parallel_state.get_tensor_model_parallel_group() if sequence_parallel else None
+        tp_group = (
+            parallel_state.get_tensor_model_parallel_group()
+            if sequence_parallel
+            else None
+        )
         tp_cp_group = (
-            parallel_state.get_tensor_and_context_parallel_group() if sequence_parallel else None
+            parallel_state.get_tensor_and_context_parallel_group()
+            if sequence_parallel
+            else None
         )
         full_tensor = _make_sequence_tensor(
             total_seq_len=32,
@@ -344,7 +378,11 @@ def test_sbhd_convert_cp_partition_mode_backward_matches_direct_source_shard(
         source_shard = source_shard.detach().requires_grad_(True)
 
         convert_kwargs = (
-            {"sequence_parallel": True, "tp_group": tp_group, "tp_cp_group": tp_cp_group}
+            {
+                "sequence_parallel": True,
+                "tp_group": tp_group,
+                "tp_cp_group": tp_cp_group,
+            }
             if sequence_parallel
             else {}
         )
@@ -360,7 +398,9 @@ def test_sbhd_convert_cp_partition_mode_backward_matches_direct_source_shard(
             full_tensor, seq_dim, cp_group, cp_partition_mode=target_layout
         )
         if sequence_parallel:
-            expected_target = _get_sequence_parallel_shard(expected_target, seq_dim, tp_group)
+            expected_target = _get_sequence_parallel_shard(
+                expected_target, seq_dim, tp_group
+            )
         torch.testing.assert_close(converted, expected_target, atol=0.0, rtol=0.0)
 
         target_upstream_grad = _get_sbhd_tensor_on_this_cp_rank(
@@ -379,7 +419,9 @@ def test_sbhd_convert_cp_partition_mode_backward_matches_direct_source_shard(
                 expected_source_grad, seq_dim, tp_group
             )
 
-        torch.testing.assert_close(source_shard.grad, expected_source_grad, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(
+            source_shard.grad, expected_source_grad, atol=0.0, rtol=0.0
+        )
     finally:
         Utils.destroy_model_parallel()
 
@@ -396,11 +438,65 @@ def test_prebuild_thd_cp_partition_routes_populates_direct_fields():
 
     route = get_thd_cp_partition_route(packed_seq_params, "zigzag", "contiguous")
     same_route = get_thd_cp_partition_route(packed_seq_params, "zigzag", "contiguous")
-    reverse_route = get_thd_cp_partition_route(packed_seq_params, "contiguous", "zigzag")
+    reverse_route = get_thd_cp_partition_route(
+        packed_seq_params, "contiguous", "zigzag"
+    )
 
     assert same_route is route
     assert reverse_route is route
     assert packed_seq_params.cp_partition_route is route
+
+
+def test_prebuild_thd_cp_partition_routes_supports_cp1_odd_lengths():
+    cu_seqlens = torch.tensor([0, 7, 12], dtype=torch.int32)
+    packed_seq_params = SimpleNamespace(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_q_padded=None,
+        cp_partition_route=None,
+    )
+
+    prebuild_thd_cp_partition_routes(packed_seq_params, _FakeGroup(size=1, rank=0))
+
+    route = packed_seq_params.cp_partition_route
+    assert route.cu_seqlens == (0, 7, 12)
+    assert route.cp_size == 1
+    assert route.cp_rank == 0
+    assert route.source_cu_seqlens_id == id(cu_seqlens)
+    assert route.zigzag_index is None
+    assert route.contiguous_index is None
+    assert route.zigzag_split_sizes == [12]
+    assert route.contiguous_split_sizes == [12]
+
+
+def test_finalize_packed_seq_params_resolves_padding_before_route_use(monkeypatch):
+    cp_group = _FakeGroup(size=1, rank=0)
+    monkeypatch.setattr(parallel_state, "get_context_parallel_group", lambda: cp_group)
+    valid = torch.tensor([0, 7, 12], dtype=torch.int32)
+
+    equal_padded = valid.clone()
+    unpadded = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=valid,
+        cu_seqlens_kv=valid,
+        cu_seqlens_q_padded=equal_padded,
+        cu_seqlens_kv_padded=equal_padded,
+        cp_group=cp_group,
+    )
+    finalize_packed_seq_params(unpadded)
+    assert unpadded.pad_between_seqs is False
+    assert unpadded.cp_partition_route.source_cu_seqlens_id == id(equal_padded)
+
+    padded = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=valid,
+        cu_seqlens_kv=valid,
+        cu_seqlens_q_padded=torch.tensor([0, 8, 12], dtype=torch.int32),
+        cu_seqlens_kv_padded=torch.tensor([0, 8, 12], dtype=torch.int32),
+        cp_group=cp_group,
+    )
+    finalize_packed_seq_params(padded)
+    assert padded.pad_between_seqs is True
 
 
 def test_prebuild_thd_cp_partition_routes_raises_route_errors():
@@ -542,7 +638,9 @@ def test_public_conversion_apis_default_to_no_cp_group():
     assert back_to_input_converter is None
     assert (
         context_parallel_layout_conversion.convert_cp_partition_mode(
-            x=hidden_states, source_partition_mode="zigzag", target_partition_mode="contiguous"
+            x=hidden_states,
+            source_partition_mode="zigzag",
+            target_partition_mode="contiguous",
         )
         is hidden_states
     )
@@ -552,7 +650,9 @@ def test_public_conversion_apis_default_to_no_cp_group():
     ("sequence_parallel", "tp_size"),
     [(False, None), (False, 2), (True, None), (True, 1), (True, 2)],
 )
-def test_sbhd_conversion_uses_one_redistribution_path(monkeypatch, sequence_parallel, tp_size):
+def test_sbhd_conversion_uses_one_redistribution_path(
+    monkeypatch, sequence_parallel, tp_size
+):
     calls = []
     cp_group = _FakeGroup(size=2, rank=0)
     tp_group = _FakeGroup(size=tp_size, rank=0) if tp_size is not None else None
@@ -564,7 +664,9 @@ def test_sbhd_conversion_uses_one_redistribution_path(monkeypatch, sequence_para
         return kwargs["input_"] + 1
 
     monkeypatch.setattr(
-        context_parallel_layout_conversion, "_redistribute_sbhd_layout", fake_redistribute
+        context_parallel_layout_conversion,
+        "_redistribute_sbhd_layout",
+        fake_redistribute,
     )
 
     converted = context_parallel_layout_conversion.convert_cp_partition_mode(
@@ -615,7 +717,9 @@ def test_sequence_parallel_thd_conversion_warns_about_naive_fallback(monkeypatch
 
     monkeypatch.setattr(mappings, "gather_from_sequence_parallel_region", fake_gather)
     monkeypatch.setattr(
-        context_parallel_layout_conversion, "_redistribute_thd_layout", fake_redistribute
+        context_parallel_layout_conversion,
+        "_redistribute_thd_layout",
+        fake_redistribute,
     )
     monkeypatch.setattr(mappings, "scatter_to_sequence_parallel_region", fake_scatter)
 

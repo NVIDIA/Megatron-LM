@@ -3,7 +3,7 @@
 """Leaf type definitions for context-parallel layout helpers."""
 
 from dataclasses import dataclass
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 
 import torch
 
@@ -23,3 +23,7 @@ class ThdCpRoute:
     zigzag_split_sizes: List[int]
     contiguous_index: Optional[torch.Tensor]
     contiguous_split_sizes: List[int]
+    cu_seqlens: Tuple[int, ...] = ()
+    cp_size: int = 0
+    cp_rank: int = 0
+    source_cu_seqlens_id: int = 0

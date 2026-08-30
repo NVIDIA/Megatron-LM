@@ -681,10 +681,22 @@ exact microbatch phase layout with the effective CP group, installs that immutab
 latent-CP layer, and calls each adapter's `prepare` method. FA4 preparation is a no-op; the shared
 cuDNN adapter builds or reuses public forward/backward Graph plans and canonical ragged buffers.
 
+The generic data scheduler already transfers THD boundaries to the host while building the
+zigzag/contiguous partition route. That route retains the compact host boundary tuple, effective CP
+size/rank, and source metadata identity; finalization also resolves the generic inter-sequence
+padding flag once. The latent layout adapter consumes that scheduler-owned tuple instead of
+synchronizing CUDA scalars or repeating padding comparisons in every layer. A bounded 16-entry
+semantic LRU, keyed by the host boundaries, effective CP geometry, token count, device, and maximum
+length, reuses derived
+`cu_full`/`cu_half`, front/back indices, and immutable phase specs across microbatches. A hit replaces
+only `cu_global` with the current microbatch tensor used by RoPE. CP=1 routes are identity routes and
+retain arbitrary positive odd sequence lengths for dynamic-CP degeneration.
+
 The preprocessing function stores no attention result, creates no decoder context or wrapper class,
 and launches no collective. `forward` validates a host-only identity key and reuses the prepared
-layout without reading CUDA scalars. cuDNN phase execution uses the exact metadata-tensor identity to
-look up its binding and never rebuilds a key, ragged buffer, or Graph inside the ring. A
+layout without reading CUDA scalars. Stable derived phase-tensor identities make the bounded cuDNN
+ragged-binding cache hit across semantically identical microbatches, so phase execution never
+rebuilds a key, ragged buffer, or Graph inside the ring. A
 custom caller that invokes a latent-CP layer outside a normal block must call the public
 preprocessing function first or fail before the first phase executes.
 
@@ -1000,7 +1012,10 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    A qualified layer must hold its matching adapter/runtime immediately after construction. The
    explicit block function derives one layout and shares it across latent-CP layers. Fake cuDNN tests
    call `prepare` twice and prove the second call reuses the same plan and canonical metadata binding;
-   phase execution only performs a binding lookup. CPU guards require exact-capacity staging to
+   phase execution only performs a binding lookup. Generic route tests cover host boundary ownership
+   and CP=1 odd-length identity routes; a focused cache test uses distinct microbatch tensors with the
+   same boundaries and proves phase metadata identity is stable without tensor-scalar reads. CPU
+   guards require exact-capacity staging to
    preserve tensor identity and workspace reuse to remain isolated by direction and CUDA stream.
    Feature-initialization tests require non-mutating GPT/Hybrid spec rewrites that preserve ordinary
    block classes. Existing data-scheduler tests own dynamic `local_cp_size/cp_group` consistency;

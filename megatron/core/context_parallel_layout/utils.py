@@ -18,7 +18,10 @@ def get_packed_seq_params_cp_partition_cu_seqlens(
     ``packed_seq_params=None`` represents the ordinary SBHD path. Only THD
     metadata carries global packed-token boundaries.
     """
-    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+    if (
+        packed_seq_params is None
+        or getattr(packed_seq_params, "qkv_format", None) != "thd"
+    ):
         return None
     return (
         packed_seq_params.cu_seqlens_q_padded
@@ -35,11 +38,22 @@ def finalize_packed_seq_params(
         return None
 
     # Keep these imports local: routes depends on this module for metadata access.
-    from megatron.core.context_parallel_layout.routes import prebuild_thd_cp_partition_routes
+    from megatron.core.context_parallel_layout import routes
     from megatron.core.packed_seq_params import resolve_cp_group
     from megatron.core.parallel_state import get_context_parallel_group
 
     cp_group = resolve_cp_group(get_context_parallel_group(), packed_seq_params)
     packed_seq_params.cp_group = cp_group
-    prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
+    if (
+        packed_seq_params.qkv_format == "thd"
+        and packed_seq_params.pad_between_seqs is None
+    ):
+        valid = packed_seq_params.cu_seqlens_q
+        padded = packed_seq_params.cu_seqlens_q_padded
+        packed_seq_params.pad_between_seqs = bool(
+            padded is not None
+            and padded is not valid
+            and not torch.equal(padded, valid)
+        )
+    routes.prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
     return packed_seq_params

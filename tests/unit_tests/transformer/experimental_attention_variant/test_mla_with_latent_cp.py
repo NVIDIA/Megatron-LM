@@ -2339,6 +2339,35 @@ def test_planner_rejects_invalid_global_metadata(cp_size: int):
         )
 
 
+def test_layout_cache_reuses_phase_metadata_across_microbatches():
+    adapter = latent_cp.AlreadyZigZagTHDAdapter()
+    first_cu = torch.tensor([0, 16, 32], dtype=torch.int32)
+    second_cu = first_cu.clone()
+
+    with mock.patch.object(
+        torch.Tensor,
+        "item",
+        side_effect=AssertionError("layout cache must not read tensor scalars"),
+    ):
+        first = adapter._cached_layout(first_cu, (0, 16, 32), 16, 2, 1, 16)
+        second = adapter._cached_layout(second_cu, (0, 16, 32), 16, 2, 1, 16)
+
+    assert first.cu_global is first_cu
+    assert second.cu_global is second_cu
+    assert second.cu_full is first.cu_full
+    assert second.cu_half is first.cu_half
+    assert second.front_indices is first.front_indices
+    assert second.back_indices is first.back_indices
+    assert second.phases is first.phases
+    assert len(adapter._layout_cache) == 1
+
+    different = adapter._cached_layout(
+        torch.tensor([0, 24], dtype=torch.int32), (0, 24), 12, 2, 1, 24
+    )
+    assert different.cu_full is not first.cu_full
+    assert len(adapter._layout_cache) == 2
+
+
 def test_layout_adapter_rejects_invalid_format_and_layout(monkeypatch):
     adapter = latent_cp.AlreadyZigZagTHDAdapter()
     hidden = mock.Mock()
@@ -2728,7 +2757,12 @@ def test_kimi_no_rope_skips_rotary_construction_and_application():
                 ),
             ) as yarn_init,
         ):
-            layer = _build_layer(config, pg).cuda().bfloat16().train()
+            layer = (
+                _build_layer(config, pg, _TorchPackedAttentionAdapter())
+                .cuda()
+                .bfloat16()
+                .train()
+            )
         rotary_init.assert_not_called()
         yarn_init.assert_not_called()
         assert layer.rotary_pos_emb is None
@@ -2759,7 +2793,12 @@ def test_tp2_sequence_parallel_payload_and_explicit_mappings():
     with _model_parallel(2, 2) as pg:
         config = _make_config(tp_size=2, cp_size=2)
         assert config.sequence_parallel
-        layer = _build_layer(config, pg).cuda().bfloat16().train()
+        layer = (
+            _build_layer(config, pg, _TorchPackedAttentionAdapter())
+            .cuda()
+            .bfloat16()
+            .train()
+        )
         assert config.sequence_parallel
         for norm in (layer.q_layernorm, layer.kv_layernorm):
             assert all(

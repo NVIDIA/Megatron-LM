@@ -21,7 +21,9 @@ _ThdLayoutSegment = Tuple[int, int, int]
 
 def _compact_thd_cu_seqlens_to_list(cu_seqlens: torch.Tensor) -> List[int]:
     if cu_seqlens.dim() != 1:
-        raise ValueError(f"cu_seqlens must be 1-D, got shape {tuple(cu_seqlens.shape)}.")
+        raise ValueError(
+            f"cu_seqlens must be 1-D, got shape {tuple(cu_seqlens.shape)}."
+        )
 
     cu = cu_seqlens.detach().to(device="cpu", dtype=torch.long).tolist()
     if not cu or cu[0] != 0:
@@ -46,6 +48,9 @@ def _validate_thd_route_partitioning(cu: List[int], cp_size: int) -> None:
             f"to be divisible by cp_size={cp_size}."
         )
 
+    if cp_size == 1:
+        return
+
     chunk_divisor = 2 * cp_size
     bad_seq_lens = [
         seq_end - seq_start
@@ -64,6 +69,11 @@ def _build_thd_layout_segments(
     cu: List[int], cp_size: int, cp_rank: int, cp_partition_mode: CpPartitionMode
 ) -> Tuple[List[_ThdLayoutSegment], int]:
     total_tokens = cu[-1]
+    if cp_size == 1:
+        if total_tokens == 0:
+            return [], 0
+        return [(0, total_tokens, 0)], total_tokens
+
     if cp_partition_mode == "contiguous":
         part_len = total_tokens // cp_size
         if part_len == 0:
@@ -84,7 +94,9 @@ def _build_thd_layout_segments(
         first_chunk = cp_rank
         second_chunk = 2 * cp_size - cp_rank - 1
         segments.append((seq_start + first_chunk * chunk_len, chunk_len, local_start))
-        segments.append((seq_start + second_chunk * chunk_len, chunk_len, local_start + chunk_len))
+        segments.append(
+            (seq_start + second_chunk * chunk_len, chunk_len, local_start + chunk_len)
+        )
         local_start += 2 * chunk_len
 
     return segments, local_start
@@ -97,8 +109,12 @@ def _intersect_thd_layout_segments(
     source_index = 0
     target_index = 0
     while source_index < len(source_segments) and target_index < len(target_segments):
-        source_global_start, source_len, source_local_start = source_segments[source_index]
-        target_global_start, target_len, target_local_start = target_segments[target_index]
+        source_global_start, source_len, source_local_start = source_segments[
+            source_index
+        ]
+        target_global_start, target_len, target_local_start = target_segments[
+            target_index
+        ]
         source_global_end = source_global_start + source_len
         target_global_end = target_global_start + target_len
 
@@ -146,7 +162,11 @@ def _build_thd_layout_side_route(
 
 
 def build_thd_cp_partition_route(
-    cu_seqlens: torch.Tensor, cp_size: int, cp_rank: int, *, device: Optional[torch.device] = None
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    *,
+    device: Optional[torch.device] = None,
 ) -> ThdCpRoute:
     """Precompute the rank-local THD CP layout route for a microbatch.
 
@@ -169,7 +189,9 @@ def build_thd_cp_partition_route(
         zigzag_lengths: List[int] = []
         contiguous_segments_by_rank: List[List[_ThdLayoutSegment]] = []
         for rank in range(cp_size):
-            zigzag_segments, zigzag_length = _build_thd_layout_segments(cu, cp_size, rank, "zigzag")
+            zigzag_segments, zigzag_length = _build_thd_layout_segments(
+                cu, cp_size, rank, "zigzag"
+            )
             contiguous_segments, contiguous_length = _build_thd_layout_segments(
                 cu, cp_size, rank, "contiguous"
             )
@@ -207,6 +229,10 @@ def build_thd_cp_partition_route(
             zigzag_split_sizes=zigzag_split_sizes,
             contiguous_index=contiguous_index,
             contiguous_split_sizes=contiguous_split_sizes,
+            cu_seqlens=tuple(cu),
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            source_cu_seqlens_id=id(cu_seqlens),
         )
 
 
@@ -224,7 +250,10 @@ def get_thd_cp_partition_route(
     """
     if source_partition_mode == target_partition_mode:
         return None
-    if source_partition_mode not in ("zigzag", "contiguous") or target_partition_mode not in (
+    if source_partition_mode not in (
+        "zigzag",
+        "contiguous",
+    ) or target_partition_mode not in (
         "zigzag",
         "contiguous",
     ):
@@ -232,7 +261,10 @@ def get_thd_cp_partition_route(
             f"Unsupported CP partition mode conversion "
             f"{source_partition_mode!r} -> {target_partition_mode!r} for THD route."
         )
-    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+    if (
+        packed_seq_params is None
+        or getattr(packed_seq_params, "qkv_format", None) != "thd"
+    ):
         return None
 
     route = getattr(packed_seq_params, "cp_partition_route", None)
@@ -261,11 +293,14 @@ def prebuild_thd_cp_partition_routes(
     device: Optional[torch.device] = None,
 ) -> None:
     """Prebuild the THD CP layout route for a packed microbatch."""
-    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+    if (
+        packed_seq_params is None
+        or getattr(packed_seq_params, "qkv_format", None) != "thd"
+    ):
         return
     if cp_group is None:
         cp_group = getattr(packed_seq_params, "cp_group", None)
-    if cp_group is None or cp_group.size() <= 1:
+    if cp_group is None:
         return
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()

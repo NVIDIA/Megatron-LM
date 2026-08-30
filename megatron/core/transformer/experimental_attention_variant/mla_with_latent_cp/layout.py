@@ -4,7 +4,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from typing import Literal, Protocol
 
 import torch
@@ -54,6 +55,18 @@ class ZigZagLayout:
     phases: tuple[PhaseSpec, ...]
 
 
+@dataclass(frozen=True)
+class _LayoutCacheKey:
+    """Semantic identity for reusable device-side phase metadata."""
+
+    cu_seqlens: tuple[int, ...]
+    local_tokens: int
+    cp_size: int
+    cp_rank: int
+    device: torch.device
+    max_global: int
+
+
 class LatentCPLayoutAdapter(Protocol):
     """Extension seam for a future contiguous-to-zigzag layout conversion."""
 
@@ -76,38 +89,30 @@ def _cu_from_lengths(lengths: Tensor) -> Tensor:
     return torch.cat((zero, cumulative)).contiguous()
 
 
-def _packed_half_indices(local_lengths: Tensor) -> tuple[Tensor, Tensor]:
+def _packed_half_indices(
+    local_lengths: tuple[int, ...], device: torch.device
+) -> tuple[Tensor, Tensor]:
     """Return front/back row indices for per-sequence [F_r, B_r] storage."""
 
-    device = local_lengths.device
-    starts = _cu_from_lengths(local_lengths)[:-1]
-    halves = local_lengths // 2
-    front = [
-        torch.arange(start, start + half, dtype=torch.long, device=device)
-        for start, half in zip(starts.unbind(), halves.unbind())
-    ]
-    back = [
-        torch.arange(start + half, start + length, dtype=torch.long, device=device)
-        for start, half, length in zip(
-            starts.unbind(), halves.unbind(), local_lengths.unbind()
+    front: list[Tensor] = []
+    back: list[Tensor] = []
+    offset = 0
+    for length in local_lengths:
+        half = length // 2
+        front.append(
+            torch.arange(offset, offset + half, dtype=torch.long, device=device)
         )
-    ]
+        back.append(
+            torch.arange(
+                offset + half, offset + length, dtype=torch.long, device=device
+            )
+        )
+        offset += length
+
     if not front:
         empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty
     return torch.cat(front), torch.cat(back)
-
-
-def _contiguous_span(indices: Tensor) -> tuple[int, int] | None:
-    """Return a host slice for contiguous indices, or None for general packed rows."""
-
-    if indices.numel() == 0:
-        return (0, 0)
-    start = int(indices[0].item())
-    expected = torch.arange(
-        start, start + indices.numel(), dtype=indices.dtype, device=indices.device
-    )
-    return (start, start + indices.numel()) if torch.equal(indices, expected) else None
 
 
 def build_zigzag_layout(
@@ -117,6 +122,7 @@ def build_zigzag_layout(
     cp_rank: int,
     *,
     max_global: int | None = None,
+    cu_values: tuple[int, ...] | None = None,
 ) -> ZigZagLayout:
     """Validate packed ownership and build the three-shape zigzag phase schedule.
 
@@ -127,51 +133,73 @@ def build_zigzag_layout(
     _require(cu_global.ndim == 1 and cu_global.numel() >= 2, "cu_seqlens must be 1-D")
     _require(cu_global.dtype == torch.int32, "cu_seqlens must have dtype torch.int32")
     _require(cp_size > 0 and 0 <= cp_rank < cp_size, "invalid CP rank or size")
-    _require(int(cu_global[0].item()) == 0, "cu_seqlens must start at zero")
+    if cu_values is None:
+        cu_values = tuple(
+            cu_global.detach().to(device="cpu", dtype=torch.long).tolist()
+        )
+    _require(len(cu_values) == cu_global.numel(), "host cu_seqlens size mismatch")
+    _require(cu_values[0] == 0, "cu_seqlens must start at zero")
 
-    global_lengths = cu_global[1:] - cu_global[:-1]
+    global_lengths_values = tuple(
+        stop - start for start, stop in zip(cu_values[:-1], cu_values[1:])
+    )
     _require(
-        bool(torch.all(global_lengths > 0).item()),
+        all(length > 0 for length in global_lengths_values),
         "empty packed sequences are unsupported",
     )
     if cp_size > 1:
         _require(
-            bool(torch.all(torch.remainder(global_lengths, 2 * cp_size) == 0).item()),
+            all(length % (2 * cp_size) == 0 for length in global_lengths_values),
             f"every global packed length must be divisible by 2*CP ({2 * cp_size})",
         )
 
-    local_lengths = torch.div(global_lengths, cp_size, rounding_mode="floor")
+    local_length_values = tuple(length // cp_size for length in global_lengths_values)
     # CP=1 is the exact no-ring degeneration. It has only a full/full diagonal
     # phase, so no artificial half-sequence divisibility requirement is needed.
-    half_lengths = (
-        torch.div(global_lengths, 2 * cp_size, rounding_mode="floor")
+    half_length_values = (
+        tuple(length // (2 * cp_size) for length in global_lengths_values)
         if cp_size > 1
-        else local_lengths
+        else local_length_values
+    )
+    local_lengths = torch.tensor(
+        local_length_values, dtype=torch.int32, device=cu_global.device
+    )
+    half_lengths = torch.tensor(
+        half_length_values, dtype=torch.int32, device=cu_global.device
     )
     cu_full = _cu_from_lengths(local_lengths)
     cu_half = _cu_from_lengths(half_lengths)
     _require(
-        int(cu_full[-1].item()) == local_tokens,
+        sum(local_length_values) == local_tokens,
         "hidden token count disagrees with metadata",
     )
 
     full_indices = torch.arange(local_tokens, dtype=torch.long, device=cu_global.device)
     if cp_size > 1:
-        front_indices, back_indices = _packed_half_indices(local_lengths)
+        front_indices, back_indices = _packed_half_indices(
+            local_length_values, cu_global.device
+        )
+        if len(local_length_values) == 1:
+            half = local_length_values[0] // 2
+            front_slice = (0, half)
+            back_slice = (half, local_tokens)
+        else:
+            front_slice = None
+            back_slice = None
     else:
         front_indices = full_indices
         back_indices = torch.empty(0, dtype=torch.long, device=cu_global.device)
-    derived_max_global = int(global_lengths.max().item())
+        front_slice = (0, local_tokens)
+        back_slice = (0, 0)
+    derived_max_global = max(global_lengths_values)
     if max_global is not None:
         _require(
             max_global == derived_max_global, "max_seqlen disagrees with cu_seqlens"
         )
     max_global = derived_max_global
-    max_full = int(local_lengths.max().item())
-    max_half = int(half_lengths.max().item())
+    max_full = max(local_length_values)
+    max_half = max(half_length_values)
     full_slice = (0, local_tokens)
-    front_slice = _contiguous_span(front_indices)
-    back_slice = _contiguous_span(back_indices)
 
     phases: list[PhaseSpec] = []
     for phase in range(cp_size):
@@ -249,6 +277,41 @@ def build_zigzag_layout(
 class AlreadyZigZagTHDAdapter:
     """V1 layout adapter: validate an input that is already zigzag-partitioned."""
 
+    _CACHE_CAPACITY = 16
+
+    def __init__(self) -> None:
+        self._layout_cache: OrderedDict[_LayoutCacheKey, ZigZagLayout] = OrderedDict()
+
+    def _cached_layout(
+        self,
+        cu_global: Tensor,
+        cu_values: tuple[int, ...],
+        local_tokens: int,
+        cp_size: int,
+        cp_rank: int,
+        max_global: int,
+    ) -> ZigZagLayout:
+        key = _LayoutCacheKey(
+            cu_values, local_tokens, cp_size, cp_rank, cu_global.device, max_global
+        )
+        cached = self._layout_cache.pop(key, None)
+        if cached is not None:
+            self._layout_cache[key] = cached
+            return replace(cached, cu_global=cu_global)
+
+        layout = build_zigzag_layout(
+            cu_global,
+            local_tokens,
+            cp_size,
+            cp_rank,
+            max_global=max_global,
+            cu_values=cu_values,
+        )
+        self._layout_cache[key] = layout
+        if len(self._layout_cache) > self._CACHE_CAPACITY:
+            self._layout_cache.popitem(last=False)
+        return layout
+
     def prepare(
         self,
         local_hidden: Tensor,
@@ -285,16 +348,29 @@ class AlreadyZigZagTHDAdapter:
             "cu_seqlens must be contiguous",
         )
         _require(
-            torch.equal(cu_q, cu_kv), "self-attention requires equal Q/KV cu_seqlens"
+            cu_q is cu_kv or torch.equal(cu_q, cu_kv),
+            "self-attention requires equal Q/KV cu_seqlens",
         )
-        for padded, valid, name in (
-            (packed_seq_params.cu_seqlens_q_padded, cu_q, "Q"),
-            (packed_seq_params.cu_seqlens_kv_padded, cu_kv, "KV"),
-        ):
+        route = packed_seq_params.cp_partition_route
+        route_source = (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else cu_q
+        )
+        if route is not None:
             _require(
-                padded is None or torch.equal(padded, valid),
-                f"{name} inter-sequence/tail padding is unsupported",
+                packed_seq_params.pad_between_seqs is False,
+                "scheduler must reject inter-sequence/tail padding before route use",
             )
+        else:
+            for padded, valid, name in (
+                (packed_seq_params.cu_seqlens_q_padded, cu_q, "Q"),
+                (packed_seq_params.cu_seqlens_kv_padded, cu_kv, "KV"),
+            ):
+                _require(
+                    padded is None or padded is valid or torch.equal(padded, valid),
+                    f"{name} inter-sequence/tail padding is unsupported",
+                )
         max_q = packed_seq_params.max_seqlen_q
         max_kv = packed_seq_params.max_seqlen_kv
         _require(
@@ -309,10 +385,21 @@ class AlreadyZigZagTHDAdapter:
         _require(max_q == max_kv, "self-attention requires equal Q/KV max_seqlen")
         cp_size = dist.get_world_size(cp_group)
         cp_rank = dist.get_rank(cp_group)
+        if route is not None:
+            _require(route.cp_size == cp_size, "stale THD route CP size")
+            _require(route.cp_rank == cp_rank, "stale THD route CP rank")
+            _require(
+                route.source_cu_seqlens_id == id(route_source),
+                "stale THD route metadata identity",
+            )
+            _require(bool(route.cu_seqlens), "THD route is missing host cu_seqlens")
+            cu_values = route.cu_seqlens
+        else:
+            cu_values = tuple(cu_q.detach().to(device="cpu", dtype=torch.long).tolist())
         local_tokens = local_hidden.size(0)
         if sequence_parallel:
             _require(tp_group is not None, "sequence parallelism requires a TP group")
             local_tokens *= dist.get_world_size(tp_group)
-        return build_zigzag_layout(
-            cu_q, local_tokens, cp_size, cp_rank, max_global=max_q
+        return self._cached_layout(
+            cu_q, cu_values, local_tokens, cp_size, cp_rank, max_q
         )
