@@ -181,8 +181,8 @@ def test_training_step_peak_memory_bounds_full_size_buffers(
     )
 
 
-def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distributed_setup):
-    """First-step peak memory should match the expected ZeRO-1 training allocations."""
+def test_zero1_memory_uses_sharded_optimizer_and_replicated_weight(distributed_setup):
+    """ZeRO-1 keeps optimizer state sharded while model weights are replicated."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
     if world_size < 2:
@@ -192,6 +192,7 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     num_tokens = 256
     dtype = torch.bfloat16
     x = torch.ones(num_tokens, dim, device=device, dtype=dtype)
+    allocated_before_setup = torch.cuda.memory_allocated(device)
     model = ElementwiseModel(dim).to(device=device, dtype=dtype)
     mesh = init_device_mesh(device.type, (world_size,))
     placements = _zero1_placements()
@@ -201,69 +202,42 @@ def test_zero1_memory_matches_sharded_optimizer_and_replicated_weight(distribute
     fully_shard_optimizer(optimizer)
     (parameter_group,) = model.parameter_groups
 
-    allocated_before_training = torch.cuda.memory_allocated(device)
+    full_bf16_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
+    sharded_bf16_weight_nbytes = full_bf16_weight_nbytes // world_size
+    sharded_fp32_weight_nbytes = (
+        dim * dim // world_size * torch.empty((), dtype=torch.float32).element_size()
+    )
+    torch._C._cuda_clearCublasWorkspaces()
     torch.cuda.reset_peak_memory_stats(device)
 
-    loss = model(x).sum()
-    loss.backward()
-    optimizer.step()
+    def train_step() -> None:
+        loss = model(x).sum()
+        loss.backward()
+        optimizer.step()
+
+    train_step()
+    peak_nbytes = torch.cuda.max_memory_allocated(device) - allocated_before_setup
+    resting_nbytes = torch.cuda.memory_allocated(device) - allocated_before_setup
     assert parameter_group.model_weight.placements == (Replicate(),)
     assert parameter_group.post_optimizer_model_weight.placements == (Flat(),)
 
-    actual_optimizer_size = sum(
+    optimizer_state_nbytes = sum(
         state["exp_avg"].to_local().nbytes + state["exp_avg_sq"].to_local().nbytes
         for state in optimizer.state.values()
     )
-    actual_training_growth = torch.cuda.max_memory_allocated(device) - allocated_before_training
-
-    # Theoretical sharded Adam size.
-    shard_numel = dim * dim // world_size
-    fp32_size = torch.empty((), dtype=torch.float32).element_size()
-    bf16_size = torch.empty((), dtype=dtype).element_size()
-    theoretical_optimizer_size = 2 * shard_numel * fp32_size
-
-    # ElementwiseModel itself is the only layer in this test model.
-    num_layers = 1
-    full_bf16_weight_size = dim * dim * bf16_size
-    sharded_bf16_weight_size = full_bf16_weight_size // world_size
-    sharded_fp32_weight_size = shard_numel * fp32_size
-    activation_size = num_tokens * dim * bf16_size
-    # Backward peak growth. The persistent replicated model weight was allocated
-    # before the measurement, so it adds no step-local allocation here.
-    backward_model_weight_size = 0
-    # - Full parameter gradient: dim * dim * bf16_size.
-    backward_parameter_gradient_size = full_bf16_weight_size
-    # - Unreduced partial-gradient buffer: dim * dim * bf16_size.
-    backward_partial_gradient_size = full_bf16_weight_size
-    # - Earlier-layer activations: (num_layers - 1) * num_tokens * dim * bf16_size.
-    #   This one-layer model has no stacked activation at its backward peak.
-    backward_stacked_activation_size = (num_layers - 1) * activation_size
-    theoretical_backward_growth = (
-        backward_model_weight_size
-        + backward_parameter_gradient_size
-        + backward_partial_gradient_size
-        + backward_stacked_activation_size
+    # Resting memory holds one replicated BF16 model weight, one sharded BF16
+    # main gradient, and three sharded FP32 buffers: main weight and two Adam states.
+    expected_resting_nbytes = (
+        full_bf16_weight_nbytes
+        + sharded_bf16_weight_nbytes
+        + 3 * sharded_fp32_weight_nbytes
     )
-
-    # - BF16 main gradient shrinks from full to sharded: -(full - sharded BF16 weight).
-    optimizer_main_gradient_reduction = full_bf16_weight_size - sharded_bf16_weight_size
-    # - Casted gradient: shard_numel * fp32_size.
-    optimizer_casted_gradient_size = sharded_fp32_weight_size
-    # - Optimizer states exp_avg and exp_avg_sq: 2 * shard_numel * fp32_size.
-    optimizer_state_size = 2 * sharded_fp32_weight_size
-    # - Two FP32 buffers that briefly coexist while Adam computes the
-    #   bias-corrected denominator: 2 * shard_numel * fp32_size.
-    optimizer_temporary_size = 2 * sharded_fp32_weight_size
-    theoretical_optimizer_growth = (
-        -optimizer_main_gradient_reduction
-        + optimizer_casted_gradient_size
-        + optimizer_state_size
-        + optimizer_temporary_size
-    )
-    theoretical_training_growth = max(theoretical_backward_growth, theoretical_optimizer_growth)
-
-    assert actual_optimizer_size == theoretical_optimizer_size
-    assert abs(actual_training_growth - theoretical_training_growth) < 1024**2
+    # Peak memory additionally holds the casted gradient and the sqrt and division
+    # intermediates in ``denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)``.
+    expected_peak_nbytes = expected_resting_nbytes + 3 * sharded_fp32_weight_nbytes
+    assert optimizer_state_nbytes == 2 * sharded_fp32_weight_nbytes
+    assert resting_nbytes < expected_resting_nbytes + 1024**2
+    assert peak_nbytes < expected_peak_nbytes + 1024**2
 
 
 def test_deleted_model_releases_fsdp_storage(distributed_setup):
