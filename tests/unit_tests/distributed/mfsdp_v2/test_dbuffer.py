@@ -12,6 +12,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer, Flat
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import BlockAtomic
 
 
 def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
@@ -66,6 +67,22 @@ def test_dbuffer_layout_aligns_fragment_offsets_to_rows(distributed_setup):
 
     assert buffer.layout.tensor_to_offset == (0, 18)
     assert buffer.layout.size == 24
+
+
+def test_block_atomic_layout_keeps_bf16_blocks_on_one_rank(distributed_setup):
+    """BlockAtomic keeps every local tensor shard aligned to its configured row block."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Requires at least 2 ranks.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (2,))
+    tensors = [
+        torch.arange(24, dtype=torch.bfloat16, device=distributed_setup.device).reshape(4, 6),
+        torch.arange(32, dtype=torch.bfloat16, device=distributed_setup.device).reshape(8, 4),
+    ]
+    block_atomic = DBuffer.distribute_tensors(tensors, mesh, [BlockAtomic(2)])
+
+    assert block_atomic.layout.block_size == 2
+    assert all(block_atomic.get_local_tensor(index).shape[0] % 2 == 0 for index in range(2))
 
 
 def test_compute_layout_fills_lcm_padding_gaps(distributed_setup):

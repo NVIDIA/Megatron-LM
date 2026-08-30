@@ -15,6 +15,7 @@
 """Distributed tensor buffers for Megatron-FSDP."""
 
 import dataclasses
+import math
 from collections.abc import Iterable
 
 import torch
@@ -25,7 +26,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate
 from torch.distributed.tensor.placement_types import Placement
 
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import Flat, changed_mesh_axis
+from .placement import BlockAtomic, Flat, changed_mesh_axis
 
 
 @dataclasses.dataclass(frozen=True)
@@ -39,15 +40,30 @@ def _validate_placements(placements: Iterable[Placement]) -> None:
     """Validate DBuffer placements form a supported contiguous local layout."""
     seen_flat = False
     for placement in placements:
-        if not isinstance(placement, (Replicate, Partial, Flat)):
+        if not isinstance(placement, (Replicate, Partial, Flat, BlockAtomic)):
             raise TypeError(f"Unsupported DBuffer placement: {placement!r}.")
-        if isinstance(placement, Flat):
+        if isinstance(placement, (Flat, BlockAtomic)):
             seen_flat = True
         elif seen_flat:
             raise ValueError(
                 "Flat placements must be a suffix of the placement list so each "
                 "local buffer is a contiguous global-buffer range."
             )
+
+
+def _get_block_size(placements: Iterable[Placement], block_size: int | None) -> int:
+    """Resolve one layout block size from explicit and placement configuration."""
+    placement_block_size = 1
+    for placement in placements:
+        if isinstance(placement, BlockAtomic):
+            placement_block_size = math.lcm(placement_block_size, placement.block_size)
+    if block_size is None:
+        return placement_block_size
+    if block_size != placement_block_size and placement_block_size != 1:
+        raise ValueError(
+            f"BlockAtomic placements require block size {placement_block_size}, got {block_size}."
+        )
+    return block_size
 
 
 def _get_reduce_op(partial_placement: Partial) -> dist.ReduceOp.RedOpType:
@@ -81,6 +97,8 @@ class DBuffer:
         tensor_shapes: Iterable[Shape],
         dtype: torch.dtype,
         device: torch.device | str,
+        *,
+        block_size: int | None = None,
     ) -> None:
         """Create a DBuffer and allocate its local buffer.
 
@@ -102,7 +120,11 @@ class DBuffer:
         self.placements = placements
 
         tensor_shapes = tuple(torch.Size(shape) for shape in tensor_shapes)
-        self.layout = GlobalLayout.build(tensor_shapes, dp_size=self.mesh.size())
+        self.layout = GlobalLayout.build(
+            tensor_shapes,
+            dp_size=self.mesh.size(),
+            block_size=_get_block_size(placements, block_size),
+        )
 
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
         self.local_buffer = torch.empty(local_numel, dtype=dtype, device=device)
@@ -171,6 +193,8 @@ class DBuffer:
         mesh: DeviceMesh,
         placements: Iterable[Placement],
         tensor_shapes: Iterable[Shape],
+        *,
+        layout: GlobalLayout | None = None,
     ) -> "DBuffer":
         """Create a DBuffer from an existing local buffer.
 
@@ -197,7 +221,9 @@ class DBuffer:
             raise ValueError("local_buffer must be contiguous for collective operations.")
 
         tensor_shapes = tuple(torch.Size(shape) for shape in tensor_shapes)
-        layout = GlobalLayout.build(tensor_shapes, dp_size=mesh.size())
+        layout = layout or GlobalLayout.build(
+            tensor_shapes, dp_size=mesh.size(), block_size=_get_block_size(placements, None)
+        )
         offset, local_numel = layout.get_local_range(mesh, placements)
         if local_buffer.numel() != local_numel:
             raise ValueError(
@@ -244,10 +270,15 @@ class DBuffer:
                 self.mesh,
                 placements,
                 self.layout.tensor_shapes,
+                layout=self.layout,
             )
         if isinstance(source_placement, Partial) and isinstance(destination_placement, Replicate):
             return DBuffer.from_local(
-                self.local_buffer, self.mesh, placements, self.layout.tensor_shapes
+                self.local_buffer,
+                self.mesh,
+                placements,
+                self.layout.tensor_shapes,
+                layout=self.layout,
             )
         raise ValueError(
             "DBuffer.view() supports identical placements, a Partial-to-Replicate relabel, "
@@ -257,7 +288,12 @@ class DBuffer:
 
     @classmethod
     def distribute_tensors(
-        cls, tensors: Iterable[torch.Tensor], mesh: DeviceMesh, placements: Iterable[Placement]
+        cls,
+        tensors: Iterable[torch.Tensor],
+        mesh: DeviceMesh,
+        placements: Iterable[Placement],
+        *,
+        block_size: int | None = None,
     ) -> "DBuffer":
         """Distribute full local tensors into a DBuffer.
 
@@ -287,6 +323,7 @@ class DBuffer:
             tensor_shapes=tensor_shapes,
             dtype=dtype,
             device=mesh.device_type,
+            block_size=block_size,
         )
         # Only logical tensor ranges are initialized. Padding and layout gaps are not
         # observable through get_local_tensor() and can remain unspecified.
@@ -323,6 +360,7 @@ class DBuffer:
                 tensor_shapes=self.layout.tensor_shapes,
                 dtype=dtype,
                 device=self.device,
+                block_size=self.layout.block_size,
             )
 
         if out.mesh != self.mesh:
@@ -403,7 +441,11 @@ class DBuffer:
                     "Replicate -> Partial redistribute does not support an out buffer."
                 )
             return DBuffer.from_local(
-                self.local_buffer, self.mesh, new_placements, self.layout.tensor_shapes
+                self.local_buffer,
+                self.mesh,
+                new_placements,
+                self.layout.tensor_shapes,
+                layout=self.layout,
             )
         raise NotImplementedError(
             "Unsupported DBuffer placement transition on axis "
