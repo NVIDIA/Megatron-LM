@@ -7,6 +7,7 @@ import logging
 import pytest
 import torch
 from torch import nn
+from torch.autograd import DeviceType
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.profiler import ProfilerActivity, profile
@@ -360,7 +361,7 @@ def test_overlaps_communication_and_compute(distributed_setup):
     cuda_events = [
         event
         for event in prof.events()
-        if event.device_type.name == "CUDA" and event.activity_type == "kernel"
+        if event.device_type == DeviceType.CUDA and "annotation" not in event.name.lower()
     ]
     all_gather_events = [
         event
