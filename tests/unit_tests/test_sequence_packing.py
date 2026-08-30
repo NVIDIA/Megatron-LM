@@ -18,6 +18,7 @@ from megatron.core.datasets.data_schedule import (
     wrap_data_iterator,
 )
 from megatron.core.datasets.data_schedule_utils import (
+    align_sample_id_groups,
     next_hdp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
 )
@@ -728,6 +729,44 @@ def test_next_hdp_group_packing_aware_can_use_larger_cp_group_for_short_sequence
     assert micro_batches == [[6144, 2048], [6144, 2048]]
     assert sample_ids == [[0, 1], [0, 1]]
     assert exec_times[0] == exec_times[1]
+
+
+def test_align_sample_id_groups_splits_packed_full_cp_group():
+    sample_id_groups = [
+        [[0] for _ in range(8)],
+        [[1] for _ in range(8)],
+        [[2, 3] for _ in range(8)],
+    ]
+
+    aligned = align_sample_id_groups(sample_id_groups, 4)
+
+    assert len(aligned) == 4
+    assert aligned[2] == [[2] for _ in range(8)]
+    assert aligned[3] == [[3] for _ in range(8)]
+
+
+def test_align_sample_id_groups_repeatedly_splits_packed_full_cp_group():
+    sample_id_groups = [[list(range(16)) for _ in range(8)]]
+
+    aligned = align_sample_id_groups(sample_id_groups, 16)
+
+    assert len(aligned) == 16
+    assert all(rank_ids == group[0] for group in aligned for rank_ids in group)
+    assert sorted(sample_id for group in aligned for sample_id in group[0]) == list(range(16))
+
+
+def test_align_sample_id_groups_prefers_existing_cp_block_split():
+    untouched_full_group = [[10, 11] for _ in range(8)]
+    sample_id_groups = [
+        [[20] for _ in range(8)],
+        [[0], [0], [0], [0], [1], [1], [2], [2]],
+        untouched_full_group,
+    ]
+
+    aligned = align_sample_id_groups(sample_id_groups, 4)
+
+    assert len(aligned) == 4
+    assert aligned[2] == untouched_full_group
 
 
 def test_next_hdp_group_packing_aware_fills_non_power_of_two_dpxcp_group():

@@ -868,7 +868,7 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
     remainder = (-len(sample_id_groups)) % multiple
     i = len(sample_id_groups) - 1
 
-    def split_group(sample_id_group):
+    def split_group(sample_id_group, allow_packed_full_group=False):
         total_hdp_ranks = len(sample_id_group)
         cu_ranks = [0]
         prev_cp_size = 0
@@ -888,7 +888,20 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
             cu_ranks.append(start_rank + cp_size)
             prev_cp_size = cp_size
         if len(cu_ranks) == 2:
-            return None, None
+            if not allow_packed_full_group:
+                return None, None
+            packed_ids = sample_id_group[0]
+            if len(packed_ids) < 2:
+                return None, None
+            assert all(rank_ids == packed_ids for rank_ids in sample_id_group), (
+                "A full DPxCP group must carry the same packed sample IDs on every rank."
+            )
+            kept_ids = packed_ids[:-1]
+            moved_ids = packed_ids[-1:]
+            return (
+                [list(kept_ids) for _ in range(total_hdp_ranks)],
+                [list(moved_ids) for _ in range(total_hdp_ranks)],
+            )
 
         k = 0
         while cu_ranks[k] < total_hdp_ranks // 2:
@@ -934,17 +947,24 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
         return sample_id_group
 
     attempts_since_split = 0
+    allow_packed_full_group = False
     while remainder > 0:
         if i < 0:
             if attempts_since_split >= len(sample_id_groups):
-                assert False, 'align_sample_id_groups: no tail microbatch has enough ids to split'
+                if allow_packed_full_group:
+                    assert False, 'align_sample_id_groups: no tail microbatch has enough ids to split'
+                allow_packed_full_group = True
+                attempts_since_split = 0
             i = len(sample_id_groups) - 1
-        group1, group2 = split_group(sample_id_groups[i])
+        group1, group2 = split_group(
+            sample_id_groups[i], allow_packed_full_group=allow_packed_full_group
+        )
         if group1 is not None and group2 is not None:
             sample_id_groups[i] = group1
             sample_id_groups.append(group2)
             remainder -= 1
             attempts_since_split = 0
+            allow_packed_full_group = False
         else:
             attempts_since_split += 1
         i -= 1
