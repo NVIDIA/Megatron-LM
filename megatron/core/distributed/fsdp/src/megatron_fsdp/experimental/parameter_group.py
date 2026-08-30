@@ -82,7 +82,10 @@ class FsdpParameterGroup:
     requires_grad: bool
     main_weight: DBuffer
     model_weight: DBuffer
+    # Optimizer-layout view into model_weight storage, avoiding a second allocation.
     post_optimizer_model_weight: DBuffer
+    # sync_model_weight_from_main_weight() updates only this rank's optimizer-layout
+    # view; the remaining model_weight slices must be all-gathered before compute.
     _model_weight_is_stale: bool
     main_grad: DBuffer | None
     _unsharded_model_weight: DBuffer
