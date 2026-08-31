@@ -188,6 +188,7 @@ def make_stack(layers, **config_overrides):
         layers=layers,
         num_layers_per_pipeline_rank=len(layers),
         training=True,
+        _has_linear_layer_with_chunkwise_cp=False,
         _cp_layout_manager=None,
         _mhc_block_end_plan=None,
     )
