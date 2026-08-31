@@ -2077,7 +2077,21 @@ class CudaGraphManager(torch.nn.Module):
             is_in_checkpoint_fwd = is_in_checkpoint_fwd or is_fp8_activation_recompute_enabled()
 
         if _CudagraphGlobalRecord.cudagraph_created:
-            if self.training and torch.is_grad_enabled():
+            is_explicit_inference = is_inference_mode or self._inline_capture
+            module_is_training = getattr(megatron_module, "training", self.training)
+            can_replay_training_graph = module_is_training and (
+                torch.is_grad_enabled() or is_in_checkpoint_fwd
+            )
+            # Validation falls back to eager execution because Python grad-mode branches and
+            # mutable-buffer side effects are fixed at capture time. Forward-only paths such as
+            # freeze-all training or RL evaluation require additional support before they can
+            # safely replay partial CUDA graphs.
+            if not is_explicit_inference and not can_replay_training_graph:
+                if self.func is not None:
+                    return self.func(*args, **kwargs)
+                return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
+
+            if module_is_training and torch.is_grad_enabled():
                 # Trigger Mcore DDP pre-forward hooks
                 self.call_ddp_preforward_hook(megatron_module)
                 for module in megatron_module.modules():
