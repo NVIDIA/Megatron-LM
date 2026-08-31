@@ -18,7 +18,10 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataPa
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import Flat
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
@@ -852,6 +855,159 @@ class TestMcoreAdapterDense:
             expected_pre_clip_norm > clip_grad
         ), "Test gradients must exceed the clipping threshold to exercise clipping."
         torch.testing.assert_close(global_norm(updates), clip_grad, rtol=1e-3, atol=0)
+
+
+class TestMcoreAdapterContextParallel:
+    """Exercise MFSDP v2 gradient sharding over the combined DP-CP domain."""
+
+    def setup_method(self):
+        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        self.cp_size = 2
+        if self.world_size < self.cp_size or self.world_size % self.cp_size:
+            pytest.skip("MFSDP v2 CP requires an even world size of at least two.")
+        Utils.initialize_model_parallel(1, 1, context_parallel_size=self.cp_size)
+        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_parallel_cuda_manual_seed(1234)
+
+    def teardown_method(self):
+        _destroy_model_parallel()
+
+    def test_cp_gradient_matches_full_sequence_reference(self):
+        """Averaging mirrored CP sequence shards must reproduce the full-sequence gradient."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            context_parallel_size=self.cp_size,
+            params_dtype=torch.float32,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        torch.manual_seed(1234)
+        reference = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False).cuda()
+        model = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False).cuda()
+        model.load_state_dict(reference.state_dict())
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        assert self.pg_collection.cp.size() == self.cp_size
+        assert self.pg_collection.dp_cp.size() == self.world_size
+
+        dp_size = self.world_size // self.cp_size
+        sequence_length = 4 * self.cp_size
+        torch.manual_seed(4321)
+        full_input = torch.randn(
+            dp_size, sequence_length, config.hidden_size, device="cuda", dtype=torch.float32
+        )
+        reference(full_input).square().mean().backward()
+
+        dp_rank = self.pg_collection.dp.rank()
+        cp_rank = self.pg_collection.cp.rank()
+        segments = full_input[dp_rank].chunk(2 * self.cp_size, dim=0)
+        local_input = torch.cat((segments[cp_rank], segments[-cp_rank - 1]), dim=0)
+        model(local_input).square().mean().backward()
+
+        assert isinstance(model.module.weight.grad, DTensor)
+        assert set(model.module.weight.grad.device_mesh.mesh.flatten().tolist()) == set(
+            torch.distributed.get_process_group_ranks(self.pg_collection.dp_cp)
+        )
+        torch.testing.assert_close(
+            model.module.weight.grad.full_tensor(), reference.weight.grad, rtol=1e-5, atol=1e-6
+        )
+
+    def test_cp_transformer_forward_backward(self, monkeypatch):
+        """Transformer Engine CP communication composes with MFSDP collectives."""
+        monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
+        monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            context_parallel_size=self.cp_size,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        block = TransformerBlock(
+            config=config,
+            spec=get_gpt_layer_with_transformer_engine_spec(),
+            pg_collection=self.pg_collection,
+        ).cuda().bfloat16()
+        for parameter in block.parameters():
+            torch.distributed.broadcast(parameter.data, src=0)
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=block,
+            pg_collection=self.pg_collection,
+        )
+
+        dp_size = self.world_size // self.cp_size
+        sequence_length = 8 * self.cp_size
+        torch.manual_seed(5678)
+        full_hidden = torch.randn(
+            sequence_length,
+            dp_size,
+            config.hidden_size,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        segments = full_hidden[:, self.pg_collection.dp.rank()].chunk(
+            2 * self.cp_size, dim=0
+        )
+        cp_rank = self.pg_collection.cp.rank()
+        local_hidden = torch.cat((segments[cp_rank], segments[-cp_rank - 1]), dim=0).unsqueeze(1)
+        output = model(hidden_states=local_hidden, attention_mask=None)
+        assert output.shape == local_hidden.shape
+        output.float().square().mean().backward()
+
+        gradients = [parameter.grad for parameter in model.parameters() if parameter.requires_grad]
+        assert gradients
+        assert all(isinstance(gradient, DTensor) for gradient in gradients)
+
+    def test_rejects_dp_only_sharding_group(self):
+        """The sharding group must contain every CP peer, not only DP peers."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            context_parallel_size=self.cp_size,
+        )
+        invalid_pg_collection = ProcessGroupCollection(
+            tp=self.pg_collection.tp,
+            pp=self.pg_collection.pp,
+            cp=self.pg_collection.cp,
+            dp_cp=self.pg_collection.dp,
+        )
+        with pytest.raises(ValueError, match="dp_cp process.?group"):
+            FullyShardedDataParallel(
+                config=config,
+                ddp_config=DistributedDataParallelConfig(
+                    use_megatron_fsdp=True,
+                    megatron_fsdp_version=2,
+                    use_distributed_optimizer=False,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                ),
+                module=torch.nn.Linear(config.hidden_size, config.hidden_size),
+                pg_collection=invalid_pg_collection,
+            )
 
 
 class TestMcoreAdapterExpertParallel:
