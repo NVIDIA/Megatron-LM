@@ -8,7 +8,7 @@ import math
 import os
 import time
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
@@ -504,19 +504,18 @@ fwd_buffer_reuse_ref_count = 0
 bwd_buffer_reuse_ref_count = 0
 
 
-def _backup_grads_before_capture(runner):
-    """Snapshot main_grad so create_fwd_graph's eager warmup can't corrupt the finalized grads;
-    restore with '_restore_grads_after_capture'.
-    """
+def _backup_grads_before_capture(runner, parameters=None):
+    """Snapshot main_grad so CUDA-graph capture cannot corrupt finalized gradients."""
     backup = {}
-    for p in runner.base_module.parameters():
+    parameters = tuple(runner.base_module.parameters() if parameters is None else parameters)
+    for p in parameters:
         mg = getattr(p, "main_grad", None)
         if mg is not None:
             backup[id(p)] = (p, mg.clone())
 
     if runner.gtp_remat:
         # GTP only: also protect the cross-graph next_w the cascade accumulates into.
-        for p in runner.base_module.parameters():
+        for p in parameters:
             nw = getattr(p, "next_w", None) if getattr(p, "is_gtp_weight_remat", False) else None
             if nw is None:
                 continue
@@ -532,6 +531,38 @@ def _restore_grads_after_capture(backup):
     """Restore the main_grad snapshots taken by '_backup_grads_before_capture'."""
     for p, saved in backup.values():
         p.main_grad.copy_(saved)
+
+
+@contextmanager
+def _preserve_parameter_grads_during_backward_capture(runner):
+    """Give each backward runner fresh accumulation state without changing the training step."""
+
+    parameters = tuple(runner.params_to_backprop)
+    main_grad_backup = _backup_grads_before_capture(runner, parameters=parameters)
+    missing = object()
+    parameter_state = [
+        (param, param.grad, getattr(param, "grad_added_to_main_grad", missing))
+        for param in parameters
+    ]
+
+    # A module can back multiple runners, as with a repeated MTP layer. Each runner must capture
+    # its own contribution instead of inheriting another runner's accumulation flag or stale grad.
+    for param, _, _ in parameter_state:
+        param.grad = None
+        if hasattr(param, "grad_added_to_main_grad"):
+            param.grad_added_to_main_grad = False
+
+    try:
+        yield
+    finally:
+        _restore_grads_after_capture(main_grad_backup)
+        for param, grad, grad_added_to_main_grad in parameter_state:
+            param.grad = grad
+            if grad_added_to_main_grad is missing:
+                if hasattr(param, "grad_added_to_main_grad"):
+                    delattr(param, "grad_added_to_main_grad")
+            else:
+                param.grad_added_to_main_grad = grad_added_to_main_grad
 
 
 class _CudagraphGlobalRecord:
@@ -1512,6 +1543,7 @@ class _CudaGraphRunner(torch.nn.Module):
         capture_comm_context = track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
         with (
             capture_comm_context as capture_comms,
+            _preserve_parameter_grads_during_backward_capture(self),
             torch.cuda.graph(self.bwd_graph, pool=self.mempool),
         ):
 
