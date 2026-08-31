@@ -30,6 +30,10 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     is_checkpointing,
 )
+from megatron.core.transformer.cuda_graph_config import (
+    is_whole_moe_cuda_graph_scope,
+    validate_moe_cuda_graph_support,
+)
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -2692,10 +2696,25 @@ class TECudaGraphHelper:
 
         self._capture_finished = True
 
+    def _should_enable_paged_stash_capture(self) -> bool:
+        """Whether this rank captures a complete local MoE with paged stash."""
+
+        has_local_moe_layer = any(
+            getattr(module, "is_moe_layer", False)
+            for layer in self.flattened_callables
+            for module in layer.modules()
+        )
+        return (
+            self.config.moe_paged_stash
+            and is_whole_moe_cuda_graph_scope(self.config.cuda_graph_modules)
+            and has_local_moe_layer
+        )
+
     def create_cudagraphs(self):
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
+        validate_moe_cuda_graph_support(self.config)
         start_time = self._start_capturing()
 
         if not self.flattened_callables:
@@ -2711,7 +2730,16 @@ class TECudaGraphHelper:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
                 rng_context = nullcontext()
-            with rng_context:
+            from megatron.core.transformer.moe.paged_stash import paged_stash_te_graph_capture
+
+            with (
+                rng_context,
+                paged_stash_te_graph_capture(
+                    self._should_enable_paged_stash_capture(),
+                    order=kwargs['_order'],
+                    config=self.config,
+                ),
+            ):
                 graphs = make_graphed_callables(
                     tuple(self.flattened_callables), sample_args, **kwargs
                 )
