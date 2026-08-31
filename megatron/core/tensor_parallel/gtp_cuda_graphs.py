@@ -5,27 +5,61 @@
 This module owns state that exists only for local CUDA-graph capture and replay:
 
 * capture-local ownership of asynchronous GTP communication;
-* persistent wgrad ring buffers whose lifetime may cross graph boundaries;
+* persistent storage for work that outlives a local graph handoff;
 * routing graph-owned allocations into the shared CUDA-graph memory pool.
+
+``get_graph_persistent_buffer`` serves replay-invariant temporary storage whose complete lifetime
+belongs to one backward runner. Eager execution records the required capacity, then capture
+receives a stable view from one of a bounded number of alternating arenas. Callers never select
+an arena, generation, name, or device. RS send buffers may select their registered symmetric
+process-group domain; every other request uses the default allocator domain.
 """
 
 from __future__ import annotations
 
-import logging
-from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Optional
+from typing import Iterable, Optional
 
 import torch
 
-from megatron.core.tensor_parallel.gtp_symmetric_memory import (
-    gtp_symm_pool_ctx,
-    is_gtp_symm_pool_registered,
-)
-from megatron.core.utils import log_single_rank
+from megatron.core.tensor_parallel.gtp_symmetric_memory import gtp_symm_pool_ctx
+from megatron.core.utils import round_up_to_nearest_multiple
 
-logger = logging.getLogger(__name__)
+_PERSISTENT_BUFFER_ALIGNMENT_BYTES = 256
+
+
+def _persistent_buffer_key(
+    dtype: torch.dtype, symmetric_group=None
+) -> tuple[Optional[str], torch.dtype]:
+    """Return the allocation-domain and dtype key for one persistent request."""
+    group_name = symmetric_group.group_name if symmetric_group is not None else None
+    return group_name, dtype
+
+
+def _format_persistent_buffer_key(key: tuple[Optional[str], torch.dtype]) -> str:
+    """Format an allocation-domain key for diagnostics."""
+    group_name, dtype = key
+    domain = "default allocator" if group_name is None else f"symmetric group {group_name}"
+    return f"{dtype} in {domain}"
+
+
+def _persistent_buffer_numel(shape: Iterable[int], dtype: torch.dtype) -> tuple[int, int]:
+    """Return the logical and aligned element counts for a persistent buffer shape."""
+    numel = 1
+    for dimension in shape:
+        if dimension < 0:
+            raise ValueError(f"Persistent buffer shape must be non-negative, got {shape}")
+        numel *= dimension
+    element_size = torch.empty((), dtype=dtype).element_size()
+    alignment = max(1, _PERSISTENT_BUFFER_ALIGNMENT_BYTES // element_size)
+    aligned_numel = round_up_to_nearest_multiple(numel, alignment)
+    return numel, aligned_numel
+
+
+# Fixed runner arenas serve requests whose number and shape are replay-invariant. An eager
+# backward first measures each runner's per-domain, per-dtype capacity. The plan then packs those
+# capacities into alternating fixed-address arenas, and capture bump-allocates stable views.
 
 
 @contextmanager
@@ -69,13 +103,287 @@ def preserve_gtp_prefetch_state(params: Iterable[torch.nn.Parameter]):
 
 
 @dataclass
-class GraphWgradRingSlot:
-    """One persistent wgrad slot guarded by its reduce-scatter completion event."""
+class GraphPersistentBufferState:
+    """Per-runner discovery, capture, and replay state.
 
-    tensor: torch.Tensor
-    ready_event: torch.cuda.Event
-    key: tuple
-    index: int
+    This object does not own GPU storage. ``GraphPersistentBufferPlan`` owns the alternating
+    arenas and binds each buffer-using runner to one generation.
+
+    Lifecycle: the runner creates this state, eager backward discovers its required capacity,
+    graph capture bump-allocates views from its assigned arena, and replay fences arena reuse.
+    """
+
+    # Total aligned elements requested per allocation domain and dtype during eager discovery.
+    capacities: dict[tuple[Optional[str], torch.dtype], int] = field(default_factory=dict)
+    # Capture-order position, used only to identify the runner in allocation errors.
+    runner_index: Optional[int] = field(default=None, init=False)
+    # Alternating arena selected by the plan; runners without arena requests leave this unset.
+    generation: Optional[int] = field(default=None, init=False)
+    # Exact process-group object for each symmetric allocation domain used by this runner.
+    _symmetric_groups: dict[str, object] = field(default_factory=dict, init=False, repr=False)
+    # Per-domain bump offsets used while capturing this runner.
+    _offsets: dict[tuple[Optional[str], torch.dtype], int] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _plan: Optional["GraphPersistentBufferPlan"] = field(default=None, init=False, repr=False)
+
+    def start_discovery(self) -> None:
+        """Start a fresh eager capacity-discovery pass for this runner."""
+        self.capacities.clear()
+        self._symmetric_groups.clear()
+
+    def clear(self) -> None:
+        """Drop all state after graphs using this runner have been deleted."""
+        self.capacities.clear()
+        self._symmetric_groups.clear()
+        self._offsets.clear()
+        self.runner_index = None
+        self.generation = None
+        self._plan = None
+
+    def record(self, shape: Iterable[int], dtype: torch.dtype, *, symmetric_group=None) -> None:
+        """Add one aligned request to this runner's discovered allocation domain."""
+        key = _persistent_buffer_key(dtype, symmetric_group)
+        group_name, _ = key
+        if group_name is not None:
+            existing_group = self._symmetric_groups.setdefault(group_name, symmetric_group)
+            if existing_group is not symmetric_group:
+                raise RuntimeError(
+                    f"Persistent buffer domain {group_name} refers to multiple process groups"
+                )
+        _, aligned_numel = _persistent_buffer_numel(shape, dtype)
+        self.capacities[key] = self.capacities.get(key, 0) + aligned_numel
+
+    def bind(
+        self, plan: "GraphPersistentBufferPlan", runner_index: int, generation: Optional[int]
+    ) -> None:
+        """Bind discovery results to the shared plan before graph capture."""
+        self._plan = plan
+        self.runner_index = runner_index
+        self.generation = generation
+
+    @property
+    def needs_replay_fence(self) -> bool:
+        """Return whether replay needs any persistent-buffer fencing."""
+        return bool(self.capacities)
+
+    def start_capture(self) -> None:
+        """Reset bump-allocation before capture."""
+        self._offsets = {key: 0 for key in self.capacities}
+
+    def allocate(
+        self, shape: Iterable[int], dtype: torch.dtype, *, symmetric_group=None
+    ) -> torch.Tensor:
+        """Bump-allocate one stable tensor view from this runner's generation."""
+        if self._plan is None or self.generation is None or self.runner_index is None:
+            raise RuntimeError(f"Runner {self.runner_index} has no persistent buffer generation")
+        numel, aligned_numel = _persistent_buffer_numel(shape, dtype)
+        key = _persistent_buffer_key(dtype, symmetric_group)
+        group_name, _ = key
+        if group_name is not None and self._symmetric_groups.get(group_name) is not symmetric_group:
+            raise RuntimeError(
+                f"Runner {self.runner_index} requested an unexpected process group for "
+                f"persistent domain {group_name} during capture"
+            )
+        consumed = self._offsets.get(key, 0)
+        capacity = self.capacities.get(key, 0)
+        if consumed + aligned_numel > capacity:
+            raise RuntimeError(
+                f"Runner {self.runner_index} exhausted its persistent "
+                f"{_format_persistent_buffer_key(key)} arena: "
+                f"requested {aligned_numel} aligned elements after {consumed}, "
+                f"capacity {capacity}"
+            )
+        arena = self._plan.get_arena(self.generation, dtype, symmetric_group=symmetric_group)
+        self._offsets[key] = consumed + aligned_numel
+        return arena.narrow(0, consumed, numel).view(shape)
+
+    def validate_complete(self) -> None:
+        """Require capture to consume exactly the capacity measured during discovery."""
+        for key, capacity in self.capacities.items():
+            consumed = self._offsets.get(key, 0)
+            if consumed != capacity:
+                raise RuntimeError(
+                    f"Runner {self.runner_index} consumed {consumed}/{capacity} persistent "
+                    f"{_format_persistent_buffer_key(key)} elements during capture"
+                )
+
+    def wait_for_reuse(self, stream: torch.cuda.Stream) -> None:
+        """Wait before overwriting this runner's arena generation."""
+        if self.capacities:
+            self._plan.wait_for_reuse(self.generation, stream)
+
+    def mark_reusable_after(self, stream: torch.cuda.Stream) -> None:
+        """Publish the graph tail for the arena generation consumed here."""
+        if self.capacities:
+            self._plan.mark_reusable_after(self.generation, stream)
+
+
+class GraphPersistentBufferPlan:
+    """Own the alternating fixed-address arenas shared by backward runners.
+
+    A generation may back several non-adjacent runners. Its arena is sized to the largest runner
+    assigned to it, and its event prevents a later runner from overwriting the arena before the
+    previous runner's graph tail has completed. Runner states only retain their generation and
+    bump-allocation offsets; all arena tensors live here.
+
+    Lifecycle: after eager discovery completes, one plan binds all runner states and allocates the
+    arenas before graph capture. It remains shared across replays and is cleared with the graphs.
+    """
+
+    def __init__(
+        self,
+        states: list[GraphPersistentBufferState],
+        capacities: dict[tuple[int, Optional[str], torch.dtype], int],
+        symmetric_groups: dict[str, object],
+        generation_count: int,
+    ) -> None:
+        # Runner states in backward graph-capture order.
+        self._states: list[GraphPersistentBufferState] = states
+        # Maximum aligned elements needed for each (generation, domain, dtype) arena.
+        self._capacities: dict[tuple[int, Optional[str], torch.dtype], int] = capacities
+        # Exact process-group object associated with each non-default allocation domain.
+        self._symmetric_groups = symmetric_groups
+        # Fixed-address backing tensors allocated outside CUDA graph memory pools.
+        self._arenas: dict[tuple[int, Optional[str], torch.dtype], torch.Tensor] = {}
+        # One completion event per reusable generation.
+        self._ready_events: list[torch.cuda.Event] = []
+        self._generation_count = generation_count
+
+    @classmethod
+    def create(
+        cls, states: Iterable[GraphPersistentBufferState], *, max_inflight: int
+    ) -> "GraphPersistentBufferPlan":
+        """Plan and allocate alternating arenas for the supplied runner states.
+
+        ``max_inflight`` is a performance-only limit on the number of local CUDA graphs whose
+        persistent buffers can remain live concurrently. Reuse is event-fenced, so a smaller
+        value remains correct but may reduce overlap. Two covers typical multi-module use cases;
+        larger values increase persistent memory.
+        """
+        if max_inflight < 1:
+            raise ValueError("max_inflight must be at least 1")
+
+        state_list = list(states)
+        buffer_runner_count = sum(bool(state.capacities) for state in state_list)
+        generation_count = min(max_inflight, buffer_runner_count)
+        capacities = {}
+        symmetric_groups = {}
+        assignments = []
+        buffer_runner_index = 0
+
+        for state in state_list:
+            generation = None
+            if state.capacities:
+                generation = buffer_runner_index % generation_count
+                buffer_runner_index += 1
+                for group_name, group in state._symmetric_groups.items():
+                    existing_group = symmetric_groups.setdefault(group_name, group)
+                    if existing_group is not group:
+                        raise RuntimeError(
+                            f"Persistent buffer domain {group_name} refers to multiple "
+                            "process groups"
+                        )
+                for (group_name, dtype), capacity in state.capacities.items():
+                    key = (generation, group_name, dtype)
+                    capacities[key] = max(capacities.get(key, 0), capacity)
+            assignments.append(generation)
+
+        plan = cls(state_list, capacities, symmetric_groups, generation_count)
+        for runner_index, (state, generation) in enumerate(zip(state_list, assignments)):
+            state.bind(plan, runner_index, generation)
+        plan._allocate()
+        return plan
+
+    def _allocate(self) -> None:
+        """Allocate every arena outside CUDA graph memory pools on the current device."""
+        device = torch.cuda.current_device()
+        for key, capacity in self._capacities.items():
+            _, group_name, dtype = key
+            group = self._symmetric_groups.get(group_name)
+            allocation_context = gtp_symm_pool_ctx(group) if group is not None else nullcontext()
+            with allocation_context:
+                self._arenas[key] = torch.empty(capacity, dtype=dtype, device=device)
+        current_stream = torch.cuda.current_stream()
+        for _ in range(self._generation_count):
+            event = torch.cuda.Event(external=True)
+            # Seed the event so every captured runner has the same unconditional reuse fence.
+            event.record(current_stream)
+            self._ready_events.append(event)
+
+    def get_arena(
+        self, generation: int, dtype: torch.dtype, *, symmetric_group=None
+    ) -> torch.Tensor:
+        """Return one generation's typed backing arena."""
+        group_name, _ = _persistent_buffer_key(dtype, symmetric_group)
+        try:
+            return self._arenas[(generation, group_name, dtype)]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"No persistent arena for generation {generation} and "
+                f"{_format_persistent_buffer_key((group_name, dtype))}"
+            ) from exc
+
+    def wait_for_reuse(self, generation: int, stream: torch.cuda.Stream) -> None:
+        """Wait until the prior runner using ``generation`` has completed."""
+        stream.wait_event(self._ready_events[generation])
+
+    def mark_reusable_after(self, generation: int, stream: torch.cuda.Stream) -> None:
+        """Make ``generation`` reusable after ``stream`` reaches this point."""
+        self._ready_events[generation].record(stream)
+
+    def clear(self) -> None:
+        """Drop persistent arenas after all referencing graphs are deleted."""
+        self._arenas.clear()
+        self._symmetric_groups.clear()
+        self._ready_events.clear()
+        self._generation_count = 0
+        for state in self._states:
+            if state._plan is self:
+                state._plan = None
+                state.generation = None
+
+
+_ACTIVE_DISCOVERY_STATE: Optional[GraphPersistentBufferState] = None
+_ACTIVE_CAPTURE_STATE: Optional[GraphPersistentBufferState] = None
+
+
+def set_graph_persistent_buffer_discovery(state: Optional[GraphPersistentBufferState]) -> None:
+    """Select the runner whose eager backward is discovering persistent capacity."""
+    global _ACTIVE_DISCOVERY_STATE
+    _ACTIVE_DISCOVERY_STATE = state
+
+
+def get_graph_persistent_buffer(
+    shape: Iterable[int], dtype: torch.dtype, *, symmetric_group=None
+) -> Optional[torch.Tensor]:
+    """Record one eager request or return its stable capture-time tensor view.
+
+    ``symmetric_group`` selects the registered NCCL allocation domain for an RS send buffer.
+    Other graph-owned storage uses the default CUDA allocator. Keeping the domain explicit
+    prevents dense GTP and expert GTP buffers from sharing memory registered to another group.
+    """
+    shape = tuple(shape)
+    if _ACTIVE_DISCOVERY_STATE is not None:
+        _ACTIVE_DISCOVERY_STATE.record(shape, dtype, symmetric_group=symmetric_group)
+    if _ACTIVE_CAPTURE_STATE is None:
+        return None
+    return _ACTIVE_CAPTURE_STATE.allocate(shape, dtype, symmetric_group=symmetric_group)
+
+
+@contextmanager
+def use_graph_persistent_buffer_state(state: GraphPersistentBufferState):
+    """Activate one runner's persistent-buffer state during backward graph capture."""
+    global _ACTIVE_CAPTURE_STATE
+    if _ACTIVE_CAPTURE_STATE is not None:
+        raise RuntimeError("Nested persistent buffer states are unsupported")
+    state.start_capture()
+    _ACTIVE_CAPTURE_STATE = state
+    try:
+        yield
+        state.validate_complete()
+    finally:
+        _ACTIVE_CAPTURE_STATE = None
 
 
 @dataclass
@@ -86,12 +394,10 @@ class GTPCaptureCommState:
     params_to_ensure_ready: list = field(default_factory=list)
     ag_streams: list = field(default_factory=list)
     rs_streams: list = field(default_factory=list)
-    wgrad_ring_slots: list = field(default_factory=list)
     _param_ids: set = field(default_factory=set)
     _param_ids_to_ensure_ready: set = field(default_factory=set)
     _ag_stream_ids: set = field(default_factory=set)
     _rs_stream_ids: set = field(default_factory=set)
-    _wgrad_ring_slot_params: dict = field(default_factory=dict)
     _comm_records: list[tuple[object, torch.cuda.Stream, bool]] = field(default_factory=list)
 
     def register_comm(self, param, stream: torch.cuda.Stream, *, reduce_scatter: bool) -> None:
@@ -141,20 +447,6 @@ class GTPCaptureCommState:
 
         return params, ag_streams, rs_streams
 
-    def register_wgrad_ring_slot(self, slot: GraphWgradRingSlot, param) -> None:
-        """Track slots used by this graph and reject unsafe intra-graph aliasing."""
-        slot_id = id(slot)
-        param_id = id(param)
-        prior_param_id = self._wgrad_ring_slot_params.get(slot_id)
-        if prior_param_id is not None and prior_param_id != param_id:
-            raise RuntimeError(
-                "One CUDA graph writes the same GTP wgrad ring slot for multiple "
-                "parameters; increase GTP_CONFIG.graph_wgrad_ring_size"
-            )
-        if prior_param_id is None:
-            self._wgrad_ring_slot_params[slot_id] = param_id
-            self.wgrad_ring_slots.append(slot)
-
 
 _ACTIVE_CAPTURE_COMM_STATE: Optional[GTPCaptureCommState] = None
 
@@ -169,12 +461,6 @@ def register_capture_params_to_ensure_ready(params: Iterable) -> None:
     """Record GTP parameter reads that need publication before graph replay."""
     if _ACTIVE_CAPTURE_COMM_STATE is not None:
         _ACTIVE_CAPTURE_COMM_STATE.register_params_to_ensure_ready(params)
-
-
-def register_capture_wgrad_ring_slot(slot: GraphWgradRingSlot, param) -> None:
-    """Register a ring slot with the active capture, if one exists."""
-    if _ACTIVE_CAPTURE_COMM_STATE is not None:
-        _ACTIVE_CAPTURE_COMM_STATE.register_wgrad_ring_slot(slot, param)
 
 
 @contextmanager
@@ -196,127 +482,6 @@ def track_gtp_capture_comms():
         yield state
     finally:
         _ACTIVE_CAPTURE_COMM_STATE = None
-
-
-# Slots live outside the shared graph pool so independently replayed graphs cannot reuse an
-# in-flight reduce-scatter input as temporary workspace.
-_GRAPH_WGRAD_RINGS: dict[tuple, list[GraphWgradRingSlot]] = {}
-
-
-def allocate_graph_wgrad_rings(
-    params: Iterable,
-    *,
-    full_iteration: bool,
-    async_reduction: bool,
-    ring_size: int,
-    graphed_chain_id: str,
-    stream_key: Callable[[str, object], tuple],
-) -> None:
-    """Allocate bounded persistent inputs for cross-graph asynchronous reduce-scatter.
-
-    Slots are shared across layers only within one communication scheduling domain. A two-slot
-    ring retains one graph of overlap without allocating one full unsharded wgrad per layer.
-    """
-    if full_iteration or not async_reduction or _GRAPH_WGRAD_RINGS:
-        return
-    if ring_size < 1:
-        raise ValueError("GTP_CONFIG.graph_wgrad_ring_size must be at least 1")
-
-    params_by_key = defaultdict(list)
-    seen_params = set()
-    for chain_param in params:
-        if not getattr(chain_param, "is_gtp_weight_remat", False):
-            continue
-        if chain_param.chain_id != graphed_chain_id or chain_param.prev_w is None:
-            continue
-        for param in chain_param._weights:
-            if id(param) in seen_params:
-                continue
-            seen_params.add(id(param))
-            if not hasattr(param, "main_grad"):
-                raise RuntimeError(
-                    "GTP wgrad rings must be initialized after DDP creates param.main_grad"
-                )
-            key = (
-                stream_key(param.chain_id, param.group),
-                param._unsharded_shape,
-                param._unsharded_shape_padded,
-                param.main_grad.dtype,
-                param.expert_idx,
-            )
-            params_by_key[key].append(param)
-
-    # Symm-RS: GRAPHED chains send their persistent ring slot directly, so allocating the
-    # slot from the window-registered pool puts the RS send buffer in the NCCL symmetric
-    # window. This runs pre-capture and the pool routing is collective-free, so it is
-    # capture-safe; slot addresses stay stable either way.
-    total_bytes = 0
-    buffer_count = 0
-    new_slots = []
-    for key, matching_params in params_by_key.items():
-        slot_count = min(ring_size, len(matching_params))
-        slots = []
-        exemplar = matching_params[0]
-        assert all(p.group is exemplar.group for p in matching_params), (
-            "GTP wgrad ring slots are allocated from the exemplar's symmetric pool, so "
-            "every param sharing a ring key must share its process group"
-        )
-        symm = is_gtp_symm_pool_registered(exemplar.group)
-        for slot_index in range(slot_count):
-            with gtp_symm_pool_ctx(exemplar.group) if symm else nullcontext():
-                tensor = torch.empty(
-                    exemplar._unsharded_shape_padded,
-                    dtype=exemplar.main_grad.dtype,
-                    device=exemplar.device,
-                    memory_format=torch.contiguous_format,
-                )
-            if exemplar.pad_length > 0:
-                tensor.narrow(0, exemplar._unsharded_shape[0], exemplar.pad_length).zero_()
-            slot = GraphWgradRingSlot(
-                tensor=tensor,
-                ready_event=torch.cuda.Event(external=True),
-                key=key,
-                index=slot_index,
-            )
-            slots.append(slot)
-            new_slots.append(slot)
-            total_bytes += tensor.numel() * tensor.element_size()
-            buffer_count += 1
-
-        _GRAPH_WGRAD_RINGS[key] = slots
-        for param_index, param in enumerate(matching_params):
-            slot = slots[param_index % slot_count]
-            param._gtp_graph_wgrad_ring_slot = slot
-            if param.pad_length > 0:
-                param._gtp_graph_wgrad_ring_view = slot.tensor.narrow(
-                    0, 0, param._unsharded_shape[0]
-                )
-            else:
-                param._gtp_graph_wgrad_ring_view = slot.tensor
-
-    # Initially every slot is available. Later generations are recorded on the RS stream after NCCL
-    # has finished reading the slot.
-    for slot in new_slots:
-        slot.ready_event.record()
-    if new_slots:
-        torch.cuda.current_stream().synchronize()
-
-    log_single_rank(
-        logger,
-        logging.INFO,
-        f"[GTP Wgrad Ring] allocated {buffer_count} buffers "
-        f"({total_bytes / 1024**2:.1f} MB), ring_size={ring_size}",
-    )
-
-
-def clear_graph_wgrad_rings() -> None:
-    """Drop every ring slot so a rebuilt model reallocates them.
-
-    Without this, the stale non-empty dict makes allocate_graph_wgrad_rings a silent
-    no-op on the next build, leaving slots keyed by the old model's groups and shapes.
-    GPU work must be idle (callers synchronize).
-    """
-    _GRAPH_WGRAD_RINGS.clear()
 
 
 _CG_MEMPOOL_DEVICE = None

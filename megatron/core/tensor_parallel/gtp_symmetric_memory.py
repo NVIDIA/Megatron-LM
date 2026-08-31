@@ -14,7 +14,8 @@ Two parts:
   - Pool lifecycle: create, register, query, and tear down the per-group pools,
     plus the allocation context ``gtp_symm_pool_ctx``.
   - ``symmetric_wgrad_pool`` (a ``RegisteredLIFOPool``): recycled, window-registered
-    send buffers for the wgrad reduce-scatter.
+    send buffers for eager wgrad reduce-scatter. Local CUDA graphs allocate their
+    plan-owned persistent send arenas through ``gtp_symm_pool_ctx`` instead.
 """
 
 from __future__ import annotations
@@ -212,7 +213,7 @@ symmetric_wgrad_pool = RegisteredLIFOPool()
 
 def deregister_and_clear_gtp_symm_pools() -> None:
     """Tear down what this module owns: deregister the pools' windows, then drop the
-    recycled send buffers. Allocations owned by others (e.g. graph wgrad ring slots)
+    recycled send buffers. Allocations owned by others (e.g. CUDA-graph persistent arenas)
     are not freed here. Call on all ranks before teardown; no-op if never registered."""
     # Wait for all GPU work to finish first: a kernel or collective still reading
     # pool memory would fault once the windows go away.

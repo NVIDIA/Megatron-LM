@@ -51,6 +51,7 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
         model_parallel_cuda_manual_seed,
     )
     from megatron.core.transformer.cuda_graphs import (
+        CudaGraphManager,
         _CudagraphGlobalRecord,
         create_cudagraphs,
         delete_cuda_graphs,
@@ -312,6 +313,8 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
         assert all(len(manager.cudagraph_runners) == 1 for manager in managers)
         runners = [manager.cudagraph_runners[0] for manager in managers]
         assert any(runner.gtp_remat for runner in runners)
+        assert any(runner.persistent_buffer_state.capacities for runner in runners)
+        assert CudaGraphManager.persistent_buffer_plan._generation_count == 1
 
         replay_grad_norms = []
         replay_losses = []

@@ -98,7 +98,8 @@ class TestTeardownContract:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA pool test")
     def test_teardown_clears_own_state_but_not_foreign_allocations(self):
         group = _StubGroup(name="teardown_contract_group")
-        # A buffer owned by another subsystem (ring-slot style), allocated in the pool.
+        # A buffer owned by another subsystem (such as the persistent graph plan), allocated
+        # in the pool.
         with gtp_symm.gtp_symm_pool_ctx(group):
             foreign = torch.full((8,), 7.0, device="cuda")
         assert group.group_name in gtp_symm._pools

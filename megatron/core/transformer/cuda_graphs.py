@@ -22,6 +22,12 @@ from torch.utils._pytree import tree_map as tree_map_pyt
 
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.gtp_cuda_graphs import (
+    GraphPersistentBufferPlan,
+    GraphPersistentBufferState,
+    set_graph_persistent_buffer_discovery,
+    use_graph_persistent_buffer_state,
+)
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     get_all_rng_states,
@@ -71,7 +77,6 @@ if HAVE_GTP:
         GTP_CONFIG,
         GTPChain,
         get_rs_stream,
-        initialize_graph_wgrad_rings,
         preserve_gtp_prefetch_state,
         set_cuda_graph_mempool,
         track_gtp_capture_comms,
@@ -84,7 +89,6 @@ else:
     GTPChain = None
     GTP_CONFIG = None
     get_rs_stream = None
-    initialize_graph_wgrad_rings = None
     preserve_gtp_prefetch_state = None
     set_cuda_graph_mempool = None
     track_gtp_capture_comms = None
@@ -534,6 +538,21 @@ def _restore_grads_after_capture(backup):
         p.main_grad.copy_(saved)
 
 
+def _get_gtp_persistent_buffer_max_inflight(gtp_backward_runners):
+    """Choose the number of live persistent arenas from the local graph scope."""
+    local_graph_modules = set()
+    for runner in gtp_backward_runners:
+        config = getattr(runner.base_module, "config", None)
+        local_graph_modules.update(getattr(config, "cuda_graph_modules", ()) or ())
+    # The local implementation treats moe_router + moe_preprocess as one graph scope.
+    local_graph_modules.discard(CudaGraphModule.moe_preprocess)
+    num_local_graph_modules = max(1, len(local_graph_modules))
+    # max_inflight controls overlap, not correctness: one arena generation is enough for
+    # one configured local-CG module scope, while two covers normal multi-module scopes.
+    # Larger values only allow more graphs to overlap if possible and increase persistent memory.
+    return min(2, num_local_graph_modules)
+
+
 class _CudagraphGlobalRecord:
     """A global datastructure that records of the ordering of all _CudaGraphRunner's
     first fwd or bwd passes. 'create_cudagraphs' will use this to create
@@ -647,7 +666,17 @@ class _CudagraphGlobalRecord:
         if gtp_active:
             # GTP buffer reuse during capture trips the param-state debug asserts; disable them.
             GTP_CONFIG.check_param_states = False
-            initialize_graph_wgrad_rings()
+            gtp_backward_runners = [
+                record[0]
+                for record in cls.cudagraph_record
+                if record[1] == "bwd" and record[0].gtp_remat
+            ]
+            set_graph_persistent_buffer_discovery(None)
+            plan = GraphPersistentBufferPlan.create(
+                [runner.persistent_buffer_state for runner in gtp_backward_runners],
+                max_inflight=_get_gtp_persistent_buffer_max_inflight(gtp_backward_runners),
+            )
+            CudaGraphManager.persistent_buffer_plan = plan
 
         _set_capture_start()
         if has_te_modules:
@@ -680,7 +709,12 @@ class _CudagraphGlobalRecord:
                 runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
             else:
                 assert fwd_buffer_reuse_ref_count == 0
-                runner.create_bwd_graph()
+                state = runner.persistent_buffer_state if runner.gtp_remat else None
+                capture_context = (
+                    use_graph_persistent_buffer_state(state) if state is not None else nullcontext()
+                )
+                with capture_context:
+                    runner.create_bwd_graph()
 
         # Memory usage.
         time_end = time.time()
@@ -755,13 +789,13 @@ def delete_cuda_graphs():
     ]:
         runner = record[0]
         assert isinstance(runner, _CudaGraphRunner)
-
         runner.cudagraph_created = False
         runner.fwd_graph_recorded = False
         runner.bwd_graph_recorded = False
         runner.fwd_graph = None
         runner.bwd_graph = None
         runner.mempool = None
+        runner.persistent_buffer_state.clear()
         runner._gtp_fwd_params_to_ensure_ready = ()
 
     # Reset global tracking state
@@ -769,6 +803,11 @@ def delete_cuda_graphs():
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
     _GTP_RUNNER_STREAMS.clear()
+
+    if CudaGraphManager.persistent_buffer_plan is not None:
+        CudaGraphManager.persistent_buffer_plan.clear()
+    CudaGraphManager.persistent_buffer_plan = None
+    set_graph_persistent_buffer_discovery(None)
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
@@ -810,8 +849,22 @@ class _CudagraphRecordNode(torch.autograd.Function):
         ), "Tried calling the bwd cudagraph when the fwd cudagraph was expected to be called next!"
         runner.status = _GraphStatus.FWD_READY
         if not runner.bwd_graph_recorded:
+            if runner.gtp_remat:
+                runner.persistent_buffer_state.start_discovery()
+                set_graph_persistent_buffer_discovery(runner.persistent_buffer_state)
+                # Record nodes switch discovery state as backward crosses runner boundaries. If
+                # the last record node is a GTP runner, no later node clears its state. Clear any
+                # residual state after the complete autograd backward, before gradient
+                # finalization or a later backward can issue unrelated requests.
+                torch.autograd.Variable._execution_engine.queue_callback(
+                    lambda: set_graph_persistent_buffer_discovery(None)
+                )
+            else:
+                set_graph_persistent_buffer_discovery(None)
             _CudagraphGlobalRecord.record_bwd_graph(runner)
             runner.bwd_graph_recorded = True
+        else:
+            set_graph_persistent_buffer_discovery(None)
 
         return None, grads
 
@@ -901,16 +954,15 @@ class _CudagraphReplayNode(torch.autograd.Function):
             if user_output_grad.data_ptr() != cudagraph_output_grad.data_ptr():
                 cudagraph_output_grad.copy_(user_output_grad)
 
+        state = runner.persistent_buffer_state if runner.gtp_remat else None
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
-            if runner.gtp_remat:
-                for slot in runner._gtp_wgrad_ring_slots:
-                    runner.stream.wait_event(slot.ready_event)
+            if state is not None and state.needs_replay_fence:
+                state.wait_for_reuse(runner.stream)
             with torch.cuda.stream(runner.stream):
                 runner.bwd_graph.replay()
-                if runner.gtp_remat:
-                    for slot in runner._gtp_wgrad_ring_slots:
-                        slot.ready_event.record(runner.stream)
+                if state is not None and state.needs_replay_fence:
+                    state.mark_reusable_after(runner.stream)
             torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
         else:
             runner.bwd_graph.replay()
@@ -965,6 +1017,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         self.base_module = base_module
         self.mempool = mempool
+        self.persistent_buffer_state = GraphPersistentBufferState()
 
         self.fwd_graph_input_arg_metas = [ArgMetadata(a) for a in fwd_graph_input_args]
         self.fwd_graph_input_kwarg_metas = {
@@ -991,14 +1044,11 @@ class _CudaGraphRunner(torch.nn.Module):
         self.use_stream = False
         self.gtp_remat = False
         # Populated by create_bwd_graph: GTP params whose main_grad.add_ was captured in THIS
-        # graph.  Used in Graphed.backward's post-replay hook loop to fire DDP hooks only in the
+        # graph. Used in Graphed.backward's post-replay hook loop to fire DDP hooks only in the
         # graph whose replay populates main_grad.
         self.finalized_during_bwd_capture = []
         # (rs_stream, params) DDP grad-ready hook plan; built in create_bwd_graph.
         self._gtp_finalize_hook_plan = []
-        # Persistent wgrad slots written by this graph. Replay waits for each slot's previous RS
-        # reader before launching the graph.
-        self._gtp_wgrad_ring_slots = []
         # GTP weights read by this forward graph before their owning module pre-hooks execute.
         self._gtp_fwd_params_to_ensure_ready = ()
 
@@ -1519,7 +1569,6 @@ class _CudaGraphRunner(torch.nn.Module):
             capture_comm_context as capture_comms,
             torch.cuda.graph(self.bwd_graph, pool=self.mempool),
         ):
-
             grad_inputs = torch.autograd.grad(
                 outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
                 inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
@@ -1579,8 +1628,6 @@ class _CudaGraphRunner(torch.nn.Module):
         self.finalized_during_bwd_capture = (
             self._compute_finalized_during_bwd_capture() if self.gtp_remat else []
         )
-        self._gtp_wgrad_ring_slots = list(capture_comms.wgrad_ring_slots) if self.gtp_remat else []
-
         # Precompute the (rs_stream, params) DDP grad-ready hook plan once — it's
         # replay-invariant — so Graphed.backward avoids per-replay group lookups.
         self._gtp_finalize_hook_plan = []
@@ -1879,6 +1926,7 @@ class CudaGraphManager(torch.nn.Module):
 
     """A global mempool for when 'cuda_graph_use_single_mempool' is used."""
     global_mempool = None
+    persistent_buffer_plan = None
 
     def __init__(
         self,
