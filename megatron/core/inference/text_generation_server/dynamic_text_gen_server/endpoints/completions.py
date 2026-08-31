@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import base64
 import logging
 import time
 
@@ -67,9 +68,11 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(req.get("temperature", 1.0))
-            top_p = float(req.get("top_p", 1.0))
-            top_k = int(req.get("top_k", 0))
+            temperature = float(
+                req.get("temperature", current_app.config.get('default_temperature', 1.0))
+            )
+            top_p = float(req.get("top_p", current_app.config.get('default_top_p', 1.0)))
+            top_k = int(req.get("top_k", current_app.config.get('default_top_k', 0)))
             echo = bool(req.get("echo", False))
 
             if temperature == 0.0:
@@ -96,6 +99,41 @@ try:
                 stop = [stop]
 
             ignore_eos = bool(req.get("ignore_eos", False))
+
+            # Optional vLLM-style multimodal input. HTTP callers provide
+            # base64/data-URL bytes; preprocessed tensors are direct-API only.
+            request_multi_modal_data = req.get("multi_modal_data") or {}
+            if not isinstance(request_multi_modal_data, dict):
+                raise ValueError("multi_modal_data must be a dictionary.")
+            unsupported_modalities = set(request_multi_modal_data) - {"image", "video"}
+            if unsupported_modalities:
+                raise ValueError(
+                    "Unsupported multimodal modalities: " f"{sorted(unsupported_modalities)}."
+                )
+            populated_modalities = [
+                modality
+                for modality in ("image", "video")
+                if request_multi_modal_data.get(modality)
+            ]
+            if len(populated_modalities) > 1:
+                raise ValueError("A completions request cannot mix image and video inputs.")
+            multi_modal_data = None
+            if populated_modalities:
+                modality = populated_modalities[0]
+                encoded_media = request_multi_modal_data[modality]
+                if isinstance(encoded_media, str):
+                    encoded_media = [encoded_media]
+                if not isinstance(encoded_media, list) or any(
+                    not isinstance(item, str) for item in encoded_media
+                ):
+                    raise ValueError(f"multi_modal_data.{modality} must be a string or list[str].")
+                media_bytes = [
+                    base64.b64decode(
+                        item.split(",", 1)[1] if item.startswith("data:") and "," in item else item
+                    )
+                    for item in encoded_media
+                ]
+                multi_modal_data = {modality: media_bytes}
 
             sampling_params = SamplingParams(
                 temperature=temperature,
@@ -143,9 +181,17 @@ try:
                 streaming_interval=sampling_params.streaming_interval,
             )
             if stream_requested:
-                tasks.append(client.add_request_streaming(prompt_tokens, per_req_params))
+                tasks.append(
+                    client.add_request_streaming(
+                        prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
+                    )
+                )
             else:
-                tasks.append(client.add_request(prompt_tokens, per_req_params))
+                tasks.append(
+                    client.add_request(
+                        prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
+                    )
+                )
 
         if stream_requested:
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))

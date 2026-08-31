@@ -657,7 +657,8 @@ class TestNVLSAllGatherVDispatcher:
         assert graph_output.shape == hidden_states.shape
         assert graph_output.dtype == torch.bfloat16
 
-    def test_batch_invariant_moe_matches_training(self):
+    @pytest.mark.parametrize("inference_grouped_gemm_backend", ["torch", "vllm"])
+    def test_batch_invariant_moe_matches_training(self, inference_grouped_gemm_backend):
         """The NVLS inference MoE path should exactly match training AllToAll."""
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
         from megatron.core.parallel_state import get_expert_model_parallel_group
@@ -673,7 +674,7 @@ class TestNVLSAllGatherVDispatcher:
             pytest.skip("Training-to-inference MoE parity requires expert parallelism.")
         if Utils.world_size & (Utils.world_size - 1):
             pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
-        if not HAVE_DEEPGEMM_BF16:
+        if inference_grouped_gemm_backend == "torch" and not HAVE_DEEPGEMM_BF16:
             pytest.skip("Batch-invariant torch MoE path requires DeepGEMM bf16 grouped kernels.")
 
         torch.manual_seed(2028)
@@ -681,7 +682,7 @@ class TestNVLSAllGatherVDispatcher:
 
         config = _make_base_config(
             expert_model_parallel_size=Utils.world_size,
-            inference_grouped_gemm_backend="torch",
+            inference_grouped_gemm_backend=inference_grouped_gemm_backend,
             inference_moe_token_dispatcher_type="nvls",
             batch_invariant_mode=True,
             attention_backend=AttnBackend.flash,
@@ -702,7 +703,8 @@ class TestNVLSAllGatherVDispatcher:
             local_tokens, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
         )
 
-        with torch.no_grad(), set_batch_invariant_mode(True):
+        backend = "te_native" if inference_grouped_gemm_backend == "vllm" else None
+        with torch.no_grad(), set_batch_invariant_mode(True, backend=backend):
             training_output, _ = layer(hidden_states.clone())
             with InferenceMode.active():
                 inference_output, _ = layer(hidden_states.clone())

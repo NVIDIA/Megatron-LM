@@ -4,7 +4,7 @@
 # Forked from `fla/ops/gated_delta_product/chunk_deltaproduct_o.py` in
 # flash-linear-attention v0.5.1 (https://github.com/fla-org/flash-linear-attention).
 #
-# Licensed under the MIT license; see the LICENSE file in this directory.
+# Licensed under the MIT license; see the LICENSE file in the repository root.
 
 """Intra-chunk output for the Gated Delta Product.
 
@@ -16,6 +16,8 @@ apart.
 """
 
 import torch
+
+from megatron.core.ssm.ops.common.determinism import autotune_configs
 
 from .common import (
     HAVE_TRITON,
@@ -38,13 +40,15 @@ NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ],
+    configs=autotune_configs(
+        [
+            triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+            for BK in BKV_LIST
+            for BV in BKV_LIST
+            for num_warps in NUM_WARPS
+            for num_stages in [2, 3, 4]
+        ]
+    ),
     key=['H', 'K', 'V', 'BT'],
 )
 @triton.jit(do_not_specialize=['T'])
@@ -190,7 +194,9 @@ def chunk_gated_delta_product_fwd_o(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    o = v.new_empty(B, T, H, V).fill_(-float('inf'))
+    # Zeros, not a poison value: with a padded token dimension the tail belongs
+    # to no chunk program, and the padding contract requires it to read back zero.
+    o = v.new_zeros(B, T, H, V)
 
     def grid(meta):
         return (triton.cdiv(V, meta['BV']), NT, B * H)

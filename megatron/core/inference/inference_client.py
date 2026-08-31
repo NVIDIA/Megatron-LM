@@ -9,7 +9,10 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core.inference.async_stream import AsyncStream
-from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    serialize_multimodal_data,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
@@ -91,7 +94,11 @@ class InferenceClient:
         self.aborted_request_ids: set[int] = set()
 
     def add_request(
-        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        *,
+        multi_modal_data=None,
     ) -> asyncio.Future:
         """
         Submits a new inference request to the coordinator.
@@ -105,6 +112,17 @@ class InferenceClient:
             sampling_params: An object containing the sampling parameters for
                 text generation (e.g., temperature, top_p). It must have a
                 `serialize()` method.
+            multi_modal_data: Optional vLLM-style modality dictionary.
+
+                Images:
+                    ``"image"`` accepts raw image bytes, a list of raw image
+                    bytes, or a preprocessed image tensor dictionary.
+                Video:
+                    ``"video"`` accepts raw video bytes, a list of raw video
+                    bytes, or a preprocessed video tensor dictionary.
+                Audio:
+                    Audio does not yet have any supported data preprocessing
+                    or modeling formats.
 
         Returns:
             asyncio.Future: A future that will be resolved with a
@@ -115,12 +133,23 @@ class InferenceClient:
         self.next_request_id += 1
         frames = [
             msgpack.packb(
-                [Headers.SUBMIT_REQUEST.value, request_id, sampling_params.serialize()],
+                [
+                    Headers.SUBMIT_REQUEST.value,
+                    request_id,
+                    sampling_params.serialize(),
+                    serialize_multimodal_data(multi_modal_data),
+                ],
                 use_bin_type=True,
             ),
             # The prompt travels in its own frame so the coordinator can route the
             # request without decoding it -- at long prompts that decode dominates
             # its per-request cost, and it is one serial loop shared by every rank.
+            #
+            # Multimodal data stays in the metadata frame: the coordinator reads
+            # `media_cache_key` out of it for routing. It is the one field here not
+            # bounded by construction, so it could later move to its own body frame,
+            # but that is a change to multimodal routing rather than to the wire
+            # format, and is left alone here.
             self._pack_prompt(prompt),
         ]
         return self._submit_request(frames, request_id)
@@ -252,7 +281,11 @@ class InferenceClient:
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
 
     def add_request_streaming(
-        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        *,
+        multi_modal_data=None,
     ) -> AsyncStream[dict]:
         """Submit a streaming inference request.
 
@@ -272,6 +305,17 @@ class InferenceClient:
             prompt: A string or list of token IDs.
             sampling_params: Sampling parameters. ``streaming`` is set to True
                 in-place.
+            multi_modal_data: Optional vLLM-style modality dictionary.
+
+                Images:
+                    ``"image"`` accepts raw image bytes, a list of raw image
+                    bytes, or a preprocessed image tensor dictionary.
+                Video:
+                    ``"video"`` accepts raw video bytes, a list of raw video
+                    bytes, or a preprocessed video tensor dictionary.
+                Audio:
+                    Audio does not yet have any supported data preprocessing
+                    or modeling formats.
 
         Returns:
             AsyncStream[dict]: Per-step partial and final reply frames.
@@ -281,12 +325,23 @@ class InferenceClient:
         self.next_request_id += 1
         frames = [
             msgpack.packb(
-                [Headers.SUBMIT_REQUEST.value, request_id, sampling_params.serialize()],
+                [
+                    Headers.SUBMIT_REQUEST.value,
+                    request_id,
+                    sampling_params.serialize(),
+                    serialize_multimodal_data(multi_modal_data),
+                ],
                 use_bin_type=True,
             ),
             # The prompt travels in its own frame so the coordinator can route the
             # request without decoding it -- at long prompts that decode dominates
             # its per-request cost, and it is one serial loop shared by every rank.
+            #
+            # Multimodal data stays in the metadata frame: the coordinator reads
+            # `media_cache_key` out of it for routing. It is the one field here not
+            # bounded by construction, so it could later move to its own body frame,
+            # but that is a change to multimodal routing rather than to the wire
+            # format, and is left alone here.
             self._pack_prompt(prompt),
         ]
         return self._submit_stream(frames, request_id)
