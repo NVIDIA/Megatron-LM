@@ -1286,9 +1286,16 @@ class MTPLossLoggingHelper:
             )
 
     @staticmethod
-    def clean_loss_in_tracker():
-        """Clear per-step MTP loss and acceptance counters."""
+    def clean_loss_in_tracker(preserve_groups: bool = False):
+        """Clear per-step MTP loss and acceptance counters.
+
+        Args:
+            preserve_groups: Keep reduction groups for CUDA Graph replay, which
+                updates the captured tracker buffers without rerunning Python setup.
+        """
         tracker = MTPLossLoggingHelper.tracker
+        reduce_group = tracker.get("reduce_group") if preserve_groups else None
+        avg_group = tracker.get("avg_group") if preserve_groups else None
         if "loss_sums" in tracker:
             tracker["loss_sums"].zero_()
         if "num_tokens" in tracker:
@@ -1297,8 +1304,8 @@ class MTPLossLoggingHelper:
             tracker["values"].zero_()
         if "loss_values" in tracker:
             tracker["loss_values"].zero_()
-        tracker["reduce_group"] = None
-        tracker["avg_group"] = None
+        tracker["reduce_group"] = reduce_group
+        tracker["avg_group"] = avg_group
         MTPLossLoggingHelper._clean_acceptance_in_tracker()
 
     @staticmethod
@@ -1331,8 +1338,19 @@ class MTPLossLoggingHelper:
         tracker["values"] = values
 
     @staticmethod
-    def track_mtp_metrics(loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None):
-        """Track per-step MTP loss and acceptance metrics."""
+    def track_mtp_metrics(
+        loss_scale,
+        iteration,
+        writer,
+        wandb_writer=None,
+        total_loss_dict=None,
+        preserve_groups: bool = False,
+    ):
+        """Track per-step MTP loss and acceptance metrics.
+
+        Args:
+            preserve_groups: Keep reduction groups after logging for CUDA Graph replay.
+        """
         MTPLossLoggingHelper.reduce_loss_in_tracker()
         MTPLossLoggingHelper.reduce_metrics_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
@@ -1394,7 +1412,7 @@ class MTPLossLoggingHelper:
                     wandb_writer.log({f"{step_acc_name}": step_rate}, iteration)
                     wandb_writer.log({f"{cum_acc_name}": cum_rate}, iteration)
 
-        MTPLossLoggingHelper.clean_loss_in_tracker()
+        MTPLossLoggingHelper.clean_loss_in_tracker(preserve_groups=preserve_groups)
 
 
 def _mtp_logits_are_vocab_sharded(

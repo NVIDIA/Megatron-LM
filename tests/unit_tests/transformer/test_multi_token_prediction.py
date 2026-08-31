@@ -1904,6 +1904,52 @@ class TestMTPLossLoggingHelper:
         assert MTPLossLoggingHelper.tracker["reduce_group"] is None
         assert MTPLossLoggingHelper.tracker["avg_group"] is None
 
+    def test_track_mtp_metrics_preserves_all_reduces_for_graph_replay(self, monkeypatch):
+        """Graph replay retains both loss and acceptance reduction metadata."""
+        fake_group = object()
+        all_reduce_calls = []
+
+        def record_all_reduce(tensor, group=None, op=None):
+            all_reduce_calls.append((tensor.shape, group, op))
+
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+        monkeypatch.setattr(torch.distributed, "all_reduce", record_all_reduce)
+        MTPLossLoggingHelper.save_loss_to_tracker(
+            loss_sum=torch.tensor(3.0),
+            num_tokens=torch.tensor(2.0),
+            correct=torch.tensor(1.0),
+            total=torch.tensor(2.0),
+            layer_number=0,
+            num_layers=1,
+            avg_group=fake_group,
+            calculate_per_token_loss=True,
+        )
+
+        def track_metrics(iteration):
+            MTPLossLoggingHelper.track_mtp_metrics(
+                loss_scale=1.0, iteration=iteration, writer=None, preserve_groups=True
+            )
+
+        track_metrics(iteration=1)
+        assert [(group, op) for _, group, op in all_reduce_calls] == [
+            (fake_group, None),
+            (fake_group, torch.distributed.ReduceOp.SUM),
+        ]
+        assert MTPLossLoggingHelper.tracker["avg_group"] is fake_group
+        assert MTPLossLoggingHelper.tracker["acceptance_avg_group"] is fake_group
+
+        # A full-iteration graph replay updates these captured buffers without
+        # rerunning save_loss_to_tracker(), so only the tensors change here.
+        MTPLossLoggingHelper.tracker["loss_sums"].fill_(4.0)
+        MTPLossLoggingHelper.tracker["num_tokens"].fill_(2.0)
+        MTPLossLoggingHelper.tracker["acceptance_counts"].copy_(torch.tensor([[1.0], [2.0]]))
+        track_metrics(iteration=2)
+
+        assert [(group, op) for _, group, op in all_reduce_calls[2:]] == [
+            (fake_group, None),
+            (fake_group, torch.distributed.ReduceOp.SUM),
+        ]
+
     def test_microbatch_means_are_not_globally_token_weighted(self):
         """MTP logging preserves the pre-#4226 microbatch-normalized semantics."""
         MTPLossLoggingHelper.save_loss_to_tracker(

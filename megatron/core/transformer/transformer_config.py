@@ -1630,6 +1630,11 @@ class TransformerConfig(ModelParallelConfig):
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        # Full-iteration capture cannot include the per-step pipeline shape handshake. Enable
+        # the shared fixed-shape packed-P2P path before the base config validates its static
+        # token-capacity, padding, and sequence-parallel divisibility requirements.
+        if self.cuda_graph_impl == "full_iteration" and self.sequence_packing_scheduler is not None:
+            self.pipeline_p2p_fixed_shape = True
         super().__post_init__()
         # Dynamic CP can assign a multi-rank group even when configured CP is one.
         has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
@@ -4356,6 +4361,42 @@ class TransformerConfig(ModelParallelConfig):
                 "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
                 f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
             )
+            if self.cuda_graph_impl == "full_iteration":
+                # The full-iteration graph captures the whole forward_backward_func,
+                # so the entire batch path must satisfy the THD static-input
+                # contract: fixed per-rank token capacity, fixed cu_seqlens width,
+                # a fixed num_microbatches per step, and a static CP topology.
+                assert self.sequence_packing_scheduler is not None, (
+                    "THD full-iteration CUDA graph is only supported with a "
+                    "sequence packing scheduler."
+                )
+                assert not self.dynamic_context_parallel, (
+                    "THD full-iteration CUDA graph does not support dynamic context "
+                    "parallel; use a static CP topology."
+                )
+                assert self.max_seqlen_per_dp_cp_rank is not None, (
+                    "THD full-iteration CUDA graph requires --max-seqlen-per-dp-cp-rank "
+                    "to define the static per-rank token capacity."
+                )
+                assert (
+                    self.thd_max_packed_sequences is not None and self.thd_max_packed_sequences > 0
+                ), (
+                    "THD full-iteration CUDA graph requires a positive "
+                    "--thd-max-packed-sequences to define the static cu_seqlens width."
+                )
+                assert not self.mtp_standalone, (
+                    "THD full-iteration CUDA graph does not support standalone MTP: "
+                    "its PP shape handshake is not graph-capturable."
+                )
+                if self.context_parallel_size > 1:
+                    assert self.cuda_graph_warmup_steps > 0, (
+                        "THD full-iteration CUDA graph with context parallelism requires "
+                        "cuda_graph_warmup_steps > 0 so consumers can materialize "
+                        "host-derived device layout caches before graph capture."
+                    )
+                assert (
+                    self.pipeline_p2p_fixed_shape
+                ), "THD full-iteration CUDA graph requires fixed-shape pipeline communication."
 
         # 'extend_last' THD tail padding with context parallelism requires the
         # global metadata to be extended before CP slicing, which only the
