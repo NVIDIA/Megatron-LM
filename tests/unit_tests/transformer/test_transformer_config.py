@@ -1152,6 +1152,25 @@ def test_sequence_packing_moe_hybridep_with_max_padded_packs_needs_no_dispatch_p
     assert config.moe_hybridep_pad_variable_tokens is False
 
 
+@requires_te_2_9
+def test_sequence_packing_moe_hybridep_full_iteration_static_inputs_need_no_padding():
+    # THD full-iteration CUDA graphs require pad_packed_seq_alignment='max', which pads every
+    # rank to max_seqlen_per_dp_cp_rank, so the dispatcher ranks see equal token counts without
+    # the runtime all-reduce.
+    config = _make_packing_config(
+        num_moe_experts=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        cuda_graph_impl="full_iteration",
+        cuda_graph_modules=[],
+        pad_packed_seq_alignment="max",
+        thd_max_packed_sequences=8,
+    )
+
+    assert config.moe_hybridep_pad_variable_tokens is False
+    assert config.pipeline_p2p_fixed_shape is True
+
+
 @pytest.mark.parametrize(
     "dev_flag,main_flag", [(False, False), (True, False), (False, True), (True, True)]
 )

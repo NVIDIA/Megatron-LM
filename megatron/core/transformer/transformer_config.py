@@ -7553,6 +7553,12 @@ class TransformerConfig(ModelParallelConfig):
                     "THD full-iteration CUDA graph does not support standalone MTP: "
                     "its PP shape handshake is not graph-capturable."
                 )
+                if self.context_parallel_size > 1:
+                    assert self.cuda_graph_warmup_steps > 0, (
+                        "THD full-iteration CUDA graph with context parallelism requires "
+                        "cuda_graph_warmup_steps > 0 so consumers can materialize "
+                        "host-derived device layout caches before graph capture."
+                    )
                 assert (
                     self.pipeline_p2p_fixed_shape
                 ), "THD full-iteration CUDA graph requires fixed-shape pipeline communication."
