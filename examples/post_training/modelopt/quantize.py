@@ -275,8 +275,11 @@ def get_modelopt_torch_quantization_config():
     mtq_config = QUANT_CFG_CHOICES[args.export_quant_cfg]
 
     if isinstance(mtq_config["quant_cfg"], dict):
-        # Normalize old dict format to new list format
-        mtq_config["quant_cfg"] = mtq.normalize_quant_cfg_list(mtq_config["quant_cfg"])
+        # Preserve insertion order while converting the legacy mapping to the list format.
+        mtq_config["quant_cfg"] = [
+            {"quantizer_name": name, **config}
+            for name, config in mtq_config["quant_cfg"].items()
+        ]
 
     fp8_config = {"enable": True, "cfg": {"num_bits": (4, 3), "axis": None}}
     fp4_config = {
