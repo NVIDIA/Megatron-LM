@@ -186,6 +186,7 @@ jobs:
       cadence:        ${{ steps.configure.outputs.cadence }}
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
       selective_tests: ${{ steps.configure.outputs.selective_tests }}
+      latest_commit_tests: ${{ steps.configure.outputs.latest_commit_tests }}
       sha:            ${{ steps.resolve-sha.outputs.sha }}
       base_sha:       ${{ steps.resolve-sha.outputs.base_sha }}
     steps:
@@ -243,7 +244,8 @@ jobs:
 
           HAS_RUN_TESTS=$(echo "$LABELS"      | jq 'any(. == "Run tests")')
           HAS_RUN_FUNCTIONAL=$(echo "$LABELS" | jq 'any(. == "Run functional tests")')
-          HAS_SELECTIVE_TESTS=$(echo "$LABELS" | jq 'any(. == "Run selective unit tests")')
+          HAS_SELECTIVE_TESTS=$(echo "$LABELS" | jq 'any(. == "Run selective unit tests" or . == "Run selective unit tests on latest commit")')
+          HAS_LATEST_COMMIT_TESTS=$(echo "$LABELS" | jq 'any(. == "Run selective unit tests on latest commit")')
           HAS_LTS=$(echo "$LABELS"            | jq 'any(. == "container::lts")')
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
           HAS_NEMO_RL=$(echo "$LABELS"        | jq 'any(. == "Run NeMoRL tests")')
@@ -326,6 +328,7 @@ jobs:
           echo "cadence=$CADENCE_OUTPUT"        | tee -a $GITHUB_OUTPUT
           echo "cadence_bypass=$CADENCE_BYPASS" | tee -a $GITHUB_OUTPUT
           echo "selective_tests=$HAS_SELECTIVE_TESTS" | tee -a $GITHUB_OUTPUT
+          echo "latest_commit_tests=$HAS_LATEST_COMMIT_TESTS" | tee -a $GITHUB_OUTPUT
 
           # Pre-compute active row markers for the decision tree
           _MG=$( [ "$IS_MERGE_GROUP" == "true" ]                                                                           && echo "**→**" || echo "" )
@@ -734,6 +737,7 @@ jobs:
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
           IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push' }}
+          LATEST_COMMIT_TESTS: ${{ needs.configure.outputs.latest_commit_tests }}
           SELECTIVE_TESTS: ${{ needs.configure.outputs.selective_tests }}
         run: |
           if [[ "$SELECTIVE_TESTS" != "true" ]]; then
@@ -761,6 +765,16 @@ jobs:
             FORCE_FULL_REASON='selective testing is limited to pull-request pushes'
           elif [[ -z "$BASE_SHA" || "$BASE_SHA" == "null" ]]; then
             FORCE_FULL_REASON='the pull-request base SHA is unavailable'
+          fi
+
+          if [[ -z "$FORCE_FULL_REASON" && "$LATEST_COMMIT_TESTS" == "true" ]]; then
+            if ! PR_HEAD_SHA=$(git rev-parse --verify 'HEAD^2' 2>/dev/null); then
+              FORCE_FULL_REASON='the tested pull-request merge has no head parent'
+            elif ! BASE_SHA=$(git rev-parse --verify "${PR_HEAD_SHA}^1" 2>/dev/null); then
+              FORCE_FULL_REASON='the latest pull-request commit has no parent'
+            elif ! git checkout --detach "$PR_HEAD_SHA"; then
+              FORCE_FULL_REASON='the latest pull-request commit could not be checked out'
+            fi
           fi
 
           SELECTOR_ARGS=(
