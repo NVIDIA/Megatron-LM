@@ -204,6 +204,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_flex_dispatcher_num_sms": None,
     "moe_grad_scale_func": None,
     "moe_grouped_gemm": True,
+    "moe_use_grouped_tensor": False,
     "moe_hybridep_num_sms": None,
     "moe_hybridep_num_sms_preprocessing": 108,
     "moe_hybridep_num_blocks_permute": None,
