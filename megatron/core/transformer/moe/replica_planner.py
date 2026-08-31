@@ -77,6 +77,27 @@ except ImportError:
     HAVE_TRITON = False
 
 
+# Grid width for the planner's persistent and cooperative launches. It stays
+# below the resident-block limit of every supported device while keeping enough
+# programs to saturate one.
+_MAX_PLANNER_PROGRAMS = 128
+
+
+def _next_power_of_two(value: int) -> int:
+    """Round a positive dimension up to the power of two Triton tiles use."""
+    return 1 << (value - 1).bit_length()
+
+
+def _route_partition_count(num_routes: int) -> int:
+    """Return the route partitioning shared by route ranking and route mapping.
+
+    Route ranking uses a cooperative launch, which must keep the complete grid
+    resident. The default is safe on the validated GB300 workload and retains
+    substantially more parallelism than a conservative 64-program setting.
+    """
+    return min(_MAX_PLANNER_PROGRAMS, num_routes)
+
+
 def _discard_runtime_parameter_grad(parameter: torch.nn.Parameter) -> None:
     """Drop TE's throwaway leaf grad after its fused wgrad reaches runtime staging."""
     parameter.grad = None
@@ -125,16 +146,20 @@ class ReplicaPlannerWorkspace:
     balance: torch.Tensor
     receiver_quotas: torch.Tensor
     allocation: torch.Tensor
+    placement_grid_sync: torch.Tensor
+    # Per-expert destination segment ends, rebased into this rank's local
+    # ordinal space and padded to a power of two so the route mapper can
+    # binary-search them.
+    destination_boundaries: torch.Tensor
     # Inverse replica lookup produced by fused placement. This turns the
     # route mapper's replica-slot search into one indexed load.
     expert_replica_slots: torch.Tensor
-    # Stable expert-bucket order of the original flattened route positions.
-    sorted_route_indices: torch.Tensor
+    # Stable per-expert route ordinals, packed with the expert id and split
+    # into the partition-local part and the per-partition prefix.
     sort_route_metadata: torch.Tensor
     sort_partition_counts: torch.Tensor
     sort_grid_sync: torch.Tensor
     sort_stream: torch.cuda.Stream
-    local_count_cumsum: torch.Tensor
     # Planner outputs; these buffers are returned directly in ReplicaPlan.
     virtual_experts: torch.Tensor
     experts_to_copy: torch.Tensor
@@ -188,13 +213,15 @@ class ReplicaPlannerWorkspace:
             balance=torch.empty(ep_size, **int32),
             receiver_quotas=torch.empty((ep_size, ep_size), **int32),
             allocation=torch.empty((num_experts, ep_size), **int32),
+            placement_grid_sync=torch.zeros(2, **int32),
+            destination_boundaries=torch.empty((num_experts, _next_power_of_two(ep_size)), **int32),
             expert_replica_slots=torch.empty((num_experts, ep_size), **int32),
-            sorted_route_indices=torch.empty(num_routes, dtype=torch.int64, device=device),
             sort_route_metadata=torch.empty(num_routes, **int32),
-            sort_partition_counts=torch.empty((256, num_experts), **int32),
+            sort_partition_counts=torch.empty(
+                (_route_partition_count(num_routes), num_experts), **int32
+            ),
             sort_grid_sync=torch.zeros(2, **int32),
             sort_stream=torch.cuda.Stream(device=device),
-            local_count_cumsum=torch.empty(num_experts, **int32),
             virtual_experts=torch.empty(
                 (num_tokens, router_topk), dtype=torch.int64, device=device
             ),
@@ -1598,196 +1625,6 @@ def wait_replica_grad_reduce_after_dispatch_backward(
 
 
 @triton.jit
-def _initialize_allocation_kernel(
-    gathered_tokens_per_expert,
-    global_tokens_per_expert,
-    expert_rank_allocations,
-    EP_SIZE: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr,
-    NUM_EXPERTS_PER_GPU: tl.constexpr,
-    BLOCK_EP_SIZE: tl.constexpr,
-):
-    """Sum per-source counts and initialize every expert on its owner rank.
-
-    ``expert_rank_allocations[expert, destination]`` records how many routes
-    the destination will execute for that semantic expert. Initially the
-    native owner executes all routes; later kernels migrate portions of
-    overloaded experts elsewhere.
-    """
-    expert = tl.program_id(0)
-    ranks = tl.arange(0, BLOCK_EP_SIZE)
-    counts = tl.load(
-        gathered_tokens_per_expert + ranks * NUM_EXPERTS + expert, mask=ranks < EP_SIZE, other=0
-    )
-    total = tl.sum(counts, axis=0).to(tl.int32)
-    tl.store(global_tokens_per_expert + expert, total)
-    owner = expert // NUM_EXPERTS_PER_GPU
-    values = tl.where(ranks == owner, total, 0)
-    tl.store(expert_rank_allocations + expert * EP_SIZE + ranks, values, mask=ranks < EP_SIZE)
-
-
-@triton.jit
-def _compute_group_balance_kernel(
-    global_tokens_per_expert,
-    rank_load_balance,
-    RANK_ROUTE_CAPACITY: tl.constexpr,
-    NUM_EXPERTS_PER_GPU: tl.constexpr,
-    BLOCK_NUM_EXPERTS_PER_GPU: tl.constexpr,
-):
-    """Compute native expert-group load relative to one rank's route capacity.
-
-    A positive balance means an owner's native experts have more than the
-    per-rank route capacity and must shed work. A negative balance is free
-    capacity that can host replicas for an overloaded owner.
-    """
-    owner = tl.program_id(0)
-    local_experts = tl.arange(0, BLOCK_NUM_EXPERTS_PER_GPU)
-    counts = tl.load(
-        global_tokens_per_expert + owner * NUM_EXPERTS_PER_GPU + local_experts,
-        mask=local_experts < NUM_EXPERTS_PER_GPU,
-        other=0,
-    )
-    tl.store(rank_load_balance + owner, tl.sum(counts, axis=0).to(tl.int32) - RANK_ROUTE_CAPACITY)
-
-
-@triton.jit
-def _choose_receiver_quotas_kernel(
-    rank_load_balance, receiver_quotas, EP_SIZE: tl.constexpr, BLOCK_EP_SIZE: tl.constexpr
-):
-    """Greedily pair the lowest-index most-loaded and roomiest ranks.
-
-    This is the rank-level balancing step. Equal balances choose the
-    lowest rank, making the quota matrix identical on every EP rank.
-    ``quotas[owner, receiver]`` records how many routes the receiver should
-    take from that owner's experts; it does not choose the experts yet.
-    """
-    ranks = tl.arange(0, BLOCK_EP_SIZE)
-    valid = ranks < EP_SIZE
-    current_balance = tl.load(rank_load_balance + ranks, mask=valid, other=0)
-    quota_owners = ranks[:, None]
-    quota_destinations = ranks[None, :]
-    tl.store(
-        receiver_quotas + quota_owners * EP_SIZE + quota_destinations,
-        0,
-        mask=valid[:, None] & valid[None, :],
-    )
-
-    for _ in tl.static_range(0, EP_SIZE):
-        maximum = tl.max(tl.where(valid, current_balance, -2147483648), axis=0)
-        minimum = tl.min(tl.where(valid, current_balance, 2147483647), axis=0)
-        overloaded = tl.min(
-            tl.where(valid & (current_balance == maximum), ranks, BLOCK_EP_SIZE), axis=0
-        )
-        receiver = tl.min(
-            tl.where(valid & (current_balance == minimum), ranks, BLOCK_EP_SIZE), axis=0
-        )
-        active = maximum > 0
-        moved = tl.where(active, -minimum, 0).to(tl.int32)
-        tl.store(receiver_quotas + overloaded * EP_SIZE + receiver, moved, mask=active)
-        current_balance = tl.where(
-            active & (ranks == overloaded), current_balance - moved, current_balance
-        )
-        current_balance = tl.where(active & (ranks == receiver), 0, current_balance)
-
-
-@triton.jit
-def _allocate_migrations_kernel(
-    global_tokens_per_expert,
-    receiver_quotas,
-    expert_rank_allocations,
-    EP_SIZE: tl.constexpr,
-    NUM_EXPERTS_PER_GPU: tl.constexpr,
-    BLOCK_EP_SIZE: tl.constexpr,
-    BLOCK_NUM_EXPERTS_PER_GPU: tl.constexpr,
-):
-    """Assign each owner rank's receive quotas to its largest expert segments.
-
-    For one owner, repeatedly pair its largest outstanding receiver quota with
-    its largest remaining expert segment. Expert ties choose the lowest local
-    expert id, matching the reference placement policy. A semantic expert may
-    therefore be split between its owner and one or more replica destinations.
-    """
-    owner = tl.program_id(0)
-    ranks = tl.arange(0, BLOCK_EP_SIZE)
-    local_experts = tl.arange(0, BLOCK_NUM_EXPERTS_PER_GPU)
-    valid_ranks = ranks < EP_SIZE
-    valid_local_experts = local_experts < NUM_EXPERTS_PER_GPU
-    remaining = tl.load(
-        global_tokens_per_expert + owner * NUM_EXPERTS_PER_GPU + local_experts,
-        mask=valid_local_experts,
-        other=0,
-    ).to(tl.int32)
-    quotas = tl.load(receiver_quotas + owner * EP_SIZE + ranks, mask=valid_ranks, other=0).to(
-        tl.int32
-    )
-
-    for _ in tl.static_range(0, EP_SIZE + NUM_EXPERTS_PER_GPU):
-        max_quota = tl.max(tl.where(valid_ranks, quotas, -1), axis=0)
-        destination = tl.min(
-            tl.where(valid_ranks & (quotas == max_quota), ranks, BLOCK_EP_SIZE), axis=0
-        )
-        max_remaining = tl.max(tl.where(valid_local_experts, remaining, -1), axis=0)
-        local_expert = tl.min(
-            tl.where(
-                valid_local_experts & (remaining == max_remaining),
-                local_experts,
-                BLOCK_NUM_EXPERTS_PER_GPU,
-            ),
-            axis=0,
-        )
-        active = max_quota > 0
-        moved = tl.where(active, tl.minimum(max_quota, max_remaining), 0).to(tl.int32)
-        expert = owner * NUM_EXPERTS_PER_GPU + local_expert
-
-        remote_ptr = expert_rank_allocations + expert * EP_SIZE + destination
-        owner_ptr = expert_rank_allocations + expert * EP_SIZE + owner
-        remote_value = tl.load(remote_ptr, mask=active, other=0)
-        owner_value = tl.load(owner_ptr, mask=active, other=0)
-        tl.store(remote_ptr, remote_value + moved, mask=active)
-        tl.store(owner_ptr, owner_value - moved, mask=active)
-        remaining = tl.where(active & (local_experts == local_expert), remaining - moved, remaining)
-        quotas = tl.where(active & (ranks == destination), quotas - moved, quotas)
-
-
-@triton.jit
-def _select_replica_experts_kernel(
-    expert_rank_allocations,
-    experts_to_copy,
-    expert_replica_slots,
-    EP_SIZE: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr,
-    NUM_EXPERTS_PER_GPU: tl.constexpr,
-    BLOCK_NUM_EXPERTS: tl.constexpr,
-):
-    """Select destination replica slots by count descending, expert id descending.
-
-    Only remote experts with a positive allocation need copied weights. The
-    ordering is observable because it defines replica-slot ids, so the expert
-    id tie-break deliberately runs in descending order for deterministic parity.
-    Unused slots are filled with ``-1``.
-    """
-    destination = tl.program_id(0)
-    experts = tl.arange(0, BLOCK_NUM_EXPERTS)
-    owner = experts // NUM_EXPERTS_PER_GPU
-    valid = (experts < NUM_EXPERTS) & (owner != destination)
-    counts = tl.load(
-        expert_rank_allocations + experts * EP_SIZE + destination, mask=valid, other=-1
-    )
-
-    for slot in tl.static_range(0, NUM_EXPERTS_PER_GPU):
-        maximum = tl.max(tl.where(valid, counts, -1), axis=0)
-        expert = tl.max(tl.where(valid & (counts == maximum), experts, -1), axis=0)
-        selected = tl.where(maximum > 0, expert, -1).to(tl.int32)
-        tl.store(experts_to_copy + destination * NUM_EXPERTS_PER_GPU + slot, selected)
-        tl.store(
-            expert_replica_slots + selected * EP_SIZE + destination,
-            slot,
-            mask=selected >= 0,
-        )
-        counts = tl.where(experts == expert, -1, counts)
-
-
-@triton.jit
 def _cooperative_grid_barrier(grid_sync, num_programs):
     """Synchronize a cooperatively launched Triton grid."""
     generation = tl.atomic_add(grid_sync + 1, 0, sem="acquire", scope="gpu")
@@ -1803,10 +1640,172 @@ def _cooperative_grid_barrier(grid_sync, num_programs):
 
 
 @triton.jit
-def _stable_route_bucket_sort_kernel(
+def _plan_replica_placement_kernel(
+    gathered_tokens_per_expert,
+    global_tokens_per_expert,
+    rank_load_balance,
+    receiver_quotas,
+    expert_rank_allocations,
+    destination_boundaries,
+    experts_to_copy,
+    expert_replica_slots,
+    grid_sync,
+    RANK_ROUTE_CAPACITY: tl.constexpr,
+    SOURCE_EP_RANK: tl.constexpr,
+    EP_SIZE: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    NUM_EXPERTS_PER_GPU: tl.constexpr,
+    BLOCK_EP_SIZE: tl.constexpr,
+    BLOCK_NUM_EXPERTS_PER_GPU: tl.constexpr,
+    BLOCK_NUM_EXPERTS: tl.constexpr,
+):
+    """Compute the whole deterministic placement in one cooperative launch.
+
+    Program ``rank`` owns the semantic experts of one EP rank and the replica
+    slots of that same rank. It runs the four placement steps in order, with a
+    grid barrier wherever a step needs a value another program produced:
+
+    1. Sum the gathered histograms for its native experts and publish the
+       resulting group balance relative to one rank's route capacity.
+    2. Replay the deterministic rank-pairing greedy over all balances. Every
+       program derives the identical quota matrix, so only the row this program
+       owns has to be kept and stored.
+    3. Split its own quotas across its native experts. The allocation rows this
+       step rewrites belong to this program alone, so the whole
+       ``[expert, destination]`` tile stays in registers.
+    4. After the allocation is globally visible, rank the remote experts routed
+       to this program and record them in its replica slots.
+
+    Step 3 also emits the route mapper's search table. Each expert's routes
+    form one global stream ordered by source rank, so subtracting the routes
+    contributed by lower source ranks rebases the destination segment ends
+    into the local ordinal space the mapper works in.
+
+    Keeping the steps in one kernel removes four launches and, more
+    importantly, keeps the quota vector and the allocation tile in registers
+    instead of round-tripping them through global memory once per greedy step.
+    The greedy loops stay rolled: their bodies work on whole tiles, so
+    unrolling them multiplies the instruction footprint without exposing any
+    parallelism the sequential dependency would allow.
+    """
+    rank = tl.program_id(0)
+    ranks = tl.arange(0, BLOCK_EP_SIZE)
+    valid_ranks = ranks < EP_SIZE
+    local_experts = tl.arange(0, BLOCK_NUM_EXPERTS_PER_GPU)
+    valid_local_experts = local_experts < NUM_EXPERTS_PER_GPU
+    native_experts = rank * NUM_EXPERTS_PER_GPU + local_experts
+
+    # Step 1: global route totals for this rank's native experts, and the
+    # amount by which their sum exceeds one rank's route capacity.
+    source_counts = tl.load(
+        gathered_tokens_per_expert + ranks[:, None] * NUM_EXPERTS + native_experts[None, :],
+        mask=valid_ranks[:, None] & valid_local_experts[None, :],
+        other=0,
+    )
+    native_totals = tl.sum(source_counts, axis=0).to(tl.int32)
+    routes_before_source = tl.sum(
+        tl.where(ranks[:, None] < SOURCE_EP_RANK, source_counts, 0), axis=0
+    ).to(tl.int32)
+    tl.store(global_tokens_per_expert + native_experts, native_totals, mask=valid_local_experts)
+    tl.store(
+        rank_load_balance + rank,
+        tl.sum(native_totals, axis=0).to(tl.int32) - RANK_ROUTE_CAPACITY,
+    )
+
+    _cooperative_grid_barrier(grid_sync, EP_SIZE)
+
+    # Step 2: greedily pair the lowest-index most-loaded and roomiest ranks.
+    # Equal balances choose the lowest rank, making the quota matrix identical
+    # on every EP rank. quotas[owner, receiver] records how many routes the
+    # receiver should take from that owner's experts; it does not choose the
+    # experts yet.
+    balances = tl.load(rank_load_balance + ranks, mask=valid_ranks, other=0)
+    quotas = tl.zeros((BLOCK_EP_SIZE,), dtype=tl.int32)
+    for _ in tl.range(0, EP_SIZE, 1, loop_unroll_factor=1):
+        maximum = tl.max(tl.where(valid_ranks, balances, -2147483648), axis=0)
+        minimum = tl.min(tl.where(valid_ranks, balances, 2147483647), axis=0)
+        overloaded = tl.min(
+            tl.where(valid_ranks & (balances == maximum), ranks, BLOCK_EP_SIZE), axis=0
+        )
+        receiver = tl.min(
+            tl.where(valid_ranks & (balances == minimum), ranks, BLOCK_EP_SIZE), axis=0
+        )
+        active = maximum > 0
+        moved = tl.where(active, -minimum, 0).to(tl.int32)
+        quotas = tl.where(active & (overloaded == rank) & (ranks == receiver), moved, quotas)
+        balances = tl.where(active & (ranks == overloaded), balances - moved, balances)
+        balances = tl.where(active & (ranks == receiver), 0, balances)
+    tl.store(receiver_quotas + rank * EP_SIZE + ranks, quotas, mask=valid_ranks)
+
+    # Step 3: assign this rank's receive quotas to its largest expert segments.
+    # Repeatedly pair the largest outstanding receiver quota with the largest
+    # remaining expert segment. Expert ties choose the lowest local expert id,
+    # matching the reference placement policy. A semantic expert may therefore
+    # be split between its owner and one or more replica destinations.
+    # allocations[local_expert, destination] starts with the native owner
+    # executing every route and is migrated away from there in place.
+    remaining = native_totals
+    allocations = tl.where(ranks[None, :] == rank, native_totals[:, None], 0)
+    for _ in tl.range(0, EP_SIZE + NUM_EXPERTS_PER_GPU, 1, loop_unroll_factor=1):
+        max_quota = tl.max(tl.where(valid_ranks, quotas, -1), axis=0)
+        destination = tl.min(
+            tl.where(valid_ranks & (quotas == max_quota), ranks, BLOCK_EP_SIZE), axis=0
+        )
+        max_remaining = tl.max(tl.where(valid_local_experts, remaining, -1), axis=0)
+        local_expert = tl.min(
+            tl.where(
+                valid_local_experts & (remaining == max_remaining),
+                local_experts,
+                BLOCK_NUM_EXPERTS_PER_GPU,
+            ),
+            axis=0,
+        )
+        active = max_quota > 0
+        moved = tl.where(active, tl.minimum(max_quota, max_remaining), 0).to(tl.int32)
+        # One pass over the tile: the migrated routes leave the owner column
+        # and arrive in the destination column of the same expert row.
+        transfer = tl.where(
+            ranks[None, :] == destination, moved, tl.where(ranks[None, :] == rank, -moved, 0)
+        )
+        allocations += tl.where((local_experts[:, None] == local_expert) & active, transfer, 0)
+        remaining = tl.where(active & (local_experts == local_expert), remaining - moved, remaining)
+        quotas = tl.where(active & (ranks == destination), quotas - moved, quotas)
+    tl.store(
+        expert_rank_allocations + native_experts[:, None] * EP_SIZE + ranks[None, :],
+        allocations,
+        mask=valid_local_experts[:, None] & valid_ranks[None, :],
+    )
+    tl.store(
+        destination_boundaries + native_experts[:, None] * BLOCK_EP_SIZE + ranks[None, :],
+        tl.cumsum(allocations, axis=1) - routes_before_source[:, None],
+        mask=valid_local_experts[:, None],
+    )
+
+    _cooperative_grid_barrier(grid_sync, EP_SIZE)
+
+    # Step 4: fill this rank's replica slots by count descending, expert id
+    # descending. Only remote experts with a positive allocation need copied
+    # weights. The ordering is observable because it defines replica-slot ids,
+    # so the expert id tie-break deliberately runs in descending order for
+    # deterministic parity. Unused slots are filled with -1.
+    experts = tl.arange(0, BLOCK_NUM_EXPERTS)
+    owner = experts // NUM_EXPERTS_PER_GPU
+    valid_remote = (experts < NUM_EXPERTS) & (owner != rank)
+    counts = tl.load(
+        expert_rank_allocations + experts * EP_SIZE + rank, mask=valid_remote, other=-1
+    )
+    for slot in tl.range(0, NUM_EXPERTS_PER_GPU, 1, loop_unroll_factor=1):
+        maximum = tl.max(tl.where(valid_remote, counts, -1), axis=0)
+        expert = tl.max(tl.where(valid_remote & (counts == maximum), experts, -1), axis=0)
+        selected = tl.where(maximum > 0, expert, -1).to(tl.int32)
+        tl.store(experts_to_copy + rank * NUM_EXPERTS_PER_GPU + slot, selected)
+        tl.store(expert_replica_slots + selected * EP_SIZE + rank, slot, mask=selected >= 0)
+        counts = tl.where(experts == expert, -1, counts)
+
+
+@triton.jit
+def _rank_routes_within_experts_kernel(
     flat_topk_indices,
-    local_tokens_per_expert_cumsum,
-    sorted_route_indices,
     route_metadata,
     partition_counts,
     grid_sync,
@@ -1814,20 +1813,20 @@ def _stable_route_bucket_sort_kernel(
     NUM_EXPERTS: tl.constexpr,
     BLOCK_NUM_EXPERTS: tl.constexpr,
     BLOCK_NUM_ROUTES: tl.constexpr,
-    BLOCK_WRITE_ROUTES: tl.constexpr,
     BLOCK_SCAN_PARTITIONS: tl.constexpr,
-    NUM_PARTITION_CHUNKS: tl.constexpr,
     NUM_SCAN_EXPERTS: tl.constexpr,
 ):
-    """Stably group route positions by expert without radix-sort scratch.
+    """Give every route its stable ordinal within its expert's local stream.
 
     A cooperative grid splits the original route stream into consecutive
     partitions. The first pass computes each route's partition-local ordinal
     and packs it with the expert id in one int32 scratch value. Programs then
-    publish their histograms, synchronize, prefix-scan the partition counts,
-    and scatter original positions to their final buckets. Consequently the
-    result is identical to sorting unique ``expert * NUM_ROUTES + position``
-    keys.
+    publish their histograms, synchronize, and prefix-scan the partition
+    counts. A route's local ordinal is therefore
+    ``partition_counts[partition, expert] + partition_local_ordinal``, which is
+    exactly its position within the expert bucket a stable sort would produce.
+    The route mapper reconstructs it from the same partitioning, so no sorted
+    index array is ever materialized.
     """
     partition = tl.program_id(0)
     num_partitions = tl.num_programs(0)
@@ -1893,80 +1892,41 @@ def _stable_route_bucket_sort_kernel(
     _cooperative_grid_barrier(grid_sync, num_partitions)
 
     # Transpose the prefix work: programs scan expert columns across route
-    # partitions, then publish all exclusive offsets through a second barrier.
+    # partitions and publish the exclusive offsets in place.
     partition_offsets = tl.arange(0, BLOCK_SCAN_PARTITIONS)
+    valid_partitions = partition_offsets < num_partitions
     for scan_expert_offset in tl.static_range(0, NUM_SCAN_EXPERTS):
         scan_expert = partition + scan_expert_offset * num_partitions
-        valid_scan_expert = scan_expert < NUM_EXPERTS
-        preceding_chunks = tl.zeros((), dtype=tl.int32)
-        for chunk in tl.static_range(0, NUM_PARTITION_CHUNKS):
-            chunk_partitions = chunk * BLOCK_SCAN_PARTITIONS + partition_offsets
-            valid_partitions = chunk_partitions < num_partitions
-            counts_for_expert = tl.load(
-                partition_counts + chunk_partitions * NUM_EXPERTS + scan_expert,
-                mask=valid_scan_expert & valid_partitions,
-                other=0,
-            )
-            inclusive_prefix = tl.cumsum(counts_for_expert, axis=0) + preceding_chunks
-            tl.store(
-                partition_counts + chunk_partitions * NUM_EXPERTS + scan_expert,
-                inclusive_prefix - counts_for_expert,
-                mask=valid_scan_expert & valid_partitions,
-            )
-            preceding_chunks += tl.sum(counts_for_expert, axis=0)
-
-    _cooperative_grid_barrier(grid_sync, num_partitions)
-
-    expert_starts = tl.load(
-        local_tokens_per_expert_cumsum + expert_offsets - 1,
-        mask=valid_experts & (expert_offsets > 0),
-        other=0,
-    ).to(tl.int32)
-    running_counts = tl.load(
-        partition_counts + partition * NUM_EXPERTS + expert_offsets, mask=valid_experts, other=0
-    )
-
-    write_tile_offsets = tl.arange(0, BLOCK_WRITE_ROUTES)
-
-    for route_start in tl.range(
-        partition_start, partition_end, BLOCK_WRITE_ROUTES, loop_unroll_factor=1
-    ):
-        route_positions = route_start + write_tile_offsets
-        valid_routes = route_positions < partition_end
-        packed_metadata = tl.load(route_metadata + route_positions, mask=valid_routes, other=0).to(
-            tl.int32
+        valid_scan = valid_partitions & (scan_expert < NUM_EXPERTS)
+        counts_for_expert = tl.load(
+            partition_counts + partition_offsets * NUM_EXPERTS + scan_expert,
+            mask=valid_scan,
+            other=0,
         )
-        route_experts = packed_metadata % BLOCK_NUM_EXPERTS
-        local_ordinals = packed_metadata // BLOCK_NUM_EXPERTS
-        safe_route_experts = tl.where(valid_routes, route_experts, 0)
-        route_expert_starts = tl.gather(expert_starts, safe_route_experts, axis=0)
-        route_running_counts = tl.gather(running_counts, safe_route_experts, axis=0)
-        output_offsets = route_expert_starts + route_running_counts + local_ordinals
-        tl.store(sorted_route_indices + output_offsets, route_positions, mask=valid_routes)
+        tl.store(
+            partition_counts + partition_offsets * NUM_EXPERTS + scan_expert,
+            tl.cumsum(counts_for_expert, axis=0) - counts_for_expert,
+            mask=valid_scan,
+        )
 
 
-def _launch_stable_route_bucket_sort(
+def _launch_route_ranking(
     workspace: ReplicaPlannerWorkspace,
     flat_topk_indices: torch.Tensor,
     *,
     num_experts: int,
     num_routes: int,
 ) -> None:
-    """Launch the one-kernel stable expert-bucket route ordering."""
+    """Launch the one-kernel stable per-expert route ranking.
 
-    # A cooperative launch must keep the complete grid resident.  The old
-    # fixed 256-program launch can exceed the device's occupancy limit for
-    # this register-heavy kernel, which then poisons the CUDA context and is
-    # often reported by Triton at a later module-load call.  The 128-program
-    # default is safe on the validated GB300 workload and retains substantially
-    # more parallelism than the conservative 64-program debug setting.
-    num_programs = min(128, num_routes)
-    grid = (num_programs,)
-
-    _stable_route_bucket_sort_kernel[grid](
+    The intra-tile ranking reads ``match.sync`` lane masks and splits its
+    histogram into a first and a second warp, so the tile must be exactly two
+    warps wide: ``BLOCK_NUM_ROUTES`` and ``num_warps`` below are a correctness
+    constraint, not a tuning choice.
+    """
+    num_programs = _route_partition_count(num_routes)
+    _rank_routes_within_experts_kernel[(num_programs,)](
         flat_topk_indices,
-        workspace.local_count_cumsum,
-        workspace.sorted_route_indices,
         workspace.sort_route_metadata,
         workspace.sort_partition_counts,
         workspace.sort_grid_sync,
@@ -1974,9 +1934,7 @@ def _launch_stable_route_bucket_sort(
         NUM_EXPERTS=num_experts,
         BLOCK_NUM_EXPERTS=triton.next_power_of_2(num_experts),
         BLOCK_NUM_ROUTES=64,
-        BLOCK_WRITE_ROUTES=128,
-        BLOCK_SCAN_PARTITIONS=128,
-        NUM_PARTITION_CHUNKS=2,
+        BLOCK_SCAN_PARTITIONS=_next_power_of_two(num_programs),
         NUM_SCAN_EXPERTS=triton.cdiv(num_experts, num_programs),
         launch_cooperative_grid=True,
         num_warps=2,
@@ -1985,81 +1943,194 @@ def _launch_stable_route_bucket_sort(
 
 @triton.jit
 def _map_virtual_experts_kernel(
-    flat_topk_indices,
-    sorted_route_indices,
-    local_tokens_per_expert_cumsum,
-    gathered_tokens_per_expert,
-    expert_rank_allocations,
+    route_metadata,
+    partition_counts,
+    destination_boundaries,
     expert_replica_slots,
     virtual_experts,
-    SOURCE_EP_RANK: tl.constexpr,
-    EP_SIZE: tl.constexpr,
+    NUM_ROUTES: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     NUM_EXPERTS_PER_GPU: tl.constexpr,
-    NUM_ROUTES: tl.constexpr,
+    EP_SIZE: tl.constexpr,
+    BLOCK_NUM_EXPERTS: tl.constexpr,
     BLOCK_NUM_ROUTES: tl.constexpr,
+    BLOCK_EP_SIZE: tl.constexpr,
+    LOG2_BLOCK_EP_SIZE: tl.constexpr,
 ):
-    """Map globally ordered expert routes to rank-major native or replica ids.
+    """Map every local route to its rank-major native or replica expert id.
 
     Routes for each expert form one deterministic global stream: source ranks
     are concatenated in rank order, and routes within a source use flattened
-    token/top-k order. ``expert_rank_allocations[expert]`` partitions that
-    stream into destination segments in rank order. This kernel computes each
-    local route's global ordinal, finds its segment, and converts the
-    destination to the transport's native-or-replica virtual id.
+    token/top-k order. ``destination_boundaries`` holds that stream's partition
+    points already rebased into this rank's local ordinal space, so a route's
+    destination is simply the number of boundaries it has passed. Because the
+    boundaries are non-decreasing, the search is a branchless binary search
+    instead of a scan over every rank.
+
+    The grid matches the route-ranking partitioning so this kernel can finish
+    the ranking with a single indexed load, read its input sequentially, and
+    write ``virtual_experts`` in route order.
     """
-    positions = tl.program_id(0) * BLOCK_NUM_ROUTES + tl.arange(0, BLOCK_NUM_ROUTES)
-    valid = positions < NUM_ROUTES
-
-    # sorted in increasing expert number,
-    routes = tl.load(sorted_route_indices + positions, mask=valid, other=0)
-    # for each token in 'routes' which expert does it belong to?
-    experts = tl.load(flat_topk_indices + routes, mask=valid, other=0).to(tl.int64)
-    # for each token in 'routes', how many tokens before it for this gpu
-    before_local = tl.load(
-        local_tokens_per_expert_cumsum + experts - 1, mask=valid & (experts > 0), other=0
+    partition = tl.program_id(0)
+    num_partitions = tl.num_programs(0)
+    routes_per_partition = tl.cdiv(NUM_ROUTES, num_partitions)
+    partition_start = partition * routes_per_partition
+    partition_end = tl.minimum(partition_start + routes_per_partition, NUM_ROUTES)
+    expert_offsets = tl.arange(0, BLOCK_NUM_EXPERTS)
+    routes_before_partition = tl.load(
+        partition_counts + partition * NUM_EXPERTS + expert_offsets,
+        mask=expert_offsets < NUM_EXPERTS,
+        other=0,
     )
-    # encodes for each token, i am the nth token for my expert
-    local_ordinal = positions - before_local
+    tile_offsets = tl.arange(0, BLOCK_NUM_ROUTES)
 
-    # Counts from lower source ranks precede this rank's routes in the global
-    # per-expert stream. SOURCE_EP_RANK is constexpr, so this loop is unrolled.
-    before_rank = tl.zeros((BLOCK_NUM_ROUTES,), dtype=tl.int32)
-    for source in tl.static_range(0, SOURCE_EP_RANK):
-        before_rank += tl.load(
-            gathered_tokens_per_expert + source * NUM_EXPERTS + experts, mask=valid, other=0
+    for route_start in tl.range(
+        partition_start, partition_end, BLOCK_NUM_ROUTES, loop_unroll_factor=1
+    ):
+        route_positions = route_start + tile_offsets
+        valid_routes = route_positions < partition_end
+        packed_metadata = tl.load(route_metadata + route_positions, mask=valid_routes, other=0).to(
+            tl.int32
         )
-    global_ordinal = local_ordinal + before_rank
-
-    # expert_rank_allocations is a prefix partition of each expert's global
-    # stream. The first boundary above the ordinal selects its destination.
-    cumulative = tl.zeros((BLOCK_NUM_ROUTES,), dtype=tl.int32)
-    destination = tl.zeros((BLOCK_NUM_ROUTES,), dtype=tl.int32)
-    unresolved = valid
-    for rank in tl.static_range(0, EP_SIZE):
-        cumulative += tl.load(
-            expert_rank_allocations + experts * EP_SIZE + rank, mask=valid, other=0
+        experts = packed_metadata % BLOCK_NUM_EXPERTS
+        ordinals_in_partition = packed_metadata // BLOCK_NUM_EXPERTS
+        safe_experts = tl.where(valid_routes, experts, 0)
+        # This route is the nth of its expert among all routes on this rank.
+        local_ordinal = (
+            tl.gather(routes_before_partition, safe_experts, axis=0) + ordinals_in_partition
         )
-        # for the nth token of an expert, if this rank is expected to carry more
-        # than n tokens from this expert, mark this rank as needed
-        choose = unresolved & (global_ordinal < cumulative)
-        destination = tl.where(choose, rank, destination)
-        unresolved = unresolved & ~choose
 
-    # Native routes use the owner's local expert id. Remote routes look up the
-    # slot holding that expert's copied weights on the selected destination.
-    owner = experts // NUM_EXPERTS_PER_GPU
-    owned_local = experts % NUM_EXPERTS_PER_GPU
-    replica_slot = tl.load(
-        expert_replica_slots + experts * EP_SIZE + destination,
-        mask=valid & (destination != owner),
-        other=-1,
-    ).to(tl.int64)
-    runtime_local = tl.where(
-        destination == owner, owned_local, NUM_EXPERTS_PER_GPU + replica_slot
-    )
-    virtual = destination.to(tl.int64) * (2 * NUM_EXPERTS_PER_GPU) + runtime_local
-    tl.store(virtual_experts + routes, virtual, mask=valid)
+        # Count the destination segments this ordinal has already passed. The
+        # boundary row is padded up to BLOCK_EP_SIZE with the expert's local
+        # route total, which no ordinal reaches, so the count never exceeds the
+        # last real rank.
+        boundary_base = destination_boundaries + safe_experts * BLOCK_EP_SIZE
+        destination = tl.zeros((BLOCK_NUM_ROUTES,), dtype=tl.int32)
+        for step in tl.static_range(0, LOG2_BLOCK_EP_SIZE):
+            candidate = destination + (BLOCK_EP_SIZE >> (step + 1))
+            boundary = tl.load(boundary_base + candidate - 1)
+            destination = tl.where(local_ordinal >= boundary, candidate, destination)
+
+        # Native routes use the owner's local expert id. Remote routes look up
+        # the slot holding that expert's copied weights on the destination.
+        owner = experts // NUM_EXPERTS_PER_GPU
+        owned_local = experts % NUM_EXPERTS_PER_GPU
+        replica_slot = tl.load(
+            expert_replica_slots + safe_experts * EP_SIZE + destination,
+            mask=valid_routes & (destination != owner),
+            other=-1,
+        )
+        runtime_local = tl.where(
+            destination == owner, owned_local, NUM_EXPERTS_PER_GPU + replica_slot
+        )
+        virtual = destination.to(tl.int64) * (2 * NUM_EXPERTS_PER_GPU) + runtime_local
+        tl.store(virtual_experts + route_positions, virtual, mask=valid_routes)
+
+
+@triton.jit
+def _compact_routing_map_kernel(
+    routing_map,
+    token_indices,
+    tokens_per_expert,
+    num_tokens,
+    ROUTER_TOPK: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    BLOCK_NUM_EXPERTS: tl.constexpr,
+):
+    """Compact a dense routing map into per-token semantic expert ids.
+
+    The dense map already names every selected expert, so recovering the
+    compact route list is a per-row prefix sum rather than a selection
+    problem: the running count of set entries before an expert is the slot
+    that expert belongs in. The same pass accumulates the local per-expert
+    route histogram the planner gathers across the EP group.
+
+    The grid is persistent because the histogram is published with one atomic
+    update per program. Sizing the grid by tokens instead would make those
+    updates, not the map itself, the dominant cost.
+    """
+    program = tl.program_id(0)
+    experts = tl.arange(0, BLOCK_NUM_EXPERTS)
+    valid_experts = experts < NUM_EXPERTS
+    token_offsets = tl.arange(0, BLOCK_TOKENS)
+    histogram = tl.zeros((BLOCK_NUM_EXPERTS,), dtype=tl.int32)
+    tokens_per_program = tl.cdiv(num_tokens, tl.num_programs(0))
+    program_start = program * tokens_per_program
+    program_end = tl.minimum(program_start + tokens_per_program, num_tokens)
+
+    for token_start in tl.range(program_start, program_end, BLOCK_TOKENS, loop_unroll_factor=1):
+        tokens = token_start + token_offsets
+        valid = (tokens[:, None] < program_end) & valid_experts[None, :]
+        selected = tl.load(
+            routing_map + tokens[:, None] * NUM_EXPERTS + experts[None, :], mask=valid, other=0
+        ).to(tl.int32)
+        slots = tl.cumsum(selected, axis=1) - selected
+        tl.store(
+            token_indices + tokens[:, None] * ROUTER_TOPK + slots,
+            tl.broadcast_to(experts[None, :], (BLOCK_TOKENS, BLOCK_NUM_EXPERTS)),
+            mask=(selected != 0) & (slots < ROUTER_TOPK),
+        )
+        histogram += tl.sum(selected, axis=0)
+
+    tl.atomic_add(tokens_per_expert + experts, histogram, mask=valid_experts)
+
+
+def extract_semantic_routes(
+    routing_map: torch.Tensor, probs: torch.Tensor, router_topk: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Recover compact semantic routes from a dense flex-dispatcher routing map.
+
+    The routing map is authoritative: reading the routes back out of the dense
+    probabilities instead would silently change a selected zero-probability
+    route whenever several unselected experts tie at zero.
+
+    Args:
+        routing_map: Bool tensor ``[num_tokens, num_experts]`` selecting exactly
+            ``router_topk`` experts per token.
+        probs: Router probabilities ``[num_tokens, num_experts]``. Gradients
+            flow back to the selected entries.
+        router_topk: Number of routes ``K`` selected for every token.
+
+    Returns:
+        ``(token_probs, token_indices, tokens_per_expert)``. The first two have
+        shape ``[num_tokens, router_topk]`` and list each token's routes in
+        ascending semantic expert order; the last is the int32 local route
+        histogram over ``num_experts``.
+    """
+    num_tokens, num_experts = (int(size) for size in routing_map.shape)
+    device = routing_map.device
+    tokens_per_expert = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    if HAVE_TRITON and device.type == "cuda":
+        # Zeroed rather than empty: a routing map that selects fewer than
+        # router_topk experts for some token would otherwise leave stale slots,
+        # and the planner indexes tables with these ids.
+        token_indices = torch.zeros((num_tokens, router_topk), dtype=torch.int32, device=device)
+        block_num_experts = _next_power_of_two(num_experts)
+        block_tokens = min(32, max(1, 16384 // block_num_experts))
+        num_programs = min(_MAX_PLANNER_PROGRAMS, triton.cdiv(num_tokens, block_tokens))
+        _compact_routing_map_kernel[(num_programs,)](
+            routing_map,
+            token_indices,
+            tokens_per_expert,
+            num_tokens,
+            ROUTER_TOPK=router_topk,
+            NUM_EXPERTS=num_experts,
+            BLOCK_TOKENS=block_tokens,
+            BLOCK_NUM_EXPERTS=block_num_experts,
+            num_warps=8,
+        )
+    else:
+        # Reference formulation for CPU tests: the same prefix sum, expressed
+        # as a scatter whose overflow column is discarded.
+        slots = torch.cumsum(routing_map, dim=1, dtype=torch.int32) - 1
+        slots = torch.where(routing_map & (slots < router_topk), slots, router_topk)
+        expert_ids = torch.arange(num_experts, dtype=torch.int32, device=device)
+        token_indices = torch.zeros(
+            (num_tokens, router_topk + 1), dtype=torch.int32, device=device
+        ).scatter_(1, slots.long(), expert_ids.expand(num_tokens, num_experts))[:, :router_topk]
+        tokens_per_expert += routing_map.sum(dim=0, dtype=torch.int32)
+    return torch.gather(probs, 1, token_indices.long()), token_indices, tokens_per_expert
 
 
 def _validate_inputs(
@@ -2138,80 +2209,60 @@ def _launch_replica_placement(
     workspace: ReplicaPlannerWorkspace,
     *,
     rank_route_capacity: int,
+    source_rank: int,
     ep_size: int,
     num_experts: int,
     num_local_experts: int,
 ) -> None:
-    """Launch deterministic multi-program replica placement."""
-    block_ep_size = triton.next_power_of_2(ep_size)
-    block_num_experts_per_gpu = triton.next_power_of_2(num_local_experts)
-
-    block_num_experts = triton.next_power_of_2(num_experts)
-    _initialize_allocation_kernel[(num_experts,)](
+    """Launch deterministic single-kernel replica placement."""
+    _plan_replica_placement_kernel[(ep_size,)](
         workspace.gathered_counts,
         workspace.expert_totals,
-        workspace.allocation,
-        EP_SIZE=ep_size,
-        NUM_EXPERTS=num_experts,
-        NUM_EXPERTS_PER_GPU=num_local_experts,
-        BLOCK_EP_SIZE=block_ep_size,
-    )
-    _compute_group_balance_kernel[(ep_size,)](
-        workspace.expert_totals,
         workspace.balance,
-        RANK_ROUTE_CAPACITY=rank_route_capacity,
-        NUM_EXPERTS_PER_GPU=num_local_experts,
-        BLOCK_NUM_EXPERTS_PER_GPU=block_num_experts_per_gpu,
-    )
-    _choose_receiver_quotas_kernel[(1,)](
-        workspace.balance, workspace.receiver_quotas, EP_SIZE=ep_size, BLOCK_EP_SIZE=block_ep_size
-    )
-    _allocate_migrations_kernel[(ep_size,)](
-        workspace.expert_totals,
         workspace.receiver_quotas,
         workspace.allocation,
-        EP_SIZE=ep_size,
-        NUM_EXPERTS_PER_GPU=num_local_experts,
-        BLOCK_EP_SIZE=block_ep_size,
-        BLOCK_NUM_EXPERTS_PER_GPU=block_num_experts_per_gpu,
-    )
-    _select_replica_experts_kernel[(ep_size,)](
-        workspace.allocation,
+        workspace.destination_boundaries,
         workspace.experts_to_copy,
         workspace.expert_replica_slots,
+        workspace.placement_grid_sync,
+        RANK_ROUTE_CAPACITY=rank_route_capacity,
+        SOURCE_EP_RANK=source_rank,
         EP_SIZE=ep_size,
         NUM_EXPERTS=num_experts,
         NUM_EXPERTS_PER_GPU=num_local_experts,
-        BLOCK_NUM_EXPERTS=block_num_experts,
+        BLOCK_EP_SIZE=triton.next_power_of_2(ep_size),
+        BLOCK_NUM_EXPERTS_PER_GPU=triton.next_power_of_2(num_local_experts),
+        BLOCK_NUM_EXPERTS=triton.next_power_of_2(num_experts),
+        launch_cooperative_grid=True,
+        num_warps=1,
     )
 
 
 def _launch_replica_route_mapping(
     workspace: ReplicaPlannerWorkspace,
-    flat_topk_indices: torch.Tensor,
     *,
-    source_rank: int,
     ep_size: int,
     num_experts: int,
     num_local_experts: int,
     num_routes: int,
 ) -> None:
-    """Map the stable route order to native-or-replica ids."""
-    block_num_routes = 256
-    _map_virtual_experts_kernel[(triton.cdiv(num_routes, block_num_routes),)](
-        flat_topk_indices,
-        workspace.sorted_route_indices,
-        workspace.local_count_cumsum,
-        workspace.gathered_counts,
-        workspace.allocation,
+    """Map the ranked routes to native-or-replica ids."""
+    block_ep_size = triton.next_power_of_2(ep_size)
+    _map_virtual_experts_kernel[(_route_partition_count(num_routes),)](
+        workspace.sort_route_metadata,
+        workspace.sort_partition_counts,
+        workspace.destination_boundaries,
         workspace.expert_replica_slots,
         workspace.virtual_experts,
-        SOURCE_EP_RANK=source_rank,
-        EP_SIZE=ep_size,
+        NUM_ROUTES=num_routes,
         NUM_EXPERTS=num_experts,
         NUM_EXPERTS_PER_GPU=num_local_experts,
-        NUM_ROUTES=num_routes,
-        BLOCK_NUM_ROUTES=block_num_routes,
+        EP_SIZE=ep_size,
+        BLOCK_NUM_EXPERTS=triton.next_power_of_2(num_experts),
+        BLOCK_NUM_ROUTES=256,
+        BLOCK_EP_SIZE=block_ep_size,
+        LOG2_BLOCK_EP_SIZE=block_ep_size.bit_length() - 1,
+        num_warps=8,
     )
 
 
@@ -2275,32 +2326,32 @@ def plan_replica_routes(
             )
         workspace.distributed_shape_validated = True
 
-    # Phase 1: collect the only cross-rank input. From here onward every rank
-    # sees the same histograms and independently produces the same placement.
-    dist.all_gather_into_tensor(
-        workspace.gathered_counts.view(-1), tokens_per_expert, group=ep_group
-    )
-
-    # Route ordering depends only on local routes and their expert-count
-    # prefix, while placement depends on the gathered histograms. Fork the
-    # stable bucket sort onto its fixed workspace stream after producing that
-    # small prefix, then join it before the route mapper consumes both results.
-    torch.cumsum(tokens_per_expert, dim=0, out=workspace.local_count_cumsum)
+    # Route ranking depends only on local routes, while placement depends on
+    # the gathered histograms. Fork the ranking onto its fixed workspace stream
+    # before the gather so the collective's latency runs underneath it, then
+    # join it before the route mapper consumes both results.
     current_stream = torch.cuda.current_stream(topk_indices.device)
     workspace.sort_stream.wait_stream(current_stream)
     with torch.cuda.stream(workspace.sort_stream):
-        _launch_stable_route_bucket_sort(
+        _launch_route_ranking(
             workspace,
             topk_indices.reshape(-1),
             num_experts=num_experts,
             num_routes=num_routes,
         )
 
+    # Phase 1: collect the only cross-rank input. From here onward every rank
+    # sees the same histograms and independently produces the same placement.
+    dist.all_gather_into_tensor(
+        workspace.gathered_counts.view(-1), tokens_per_expert, group=ep_group
+    )
+
     # Phases 2-4: construct allocation[expert, destination], then turn its
     # remote nonzero entries into a deterministic replica-weight list per rank.
     _launch_replica_placement(
         workspace,
         rank_route_capacity=num_routes,
+        source_rank=source_rank,
         ep_size=ep_size,
         num_experts=num_experts,
         num_local_experts=num_local_experts,
@@ -2309,20 +2360,17 @@ def plan_replica_routes(
     plan = ReplicaPlan(
         virtual_experts=workspace.virtual_experts, experts_to_copy=workspace.experts_to_copy
     )
-    # Phase 5: allocations contain counts, not individual route identities.
-    # Establish a stable per-expert route order, then locate every route in
-    # the destination segments described by allocation. When placement and
-    # the stable sort are independent branches, keep Phase 5 on the sort
-    # branch and make it wait only for placement, then launch weight prefetch
-    # as a sibling branch. Enqueuing Phase 5 after the prefetch callback makes
-    # CUDA-graph capture incorrectly put weight completion on the mapping
-    # critical path.
+    # Phase 5: allocations contain counts, not individual route identities, so
+    # finish the ranking started above and locate every route in the
+    # destination segments the allocation describes. Keep Phase 5 on the
+    # ranking branch and make it wait only for placement, then launch weight
+    # prefetch as a sibling branch. Enqueuing Phase 5 after the prefetch
+    # callback makes CUDA-graph capture incorrectly put weight completion on
+    # the mapping critical path.
     workspace.sort_stream.wait_stream(current_stream)
     with torch.cuda.stream(workspace.sort_stream):
         _launch_replica_route_mapping(
             workspace,
-            topk_indices.reshape(-1),
-            source_rank=source_rank,
             ep_size=ep_size,
             num_experts=num_experts,
             num_local_experts=num_local_experts,
