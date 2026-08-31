@@ -171,6 +171,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "layernorm_zero_centered_gamma": False,
     "linear_attention_freq": None,
     "linear_cp_layout": "zigzag",
+    "linear_cp_mode": "headwise",
     "linear_conv_kernel_dim": 4,
     "linear_key_head_dim": 128,
     "linear_num_key_heads": 16,

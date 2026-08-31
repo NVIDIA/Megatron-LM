@@ -32,6 +32,7 @@ from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConn
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
+from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
@@ -160,6 +161,11 @@ class HybridStack(MegatronModule):
         self._mhc_block_end_plan: Optional[List[bool]] = None
 
         self.layer_config_list = layer_config_list
+        self._has_linear_layer_with_chunkwise_cp = self.cp_group.size() > 1 and any(
+            type(layer_config) is layer_utils.MambaLayerConfig
+            and layer_config.linear_cp_mode == "chunkwise"
+            for layer_config in self.layer_config_list
+        )
         self._cp_layout_manager = None
         if self.cp_group.size() > 1:
             layer_layouts = tuple(
@@ -440,9 +446,24 @@ class HybridStack(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        if self._has_linear_layer_with_chunkwise_cp and padding_mask is not None:
+            raise NotImplementedError(
+                "Hybrid chunkwise context parallelism does not support padding masks."
+            )
+
         cp_layout_state = None
         if self._cp_layout_manager is not None:
             cp_layout_state = self._cp_layout_manager.build_forward_state(packed_seq_params)
+
+        packed_sequence_cp_metadata = None
+        if self._has_linear_layer_with_chunkwise_cp and packed_seq_params is not None:
+            if packed_seq_params.seq_idx is None:
+                raise ValueError("Packed chunkwise CP requires packed_seq_params.seq_idx")
+            packed_sequence_cp_metadata = build_packed_sequence_cp_metadata(
+                packed_seq_params.seq_idx,
+                cp_rank=self.cp_group.rank(),
+                cp_size=self.cp_group.size(),
+            )
 
         if not self.pre_process:
             # See set_input_tensor()
@@ -526,6 +547,7 @@ class HybridStack(MegatronModule):
                     padding_mask=padding_mask,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
+                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )
             else:
                 for layer_idx, (layer_config, layer) in enumerate(
@@ -543,6 +565,12 @@ class HybridStack(MegatronModule):
                     mhc_manager = mhc_layer_managers[layer_idx]
                     if mhc_manager is not None:
                         mhc_manager.is_last_layer_in_recompute_block = mhc_block_ends[layer_idx]
+                    layer_cp_metadata = (
+                        packed_sequence_cp_metadata
+                        if type(layer_config) is layer_utils.MambaLayerConfig
+                        and layer_config.linear_cp_mode == "chunkwise"
+                        else None
+                    )
 
                     with inner_quant_context:
                         if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
@@ -555,11 +583,21 @@ class HybridStack(MegatronModule):
                                 packed_seq_params=layer_packed_seq_params,
                                 padding_mask=padding_mask,
                             )
+                            if layer_cp_metadata is not None:
+                                layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
                             if mhc_manager is not None and isinstance(
                                 layer, HyperConnectionHybridLayer
                             ):
                                 layer_kwargs["mhc_recompute_manager"] = mhc_manager
                             hidden_states, _ = layer(**layer_kwargs)
+                        elif layer_cp_metadata is not None:
+                            hidden_states = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                packed_seq_params=layer_packed_seq_params,
+                                packed_sequence_cp_metadata=layer_cp_metadata,
+                            )
                         else:  # MambaLayer, Expert, or MLP
                             hidden_states = layer(
                                 hidden_states=hidden_states,
