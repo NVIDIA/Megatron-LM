@@ -16,9 +16,11 @@ from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
     get_deprecated_cuda_graph_modules_migration,
+    is_whole_moe_cuda_graph_scope,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
     validate_deprecated_cuda_graph_modules_migration_inputs,
+    validate_moe_cuda_graph_support,
 )
 from megatron.core.transformer.enums import (
     AttnBackend,
@@ -3399,9 +3401,8 @@ class TransformerConfig(ModelParallelConfig):
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
                     ):
-                        assert (
-                            CudaGraphModule.moe not in self.cuda_graph_modules
-                        ), 'moe cuda graph is only supported with drop-padding MoE.'
+                        if CudaGraphModule.moe in self.cuda_graph_modules:
+                            validate_moe_cuda_graph_support(self)
                         if self.moe_token_dispatcher_type == 'alltoall' and (
                             self.moe_expert_capacity_factor is not None
                             or self.moe_router_padding_for_fp8
@@ -3410,6 +3411,27 @@ class TransformerConfig(ModelParallelConfig):
                                 'moe_preprocess cuda graph is not supported when there are '
                                 'DtoH copies and synchronizations in the preprocess step.'
                             )
+
+            te_whole_moe_paged_stash = (
+                self.cuda_graph_impl == "transformer_engine"
+                and is_whole_moe_cuda_graph_scope(self.cuda_graph_modules)
+                and self.moe_paged_stash
+            )
+            if te_whole_moe_paged_stash:
+                if not is_te_min_version("2.19.0"):
+                    raise ValueError(
+                        "Transformer Engine whole-MoE CUDA graphs with paged stash require "
+                        f"Transformer Engine >= 2.19.0, but found {get_te_version()}."
+                    )
+                assert not self.cuda_graph_dynamic_microbatches, (
+                    "Transformer Engine whole-MoE CUDA graphs with paged stash require a fixed "
+                    "runtime microbatch schedule; cuda_graph_dynamic_microbatches is not "
+                    "supported."
+                )
+                assert self.cuda_graph_warmup_steps >= 2, (
+                    "Transformer Engine whole-MoE CUDA graphs with paged stash require at least "
+                    "2 cuda_graph_warmup_steps to record the pipeline schedule before capture."
+                )
 
             if self.recompute_granularity:
                 if self.recompute_granularity != "selective":
