@@ -254,7 +254,6 @@ class _ReplicaBulkKernel:
     """Configuration shared by the warp-specialized transport kernels."""
 
     STAGES = 3
-    NUM_THREADS = 64
 
     def __init__(
         self,
@@ -629,7 +628,17 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
     BULK_ELEMENTS = 4096
     BULKS_PER_CHUNK = 4
     CHUNK_ELEMENTS = BULK_ELEMENTS * BULKS_PER_CHUNK
-    BF16_NUM_THREADS = 544
+    BF16_CONSUMER_WARPS = 16
+    # Transport the chunks in several passes over disjoint ranges. The
+    # cross-rank barrier closing a pass proves every owner has read that range,
+    # so the next pass can zero the local slots behind it while it waits on the
+    # wire. Only the trailing range stays exposed. More passes hide more of the
+    # zero fill but add a barrier each; four is the measured optimum.
+    TRANSPORT_PASSES = 4
+    # Zero the slots with ordinary vector stores instead of bulk copies: the
+    # retiring warp runs beside the peer loads, and both would otherwise queue
+    # behind the same asynchronous-copy engine.
+    CLEAR_STORE_BITS = 128
 
     def __init__(self, *, grad_dtype: torch.dtype, **kwargs) -> None:
         if grad_dtype == torch.bfloat16:
@@ -642,14 +651,64 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
         self.is_bf16 = grad_dtype == torch.bfloat16
         self.grad_type = BFloat16 if self.is_bf16 else Float32
         self.element_bytes = 2 if self.is_bf16 else 4
-        self.num_threads = self.BF16_NUM_THREADS if self.is_bf16 else self.NUM_THREADS
+        self.clear_vector = self.CLEAR_STORE_BITS // (8 * self.element_bytes)
+        # One producer warp, the reduction warps, and one warp that retires the
+        # slots the previous pass drained.
+        self.consumer_warps = self.BF16_CONSUMER_WARPS if self.is_bf16 else 1
+        self.num_threads = 32 * (self.consumer_warps + 2)
 
     def _smem_bytes(self) -> int:
         stages = self.STAGES * self.CHUNK_ELEMENTS * self.element_bytes
-        zero_source = 0 if self.is_bf16 else self.BULK_ELEMENTS * self.element_bytes
         barriers = self.STAGES * 2 * 8
         plan = (self.num_local_experts * (self.world_size + 1) + 1) * 4
-        return stages + zero_source + barriers + plan + 256
+        return stages + barriers + plan + 256
+
+    def _chunk_boundaries(self) -> list[int]:
+        """Return the transport pass boundaries in per-expert chunk units."""
+        chunks_per_expert = self.fc1_member_chunks + self.fc2_member_chunks
+        return [
+            chunks_per_expert * index // self.TRANSPORT_PASSES
+            for index in range(self.TRANSPORT_PASSES + 1)
+        ]
+
+    @cute.jit
+    def _clear_slot_bulk(
+        self,
+        arena: cute.Tensor,
+        active_slots: cute.Tensor,
+        zero_atom: cute.CopyAtom,
+        zeros: cute.Tensor,
+        lane: Int32,
+        work: Int32,
+        first_bulk: cutlass.Constexpr[int],
+        range_bulks: cutlass.Constexpr[int],
+    ):
+        """Zero one bulk of one locally hosted replica slot with the calling warp.
+
+        ``work`` enumerates ``(active slot, bulk within the retired range)``,
+        where the range holds ``range_bulks`` bulks per slot and starts at
+        whole-slot bulk ``first_bulk``.
+        """
+        active = work // range_bulks
+        slot_bulk = first_bulk + work - active * range_bulks
+        slot = Int64(active_slots[active])
+        bulks_per_fc1 = cutlass.const_expr(self.fc1_member_numel // self.BULK_ELEMENTS)
+        destination_offset = slot * self.fc1_member_numel + Int64(slot_bulk * self.BULK_ELEMENTS)
+        if slot_bulk >= bulks_per_fc1:
+            destination_offset = (
+                Int64(self.num_local_experts * self.fc1_member_numel)
+                + slot * self.fc2_member_numel
+                + Int64((slot_bulk - bulks_per_fc1) * self.BULK_ELEMENTS)
+            )
+        vector = cutlass.const_expr(self.clear_vector)
+        store_bytes = cutlass.const_expr(self.CLEAR_STORE_BITS // 8)
+        for index in cutlass.range_constexpr(self.BULK_ELEMENTS // (32 * vector)):
+            # Offsetting an iterator drops its alignment, and the vector store
+            # atom requires the full width, so restate it on every destination.
+            destination = (
+                arena.iterator + destination_offset + (lane + index * 32) * vector
+            ).align(store_bytes)
+            cute.copy(zero_atom, zeros, _tensor_1d(destination, vector))
 
     @cute.jit
     def __call__(
@@ -704,11 +763,10 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
         tid, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        lane = cute.arch.lane_idx()
         stages = cutlass.const_expr(self.STAGES)
         chunk_bytes = cutlass.const_expr(self.CHUNK_ELEMENTS * self.element_bytes)
         virtual_fc1_numel = cutlass.const_expr(self.num_local_experts * self.fc1_member_numel)
-        fc1_chunks = cutlass.const_expr(self.num_local_experts * self.fc1_member_chunks)
-        fc2_chunks = cutlass.const_expr(self.num_local_experts * self.fc2_member_chunks)
 
         smem = utils.SmemAllocator()
         load_mbar = smem.allocate_array(Int64, num_elems=2 * stages)
@@ -717,10 +775,6 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
             cute.make_ordered_layout((self.CHUNK_ELEMENTS, stages), order=(0, 1)),
             byte_alignment=128,
         )
-        if cutlass.const_expr(not self.is_bf16):
-            zero_smem = smem.allocate_tensor(
-                Float32, cute.make_layout((self.BULK_ELEMENTS,)), byte_alignment=128
-            )
         matches = smem.allocate_tensor(
             Int32, cute.make_layout((self.num_local_experts * self.world_size,)), byte_alignment=16
         )
@@ -746,9 +800,6 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                     active_slots[count] = Int32(slot)
                     count += Int32(1)
             active_count[0] = count
-        if cutlass.const_expr(not self.is_bf16):
-            for element in cutlass.range(tid, self.BULK_ELEMENTS, self.num_threads):
-                zero_smem[element] = 0.0
         cute.arch.sync_threads()
 
         _cross_rank_barrier(
@@ -760,180 +811,188 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
             tid,
         )
 
-        consumer_group_size = cutlass.const_expr(self.num_threads // 32 - 1 if self.is_bf16 else 1)
         load_pipe = pipeline.PipelineTmaAsync.create(
             barrier_storage=load_mbar,
             num_stages=stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, consumer_group_size),
+            consumer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, cutlass.const_expr(self.consumer_warps)
+            ),
             tx_count=chunk_bytes,
         )
         load_atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), self.grad_type)
-        if cutlass.const_expr(not self.is_bf16):
-            store_atom = cute.make_copy_atom(cpasync.CopyBulkS2GOp(), Float32)
+        zero_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.grad_type,
+            num_bits_per_copy=cutlass.const_expr(self.CLEAR_STORE_BITS),
+        )
+        zeros = cute.make_rmem_tensor((self.clear_vector,), self.grad_type)
+        for index in cutlass.range_constexpr(self.clear_vector):
+            zeros[index] = self.grad_type(0.0)
         load_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, stages)
         consume_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, stages)
-        total_work = cutlass.const_expr(fc1_chunks + fc2_chunks)
-        for work in cutlass.range(block, total_work, self.num_sms, unroll=1):
-            is_fc2 = work >= fc1_chunks
-            projection_work = work
-            member_chunks = cutlass.const_expr(self.fc1_member_chunks)
-            member_numel = cutlass.const_expr(self.fc1_member_numel)
-            virtual_projection_base = Int64(0)
-            native_grad_bases = fc1_native_grad_bases
-            if is_fc2:
-                projection_work = work - fc1_chunks
-                member_chunks = cutlass.const_expr(self.fc2_member_chunks)
-                member_numel = cutlass.const_expr(self.fc2_member_numel)
-                virtual_projection_base = Int64(virtual_fc1_numel)
-                native_grad_bases = fc2_native_grad_bases
-            local_expert = projection_work // member_chunks
-            member_chunk = projection_work - local_expert * member_chunks
-            member_offset = Int64(member_chunk * self.CHUNK_ELEMENTS)
+        boundaries = self._chunk_boundaries()
+        bulks_per_chunk = cutlass.const_expr(self.BULKS_PER_CHUNK)
+        for transport_pass in cutlass.range_constexpr(self.TRANSPORT_PASSES):
+            first_chunk = cutlass.const_expr(boundaries[transport_pass])
+            retired_first_bulk = cutlass.const_expr(
+                boundaries[transport_pass - 1] * bulks_per_chunk if transport_pass else 0
+            )
+            retired_bulks = cutlass.const_expr(
+                first_chunk * bulks_per_chunk - retired_first_bulk if transport_pass else 0
+            )
+            retired_work = active_count[0] * retired_bulks
+            if warp <= self.consumer_warps:
+                # Sweep the local experts fastest. Consecutive experts come from
+                # different peers, so this keeps the blocks running at any
+                # instant spread over the peers instead of pointing all of them
+                # at the one peer that hosts the expert currently being swept.
+                for work in cutlass.range(
+                    first_chunk * self.num_local_experts + block,
+                    cutlass.const_expr(boundaries[transport_pass + 1] * self.num_local_experts),
+                    self.num_sms,
+                    unroll=1,
+                ):
+                    expert_chunk = work // self.num_local_experts
+                    local_expert = work - expert_chunk * self.num_local_experts
+                    member_chunk = expert_chunk
+                    member_numel = cutlass.const_expr(self.fc1_member_numel)
+                    virtual_projection_base = Int64(0)
+                    native_grad_bases = fc1_native_grad_bases
+                    if expert_chunk >= self.fc1_member_chunks:
+                        member_chunk = expert_chunk - self.fc1_member_chunks
+                        member_numel = cutlass.const_expr(self.fc2_member_numel)
+                        virtual_projection_base = Int64(virtual_fc1_numel)
+                        native_grad_bases = fc2_native_grad_bases
+                    member_offset = Int64(member_chunk * self.CHUNK_ELEMENTS)
 
-            if warp == 0:
-                for destination in cutlass.range_constexpr(self.world_size):
-                    slot = matches[local_expert * self.world_size + destination]
-                    if slot >= Int32(0):
-                        peer = cute.make_ptr(
-                            self.grad_type,
-                            peer_bases[destination],
-                            cute.AddressSpace.gmem,
-                            assumed_align=16,
-                        )
-                        peer_offset = (
-                            virtual_projection_base + Int64(slot) * member_numel + member_offset
-                        )
-                        load_pipe.producer_acquire(load_state)
-                        stage = stage_smem[(None, load_state.index)]
-                        _bulk_load_copy(
-                            load_atom,
-                            peer + peer_offset,
-                            stage.iterator,
-                            load_pipe.producer_get_barrier(load_state),
-                            cutlass.const_expr(self.BULK_ELEMENTS),
-                            cutlass.const_expr(self.BULKS_PER_CHUNK),
-                        )
-                        load_pipe.producer_commit(load_state)
-                        load_state.advance()
-            elif warp >= 1:
-                source_count = Int32(0)
-                for destination in cutlass.range_constexpr(self.world_size):
-                    if matches[local_expert * self.world_size + destination] >= Int32(0):
-                        source_count += Int32(1)
-                if source_count > Int32(0):
-                    native_destination = cute.make_ptr(
-                        self.grad_type,
-                        native_grad_bases[local_expert],
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    native_destination = _tensor_1d(
-                        native_destination + member_offset, self.CHUNK_ELEMENTS
-                    )
-                    if cutlass.const_expr(self.is_bf16):
-                        consumer_thread = tid - Int32(32)
-                        consumer_threads = cutlass.const_expr(self.num_threads - 32)
-                        thread_elements = cutlass.const_expr(
-                            self.CHUNK_ELEMENTS // (self.num_threads - 32)
-                        )
-                        accumulator = cute.make_rmem_tensor((thread_elements,), Float32)
-                        for register in cutlass.range_constexpr(thread_elements):
-                            element = consumer_thread + register * consumer_threads
-                            accumulator[register] = Float32(native_destination[element])
-                        for _source_index in cutlass.range(source_count, unroll=1):
-                            load_pipe.consumer_wait(consume_state)
-                            stage = stage_smem[(None, consume_state.index)]
-                            for register in cutlass.range_constexpr(thread_elements):
-                                element = consumer_thread + register * consumer_threads
-                                accumulator[register] += Float32(stage[element])
-                            load_pipe.consumer_release(consume_state)
-                            consume_state.advance()
-                        # Round only on the final store; peer traffic and persistent
-                        # storage remain BF16 while local additions use FP32.
-                        for register in cutlass.range_constexpr(thread_elements):
-                            element = consumer_thread + register * consumer_threads
-                            native_destination[element] = BFloat16(accumulator[register])
-                    else:
-                        for _source_index in cutlass.range(source_count, unroll=1):
-                            load_pipe.consumer_wait(consume_state)
-                            with cute.arch.elect_one():
-                                for bulk in cutlass.range_constexpr(self.BULKS_PER_CHUNK):
-                                    stage = stage_smem[(None, consume_state.index)]
-                                    _cp_reduce_async_bulk_add_f32(
-                                        stage.iterator + bulk * self.BULK_ELEMENTS,
-                                        native_destination.iterator + bulk * self.BULK_ELEMENTS,
-                                        self.BULK_ELEMENTS * 4,
-                                    )
-                                cute.arch.cp_async_bulk_commit_group()
-                                cute.arch.cp_async_bulk_wait_group(0, read=True)
-                            load_pipe.consumer_release(consume_state)
-                            consume_state.advance()
-
-        if cutlass.const_expr(not self.is_bf16):
-            if warp == 1:
-                with cute.arch.elect_one():
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
-
-        _cross_rank_barrier(
-            signal_bases,
-            grid_barrier,
-            rank,
-            cutlass.const_expr(self.world_size),
-            Int32(self.num_sms),
-            tid,
-        )
-
-        # Owners have now acquired all remote virtual gradients. Clear exactly
-        # the locally used slots; planner slots need not form a dense prefix.
-        if cutlass.const_expr(self.is_bf16):
-            chunks_per_slot = cutlass.const_expr(self.fc1_member_chunks + self.fc2_member_chunks)
-            clear_work = active_count[0] * chunks_per_slot
-            for work in cutlass.range(block, clear_work, self.num_sms, unroll=1):
-                active = work // chunks_per_slot
-                slot_chunk = work - active * chunks_per_slot
-                slot = active_slots[active]
-                destination_offset = Int64(slot) * self.fc1_member_numel + Int64(
-                    slot_chunk * self.CHUNK_ELEMENTS
-                )
-                if slot_chunk >= self.fc1_member_chunks:
-                    destination_offset = (
-                        Int64(virtual_fc1_numel)
-                        + Int64(slot) * self.fc2_member_numel
-                        + Int64((slot_chunk - self.fc1_member_chunks) * self.CHUNK_ELEMENTS)
-                    )
-                for element in cutlass.range(tid, self.CHUNK_ELEMENTS, self.num_threads):
-                    arena[destination_offset + element] = BFloat16(0.0)
-        else:
-            bulks_per_fc1 = cutlass.const_expr(self.fc1_member_numel // self.BULK_ELEMENTS)
-            bulks_per_fc2 = cutlass.const_expr(self.fc2_member_numel // self.BULK_ELEMENTS)
-            bulks_per_slot = cutlass.const_expr(bulks_per_fc1 + bulks_per_fc2)
-            clear_work = active_count[0] * bulks_per_slot
-            if warp == 0:
-                # Amortize the bulk-group drain across the hardware's eight
-                # outstanding groups while preserving sparse-slot addressing.
-                for base in cutlass.range(block, clear_work, self.num_sms * 8, unroll=1):
-                    for batch in cutlass.range_constexpr(8):
-                        work = base + batch * self.num_sms
-                        if work < clear_work:
-                            active = work // bulks_per_slot
-                            slot_bulk = work - active * bulks_per_slot
-                            slot = active_slots[active]
-                            destination_offset = Int64(slot) * self.fc1_member_numel + Int64(
-                                slot_bulk * self.BULK_ELEMENTS
-                            )
-                            if slot_bulk >= bulks_per_fc1:
-                                destination_offset = (
-                                    Int64(virtual_fc1_numel)
-                                    + Int64(slot) * self.fc2_member_numel
-                                    + Int64((slot_bulk - bulks_per_fc1) * self.BULK_ELEMENTS)
+                    if warp == 0:
+                        for destination in cutlass.range_constexpr(self.world_size):
+                            slot = matches[local_expert * self.world_size + destination]
+                            if slot >= Int32(0):
+                                peer = cute.make_ptr(
+                                    self.grad_type,
+                                    peer_bases[destination],
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16,
                                 )
-                            clear_destination = _tensor_1d(
-                                arena.iterator + destination_offset, self.BULK_ELEMENTS
+                                peer_offset = (
+                                    virtual_projection_base
+                                    + Int64(slot) * member_numel
+                                    + member_offset
+                                )
+                                load_pipe.producer_acquire(load_state)
+                                stage = stage_smem[(None, load_state.index)]
+                                _bulk_load_copy(
+                                    load_atom,
+                                    peer + peer_offset,
+                                    stage.iterator,
+                                    load_pipe.producer_get_barrier(load_state),
+                                    cutlass.const_expr(self.BULK_ELEMENTS),
+                                    cutlass.const_expr(self.BULKS_PER_CHUNK),
+                                )
+                                load_pipe.producer_commit(load_state)
+                                load_state.advance()
+                    else:
+                        source_count = Int32(0)
+                        for destination in cutlass.range_constexpr(self.world_size):
+                            if matches[local_expert * self.world_size + destination] >= Int32(0):
+                                source_count += Int32(1)
+                        if source_count > Int32(0):
+                            native_destination = cute.make_ptr(
+                                self.grad_type,
+                                native_grad_bases[local_expert],
+                                cute.AddressSpace.gmem,
+                                assumed_align=16,
                             )
-                            cute.copy(store_atom, zero_smem, clear_destination)
-                            cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                            native_destination = _tensor_1d(
+                                native_destination + member_offset, self.CHUNK_ELEMENTS
+                            )
+                            if cutlass.const_expr(self.is_bf16):
+                                consumer_thread = tid - Int32(32)
+                                consumer_threads = cutlass.const_expr(32 * self.consumer_warps)
+                                thread_elements = cutlass.const_expr(
+                                    self.CHUNK_ELEMENTS // consumer_threads
+                                )
+                                accumulator = cute.make_rmem_tensor((thread_elements,), Float32)
+                                for register in cutlass.range_constexpr(thread_elements):
+                                    element = consumer_thread + register * consumer_threads
+                                    accumulator[register] = Float32(native_destination[element])
+                                for _source_index in cutlass.range(source_count, unroll=1):
+                                    load_pipe.consumer_wait(consume_state)
+                                    stage = stage_smem[(None, consume_state.index)]
+                                    for register in cutlass.range_constexpr(thread_elements):
+                                        element = consumer_thread + register * consumer_threads
+                                        accumulator[register] += Float32(stage[element])
+                                    load_pipe.consumer_release(consume_state)
+                                    consume_state.advance()
+                                # Round only on the final store; peer traffic and persistent
+                                # storage remain BF16 while local additions use FP32.
+                                for register in cutlass.range_constexpr(thread_elements):
+                                    element = consumer_thread + register * consumer_threads
+                                    native_destination[element] = BFloat16(accumulator[register])
+                            else:
+                                for _source_index in cutlass.range(source_count, unroll=1):
+                                    load_pipe.consumer_wait(consume_state)
+                                    with cute.arch.elect_one():
+                                        for bulk in cutlass.range_constexpr(self.BULKS_PER_CHUNK):
+                                            stage = stage_smem[(None, consume_state.index)]
+                                            _cp_reduce_async_bulk_add_f32(
+                                                stage.iterator + bulk * self.BULK_ELEMENTS,
+                                                native_destination.iterator
+                                                + bulk * self.BULK_ELEMENTS,
+                                                self.BULK_ELEMENTS * 4,
+                                            )
+                                        cute.arch.cp_async_bulk_commit_group()
+                                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                                    load_pipe.consumer_release(consume_state)
+                                    consume_state.advance()
+            else:
+                if cutlass.const_expr(retired_bulks > 0):
+                    # The barrier that closed the previous pass proved every owner
+                    # has read that range, so this warp zeroes it concurrently with
+                    # the transport warps above, which are waiting on the wire.
+                    for work in cutlass.range(block, retired_work, self.num_sms, unroll=1):
+                        self._clear_slot_bulk(
+                            arena,
+                            active_slots,
+                            zero_atom,
+                            zeros,
+                            lane,
+                            work,
+                            retired_first_bulk,
+                            retired_bulks,
+                        )
+
+            _cross_rank_barrier(
+                signal_bases,
+                grid_barrier,
+                rank,
+                cutlass.const_expr(self.world_size),
+                Int32(self.num_sms),
+                tid,
+            )
+
+        # Owners have now acquired every remote virtual gradient. Retire the
+        # trailing range with all warps; planner slots need not form a dense
+        # prefix, so address them through the active-slot table.
+        trailing_first_bulk = cutlass.const_expr(boundaries[-2] * bulks_per_chunk)
+        trailing_bulks = cutlass.const_expr(boundaries[-1] * bulks_per_chunk - trailing_first_bulk)
+        warps = cutlass.const_expr(self.num_threads // 32)
+        trailing_work = active_count[0] * trailing_bulks
+        for work in cutlass.range(
+            block * warps + warp, trailing_work, self.num_sms * warps, unroll=1
+        ):
+            self._clear_slot_bulk(
+                arena,
+                active_slots,
+                zero_atom,
+                zeros,
+                lane,
+                work,
+                trailing_first_bulk,
+                trailing_bulks,
+            )
 
 
 def _validate_compile_shape(
@@ -952,7 +1011,10 @@ def _validate_compile_shape(
             "Replica CuTeDSL weight kernels are limited to "
             f"{MAX_REPLICA_WEIGHT_SMS} SMs, got {num_sms}."
         )
-    max_ranks = min(_ReplicaWeightPushKernel.NUM_THREADS, _ReplicaGradReduceKernel.NUM_THREADS)
+    # One thread of the first block signals each peer across the barrier, so no
+    # transport block may be narrower than the rank count. The push kernel is
+    # the narrowest of the two.
+    max_ranks = _ReplicaWeightPushKernel.NUM_THREADS
     if world_size > max_ranks:
         raise ValueError(
             "Replica CuTeDSL supports at most " f"{max_ranks} EP ranks, got {world_size}."
