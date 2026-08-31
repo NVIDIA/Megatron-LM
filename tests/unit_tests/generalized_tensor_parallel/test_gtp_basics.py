@@ -1921,3 +1921,84 @@ class TestGTPCountZerosExcludesPadding:
         .gtp_pad_zeros wiring."""
         _requires_multi_gpu(4)
         _run_distributed(_worker_count_zeros_excludes_gtp_padding, 4)
+
+
+# ---------------------------------------------------------------------------
+# TestGTPReplicatedBias - the linear bias must stay replicated, not follow the weight
+# ---------------------------------------------------------------------------
+
+
+def _worker_bias_is_replicated(rank, world_size, port, gtp_remat_size):
+    from megatron.core import parallel_state as ps
+    from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    hidden, out_features, bias_value = 256, 512, 100.0
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(gtp_remat_size=gtp_remat_size)
+    try:
+        model_parallel_cuda_manual_seed(1234, force_reset_rng=True)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'cp', 'pp', 'ep', 'expt_tp', 'gtp_remat', 'expt_gtp_remat']
+        )
+        layer = TEColumnParallelLinear(
+            hidden,
+            out_features,
+            config=TransformerConfig(
+                num_layers=1,
+                hidden_size=hidden,
+                num_attention_heads=8,
+                add_bias_linear=True,
+                params_dtype=torch.bfloat16,
+                bf16=True,
+            ),
+            init_method=lambda w: nn.init.normal_(w, std=0.02),
+            gather_output=False,
+            bias=True,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name=None,
+            pg_collection=pg_collection,
+        ).cuda()
+
+        assert layer.bias.shape == (out_features,), (
+            f"bias is {tuple(layer.bias.shape)} at GTP_remat={gtp_remat_size}; expected the "
+            f"replicated size ({out_features},)"
+        )
+
+        # The shape alone is not enough: a sharded bias fails silently, still returning the full
+        # out_features but biasing only the first out_features/gtp_remat_size columns.
+        with torch.no_grad():
+            layer.bias.fill_(bias_value)
+        shard = layer.weight.data.contiguous()
+        shards = [torch.empty_like(shard) for _ in range(gtp_remat_size)]
+        dist.all_gather(shards, shard, group=pg_collection.gtp_remat)
+        full_weight = torch.cat(shards, dim=0)[:out_features].float()
+
+        inputs = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda")
+        dist.broadcast(inputs, src=0)
+        # GTP writes the reduce-scattered wgrad here; it must exist before backward.
+        layer.weight.main_grad = torch.zeros(
+            layer.weight.shape, dtype=torch.bfloat16, device="cuda"
+        )
+
+        applied = (layer(inputs)[0].float() - inputs.float() @ full_weight.T).mean(dim=0)
+        missing = (applied - bias_value).abs() > 1.0
+        assert not missing.any(), (
+            f"{int(missing.sum())} of {out_features} outputs did not receive the bias at "
+            f"GTP_remat={gtp_remat_size}: the bias is still sharded"
+        )
+    finally:
+        ps.destroy_model_parallel()
+        GTPShardedParam._chain_state = {}
+
+
+class TestGTPReplicatedBias:
+    @pytest.mark.parametrize("gtp_remat_size", [2, 4])
+    def test_bias_is_replicated(self, gtp_remat_size):
+        """``_gtp_pre_init`` gives TE a pre-sharded ``out_features`` and TE sizes the bias from it,
+        so without ``_gtp_restore_replicated_bias`` the bias is sharded too (256 of 512 outputs
+        biased at GTP_remat=2, with no error)."""
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_bias_is_replicated, 4, gtp_remat_size)
