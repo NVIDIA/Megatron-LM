@@ -30,7 +30,10 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     is_checkpointing,
 )
-from megatron.core.transformer.cuda_graph_config import cuda_graph_modules_capture_whole_moe
+from megatron.core.transformer.cuda_graph_config import (
+    is_whole_moe_cuda_graph_scope,
+    validate_moe_cuda_graph_support,
+)
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -2658,7 +2661,7 @@ class TECudaGraphHelper:
         )
         return (
             self.config.moe_paged_stash
-            and cuda_graph_modules_capture_whole_moe(self.config.cuda_graph_modules)
+            and is_whole_moe_cuda_graph_scope(self.config.cuda_graph_modules)
             and has_local_moe_layer
         )
 
@@ -2666,6 +2669,7 @@ class TECudaGraphHelper:
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
+        validate_moe_cuda_graph_support(self.config)
         start_time = self._start_capturing()
 
         if not self.flattened_callables:

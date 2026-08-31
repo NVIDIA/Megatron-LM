@@ -4,7 +4,6 @@ import gc
 import os
 import sys
 from contextlib import nullcontext
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -35,6 +34,7 @@ from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.transformer.cuda_graph_config import validate_moe_cuda_graph_support
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
@@ -175,13 +175,23 @@ class TestCudaGraphConfigAndArguments:
                 num_moe_experts=4,
             )
 
-    def test_local_full_layer_graph_rejects_dropless_moe(self):
+    def test_local_explicit_moe_graph_rejects_dropless_moe(self):
         with pytest.raises(
             AssertionError, match="moe cuda graph is only supported with drop-padding MoE"
         ):
             _base_cuda_graph_config(
-                cuda_graph_impl='local', cuda_graph_modules=[], num_moe_experts=4
+                cuda_graph_impl='local', cuda_graph_modules=[CudaGraphModule.moe], num_moe_experts=4
             )
+
+    def test_local_inference_full_layer_graph_allows_dropless_moe(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='local',
+            cuda_graph_modules=[],
+            inference_cuda_graph_scope=InferenceCudaGraphScope.block,
+            num_moe_experts=4,
+        )
+
+        assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.block
 
     @pytest.mark.parametrize(
         "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
@@ -193,6 +203,7 @@ class TestCudaGraphConfigAndArguments:
         cfg = _te_whole_moe_paged_stash_config(
             cuda_graph_modules=cuda_graph_modules, cuda_graph_warmup_steps=2
         )
+        validate_moe_cuda_graph_support(cfg)
 
         assert cfg.cuda_graph_modules == cuda_graph_modules
 
@@ -250,7 +261,7 @@ class TestCudaGraphConfigAndArguments:
         with pytest.raises(
             AssertionError, match="sync-free HybridEP with rank capacity and paged stash"
         ):
-            _base_cuda_graph_config(
+            cfg = _base_cuda_graph_config(
                 cuda_graph_impl="transformer_engine",
                 cuda_graph_modules=cuda_graph_modules,
                 num_moe_experts=4,
@@ -259,6 +270,7 @@ class TestCudaGraphConfigAndArguments:
                 moe_expert_rank_capacity_factor=1.2,
                 use_transformer_engine_op_fuser=True,
             )
+            validate_moe_cuda_graph_support(cfg)
 
     def test_full_iteration_impl_requires_empty_scope(self):
         with pytest.raises(
@@ -1053,13 +1065,10 @@ class TestTECudaGraphHelper:
             inner_layer.is_moe_layer = True
             layer.inner_layer = inner_layer
 
+        monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: True)
+
         helper = object.__new__(TECudaGraphHelper)
-        helper.config = SimpleNamespace(
-            moe_paged_stash=True,
-            cuda_graph_modules=cuda_graph_modules,
-            sequence_parallel=False,
-            overlap_moe_expert_parallel_comm=False,
-        )
+        helper.config = _te_whole_moe_paged_stash_config(cuda_graph_modules=cuda_graph_modules)
         helper.flattened_callables = [layer]
         helper.callables_per_chunk = []
         helper.num_microbatches = 1

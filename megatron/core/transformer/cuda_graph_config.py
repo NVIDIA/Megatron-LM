@@ -22,7 +22,7 @@ ALLOWED_INFERENCE_SCOPES: dict[str, Set[InferenceCudaGraphScope]] = {
 }
 
 
-def cuda_graph_modules_capture_whole_moe(cuda_graph_modules: Sequence[CudaGraphModule]) -> bool:
+def is_whole_moe_cuda_graph_scope(cuda_graph_modules: Sequence[CudaGraphModule]) -> bool:
     """Whether a per-layer CUDA graph scope captures the complete MoE module.
 
     An empty normalized scope represents whole-layer capture, while an explicit
@@ -30,6 +30,33 @@ def cuda_graph_modules_capture_whole_moe(cuda_graph_modules: Sequence[CudaGraphM
     """
 
     return not cuda_graph_modules or CudaGraphModule.moe in cuda_graph_modules
+
+
+def validate_moe_cuda_graph_support(config) -> None:
+    """Validate backend support when the capture includes a whole-MoE module."""
+
+    if (
+        config.num_moe_experts is None
+        or config.num_moe_experts <= 1
+        or not is_whole_moe_cuda_graph_scope(config.cuda_graph_modules)
+        or (
+            config.moe_expert_capacity_factor is not None
+            and config.moe_pad_expert_input_to_capacity
+        )
+    ):
+        return
+
+    assert (
+        config.cuda_graph_impl == "transformer_engine"
+        and config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "hybridep"
+        and config.moe_expert_rank_capacity_factor is not None
+        and config.moe_paged_stash
+        and config.use_transformer_engine_op_fuser
+    ), (
+        "moe cuda graph is only supported with drop-padding MoE or transformer_engine "
+        "sync-free HybridEP with rank capacity and paged stash."
+    )
 
 
 def normalize_cuda_graph_modules(

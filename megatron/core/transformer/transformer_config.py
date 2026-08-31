@@ -15,11 +15,12 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
-    cuda_graph_modules_capture_whole_moe,
     get_deprecated_cuda_graph_modules_migration,
+    is_whole_moe_cuda_graph_scope,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
     validate_deprecated_cuda_graph_modules_migration_inputs,
+    validate_moe_cuda_graph_support,
 )
 from megatron.core.transformer.enums import (
     AttnBackend,
@@ -3304,22 +3305,8 @@ class TransformerConfig(ModelParallelConfig):
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
                     ):
-                        sync_free_hybridep_moe_graph = (
-                            self.cuda_graph_impl == "transformer_engine"
-                            and self.moe_token_dispatcher_type == "flex"
-                            and self.moe_flex_dispatcher_backend == "hybridep"
-                            and self.moe_expert_rank_capacity_factor is not None
-                            and self.moe_paged_stash
-                            and self.use_transformer_engine_op_fuser
-                        )
-                        assert (
-                            not cuda_graph_modules_capture_whole_moe(self.cuda_graph_modules)
-                            or sync_free_hybridep_moe_graph
-                        ), (
-                            "moe cuda graph is only supported with drop-padding MoE or "
-                            "transformer_engine sync-free HybridEP with rank capacity and "
-                            "paged stash."
-                        )
+                        if CudaGraphModule.moe in self.cuda_graph_modules:
+                            validate_moe_cuda_graph_support(self)
                         if self.moe_token_dispatcher_type == 'alltoall' and (
                             self.moe_expert_capacity_factor is not None
                             or self.moe_router_padding_for_fp8
@@ -3331,7 +3318,7 @@ class TransformerConfig(ModelParallelConfig):
 
             te_whole_moe_paged_stash = (
                 self.cuda_graph_impl == "transformer_engine"
-                and cuda_graph_modules_capture_whole_moe(self.cuda_graph_modules)
+                and is_whole_moe_cuda_graph_scope(self.cuda_graph_modules)
                 and self.moe_paged_stash
             )
             if te_whole_moe_paged_stash:

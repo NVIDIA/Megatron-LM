@@ -9,7 +9,7 @@ import torch
 from megatron.core._rank_utils import log_single_rank
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.transformer.cuda_graph_config import cuda_graph_modules_capture_whole_moe
+from megatron.core.transformer.cuda_graph_config import is_whole_moe_cuda_graph_scope
 from megatron.core.transformer.moe.ops.paged_stash import (
     GLOBAL_BLOCK_SIZE,
     paged_stash_copy_kernel,
@@ -1320,7 +1320,7 @@ class PagedStashRunner:
         te_whole_moe_graph_replay = (
             training
             and self.config.cuda_graph_impl == "transformer_engine"
-            and cuda_graph_modules_capture_whole_moe(self.config.cuda_graph_modules)
+            and is_whole_moe_cuda_graph_scope(self.config.cuda_graph_modules)
             and self._te_graph_capture_finished
         )
         if not te_whole_moe_graph_replay or (stash_overflow_ranks == 0 and overbudget_ranks == 0):
@@ -1340,7 +1340,7 @@ class PagedStashRunner:
         te_whole_moe_paged_stash_replay = (
             training
             and self.config.cuda_graph_impl == "transformer_engine"
-            and cuda_graph_modules_capture_whole_moe(self.config.cuda_graph_modules)
+            and is_whole_moe_cuda_graph_scope(self.config.cuda_graph_modules)
             and self.config.moe_paged_stash
             and self._te_graph_capture_finished
         )
