@@ -60,7 +60,6 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_data_args(parser)
     parser = _add_tokenizer_args(parser)
     parser = _add_autoresume_args(parser)
-    parser = _add_biencoder_args(parser)
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
     parser = _add_mla_args(parser)
@@ -3489,63 +3488,6 @@ def _add_autoresume_args(parser):
                        help='Intervals over which check for autoresume'
                        'termination signal')
 
-    return parser
-
-
-def _add_biencoder_args(parser):
-    group = parser.add_argument_group(title='biencoder')
-
-    # network size
-    group.add_argument('--ict-head-size', type=int, default=None,
-                       help='Size of block embeddings to be used in ICT and '
-                        'REALM (paper default: 128)')
-    group.add_argument('--biencoder-projection-dim', type=int, default=0,
-                       help='Size of projection head used in biencoder (paper'
-                        ' default: 128)')
-    group.add_argument('--biencoder-shared-query-context-model', action='store_true',
-                        help='Whether to share the parameters of the query '
-                        'and context models or not')
-
-    # checkpointing
-    group.add_argument('--ict-load', type=str, default=None,
-                       help='Directory containing an ICTBertModel checkpoint')
-    group.add_argument('--bert-load', type=str, default=None,
-                       help='Directory containing an BertModel checkpoint '
-                       '(needed to start ICT and REALM)')
-
-    # data
-    group.add_argument('--titles-data-path', type=str, default=None,
-                       help='Path to titles dataset used for ICT')
-    group.add_argument('--query-in-block-prob', type=float, default=0.1,
-                       help='Probability of keeping query in block for '
-                       'ICT dataset')
-    group.add_argument('--use-one-sent-docs', action='store_true',
-                       help='Whether to use one sentence documents in ICT')
-    group.add_argument('--evidence-data-path', type=str, default=None,
-                       help='Path to Wikipedia Evidence frm DPR paper')
-
-    # training
-    group.add_argument('--retriever-report-topk-accuracies', nargs='+', type=int,
-                        default=[], help="Which top-k accuracies to report "
-                        "(e.g. '1 5 20')")
-    group.add_argument('--retriever-score-scaling', action='store_true',
-                       help='Whether to scale retriever scores by inverse '
-                        'square root of hidden size')
-
-    # faiss index
-    group.add_argument('--block-data-path', type=str, default=None,
-                       help='Where to save/load BlockData to/from')
-    group.add_argument('--embedding-path', type=str, default=None,
-                       help='Where to save/load Open-Retrieval Embedding'
-                        ' data to/from')
-
-    # indexer
-    group.add_argument('--indexer-batch-size', type=int, default=128,
-                       help='How large of batches to use when doing indexing '
-                       'jobs')
-    group.add_argument('--indexer-log-interval', type=int, default=1000,
-                       help='After how many batches should the indexer '
-                       'report progress')
     return parser
 
 
