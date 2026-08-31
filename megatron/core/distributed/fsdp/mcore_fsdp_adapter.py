@@ -64,6 +64,43 @@ except ImportError as import_megatron_fsdp_error:
 logger = logging.getLogger(__name__)
 
 
+def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> None:
+    """Materialize and initialize one module's direct meta parameters."""
+    # Container modules may have parameterized children but no direct parameters or
+    # reset_parameters() method; their children are materialized separately.
+    if not any(parameter.is_meta for parameter in module.parameters(recurse=False)):
+        return
+
+    if device is None:
+        device = torch.device("cpu")
+
+    def materialize_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.is_meta:
+            return torch.empty_like(tensor, device=device)
+        return tensor
+
+    reset_parameters = getattr(module, "reset_parameters", None)
+    if reset_parameters is None:
+        raise ValueError(
+            f"Meta parameter module {type(module).__qualname__} does not have a "
+            "reset_parameters method."
+        )
+
+    module._apply(materialize_tensor, recurse=False)
+    reset_parameters()
+
+
+def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | None) -> None:
+    """Materialize meta parameters reachable from one FSDP unit.
+
+    PyTorch and Transformer Engine differ in reset_parameters(): PyTorch typically initializes
+    existing Parameters in place, while TE may replace a Parameter via setattr(). Run resets
+    before fully_shard() so FSDP sees the final Parameter objects.
+    """
+    for submodule in module.modules():
+        _materialize_meta_module(submodule, device)
+
+
 class FullyShardedDataParallelV1(_BaseDataParallel):
     """
     Fully Sharded Data Parallel (FSDP) wrapper for the Megatron model.
@@ -609,6 +646,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 # contributions after dispatch from every EP rank.
                 for submodule in module.modules():
                     if isinstance(submodule, MoELayer):
+                        if config.init_model_with_meta_device:
+                            _materialize_owned_meta_modules(submodule.experts, device)
                         fully_shard(
                             submodule.experts,
                             mesh=expert_dp_mesh,
@@ -622,12 +661,16 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     # wrapped twice when its type also appears in fsdp_unit_modules.
                     continue
                 if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
+                    if config.init_model_with_meta_device:
+                        _materialize_owned_meta_modules(submodule, device)
                     fully_shard(
                         submodule,
                         mesh=dp_mesh,
                         placements=dense_placements,
                         mixed_precision_policy=self.mp_policy,
                     )
+            if config.init_model_with_meta_device:
+                _materialize_owned_meta_modules(module, device)
             fully_shard(
                 module,
                 mesh=dp_mesh,
