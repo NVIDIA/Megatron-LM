@@ -10,7 +10,11 @@ import torch
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..optimizer.param_layout import FullParamLayout
 from ..process_groups_config import ProcessGroupCollection
-from ..transformer.cuda_graphs import is_graph_capturing
+from ..transformer.cuda_graphs import (
+    get_cuda_graph_capture_stream,
+    get_cuda_graph_param_ids,
+    is_graph_capturing,
+)
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import PARAM_READY_CALLBACK_ATTR, log_single_rank
 
@@ -435,6 +439,10 @@ class DistributedDataParallel(_BaseDataParallel):
         # Accumulation function for the gradients need to be stored so they
         # don't go out of scope.
         self.grad_accs = []
+        capture_stream = get_cuda_graph_capture_stream()
+        cuda_graph_param_ids = (
+            get_cuda_graph_param_ids(self.module) if capture_stream is not None else set()
+        )
         for param in self.module.parameters():
             if param.requires_grad:
                 # When delay_wgrad_compute is True and the param is marked with
@@ -455,7 +463,17 @@ class DistributedDataParallel(_BaseDataParallel):
                                     break
                 else:
                     # Expand so we get access to grad_fn.
-                    param_tmp = param.expand_as(param)
+                    grad_acc_on_capture_stream = id(param) in cuda_graph_param_ids
+                    if grad_acc_on_capture_stream:
+                        # DDP retains this AccumulateGrad node for the model's lifetime. Create
+                        # graph parameters' nodes on the capture stream so backward capture does
+                        # not inherit their eager stream affinity. Eager-only parameters remain on
+                        # the caller stream.
+                        with torch.cuda.stream(capture_stream):
+                            param_tmp = param.expand_as(param)
+                    else:
+                        param_tmp = param.expand_as(param)
+                    param._ddp_grad_acc_on_cudagraph_stream = grad_acc_on_capture_stream
                     # Get the gradient accumulator function.
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
                     if getattr(param, 'is_gtp_weight_remat', False) and hasattr(

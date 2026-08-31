@@ -1358,6 +1358,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 submodules += [self.mlp.shared_experts]
         return submodules
 
+    def _uses_local_cudagraph_for_training(self) -> bool:
+        """Return whether this layer owns a full or partial training CUDA graph."""
+        return any(
+            hasattr(self, attr)
+            for attr in (
+                "cudagraph_manager",
+                "cudagraph_manager_router",
+                "cudagraph_manager_postprocess",
+            )
+        )
+
     def _te_cuda_graph_capture(self, *args, **kwargs):
         """
         CUDA Graph capture for this layer using TE interface.
@@ -2154,6 +2165,19 @@ class MoETransformerLayer(TransformerLayer):
             or CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules
         ):
             self.transition_cudagraph_scope('partial')
+
+    def _get_additional_cudagraph_parameters(self):
+        """Return latent-projection parameters used by partial MoE graphs."""
+        params = list(super()._get_additional_cudagraph_parameters())
+        if CudaGraphModule.moe_router in (self.config.cuda_graph_modules or []):
+            # Router and postprocess graph closures call these projections even though they are
+            # outside the selected ``mlp.router`` tree. DDP must create their AccumulateGrad nodes
+            # on the capture stream as well.
+            for name in ("fc1_latent_proj", "fc2_latent_proj"):
+                projection = getattr(self.mlp, name, None)
+                if projection is not None:
+                    params.extend(projection.parameters())
+        return params
 
     def _resolve_token_dispatcher_attr(self, attr_name: str) -> tuple[Any, str]:
         parent_attr_name, _, leaf_attr_name = attr_name.rpartition('.')

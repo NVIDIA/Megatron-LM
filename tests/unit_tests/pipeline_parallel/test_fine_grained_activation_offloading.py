@@ -5,6 +5,7 @@ import logging
 import os
 from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -122,6 +123,32 @@ def _make_chunk_handler_for_offload_reload():
     handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
     handler.cpu_tensor_pool = OffloadTensorPool(device="cpu", pin_memory=True)
     return handler
+
+
+def test_chunk_offload_handler_reload_uses_default_stream_allocation(monkeypatch):
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as offload
+
+    handler = _make_chunk_handler_for_offload_reload()
+    cpu_backup = Mock()
+    cpu_backup.is_pinned.return_value = True
+    cpu_backup.size.return_value = (16,)
+    cpu_backup.dtype = torch.float32
+    cpu_backup.layout = torch.strided
+    gpu_tensor = Mock()
+    consumer_stream = Mock()
+    allocation_context = Mock(return_value=nullcontext())
+    empty = Mock(return_value=gpu_tensor)
+
+    monkeypatch.setattr(offload, "default_stream_allocation", allocation_context)
+    monkeypatch.setattr(torch.cuda, "current_stream", Mock(return_value=consumer_stream))
+    monkeypatch.setattr(torch, "empty", empty)
+
+    state = (torch.device("cuda"), cpu_backup, False, None)
+    assert handler.reload(state) is gpu_tensor
+
+    allocation_context.assert_called_once_with()
+    gpu_tensor.record_stream.assert_called_once_with(consumer_stream)
+    gpu_tensor.copy_.assert_called_once_with(cpu_backup, non_blocking=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
