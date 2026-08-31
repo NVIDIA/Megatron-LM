@@ -649,6 +649,40 @@ def test_sequence_packing_moe_hybridep_with_uneven_input_padding_passes():
     assert config.moe_hybridep_pad_uneven_dispatch_inputs is True
 
 
+@requires_te_2_9
+def test_sequence_packing_moe_hybridep_full_iteration_static_inputs_need_no_padding():
+    # THD full-iteration CUDA graphs pad every rank to max_seqlen_per_dp_cp_rank, so the
+    # dispatcher ranks see equal token counts without the runtime all-reduce.
+    config = _make_packing_config(
+        num_moe_experts=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        cuda_graph_impl="full_iteration",
+        cuda_graph_modules=[],
+        pad_packed_seq_alignment="max",
+        thd_max_packed_sequences=8,
+    )
+
+    assert config.moe_hybridep_pad_variable_tokens is False
+    assert config.pipeline_p2p_fixed_shape is True
+
+
+@requires_te_2_9
+def test_sequence_packing_moe_hybridep_full_iteration_still_requires_static_padding():
+    # The exemption relies on the static per-rank token capacity, which full-iteration
+    # sequence packing enforces through its fixed-shape pipeline path.
+    with pytest.raises(ValueError, match="requires pad_packed_seq_alignment='max'"):
+        _make_packing_config(
+            num_moe_experts=2,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            cuda_graph_impl="full_iteration",
+            cuda_graph_modules=[],
+            pad_packed_seq_alignment=128,
+            thd_max_packed_sequences=8,
+        )
+
+
 @pytest.mark.parametrize(
     "dev_flag,main_flag", [(False, False), (True, False), (False, True), (True, True)]
 )

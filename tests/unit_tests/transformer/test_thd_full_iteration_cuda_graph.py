@@ -18,22 +18,48 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import ModelParallelConfig, parallel_state
+from megatron.core.context_parallel_layout import finalize_packed_seq_params
+from megatron.core.context_parallel_layout.routes import build_thd_cp_partition_route
+from megatron.core.datasets import data_schedule
 from megatron.core.datasets.data_schedule import (
     THD_FULL_ITERATION_STATIC_BATCH_KEY,
     get_batch_on_this_rank_for_sequence_packing,
     prepare_thd_static_batch_for_full_iteration_cuda_graph,
 )
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
+from megatron.core.full_cuda_graph import (
+    FULL_CUDA_GRAPH_STATIC_METADATA_KEY,
+    FullCudaGraphWrapper,
+    StaticBufferLoader,
+)
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.schedules import get_tensor_shapes
-from megatron.core.tensor_parallel.random import HAVE_TE, initialize_rng_tracker
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
+from megatron.core.tensor_parallel.random import (
+    HAVE_TE,
+    convert_cuda_rng_state,
+    get_cuda_rng_tracker,
+    initialize_rng_tracker,
+)
 from megatron.core.utils import is_te_min_version
+from megatron.training.training import _resolve_thd_static_batch_pg_collection
 from tests.unit_tests.test_utilities import Utils
 
 TOKEN_CAPACITY = 64
 MAX_PACKED_SEQS = 8
 VOCAB_SIZE = 1024
 HIDDEN_SIZE = 32
+
+GRAPH_SAFE_RNG_AVAILABLE = all(
+    (
+        hasattr(torch.cuda.CUDAGraph, 'register_generator_state'),
+        hasattr(torch.Generator, 'graphsafe_set_state'),
+        hasattr(torch.Generator, 'graphsafe_get_state'),
+        hasattr(torch.Generator, 'clone_state'),
+    )
+)
 
 
 def _make_thd_full_iter_config(**overrides):
@@ -44,7 +70,7 @@ def _make_thd_full_iter_config(**overrides):
         pad_packed_seq_alignment='max',
         max_seqlen_per_dp_cp_rank=TOKEN_CAPACITY,
         thd_max_packed_sequences=MAX_PACKED_SEQS,
-        pad_packed_seq_by_appending_dummy_seq=True,
+        thd_tail_padding_policy=None,
         cp_partition_mode='zigzag',
         dynamic_context_parallel=False,
         pipeline_model_parallel_layout=None,
@@ -84,9 +110,42 @@ def _make_raw_packed_batch(sequence_lengths, seed, device='cuda', with_tokens=Tr
     return batch
 
 
+class _FakeCPGroup:
+    """Two-rank CP geometry for single-rank static-metadata lifecycle tests."""
+
+    @staticmethod
+    def size():
+        return 2
+
+    @staticmethod
+    def rank():
+        return 0
+
+
+_FAKE_CP_GROUP = _FakeCPGroup()
+
+
+def _finalize_with_fake_cp(packed_seq_params):
+    """Attach representative CP>1 metadata without requiring a second process."""
+    packed_seq_params.cp_group = _FAKE_CP_GROUP
+    cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+    packed_seq_params.cp_partition_route = build_thd_cp_partition_route(
+        cu_seqlens,
+        cp_size=_FAKE_CP_GROUP.size(),
+        cp_rank=_FAKE_CP_GROUP.rank(),
+        device=cu_seqlens.device,
+    )
+    host_cu = []
+    for value in cu_seqlens.cpu().tolist():
+        if not host_cu or value != host_cu[-1]:
+            host_cu.append(value)
+    packed_seq_params.thd_cp_host_cu_seqlens_q = host_cu
+    packed_seq_params.thd_cp_host_cu_seqlens_kv = host_cu
+    return packed_seq_params
+
+
 def _reset_full_cuda_graph_state():
     FullCudaGraphWrapper.reset_cuda_graph()
-    StaticBufferLoader.reset()
 
 
 @pytest.fixture(autouse=True)
@@ -134,8 +193,9 @@ class TestThdStaticBatchPreparation:
         assert not padding_mask[:total].any()
         assert padding_mask[total:].all()
 
-    def test_fast_path_reads_static_tensors_without_rebuilding(self):
-        config = _make_thd_full_iter_config()
+    @pytest.mark.parametrize('tail_padding_policy', ['append_dummy_seq', 'extend_last'])
+    def test_fast_path_preserves_padding_contract(self, tail_padding_policy):
+        config = _make_thd_full_iter_config(thd_tail_padding_policy=tail_padding_policy)
         batch = prepare_thd_static_batch_for_full_iteration_cuda_graph(
             iter([_make_raw_packed_batch([7, 9], seed=3)]), config=config
         )
@@ -158,7 +218,21 @@ class TestThdStaticBatchPreparation:
         assert psp.cu_seqlens_kv_padded is batch['cu_seqlens_padded']
         assert psp.max_seqlen_q == TOKEN_CAPACITY
         assert psp.max_seqlen_kv == TOKEN_CAPACITY
-        assert psp.pad_between_seqs is False
+        assert batch['pad_between_seqs'] is True
+        assert psp.pad_between_seqs is True
+        assert padding_mask[0, :16].logical_not().all()
+        assert padding_mask[0, 16:].all()
+
+        if tail_padding_policy == 'append_dummy_seq':
+            assert batch['cu_seqlens'][:4].tolist() == [0, 7, 16, TOKEN_CAPACITY]
+            assert batch['cu_seqlens_padded'][:4].tolist() == [0, 7, 16, TOKEN_CAPACITY]
+            assert (batch['cu_seqlens'][3:] == TOKEN_CAPACITY).all()
+            assert (batch['cu_seqlens_padded'][3:] == TOKEN_CAPACITY).all()
+        else:
+            assert batch['cu_seqlens'][:3].tolist() == [0, 7, 16]
+            assert batch['cu_seqlens_padded'][:3].tolist() == [0, 7, TOKEN_CAPACITY]
+            assert (batch['cu_seqlens'][2:] == 16).all()
+            assert (batch['cu_seqlens_padded'][2:] == TOKEN_CAPACITY).all()
 
     def test_oversized_pack_is_rejected(self):
         config = _make_thd_full_iter_config()
@@ -186,6 +260,133 @@ class TestThdStaticBatchPreparation:
         ):
             assert torch.equal(first[key], second[key]), key
         assert first['max_seqlen'] == second['max_seqlen']
+        assert first['pad_between_seqs'] is second['pad_between_seqs']
+
+    def test_cp1_static_slot_rebuilds_packed_params_when_boundaries_change(self):
+        """CP1 keeps dynamic packed boundaries and must not retain layout caches."""
+        config = _make_thd_full_iter_config()
+        loader = StaticBufferLoader()
+
+        first = prepare_thd_static_batch_for_full_iteration_cuda_graph(
+            iter([_make_raw_packed_batch([7, 9], seed=3)]), config=config
+        )
+        static_batch = loader(first, 'training', 0)
+        first_params = get_batch_on_this_rank_for_sequence_packing(
+            iter([static_batch]), config=config
+        )[5]
+
+        second = prepare_thd_static_batch_for_full_iteration_cuda_graph(
+            iter([_make_raw_packed_batch([8, 8], seed=4)]), config=config
+        )
+        static_batch = loader(second, 'training', 0)
+        second_params = get_batch_on_this_rank_for_sequence_packing(
+            iter([static_batch]), config=config
+        )[5]
+
+        assert second_params is not first_params
+        assert second_params.cu_seqlens_q is static_batch['cu_seqlens']
+        assert second_params.cu_seqlens_q_padded is static_batch['cu_seqlens_padded']
+        assert torch.equal(
+            second_params.cu_seqlens_q[:3],
+            torch.tensor([0, 8, 16], device='cuda', dtype=torch.int32),
+        )
+
+    def test_cp_metadata_uses_stable_slot_and_rejects_geometry_change(self, monkeypatch):
+        """CP>1 Python route metadata is fixed while tensor payloads remain updateable."""
+        monkeypatch.setattr(data_schedule, 'finalize_packed_seq_params', _finalize_with_fake_cp)
+        config = _make_thd_full_iter_config()
+        loader = StaticBufferLoader()
+
+        first = prepare_thd_static_batch_for_full_iteration_cuda_graph(
+            iter([_make_raw_packed_batch([8, 8], seed=3)]), config=config
+        )
+        assert FULL_CUDA_GRAPH_STATIC_METADATA_KEY in first
+        static_batch = loader(first, 'training', 0)
+        first_tokens = static_batch['tokens'].clone()
+        first_outputs = get_batch_on_this_rank_for_sequence_packing(
+            iter([static_batch]), config=config
+        )
+        first_params = first_outputs[5]
+        first_route = first_params.cp_partition_route
+        assert sum(first_route.zigzag_split_sizes) == TOKEN_CAPACITY // 2
+        assert sum(first_route.contiguous_split_sizes) == TOKEN_CAPACITY // 2
+        assert first_route.contiguous_index is not None
+        assert first_route.contiguous_index.numel() == TOKEN_CAPACITY // 2
+        first_route_ptr = first_route.contiguous_index.data_ptr()
+        assert first_params.thd_cp_host_cu_seqlens_q == [0, 8, 16, TOKEN_CAPACITY]
+        assert first_params.thd_cp_host_cu_seqlens_kv == [0, 8, 16, TOKEN_CAPACITY]
+
+        # The ordinary pretrain get_batch finalizer must recognize that the
+        # static fast path already finalized the metadata outside capture.
+        from megatron.core.context_parallel_layout import routes
+
+        monkeypatch.setattr(
+            routes,
+            'prebuild_thd_cp_partition_routes',
+            lambda *args, **kwargs: pytest.fail('CP route rebuilt on the captured path'),
+        )
+        assert finalize_packed_seq_params(first_params) is first_params
+
+        second = prepare_thd_static_batch_for_full_iteration_cuda_graph(
+            iter([_make_raw_packed_batch([8, 8], seed=4)]), config=config
+        )
+        static_batch_again = loader(second, 'training', 0)
+        second_outputs = get_batch_on_this_rank_for_sequence_packing(
+            iter([static_batch_again]), config=config
+        )
+        second_params = second_outputs[5]
+        assert second_params is first_params
+        assert second_params.cp_partition_route.contiguous_index.data_ptr() == first_route_ptr
+        assert not torch.equal(static_batch_again['tokens'], first_tokens)
+
+        changed_geometry = prepare_thd_static_batch_for_full_iteration_cuda_graph(
+            iter([_make_raw_packed_batch([4, 12], seed=5)]), config=config
+        )
+        with pytest.raises(RuntimeError, match='static input metadata changed'):
+            loader(changed_geometry, 'training', 0)
+
+
+def test_resolve_thd_static_batch_pg_collection():
+    language_model_pgs = ProcessGroupCollection()
+    multimodule_pgs = MultiModuleProcessGroupCollection(
+        module_pgs={'language_model': language_model_pgs},
+        language_model_module_name='language_model',
+    )
+    assert _resolve_thd_static_batch_pg_collection(language_model_pgs) is language_model_pgs
+    assert _resolve_thd_static_batch_pg_collection(None) is None
+
+    with pytest.raises(ValueError, match='does not support MultiModuleProcessGroupCollection'):
+        _resolve_thd_static_batch_pg_collection(multimodule_pgs)
+
+    no_language_model_pgs = MultiModuleProcessGroupCollection(
+        module_pgs={'encoder': ProcessGroupCollection()}, language_model_module_name=None
+    )
+    with pytest.raises(ValueError, match='does not support MultiModuleProcessGroupCollection'):
+        _resolve_thd_static_batch_pg_collection(no_language_model_pgs)
+
+
+def test_stage_specific_reset_preserves_other_graph_state():
+    FullCudaGraphWrapper.result = {'training': object(), 'validation': object()}
+    FullCudaGraphWrapper.capture_signature = {
+        'training': {'num_microbatches': 2},
+        'validation': {'num_microbatches': 1},
+    }
+    StaticBufferLoader.static_buffers = {
+        'training': [{'tokens': object()}],
+        'validation': [{'tokens': object()}],
+    }
+
+    validation_result = FullCudaGraphWrapper.result['validation']
+    validation_signature = FullCudaGraphWrapper.capture_signature['validation']
+    validation_buffers = StaticBufferLoader.static_buffers['validation']
+    FullCudaGraphWrapper.reset_cuda_graph(stage='training')
+
+    assert FullCudaGraphWrapper.result['training'] is None
+    assert FullCudaGraphWrapper.capture_signature['training'] is None
+    assert StaticBufferLoader.static_buffers['training'] == []
+    assert FullCudaGraphWrapper.result['validation'] is validation_result
+    assert FullCudaGraphWrapper.capture_signature['validation'] is validation_signature
+    assert StaticBufferLoader.static_buffers['validation'] is validation_buffers
 
 
 class TestThdStaticPPCommunicationShapes:
@@ -202,7 +403,8 @@ class TestThdStaticPPCommunicationShapes:
             variable_seq_lengths=True,
             sequence_parallel=False,
             hidden_size=HIDDEN_SIZE,
-            enable_hyper_connections=False,
+            pipeline_model_parallel_size=1,
+            enable_mhc_connections=False,
         )
         shapes = get_tensor_shapes(
             seq_length=8192,  # nominal value; must be ignored in THD static mode
@@ -308,8 +510,8 @@ def _raw_batches_for_step(step, num_microbatches, seed_base=1000):
 
 
 @pytest.mark.skipif(
-    not (HAVE_TE and is_te_min_version("1.5.0")),
-    reason="full-iteration capture uses the TE RNG tracker (requires TE >= 1.5)",
+    not (HAVE_TE and is_te_min_version("1.5.0") and GRAPH_SAFE_RNG_AVAILABLE),
+    reason="full-iteration TE RNG capture requires TE >= 1.5 and graph-safe PyTorch RNG APIs",
 )
 class TestThdFullIterationWrapper:
     """End-to-end capture/replay with a fixed num_microbatches."""
@@ -320,9 +522,50 @@ class TestThdFullIterationWrapper:
     def setup_method(self, method):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel()
+        tracker = get_cuda_rng_tracker()
+        tracker.add('model-parallel-rng', 1234 + Utils.rank)
+        tracker.set_states(
+            {
+                name: convert_cuda_rng_state(state, to_graphable=False)
+                for name, state in tracker.get_states().items()
+            }
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_graphable_rng_states_are_accepted_and_consumed(self):
+        initialize_rng_tracker(use_cudagraphable_rng=True, force_reset=True)
+        tracker = get_cuda_rng_tracker()
+        tracker.add('model-parallel-rng', 1234)
+
+        states = FullCudaGraphWrapper._get_graphable_rng_states()
+
+        assert isinstance(states['model-parallel-rng'], torch.Generator)
+        assert tracker.get_states()['model-parallel-rng'] is states['model-parallel-rng']
+        with tracker.fork('model-parallel-rng'):
+            torch.rand(1, device='cuda')
+
+    def test_non_graphable_rng_tracker_fails_before_capture(self):
+        initialize_rng_tracker(use_cudagraphable_rng=False, force_reset=True)
+        tracker = get_cuda_rng_tracker()
+        tracker.add('model-parallel-rng', 1234)
+
+        with pytest.raises(RuntimeError, match='requires a graph-safe CUDA RNG tracker'):
+            FullCudaGraphWrapper._get_graphable_rng_states()
+
+    def test_te_tensor_rng_states_are_converted_and_consumed(self):
+        tracker = get_cuda_rng_tracker()
+        assert tracker.get_states()
+        assert all(isinstance(state, torch.Tensor) for state in tracker.get_states().values())
+
+        states = FullCudaGraphWrapper._get_graphable_rng_states()
+
+        assert all(isinstance(state, torch.Generator) for state in states.values())
+        for name, state in states.items():
+            assert tracker.get_states()[name] is state
+        with tracker.fork(next(iter(states))):
+            torch.rand(1, device='cuda')
 
     def _make_models(self):
         torch.manual_seed(1234 + Utils.rank)
@@ -389,6 +632,48 @@ class TestThdFullIterationWrapper:
         for p_graph, p_eager in zip(model_graph.parameters(), model_eager.parameters()):
             assert torch.equal(p_graph.grad, p_eager.grad)
 
+    def test_cp_metadata_is_prebuilt_before_capture_and_reused(self, monkeypatch):
+        """A CP>1 static slot never rebuilds host-derived metadata in capture."""
+        monkeypatch.setattr(data_schedule, 'finalize_packed_seq_params', _finalize_with_fake_cp)
+        from megatron.core.context_parallel_layout import routes
+
+        monkeypatch.setattr(
+            routes,
+            'prebuild_thd_cp_partition_routes',
+            lambda *args, **kwargs: pytest.fail('CP route rebuilt in forward/capture'),
+        )
+
+        config = _make_thd_full_iter_config()
+        model, _ = self._make_models()
+        seen_params = []
+
+        def forward_step(data_iterator, model):
+            tokens, labels, loss_mask, _, _, packed_seq_params, padding_mask = (
+                get_batch_on_this_rank_for_sequence_packing(data_iterator, config=config)
+            )
+            finalize_packed_seq_params(packed_seq_params)
+            seen_params.append(packed_seq_params)
+            # Consume a route tensor so capture also pins the static tensor input,
+            # not only the Python metadata wrapper around it.
+            tokens = tokens + packed_seq_params.cp_partition_route.contiguous_index[0]
+            logits = model(tokens)
+            return logits, _make_masked_loss_func(labels, loss_mask, padding_mask)
+
+        prepare_fn = functools.partial(
+            prepare_thd_static_batch_for_full_iteration_cuda_graph, config=config
+        )
+        wrapped = FullCudaGraphWrapper(
+            get_forward_backward_func(), cuda_graph_warmup_steps=1, batch_preparation_fn=prepare_fn
+        )
+
+        for step in range(3):
+            raw = [_make_raw_packed_batch([8, 8], seed=800 + step)]
+            wrapped(**self._run_kwargs(forward_step, [iter(raw)], model, num_microbatches=1))
+
+        assert FullCudaGraphWrapper.cuda_graph['training'] is not None
+        assert len(seen_params) == 2  # eager warmup + capture; replay runs no Python
+        assert seen_params[0] is seen_params[1]
+
     def test_num_microbatches_change_after_capture_raises(self):
         thd_config = _make_thd_full_iter_config()
         model_graph, _ = self._make_models()
@@ -452,8 +737,8 @@ class _ThdToyLastStage(torch.nn.Module):
 
 
 @pytest.mark.skipif(
-    not (HAVE_TE and is_te_min_version("1.5.0")),
-    reason="full-iteration capture uses the TE RNG tracker (requires TE >= 1.5)",
+    not (HAVE_TE and is_te_min_version("1.5.0") and GRAPH_SAFE_RNG_AVAILABLE),
+    reason="full-iteration TE RNG capture requires TE >= 1.5 and graph-safe PyTorch RNG APIs",
 )
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="PP2 requires at least 2 GPUs")
 class TestThdFullIterationWrapperPP2:
@@ -465,6 +750,14 @@ class TestThdFullIterationWrapperPP2:
     def setup_method(self, method):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(1, 2)
+        tracker = get_cuda_rng_tracker()
+        tracker.add('model-parallel-rng', 1234 + Utils.rank)
+        tracker.set_states(
+            {
+                name: convert_cuda_rng_state(state, to_graphable=False)
+                for name, state in tracker.get_states().items()
+            }
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -651,6 +944,8 @@ _DENSE_E2E_ARGS = _E2E_COMMON_ARGS + [
     "32000",
 ]
 
+_DENSE_CP2_E2E_ARGS = _DENSE_E2E_ARGS + ["--context-parallel-size", "2"]
+
 # Moonlight-style MLA + MoE, downsized, with STATIC expert shapes: alltoall
 # dispatcher + capacity factor + pad-to-capacity (the v1 full-iteration MoE
 # contract). Router fusion exercises TE's fused_moe_aux_loss with a tensor
@@ -755,6 +1050,7 @@ def _wait_for_idle_gpus(timeout_s=90):
     "model_name,model_args,base_port",
     [
         ("dense", _DENSE_E2E_ARGS, 29720),
+        ("dense_cp2", _DENSE_CP2_E2E_ARGS, 29722),
         ("moonlight_static_capacity", _MOONLIGHT_STATIC_E2E_ARGS, 29724),
     ],
 )
