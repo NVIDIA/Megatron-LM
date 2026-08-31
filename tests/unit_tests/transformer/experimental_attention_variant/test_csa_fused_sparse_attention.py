@@ -1116,18 +1116,18 @@ class TestCPCommunicationOverlap:
             local_compressed_kv_rows = 2
             softmax_scale = 0.5
             q_padding_mask = None
-            num_forward_inputs = 25
+            num_forward_inputs = 26
 
         gradients = FusedCSAIndexerSparseAttnFromTopkFunc.backward(
             FakeContext(), torch.ones(2, 5), torch.ones(())
         )
 
-        assert len(gradients) == 25
+        assert len(gradients) == 26
         assert events == ["sparse_attention_backward", "launch_compressed_kv", "launch_indexer"]
-        assert gradients[18] is handles["indexer"].tensor
-        assert gradients[19] is handles["compressed_kv"].tensor
-        assert gradients[18].shape == (2, 3)
-        assert gradients[19].shape == (2, 5)
+        assert gradients[19] is handles["indexer"].tensor
+        assert gradients[20] is handles["compressed_kv"].tensor
+        assert gradients[19].shape == (2, 3)
+        assert gradients[20].shape == (2, 5)
         assert indexer_state.handle is handles["indexer"]
         assert compressed_kv_state.handle is handles["compressed_kv"]
 
