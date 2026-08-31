@@ -37,6 +37,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
 )
@@ -276,6 +277,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Prefix caching hit tracking (accumulated, reset by engine after logging).
         self.prefix_cache_hits = 0  # requests that matched at least one cached block
         self.prefix_cache_blocks_matched = 0  # total matched blocks across all requests
+        # Prefill compute accounting (drained into engine accumulators each step).
+        # computed = prompt tokens actually run through the model this step;
+        # skipped = prompt tokens whose prefill was skipped via a prefix-cache hit.
+        # A high skipped fraction confirms prefix caching is saving prefill compute
+        # (so any per-step latency growth is attention-over-context, not re-prefill).
+        self.prefix_cache_prefill_computed_tokens = 0
+        self.prefix_cache_prefill_skipped_tokens = 0
 
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
@@ -629,6 +637,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
 
+        # are we using the inference_optimized nvls ep dispatcher for MoEs?
+        self._nvls_dispatcher = (
+            get_pg_size(self.expert_model_parallel_group) > 1
+            and model_config.inference_moe_token_dispatcher_type == 'nvls'
+        )
+
         # are we using the training a2a dispatcher for MoEs?
         # Note that this is not optimal for speed.
         self._training_ep_dispatcher = (
@@ -673,19 +687,24 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
-        if get_pg_size(self.expert_model_parallel_group) > 1:
-            if self._nccl_ep_dispatcher:
-                NCCLAllGatherDispatcher.allocate_buffers()
-            else:
-                # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
-                moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
-                NVLSAllGatherVDispatcher.allocate_buffers(
-                    per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens)
-                    // tp_size,
-                    topk=model_config.moe_router_topk,
-                    hidden_size=moe_hidden_size,
-                    ep_group=self.expert_model_parallel_group,
-                )
+        #
+        # The shared _valid_tokens_tensor scalar is read as a pointer by both fused
+        # MoE backends (mcore_fused_moe and vllm_fused_moe) regardless of EP size, so
+        # allocate it unconditionally (covers EP=1, where no dispatcher comm buffers
+        # exist). The EP>1 dispatchers below reallocate it as part of their own buffer
+        # setup, which is harmless.
+        InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
+        if self._nccl_ep_dispatcher:
+            NCCLAllGatherDispatcher.allocate_buffers()
+        elif self._nvls_dispatcher:
+            # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
+            moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
+            NVLSAllGatherVDispatcher.allocate_buffers(
+                per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens) // tp_size,
+                topk=model_config.moe_router_topk,
+                hidden_size=moe_hidden_size,
+                ep_group=self.expert_model_parallel_group,
+            )
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -702,6 +721,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.is_tensor_state_allocated = False
         self._bookkeeping_no_real_work = False
         self.initialize_all_tensors()
+
+        # Bind the GPU real-token-count tensor onto the NVLS dispatcher class
+        # so it can mask out CUDA-graph padding tokens during routing. The
+        # tensor lives inside gpu_view._buf (fixed address) and is refreshed
+        # each step by transfer_bookkeeping_to_gpu(). NVLS-only — the NCCL
+        # dispatcher requires equal token counts across ranks already.
+        if self._nvls_dispatcher:
+            NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         # Print info.
         active_blocks = self.kv_block_allocator.active_count
@@ -2507,12 +2534,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx.fill_(-1)
         self.token_to_local_position_within_kv_block.fill_(0)
 
-    def reset_metadata(self) -> None:
+    def reset_metadata(self, preserve_prefix_cache: bool = False) -> None:
         """Reset all bookkeeping state: counters, block allocator, attention/mamba state.
 
         This must be called after ``initialize_all_tensors()`` and after any
         suspend/resume cycle to bring the context back to a clean state.
+
+        Args:
+            preserve_prefix_cache: When True, keep the KV block allocator's prefix-cache
+                state (hash index, ref counts, cached blocks) intact. Used by the idle
+                ``dummy_forward`` path, which only needs to clear the transient one-token
+                step state -- wiping the allocator there would destroy cross-request prefix
+                reuse for any subsequent request (the engine idles between requests at low
+                concurrency, especially with EP > 1).
         """
+        # No cache to preserve when prefix caching is off: fall back to a full
+        # reset so the disabled path is byte-identical to the original behavior.
+        preserve_prefix_cache = preserve_prefix_cache and self.enable_prefix_caching
 
         # Reset request/token counts.
         self.total_request_count = 0
@@ -2535,7 +2573,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Reset attention, mamba, and block allocator state.
         self.reset_attention_state()
         self.reset_mamba_state()
-        self.kv_block_allocator.reset()
+        if not preserve_prefix_cache:
+            self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
         # Reset chunked prefill state
@@ -2547,7 +2586,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
 
-    def reset(self) -> None:
+    def reset(self, preserve_prefix_cache: bool = False) -> None:
         """Reset entire context.
 
         This method does:
@@ -2558,18 +2597,31 @@ class DynamicInferenceContext(BaseInferenceContext):
         This method is useful after cuda graph warmup iterations, where the
         context's memory buffer is referenced by the cuda graph system and
         cannot be deallocated.
+
+        Args:
+            preserve_prefix_cache: When True, keep the KV and Mamba prefix-cache
+                state (hash indices, cached blocks/slots, LRU clock) intact. Used by
+                the idle ``dummy_forward`` path so an idle step between requests does
+                not destroy cross-request prefix reuse.
         """
+        # No cache to preserve when prefix caching is off: fall back to a full
+        # reset so the disabled path is byte-identical to the original behavior.
+        preserve_prefix_cache = preserve_prefix_cache and self.enable_prefix_caching
         self.reset_tensors()
-        self.reset_metadata()
+        self.reset_metadata(preserve_prefix_cache=preserve_prefix_cache)
 
         # Reset lifetime counters (not reset in reset_metadata, which is also
         # called during suspend/resume where these must persist).
-        self.step_count = 0
-        self.prefix_cache_lru_clock = 0
+        if not preserve_prefix_cache:
+            self.step_count = 0
+            self.prefix_cache_lru_clock = 0
 
-        # Reset Mamba cache state
-        if self.mamba_slot_allocator is not None:
-            self.mamba_slot_allocator.reset()
+            # Reset Mamba cache state
+            if self.mamba_slot_allocator is not None:
+                self.mamba_slot_allocator.reset()
+        # When preserving prefix cache (idle dummy_forward), keep step_count
+        # monotonic so the engine's periodic logging cadence
+        # (step_count % logging_step_interval) still fires for short requests.
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
@@ -3018,6 +3070,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.active_token_count += effective_prefill_chunk_length
         self.lifetime_prefill_token_count += effective_prefill_chunk_length
+        if self.enable_prefix_caching:
+            self.prefix_cache_prefill_computed_tokens += effective_prefill_chunk_length
+            self.prefix_cache_prefill_skipped_tokens += prefix_skip_tokens
         self.total_request_count += 1
         self.num_prefill_requests += 1
 
