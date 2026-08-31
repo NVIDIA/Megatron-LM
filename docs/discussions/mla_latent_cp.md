@@ -650,7 +650,7 @@ The completed sanitized qualification matrix is:
 
 | Hardware | Backend | Frontend/package | Runtime/distribution identity | Evidence epsilon |
 | --- | --- | --- | --- | --- |
-| H100 / SM90 | `AttnBackend.fused` | `1.22.1` | cuDNN `9.21.0` | `4.561878810305231e-05` |
+| H100 / SM90 | `AttnBackend.fused` | `1.22.1` | cuDNN `9.21.0` | `4.5788848699546136e-05` |
 | SM100 | `AttnBackend.fused` | `1.26.0` | cuDNN `9.25.0` | `4.423665134356547e-05` |
 | SM100 | `AttnBackend.flash` | `4.0.0b11` | `flash-attn-4==4.0.0b11` | `4.3095951884009054e-05` |
 

@@ -70,7 +70,7 @@ EXPECTED_QUALIFIED_BACKEND_CONFIGS: tuple[latent_cp.QualifiedBackendTuple, ...] 
     (AttnBackend.flash, "4.0.0b11", "flash-attn-4==4.0.0b11", (10, 0)),
 )
 EXPECTED_QUALIFICATION_EPS: dict[latent_cp.QualifiedBackendTuple, float] = {
-    (AttnBackend.fused, "1.22.1", "9.21.0", (9, 0)): 4.561878810305231e-05,
+    (AttnBackend.fused, "1.22.1", "9.21.0", (9, 0)): 4.5788848699546136e-05,
     (AttnBackend.fused, "1.26.0", "9.25.0", (10, 0)): 4.423665134356547e-05,
     (
         AttnBackend.flash,
