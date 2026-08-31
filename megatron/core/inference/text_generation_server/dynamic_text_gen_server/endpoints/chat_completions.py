@@ -614,7 +614,7 @@ def _coerce_to_token_id_list(result):
     return list(result)
 
 
-def _tokenize_with_media_slots_sync(
+async def _tokenize_with_media_slots(
     chat_tok,
     messages,
     media_slots,
@@ -624,21 +624,16 @@ def _tokenize_with_media_slots_sync(
     chat_template_kwargs,
     add_generation_prompt=True,
 ):
-    """Render a chat template and lower internal media slots to model tokens.
-
-    Synchronous, for use in a worker thread. Rendering the template is only part
-    of the cost: lowering the slots issues two encodes per slot plus one per text
-    run between them, so a request with several media items does far more
-    tokenizer work than the render itself. Running the whole function in one
-    executor hop keeps all of it off the event loop, rather than offloading the
-    render and leaving the per-slot encodes on the loop.
-    """
-    rendered = chat_tok.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=add_generation_prompt,
-        tools=tools,
-        **chat_template_kwargs,
+    """Render a chat template and lower internal media slots to model tokens."""
+    rendered = await asyncio.to_thread(
+        functools.partial(
+            chat_tok.apply_chat_template,
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+            **chat_template_kwargs,
+        )
     )
     if not isinstance(rendered, str):
         raise TypeError("Multimodal chat template rendering must return a string.")
@@ -822,10 +817,11 @@ try:
                 # Jinja renders that contend for the GIL with the very loop this
                 # offload protects. The executor also owns a private tokenizer
                 # copy, since HF tokenizers are not thread-safe.
+                # The multimodal path is left as-is: it is owned by the multimodal
+                # work and its slot lowering is being looked at separately.
                 if media_slots:
-                    tokenize_fn = partial(
-                        _tokenize_with_media_slots_sync,
-                        tokenize_chat_tok,
+                    prompt_tokens = await _tokenize_with_media_slots(
+                        chat_tok,
                         template_messages,
                         media_slots,
                         prompt_config,
@@ -834,16 +830,16 @@ try:
                         add_generation_prompt=True,
                     )
                 else:
-                    tokenize_fn = partial(
-                        _apply_chat_template_sync,
-                        tokenize_chat_tok,
-                        template_messages,
-                        template_tools,
-                        chat_template_kwargs,
+                    prompt_tokens = await asyncio.get_running_loop().run_in_executor(
+                        current_app.config['tokenize_executor'],
+                        partial(
+                            _apply_chat_template_sync,
+                            tokenize_chat_tok,
+                            template_messages,
+                            template_tools,
+                            chat_template_kwargs,
+                        ),
                     )
-                prompt_tokens = await asyncio.get_running_loop().run_in_executor(
-                    current_app.config['tokenize_executor'], tokenize_fn
-                )
 
                 if prevent_retokenization:
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
@@ -893,12 +889,9 @@ try:
                         )
 
                         # Get the templated tokenization of just the previous generation.
-                        # Same executor as the initial tokenization above: one hop,
-                        # private tokenizer copy, off the shared default pool.
                         if previous_media_slots:
-                            retokenize_fn = partial(
-                                _tokenize_with_media_slots_sync,
-                                tokenize_chat_tok,
+                            retokenized_previous_turn_token_ids = await _tokenize_with_media_slots(
+                                chat_tok,
                                 messages_to_last_assistant_message,
                                 previous_media_slots,
                                 prompt_config,
@@ -907,19 +900,19 @@ try:
                                 add_generation_prompt=False,
                             )
                         else:
-                            retokenize_fn = partial(
-                                _apply_chat_template_sync,
-                                tokenize_chat_tok,
-                                messages_to_last_assistant_message,
-                                template_tools,
-                                chat_template_kwargs,
-                                add_generation_prompt=False,
+                            retokenized_previous_turn_token_ids = (
+                                await asyncio.get_running_loop().run_in_executor(
+                                    current_app.config['tokenize_executor'],
+                                    partial(
+                                        _apply_chat_template_sync,
+                                        tokenize_chat_tok,
+                                        messages_to_last_assistant_message,
+                                        template_tools,
+                                        chat_template_kwargs,
+                                        add_generation_prompt=False,
+                                    ),
+                                )
                             )
-                        retokenized_previous_turn_token_ids = (
-                            await asyncio.get_running_loop().run_in_executor(
-                                current_app.config['tokenize_executor'], retokenize_fn
-                            )
-                        )
 
                         previous_turn_token_ids = (
                             previous_prompt_token_ids
