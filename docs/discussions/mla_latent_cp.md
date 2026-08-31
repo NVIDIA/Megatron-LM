@@ -536,10 +536,13 @@ communication stream. The public `torch.distributed.batch_isend_irecv` batch con
 objects ordered as `[isend(next), irecv(previous)]`, and every operation sets
 `group=effective_cp_group`. For a compute-produced payload, the communication stream waits for its producer;
 each returned `Work.wait` is issued while that stream is current, followed by a CUDA readiness event.
-Only the first hop waits for the ordinary compute stream: later hops relay a read-only receive already
-ordered on the same communication stream, so waiting for the preceding phase's attention kernels
-would create a false dependency. Every backward hop still waits for its compute-produced gradient.
-The generator then yields phase `i` on the ordinary attention stream. When it resumes for phase
+Only the first hop waits for the ordinary compute stream. Before a later hop is exposed to attention,
+the communication stream copies the received latent payload into a dedicated relay buffer and records
+a new readiness event. The consumer waits only for that small D2D staging copy; attention reads the
+original receive while NCCL relays the disjoint staging buffer. This removes the false dependency on
+the preceding phase's attention kernels without giving attention and transport concurrent access to
+the same storage. Every backward hop still waits for its compute-produced gradient. The generator then
+yields phase `i` on the ordinary attention stream. When it resumes for phase
 `i+1`, that consumer stream waits on the event, so the intervening attention kernels can overlap the
 one-hop receive without exposing an unready tensor.
 

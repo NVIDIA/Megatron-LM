@@ -74,6 +74,27 @@ class _PendingExchange:
         self.send_tensor = None
 
 
+def _stage_relay_payload(
+    payload: Tensor,
+    communication_stream: torch.cuda.Stream | None,
+    pending: _PendingExchange,
+) -> Tensor:
+    """Copy a received payload before NCCL relays it alongside its consumer."""
+
+    if communication_stream is None:
+        return payload
+    relay_payload = torch.empty_like(payload)
+    with torch.no_grad(), torch.cuda.stream(communication_stream):
+        relay_payload.copy_(payload)
+        ready_event = torch.cuda.Event()
+        ready_event.record(communication_stream)
+        payload.record_stream(communication_stream)
+        relay_payload.record_stream(communication_stream)
+    # The consumer must wait for the staging read, not for the following NCCL send.
+    pending.ready_event = ready_event
+    return relay_payload
+
+
 def _launch_ring_exchange(
     payload: Tensor,
     cp_group: dist.ProcessGroup,
@@ -117,6 +138,7 @@ class _LatentRingExchange(torch.autograd.Function):
     def forward(
         ctx: Any,
         payload: Tensor,
+        send_payload: Tensor,
         cp_group: dist.ProcessGroup,
         previous_peer: int,
         next_peer: int,
@@ -130,7 +152,7 @@ class _LatentRingExchange(torch.autograd.Function):
         ctx.next_peer = next_peer
         ctx.communication_stream = communication_stream
         return _launch_ring_exchange(
-            payload,
+            send_payload,
             cp_group,
             next_peer,
             previous_peer,
@@ -142,7 +164,7 @@ class _LatentRingExchange(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx: Any, grad_receive: Tensor
-    ) -> tuple[Tensor, None, None, None, None, None, None]:
+    ) -> tuple[Tensor, None, None, None, None, None, None, None]:
         """Route the received-payload gradient through the reverse ring hop."""
         grad_receive = grad_receive.contiguous()
         pending = _PendingExchange()
@@ -156,7 +178,7 @@ class _LatentRingExchange(torch.autograd.Function):
             True,
         )
         pending.wait_on_current_stream(grad_payload)
-        return grad_payload, None, None, None, None, None, None
+        return grad_payload, None, None, None, None, None, None, None
 
 
 class P2PRingTransport:
@@ -192,7 +214,12 @@ class P2PRingTransport:
             _communication_stream(local_payload) if self.size > 1 else None
         )
         for phase_index, phase in enumerate(phase_plan):
+            send_payload = payload
             if pending is not None:
+                if phase_index + 1 < self.size:
+                    send_payload = _stage_relay_payload(
+                        payload, communication_stream, pending
+                    )
                 pending.wait_on_current_stream(payload)
 
             next_payload: Tensor | None = None
@@ -201,6 +228,7 @@ class P2PRingTransport:
                 next_pending = _PendingExchange()
                 next_payload = _LatentRingExchange.apply(
                     payload,
+                    send_payload,
                     self.cp_group,
                     self.previous_peer,
                     self.next_peer,

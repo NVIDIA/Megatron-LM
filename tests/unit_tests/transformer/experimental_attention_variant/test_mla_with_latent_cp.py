@@ -2587,7 +2587,9 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         wait_count = 0
 
         def p2p_op(op, tensor, peer, group=None, tag=0):
-            p2p_records.append((op, tensor.numel(), tensor.element_size(), peer, group))
+            p2p_records.append(
+                (op, tensor.numel(), tensor.element_size(), peer, group, tensor)
+            )
             return real_p2p_op(op, tensor, peer, group=group, tag=tag)
 
         class WorkProxy:
@@ -2633,6 +2635,11 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
             assert torch.equal(
                 lease.tensor, torch.full_like(lease.tensor, float(lease.owner))
             )
+        forward_sends = [p2p_records[2 * phase][5] for phase in range(cp_size - 1)]
+        assert forward_sends[0].data_ptr() == leases[0].tensor.data_ptr()
+        for send, lease in zip(forward_sends[1:], leases[1:-1], strict=True):
+            assert send.data_ptr() != lease.tensor.data_ptr()
+            assert torch.equal(send, lease.tensor)
         weights = [float(cp_rank * cp_size + phase + 1) for phase in range(cp_size)]
         loss = sum(
             weight * lease.tensor.float().sum()
