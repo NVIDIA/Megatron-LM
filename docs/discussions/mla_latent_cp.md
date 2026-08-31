@@ -368,10 +368,13 @@ Both kernels consume BF16 Q/K/V. Their raw phase output is BF16 and their LSE/st
 adapter immediately returns canonical FP32 `O_i` and FP32 `E_i` with shapes
 `[T_q,H_tp,D_v]` and `[T_q,H_tp]`.
 
-When an upper phase's back rows form a contiguous interval, only that interval of the accumulated
-output/LSE enters the merge and the prefix/suffix are concatenated unchanged. This avoids allocating
-full-size zero/`-inf` scatter buffers. General multi-sequence layouts retain the functional
-`index_copy` fallback below, never an in-place write:
+All upper phases target the same back-row subset. They are first merged in that compact row space,
+then combined with the full-row accumulator once after the phase loop. This keeps the online-softmax
+math and analytical backward intact while avoiding a full-output concatenation after every upper
+phase. When the back rows form a contiguous interval, only that interval of the accumulated
+output/LSE enters the final merge and the prefix/suffix are concatenated unchanged.
+This avoids allocating full-size zero/`-inf` scatter buffers. General multi-sequence layouts retain
+the functional `index_copy` fallback below, never an in-place write:
 
 ```text
 O_i_full = zeros([T_r,H_tp,D_v], FP32).index_copy(0, back_indices, O_i)

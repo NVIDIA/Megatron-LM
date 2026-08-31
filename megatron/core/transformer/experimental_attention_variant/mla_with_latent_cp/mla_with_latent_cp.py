@@ -771,6 +771,10 @@ class MLAWithLatentCP(MLASelfAttention):
 
         merged_output: Tensor | None = None
         merged_lse: Tensor | None = None
+        subset_output: Tensor | None = None
+        subset_lse: Tensor | None = None
+        subset_indices: Tensor | None = None
+        subset_slice: tuple[int, int] | None = None
         lease_count = 0
         leases = transport.iter_payloads(local_payload, layout.phases)
         recomputed_forward = getattr(backend, "forward_recomputed_phase", None)
@@ -826,16 +830,27 @@ class MLAWithLatentCP(MLASelfAttention):
                     "the first phase must cover every local query row",
                 )
                 merged_output, merged_lse = partial_output, partial_lse
+            elif phase.scatter_indices is None:
+                _require(
+                    subset_output is None,
+                    "a full-row phase cannot follow a partial-row phase",
+                )
+                merged_output, merged_lse = latent_cp_utils.merge_attention_partials(
+                    merged_output, merged_lse, partial_output, partial_lse
+                )
+            elif subset_output is None:
+                subset_output, subset_lse = partial_output, partial_lse
+                subset_indices = phase.scatter_indices
+                subset_slice = phase.scatter_slice
             else:
-                merged_output, merged_lse = (
-                    latent_cp_utils.merge_attention_partial_rows(
-                        merged_output,
-                        merged_lse,
-                        partial_output,
-                        partial_lse,
-                        phase.scatter_indices,
-                        phase.scatter_slice,
-                    )
+                _require(
+                    subset_lse is not None
+                    and subset_indices is phase.scatter_indices
+                    and subset_slice == phase.scatter_slice,
+                    "partial-row phases must share one query-row mapping",
+                )
+                subset_output, subset_lse = latent_cp_utils.merge_attention_partials(
+                    subset_output, subset_lse, partial_output, partial_lse
                 )
 
         _require(
@@ -843,9 +858,24 @@ class MLAWithLatentCP(MLASelfAttention):
             "transport did not yield exactly one lease per CP phase",
         )
 
-        if merged_output is None:
+        if merged_output is None or merged_lse is None:
             raise LatentCPError(
                 "zigzag phase plan unexpectedly produced no attention output"
+            )
+        _require(
+            (subset_output is None) == (subset_lse is None),
+            "partial-row output and LSE state disagree",
+        )
+        if subset_output is not None and subset_lse is not None:
+            if subset_indices is None:
+                raise LatentCPError("partial-row phase lost its query-row mapping")
+            merged_output, merged_lse = latent_cp_utils.merge_attention_partial_rows(
+                merged_output,
+                merged_lse,
+                subset_output,
+                subset_lse,
+                subset_indices,
+                subset_slice,
             )
         # This is the one and only post-backend FP32-to-BF16 cast.
         core_output = merged_output.to(torch.bfloat16).reshape(
