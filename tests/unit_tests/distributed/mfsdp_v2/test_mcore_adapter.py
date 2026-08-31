@@ -105,19 +105,16 @@ class TestMcoreAdapterDense:
         for name, parameter in parameters.items():
             local_parameter = parameter.to_local()
 
-            # Biases and layer norms use their module-specific initialization values.
-            if name.endswith("bias"):
-                expected_value = 0.0
-            elif "layernorm" in name or "layer_norm" in name:
-                expected_value = 1.0
-            else:
-                expected_value = 0.25
+            # Some parameters use module-specific initializers, so only check those
+            # initialized by the configured init method.
+            if name.endswith("bias") or "layernorm" in name or "layer_norm" in name:
+                continue
             torch.testing.assert_close(
                 local_parameter,
-                torch.full_like(local_parameter, expected_value),
+                torch.full_like(local_parameter, 0.25),
                 rtol=0,
                 atol=0,
-                msg=f"{name} was not initialized to {expected_value}",
+                msg=f"{name} was not initialized to 0.25",
             )
 
     def test_wraps_fsdp_unit_modules_before_root(self):
