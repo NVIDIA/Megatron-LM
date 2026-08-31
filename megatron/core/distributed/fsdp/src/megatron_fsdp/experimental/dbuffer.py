@@ -229,8 +229,10 @@ class DBuffer:
     def view(self, placements: Iterable[Placement]) -> "DBuffer":
         """Return a storage-sharing buffer with supported ``placements``.
 
-        Views preserve placements or locally slice one Replicate axis to Flat.
-        Other placement changes require communication and are not views.
+        Views preserve placements, relabel a full local buffer, or locally slice
+        one full local buffer to Flat. A view that changes a Partial placement is
+        only a storage destination: callers must populate it with a reduction
+        before reading it.
         """
         placements = tuple(placements)
         if len(placements) != self.mesh.ndim:
@@ -241,8 +243,10 @@ class DBuffer:
         changed_axis = changed_mesh_axis(self.placements, placements)
         if changed_axis is None:
             return self
-        if isinstance(self.placements[changed_axis], Replicate) and isinstance(
-            placements[changed_axis], Flat
+        source_placement = self.placements[changed_axis]
+        destination_placement = placements[changed_axis]
+        if isinstance(source_placement, (Replicate, Partial)) and isinstance(
+            destination_placement, Flat
         ):
             offset, local_numel = self.layout.get_local_range(self.mesh, placements)
             local_offset = offset - self.offset
@@ -255,8 +259,17 @@ class DBuffer:
                 self.layout.tensor_shapes,
                 allocation_stream=self.allocation_stream,
             )
+        if isinstance(source_placement, Partial) and isinstance(destination_placement, Replicate):
+            return DBuffer.from_local(
+                self.local_buffer,
+                self.mesh,
+                placements,
+                self.layout.tensor_shapes,
+                allocation_stream=self.allocation_stream,
+            )
         raise ValueError(
-            "DBuffer.view() supports identical placements or a Replicate-to-Flat slice, "
+            "DBuffer.view() supports identical placements, a Partial-to-Replicate relabel, "
+            "or a Replicate/Partial-to-Flat slice, "
             f"got {self.placements!r} -> {placements!r}."
         )
 

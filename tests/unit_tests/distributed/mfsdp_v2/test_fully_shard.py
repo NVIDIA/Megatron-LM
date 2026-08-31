@@ -21,6 +21,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import Flat
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_event_groups
 
@@ -248,6 +249,40 @@ def test_fully_shard_sgd_losses_match_baseline(
     )
 
 
+def test_zero1_main_grad_reuses_default_stream_storage(distributed_setup):
+    """ZeRO-1 keeps its main-gradient allocation and optimizer view across backwards."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = TinyModel().to(device)
+    construction_stream = torch.cuda.Stream(device)
+    with torch.cuda.stream(construction_stream):
+        with fully_shard_context(device=device):
+            fully_shard(model.fc1, mesh=mesh, placements=_zero1_placements())
+            fully_shard(model.fc2, mesh=mesh, placements=_zero1_placements())
+
+    (parameter_group,) = model.fc1.parameter_groups
+    main_grad = parameter_group.main_grad
+    pre_optimizer_main_grad = parameter_group.pre_optimizer_main_grad
+    assert main_grad is not None
+    assert pre_optimizer_main_grad is not None
+    assert main_grad.allocation_stream == torch.cuda.default_stream(device)
+    assert pre_optimizer_main_grad.placements == (Flat(),)
+    assert (
+        pre_optimizer_main_grad.local_buffer.untyped_storage()
+        is main_grad.local_buffer.untyped_storage()
+    )
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    for _ in range(2):
+        optimizer.zero_grad(set_to_none=True)
+        model(torch.randn(2, 8, device=device)).sum().backward()
+        assert parameter_group.main_grad is main_grad
+
+
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
 def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup, use_reentrant):
     """Activation recomputation should leave every FSDP module resharded.
@@ -372,10 +407,11 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
     Like HSDP, gradients reduce-scatter within DP-inner every backward and
     accumulate into main_grad. Unlike HSDP, the last-microbatch DP-outer reduction
     is a reduce-scatter (not an all-reduce) that finalizes main_grad to the
-    optimizer's [Shard(0), Shard(0)] placement, shrinking the buffer; the next step's reset
-    therefore allocates a fresh [Partial, Shard(0)] accumulation buffer. Every rank
-    sees identical data, so the averaged gradient equals the single-rank gradient
-    and losses must match. Both ``zero_grad`` modes are covered.
+    optimizer's [Shard(0), Shard(0)] placement. The optimizer layout is a view into
+    persistent [Partial, Shard(0)] accumulation storage, which is cleared before the
+    next ``zero_grad(set_to_none=False)`` accumulation. Every rank sees identical data,
+    so the averaged gradient equals the single-rank gradient and losses must match.
+    Both ``zero_grad`` modes are covered.
     """
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
@@ -729,7 +765,7 @@ def test_rejects_optimizer_placements_larger_than_model_weight_placements(distri
     placements = Placements(
         dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Replicate()]
     )
-    with pytest.raises(ValueError, match="Replicate-to-Flat slice"):
+    with pytest.raises(ValueError, match="DBuffer.view"):
         with fully_shard_context(device=device):
             fully_shard(
                 model,
