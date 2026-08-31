@@ -10,7 +10,7 @@ import torch
 
 from verl_mlite.engine.mlite_engine import MegatronLiteEngine
 
-pytestmark = (pytest.mark.mlite, pytest.mark.optional)
+pytestmark = [pytest.mark.mlite, pytest.mark.optional]
 
 
 def test_mtp_metric_averages_over_physical_pool_not_logical_singleton(monkeypatch):

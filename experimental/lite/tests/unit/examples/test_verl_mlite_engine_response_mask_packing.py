@@ -7,7 +7,7 @@ from tensordict import TensorDict
 
 from verl_mlite.engine.mlite_engine import MegatronLiteEngine
 
-pytestmark = (pytest.mark.mlite, pytest.mark.optional)
+pytestmark = [pytest.mark.mlite, pytest.mark.optional]
 
 
 def test_response_mask_is_used_when_loss_mask_is_absent():
