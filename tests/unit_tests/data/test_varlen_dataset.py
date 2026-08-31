@@ -685,6 +685,7 @@ def _loader_args(*, use_varlen, sbhd, scheduler, mbs, gbs=None):
         global_batch_size=mbs if gbs is None else gbs,
         full_validation=False,
         num_workers=0,
+        hybrid_context_parallel=False,
         use_varlen_dataset=use_varlen,
         varlen_sbhd_validation=sbhd,
         sequence_packing_scheduler=scheduler,
