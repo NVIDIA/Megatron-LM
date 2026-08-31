@@ -127,11 +127,7 @@ async def test_openai_stream_emits_delta_chunks_and_terminal_metadata():
     assert "generated_length" not in reconciled["choices"][0]
     assert finished["choices"][0]["finish_reason"] == "length"
     assert finished["choices"][0]["generation_token_ids"] == [1, 2, 3]
-    assert finished["choices"][0]["generation_log_probs"] == [
-        -0.1,
-        JSON_SAFE_LOGPROB_FLOOR,
-        -0.3,
-    ]
+    assert finished["choices"][0]["generation_log_probs"] == [-0.1, JSON_SAFE_LOGPROB_FLOOR, -0.3]
     assert finished["choices"][0]["generated_text"] == "abc"
     assert finished["choices"][0]["generated_length"] == 3
     assert usage["usage"] == {

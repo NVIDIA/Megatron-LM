@@ -981,12 +981,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         no_top_k, no_top_p = context.active_sampling_filter_flags()
         return self._sampling.sample_kernel(
-            logits_2d,
-            logits_2d.shape[0],
-            context,
-            no_top_k=no_top_k,
-            no_top_p=no_top_p,
-            eager=True,
+            logits_2d, logits_2d.shape[0], context, no_top_k=no_top_k, no_top_p=no_top_p, eager=True
         )
 
     def _compute_serial_mtp_and_sample(self, base_position: Optional[Tensor] = None) -> None:

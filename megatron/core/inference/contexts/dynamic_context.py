@@ -4818,9 +4818,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                     temperature = self.gpu_view.temperature[
                         row_to_request.to(logits.device, non_blocking=True)
                     ]
-                scaled = active_logits / temperature.clamp(
-                    min=MIN_SAMPLING_TEMPERATURE
-                ).unsqueeze(1)
+                scaled = active_logits / temperature.clamp(min=MIN_SAMPLING_TEMPERATURE).unsqueeze(
+                    1
+                )
                 gathered = scaled.gather(1, new_tokens.view(-1, 1).long()).squeeze(1)
                 tempered = gathered - scaled.logsumexp(dim=1)
                 selected_log_probs = torch.where(

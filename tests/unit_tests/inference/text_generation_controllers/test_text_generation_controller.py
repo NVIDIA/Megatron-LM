@@ -1972,8 +1972,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         # temperature=0 sharpens toward argmax instead of dividing into inf/NaN.
         cpu_logits = torch.randn(4, 32)
         assert torch.equal(
-            TorchSampling.filter_logits(cpu_logits, temperature=1.0, top_k=0, top_p=1.0),
-            cpu_logits,
+            TorchSampling.filter_logits(cpu_logits, temperature=1.0, top_k=0, top_p=1.0), cpu_logits
         )
         for top_k, top_p in ((4, 0.0), (0, 0.9)):
             filtered = TorchSampling.filter_logits(

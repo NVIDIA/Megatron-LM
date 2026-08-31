@@ -16,7 +16,9 @@ logger = logging.getLogger(__name__)
 
 # JSON cannot represent non-finite floats: `orjson.dumps` encodes them as null and the
 # std-json fallback emits `-Infinity` literals that strict parsers reject.
-# Use the standard floor of -9999.0, which other inference backends also use.
+# Use the standard floor of -9999.0, which other inference backends also use, e.g. vLLM:
+# https://github.com/vllm-project/vllm/blob/85c1365bd971/vllm/entrypoints/openai/completion/serving.py#L703
+# https://github.com/vllm-project/vllm/blob/85c1365bd971/vllm/entrypoints/generate/base/serving.py#L376-L388
 JSON_SAFE_LOGPROB_FLOOR = -9999.0
 
 
