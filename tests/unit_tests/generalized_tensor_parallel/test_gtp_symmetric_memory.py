@@ -98,7 +98,8 @@ class TestTeardownContract:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA pool test")
     def test_teardown_clears_own_state_but_not_foreign_allocations(self):
         group = _StubGroup(name="teardown_contract_group")
-        # A buffer owned by another subsystem (ring-slot style), allocated in the pool.
+        # A buffer owned by another subsystem (such as the persistent graph plan), allocated
+        # in the pool.
         with gtp_symm.gtp_symm_pool_ctx(group):
             foreign = torch.full((8,), 7.0, device="cuda")
         assert group.group_name in gtp_symm._pools
@@ -203,7 +204,8 @@ def _worker_sync_plain_recycle(rank, world_size, port):
     send_bufs, release_bufs = w._prepare_wgrad_reduce_scatter_inputs([scratch])
     assert send_bufs[0] is scratch and release_bufs[0] is scratch
 
-    # Plain padded branch: a padded copy is sent, the original is released.
+    # Plain padded branch: the original is recycled after the copy, while the padded send
+    # buffer is retained until the collective completes.
     padded_layer = _make_gtp_linear(64, 100, group, dtype)
     wp = padded_layer.weight
     wp.main_grad = torch.zeros(wp.shape, dtype=dtype, device="cuda")
@@ -211,8 +213,7 @@ def _worker_sync_plain_recycle(rank, world_size, port):
     send_bufs, release_bufs = wp._prepare_wgrad_reduce_scatter_inputs([p_scratch])
     assert send_bufs[0] is not p_scratch
     assert tuple(send_bufs[0].shape) == tuple(wp._unsharded_shape_padded)
-    assert release_bufs[0] is p_scratch
-    gtp_module._wgrad_pool_put(p_scratch)
+    assert release_bufs[0] is send_bufs[0]
 
     # Chain head -> synchronous reduce-scatter; the release path must return the
     # scratch to the plain pool (regression test for the sync-path dual release).
@@ -412,15 +413,14 @@ def _worker_real_pool_registration(rank, world_size, port):
             torch.arange(world_size, device="cuda", dtype=torch.float32), 4
         )
         assert torch.equal(out, expected)
-        # Pool tensors must be gone before the pools are deregistered and dropped
-        # (mirrors production teardown, which clears the LIFO first): a pool torn
-        # down with live allocations later frees blocks into a dead pool and a
-        # subsequent NCCL op hits deregistered memory (intermittent IMA).
-        del src, out
-        torch.cuda.synchronize()
     finally:
-        # Mandatory: leftover windows abort the ProcessGroupNCCL destructor at teardown.
+        # Mandatory: deregister the pool while its allocations are still alive. Local CUDA
+        # graphs follow this contract because their persistent arenas outlive this call.
         deregister_and_clear_gtp_symm_pools()
+    # Deregistration removes the NCCL windows, not the allocations themselves.
+    assert torch.equal(out, expected)
+    del src, out
+    torch.cuda.synchronize()
     assert not is_gtp_symm_pool_registered(group)
 
 
