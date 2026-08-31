@@ -199,7 +199,10 @@ class TestDSAIndexShareHelpers:
         assert not hasattr(attention_mask, DSAttention._HOLDER_ATTR)
         assert not hasattr(attention_mask, DSAttention._LENGTH_HOLDER_ATTR)
 
-    def test_nonpacked_checkpointed_forwards_keep_index_share_holders_isolated(self, monkeypatch):
+    @pytest.mark.parametrize("recompute_method", ["block", "uniform"])
+    def test_nonpacked_checkpointed_forwards_keep_index_share_holders_isolated(
+        self, monkeypatch, recompute_method
+    ):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
@@ -241,7 +244,7 @@ class TestDSAIndexShareHelpers:
                 fp8=False,
                 fp4=False,
                 distribute_saved_activations=False,
-                recompute_method="block",
+                recompute_method=recompute_method,
                 recompute_num_layers=1,
             ),
             layers=[HolderLayer()],
