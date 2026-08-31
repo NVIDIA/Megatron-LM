@@ -4,6 +4,7 @@ import gc
 import importlib.util
 import types
 from dataclasses import fields
+from functools import partial
 from typing import List, Optional, Tuple
 
 import pytest
@@ -23,8 +24,15 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.resharding.refit import clear_all_caches, swap_model_weights
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAttention,
+    DSAttentionSubmodules,
+)
+from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -202,18 +210,21 @@ def _build_gpt(
     return model
 
 
-def _build_mamba(
+def _build_hybrid(
     config: TransformerConfig,
     vocab_size: int,
     seq_len: int,
     pg_collection,
     hybrid_layer_pattern: str,
     parallel_output: bool = True,
+    stack_spec=None,
 ):
     pre_process, post_process = _pp_flags(pg_collection)
+    if stack_spec is None:
+        stack_spec = hybrid_stack_spec
     model = HybridModel(
         config=config,
-        hybrid_stack_spec=hybrid_stack_spec,
+        hybrid_stack_spec=stack_spec,
         vocab_size=vocab_size,
         max_sequence_length=seq_len,
         hybrid_layer_pattern=hybrid_layer_pattern,
@@ -227,13 +238,113 @@ def _build_mamba(
     return model
 
 
-def _mamba_layer_pattern(base: str, num_layers: int, pp_size: int) -> str:
+def _hybrid_layer_pattern(base: str, num_layers: int, pp_size: int) -> str:
     """Build hybrid_layer_pattern with '|' pipeline stage boundaries."""
     layers_per_stage = num_layers // pp_size
     unit_len = len(base)
     repeats_per_stage = layers_per_stage // unit_len
     stage = base * repeats_per_stage
     return "|".join([stage] * pp_size)
+
+
+class _DSGQACoreAttention(DSAttention):
+    """Wire the production DSA core to explicit GQA query, key, and value tensors."""
+
+    def set_hidden_states(self, hidden_states: torch.Tensor) -> None:
+        self._dsa_hidden_states = hidden_states
+
+    def clear_hidden_states(self) -> None:
+        self._dsa_hidden_states = None
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+        attn_mask_type: AttnMaskType = None,
+        attention_bias: torch.Tensor = None,
+        packed_seq_params=None,
+    ) -> torch.Tensor:
+        hidden_states = getattr(self, "_dsa_hidden_states", None)
+        if hidden_states is None:
+            raise RuntimeError("DSA-GQA core attention requires the self-attention input")
+        return super().forward(
+            query=query,
+            key=key,
+            value=value,
+            attention_mask=attention_mask,
+            x=hidden_states,
+            qr=hidden_states,
+            attn_mask_type=attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+        )
+
+
+class _DSGroupedSelfAttention(SelfAttention):
+    """Self-attention layer that executes the production DSA core on GQA tensors."""
+
+    def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+        self.core_attention.set_hidden_states(hidden_states)
+        try:
+            return super().forward(hidden_states, *args, **kwargs)
+        finally:
+            self.core_attention.clear_hidden_states()
+
+
+def _dsa_gqa_stack_spec():
+    """Return a hybrid stack spec with a non-absorbed, single-group GQA DSA layer."""
+    stack_spec = copy.deepcopy(hybrid_stack_spec)
+    dsa_layer_spec = stack_spec.submodules.dsa_layer
+    mla_attention_submodules = dsa_layer_spec.submodules.self_attention.submodules
+    dsa_submodules = DSAttentionSubmodules(
+        indexer=copy.deepcopy(mla_attention_submodules.core_attention.submodules.indexer)
+    )
+    dsa_layer_spec.submodules.self_attention = ModuleSpec(
+        module=_DSGroupedSelfAttention,
+        params={"attn_mask_type": AttnMaskType.causal},
+        submodules=SelfAttentionSubmodules(
+            linear_qkv=mla_attention_submodules.linear_q_proj,
+            core_attention=partial(_DSGQACoreAttention, submodules=dsa_submodules),
+            linear_proj=mla_attention_submodules.linear_proj,
+        ),
+    )
+    return stack_spec
+
+
+def _dsa_config(num_layers: int, tp_size: int, pp_size: int, *, gqa: bool):
+    """Build a compact config for absorbed MLA DSA or explicit single-group GQA DSA."""
+    hidden_size = 128
+    return MLATransformerConfig(
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_attention_heads=8,
+        num_query_groups=1 if gqa else 8,
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=pp_size,
+        sequence_parallel=not gqa and tp_size > 1,
+        use_cpu_initialization=True,
+        pipeline_dtype=torch.float32,
+        params_dtype=torch.float32,
+        add_bias_linear=False,
+        normalization="RMSNorm",
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        multi_latent_attention=not gqa,
+        q_lora_rank=hidden_size if gqa else 64,
+        kv_lora_rank=32,
+        qk_head_dim=16,
+        qk_pos_emb_head_dim=8,
+        v_head_dim=16,
+        rope_type="rope",
+        experimental_attention_variant="dsa",
+        dsa_indexer_n_heads=2,
+        dsa_indexer_head_dim=16,
+        dsa_indexer_topk=4,
+        dsa_indexer_rotate_activation=False,
+        dsa_kernel_backend="none",
+    )
 
 
 def _mp_config() -> ModelParallelConfig:
@@ -444,6 +555,122 @@ def test_swap_gpt_parametrized(
     # Free GPU memory to prevent OOM across the many parametrized test cases
     del src_model, dst_model
     # Clear refit caches before destroying model parallel to avoid stale plans
+    clear_all_caches()
+    _destroy_pg_collection(src_pgs)
+    _destroy_pg_collection(dst_pgs)
+    Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("dsa_type", ["mla", "gqa"])
+@pytest.mark.parametrize(
+    "src_tp,src_pp,dst_tp,dst_pp",
+    [
+        # Four-GPU Blackwell coverage.
+        (1, 1, 4, 1),
+        (4, 1, 1, 1),
+        (4, 1, 2, 2),
+        (2, 2, 4, 1),
+        # Eight-GPU H100 coverage.
+        (1, 1, 8, 1),
+        (8, 1, 1, 1),
+        (8, 1, 4, 2),
+        (4, 2, 8, 1),
+    ],
+)
+@pytest.mark.launch_on_gb200
+def test_swap_dsa_parallelism(dsa_type: str, src_tp: int, src_pp: int, dst_tp: int, dst_pp: int):
+    """Refit real MLA and single-group GQA DSA models across full-node TP/PP layouts."""
+    if not has_mamba_deps:
+        pytest.skip("HybridModel dependencies (mamba_ssm, einops) not available")
+
+    world = Utils.world_size
+    if (world % (src_tp * src_pp) != 0) or (world % (dst_tp * dst_pp) != 0):
+        pytest.skip("WORLD_SIZE must be divisible by both src_tp*src_pp and dst_tp*dst_pp")
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=src_tp, pipeline_model_parallel_size=src_pp
+    )
+    model_parallel_cuda_manual_seed(1234)
+    torch.manual_seed(1234)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    from math import lcm
+
+    seq_len = 8
+    vocab_size = 64
+    base_pattern = "D-"
+    num_layers = lcm(src_pp, dst_pp) * len(base_pattern)
+    src_cfg = _dsa_config(num_layers, src_tp, src_pp, gqa=dsa_type == "gqa")
+    dst_cfg = _dsa_config(num_layers, dst_tp, dst_pp, gqa=dsa_type == "gqa")
+    stack_spec = _dsa_gqa_stack_spec() if dsa_type == "gqa" else hybrid_stack_spec
+    src_pgs = _build_pg_collection(tp_size=src_tp, pp_size=src_pp)
+    dst_pgs = _build_pg_collection(tp_size=dst_tp, pp_size=dst_pp)
+    src_pattern = _hybrid_layer_pattern(base_pattern, num_layers, src_pp)
+    dst_pattern = _hybrid_layer_pattern(base_pattern, num_layers, dst_pp)
+
+    src_model = _build_hybrid(
+        src_cfg,
+        vocab_size,
+        seq_len,
+        src_pgs,
+        src_pattern,
+        parallel_output=False,
+        stack_spec=stack_spec,
+    ).to(device)
+    dst_model = _build_hybrid(
+        dst_cfg,
+        vocab_size,
+        seq_len,
+        dst_pgs,
+        dst_pattern,
+        parallel_output=False,
+        stack_spec=stack_spec,
+    ).to(device)
+    src_model.eval()
+    dst_model.eval()
+
+    for model in (src_model, dst_model):
+        dsa_modules = [module for module in model.modules() if isinstance(module, DSAttention)]
+        assert dsa_modules
+        assert all(isinstance(module, _DSGQACoreAttention) for module in dsa_modules) == (
+            dsa_type == "gqa"
+        )
+
+    batch = 1
+    tokens = torch.arange(seq_len, device=device, dtype=torch.long).view(batch, seq_len)
+    position_ids = torch.arange(seq_len, device=device, dtype=torch.long).view(batch, seq_len)
+    attention_mask = torch.triu(
+        torch.ones((batch, 1, seq_len, seq_len), device=device, dtype=torch.bool), diagonal=1
+    )
+
+    ref_logits = torch.empty(batch, seq_len, vocab_size, device=device)
+    src_last_pp_rank = dist.get_process_group_ranks(src_pgs.pp)[-1]
+    with torch.no_grad():
+        src_out = _run_forward(src_model, tokens, position_ids, attention_mask, src_pgs)
+        if dist.get_rank() == src_last_pp_rank:
+            ref_logits.copy_(src_out)
+    dist.broadcast(ref_logits, src=src_last_pp_rank, group=src_pgs.pp)
+
+    swap_model_weights([src_model], [dst_model], refit_method="nccl")
+
+    dst_logits = torch.empty_like(ref_logits)
+    dst_last_pp_rank = dist.get_process_group_ranks(dst_pgs.pp)[-1]
+    with torch.no_grad():
+        dst_out = _run_forward(dst_model, tokens, position_ids, attention_mask, dst_pgs)
+        if dist.get_rank() == dst_last_pp_rank:
+            dst_logits.copy_(dst_out)
+    dist.broadcast(dst_logits, src=dst_last_pp_rank, group=dst_pgs.pp)
+
+    max_diff = (dst_logits - ref_logits).abs().max().item()
+    assert torch.allclose(dst_logits, ref_logits, atol=2e-3, rtol=2e-3), (
+        f"{dsa_type.upper()} DSA refit src(TP={src_tp},PP={src_pp})"
+        f"->dst(TP={dst_tp},PP={dst_pp}) outputs differ (max_diff={max_diff:.6f})"
+    )
+
+    dist.barrier()
+    del src_model, dst_model
     clear_all_caches()
     _destroy_pg_collection(src_pgs)
     _destroy_pg_collection(dst_pgs)
@@ -796,6 +1023,169 @@ def test_router_expert_bias_refit_non_collocated(refit_backend: str):
     "refit_backend",
     [
         pytest.param(
+            "nccl_m2n",
+            marks=pytest.mark.skipif(
+                not has_nccl_m2n, reason="NVIDIA/nccl-extensions and NCCL4Py are not installed"
+            ),
+        ),
+        "nccl",
+    ],
+)
+@pytest.mark.parametrize(
+    "src_world,src_tp,src_pp,dst_world,dst_tp,dst_pp",
+    [
+        # Four-rank Blackwell CI: two disjoint ranks per side, including native M2N.
+        (2, 1, 1, 2, 2, 1),  # TP1,DP2 -> TP2
+        (2, 2, 1, 2, 1, 1),  # TP2 -> TP1,DP2
+        (2, 1, 1, 2, 1, 2),  # PP1,DP2 -> PP2
+        (2, 1, 2, 2, 1, 1),  # PP2 -> PP1,DP2
+        (2, 2, 1, 2, 1, 2),  # TP2,PP1 -> TP1,PP2
+        (2, 1, 2, 2, 2, 1),  # TP1,PP2 -> TP2,PP1
+        # Eight-rank H100 CI: four disjoint ranks per side (NCCL, plus M2N if installed).
+        (4, 1, 1, 4, 4, 1),  # TP1,DP4 -> TP4
+        (4, 4, 1, 4, 1, 1),  # TP4 -> TP1,DP4
+        (4, 1, 1, 4, 1, 2),  # PP1,DP4 -> PP2,DP2
+        (4, 1, 2, 4, 1, 1),  # PP2,DP2 -> PP1,DP4
+        (4, 4, 1, 4, 2, 2),  # TP4,PP1 -> TP2,PP2
+        (4, 2, 2, 4, 4, 1),  # TP2,PP2 -> TP4,PP1
+    ],
+)
+@pytest.mark.parametrize("dsa_type", ["mla", "gqa"])
+@pytest.mark.launch_on_gb200
+def test_swap_dsa_non_collocated(
+    refit_backend: str,
+    src_world: int,
+    src_tp: int,
+    src_pp: int,
+    dst_world: int,
+    dst_tp: int,
+    dst_pp: int,
+    dsa_type: str,
+):
+    """Refit real MLA and GQA DSA layers across disjoint rank windows."""
+    if not has_mamba_deps:
+        pytest.skip("Mamba dependencies (mamba_ssm, einops) not available")
+    if Utils.world_size != src_world + dst_world:
+        pytest.skip("Test requires a world containing exactly the source and destination ranks")
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+    from math import lcm
+
+    from megatron.core.inference.shards import build_inference_pg_collection
+
+    rank = dist.get_rank()
+    is_src = rank < src_world
+    is_dst = src_world <= rank < src_world + dst_world
+    model_parallel_cuda_manual_seed(1234)
+    torch.manual_seed(1234)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    src_pgs = build_inference_pg_collection(
+        world_size=src_world, tp_size=src_tp, pp_size=src_pp, rank_offset=0
+    )
+    dst_pgs = build_inference_pg_collection(
+        world_size=dst_world, tp_size=dst_tp, pp_size=dst_pp, rank_offset=src_world
+    )
+
+    base_pattern = "D-"
+    num_layers = lcm(src_pp, dst_pp) * len(base_pattern)
+    src_cfg = _dsa_config(num_layers, src_tp, src_pp, gqa=dsa_type == "gqa")
+    dst_cfg = _dsa_config(num_layers, dst_tp, dst_pp, gqa=dsa_type == "gqa")
+    stack_spec = _dsa_gqa_stack_spec() if dsa_type == "gqa" else hybrid_stack_spec
+    src_pattern = _hybrid_layer_pattern(base_pattern, num_layers, src_pp)
+    dst_pattern = _hybrid_layer_pattern(base_pattern, num_layers, dst_pp)
+
+    src_model = None
+    dst_model = None
+    if is_src:
+        src_model = _build_hybrid(
+            src_cfg,
+            vocab_size=64,
+            seq_len=8,
+            pg_collection=src_pgs,
+            hybrid_layer_pattern=src_pattern,
+            parallel_output=False,
+            stack_spec=stack_spec,
+        )
+        src_model = src_model.to(device).eval()
+    elif is_dst:
+        dst_model = _build_hybrid(
+            dst_cfg,
+            vocab_size=64,
+            seq_len=8,
+            pg_collection=dst_pgs,
+            hybrid_layer_pattern=dst_pattern,
+            parallel_output=False,
+            stack_spec=stack_spec,
+        )
+        dst_model = dst_model.to(device).eval()
+
+    local_model = src_model if src_model is not None else dst_model
+    dsa_modules = [module for module in local_model.modules() if isinstance(module, DSAttention)]
+    assert dsa_modules
+    assert all(isinstance(module, _DSGQACoreAttention) for module in dsa_modules) == (
+        dsa_type == "gqa"
+    )
+
+    batch = 1
+    seq_len = 8
+    vocab_size = 64
+    tokens = torch.arange(seq_len, device=device, dtype=torch.long).view(batch, seq_len)
+    position_ids = (
+        torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
+    )
+    attention_mask = torch.triu(
+        torch.ones((batch, 1, seq_len, seq_len), device=device, dtype=torch.bool), diagonal=1
+    )
+
+    ref_logits = torch.empty(batch, seq_len, vocab_size, device=device, dtype=torch.float32)
+    if is_src:
+        with torch.no_grad():
+            src_out = _run_forward(src_model, tokens, position_ids, attention_mask, src_pgs)
+        if rank == src_world - 1:
+            ref_logits.copy_(src_out)
+    dist.broadcast(ref_logits, src=src_world - 1)
+
+    swap_model_weights(
+        [src_model] if src_model is not None else None,
+        [dst_model] if dst_model is not None else None,
+        refit_method=refit_backend,
+    )
+    torch.cuda.synchronize()
+
+    dst_logits = torch.empty_like(ref_logits)
+    if is_dst:
+        with torch.no_grad():
+            dst_out = _run_forward(dst_model, tokens, position_ids, attention_mask, dst_pgs)
+        if rank == src_world + dst_world - 1:
+            dst_logits.copy_(dst_out)
+    dist.broadcast(dst_logits, src=src_world + dst_world - 1)
+
+    max_diff = (dst_logits - ref_logits).abs().max().item()
+    assert torch.allclose(dst_logits, ref_logits, atol=2e-3, rtol=2e-3), (
+        f"Non-collocated {dsa_type.upper()} DSA refit via {refit_backend} "
+        f"src(TP={src_tp},PP={src_pp})->dst(TP={dst_tp},PP={dst_pp}) "
+        f"outputs differ (max_diff={max_diff:.6f})"
+    )
+
+    dist.barrier()
+    if src_model is not None:
+        del src_model
+    if dst_model is not None:
+        del dst_model
+    clear_all_caches()
+    _destroy_pg_collection(src_pgs)
+    _destroy_pg_collection(dst_pgs)
+    Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize(
+    "refit_backend",
+    [
+        pytest.param(
             "nvshmem",
             marks=pytest.mark.skipif(
                 not has_nvshmem,
@@ -824,13 +1214,12 @@ def test_swap_mamba_parametrized(
     if not has_mamba_deps:
         pytest.skip("Mamba dependencies (mamba_ssm, einops) not available")
 
+    world = Utils.world_size
+    if (world % (src_tp * src_pp) != 0) or (world % (dst_tp * dst_pp) != 0):
+        pytest.skip("WORLD_SIZE must be divisible by both src_tp*src_pp and dst_tp*dst_pp")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=src_tp, pipeline_model_parallel_size=src_pp
     )
-    world = dist.get_world_size()
-    if (world % (src_tp * src_pp) != 0) or (world % (dst_tp * dst_pp) != 0):
-        Utils.destroy_model_parallel()
-        pytest.skip("WORLD_SIZE must be divisible by both src_tp*src_pp and dst_tp*dst_pp")
 
     model_parallel_cuda_manual_seed(1234)
     torch.manual_seed(1234)
@@ -864,19 +1253,17 @@ def test_swap_mamba_parametrized(
     src_pgs = _build_pg_collection(tp_size=src_tp, pp_size=src_pp)
     dst_pgs = _build_pg_collection(tp_size=dst_tp, pp_size=dst_pp)
 
-    src_pattern = _mamba_layer_pattern(base_pattern, num_layers, src_pp)
-    dst_pattern = _mamba_layer_pattern(base_pattern, num_layers, dst_pp)
+    src_pattern = _hybrid_layer_pattern(base_pattern, num_layers, src_pp)
+    dst_pattern = _hybrid_layer_pattern(base_pattern, num_layers, dst_pp)
 
-    src_model = (
-        _build_mamba(cfg, vocab_size, seq_len, src_pgs, src_pattern, parallel_output=False)
-        .to(device)
-        .eval()
-    )
-    dst_model = (
-        _build_mamba(cfg, vocab_size, seq_len, dst_pgs, dst_pattern, parallel_output=False)
-        .to(device)
-        .eval()
-    )
+    src_model = _build_hybrid(
+        cfg, vocab_size, seq_len, src_pgs, src_pattern, parallel_output=False
+    ).to(device)
+    dst_model = _build_hybrid(
+        cfg, vocab_size, seq_len, dst_pgs, dst_pattern, parallel_output=False
+    ).to(device)
+    src_model.eval()
+    dst_model.eval()
 
     # Inputs
     batch = 2
