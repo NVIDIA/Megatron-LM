@@ -1257,7 +1257,7 @@ class TestDSv4HybridAttentionTHDCP:
         del graph_out, graph_hidden_grad, eager_hidden
         _clear_cuda_test_state()
 
-    def test_balanced_dynamic_pack_graph_replays_30_iterations(self):
+    def run_balanced_dynamic_pack_graph_replays_30_iterations(self):
         """The raw graph refreshes two fixed-shape route owners for 30 A/B/C replays."""
         if not self.fused_kernels_available:
             pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
@@ -1444,7 +1444,7 @@ class TestDSv4HybridAttentionTHDCP:
         del full_hidden, full_grad, local_hidden, local_grad
         _clear_cuda_test_state()
 
-    def test_balanced_dynamic_pack_te_layer_graph_replays_30_iterations(self):
+    def run_balanced_dynamic_pack_te_layer_graph_replays_30_iterations(self):
         """The direct TE layer fallback refreshes two owner kwargs for 30 A/B/C replays."""
         # The real-TE plumbing is topology-independent once the route tensors reach the
         # TransformerLayer kwarg boundary, so capture it once under CP2.  The raw graph

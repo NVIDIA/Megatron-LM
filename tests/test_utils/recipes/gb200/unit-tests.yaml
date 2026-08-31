@@ -67,6 +67,13 @@ spec:
 # (see tests/unit_tests/run_ci_test.sh --platform gb200). Re-shard into smaller
 # buckets here if the marked set grows large enough to need parallelism.
 products:
+  - test_case: [tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention_cp_cuda_graph.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/**/*.py]
     products:
       - environment: [dev]
