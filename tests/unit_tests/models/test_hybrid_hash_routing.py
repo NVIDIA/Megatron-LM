@@ -186,6 +186,7 @@ def make_stack(layers, **config_overrides):
         post_layer_norm=False,
         input_tensor=None,
         layers=layers,
+        layer_config_list=[SimpleNamespace() for _ in layers],
         num_layers_per_pipeline_rank=len(layers),
         training=True,
         _has_linear_layer_with_chunkwise_cp=False,
