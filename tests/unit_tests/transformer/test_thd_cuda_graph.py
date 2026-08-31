@@ -1712,10 +1712,10 @@ class TestGraphDynamicRouteMetadataArena:
         helper.chunks_with_decoder = [SimpleNamespace(decoder=block)]
         helper.flattened_callables = list(graph_layers)
 
-        # These are three genuine fixed-capacity zigzag plans. K=4 for each plan,
+        # These are three genuine fixed-capacity zigzag plans. K=5 for each plan,
         # CP=2, L=8, and every sequence length is divisible by 2*CP.
         source_packs = []
-        for boundaries in ((0, 8, 16, 16), (0, 8, 8, 16), (0, 0, 8, 16)):
+        for boundaries in ((0, 4, 8, 16, 16), (0, 4, 4, 8, 16), (0, 0, 4, 8, 16)):
             cu = torch.tensor(boundaries, dtype=torch.int32, device="cuda")
             built = cp_balanced_indexer.build_graph_dynamic_plan(cu, LocalCPGroup(), 16)
             packed = PackedSeqParams(
@@ -1796,6 +1796,15 @@ class TestGraphDynamicRouteMetadataArena:
             )
             assert len({pair[1].shape for pair in arenas}) == 2
 
+            # The final TE-owned K=5 views, not only the source plan, must satisfy
+            # cuDNN Frontend's 16-byte packed-layout pointer contract.
+            for slot, pair in enumerate(arenas):
+                final_plan = cp_balanced_indexer._graph_dynamic_plan_from_buffers(
+                    pair[0], pair[1], 2, 8, route_padding=slot + 1, cp_rank=0
+                )
+                for layout_name in ("head_layout", "tail_layout", "output_layout"):
+                    assert all(tensor.data_ptr() % 16 == 0 for tensor in final_plan[layout_name])
+
             # The two layer graphs for a slot must expose the same final TE static owners.
             for slot in range(2):
                 arena_ptrs = tuple(owner.data_ptr() for owner in arenas[slot])
@@ -1866,6 +1875,10 @@ class TestGraphDynamicRouteMetadataArena:
                     layer.current_microbatch = replay_idx + 1
                     graph_output = layer(graph_output, packed_seq_params=staged)
                     assert layer._te_cuda_graph_route_replay_state is None
+                # TE returns a detached view of its recyclable static output. With
+                # input/output-buffer reuse enabled, that view is owned only until its
+                # scheduled consumer/backward; retain the value before crossing that boundary.
+                graph_output_value = graph_output.detach().clone()
                 graph_output.backward(graph_grad_output)
 
                 eager_hidden = hidden_template.clone().requires_grad_(True)
@@ -1881,9 +1894,10 @@ class TestGraphDynamicRouteMetadataArena:
                         dsa_cp_graph_layout_buffer=source_pair[0],
                         dsa_cp_graph_route_buffer=source_pair[1],
                     )
+                eager_output_value = eager_output.detach().clone()
                 eager_output.backward(eager_grad_output)
 
-                torch.testing.assert_close(graph_output, eager_output, rtol=0, atol=0)
+                torch.testing.assert_close(graph_output_value, eager_output_value, rtol=0, atol=0)
                 torch.testing.assert_close(graph_hidden.grad, eager_hidden.grad, rtol=0, atol=0)
                 for graph_layer, eager_layer in zip(graph_layers, eager_layers):
                     for (graph_name, graph_param), (eager_name, eager_param) in zip(
@@ -1927,10 +1941,10 @@ class TestGraphDynamicRouteMetadataArena:
 
                 if pack_idx in first_outputs:
                     torch.testing.assert_close(
-                        graph_output, first_outputs[pack_idx], rtol=0, atol=0
+                        graph_output_value, first_outputs[pack_idx], rtol=0, atol=0
                     )
                 else:
-                    first_outputs[pack_idx] = graph_output.detach().clone()
+                    first_outputs[pack_idx] = graph_output_value
 
             assert len(first_outputs) == 3
             assert not torch.equal(first_outputs[0], first_outputs[1])
