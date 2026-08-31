@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import copy
 import warnings
-from dataclasses import dataclass
-from enum import Enum, auto
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,60 +14,6 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
 
 _SHARED_EXPERT_BF16_WARNING_EMITTED = False
-
-
-class _ExpertWeightStorageLayout(Enum):
-    """Native MCore expert-parameter ownership layout."""
-
-    SINGLE_GROUPED = auto()
-    PER_EXPERT = auto()
-
-
-@dataclass(frozen=True)
-class _NativeExpertWeightSource:
-    """One FC direction exposed from native MCore/TE storage.
-
-    SINGLE_GROUPED fields contain one expert-major tensor. PER_EXPERT fields
-    contain one tensor per local expert. MXFP8 sources additionally expose
-    native TE columnwise payloads and logical E8M0 scales.
-    """
-
-    storage_layout: _ExpertWeightStorageLayout
-    num_experts: int
-    rows: int
-    columns: int
-    row_data: tuple[torch.Tensor, ...]
-    row_scales: tuple[torch.Tensor, ...] | None = None
-    column_data: tuple[torch.Tensor, ...] | None = None
-    column_scales: tuple[torch.Tensor, ...] | None = None
-
-    @property
-    def use_mxfp8(self) -> bool:
-        optional_fields = (self.row_scales, self.column_data, self.column_scales)
-        if all(field is None for field in optional_fields):
-            return False
-        if any(field is None for field in optional_fields):
-            raise RuntimeError("MOK native MXFP8 source is only partially populated")
-        return True
-
-    def validate(self) -> None:
-        expected_tensors = (
-            1
-            if self.storage_layout is _ExpertWeightStorageLayout.SINGLE_GROUPED
-            else self.num_experts
-        )
-        fields = [self.row_data]
-        if self.use_mxfp8:
-            assert self.row_scales is not None
-            assert self.column_data is not None
-            assert self.column_scales is not None
-            fields.extend((self.row_scales, self.column_data, self.column_scales))
-        if any(len(field) != expected_tensors for field in fields):
-            raise RuntimeError(
-                "MOK native weight source tensor count does not match its storage layout: "
-                f"layout={self.storage_layout.name}, expected={expected_tensors}, "
-                f"actual={[len(field) for field in fields]}"
-            )
 
 
 def prepare_shared_expert_config(config: TransformerConfig) -> TransformerConfig:
@@ -198,96 +142,107 @@ def _swizzle_mxfp8_scale(
     return out
 
 
-def _extract_single_grouped_weight_source(
-    param: nn.Parameter,
+def _native_single_grouped_weight_views(
+    fc1: nn.Parameter,
+    fc2: nn.Parameter,
     *,
     num_experts: int,
-    rows: int,
-    columns: int,
+    intermediate_size: int,
+    hidden_size: int,
     use_mxfp8: bool,
-    name: str,
-) -> _NativeExpertWeightSource:
-    """Expose one native single-grouped parameter without copying its payload."""
-    expected_shape = (num_experts, rows, columns)
-    if tuple(param.shape) != expected_shape:
+):
+    """Build MOK FC1/FC2 views directly over native TE grouped parameters."""
+    e, i, h = num_experts, intermediate_size, hidden_size
+    if tuple(fc1.shape) != (e, 2 * i, h) or tuple(fc2.shape) != (e, h, i):
         raise RuntimeError(
-            f"MOK {name} single-grouped shape mismatch: got {tuple(param.shape)}, "
-            f"expected {expected_shape}"
+            "MOK requires native single-grouped FC1/FC2 shapes "
+            f"{(e, 2 * i, h)} and {(e, h, i)}, got "
+            f"{tuple(fc1.shape)} and {tuple(fc2.shape)}"
         )
 
     if not use_mxfp8:
-        if param.dtype != torch.bfloat16 or not param.is_contiguous():
-            raise RuntimeError(f"MOK {name} BF16 requires a contiguous BF16 parameter")
+        if fc1.dtype != torch.bfloat16 or fc2.dtype != torch.bfloat16:
+            raise RuntimeError("MOK BF16 requires native BF16 grouped parameters")
+        if not fc1.is_contiguous() or not fc2.is_contiguous():
+            raise RuntimeError("MOK BF16 requires contiguous grouped parameters")
         # A high-precision TE GroupedTensor keeps its authoritative payload in
-        # rowwise_data. Expose that backing storage so the MOK custom op does
-        # not materialize the wrapper with torch.stack().
-        rowwise_data = getattr(param, "rowwise_data", None)
-        row_data = (
-            param
-            if rowwise_data is None
-            else _storage_view(
-                rowwise_data,
-                expected_shape,
-                dtype=torch.bfloat16,
-                name=f"{name} BF16 rowwise",
+        # rowwise_data. Passing the wrapper itself through a custom op makes TE
+        # materialize each argument independently with torch.stack(), which
+        # both copies the weights and loses the gate/up pointer alias MOK uses
+        # to recognize a combined [E, 2I, H] FC1 tensor. Expose the backing
+        # storage directly so gate and up remain zero-copy aliases.
+        fc1_storage = getattr(fc1, "rowwise_data", None)
+        fc2_storage = getattr(fc2, "rowwise_data", None)
+        if fc1_storage is not None or fc2_storage is not None:
+            if fc1_storage is None or fc2_storage is None:
+                raise RuntimeError(
+                    "MOK BF16 requires both grouped parameters to expose rowwise_data"
+                )
+            fc1_view = _storage_view(
+                fc1_storage, (e, 2 * i, h), dtype=torch.bfloat16, name="FC1 BF16 rowwise"
             )
-        )
-        source = _NativeExpertWeightSource(
-            storage_layout=_ExpertWeightStorageLayout.SINGLE_GROUPED,
-            num_experts=num_experts,
-            rows=rows,
-            columns=columns,
-            row_data=(row_data,),
-        )
-        source.validate()
-        return source
+            fc2_view = _storage_view(
+                fc2_storage, (e, h, i), dtype=torch.bfloat16, name="FC2 BF16 rowwise"
+            )
+            return fc1_view, fc2_view
+        return fc1, fc2
 
     from megatron.core.fp8_utils import is_grouped_mxfp8tensor
 
-    if not is_grouped_mxfp8tensor(param):
-        raise RuntimeError(
-            f"MOK {name} MXFP8 requires a native TE grouped MXFP8 parameter"
-        )
+    if not is_grouped_mxfp8tensor(fc1) or not is_grouped_mxfp8tensor(fc2):
+        raise RuntimeError("MOK MXFP8 requires native TE grouped MXFP8 parameters")
 
-    row_data = _storage_view(
-        param.rowwise_data,
-        expected_shape,
-        dtype=torch.float8_e4m3fn,
-        name=f"{name} rowwise",
+    fc1_row = _storage_view(
+        fc1.rowwise_data, (e, 2 * i, h), dtype=torch.float8_e4m3fn, name="FC1 rowwise"
     )
-    column_data = _storage_view(
-        param.columnwise_data,
-        expected_shape,
-        dtype=torch.float8_e4m3fn,
-        name=f"{name} columnwise",
+    fc1_col = _storage_view(
+        fc1.columnwise_data, (e, 2 * i, h), dtype=torch.float8_e4m3fn, name="FC1 columnwise"
     )
-    row_scale = _grouped_mxfp8_scale_view(
-        param,
-        "_rowwise_scale_inv",
-        (num_experts, rows, columns // 32),
-        name=f"{name} rowwise",
+    fc2_row = _storage_view(
+        fc2.rowwise_data, (e, h, i), dtype=torch.float8_e4m3fn, name="FC2 rowwise"
     )
-    # TE's native columnwise scale is [E, M/32, K]. MOK interprets the
-    # associated columnwise payload as the transposed matrix, so expose the
-    # logical scale as [E, K, M/32].
-    column_scale = _grouped_mxfp8_scale_view(
-        param,
-        "_columnwise_scale_inv",
-        (num_experts, rows // 32, columns),
-        name=f"{name} columnwise",
+    fc2_col = _storage_view(
+        fc2.columnwise_data, (e, h, i), dtype=torch.float8_e4m3fn, name="FC2 columnwise"
+    )
+    # TE keeps E8M0 scales in logical order. Rowwise member storage is
+    # [M, K/32]; columnwise member storage is [M/32, K] for the original
+    # matrix, so transpose the latter into logical order for the transposed
+    # FP8 payload. These are all zero-copy views.
+    fc1_row_sc = _grouped_mxfp8_scale_view(
+        fc1, "_rowwise_scale_inv", (e, 2 * i, h // 32), name="FC1 rowwise"
+    )
+    fc1_col_sc = _grouped_mxfp8_scale_view(
+        fc1, "_columnwise_scale_inv", (e, 2 * i // 32, h), name="FC1 columnwise"
     ).transpose(-2, -1)
-    source = _NativeExpertWeightSource(
-        storage_layout=_ExpertWeightStorageLayout.SINGLE_GROUPED,
-        num_experts=num_experts,
-        rows=rows,
-        columns=columns,
-        row_data=(row_data,),
-        row_scales=(row_scale,),
-        column_data=(column_data,),
-        column_scales=(column_scale,),
+    fc2_row_sc = _grouped_mxfp8_scale_view(
+        fc2, "_rowwise_scale_inv", (e, h, i // 32), name="FC2 rowwise"
     )
-    source.validate()
-    return source
+    fc2_col_sc = _grouped_mxfp8_scale_view(
+        fc2, "_columnwise_scale_inv", (e, h // 32, i), name="FC2 columnwise"
+    ).transpose(-2, -1)
+    # The final flag tells MOK that ``columnwise_data`` is TE's native
+    # columnwise-quantized storage in the original [E, M, K] tensor shape.
+    # MOK can then consume it directly for dgrad instead of materializing an
+    # explicit [E, K, M] transpose on every backward.
+    fc1_views = (fc1_row, fc1_row_sc, fc1_col, fc1_col_sc, True)
+    fc2_views = (fc2_row, fc2_row_sc, fc2_col, fc2_col_sc, True)
+    return fc1_views, fc2_views
+
+
+def _mok_mxfp8_backward_weight_views(
+    native_weight: tuple[torch.Tensor, ...], *, rows: int, columns: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """Prepare zero-copy payloads and compact scale layouts for forward/backward."""
+    row_data, row_scale, column_data, column_scale, native_columnwise = native_weight
+    if native_columnwise is not True:
+        raise RuntimeError("MOK MCore integration requires native TE columnwise weights")
+    return (
+        row_data,
+        _swizzle_mxfp8_scale(row_scale, rows=rows, columns=columns),
+        column_data,
+        _swizzle_mxfp8_scale(column_scale, rows=columns, columns=rows),
+        True,
+    )
 
 
 def _parameter_storage_attr(param: nn.Parameter, name: str) -> torch.Tensor | None:
@@ -306,21 +261,14 @@ def _parameter_storage_attr(param: nn.Parameter, name: str) -> torch.Tensor | No
     return None
 
 
-def _extract_per_expert_weight_source(
-    params: tuple[nn.Parameter, ...],
-    *,
-    num_experts: int,
-    rows: int,
-    columns: int,
-    use_mxfp8: bool,
-    name: str,
-) -> _NativeExpertWeightSource:
-    """Expose independent per-expert parameters before building MOK tables."""
-    if len(params) != num_experts:
-        raise RuntimeError(
-            f"MOK {name} per-expert parameter count mismatch: got {len(params)}, "
-            f"expected {num_experts}"
-        )
+def _native_split_weight_view(
+    params: tuple[nn.Parameter, ...], *, rows: int, columns: int, use_mxfp8: bool
+):
+    """Expose independent per-expert parameters through MOK descriptor tables."""
+    from mok import functional, ops
+
+    if not params:
+        raise RuntimeError("MOK split routed weight list must not be empty")
     shape = (rows, columns)
     if not use_mxfp8:
         payloads = []
@@ -328,19 +276,11 @@ def _extract_per_expert_weight_source(
             storage = _parameter_storage_attr(param, "rowwise_data")
             payload = param if storage is None else storage
             payloads.append(
-                _storage_view(
-                    payload, shape, dtype=torch.bfloat16, name=f"{name} BF16 rowwise"
-                )
+                _storage_view(payload, shape, dtype=torch.bfloat16, name="split BF16 rowwise")
             )
-        source = _NativeExpertWeightSource(
-            storage_layout=_ExpertWeightStorageLayout.PER_EXPERT,
-            num_experts=num_experts,
-            rows=rows,
-            columns=columns,
-            row_data=tuple(payloads),
+        return functional.SplitRoutedWeight(
+            data=payloads[0], storage_table=ops.make_routed_weight_storage_table_bf16(payloads)
         )
-        source.validate()
-        return source
 
     from megatron.core.fp8_utils import is_mxfp8tensor
 
@@ -348,22 +288,20 @@ def _extract_per_expert_weight_source(
     column_payloads = []
     row_scales = []
     column_scales = []
-    for expert, param in enumerate(params):
+    for param in params:
         if not is_mxfp8tensor(param):
             raise RuntimeError(
-                f"MOK {name} expert {expert} requires native TE MXFP8 storage"
+                "MOK MXFP8 split weights require every per-expert parameter "
+                "to use native TE MXFP8 storage"
             )
         row_payload = _parameter_storage_attr(param, "rowwise_data")
         column_payload = _parameter_storage_attr(param, "columnwise_data")
         row_scale = _parameter_storage_attr(param, "_rowwise_scale_inv")
         column_scale = _parameter_storage_attr(param, "_columnwise_scale_inv")
-        if any(
-            value is None
-            for value in (row_payload, column_payload, row_scale, column_scale)
-        ):
+        if any(value is None for value in (row_payload, column_payload, row_scale, column_scale)):
             missing = [
-                field_name
-                for field_name, value in (
+                name
+                for name, value in (
                     ("rowwise_data", row_payload),
                     ("columnwise_data", column_payload),
                     ("_rowwise_scale_inv", row_scale),
@@ -377,205 +315,95 @@ def _extract_per_expert_weight_source(
             if callable(get_quantizer):
                 quantizer = get_quantizer()
             raise RuntimeError(
-                f"MOK {name} expert {expert} is missing native storage: "
+                "MOK MXFP8 split parameter is missing native storage: "
                 f"missing={missing}, param_type={type(param).__name__}, "
                 f"data_type={type(data).__name__}, quantizer_type="
                 f"{type(quantizer).__name__ if quantizer is not None else None}, "
                 f"param_shape={tuple(param.shape)}"
             )
         row_payloads.append(
-            _storage_view(
-                row_payload,
-                shape,
-                dtype=torch.float8_e4m3fn,
-                name=f"{name} MXFP8 rowwise",
-            )
+            _storage_view(row_payload, shape, dtype=torch.float8_e4m3fn, name="split MXFP8 rowwise")
         )
         column_payloads.append(
             _storage_view(
-                column_payload,
-                shape,
-                dtype=torch.float8_e4m3fn,
-                name=f"{name} MXFP8 columnwise",
+                column_payload, shape, dtype=torch.float8_e4m3fn, name="split MXFP8 columnwise"
             )
         )
         if tuple(row_scale.shape) != (rows, columns // 32):
             raise RuntimeError(
-                f"MOK {name} rowwise scale shape mismatch: got {tuple(row_scale.shape)}, "
-                f"expected {(rows, columns // 32)}"
+                "MOK split MXFP8 rowwise scale shape mismatch: "
+                f"got {tuple(row_scale.shape)}, expected {(rows, columns // 32)}"
             )
         if tuple(column_scale.shape) != (rows // 32, columns):
             raise RuntimeError(
-                f"MOK {name} columnwise scale shape mismatch: "
+                "MOK split MXFP8 columnwise scale shape mismatch: "
                 f"got {tuple(column_scale.shape)}, expected {(rows // 32, columns)}"
             )
         row_scales.append(row_scale)
         column_scales.append(column_scale.transpose(-2, -1))
 
-    source = _NativeExpertWeightSource(
-        storage_layout=_ExpertWeightStorageLayout.PER_EXPERT,
-        num_experts=num_experts,
-        rows=rows,
-        columns=columns,
-        row_data=tuple(row_payloads),
-        row_scales=tuple(row_scales),
-        column_data=tuple(column_payloads),
-        column_scales=tuple(column_scales),
-    )
-    source.validate()
-    return source
-
-
-def _extract_native_expert_weight_source(
-    params: tuple[nn.Parameter, ...],
-    *,
-    storage_layout: _ExpertWeightStorageLayout,
-    num_experts: int,
-    rows: int,
-    columns: int,
-    use_mxfp8: bool,
-    name: str,
-) -> _NativeExpertWeightSource:
-    """Dispatch extraction using MCore's explicit single/non-single semantics."""
-    if storage_layout is _ExpertWeightStorageLayout.SINGLE_GROUPED:
-        if len(params) != 1:
-            raise RuntimeError(
-                f"MOK {name} SINGLE_GROUPED requires one parameter, got {len(params)}"
-            )
-        return _extract_single_grouped_weight_source(
-            params[0],
-            num_experts=num_experts,
-            rows=rows,
-            columns=columns,
-            use_mxfp8=use_mxfp8,
-            name=name,
-        )
-    if storage_layout is _ExpertWeightStorageLayout.PER_EXPERT:
-        return _extract_per_expert_weight_source(
-            params,
-            num_experts=num_experts,
-            rows=rows,
-            columns=columns,
-            use_mxfp8=use_mxfp8,
-            name=name,
-        )
-    raise AssertionError(f"Unhandled MOK weight layout: {storage_layout}")
-
-
-def _prepare_mok_weight(source: _NativeExpertWeightSource):
-    """Build MOK's tensor/descriptor representation from a native source."""
-    from mok import functional, ops
-
-    source.validate()
-    if source.storage_layout is _ExpertWeightStorageLayout.SINGLE_GROUPED:
-        if not source.use_mxfp8:
-            return source.row_data[0]
-        assert source.row_scales is not None
-        assert source.column_data is not None
-        assert source.column_scales is not None
-        return (
-            source.row_data[0],
-            _swizzle_mxfp8_scale(
-                source.row_scales[0], rows=source.rows, columns=source.columns
-            ),
-            source.column_data[0],
-            _swizzle_mxfp8_scale(
-                source.column_scales[0], rows=source.columns, columns=source.rows
-            ),
-            True,
-        )
-
-    if source.storage_layout is not _ExpertWeightStorageLayout.PER_EXPERT:
-        raise AssertionError(f"Unhandled MOK weight layout: {source.storage_layout}")
-
-    if not source.use_mxfp8:
-        payloads = list(source.row_data)
-        return functional.SplitRoutedWeight(
-            data=payloads[0],
-            storage_table=ops.make_routed_weight_storage_table_bf16(payloads),
-        )
-
-    assert source.row_scales is not None
-    assert source.column_data is not None
-    assert source.column_scales is not None
+    # Keep expert scales in independent allocations just like the native TE
+    # parameters. MOK's descriptor table selects the expert; only each
+    # expert's logical E8M0 matrix is converted to tcgen05 scale layout.
     row_scale_tensors = [
-        _swizzle_mxfp8_scale(
-            scale.unsqueeze(0), rows=source.rows, columns=source.columns
-        )
-        for scale in source.row_scales
+        _swizzle_mxfp8_scale(scale.unsqueeze(0), rows=rows, columns=columns) for scale in row_scales
     ]
     column_scale_tensors = [
-        _swizzle_mxfp8_scale(
-            scale.unsqueeze(0), rows=source.columns, columns=source.rows
-        )
-        for scale in source.column_scales
+        _swizzle_mxfp8_scale(scale.unsqueeze(0), rows=columns, columns=rows)
+        for scale in column_scales
     ]
-    row_payloads = list(source.row_data)
-    column_payloads = list(source.column_data)
+    row_storage_table = ops.make_routed_weight_storage_table_mxfp8(row_payloads)
+    column_storage_table = ops.make_routed_weight_storage_table_mxfp8(column_payloads)
     return functional.SplitRoutedWeight(
         data=row_payloads[0],
-        storage_table=ops.make_routed_weight_storage_table_mxfp8(row_payloads),
+        storage_table=row_storage_table,
         scale=row_scale_tensors[0],
         scale_storage_table=ops.make_routed_scale_storage_table(row_scale_tensors),
         scale_tensors=tuple(row_scale_tensors),
         transposed_data=column_payloads[0],
         transposed_scale=column_scale_tensors[0],
-        transposed_storage_table=ops.make_routed_weight_storage_table_mxfp8(
-            column_payloads
-        ),
-        transposed_scale_storage_table=ops.make_routed_scale_storage_table(
-            column_scale_tensors
-        ),
+        transposed_storage_table=column_storage_table,
+        transposed_scale_storage_table=ops.make_routed_scale_storage_table(column_scale_tensors),
         transposed_scale_tensors=tuple(column_scale_tensors),
         native_columnwise=True,
     )
 
 
-def _refresh_prepared_mok_weight(prepared, source: _NativeExpertWeightSource) -> None:
-    """Refresh per-expert MXFP8 scales without replacing captured descriptors."""
-    source.validate()
-    if (
-        source.storage_layout is not _ExpertWeightStorageLayout.PER_EXPERT
-        or not source.use_mxfp8
-    ):
-        raise RuntimeError(
-            "MOK in-place scale refresh requires PER_EXPERT MXFP8 weights"
-        )
-
-    assert source.row_scales is not None
-    assert source.column_scales is not None
+def _refresh_native_split_weight_scales(
+    prepared, params: tuple[nn.Parameter, ...], *, rows: int, columns: int
+) -> None:
+    """Refresh split MXFP8 scales without replacing graph-captured descriptors."""
     row_outputs = prepared.scale_tensors
     column_outputs = prepared.transposed_scale_tensors
     if row_outputs is None or column_outputs is None:
+        raise RuntimeError("MOK split MXFP8 cache is missing retained scale tensors")
+    if len(row_outputs) != len(params) or len(column_outputs) != len(params):
         raise RuntimeError(
-            "MOK per-expert MXFP8 cache is missing retained scale tensors"
-        )
-    if (
-        len(row_outputs) != source.num_experts
-        or len(column_outputs) != source.num_experts
-    ):
-        raise RuntimeError(
-            "MOK per-expert MXFP8 scale cache expert count mismatch: "
-            f"source={source.num_experts}, row_outputs={len(row_outputs)}, "
+            "MOK split MXFP8 scale cache expert count mismatch: "
+            f"parameters={len(params)}, row_outputs={len(row_outputs)}, "
             f"column_outputs={len(column_outputs)}"
         )
 
-    for row_scale, column_scale, row_out, column_out in zip(
-        source.row_scales,
-        source.column_scales,
-        row_outputs,
-        column_outputs,
-        strict=True,
+    for expert, (param, row_out, column_out) in enumerate(
+        zip(params, row_outputs, column_outputs, strict=True)
     ):
+        row_scale = _parameter_storage_attr(param, "_rowwise_scale_inv")
+        column_scale = _parameter_storage_attr(param, "_columnwise_scale_inv")
+        if row_scale is None or column_scale is None:
+            raise RuntimeError(f"MOK split MXFP8 expert {expert} lost its native TE scale storage")
+        if tuple(row_scale.shape) != (rows, columns // 32):
+            raise RuntimeError(
+                "MOK split MXFP8 rowwise scale shape changed after cache creation: "
+                f"expert={expert}, got={tuple(row_scale.shape)}, "
+                f"expected={(rows, columns // 32)}"
+            )
+        if tuple(column_scale.shape) != (rows // 32, columns):
+            raise RuntimeError(
+                "MOK split MXFP8 columnwise scale shape changed after cache creation: "
+                f"expert={expert}, got={tuple(column_scale.shape)}, "
+                f"expected={(rows // 32, columns)}"
+            )
+        _swizzle_mxfp8_scale(row_scale.unsqueeze(0), rows=rows, columns=columns, out=row_out)
         _swizzle_mxfp8_scale(
-            row_scale.unsqueeze(0),
-            rows=source.rows,
-            columns=source.columns,
-            out=row_out,
-        )
-        _swizzle_mxfp8_scale(
-            column_scale.unsqueeze(0),
-            rows=source.columns,
-            columns=source.rows,
-            out=column_out,
+            column_scale.transpose(-2, -1).unsqueeze(0), rows=columns, columns=rows, out=column_out
         )
