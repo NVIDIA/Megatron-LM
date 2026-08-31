@@ -32,8 +32,8 @@ version = "1.0.0+9edee0c"
 
 [[manifest.dependency-metadata]]
 name = "transformer-engine"
-version = "2.17.1+4329ff84"
-requires-dist = ["pydantic<2.14", "importlib-metadata>=1.0", "packaging", "torch>=2.1", "einops", "onnxscript", "onnx", "nvdlfw-inspect"]
+version = "2.18.0+27486e03"
+requires-dist = ["pydantic<2.14", "importlib-metadata>=1.0", "packaging", "torch>=2.1", "einops", "onnxscript", "onnx", "nvdlfw-inspect", "nvidia-cudnn-frontend>=1.25.0"]
 
 [[package]]
 name = "absl-py"
@@ -2459,7 +2459,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.6.0" },
     { name = "torch-memory-saver", marker = "extra == 'dev'", git = "https://github.com/fzyzcjy/torch_memory_saver.git?rev=9bc9a442e6d108c7b7903def199896a005143aaf" },
     { name = "tqdm", marker = "extra == 'dev'" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=4329ff84bfbdaa778a33cba02a15fb0807c64689" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=27486e03cfc1fa41f6932dcecdc47c71c47eac3e" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "transformers", marker = "extra == 'training'" },
     { name = "wandb", marker = "extra == 'mlm'" },
@@ -5431,12 +5431,13 @@ wheels = [
 
 [[package]]
 name = "transformer-engine"
-version = "2.17.1+4329ff84"
-source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=4329ff84bfbdaa778a33cba02a15fb0807c64689#4329ff84bfbdaa778a33cba02a15fb0807c64689" }
+version = "2.18.0+27486e03"
+source = { git = "https://github.com/NVIDIA/TransformerEngine.git?rev=27486e03cfc1fa41f6932dcecdc47c71c47eac3e#27486e03cfc1fa41f6932dcecdc47c71c47eac3e" }
 dependencies = [
     { name = "einops" },
     { name = "importlib-metadata" },
     { name = "nvdlfw-inspect" },
+    { name = "nvidia-cudnn-frontend" },
     { name = "onnx" },
     { name = "onnxscript" },
     { name = "packaging" },
