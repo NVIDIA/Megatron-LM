@@ -674,9 +674,9 @@ class MLAWithLatentCP(MLASelfAttention):
             latent = self._phase_rows(latent, phase.kv_indices, phase.kv_slice)
             k_rope = self._phase_rows(k_rope, phase.kv_indices, phase.kv_slice)
         latent = latent.contiguous()
-        k_rope = k_rope.contiguous()
         expanded, _ = self.linear_kv_up_proj(latent)
         if self.config.sequence_parallel:
+            k_rope = k_rope.contiguous()
             k_rope = tp_mappings.gather_from_sequence_parallel_region(
                 k_rope, tensor_parallel_output_grad=True, group=self.pg_collection.tp
             )

@@ -169,8 +169,10 @@ rank enters with a contiguous `[T_r/N, 1, hidden_size]` sequence shard. The exac
    module independently gathers the received K positional shard
    with `gather_from_sequence_parallel_region(..., tensor_parallel_output_grad=True, group=TP)`.
    Because splitting the contiguous ring payload along its channel dimension produces strided views,
-   both the latent and positional slices are materialized as contiguous tensors before either TP
-   collective; the collective boundary never relies on backend acceptance of noncontiguous inputs.
+   TP>1 materializes both latent and positional slices before their TP operations; the collective
+   boundary never relies on backend acceptance of noncontiguous inputs. TP1 materializes only the
+   latent branch required by the up projection. Its positional view is read directly by the final
+   key concatenation instead of paying for a separate staging copy.
    TP1 has no sequence gather inside the up projection, so it selects the compact phase rows before
    KV expansion; a lower rectangular phase therefore never projects its unused second half. TP>1
    sequence-parallel execution first reconstructs the complete local token axis and then selects
