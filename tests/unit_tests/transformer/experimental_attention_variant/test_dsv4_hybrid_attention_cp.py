@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
-import inspect
 import os
 import statistics
 from contextlib import contextmanager, nullcontext
@@ -146,16 +145,15 @@ def _dsv4_cp_fused_kernels_available():
     if sm_major < 9:
         return False
     try:
-        from cudnn import DSA
+        from cudnn import DSA  # noqa: F401
         from flash_mla import flash_mla_sparse_fwd  # noqa: F401
     except ImportError:
         return False
-    return "q_causal_offsets" in inspect.signature(DSA.indexer_forward_wrapper).parameters
+    return True
 
 
 _DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON = (
-    "DSv4 fused DSA CP cases require SM90+, flash_mla, and a cudnn.DSA "
-    "indexer_forward_wrapper with q_causal_offsets support"
+    "DSv4 fused DSA cases require SM90+, flash_mla, and cudnn.DSA"
 )
 
 

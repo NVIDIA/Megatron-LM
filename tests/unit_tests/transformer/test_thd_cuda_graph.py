@@ -1820,12 +1820,20 @@ class TestGraphDynamicRouteMetadataArena:
 
             for layer in tuple(graph_layers) + tuple(eager_layers):
                 for parameter in layer.parameters():
-                    parameter.grad = None
+                    # Keep optimizer-owned grad buffers alive across TE graph replay. If a
+                    # leaf grad starts as None, AccumulateGrad may adopt TE's recyclable static
+                    # grad-input buffer instead of copying from it, extending that buffer's
+                    # lifetime beyond the graph schedule that owns it.
+                    parameter.grad = torch.zeros_like(parameter)
 
             hidden_template = torch.linspace(-0.75, 0.75, 32, device="cuda").view(8, 4)
             grad_output = torch.linspace(0.5, -0.5, 32, device="cuda").view(8, 4)
             first_outputs = {}
             for replay_idx in range(30):
+                for layer in tuple(graph_layers) + tuple(eager_layers):
+                    for parameter in layer.parameters():
+                        parameter.grad.zero_()
+
                 pack_idx = replay_idx % 3
                 source = source_packs[pack_idx]
                 source_pair = source_pairs[pack_idx]
@@ -1844,6 +1852,13 @@ class TestGraphDynamicRouteMetadataArena:
                 )
 
                 graph_hidden = hidden_template.clone().requires_grad_(True)
+                # As with parameters, use a caller-owned leaf-grad buffer so the assertion
+                # cannot observe a TE static dgrad allocation after the shared graph pool has
+                # reused it. Give graph and eager separate upstream grads as TE is free to use
+                # an incoming backward tensor as graph workspace.
+                graph_hidden.grad = torch.zeros_like(graph_hidden)
+                graph_grad_output = grad_output.clone()
+                eager_grad_output = grad_output.clone()
                 graph_output = graph_hidden
                 for layer in graph_layers:
                     # Simulate checkpoint recompute after the global layer state advanced to
@@ -1851,9 +1866,10 @@ class TestGraphDynamicRouteMetadataArena:
                     layer.current_microbatch = replay_idx + 1
                     graph_output = layer(graph_output, packed_seq_params=staged)
                     assert layer._te_cuda_graph_route_replay_state is None
-                graph_output.backward(grad_output)
+                graph_output.backward(graph_grad_output)
 
                 eager_hidden = hidden_template.clone().requires_grad_(True)
+                eager_hidden.grad = torch.zeros_like(eager_hidden)
                 eager_output = eager_hidden
                 for layer in eager_layers:
                     eager_output = layer(
@@ -1865,7 +1881,7 @@ class TestGraphDynamicRouteMetadataArena:
                         dsa_cp_graph_layout_buffer=source_pair[0],
                         dsa_cp_graph_route_buffer=source_pair[1],
                     )
-                eager_output.backward(grad_output)
+                eager_output.backward(eager_grad_output)
 
                 torch.testing.assert_close(graph_output, eager_output, rtol=0, atol=0)
                 torch.testing.assert_close(graph_hidden.grad, eager_hidden.grad, rtol=0, atol=0)

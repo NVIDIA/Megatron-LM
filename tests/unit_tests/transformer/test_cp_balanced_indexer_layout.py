@@ -9,7 +9,6 @@ zigzag layout per-sequence-interleaved (``[seq0 head, seq0 tail, seq1 head, ...]
 These tests pin the two implementations to one canonical layout definition.
 """
 
-import inspect
 import os
 import subprocess
 import sys
@@ -358,6 +357,19 @@ def test_graph_dynamic_two_buffer_views_match_raw_builder():
         assert torch.equal(packed[key], raw[key]), key
 
 
+def test_graph_dynamic_fused_layout_views_keep_16_byte_alignment_for_five_cu_entries():
+    """Regression for the real FE1.26 failure: K=5 made score_cu_q start at L+5."""
+    group = _StubGroup(2, 1)
+    cu = torch.tensor([0, 256, 1024, 2048, 4096], dtype=torch.int32)
+    plan = build_graph_dynamic_plan(cu, group, 4096)
+
+    assert plan["validated_cu"].numel() == 5
+    for layout_name in ("head_layout", "tail_layout", "output_layout"):
+        for tensor in plan[layout_name]:
+            assert tensor.is_contiguous()
+            assert tensor.data_ptr() % 16 == 0, (layout_name, tensor.storage_offset())
+
+
 def test_graph_dynamic_plan_two_buffer_schema_roundtrip_and_refresh():
     """TE exposes two owners; logical views alias them and refresh with two copies."""
     group = _StubGroup(4, 1)
@@ -373,8 +385,8 @@ def test_graph_dynamic_plan_two_buffer_schema_roundtrip_and_refresh():
     assert kwargs["dsa_cp_graph_layout_buffer"].dtype == torch.int32
     assert kwargs["dsa_cp_graph_route_buffer"].dtype == torch.int64
     # K=4 padded-cu entries, L=24 local rows, C=min(24, 24/4+3)=9,
-    # R=36: layout=L+7K+3, route=2L+R.
-    assert kwargs["dsa_cp_graph_layout_buffer"].shape == (24 + 7 * 4 + 3,)
+    # R=36. The layout pads each logical field start to 16 bytes; route=2L+R.
+    assert kwargs["dsa_cp_graph_layout_buffer"].shape == (64,)
     assert kwargs["dsa_cp_graph_route_buffer"].shape == (2 * 24 + 36,)
 
     layout_ptr = kwargs["dsa_cp_graph_layout_buffer"].data_ptr()
@@ -406,16 +418,17 @@ def test_graph_dynamic_plan_two_buffer_schema_roundtrip_and_refresh():
         "pos_head": 4,
         "pos_tail": 16,
         "score_cu_q": 28,
-        "score_cu_kv": 33,
-        "output_cu_kv": 33,
-        "head_offsets": 38,
-        "tail_offsets": 42,
-        "output_cu_q": 46,
-        "output_offsets": 51,
+        "score_cu_kv": 36,
+        "output_cu_kv": 36,
+        "head_offsets": 44,
+        "tail_offsets": 48,
+        "output_cu_q": 52,
+        "output_offsets": 60,
     }
     for key in layout_fields:
         assert reconstructed[key].untyped_storage().data_ptr() == layout_ptr
         assert reconstructed[key].storage_offset() == expected_layout_offsets[key]
+        assert reconstructed[key].data_ptr() % 16 == 0
     expected_route_offsets = {"src_slot": 0, "relay_perm": 24, "dst_slot": 60}
     for key in route_fields:
         assert reconstructed[key].untyped_storage().data_ptr() == route_ptr
@@ -457,6 +470,9 @@ def test_graph_dynamic_plan_buffers_fail_closed_on_malformed_inputs():
         attach_graph_dynamic_plan_buffers(
             missing, layout, noncontiguous_route, cp_size=4, l_local=24
         )
+    misaligned_layout = torch.empty(layout.numel() + 1, dtype=torch.int32)[1:]
+    with pytest.raises(ValueError, match="must be 16-byte aligned"):
+        attach_graph_dynamic_plan_buffers(missing, misaligned_layout, route, cp_size=4, l_local=24)
     with pytest.raises(ValueError, match="layout buffer length"):
         attach_graph_dynamic_plan_buffers(missing, layout[:-1], route, cp_size=4, l_local=24)
     with pytest.raises(ValueError, match="route buffer length"):
@@ -1203,14 +1219,6 @@ def test_fused_multi_offset_packed_layout():
     on the REAL kernel, with tie-free signature data, that a plan's head/tail packed
     calls select exactly the same keys as one full fused reference call."""
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils as _cu
-
-    from cudnn import DSA
-
-    if "q_causal_offsets" not in inspect.signature(DSA.indexer_forward_wrapper).parameters:
-        pytest.skip(
-            "multi-offset fused indexer coverage requires a cuDNN Frontend "
-            "indexer_forward_wrapper with q_causal_offsets support"
-        )
 
     torch.manual_seed(29)
     dev = torch.device("cuda")
