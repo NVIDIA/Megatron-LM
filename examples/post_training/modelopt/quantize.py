@@ -266,6 +266,13 @@ def check_arguments():
                 )
 
 
+def _add_quant_cfg_entry(quant_cfg, quantizer_name, config):
+    if isinstance(quant_cfg, dict):
+        quant_cfg[quantizer_name] = {**config.get("cfg", {}), "enable": config["enable"]}
+    else:
+        quant_cfg.append({"quantizer_name": quantizer_name, **config})
+
+
 def get_modelopt_torch_quantization_config():
     """Return a quantization config."""
     args = get_args()
@@ -275,11 +282,9 @@ def get_modelopt_torch_quantization_config():
     mtq_config = QUANT_CFG_CHOICES[args.export_quant_cfg]
 
     if isinstance(mtq_config["quant_cfg"], dict):
-        # Preserve insertion order while converting the legacy mapping to the list format.
-        mtq_config["quant_cfg"] = [
-            {"quantizer_name": name, **config}
-            for name, config in mtq_config["quant_cfg"].items()
-        ]
+        normalize_quant_cfg_list = getattr(mtq, "normalize_quant_cfg_list", None)
+        if normalize_quant_cfg_list is not None:
+            mtq_config["quant_cfg"] = normalize_quant_cfg_list(mtq_config["quant_cfg"])
 
     fp8_config = {"enable": True, "cfg": {"num_bits": (4, 3), "axis": None}}
     fp4_config = {
@@ -292,10 +297,10 @@ def get_modelopt_torch_quantization_config():
     }
     if args.export_quant_cfg == "FP8_DEFAULT_CFG":
         # Enable Medusa heads and kv-cache quantization
-        mtq_config["quant_cfg"].append({"quantizer_name": "*medusa_heads**", **fp8_config})
+        _add_quant_cfg_entry(mtq_config["quant_cfg"], "*medusa_heads**", fp8_config)
     if "FP4" in args.export_quant_cfg:
         # Enable Medusa heads and kv-cache quantization
-        mtq_config["quant_cfg"].append({"quantizer_name": "*medusa_heads**", **fp4_config})
+        _add_quant_cfg_entry(mtq_config["quant_cfg"], "*medusa_heads**", fp4_config)
     if "AWQ" in args.export_quant_cfg:
         try:
             weight_quantizer = mtq.find_quant_cfg_entry_by_path(
@@ -306,7 +311,7 @@ def get_modelopt_torch_quantization_config():
             weight_quantizer = None
     # Customization
     if args.disable_qkv_quant:
-        mtq_config["quant_cfg"].append({"quantizer_name": "*self_attention*", "enable": False})
+        _add_quant_cfg_entry(mtq_config["quant_cfg"], "*self_attention*", {"enable": False})
 
     # KV Cache Quantization
     enable_quant_kv_cache = args.export_kv_cache_quant != "none"
@@ -318,7 +323,7 @@ def get_modelopt_torch_quantization_config():
 
     # Weight Only Quantization
     if args.weight_only:
-        mtq_config["quant_cfg"].append({"quantizer_name": "*input_quantizer", "enable": False})
+        _add_quant_cfg_entry(mtq_config["quant_cfg"], "*input_quantizer", {"enable": False})
     return mtq_config
 
 
