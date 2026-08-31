@@ -363,4 +363,3 @@ def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param():
         assert update_successful
     finally:
         Utils.destroy_model_parallel()
-
