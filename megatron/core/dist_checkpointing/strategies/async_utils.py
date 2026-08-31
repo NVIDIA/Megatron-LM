@@ -470,6 +470,49 @@ class PersistentAsyncCaller(AsyncCaller):
             "to schedule async ckpt "
         )
 
+    def _try_get_completion_result(self, timeout: Optional[float] = None) -> Tuple[bool, object]:
+        """Read one worker completion without exposing ``queue.Empty`` to callers."""
+        try:
+            if timeout is None:
+                result = self._persistent_comp_q.get_nowait()
+            else:
+                result = self._persistent_comp_q.get(timeout=timeout)
+        except Empty:
+            return False, None
+        return True, result
+
+    def _wait_for_completion(self, blocking: bool) -> bool:
+        """Wait for the local worker or report that a non-blocking poll is still active."""
+        process = self.process
+        if process is None:
+            return False
+
+        while self.cur_item is None and self.worker_error is None:
+            has_result, result = self._try_get_completion_result()
+            if has_result:
+                self._handle_completion_result(result)
+                return False
+
+            if not process.is_alive():
+                process.join()
+                # A multiprocessing queue can take a moment to flush after its
+                # producer exits, so check once more before reporting a crash.
+                has_result, result = self._try_get_completion_result(timeout=0.1)
+                if has_result:
+                    self._handle_completion_result(result)
+                else:
+                    self.worker_error = (
+                        "Persistent checkpoint worker exited without reporting "
+                        f"completion (exit code {process.exitcode})"
+                    )
+                return False
+
+            if not blocking:
+                return True
+            sleep(0.1)
+
+        return False
+
     def is_current_async_call_done(self, blocking: bool = False, no_dist: bool = False) -> bool:
         """Check if async save is finished on all ranks.
 
@@ -488,38 +531,7 @@ class PersistentAsyncCaller(AsyncCaller):
                 if `blocking` is True), False if at least one rank is still active.
         """
 
-        is_alive: bool = False
-
-        if self.process:
-            while self.cur_item is None and self.worker_error is None:
-                try:
-                    # Retrieve comp call_idx without waiting
-                    result = self._persistent_comp_q.get_nowait()
-                except Empty:
-                    if not self.process.is_alive():
-                        self.process.join()
-                        try:
-                            # A multiprocessing queue can take a moment to flush after its
-                            # producer exits, so check once more before reporting a crash.
-                            result = self._persistent_comp_q.get(timeout=0.1)
-                        except Empty:
-                            self.worker_error = (
-                                "Persistent checkpoint worker exited without reporting "
-                                f"completion (exit code {self.process.exitcode})"
-                            )
-                            break
-                        else:
-                            self._handle_completion_result(result)
-                            break
-                    # This method is called after any `AsyncRequest` is pushed to the main loop
-                    # So, the background writing is still active
-                    # before the worker put call_idx to `comp_q`
-                    if not blocking:
-                        is_alive = True
-                        break
-                    sleep(0.1)
-                else:
-                    self._handle_completion_result(result)
+        is_alive = self._wait_for_completion(blocking)
 
         if no_dist:
             if self.worker_error is not None:
