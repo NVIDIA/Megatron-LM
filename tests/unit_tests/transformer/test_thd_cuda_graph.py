@@ -1200,15 +1200,6 @@ def test_balanced_static_pack_pp_allows_graph_scope_outside_attention(monkeypatc
             {"delay_wgrad_compute": True},
             "does not yet support overlap_moe_expert_parallel_comm or delay_wgrad_compute",
         ),
-        (
-            {
-                "mtp_num_layers": 1,
-                "recompute_granularity": "full",
-                "recompute_method": "uniform",
-                "recompute_num_layers": 1,
-            },
-            "does not yet support full activation recompute with MTP",
-        ),
     ],
 )
 def test_balanced_dynamic_packs_validates_opt_in_contract(monkeypatch, overrides, match):

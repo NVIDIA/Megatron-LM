@@ -423,8 +423,9 @@ class TransformerConfig(ModelParallelConfig):
     The opt-in keeps graph tensor shapes and communication sizes fixed. Data preparation builds
     one fixed-shape source plan from each microbatch's ``cu_seqlens``. The decoder stack copies
     its two typed metadata owners once into a fixed-address graph-slot arena shared by all of its
-    captured DSA callables. Full activation recompute retains the originating main-decoder slot;
-    the MTP direct-layer fallback does not yet support full recompute. It requires
+    captured DSA callables. Staged route inputs retain their originating slot so replay cannot
+    follow mutable layer microbatch state; this does not change the existing CUDA-graph/recompute
+    compatibility matrix. It requires
     ``dsa_cp_balance_indexer``, fixed context parallelism, ``sequence_packing_scheduler`` set to
     ``"dp_balanced"``, and Transformer Engine CUDA graphs that capture attention. PP/VPP also
     requires ``cuda_graph_dynamic_microbatches`` so a graph input slot cannot be reused while its
@@ -3591,14 +3592,6 @@ class TransformerConfig(ModelParallelConfig):
                     "CUDA graph capture back to the runtime microbatch count instead of the THD "
                     "packing upper bound, so a still-live graph input slot could be reused."
                 )
-            if self.mtp_num_layers and self.recompute_granularity == 'full':
-                raise ValueError(
-                    "dsa_cp_balance_indexer_graph_dynamic_packs does not yet support full "
-                    "activation recompute with MTP. Main-decoder layers retain their original "
-                    "block-owned route slot across recompute, but MTP currently uses the "
-                    "direct-layer fallback and has no stack-owned slot to retain."
-                )
-
         if (
             self.dsa_cp_balance_indexer
             and not self.dsa_cp_balance_indexer_graph_dynamic_packs
