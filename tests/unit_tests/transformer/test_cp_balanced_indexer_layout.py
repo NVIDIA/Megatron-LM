@@ -370,6 +370,28 @@ def test_graph_dynamic_fused_layout_views_keep_16_byte_alignment_for_five_cu_ent
             assert tensor.data_ptr() % 16 == 0, (layout_name, tensor.storage_offset())
 
 
+def test_graph_dynamic_aligned_layout_size_roundtrips_and_caches_all_k_residues():
+    """Shape-only K recovery is injective and constant-time after the first schema use."""
+    import megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer as M
+
+    M._infer_graph_dynamic_cu_entries.cache_clear()
+    for l_local in (2, 6, 24, 2048):
+        previous_numel = None
+        for cu_entries in range(2, 65):
+            layout_numel = M._graph_dynamic_layout_numel(cu_entries, l_local)
+            assert M._infer_graph_dynamic_cu_entries(layout_numel, l_local) == cu_entries
+            if previous_numel is not None and layout_numel > previous_numel + 1:
+                with pytest.raises(ValueError, match="layout buffer length"):
+                    M._infer_graph_dynamic_cu_entries(previous_numel + 1, l_local)
+            previous_numel = layout_numel
+
+    layout_numel = M._graph_dynamic_layout_numel(5, 2048)
+    before = M._infer_graph_dynamic_cu_entries.cache_info()
+    assert M._infer_graph_dynamic_cu_entries(layout_numel, 2048) == 5
+    after = M._infer_graph_dynamic_cu_entries.cache_info()
+    assert after.hits == before.hits + 1
+
+
 def test_graph_dynamic_plan_two_buffer_schema_roundtrip_and_refresh():
     """TE exposes two owners; logical views alias them and refresh with two copies."""
     group = _StubGroup(4, 1)

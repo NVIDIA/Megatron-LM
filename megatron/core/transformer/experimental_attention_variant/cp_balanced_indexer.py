@@ -43,6 +43,7 @@ replay can refresh metadata for a different pack without recapturing or repeatin
 
 import logging
 import os
+from functools import lru_cache
 
 import torch
 import torch.distributed as dist
@@ -865,6 +866,7 @@ def _graph_dynamic_layout_numel(cu_entries, l_local):
     return offset + counts[-1]
 
 
+@lru_cache(maxsize=128)
 def _infer_graph_dynamic_cu_entries(layout_numel, l_local):
     """Recover K from the strictly increasing aligned layout-size contract."""
     low, high = 2, max(2, layout_numel)
