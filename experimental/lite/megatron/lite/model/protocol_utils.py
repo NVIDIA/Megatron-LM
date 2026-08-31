@@ -36,6 +36,16 @@ def _parallel_state(model) -> ParallelState:
     return parallel_state_from_model(model) or ParallelState()
 
 
+def router_replay_roots(chunk) -> list:
+    """Select decoder layers for R3, excluding MTP-only routers."""
+    model = getattr(chunk, "model", chunk)
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        return [chunk]
+    values = getattr(layers, "values", None)
+    return list(values()) if callable(values) else list(layers)
+
+
 def _model_attribute(model, name: str):
     """Read an attribute through optional distributed model wrappers."""
 

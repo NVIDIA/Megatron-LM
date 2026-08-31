@@ -264,6 +264,11 @@ class FSDP2Optimizer:
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.optimizer.load_state_dict(state_dict)
 
+    def reload_model_params(self) -> None:
+        reload_model_params = getattr(self.optimizer, "reload_model_params", None)
+        if callable(reload_model_params):
+            reload_model_params()
+
     def offload_state_to_cpu(self) -> None:
         move_optimizer_state_to_cpu(
             self.optimizer, self._cpu_offloaded_state, include_dtensor_state=True
@@ -450,6 +455,8 @@ def build_fsdp2_training_optimizer(
             ignored_params=ignored_expert_params or None,
             shard_placement_fn=dense_shard_placement_fn,
         )
+        if any(param.is_meta for param in chunk.parameters()):
+            chunk.to_empty(device="cuda")
     if model_param_dtypes:
         _restore_model_param_dtypes(model_chunks, model_param_dtypes)
 

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from megatron.lite.primitive.modules.attention.dsa import (
+    DSAIndexShareState,
     DynamicSparseAttention,
     RMSNorm,
     build_rope_cache,
@@ -12,6 +13,7 @@ from megatron.lite.primitive.modules.attention.magi import (
 from megatron.lite.primitive.modules.attention.mla import MultiLatentAttention
 
 __all__ = [
+    "DSAIndexShareState",
     "DynamicSparseAttention",
     "MagiAttentionConfig",
     "MagiDotProductAttention",
