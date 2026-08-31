@@ -1679,13 +1679,35 @@ class TestGraphDynamicRouteMetadataArena:
                 is_first_microbatch=False,
             ):
                 del is_first_microbatch
+                # Keep this signal bitwise deterministic across independently captured graph
+                # slots. CUDA reductions are allowed to choose a different reduction schedule,
+                # which would make the cross-slot replay assertion test reduction ordering
+                # instead of the fixed-address route-metadata contract.
+                layout = dsa_cp_graph_layout_buffer.to(hidden_states.dtype)
+                route = dsa_cp_graph_route_buffer.to(hidden_states.dtype)
+                cu_q = cu_seqlens_q.to(hidden_states.dtype)
+                cu_kv = cu_seqlens_kv.to(hidden_states.dtype)
+                cu_q_padded = cu_seqlens_q_padded.to(hidden_states.dtype)
+                cu_kv_padded = cu_seqlens_kv_padded.to(hidden_states.dtype)
                 signal = (
-                    dsa_cp_graph_layout_buffer[:4].to(hidden_states.dtype).sum() * 0.01
-                    + dsa_cp_graph_route_buffer[:4].to(hidden_states.dtype).sum() * 0.001
-                    + cu_seqlens_q.to(hidden_states.dtype).sum() * 0.0001
-                    + cu_seqlens_kv.to(hidden_states.dtype).sum() * 0.0001
-                    + cu_seqlens_q_padded.to(hidden_states.dtype).sum() * 0.0001
-                    + cu_seqlens_kv_padded.to(hidden_states.dtype).sum() * 0.0001
+                    (layout[0] + 2 * layout[1] + 3 * layout[2] + 4 * layout[3]) * 0.01
+                    + (route[0] + 2 * route[1] + 3 * route[2] + 4 * route[3]) * 0.001
+                    + (cu_q[0] + 2 * cu_q[1] + 3 * cu_q[2] + 4 * cu_q[3]) * 0.0001
+                    + (cu_kv[0] + 2 * cu_kv[1] + 3 * cu_kv[2] + 4 * cu_kv[3]) * 0.0001
+                    + (
+                        cu_q_padded[0]
+                        + 2 * cu_q_padded[1]
+                        + 3 * cu_q_padded[2]
+                        + 4 * cu_q_padded[3]
+                    )
+                    * 0.0001
+                    + (
+                        cu_kv_padded[0]
+                        + 2 * cu_kv_padded[1]
+                        + 3 * cu_kv_padded[2]
+                        + 4 * cu_kv_padded[3]
+                    )
+                    * 0.0001
                 )
                 return hidden_states * (self.gain + signal * 0.001) + self.bias * signal * 0.01
 
