@@ -554,18 +554,23 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         device_type = device.type if device is not None else "cuda"
 
-        # Expert parameters are ZeRO-3 sharded over the whole expert-DP domain and never
-        # take an outer axis: they are the large ones, so sharding them maximally matters
-        # more than the intra-instance collectives hybrid sharding buys. Dense parameters
-        # are the ones that go hybrid below.
+        # Expert parameters use a single mesh over the whole expert-DP domain and never
+        # take an outer axis. Dense parameters are the ones that go hybrid below.
         expert_dp_mesh = None
-        expert_placements = Placements(
-            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
-        )
         if config.expert_model_parallel_size > 1:
             expert_dp_mesh = DeviceMesh.from_group(
                 pg_collection.expt_dp, device_type=device_type, mesh_dim_names=("expert_dp",)
             )
+        expert_axis = _DATA_PARALLEL_PLACEMENTS[
+            ddp_config.expert_data_parallel_sharding_strategy
+            or ddp_config.data_parallel_sharding_strategy
+        ]
+        expert_placements = Placements(
+            dp_axes=[0],
+            parameter=[expert_axis.parameter],
+            gradient=[expert_axis.gradient],
+            optimizer=[expert_axis.optimizer],
+        )
 
         if has_outer_dp_axis := ddp_config.num_distributed_optimizer_instances > 1:
             # Dense parameters get an outer DP axis. There is no HSDP/HFSDP special case:
@@ -576,7 +581,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
             outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.outer_dp_sharding_strategy]
             inner = _DATA_PARALLEL_PLACEMENTS[ddp_config.data_parallel_sharding_strategy]
-            placements = Placements(
+            dense_placements = Placements(
                 dp_axes=[0, 1],
                 parameter=[outer.parameter, inner.parameter],
                 gradient=[outer.gradient, inner.gradient],
@@ -587,7 +592,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 pg_collection.dp_cp, device_type=device_type, mesh_dim_names=("dp",)
             )
             axis = _DATA_PARALLEL_PLACEMENTS[ddp_config.data_parallel_sharding_strategy]
-            placements = Placements(
+            dense_placements = Placements(
                 dp_axes=[0],
                 parameter=[axis.parameter],
                 gradient=[axis.gradient],
@@ -620,11 +625,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     fully_shard(
                         submodule,
                         mesh=dp_mesh,
-                        placements=placements,
+                        placements=dense_placements,
                         mixed_precision_policy=self.mp_policy,
                     )
             fully_shard(
-                module, mesh=dp_mesh, placements=placements, mixed_precision_policy=self.mp_policy
+                module,
+                mesh=dp_mesh,
+                placements=dense_placements,
+                mixed_precision_policy=self.mp_policy,
             )
         super().__init__(config=config, module=module)
 
