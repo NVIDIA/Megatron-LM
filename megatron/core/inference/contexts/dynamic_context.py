@@ -26,7 +26,11 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling.base import Sampling
-from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.sampling_params import (
+    SamplingParams,
+    is_no_op_top_k,
+    is_no_op_top_p,
+)
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
@@ -4717,6 +4721,25 @@ class DynamicInferenceContext(BaseInferenceContext):
             "newly_paused_request_ids": newly_paused_request_ids,
             "evict_request_ids": evict_request_ids,
         }
+
+    def active_sampling_filter_flags(
+        self, active_request_count: Optional[int] = None
+    ) -> Tuple[bool, bool]:
+        """Return `(no_top_k, no_top_p)` batch-level flags for the active batch.
+
+        These are read from the pinned CPU sampling metadata, so they incur no GPU sync.
+        They are used in several places to decide whether to skip sampling-filtering work.
+        """
+        if active_request_count is None:
+            active_request_count = self.total_request_count - self.paused_request_count
+        if active_request_count <= 0:
+            return True, True
+
+        top_k = self.active_request_metadata["top_k"][:active_request_count]
+        top_p = self.active_request_metadata["top_p"][:active_request_count]
+        no_top_k = bool(is_no_op_top_k(top_k).all())
+        no_top_p = bool(is_no_op_top_p(top_p).all())
+        return no_top_k, no_top_p
 
     def _processed_log_probs(
         self,

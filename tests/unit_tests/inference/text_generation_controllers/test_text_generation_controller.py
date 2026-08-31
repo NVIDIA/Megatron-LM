@@ -32,6 +32,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
     GPTInferenceWrapper,
 )
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
+from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     AsyncScheduleLogitsState,
@@ -1957,15 +1958,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 sampling_params=SamplingParams(top_k=2, top_p=0.4),
                 vocab_size=self.vocab_size,
             )
-        assert str(aerror.value) == 'Cannot have top-p and top-k both greater than zero'
-
-        with pytest.raises(AssertionError) as aerror:
-            self.text_generation_controller.sample_from_logits(
-                last_token_logits=None,
-                sampling_params=SamplingParams(top_p=1.4, top_k=0),
-                vocab_size=self.vocab_size,
-            )
-        assert str(aerror.value) == 'top-p should be in (0,1]'
+        assert str(aerror.value) == 'Cannot have top-p and top-k both active'
 
         with pytest.raises(AssertionError) as aerror:
             self.text_generation_controller.sample_from_logits(
@@ -1974,6 +1967,25 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 vocab_size=self.vocab_size,
             )
         assert str(aerror.value) == 'top-k is larger than logit size.'
+
+        # top_p >= 1.0 is a no-op filter: identity on logits, legal alongside top-k;
+        # temperature=0 sharpens toward argmax instead of dividing into inf/NaN.
+        cpu_logits = torch.randn(4, 32)
+        assert torch.equal(
+            TorchSampling.filter_logits(cpu_logits, temperature=1.0, top_k=0, top_p=1.0),
+            cpu_logits,
+        )
+        for top_k, top_p in ((4, 0.0), (0, 0.9)):
+            filtered = TorchSampling.filter_logits(
+                cpu_logits, temperature=0.0, top_k=top_k, top_p=top_p
+            )
+            kept = filtered[filtered != float('-inf')]
+            assert torch.isfinite(kept).all()
+            assert torch.equal(filtered.argmax(dim=-1), cpu_logits.argmax(dim=-1))
+        sampled = TorchSampling.sample_from_logits(
+            cpu_logits, temperature=1.0, top_k=8, top_p=1.0, generator=torch.Generator()
+        )
+        assert sampled.shape == (4,)
 
         last_token_logits = (
             torch.arange(0, self.vocab_size).repeat(self.batch_size, 1).float().cuda()
