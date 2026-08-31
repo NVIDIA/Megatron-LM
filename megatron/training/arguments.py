@@ -2282,12 +2282,15 @@ def _add_inference_args(parser):
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-sizing-distribution',
-                       type=str, default='exponential',
-                       choices=['exponential', 'linear'],
+                       type=str, default='hybrid',
+                       choices=['exponential', 'linear', 'hybrid'],
                        dest='inference_dynamic_batching_cuda_graph_sizing_distribution',
-                       help='Spacing of CUDA graph token counts. "exponential" (default) '
-                            'halves from cuda_graph_max_tokens down to tp_size, giving a '
-                            'log-spaced distribution with bounded relative padding. '
+                       help='Spacing of CUDA graph token counts. "hybrid" (default) uses '
+                            'exponential spacing for prefill/mixed graphs and linear spacing '
+                            'for decode-only graphs, whose token counts are capped at '
+                            'max_requests and are far too small for halving to cover well. '
+                            '"exponential" halves from cuda_graph_max_tokens down to tp_size, '
+                            'giving a log-spaced distribution with bounded relative padding. '
                             '"linear" uses varying linear strides across the range.')
     group.add_argument('--inference-dynamic-batching-sampling-backend',
                        type=str, default='torch',
@@ -3283,6 +3286,10 @@ def _add_distributed_args(parser):
     group.add_argument('--data-parallel-sharding-strategy', type=str, default='optim_grads_params',
                        choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
                        help='Sharding strategy of data parallelism.')
+    group.add_argument('--expert-data-parallel-sharding-strategy', type=str, default=None,
+                       choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
+                       help='Optional expert-parameter sharding strategy for MFSDP v2. '
+                            'Defaults to --data-parallel-sharding-strategy.')
     group.add_argument('--outer-dp-sharding-strategy', type=str, default='no_shard',
                        choices=['no_shard', 'optim'],
                        help='Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode. '
