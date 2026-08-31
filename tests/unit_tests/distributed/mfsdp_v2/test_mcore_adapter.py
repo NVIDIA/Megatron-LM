@@ -8,7 +8,8 @@ from dataclasses import replace
 
 import pytest
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.distributed_c10d import _world
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -46,6 +47,19 @@ def _build_block(config: TransformerConfig) -> TransformerBlock:
     )
 
 
+def _destroy_model_parallel():
+    """Utils.destroy_model_parallel, plus the groups it leaves behind.
+
+    It clears Megatron's references but frees only a few of the groups; c10d holds its own
+    reference to the rest, so their NCCL communicators -- and, with NVLS enabled, their
+    multicast reservations -- would outlive the test. See #6897.
+    """
+    Utils.destroy_model_parallel()
+    for group in list(_world.pg_map):
+        if group is not torch.distributed.group.WORLD:
+            torch.distributed.destroy_process_group(group)
+
+
 class TestMcoreAdapterDense:
     """Exercise a dense MCore transformer block over two data-parallel ranks."""
 
@@ -55,7 +69,7 @@ class TestMcoreAdapterDense:
         model_parallel_cuda_manual_seed(1234)
 
     def teardown_method(self):
-        Utils.destroy_model_parallel()
+        _destroy_model_parallel()
 
     def test_wraps_fsdp_unit_modules_before_root(self):
         config = TransformerConfig(
@@ -430,8 +444,7 @@ class TestMcoreAdapterExpertParallel:
         model_parallel_cuda_manual_seed(1234)
 
     def teardown_method(self):
-        torch.distributed.destroy_process_group(self.reference_group)
-        Utils.destroy_model_parallel()
+        _destroy_model_parallel()
 
     def test_build_train_step_and_clip(self):
         """Shard experts over expert-DP and clip their combined gradients."""
@@ -573,3 +586,210 @@ class TestMcoreAdapterExpertParallel:
         assert torch.isfinite(reference_losses).all()
         assert losses[-1] < losses[0]
         torch.testing.assert_close(losses, reference_losses)
+
+
+class TestMcoreAdapterHybrid:
+    """Exercise MFSDP v2 over a hybrid data-parallel domain (an outer DP axis)."""
+
+    def teardown_method(self):
+        _destroy_model_parallel()
+
+    @staticmethod
+    def _config() -> TransformerConfig:
+        return TransformerConfig(
+            num_layers=2,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+
+    @staticmethod
+    def _train(config, instances, outer_strategy, steps=3):
+        """Train over the already-initialized DP topology and return per-step losses.
+
+        ``instances`` must match what initialize_model_parallel was given: it selects the
+        adapter's mesh, while the process groups it maps onto come from the caller.
+        """
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_parallel_cuda_manual_seed(1234)
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                num_distributed_optimizer_instances=instances,
+                outer_dp_sharding_strategy=outer_strategy,
+            ),
+            module=_build_block(config),
+            pg_collection=pg_collection,
+        )
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="sgd",
+                lr=1.0e-2,
+                weight_decay=0.0,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                use_distributed_optimizer=False,
+                clip_grad=0.0,
+            ),
+            [model],
+            pg_collection=pg_collection,
+            use_gloo_process_groups=False,
+        )
+        losses = []
+        for step in range(steps):
+            optimizer.zero_grad(set_to_none=True)
+            # Rank-dependent but step-deterministic input, so every configuration
+            # sees the same global batch however the domain is split.
+            hidden = torch.arange(
+                1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16
+            ).view(1, 1, -1).expand(8, 2, -1) * (torch.distributed.get_rank() + 1 + step)
+            loss = model(hidden_states=hidden, attention_mask=None).float().square().mean()
+            loss.backward()
+            success, _, _ = optimizer.step()
+            assert success
+            losses.append(loss.detach())
+        return torch.stack(losses)
+
+    @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
+    def test_hybrid_placements(self, outer_strategy):
+        """The outer axis takes its strategy's placement; the inner axis stays ZeRO-3."""
+        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_parallel_cuda_manual_seed(1234)
+        config = self._config()
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                num_distributed_optimizer_instances=2,
+                outer_dp_sharding_strategy=outer_strategy,
+            ),
+            module=_build_block(config),
+            pg_collection=pg_collection,
+        )
+        output = model(
+            hidden_states=torch.randn(
+                8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16
+            ),
+            attention_mask=None,
+        )
+        output.float().square().sum().backward()
+
+        expected_outer = Replicate() if outer_strategy == "no_shard" else Shard(0)
+        graded = [p for p in model.parameters() if p.grad is not None]
+        assert graded, "no gradients to inspect"
+        for parameter in graded:
+            assert parameter.grad.device_mesh.mesh_dim_names == ("dp_outer", "dp_shard")
+            assert parameter.grad.placements == (expected_outer, Shard(0))
+
+    @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"], ids=["hsdp", "hfsdp"])
+    def test_hybrid_matches_single_instance(self, outer_strategy):
+        """Splitting the DP domain must not change the math: same losses as one instance."""
+        config = self._config()
+        # The instance count is fixed by initialize_model_parallel, so comparing two
+        # topologies means initializing twice. teardown_method destroys the second.
+        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=1)
+        reference = self._train(config, instances=1, outer_strategy="no_shard")
+        _destroy_model_parallel()
+
+        Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=2)
+        hybrid = self._train(config, instances=2, outer_strategy=outer_strategy)
+        assert torch.isfinite(reference).all()
+        torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
+
+    def test_moe_with_hybrid_dense(self):
+        """Dense parameters go hybrid; experts stay ZeRO-3 over the whole expert-DP domain.
+
+        This is the intended MoE configuration: ZeRO-3 + EP for the large expert weights,
+        and hybrid sharding for the dense ones. The two must end up on different meshes.
+        """
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size < 4 or world_size % 4:
+            pytest.skip("MoE + hybrid needs a world size divisible by four (EP=2, instances=2).")
+
+        Utils.initialize_model_parallel(
+            1, 1, expert_model_parallel_size=2, num_distributed_optimizer_instances=2
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(1234)
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            expert_model_parallel_size=2,
+            moe_layer_freq=[0, 1],
+            moe_token_dispatcher_type="alltoall",
+            moe_router_topk=2,
+            moe_grouped_gemm=True,
+            moe_ffn_hidden_size=128,
+            add_bias_linear=False,
+            use_cpu_initialization=True,
+            params_dtype=torch.float32,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            gradient_accumulation_fusion=False,
+            attention_backend=AttnBackend.unfused,
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                num_distributed_optimizer_instances=2,
+                outer_dp_sharding_strategy="optim",
+            ),
+            module=HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=128,
+                max_sequence_length=8,
+                hybrid_layer_pattern="*E",
+                pg_collection=pg_collection,
+            ).cuda(),
+            pg_collection=pg_collection,
+        )
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="sgd",
+                lr=1.0e-3,
+                weight_decay=0.0,
+                use_distributed_optimizer=False,
+                clip_grad=0.0,
+            ),
+            [model],
+            pg_collection=pg_collection,
+            use_gloo_process_groups=False,
+        )
+
+        optimizer.zero_grad(set_to_none=True)
+        input_ids = torch.randint(0, 128, (2, 8), device="cuda")
+        position_ids = torch.arange(8, device="cuda").repeat(2, 1)
+        output = model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
+        output.float().square().mean().backward()
+        success, _, _ = optimizer.step()
+        assert success
+
+        meshes = {
+            parameter.grad.device_mesh.mesh_dim_names
+            for parameter in model.parameters()
+            if parameter.grad is not None
+        }
+        assert ("dp_outer", "dp_shard") in meshes, f"no hybrid dense mesh in {meshes}"
+        assert ("expert_dp",) in meshes, f"no expert mesh in {meshes}"
+        # Experts must not have acquired an outer axis.
+        assert meshes == {("dp_outer", "dp_shard"), ("expert_dp",)}, meshes
