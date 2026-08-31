@@ -21,7 +21,6 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.abspath(os.path.join(_SCRIPT_DIR, "../../../")))
 
 import modelopt.torch.quantization as mtq
-from modelopt.recipe import ModelOptPTQRecipe, load_recipe
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.quantization.config import _default_disabled_quantizer_cfg
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
@@ -270,21 +269,6 @@ def check_arguments():
 def get_modelopt_torch_quantization_config():
     """Return a quantization config."""
     args = get_args()
-
-    if args.recipe is not None:
-        # YAML recipe is authoritative: skip predefined-config customizations and KV
-        # cache override; the recipe encodes quant_cfg + algorithm + KV cache directly.
-        print_rank_0(f"Use recipe {args.recipe} for quantization")
-        recipe = load_recipe(args.recipe)
-        if not isinstance(recipe, ModelOptPTQRecipe):
-            raise TypeError(
-                f"Expected PTQ recipe, but got {type(recipe).__name__} from {args.recipe}"
-            )
-        if args.export_kv_cache_quant != "none":
-            print_rank_0(
-                f"Ignoring --export-kv-cache-quant={args.export_kv_cache_quant} since you passed in a YAML recipe."
-            )
-        return recipe.quantize.model_dump()
 
     if args.export_quant_cfg not in QUANT_CFG_CHOICES:
         raise ValueError(f"Unsupported quantization config {args.export_quant_cfg}.")
