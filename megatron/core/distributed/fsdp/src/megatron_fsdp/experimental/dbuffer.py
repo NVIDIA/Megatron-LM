@@ -115,6 +115,7 @@ class DBuffer:
             if self.local_buffer.is_cuda
             else None
         )
+        self._local_tensor_cache: dict[int, torch.Tensor] = {}
 
     @property
     def dtype(self) -> torch.dtype:
@@ -144,6 +145,31 @@ class DBuffer:
         # for a later reallocate_storage().
         self._resize_storage(0)
 
+    def bind_local_buffer(self, local_buffer: torch.Tensor) -> None:
+        """Rebind this DBuffer to allocator-owned flat storage.
+
+        The DBuffer object and its layout remain stable while a trace-pool slot
+        supplies the physical storage. Callers that retain per-tensor views must
+        refresh those views after this method returns.
+        """
+        if local_buffer.dim() != 1:
+            raise ValueError("Trace-pool local_buffer must be a flat 1D tensor.")
+        if not local_buffer.is_contiguous():
+            raise ValueError("Trace-pool local_buffer must be contiguous.")
+        if local_buffer.numel() != self.local_buffer.numel():
+            raise ValueError(
+                f"Expected trace-pool buffer with {self.local_buffer.numel()} elements, "
+                f"got {local_buffer.numel()}."
+            )
+        if local_buffer.dtype != self.dtype or local_buffer.device != self.device:
+            raise ValueError(
+                "Trace-pool buffer dtype/device mismatch: expected "
+                f"{(self.dtype, self.device)}, got "
+                f"{(local_buffer.dtype, local_buffer.device)}."
+            )
+        self.local_buffer.set_(local_buffer)
+        self._local_tensor_cache.clear()
+
     def rendezvous(self, mesh_axis: int) -> None:
         """Rendezvous this local buffer for symmetric-memory collectives."""
         group = self.mesh.get_group(mesh_axis)
@@ -151,6 +177,9 @@ class DBuffer:
 
     def _resize_storage(self, numel: int) -> None:
         self.local_buffer.untyped_storage().resize_(numel * self.local_buffer.element_size())
+        # Cached local-tensor views alias this storage, so they are invalid
+        # after a resize (release_storage() and reallocate_storage()).
+        self._local_tensor_cache.clear()
 
     def _get_owned_range(self, tensor_index: int) -> _OwnedRange | None:
         """Return this buffer's owned range for logical tensor ``tensor_index``."""
@@ -221,6 +250,7 @@ class DBuffer:
         buffer.offset = offset
         buffer.local_buffer = local_buffer
         buffer.allocation_stream = allocation_stream
+        buffer._local_tensor_cache = {}
         return buffer
 
     @classmethod
@@ -498,11 +528,17 @@ class DBuffer:
         Flat placements shard dim 0, so the returned view preserves all
         non-leading dimensions and only changes the leading dimension.
         """
+        cached = self._local_tensor_cache.get(index)
+        if cached is not None:
+            return cached
+
         shape = self.layout.tensor_shapes[index]
         owned_range = self._get_owned_range(index)
 
         row_size = non_leading_numel(shape)
         if owned_range is None:
+            # Empty shards are free to recreate and are not cached, so indices
+            # never share the same (empty) tensor object.
             empty_shape = torch.Size((0, *shape[1:]))
             return torch.empty(empty_shape, dtype=self.dtype, device=self.device)
 
@@ -511,9 +547,11 @@ class DBuffer:
                 f"Local tensor shard for tensor {index} does not preserve dim-0 boundaries."
             )
         local_shape = torch.Size((owned_range.numel // row_size, *shape[1:]))
-        return self.local_buffer.narrow(
+        local = self.local_buffer.narrow(
             0, owned_range.buffer_relative_offset, owned_range.numel
         ).view(local_shape)
+        self._local_tensor_cache[index] = local
+        return local
 
     def get_dtensor(self, index: int) -> DTensor:
         """Return logical tensor ``index`` as a DTensor."""

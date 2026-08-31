@@ -226,6 +226,29 @@ def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup
     torch.testing.assert_close(tensor_view, torch.full_like(tensor_view, 7.0))
 
 
+def test_bind_local_buffer_replaces_storage_and_invalidates_cached_views(distributed_setup):
+    """DBuffer can adopt an allocator-owned flat tensor at a batch boundary."""
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    buffer = DBuffer(
+        mesh=mesh,
+        placements=[Replicate()],
+        tensor_shapes=[torch.Size((4, 4))],
+        dtype=torch.float32,
+        device=distributed_setup.device,
+    )
+    old_view = buffer.get_local_tensor(0)
+    local_buffer = torch.empty_like(buffer.local_buffer)
+
+    buffer.bind_local_buffer(local_buffer)
+    new_view = buffer.get_local_tensor(0)
+    local_buffer.fill_(11)
+
+    assert buffer.local_buffer.data_ptr() == local_buffer.data_ptr()
+    assert new_view.data_ptr() == local_buffer.data_ptr()
+    assert old_view.data_ptr() != new_view.data_ptr()
+    torch.testing.assert_close(new_view, torch.full_like(new_view, 11))
+
+
 def test_from_local_reuses_required_local_buffer(distributed_setup):
     """DBuffer.from_local reuses caller-provided local storage without allocation."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
