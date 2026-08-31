@@ -152,3 +152,14 @@ The final summary contains only the source revision with a dirty suffix when
 applicable, safe software and GPU metadata, suite durations, result counts, and
 overall status. It does not print hostnames, container identifiers, environment
 values, credentials, or infrastructure paths.
+
+## Optional MagiAttention Suite
+
+MagiAttention is an optional CUDA dependency, so its coverage is split by
+dependency weight. `unit/primitive/test_magi_attention_unit.py` uses a fake
+MagiAttention API and runs in the standard workflow with no extra install.
+The operator-level numerical test
+(`smoke/primitive/test_magi_attention_operator.py`) and the Qwen3-MoE E2E
+(`smoke/model/test_magi_attention_e2e.py`) require a real MagiAttention
+build; they are marked `optional` and run through their dedicated venv-based
+runner. See `../docs/magi_attention.md` and `run_magi_attention_e2e.sh`.

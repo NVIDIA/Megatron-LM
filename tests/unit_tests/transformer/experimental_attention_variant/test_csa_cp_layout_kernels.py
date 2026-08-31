@@ -5,8 +5,10 @@ from typing import List, Tuple
 import pytest
 import torch
 
-from megatron.core.transformer.experimental_attention_variant import csa_cp_layout_kernels
-from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_layout_kernels as csa_cp_layout_kernels,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
     prepare_cp_compressor_input,
 )
 

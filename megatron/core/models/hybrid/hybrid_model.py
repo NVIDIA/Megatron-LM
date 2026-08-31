@@ -13,7 +13,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -27,6 +27,7 @@ from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_han
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
+    prepare_mtp_sequence_roll_context,
     process_mtp_loss,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -477,6 +478,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             decoder_input = None
 
         rotary_pos_emb = None
+        # Model-level rotary_pos_emb is only for regular attention. Regular
+        # attention uses the default zigzag CP RoPE layout; MLA/CSA/DSv4-style
+        # variants must ignore this external RoPE and build/apply RoPE internally.
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
@@ -484,6 +488,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb = self.rotary_pos_emb(
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
             )
         elif self.position_embedding_type == 'yarn':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
@@ -493,6 +498,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb, _ = self.rotary_pos_emb(
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
             )
 
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
@@ -551,6 +557,32 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and inference_context.is_dynamic_batching()
             and inference_context.num_speculative_tokens > 0
         )
+        mtp_cp_group = None
+        sequence_roll_context = None
+        if (
+            self.config.mtp_num_layers
+            and self.mtp_process
+            and not (in_inference_mode or is_spec_decode)
+        ):
+            mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+            # Build layout-specific metadata once, then fetch every locally owned
+            # MTP field's compact successor rows in one grouped operation. The extra
+            # row covers RL's initial label derivation before the per-layer rolls.
+            sequence_roll_context = prepare_mtp_sequence_roll_context(
+                tensor=input_ids if input_ids is not None else labels,
+                cp_group=mtp_cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+            if sequence_roll_context is not None:
+                roll_position_ids = getattr(self.embedding, "add_position_embedding", True)
+                sequence_roll_context = sequence_roll_context.prefetch_halos(
+                    width=self.config.mtp_num_layers + 1,
+                    input_ids=input_ids,
+                    position_ids=position_ids if roll_position_ids else None,
+                    labels=labels if self.post_process else None,
+                    loss_mask=loss_mask if self.post_process else None,
+                    padding_mask=padding_mask,
+                )
 
         mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
         if mtp_forward_ran:
@@ -563,6 +595,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
+                sequence_roll_context=sequence_roll_context,
                 embedding=self.embedding,
                 padding_mask=padding_mask,
             )
@@ -587,9 +620,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=mtp_cp_group,
                     tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
+                    sequence_roll_context=sequence_roll_context,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
                 )

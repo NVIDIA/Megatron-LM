@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain utilities."""
 
@@ -58,6 +58,7 @@ from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    is_gated_delta_net_variant,
     is_linear_attention_variant,
 )
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
@@ -577,6 +578,8 @@ def num_floating_point_operations(
         gqa=True,
         gqa_groups=8,
         kv_channels=None,
+        attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
     ):
         """Calculate FLOPs for an attention layer.
 
@@ -589,10 +592,23 @@ def num_floating_point_operations(
         """
         p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
         g = gqa_groups if gqa else num_heads
+        gate_projection_size = 0
+        if attention_output_gate:
+            if gated_attention_proj_granularity == "elementwise":
+                gate_projection_size = hidden_size * p
+            elif gated_attention_proj_granularity == "headwise":
+                gate_projection_size = num_heads
+            else:
+                raise ValueError(
+                    "gated_attention_proj_granularity must be either 'elementwise' or "
+                    f"'headwise', got {gated_attention_proj_granularity!r}."
+                )
         # 4 * total_tokens * h * p * (h + h*(g/n)): QKV + output projections (fwd*3, with FMA*2).
+        # The output gate contributes one additional hidden_size -> gate_size projection.
         # 2 * sum(L^2) * h * p: core attention (causal mask -> /2 cancels with FMA *2).
         return (
             4 * total_tokens * hidden_size * p * (hidden_size + hidden_size * (g / num_heads))
+            + 2 * total_tokens * hidden_size * gate_projection_size
             + 2 * seqlen_squared_sum * hidden_size * p
         )
 
@@ -606,6 +622,8 @@ def num_floating_point_operations(
         qk_head_dim,
         qk_pos_emb_head_dim,
         v_head_dim,
+        attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
     ):
         """Calculate FLOPs for a Multi-Latent Attention (MLA) layer.
 
@@ -615,9 +633,8 @@ def num_floating_point_operations(
         ``attn_layer_flops`` above assumes dense MHA/GQA QKV projections and
         badly overcounts MLA, whose Q/KV go through low-rank ``lora`` ranks.
 
-        Returns a forward-equivalent value (FMA factor 2 baked in, NO fwd+bwd
-        factor): the caller (``hybrid_flops``) applies the global ``* 3`` for
-        forward + wgrad + dgrad, exactly as for the other layer types.
+        Returns a forward-equivalent value (FMA factor 2 baked in, no
+        forward/backward factor): hybrid_flops applies the global factor 3.
         """
         fma = 2
         if q_lora_rank is None:
@@ -626,12 +643,24 @@ def num_floating_point_operations(
             q_term = q_lora_rank * (
                 hidden_size + num_heads * (qk_head_dim + qk_pos_emb_head_dim) + 1
             )
+        gate_projection_size = 0
+        if attention_output_gate:
+            if gated_attention_proj_granularity == "elementwise":
+                gate_projection_size = num_heads * v_head_dim
+            elif gated_attention_proj_granularity == "headwise":
+                gate_projection_size = num_heads
+            else:
+                raise ValueError(
+                    "gated_attention_proj_granularity must be either 'elementwise' or "
+                    f"'headwise', got {gated_attention_proj_granularity!r}."
+                )
         # Token-linear part (q lora+rope+norm, kv lora+rope+norm, output proj).
         token_linear = fma * (
             q_term
             + kv_lora_rank * (hidden_size + num_heads * (qk_head_dim + v_head_dim) + 1)
             + hidden_size * qk_pos_emb_head_dim
             + (num_heads * v_head_dim) * hidden_size
+            + hidden_size * gate_projection_size
         )
         # Core attention (L^2) part: QK^T and (softmax(QK^T))V. /2 (causal) cancels *2 (FMA).
         core = fma * (
@@ -685,11 +714,43 @@ def num_floating_point_operations(
             )
         )
 
+    def kda_layer_flops(
+        total_tokens,
+        hidden_size,
+        qk_head_dim=128,
+        v_head_dim=128,
+        num_qk_heads=16,
+        num_v_heads=16,
+        conv_kernel_dim=4,
+    ):
+        """Calculate FLOPs for a direct-projection Kimi Delta Attention layer."""
+        if num_qk_heads != num_v_heads or qk_head_dim != v_head_dim:
+            raise ValueError(
+                "KDA FLOPs require the equal K/V head layout enforced by KimiDeltaAttention."
+            )
+        qk_dim = qk_head_dim * num_qk_heads
+        v_dim = v_head_dim * num_v_heads
+        in_proj_dim = 3 * qk_dim + 2 * v_dim
+        non_core_flops = (
+            2
+            * total_tokens
+            * (
+                hidden_size * (in_proj_dim + num_qk_heads)
+                + conv_kernel_dim * (2 * qk_dim + v_dim)
+                + hidden_size * v_dim
+            )
+        )
+        state_update_flops = num_v_heads * (qk_head_dim**2 + 3 * qk_head_dim * v_head_dim)
+        core_flops = 2 * total_tokens * state_update_flops
+        return non_core_flops + core_flops
+
     def hybrid_flops(
         total_tokens,
         seqlen_squared_sum,
         hidden_size,
         num_attn_layers,
+        num_mla_layers,
+        num_kda_layers,
         num_mamba_layers,
         num_mlp_layers,
         num_moe_layers,
@@ -713,14 +774,20 @@ def num_floating_point_operations(
         gdn_num_qk_heads=16,
         gdn_num_v_heads=32,
         gdn_conv_kernel_dim=4,
+        kda_qk_head_dim=128,
+        kda_v_head_dim=128,
+        kda_num_qk_heads=16,
+        kda_num_v_heads=16,
+        kda_conv_kernel_dim=4,
         vocab_size=256000,
         mtp_num_layers=0,
-        multi_latent_attention=False,
         q_lora_rank=None,
         kv_lora_rank=0,
         qk_head_dim=0,
         qk_pos_emb_head_dim=0,
         v_head_dim=0,
+        attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
         experimental_attention_variant=None,
         dsv4_n_layers_r0=0,
         dsv4_n_layers_r4=0,
@@ -737,10 +804,8 @@ def num_floating_point_operations(
         # Self-attention (already summed over all attention layers, fwd-equivalent
         # with the FMA factor baked in; the global ``* 3`` below adds fwd+bwd).
         if experimental_attention_variant == "dsv4_hybrid":
-            # DSv4 attention (Window/CSA/HCA) is MLA-based but runs SPARSE
-            # attention, not full O(L^2) MLA. Use the shared helper -- the single
-            # source of truth also used by ``transformer_flops`` -- so both code
-            # paths agree. Window/CSA/HCA layer counts come from the pattern.
+            # DSv4 uses sparse MLA attention. Keep the shared helper as the
+            # single source of truth for both HybridModel and GPTModel.
             dsv4_token_term, dsv4_core_term = _dsv4_hybrid_self_attention_flops(
                 hidden_size=hidden_size,
                 num_attention_heads=num_attn_heads,
@@ -760,20 +825,10 @@ def num_floating_point_operations(
             attn_flops_total = 2 * (
                 dsv4_token_term * total_tokens + dsv4_core_term * seqlen_squared_sum
             )
-        elif multi_latent_attention:
-            attn_flops_total = num_attn_layers * mla_attn_layer_flops(
-                total_tokens,
-                seqlen_squared_sum,
-                hidden_size,
-                num_attn_heads,
-                q_lora_rank,
-                kv_lora_rank,
-                qk_head_dim,
-                qk_pos_emb_head_dim,
-                v_head_dim,
-            )
         else:
-            attn_flops_total = num_attn_layers * attn_layer_flops(
+            # HybridStack assigns '*' to regular attention and '+' to MLA independently of the
+            # model-wide multi_latent_attention flag.
+            plain_attn_layer_flops = attn_layer_flops(
                 total_tokens,
                 seqlen_squared_sum,
                 hidden_size,
@@ -781,9 +836,40 @@ def num_floating_point_operations(
                 gqa,
                 gqa_groups,
                 kv_channels,
+                attention_output_gate,
+                gated_attention_proj_granularity,
             )
+            attn_flops_total = num_attn_layers * plain_attn_layer_flops
+            if num_mla_layers:
+                attn_flops_total += num_mla_layers * mla_attn_layer_flops(
+                    total_tokens,
+                    seqlen_squared_sum,
+                    hidden_size,
+                    num_attn_heads,
+                    q_lora_rank,
+                    kv_lora_rank,
+                    qk_head_dim,
+                    qk_pos_emb_head_dim,
+                    v_head_dim,
+                    attention_output_gate,
+                    gated_attention_proj_granularity,
+                )
+
+        kda_flops_total = 0
+        if num_kda_layers:
+            kda_flops_total = num_kda_layers * kda_layer_flops(
+                total_tokens,
+                hidden_size,
+                kda_qk_head_dim,
+                kda_v_head_dim,
+                kda_num_qk_heads,
+                kda_num_v_heads,
+                kda_conv_kernel_dim,
+            )
+
         flops_fwd = (
             attn_flops_total
+            + kda_flops_total
             + num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size, mlp_expansion, swiglu)
             + num_mamba_layers
             * mamba_layer_flops(
@@ -817,9 +903,7 @@ def num_floating_point_operations(
             +
             # MTP norms (eh_norm + final_norm) and eh projection (2 * h^2).
             2 * mtp_num_layers * (3 * hidden_size + 2 * hidden_size * hidden_size) * total_tokens
-            + (
-                2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers)
-            )  # logits computation
+            + 2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers)
         )
         return flops_fwd * 3
 
@@ -930,6 +1014,20 @@ def num_floating_point_operations(
                         + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
                         + 1
                     )
+                gate_projection_size = 0
+                if args.attention_output_gate:
+                    gate_granularity = getattr(
+                        args, "gated_attention_proj_granularity", "elementwise"
+                    )
+                    if gate_granularity == "elementwise":
+                        gate_projection_size = args.num_attention_heads * args.v_head_dim
+                    elif gate_granularity == "headwise":
+                        gate_projection_size = args.num_attention_heads
+                    else:
+                        raise ValueError(
+                            "gated_attention_proj_granularity must be either 'elementwise' or "
+                            f"'headwise', got {gate_granularity!r}."
+                        )
                 # Token-linear part of MLA self-attention (lora projs, kv proj, RoPE, output proj).
                 standard_self_attn_term = (
                     forward_backward_expansion_factor
@@ -947,6 +1045,8 @@ def num_floating_point_operations(
                         + args.hidden_size * args.qk_pos_emb_head_dim
                         ## o proj
                         + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
+                        ## output gate proj
+                        + gate_projection_size * args.hidden_size
                     )
                 )
                 # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``. The
@@ -1024,7 +1124,17 @@ def num_floating_point_operations(
             num_linear_attention_layers = sum(linear_attention_pattern)
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
-            if args.experimental_attention_variant == "gated_delta_net":
+            if args.experimental_attention_variant == "kda":
+                linear_self_attn_term = forward_backward_expansion_factor * kda_layer_flops(
+                    total_tokens=1,
+                    hidden_size=args.hidden_size,
+                    qk_head_dim=args.linear_key_head_dim,
+                    v_head_dim=args.linear_value_head_dim,
+                    num_qk_heads=args.linear_num_key_heads,
+                    num_v_heads=args.linear_num_value_heads,
+                    conv_kernel_dim=args.linear_conv_kernel_dim,
+                )
+            elif is_gated_delta_net_variant(args.experimental_attention_variant):
                 # Calculate the FLOPs for the gated delta net attention.
                 qk_head_dim = args.linear_key_head_dim
                 v_head_dim = args.linear_value_head_dim
@@ -1169,34 +1279,34 @@ def num_floating_point_operations(
 
     # Main entrypoint for FLOPs calculation.
     if is_hybrid_model(args):
-        # Calculate the number of each type of layer.
-        from operator import itemgetter
-
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             Symbols,
             get_hybrid_layer_counts,
         )
 
         layer_counts = get_hybrid_layer_counts(args.hybrid_layer_pattern)
-        num_mamba_layers, num_gdn_layers, num_mlp_layers, num_moe_layers = itemgetter(
-            Symbols.MAMBA, Symbols.GDN, Symbols.MLP, Symbols.MOE
-        )(layer_counts)
-        # Attention layers = plain ATTENTION ('*') PLUS every MLA variant
-        # (DS_ATTENTION 'D', CSA 'C', HCA 'H', WINDOW 'W'). Previously only '*'
-        # was counted, so a DSv4 pattern (all C/H/W, zero '*') yielded
-        # num_attn_layers=0 and dropped ALL attention FLOPs from the estimate,
-        # roughly halving the reported throughput vs. the gpt_model.
-        num_attn_layers = layer_counts[Symbols.ATTENTION] + sum(
-            layer_counts[s] for s in Symbols.MLA_ATTENTION
-        )
+        num_mamba_layers = layer_counts[Symbols.MAMBA]
+        num_gdn_layers = layer_counts[Symbols.GDN]
+        num_kda_layers = layer_counts[Symbols.KDA]
+        num_mlp_layers = layer_counts[Symbols.MLP]
+        num_moe_layers = layer_counts[Symbols.MOE]
 
-        # DSv4 sparse-attention layer counts by compression ratio, derived from the
-        # pattern symbols: WINDOW -> r0, CSA -> r4, HCA -> r128 (mirrors the
-        # ``csa_compress_ratios`` 0/4/128 buckets used by ``transformer_flops``).
+        # DSv4 D/C/H/W layers are MLA variants, but their
+        # sparse attention FLOPs are handled by the DSv4 branch.
+        dsv4_mla_symbols = Symbols.MLA_ATTENTION - {Symbols.MLA}
+        dsv4_mla_layers = sum(layer_counts[symbol] for symbol in dsv4_mla_symbols)
+        num_mla_layers = layer_counts[Symbols.MLA]
+        if args.experimental_attention_variant == "dsv4_hybrid":
+            num_attn_layers = layer_counts[Symbols.ATTENTION] + dsv4_mla_layers
+        else:
+            num_attn_layers = layer_counts[Symbols.ATTENTION]
+            num_mla_layers += dsv4_mla_layers
+
         dsv4_n_layers_r0 = layer_counts[Symbols.WINDOW]
         dsv4_n_layers_r4 = layer_counts[Symbols.CSA]
         dsv4_n_layers_r128 = layer_counts[Symbols.HCA]
         if args.experimental_attention_variant == "dsv4_hybrid":
+            assert num_mla_layers == 0, "dsv4_hybrid does not support dense + MLA layers"
             assert num_attn_layers == (dsv4_n_layers_r0 + dsv4_n_layers_r4 + dsv4_n_layers_r128), (
                 "dsv4_hybrid expects all attention layers to be Window/CSA/HCA; "
                 f"got {num_attn_layers} attention layers but only "
@@ -1206,12 +1316,14 @@ def num_floating_point_operations(
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
             mtp_num_layers = 0
-        # Compute hybrid model FLOPs.
+
         return hybrid_flops(
             total_tokens=total_real_tokens_in_batch,
             seqlen_squared_sum=seqlen_squared_sum_in_batch,
             hidden_size=args.hidden_size,
             num_attn_layers=num_attn_layers,
+            num_mla_layers=num_mla_layers,
+            num_kda_layers=num_kda_layers,
             num_mamba_layers=num_mamba_layers,
             num_mlp_layers=num_mlp_layers,
             num_moe_layers=num_moe_layers,
@@ -1243,14 +1355,22 @@ def num_floating_point_operations(
             gdn_num_qk_heads=args.linear_num_key_heads or 16,
             gdn_num_v_heads=args.linear_num_value_heads or 32,
             gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
+            kda_qk_head_dim=args.linear_key_head_dim or 128,
+            kda_v_head_dim=args.linear_value_head_dim or 128,
+            kda_num_qk_heads=args.linear_num_key_heads or 16,
+            kda_num_v_heads=args.linear_num_value_heads or 16,
+            kda_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
-            multi_latent_attention=args.multi_latent_attention,
             q_lora_rank=args.q_lora_rank,
             kv_lora_rank=args.kv_lora_rank,
             qk_head_dim=args.qk_head_dim,
             qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
             v_head_dim=args.v_head_dim,
+            attention_output_gate=getattr(args, "attention_output_gate", False),
+            gated_attention_proj_granularity=getattr(
+                args, "gated_attention_proj_granularity", "elementwise"
+            ),
             experimental_attention_variant=args.experimental_attention_variant,
             dsv4_n_layers_r0=dsv4_n_layers_r0,
             dsv4_n_layers_r4=dsv4_n_layers_r4,
@@ -2744,28 +2864,54 @@ def train_step(
     timers = get_timers()
     num_microbatches = get_num_microbatches()
 
-    offload_optimizer_states = getattr(args, 'offload_optimizer_states', False)
-    if offload_optimizer_states:
-        # Reload optimizer states as late as possible so the H2D transfer can overlap
-        # with gradient finalization. Preserve custom finalize hooks installed by a
-        # model builder, and avoid wrapping the hook again on every training step.
+    optimizer_config = getattr(optimizer, 'config', None)
+    chunked_optimizer_state_offload = bool(
+        optimizer_config is not None
+        and getattr(optimizer_config, 'chunked_optimizer_state_offload', False)
+        and getattr(optimizer_config, 'optimizer_state_offload_fraction', 1.0) > 0.0
+    )
+    pre_forward_param_sync_before_master_offload = (
+        chunked_optimizer_state_offload
+        and optimizer.optimizer_state_offload_requires_pre_forward_param_sync()
+    )
+    delay_master_offload_for_param_buffer = (
+        chunked_optimizer_state_offload
+        and args.reuse_grad_buf_for_mxfp8_param_ag
+        and args.overlap_param_gather
+    )
+    if chunked_optimizer_state_offload:
+        # Prefetch masters and the first state chunk as late as possible so H2D overlaps
+        # gradient finalization. Preserve custom hooks and avoid wrapping more than once.
         finalize_model_grads_func = getattr(config, 'finalize_model_grads_func', None)
         if (
-            getattr(finalize_model_grads_func, '_optimizer_state_offload_wrapped_optimizer', None)
+            getattr(
+                finalize_model_grads_func,
+                '_chunked_optimizer_state_offload_wrapped_optimizer',
+                None,
+            )
             is not optimizer
         ):
-            base_finalize_model_grads_func = finalize_model_grads_func or finalize_model_grads
+            base_finalize_model_grads_func = getattr(
+                finalize_model_grads_func,
+                '_chunked_optimizer_state_offload_base_finalize_model_grads_func',
+                None,
+            )
+            if base_finalize_model_grads_func is None:
+                base_finalize_model_grads_func = finalize_model_grads_func or finalize_model_grads
 
             def finalize_model_grads_with_state_reload(*fmg_args, **fmg_kwargs):
-                for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
-                        optim_instance.reload_offloaded_states()
+                optimizer.prefetch_optimizer_state_for_gradient_finalization()
                 return base_finalize_model_grads_func(*fmg_args, **fmg_kwargs)
 
             setattr(
                 finalize_model_grads_with_state_reload,
-                '_optimizer_state_offload_wrapped_optimizer',
+                '_chunked_optimizer_state_offload_wrapped_optimizer',
                 optimizer,
+            )
+            setattr(
+                finalize_model_grads_with_state_reload,
+                '_chunked_optimizer_state_offload_base_finalize_model_grads_func',
+                base_finalize_model_grads_func,
             )
             config.finalize_model_grads_func = finalize_model_grads_with_state_reload
 
@@ -2791,11 +2937,12 @@ def train_step(
         args.save_dgrads_interval is not None and (iteration + 1) % args.save_dgrads_interval == 0
     )
     while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
-        # Start the D2H transfer before zeroing gradients to maximize overlap.
-        if offload_optimizer_states:
-            for optim_instance in optimizer.chained_optimizers:
-                if isinstance(optim_instance, DistributedOptimizer):
-                    optim_instance.offload_states()
+        # Start D2H before zeroing gradients. In the MXFP8 staging path, updated masters
+        # remain readable until their delayed D2H after the main-param copy below.
+        if chunked_optimizer_state_offload and not pre_forward_param_sync_before_master_offload:
+            optimizer.offload_optimizer_state_for_forward(
+                offload_master=not delay_master_offload_for_param_buffer
+            )
 
         # Set grad to zero.
         for model_chunk in model:
@@ -2803,6 +2950,16 @@ def train_step(
             # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
+
+        if pre_forward_param_sync_before_master_offload:
+            # Compact LayerWise FP8 gather consumes fp32 masters. Finish the normally
+            # overlapped gather after grad-buffer reset. If a sibling DistOpt still needs
+            # MXFP8 staging, keep masters until that copy below completes.
+            optimizer.ensure_master_weights_for_pre_forward_param_sync()
+            optimizer.start_param_sync_for_bucket_group_subset(force_sync=True)
+            optimizer.offload_optimizer_state_for_forward(
+                offload_master=not delay_master_offload_for_param_buffer
+            )
 
         if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
             # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
@@ -2836,14 +2993,15 @@ def train_step(
             if forward_pre_hook_enabled or full_cg_captured:
                 for optim_instance in optimizer.chained_optimizers:
                     if isinstance(optim_instance, DistributedOptimizer):
+                        # Only this DistOpt sibling consumes masters in the MXFP8 param-buffer
+                        # staging pass. The staging entry restores its own offloaded masters;
+                        # do not perturb the LayerWise/Muon master lifecycle here.
                         optim_instance._copy_main_params_to_param_buffer()
 
-        # Master weights must remain resident until any main-param copy above is
-        # complete. Releasing here keeps optimizer memory out of forward/backward.
-        if offload_optimizer_states:
-            for optim_instance in optimizer.chained_optimizers:
-                if isinstance(optim_instance, DistributedOptimizer):
-                    optim_instance.release_offloaded_gpu_states()
+        # In the delayed MXFP8 path, optimizer state was offloaded above while masters
+        # remained resident for main-param staging. Start master D2H after that copy.
+        if delay_master_offload_for_param_buffer:
+            optimizer.offload_optimizer_state_for_forward()
 
         # Forward pass.
         if save_activations_in_this_iteration:
@@ -2871,6 +3029,14 @@ def train_step(
             seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
             seqlen_squared_sum_this_global_batch = args.seq_length**2 * args.global_batch_size
             forward_backward_data_iterator = data_iterator
+
+        if getattr(config, "mtp_num_layers", None):
+            # Writer objects only exist on the last rank, so use globally consistent
+            # configuration flags to keep the acceptance collective branch rank-aligned.
+            has_acceptance_consumer = bool(
+                getattr(args, "tensorboard_dir", None) or getattr(args, "wandb_project", "")
+            )
+            MTPLossLoggingHelper.configure_acceptance_collection(enabled=has_acceptance_consumer)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=forward_backward_data_iterator,
@@ -3075,8 +3241,12 @@ def training_log(
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
 
-    # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
-    should_reset = not is_first_iteration
+    # On the first iteration we normally keep the accumulator so the next
+    # regular interval still covers a full window.  With log_interval=1 the
+    # first iteration already is a complete window; retaining it would make
+    # iteration 2 report the average of iterations 1 and 2 instead of the
+    # current loss, which invalidates step-by-step alignment comparisons.
+    should_reset = not is_first_iteration or args.log_interval == 1
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'

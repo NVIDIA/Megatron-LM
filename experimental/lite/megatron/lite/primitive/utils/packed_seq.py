@@ -26,6 +26,8 @@ class PackedSeqParams:
     total_tokens: int | None = None
     seq_idx: Tensor | None = None
     cp_rank: int | None = None
+    magi_runtime_key: Any | None = None
+    """Per-microbatch MagiAttention dispatch/runtime metadata."""
 
     def __post_init__(self) -> None:
         cu_seqlens = (

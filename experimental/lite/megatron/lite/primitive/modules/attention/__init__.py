@@ -5,10 +5,16 @@ from megatron.lite.primitive.modules.attention.dsa import (
     build_rope_cache,
     build_rotary_embeddings,
 )
+from megatron.lite.primitive.modules.attention.magi import (
+    MagiAttentionConfig,
+    MagiDotProductAttention,
+)
 from megatron.lite.primitive.modules.attention.mla import MultiLatentAttention
 
 __all__ = [
     "DynamicSparseAttention",
+    "MagiAttentionConfig",
+    "MagiDotProductAttention",
     "MultiLatentAttention",
     "RMSNorm",
     "build_rope_cache",
