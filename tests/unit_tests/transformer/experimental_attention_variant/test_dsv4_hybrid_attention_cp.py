@@ -564,10 +564,24 @@ class TestDSv4HybridAttentionTHDCP:
         cls.ref_pg.cp = _ReferenceCPGroup()
         cls._cp1_memory_delta_cache = {}
         cls._cp1_graph_time_cache = {}
+        cp_group = cls.pg.cp
 
         yield
         _clear_cuda_test_state()
         Utils.destroy_model_parallel()
+        # The balanced CUDA graph captures NCCL all-to-all on this subgroup. MCore's
+        # model-parallel teardown only drops its Python references to NCCL groups, so
+        # explicitly destroy the test-owned CP communicator to release graph-registered
+        # buffers before later near-capacity attention tests run in this pytest worker.
+        if cp_group is dist.group.WORLD:
+            raise RuntimeError("DSv4 CP tests unexpectedly reused the default process group")
+        if dist.distributed_c10d._world.pg_map.get(cp_group) is not None:
+            dist.destroy_process_group(cp_group)
+        cls.pg = None
+        cls.ref_pg = None
+        cls._cp1_memory_delta_cache.clear()
+        cls._cp1_graph_time_cache.clear()
+        _clear_cuda_test_state()
 
     @pytest.fixture(autouse=True)
     def clear_cuda_test_case(self):
