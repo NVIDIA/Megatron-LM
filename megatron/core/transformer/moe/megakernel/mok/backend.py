@@ -18,10 +18,11 @@ from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
 from megatron.core.transformer.moe.megakernel.mok.weights import (
-    _mok_mxfp8_backward_weight_views,
-    _native_single_grouped_weight_views,
-    _native_split_weight_view,
-    _refresh_native_split_weight_scales,
+    _ExpertWeightStorageLayout,
+    _NativeExpertWeightSource,
+    _extract_native_expert_weight_source,
+    _prepare_mok_weight,
+    _refresh_prepared_mok_weight,
 )
 from megatron.core.transformer.moe.megakernel.parameter_bridge import (
     finish_weight_gradient as _finish_weight_gradient,
@@ -216,81 +217,76 @@ class MoKMegakernel(MegakernelBackend):
         self.register_parameter("shared_fc1_weight", fc1_ref)
         self.register_parameter("shared_fc2_weight", fc2_ref)
 
+    def _native_routed_weight_sources(
+        self, storage_layout: _ExpertWeightStorageLayout
+    ) -> tuple[_NativeExpertWeightSource, _NativeExpertWeightSource]:
+        """Extract native FC1/FC2 sources only when preparation or refresh is needed."""
+        return (
+            _extract_native_expert_weight_source(
+                self.routed_fc1_parameters,
+                storage_layout=storage_layout,
+                num_experts=self.num_local_experts,
+                rows=2 * self.intermediate_size,
+                columns=self.hidden_size,
+                use_mxfp8=self.use_mxfp8_weights,
+                name="routed FC1",
+            ),
+            _extract_native_expert_weight_source(
+                self.routed_fc2_parameters,
+                storage_layout=storage_layout,
+                num_experts=self.num_local_experts,
+                rows=self.hidden_size,
+                columns=self.intermediate_size,
+                use_mxfp8=self.use_mxfp8_weights,
+                name="routed FC2",
+            ),
+        )
+
     @torch.no_grad()
     def quantized_routed_weights(self):
         """Prepare routed weights without copying their FP8/BF16 payloads."""
-        if not self.native_single_grouped_weights:
-            # Non-single BF16/MXFP8: build per-expert data/scale descriptor tables.
-            if self._prepared_routed_weight_cache is None:
-                prepared_fc1 = _native_split_weight_view(
-                    self.routed_fc1_parameters,
-                    rows=2 * self.intermediate_size,
-                    columns=self.hidden_size,
-                    use_mxfp8=self.use_mxfp8_weights,
+        storage_layout = (
+            _ExpertWeightStorageLayout.SINGLE_GROUPED
+            if self.native_single_grouped_weights
+            else _ExpertWeightStorageLayout.PER_EXPERT
+        )
+        if (
+            storage_layout is _ExpertWeightStorageLayout.SINGLE_GROUPED
+            and not self.use_mxfp8_weights
+        ):
+            # Single-weight BF16 is already MOK-readable and needs no cache.
+            fc1_source, fc2_source = self._native_routed_weight_sources(storage_layout)
+            prepared = (
+                _prepare_mok_weight(fc1_source),
+                _prepare_mok_weight(fc2_source),
+            )
+        else:
+            rebuild_single_grouped = (
+                storage_layout is _ExpertWeightStorageLayout.SINGLE_GROUPED
+                and self.use_mxfp8_weights
+                and self.is_first_microbatch
+            )
+            if self._prepared_routed_weight_cache is None or rebuild_single_grouped:
+                fc1_source, fc2_source = self._native_routed_weight_sources(
+                    storage_layout
                 )
-                prepared_fc2 = _native_split_weight_view(
-                    self.routed_fc2_parameters,
-                    rows=self.hidden_size,
-                    columns=self.intermediate_size,
-                    use_mxfp8=self.use_mxfp8_weights,
+                self._prepared_routed_weight_cache = (
+                    _prepare_mok_weight(fc1_source),
+                    _prepare_mok_weight(fc2_source),
                 )
-                self._prepared_routed_weight_cache = (prepared_fc1, prepared_fc2)
             elif self.use_mxfp8_weights and self.is_first_microbatch:
-                # Non-single MXFP8: TE updates scales each optimizer iteration;
-                # refresh scale layouts while keeping data/descriptor addresses stable.
+                # PER_EXPERT descriptors keep stable addresses; only their TE
+                # scale contents change after the optimizer updates the weights.
+                fc1_source, fc2_source = self._native_routed_weight_sources(
+                    storage_layout
+                )
                 prepared_fc1, prepared_fc2 = self._prepared_routed_weight_cache
-                _refresh_native_split_weight_scales(
-                    prepared_fc1,
-                    self.routed_fc1_parameters,
-                    rows=2 * self.intermediate_size,
-                    columns=self.hidden_size,
-                )
-                _refresh_native_split_weight_scales(
-                    prepared_fc2,
-                    self.routed_fc2_parameters,
-                    rows=self.hidden_size,
-                    columns=self.intermediate_size,
-                )
-            # There is deliberately no BF16 refresh branch: optimizer steps update
-            # payloads in place, and cached TMA descriptors keep pointing at that storage.
-            self.is_first_microbatch = False
-            return self._prepared_routed_weight_cache
-
-        if not self.use_mxfp8_weights:
-            # Single-weight BF16: native grouped FC1/FC2 storage is already MOK-readable.
-            self.is_first_microbatch = False
-            return _native_single_grouped_weight_views(
-                self.routed_fc1_weight,
-                self.routed_fc2_weight,
-                num_experts=self.num_local_experts,
-                intermediate_size=self.intermediate_size,
-                hidden_size=self.hidden_size,
-                use_mxfp8=False,
-            )
-
-        if self._prepared_routed_weight_cache is None or self.is_first_microbatch:
-            # Single-weight MXFP8: reuse TE's gathered FP8 payload and prepare the
-            # rowwise/columnwise scale layouts required by MOK forward/backward.
-            native_fc1, native_fc2 = _native_single_grouped_weight_views(
-                self.routed_fc1_weight,
-                self.routed_fc2_weight,
-                num_experts=self.num_local_experts,
-                intermediate_size=self.intermediate_size,
-                hidden_size=self.hidden_size,
-                use_mxfp8=True,
-            )
-            prepared_fc1 = _mok_mxfp8_backward_weight_views(
-                native_fc1, rows=2 * self.intermediate_size, columns=self.hidden_size
-            )
-            prepared_fc2 = _mok_mxfp8_backward_weight_views(
-                native_fc2, rows=self.hidden_size, columns=self.intermediate_size
-            )
-            # Only the compact scale layouts allocate storage. FP8 row/column
-            # payloads remain zero-copy views of the current TE gather buffer.
-            self._prepared_routed_weight_cache = (prepared_fc1, prepared_fc2)
+                _refresh_prepared_mok_weight(prepared_fc1, fc1_source)
+                _refresh_prepared_mok_weight(prepared_fc2, fc2_source)
+            prepared = self._prepared_routed_weight_cache
 
         self.is_first_microbatch = False
-        return self._prepared_routed_weight_cache
+        return prepared
 
     # Checkpoint contract: native MCore expert modules own the canonical parameters,
     # optimizer state, and checkpoint shards. This supports regular/distributed
