@@ -25,7 +25,10 @@ Returning a truthy value signals the event loop to stop.
 
 import logging
 
-from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.config import (
+    MediaCacheCoordinatorPolicy,
+    PrefixCachingCoordinatorPolicy,
+)
 from megatron.core.inference.headers import Headers
 
 from .state import CONTROL_TRANSITIONS, CoordinatorState
@@ -97,7 +100,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         logging.info(f"Received message from unknown client {sender_identity}. Ignoring.")
         return
 
-    _, client_request_id, sampling_params = metadata
+    _, client_request_id, sampling_params, multi_modal_data = metadata
     prompt_frame = bodies[0]
 
     # map client request_id to server request_id
@@ -110,7 +113,14 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
 
     # Rebuilding the metadata frame is cheap: it holds no prompt tokens.
     engine_metadata = msgpack.packb(
-        [Headers.SUBMIT_REQUEST.value, request_id, sampling_params], use_bin_type=True
+        [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, multi_modal_data],
+        use_bin_type=True,
+    )
+
+    # Media identity is read straight from the metadata frame; it salts the
+    # routing hashes and is passed to rank selection for media affinity.
+    media_cache_key = (
+        multi_modal_data.get("media_cache_key") if isinstance(multi_modal_data, dict) else None
     )
 
     # Only prefix-affinity routing consults the block hashes. When nothing will
@@ -123,7 +133,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         != PrefixCachingCoordinatorPolicy.LOAD_BALANCED
     ):
         request_hashes = coordinator.compute_request_hashes(
-            msgpack.unpackb(prompt_frame, raw=False)
+            msgpack.unpackb(prompt_frame, raw=False), cache_salt=media_cache_key
         )
     else:
         request_hashes = []
@@ -136,7 +146,9 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
 
     # Account for the fact that some engines may have died.
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
-        next_identity = coordinator.get_best_data_parallel_rank(request_hashes)
+        next_identity = coordinator.get_best_data_parallel_rank(
+            request_hashes, media_cache_key=media_cache_key
+        )
         if coordinator._send_to_engine(next_identity, [engine_metadata, prompt_frame]):
             break
     else:
@@ -149,6 +161,12 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
 
     coordinator.request_id_to_rank[request_id] = next_identity
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
+    if (
+        isinstance(media_cache_key, str)
+        and coordinator.vision_embedding_cache_enabled
+        and coordinator.media_cache_coordinator_policy == MediaCacheCoordinatorPolicy.AFFINITY
+    ):
+        coordinator._update_media_affinity(media_cache_key, next_identity)
     if request_hashes:
         coordinator._update_rank_hashes(next_identity, request_hashes)
     if coordinator.schedule_records is not None:
