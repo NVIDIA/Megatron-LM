@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Pin fp32-on-export whitelist for DeepSeek-V4 HF checkpoints."""
 
 from __future__ import annotations
