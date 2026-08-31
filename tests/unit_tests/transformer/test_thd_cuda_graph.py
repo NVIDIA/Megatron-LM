@@ -1591,7 +1591,7 @@ class TestGraphDynamicRouteMetadataArena:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_real_te_shared_route_arenas_replay_30_dynamic_packs(self, monkeypatch):
         """Real TE graphs share one two-copy route arena per stack slot for 30 replays."""
-        from transformer_engine.pytorch.graph import make_graphed_callables
+        import transformer_engine.pytorch.graph as te_graph
 
         from megatron.core import parallel_state
         from megatron.core.transformer.cuda_graphs import (
@@ -1764,18 +1764,25 @@ class TestGraphDynamicRouteMetadataArena:
         graphed = ()
         _set_capture_start()
         try:
-            graphed = make_graphed_callables(
-                tuple(graph_layers),
-                sample_args,
-                sample_kwargs=sample_kwargs,
-                allow_unused_input=True,
-                num_warmup_iters=1,
-                _order=[1, -1, 1, -1],
-                _num_layers_per_chunk=[2],
-                retain_graph_in_backward=False,
-                _reuse_graph_input_output_buffers=True,
-                fp8_enabled=False,
-            )
+            # This toy contains no RNG operation. Other tests in the same worker may leave
+            # TE's process-global auxiliary RNG registry populated with legacy Tensor states,
+            # while TE's graph-safe capture path assumes every auxiliary entry is a Generator
+            # and calls get_state() on it. Isolate this RNG-free capture from those unrelated
+            # tracker entries while preserving TE's normal default CUDA generator handling.
+            with monkeypatch.context() as capture_patch:
+                capture_patch.setattr(te_graph, "get_all_rng_states", lambda: {})
+                graphed = te_graph.make_graphed_callables(
+                    tuple(graph_layers),
+                    sample_args,
+                    sample_kwargs=sample_kwargs,
+                    allow_unused_input=True,
+                    num_warmup_iters=1,
+                    _order=[1, -1, 1, -1],
+                    _num_layers_per_chunk=[2],
+                    retain_graph_in_backward=False,
+                    _reuse_graph_input_output_buffers=True,
+                    fp8_enabled=False,
+                )
         finally:
             _set_capture_end()
 
