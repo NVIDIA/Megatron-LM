@@ -1907,8 +1907,10 @@ class CudaGraphManager(torch.nn.Module):
                 Setting this argument to True always forces the inline capture path to be taken.
             num_warmup_steps: If set, overrides the per-runner warmup step count.
         """
+        self.config = config
         self._inline_capture = inline_capture
         self._num_warmup_steps = num_warmup_steps
+        self._replayed_training_graph_in_eval = False
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
@@ -1968,6 +1970,29 @@ class CudaGraphManager(torch.nn.Module):
         # idempotent, and graph creation removes the hook before capture begins.
         if need_backward:
             _CudagraphGlobalRecord._enable_saved_tensors_observer()
+
+    def train(self, mode: bool = True):
+        """Set training mode and discard temporary state replayed during evaluation."""
+        was_training = self.training
+        super().train(mode)
+
+        if mode and not was_training and self._replayed_training_graph_in_eval:
+            # A training-captured graph preserves capture-time buffer updates even when replayed
+            # under no_grad. Reset each distinct graph owner before its next training forward so
+            # validation state cannot reach the next finalize_model_grads call.
+            from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
+
+            graph_owners = []
+            seen_owner_ids = set()
+            for runner in self.cudagraph_runners:
+                owner = runner.base_module
+                if isinstance(owner, torch.nn.Module) and id(owner) not in seen_owner_ids:
+                    graph_owners.append(owner)
+                    seen_owner_ids.add(id(owner))
+            reset_model_temporary_tensors(self.config, graph_owners)
+            self._replayed_training_graph_in_eval = False
+
+        return self
 
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
@@ -2087,6 +2112,12 @@ class CudaGraphManager(torch.nn.Module):
                 megatron_module, args, kwargs, self.reuse_cudagraphs, cache_key=cache_key
             )
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
+            if (
+                not is_inference_mode
+                and not self._inline_capture
+                and not getattr(megatron_module, "training", self.training)
+            ):
+                self._replayed_training_graph_in_eval = True
         else:
             if is_inference_mode or self._inline_capture:
                 # Inference generation mode creates graphs immediately
