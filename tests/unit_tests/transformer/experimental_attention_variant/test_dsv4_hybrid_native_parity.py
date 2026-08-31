@@ -883,6 +883,8 @@ def _skip_if_real_kernels_unavailable(*, sm_min: int = 9, need_flash_mla: bool =
     if not hasattr(cudnn, 'DSA'):
         pytest.skip("cudnn.DSA namespace not available")
     if need_flash_mla:
+        if sm_major < 10:
+            pytest.skip("pinned FlashMLA sparse kernels require SM100+")
         pytest.importorskip("flash_mla")
 
 
