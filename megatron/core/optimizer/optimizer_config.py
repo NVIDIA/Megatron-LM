@@ -263,6 +263,12 @@ class OptimizerConfig:
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
+    muon_split_qkv_per_head: bool = False
+    """Whether to orthogonalize each Q, gate, K, and V head independently. Requires
+    ``muon_split_qkv``. Uniform head sizes use the batched Newton-Schulz implementation
+    from the Emerging-Optimizers revision pinned in ``pyproject.toml``. By default, Muon
+    orthogonalizes the Q, gate, K, and V projection matrices separately."""
+
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
@@ -280,7 +286,9 @@ class OptimizerConfig:
     """The number of iteration steps to use in the Newton-Schulz iteration."""
 
     muon_tp_mode: str = "blockwise"
-    """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
+    """How to perform NS calculation for tensor parallel weights. For QKV weights, ``distributed``
+    applies only to projection splits with complete local query groups; other QKV layouts fall back
+    to non-TP NS with a warning. Defaults to "blockwise"."""
 
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""

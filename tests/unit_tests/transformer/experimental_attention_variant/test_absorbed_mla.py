@@ -13,6 +13,11 @@ from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.optimizer import (
+    HAVE_EMERGING_OPTIMIZERS,
+    OptimizerConfig,
+    get_megatron_optimizer,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -309,6 +314,75 @@ def get_mla_submodules(
 # TODO: Add test case to cover TP > 1 but SP = False.
 
 
+@pytest.mark.parametrize("split_per_head", [False, True])
+@pytest.mark.skipif(
+    not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package is not installed"
+)
+def test_split_kv_up_projections_are_tagged_for_muon(split_per_head):
+    """The dev-only split K/V layout is consumed by Muon's QKV split path."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    try:
+        config = get_mock_mla_config(
+            tensor_model_parallel_size=1,
+            context_parallel_size=1,
+            sequence_parallel=False,
+            recompute_mla_up_proj=False,
+        )
+        config.hidden_size = 16
+        config.num_attention_heads = 4
+        config.num_query_groups = 4
+        config.q_lora_rank = 8
+        config.kv_lora_rank = 4
+        config.qk_head_dim = 4
+        config.qk_pos_emb_head_dim = 2
+        config.v_head_dim = 3
+        attention = AbsorbedMLASelfAttention(
+            config=config,
+            submodules=get_absorbed_mla_submodules(
+                down_proj_use_column_parallel=False,
+                qk_layernorm=True,
+                rms_norm=True,
+                combined_kv_up_projection=False,
+            ),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=None,
+        ).cuda()
+        optimizer_config = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            bf16=True,
+            use_distributed_optimizer=False,
+            muon_split_qkv=True,
+            muon_split_qkv_per_head=split_per_head,
+        )
+
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=[attention], use_gloo_process_groups=False
+        )
+
+        k_weight = attention.linear_k_up_proj.weight
+        v_weight = attention.linear_v_up_proj.weight
+        assert optimizer is not None
+        assert k_weight.is_qkv
+        assert v_weight.is_qkv
+        assert k_weight.qkv_split_shapes_global == [config.qk_head_dim] * 4
+        assert v_weight.qkv_split_shapes_global == [config.v_head_dim] * 4
+        if split_per_head:
+            assert k_weight.qkv_split_shapes == [config.qk_head_dim] * 4
+            assert v_weight.qkv_split_shapes == [config.v_head_dim] * 4
+            assert k_weight.qkv_split_heads_are_complete
+            assert v_weight.qkv_split_heads_are_complete
+        else:
+            assert k_weight.qkv_split_shapes == [config.qk_head_dim]
+            assert v_weight.qkv_split_shapes == [config.v_head_dim]
+            assert k_weight.qkv_split_groups_are_complete
+            assert v_weight.qkv_split_groups_are_complete
+        assert not getattr(attention.linear_kv_down_proj.weight, 'is_qkv', False)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def _run_functionality(
     tp_cp_sp: List,
     qkv_format: str,
@@ -362,6 +436,19 @@ def _run_functionality(
         cp_comm_type="all_gather" if cp_size > 1 else None,
         pg_collection=None,
     ).cuda()
+    assert absorbed_mla.linear_q_up_proj.weight.qkv_layout.num_groups == config.num_attention_heads
+    if combined_kv_up_projection:
+        assert absorbed_mla.linear_kv_up_proj.weight.qkv_layout.projection_split_shapes == (
+            config.qk_head_dim,
+            config.v_head_dim,
+        )
+    else:
+        assert absorbed_mla.linear_k_up_proj.weight.qkv_layout.projection_split_shapes == (
+            config.qk_head_dim,
+        )
+        assert absorbed_mla.linear_v_up_proj.weight.qkv_layout.projection_split_shapes == (
+            config.v_head_dim,
+        )
 
     assert absorbed_mla.q_layernorm.eps == pytest.approx(config.attention_latent_norm_epsilon)
     assert absorbed_mla.kv_layernorm.eps == pytest.approx(config.attention_latent_norm_epsilon)
