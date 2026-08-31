@@ -4,8 +4,8 @@
 
 """GTP symmetric memory: NCCL window registration for GTP communication buffers.
 
-This module keeps one ``torch.cuda.MemPool`` per GTP process group, backed by the GTP
-VMM allocator (see gtp_vmm_allocator). Once
+This module keeps one ``torch.cuda.MemPool`` per GTP process group, backed by the
+VMM allocator (see megatron.core.vmm_symm_allocator). Once
 ``register_gtp_symm_pool(group)`` registers a pool on its group, PyTorch's
 ProcessGroupNCCL hook window-registers every allocation made inside
 ``gtp_symm_pool_ctx(group)``, which lets NCCL run its symmetric / NVLS kernels on
@@ -29,7 +29,8 @@ from contextlib import AbstractContextManager
 import torch
 import torch.distributed as dist
 
-import megatron.core.tensor_parallel.gtp_vmm_allocator as gtp_vmm_allocator
+import megatron.core.nccl_allocator as nccl_allocator
+import megatron.core.vmm_symm_allocator as vmm_symm_allocator
 from megatron.core.utils import is_torch_min_version, log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -51,12 +52,26 @@ _registered: typing.Dict[str, typing.Any] = {}
 
 
 def _get_gtp_symm_pool(group: dist.ProcessGroup) -> torch.cuda.MemPool:
-    """Return the per-group VMM-backed symmetric MemPool, creating it once."""
+    """Return the per-group symmetric MemPool, creating it once. Pools come from the
+    VMM allocator, falling back to ``ncclMemAlloc`` (same pool API) if its extension
+    cannot build."""
     name = group.group_name
     pool = _pools.get(name)
     if pool is None:
-        gtp_vmm_allocator.init()
-        pool = gtp_vmm_allocator.create_vmm_mem_pool()
+        try:
+            vmm_symm_allocator.init()
+            pool = vmm_symm_allocator.create_vmm_mem_pool()
+        except RuntimeError as e:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                f"[MCORE][GTP] {e}\n"
+                "[MCORE][GTP] FALLING BACK to ncclMemAlloc-backed symmetric pools. "
+                "ncclMemAlloc maps every allocation on all P2P-visible peer GPUs, "
+                "which slows CPU-side kernel launching at scale.",
+            )
+            nccl_allocator.init()
+            pool = nccl_allocator.create_nccl_mem_pool(symmetric=True)
         _pools[name] = pool
     return pool
 
@@ -84,7 +99,7 @@ def register_gtp_symm_pool(group: dist.ProcessGroup | None) -> torch.cuda.MemPoo
     # so the registration below sees an initialized communicator.
     warmup = torch.zeros(1, device=torch.cuda.current_device())
     dist.all_reduce(warmup, group=group)
-    gtp_vmm_allocator.register_mem_pool(pool, group)
+    vmm_symm_allocator.register_mem_pool(pool, group)
     _registered[group.group_name] = group
     log_single_rank(
         logger,
@@ -223,7 +238,7 @@ def deregister_and_clear_gtp_symm_pools() -> None:
     # Deregister while the recycled send buffers are still alive. Their memory keeps
     # the pool non-empty, so deregister_mem_pool (which skips empty pools) always runs.
     for name in sorted(_registered):
-        gtp_vmm_allocator.deregister_mem_pool(_pools[name], _registered[name])
+        vmm_symm_allocator.deregister_mem_pool(_pools[name], _registered[name])
     # Only now drop the buffers and the pools; the windows are gone, so the memory
     # is safe to release.
     symmetric_wgrad_pool.clear()
