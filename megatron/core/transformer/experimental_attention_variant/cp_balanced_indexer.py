@@ -112,20 +112,27 @@ _SEEN_CU: dict = {}
 # PackedSeqParams dataclass while still giving every layer a fixed-shape input.
 _GRAPH_DYNAMIC_PLAN_ATTR = "_dsa_cp_balance_graph_plan"
 _GRAPH_DYNAMIC_PLAN_KWARGS = {
-    "validated_cu": "dsa_cp_graph_validated_cu",
-    "pos_head": "dsa_cp_graph_pos_head",
-    "pos_tail": "dsa_cp_graph_pos_tail",
-    "score_cu_q": "dsa_cp_graph_score_cu_q",
-    "score_cu_kv": "dsa_cp_graph_score_cu_kv",
-    "head_offsets": "dsa_cp_graph_head_offsets",
-    "tail_offsets": "dsa_cp_graph_tail_offsets",
-    "output_cu_q": "dsa_cp_graph_output_cu_q",
-    "output_cu_kv": "dsa_cp_graph_output_cu_kv",
-    "output_offsets": "dsa_cp_graph_output_offsets",
-    "src_slot": "dsa_cp_graph_src_slot",
-    "relay_perm": "dsa_cp_graph_relay_perm",
-    "dst_slot": "dsa_cp_graph_dst_slot",
+    "layout_i32": "dsa_cp_graph_layout_buffer",
+    "route_i64": "dsa_cp_graph_route_buffer",
 }
+
+# One int32 owner carries all scorer/layout metadata. ``output_cu_kv`` is the
+# same logical vector as ``score_cu_kv`` and deliberately aliases that slice
+# instead of occupying a second region. One int64 owner carries the two-hop
+# route. Keeping these schemas explicit makes the two TE graph inputs a stable
+# ABI and lets replay refresh them with exactly two copies.
+_GRAPH_DYNAMIC_LAYOUT_FIELDS = (
+    "validated_cu",
+    "pos_head",
+    "pos_tail",
+    "score_cu_q",
+    "score_cu_kv",
+    "head_offsets",
+    "tail_offsets",
+    "output_cu_q",
+    "output_offsets",
+)
+_GRAPH_DYNAMIC_ROUTE_FIELDS = ("src_slot", "relay_perm", "dst_slot")
 
 
 def _is_capturing() -> bool:
@@ -808,6 +815,221 @@ def _validate_graph_dynamic_capacity(capacity, cp_size):
     return l_local
 
 
+def _graph_dynamic_route_rows(cp_size, l_local):
+    """Return the fixed row count of one equal-split route hop."""
+    return cp_size * min(l_local, l_local // cp_size + cp_size - 1)
+
+
+def _tensor_byte_range(tensor):
+    """Return the occupied byte range of a contiguous tensor."""
+    start = tensor.data_ptr()
+    return start, start + tensor.numel() * tensor.element_size()
+
+
+def _validate_graph_dynamic_cp_rank(cp_rank, cp_size):
+    """Validate an optional host-side CP-local rank tag."""
+    if cp_rank is not None and (
+        not isinstance(cp_rank, int) or isinstance(cp_rank, bool) or not 0 <= cp_rank < cp_size
+    ):
+        raise ValueError(
+            f"graph-dynamic balanced CP rank must be in [0, {cp_size}), got {cp_rank!r}"
+        )
+
+
+def _validate_graph_dynamic_buffers(layout_i32, route_i64, cp_size, l_local, *, route_padding=0):
+    """Validate the two-buffer ABI without reading tensor values."""
+    if not isinstance(cp_size, int) or not isinstance(l_local, int):
+        raise TypeError("graph-dynamic balanced CP buffer dimensions must be Python integers")
+    if not isinstance(route_padding, int) or route_padding < 0:
+        raise ValueError(
+            "graph-dynamic balanced CP route padding must be a non-negative Python integer"
+        )
+    _validate_graph_dynamic_capacity(cp_size * l_local, cp_size)
+    if not isinstance(layout_i32, torch.Tensor) or not isinstance(route_i64, torch.Tensor):
+        raise TypeError("graph-dynamic balanced CP route buffers must be torch tensors")
+    if layout_i32.dtype != torch.int32:
+        raise TypeError(
+            "graph-dynamic balanced CP layout buffer must have dtype torch.int32 "
+            f"(got {layout_i32.dtype})"
+        )
+    if route_i64.dtype != torch.int64:
+        raise TypeError(
+            "graph-dynamic balanced CP route buffer must have dtype torch.int64 "
+            f"(got {route_i64.dtype})"
+        )
+    if layout_i32.ndim != 1 or route_i64.ndim != 1:
+        raise ValueError(
+            "graph-dynamic balanced CP route buffers must be one-dimensional "
+            f"(layout={tuple(layout_i32.shape)}, route={tuple(route_i64.shape)})"
+        )
+    if not layout_i32.is_contiguous() or not route_i64.is_contiguous():
+        raise ValueError("graph-dynamic balanced CP route buffers must be contiguous")
+    if layout_i32.device != route_i64.device:
+        raise ValueError(
+            "graph-dynamic balanced CP route buffers must be on the same device "
+            f"(layout={layout_i32.device}, route={route_i64.device})"
+        )
+    layout_start, layout_end = _tensor_byte_range(layout_i32)
+    route_start, route_end = _tensor_byte_range(route_i64)
+    if max(layout_start, route_start) < min(layout_end, route_end):
+        raise ValueError(
+            "graph-dynamic balanced CP layout and route buffers must not overlap in storage"
+        )
+
+    cu_payload = layout_i32.numel() - l_local - 3
+    if cu_payload < 14 or cu_payload % 7 != 0:
+        raise ValueError(
+            "invalid graph-dynamic balanced CP layout buffer length: expected "
+            f"L + 7*K + 3 with K >= 2 (L={l_local}, got {layout_i32.numel()})"
+        )
+    cu_entries = cu_payload // 7
+    route_rows = _graph_dynamic_route_rows(cp_size, l_local)
+    expected_route_numel = 2 * l_local + route_rows + route_padding
+    if route_i64.numel() != expected_route_numel:
+        raise ValueError(
+            "invalid graph-dynamic balanced CP route buffer length: expected "
+            f"2*L + R + padding = {expected_route_numel}, got {route_i64.numel()} "
+            f"(L={l_local}, R={route_rows}, padding={route_padding})"
+        )
+    return cu_entries, route_rows
+
+
+def _graph_dynamic_plan_from_buffers(
+    layout_i32, route_i64, cp_size, l_local, *, route_padding=0, cp_rank=None
+):
+    """Validate the two-buffer ABI and reconstruct its logical tensor views.
+
+    The layout buffer length is ``L + 7*K + 3``, where ``K`` is the number of
+    padded-cu entries. The route buffer length is ``2*L + R``. Validation is
+    host-only, so this is safe to use for CUDA graph input reconstruction.
+    """
+    cu_entries, route_rows = _validate_graph_dynamic_buffers(
+        layout_i32, route_i64, cp_size, l_local, route_padding=route_padding
+    )
+    _validate_graph_dynamic_cp_rank(cp_rank, cp_size)
+
+    layout_offset = 0
+
+    def _layout_view(count):
+        nonlocal layout_offset
+        result = layout_i32.narrow(0, layout_offset, count)
+        layout_offset += count
+        return result
+
+    half = l_local // 2
+    validated_cu = _layout_view(cu_entries)
+    pos_head = _layout_view(half)
+    pos_tail = _layout_view(half)
+    score_cu_q = _layout_view(cu_entries + 1)
+    score_cu_kv = _layout_view(cu_entries + 1)
+    head_offsets = _layout_view(cu_entries)
+    tail_offsets = _layout_view(cu_entries)
+    output_cu_q = _layout_view(cu_entries + 1)
+    output_offsets = _layout_view(cu_entries)
+    if layout_offset != layout_i32.numel():
+        raise RuntimeError("internal graph-dynamic balanced CP layout schema mismatch")
+
+    route_offset = 0
+
+    def _route_view(count):
+        nonlocal route_offset
+        result = route_i64.narrow(0, route_offset, count)
+        route_offset += count
+        return result
+
+    src_slot = _route_view(l_local)
+    relay_perm = _route_view(route_rows)
+    dst_slot = _route_view(l_local)
+    if route_offset + route_padding != route_i64.numel():
+        raise RuntimeError("internal graph-dynamic balanced CP route schema mismatch")
+
+    return {
+        "layout_i32": layout_i32,
+        "route_i64": route_i64,
+        "validated_cu": validated_cu,
+        "pos_head": pos_head,
+        "pos_tail": pos_tail,
+        "score_cu_q": score_cu_q,
+        "score_cu_kv": score_cu_kv,
+        "head_offsets": head_offsets,
+        "tail_offsets": tail_offsets,
+        "output_cu_q": output_cu_q,
+        # One physical slice serves both identical logical layouts.
+        "output_cu_kv": score_cu_kv,
+        "output_offsets": output_offsets,
+        "head_layout": (score_cu_q, score_cu_kv, head_offsets),
+        "tail_layout": (score_cu_q, score_cu_kv, tail_offsets),
+        "output_layout": (output_cu_q, score_cu_kv, output_offsets),
+        "half": half,
+        "src_slot": src_slot,
+        "relay_perm": relay_perm,
+        "dst_slot": dst_slot,
+        "route_rows": route_rows,
+        # Graph-static arenas append a small identity suffix to this owner so
+        # TE 2.7's signature-based reuse cannot merge distinct chunk/slot
+        # surfaces. Logical route views above deliberately exclude the suffix.
+        "route_padding": route_padding,
+        "cp_size": cp_size,
+        # Route owners are rank-local: src/dst/relay permutations are built
+        # from the caller's CP-local rank. Tensor-only TE reconstruction cannot
+        # carry this host tag, but eager plan copy/staging boundaries require it.
+        "cp_rank": cp_rank,
+        "l_local": l_local,
+    }
+
+
+def _pack_graph_dynamic_plan(raw_plan, cp_size, cp_rank, l_local):
+    """Pack a raw builder result into the two graph-input storage owners."""
+    cu_entries = raw_plan["validated_cu"].numel()
+    half = l_local // 2
+    route_rows = _graph_dynamic_route_rows(cp_size, l_local)
+    expected = {
+        "validated_cu": (cu_entries, torch.int32),
+        "pos_head": (half, torch.int32),
+        "pos_tail": (half, torch.int32),
+        "score_cu_q": (cu_entries + 1, torch.int32),
+        "score_cu_kv": (cu_entries + 1, torch.int32),
+        "head_offsets": (cu_entries, torch.int32),
+        "tail_offsets": (cu_entries, torch.int32),
+        "output_cu_q": (cu_entries + 1, torch.int32),
+        "output_cu_kv": (cu_entries + 1, torch.int32),
+        "output_offsets": (cu_entries, torch.int32),
+        "src_slot": (l_local, torch.int64),
+        "relay_perm": (route_rows, torch.int64),
+        "dst_slot": (l_local, torch.int64),
+    }
+    device = raw_plan["validated_cu"].device
+    for name, (numel, dtype) in expected.items():
+        tensor = raw_plan.get(name)
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"graph-dynamic balanced CP plan field {name!r} must be a tensor")
+        if tensor.ndim != 1 or tensor.numel() != numel:
+            raise ValueError(
+                f"graph-dynamic balanced CP plan field {name!r} must have shape ({numel},), "
+                f"got {tuple(tensor.shape)}"
+            )
+        if tensor.dtype != dtype:
+            raise TypeError(
+                f"graph-dynamic balanced CP plan field {name!r} must have dtype {dtype}, "
+                f"got {tensor.dtype}"
+            )
+        if tensor.device != device:
+            raise ValueError(
+                f"graph-dynamic balanced CP plan field {name!r} is on {tensor.device}, "
+                f"expected {device}"
+            )
+    if raw_plan.get("half") != half or raw_plan.get("route_rows") != route_rows:
+        raise RuntimeError("raw graph-dynamic balanced CP plan dimensions do not match capacity")
+    if raw_plan["output_cu_kv"].data_ptr() != raw_plan["score_cu_kv"].data_ptr():
+        raise RuntimeError("raw graph-dynamic output_cu_kv must alias score_cu_kv")
+
+    layout_i32 = torch.cat(tuple(raw_plan[name] for name in _GRAPH_DYNAMIC_LAYOUT_FIELDS))
+    route_i64 = torch.cat(tuple(raw_plan[name] for name in _GRAPH_DYNAMIC_ROUTE_FIELDS))
+    return _graph_dynamic_plan_from_buffers(
+        layout_i32, route_i64, cp_size, l_local, cp_rank=cp_rank
+    )
+
+
 def build_graph_dynamic_plan(cu_seqlens, cp_group, capacity):
     """Build and return one graph-input route plan for the current microbatch.
 
@@ -815,24 +1037,49 @@ def build_graph_dynamic_plan(cu_seqlens, cp_group, capacity):
     layers then consume this source plan through their TE input surfaces, avoiding
     composition-dependent Python caches as well as repeated in-graph sorting.
     """
+    if not isinstance(cu_seqlens, torch.Tensor):
+        raise TypeError("graph-dynamic balanced CP cu_seqlens must be a torch tensor")
+    if cu_seqlens.dtype != torch.int32:
+        raise TypeError(
+            "graph-dynamic balanced CP cu_seqlens must have dtype torch.int32 "
+            f"(got {cu_seqlens.dtype})"
+        )
     cu = cu_seqlens.reshape(-1)
     cp_size = cp_group.size()
+    cp_rank = cp_group.rank()
     if cu.numel() < 2:
         raise ValueError("graph-dynamic balanced CP route requires at least one sequence.")
     l_local = _validate_graph_dynamic_capacity(capacity, cp_size)
+    _validate_graph_dynamic_cp_rank(cp_rank, cp_size)
     compressed_lens = torch.div(cu[1:] - cu[:-1], 4, rounding_mode="floor")
     cu_compressed = torch.cat(
         (torch.zeros_like(cu[:1]), torch.cumsum(compressed_lens, dim=0, dtype=torch.int32))
     )
     with torch.no_grad():
-        return _graph_dynamic_zigzag_plan(
-            cu, cu_compressed, cp_size, l_local, cp_group.rank(), cu.device
+        raw_plan = _graph_dynamic_zigzag_plan(
+            cu, cu_compressed, cp_size, l_local, cp_rank, cu.device
         )
+        return _pack_graph_dynamic_plan(raw_plan, cp_size, cp_rank, l_local)
 
 
 def attach_graph_dynamic_plan(packed_seq_params, plan):
     """Attach an invocation-owned graph route without publishing process-global state."""
-    setattr(packed_seq_params, _GRAPH_DYNAMIC_PLAN_ATTR, plan)
+    if not isinstance(plan, dict):
+        raise TypeError("graph-dynamic balanced CP plan must be a dictionary")
+    try:
+        canonical_plan = _graph_dynamic_plan_from_buffers(
+            plan["layout_i32"],
+            plan["route_i64"],
+            plan["cp_size"],
+            plan["l_local"],
+            route_padding=plan.get("route_padding", 0),
+            cp_rank=plan.get("cp_rank"),
+        )
+    except KeyError as exc:
+        raise RuntimeError(
+            f"incomplete graph-dynamic balanced CP plan: missing {exc.args[0]}"
+        ) from exc
+    setattr(packed_seq_params, _GRAPH_DYNAMIC_PLAN_ATTR, canonical_plan)
 
 
 def get_graph_dynamic_plan(packed_seq_params):
@@ -840,19 +1087,135 @@ def get_graph_dynamic_plan(packed_seq_params):
     return getattr(packed_seq_params, _GRAPH_DYNAMIC_PLAN_ATTR, None)
 
 
+def get_graph_dynamic_plan_buffers(packed_seq_params):
+    """Return the two validated storage owners attached to one invocation."""
+    plan = get_graph_dynamic_plan(packed_seq_params)
+    if plan is None:
+        raise RuntimeError(
+            "graph-dynamic balanced CP indexer is missing its per-pack route. "
+            "The frontend must call prebuild_balanced_layouts before model forward."
+        )
+    try:
+        layout_i32 = plan["layout_i32"]
+        route_i64 = plan["route_i64"]
+        _validate_graph_dynamic_buffers(
+            layout_i32,
+            route_i64,
+            plan["cp_size"],
+            plan["l_local"],
+            route_padding=plan.get("route_padding", 0),
+        )
+        _validate_graph_dynamic_cp_rank(plan.get("cp_rank"), plan["cp_size"])
+    except KeyError as exc:
+        raise RuntimeError(
+            f"incomplete graph-dynamic balanced CP plan: missing {exc.args[0]}"
+        ) from exc
+    return layout_i32, route_i64
+
+
+def validate_graph_dynamic_plan_contract(packed_seq_params, cp_size, cp_rank, l_local):
+    """Validate an eager route before its host-only rank tag is flattened for TE.
+
+    The two tensor kwargs intentionally do not encode ``cp_rank``: rank-local route
+    indices are already materialized in their bytes, and reading a host scalar from a
+    CUDA tensor during capture is not allowed.  Callers must therefore validate the
+    known eager plan before flattening it; tensor-only reconstruction inside the
+    captured callable may then safely use ``cp_rank=None``.
+    """
+    plan = get_graph_dynamic_plan(packed_seq_params)
+    if plan is None:
+        raise RuntimeError(
+            "graph-dynamic balanced CP indexer is missing its per-pack route. "
+            "The frontend must call prebuild_balanced_layouts before model forward."
+        )
+    get_graph_dynamic_plan_buffers(packed_seq_params)
+    _validate_graph_dynamic_cp_rank(cp_rank, cp_size)
+    actual_contract = (plan.get("cp_size"), plan.get("cp_rank"), plan.get("l_local"))
+    expected_contract = (cp_size, cp_rank, l_local)
+    if actual_contract != expected_contract:
+        raise ValueError(
+            "graph-dynamic balanced CP route must match the current rank-local contract: "
+            f"expected=(cp={cp_size}, rank={cp_rank}, L={l_local}), "
+            f"got=(cp={actual_contract[0]}, rank={actual_contract[1]}, "
+            f"L={actual_contract[2]})"
+        )
+    return plan
+
+
+def attach_graph_dynamic_plan_buffers(
+    packed_seq_params, layout_i32, route_i64, cp_size, l_local, *, route_padding=0, cp_rank=None
+):
+    """Reconstruct logical views over two graph-static buffers and attach them."""
+    plan = _graph_dynamic_plan_from_buffers(
+        layout_i32, route_i64, cp_size, l_local, route_padding=route_padding, cp_rank=cp_rank
+    )
+    setattr(packed_seq_params, _GRAPH_DYNAMIC_PLAN_ATTR, plan)
+
+
 def copy_graph_dynamic_plan_(destination, source):
-    """Refresh an already-captured plan's tensor surfaces from another pack."""
+    """Refresh the two captured storage owners from another compatible pack."""
     destination_plan = get_graph_dynamic_plan(destination)
     source_plan = get_graph_dynamic_plan(source)
     if destination_plan is None or source_plan is None:
         raise RuntimeError("both packs must have prebuilt graph-dynamic balanced CP routes")
+    destination_layout, destination_route = get_graph_dynamic_plan_buffers(destination)
+    source_layout, source_route = get_graph_dynamic_plan_buffers(source)
+    if (
+        destination_plan["cp_size"] != source_plan["cp_size"]
+        or destination_plan["l_local"] != source_plan["l_local"]
+    ):
+        raise ValueError(
+            "graph-dynamic balanced CP route buffers have incompatible topology/capacity: "
+            f"destination=(cp={destination_plan['cp_size']}, L={destination_plan['l_local']}), "
+            f"source=(cp={source_plan['cp_size']}, L={source_plan['l_local']})"
+        )
+    destination_rank = destination_plan.get("cp_rank")
+    source_rank = source_plan.get("cp_rank")
+    if destination_rank is None or source_rank is None or destination_rank != source_rank:
+        raise ValueError(
+            "graph-dynamic balanced CP route buffers must have the same known CP-local rank: "
+            f"destination={destination_rank}, source={source_rank}"
+        )
+    if (
+        destination_layout.shape != source_layout.shape
+        or destination_route.shape != source_route.shape
+    ):
+        raise ValueError(
+            "graph-dynamic balanced CP route buffers have incompatible shapes: "
+            f"destination=({tuple(destination_layout.shape)}, {tuple(destination_route.shape)}), "
+            f"source=({tuple(source_layout.shape)}, {tuple(source_route.shape)})"
+        )
+    if (
+        destination_layout.dtype != source_layout.dtype
+        or destination_route.dtype != source_route.dtype
+    ):
+        raise TypeError("graph-dynamic balanced CP route buffers have incompatible dtypes")
+    if (
+        destination_layout.device != source_layout.device
+        or destination_route.device != source_route.device
+    ):
+        raise ValueError("graph-dynamic balanced CP route buffers are on incompatible devices")
+    destination_ranges = tuple(
+        _tensor_byte_range(tensor) for tensor in (destination_layout, destination_route)
+    )
+    source_ranges = tuple(_tensor_byte_range(tensor) for tensor in (source_layout, source_route))
+    for destination_index, destination_range in enumerate(destination_ranges):
+        for source_index, source_range in enumerate(source_ranges):
+            overlaps = max(destination_range[0], source_range[0]) < min(
+                destination_range[1], source_range[1]
+            )
+            same_owner = destination_index == source_index and destination_range == source_range
+            if overlaps and not same_owner:
+                raise ValueError(
+                    "graph-dynamic balanced CP source and destination owners must not overlap"
+                )
     with torch.no_grad():
-        for key in _GRAPH_DYNAMIC_PLAN_KWARGS:
-            destination_plan[key].copy_(source_plan[key])
+        destination_layout.copy_(source_layout)
+        destination_route.copy_(source_route)
 
 
 def add_graph_dynamic_plan_to_kwargs(packed_seq_params, kwargs, *, required=False):
-    """Flatten a route plan into tensor-only TE CUDA graph kwargs."""
+    """Flatten a route plan into exactly two tensor-only TE CUDA graph kwargs."""
     plan = get_graph_dynamic_plan(packed_seq_params)
     if plan is None:
         if required:
@@ -861,37 +1224,38 @@ def add_graph_dynamic_plan_to_kwargs(packed_seq_params, kwargs, *, required=Fals
                 "The frontend must call prebuild_balanced_layouts before model forward."
             )
         return
-    for plan_key, kwarg_key in _GRAPH_DYNAMIC_PLAN_KWARGS.items():
-        kwargs[kwarg_key] = plan[plan_key]
+    layout_i32, route_i64 = get_graph_dynamic_plan_buffers(packed_seq_params)
+    kwargs[_GRAPH_DYNAMIC_PLAN_KWARGS["layout_i32"]] = layout_i32
+    kwargs[_GRAPH_DYNAMIC_PLAN_KWARGS["route_i64"]] = route_i64
 
 
 def pop_graph_dynamic_plan_from_kwargs(kwargs, cp_size, l_local):
     """Reconstruct a route plan from TE CUDA graph tensor kwargs."""
-    first_key = next(iter(_GRAPH_DYNAMIC_PLAN_KWARGS.values()))
-    if first_key not in kwargs:
+    present = [name for name in _GRAPH_DYNAMIC_PLAN_KWARGS.values() if name in kwargs]
+    if not present:
         return None
     missing = [name for name in _GRAPH_DYNAMIC_PLAN_KWARGS.values() if name not in kwargs]
     if missing:
         raise RuntimeError(
             "incomplete graph-dynamic balanced CP route kwargs: " + ", ".join(missing)
         )
-    plan = {
-        plan_key: kwargs.pop(kwarg_key)
-        for plan_key, kwarg_key in _GRAPH_DYNAMIC_PLAN_KWARGS.items()
-    }
-    plan["half"] = l_local // 2
-    plan["route_rows"] = cp_size * min(l_local, l_local // cp_size + cp_size - 1)
-    plan["head_layout"] = (plan["score_cu_q"], plan["score_cu_kv"], plan["head_offsets"])
-    plan["tail_layout"] = (plan["score_cu_q"], plan["score_cu_kv"], plan["tail_offsets"])
-    plan["output_layout"] = (plan["output_cu_q"], plan["output_cu_kv"], plan["output_offsets"])
+    layout_i32 = kwargs[_GRAPH_DYNAMIC_PLAN_KWARGS["layout_i32"]]
+    route_i64 = kwargs[_GRAPH_DYNAMIC_PLAN_KWARGS["route_i64"]]
+    logical_route_numel = 2 * l_local + _graph_dynamic_route_rows(cp_size, l_local)
+    route_padding = route_i64.numel() - logical_route_numel
+    plan = _graph_dynamic_plan_from_buffers(
+        layout_i32, route_i64, cp_size, l_local, route_padding=route_padding
+    )
+    for kwarg_key in _GRAPH_DYNAMIC_PLAN_KWARGS.values():
+        kwargs.pop(kwarg_key)
     return plan
 
 
 def add_graph_dynamic_plan_static_inputs(static_inputs, cu_seqlens, cp_group, capacity):
     """Add a valid full-capacity sample route to a layer's TE capture inputs."""
     plan = build_graph_dynamic_plan(cu_seqlens, cp_group, capacity)
-    for plan_key, kwarg_key in _GRAPH_DYNAMIC_PLAN_KWARGS.items():
-        static_inputs[kwarg_key] = plan[plan_key]
+    static_inputs[_GRAPH_DYNAMIC_PLAN_KWARGS["layout_i32"]] = plan["layout_i32"]
+    static_inputs[_GRAPH_DYNAMIC_PLAN_KWARGS["route_i64"]] = plan["route_i64"]
 
 
 def _graph_dynamic_dispatch_chunks_async(

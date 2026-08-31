@@ -1419,9 +1419,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
         if self._uses_graph_dynamic_dsa_route():
+            cp_group = self.pg_collection.cp
+            if cp_group is None or cp_group.size() != self.config.context_parallel_size:
+                raise RuntimeError(
+                    "graph-dynamic balanced CP route requires the layer's explicit CP group "
+                    f"to have size {self.config.context_parallel_size}"
+                )
+            cp_balanced_indexer.validate_graph_dynamic_plan_contract(
+                packed_seq_params,
+                self.config.context_parallel_size,
+                cp_group.rank(),
+                self.config.max_seqlen_per_dp_cp_rank,
+            )
             cp_balanced_indexer.add_graph_dynamic_plan_to_kwargs(
                 packed_seq_params, kwargs, required=True
             )
+            self._set_te_cuda_graph_route_replay_state(packed_seq_params)
 
     def _reconstruct_packed_seq_params_from_kwargs(self, kwargs):
         """Reconstruct PackedSeqParams from individual tensor kwargs (CUDA graph path).
