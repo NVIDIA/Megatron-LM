@@ -17,12 +17,17 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 
-from .mla_with_latent_cp import MLAWithLatentCP, _build_local_latent_norm
+from .mla_with_latent_cp import (
+    HAVE_TE,
+    MLAWithLatentCP,
+    _build_local_latent_norm,
+    _validate_supported_submodules,
+)
 from .utils import LatentCPError, _require
 
 
 def make_mla_with_latent_cp_spec(base_mla_spec: ModuleSpec) -> ModuleSpec:
-    """Return a non-mutating opt-in copy of a supported local MLA attention spec."""
+    """Replace only core attention while preserving a supported old-path projection stack."""
 
     from megatron.core.transformer.dot_product_attention import DotProductAttention
 
@@ -31,37 +36,13 @@ def make_mla_with_latent_cp_spec(base_mla_spec: ModuleSpec) -> ModuleSpec:
     )
     _require(
         base_mla_spec.module is MLASelfAttention,
-        "base_mla_spec must be layer_spec.submodules.self_attention from local MLA",
+        "base_mla_spec must be an ordinary MLA self-attention spec",
     )
     _require(
         isinstance(base_mla_spec.submodules, MLASelfAttentionSubmodules),
         "base_mla_spec has incompatible submodules",
     )
     original = base_mla_spec.submodules
-    expected_column = (
-        original.linear_q_proj,
-        original.linear_q_down_proj,
-        original.linear_q_up_proj,
-        original.linear_kv_down_proj,
-        original.linear_kv_up_proj,
-    )
-    _require(
-        all(module is ColumnParallelLinear for module in expected_column),
-        "base MLA spec must use local MCore ColumnParallelLinear projections",
-    )
-    _require(
-        original.linear_proj is RowParallelLinear,
-        "base MLA spec must use local MCore RowParallelLinear output",
-    )
-    _require(
-        original.q_layernorm is WrappedTorchNorm
-        and original.kv_layernorm is WrappedTorchNorm,
-        "base MLA spec must use standalone WrappedTorchNorm Q/KV norms",
-    )
-    _require(
-        original.core_attention is DotProductAttention,
-        "base MLA spec must use the local MCore core-attention placeholder",
-    )
     _require(
         original.linear_qkv_down_proj is None,
         "fused MLA down projection is unsupported",
@@ -71,12 +52,36 @@ def make_mla_with_latent_cp_spec(base_mla_spec: ModuleSpec) -> ModuleSpec:
         "base MLA spec must be causal",
     )
 
-    latent_submodules = replace(
-        original,
-        q_layernorm=_build_local_latent_norm,
-        kv_layernorm=_build_local_latent_norm,
-        core_attention=IdentityOp,
+    local_norms = (
+        original.q_layernorm is WrappedTorchNorm
+        and original.kv_layernorm is WrappedTorchNorm
     )
+    if local_norms:
+        _require(
+            original.core_attention is DotProductAttention,
+            "local MLA spec must use DotProductAttention",
+        )
+        latent_submodules = replace(
+            original,
+            q_layernorm=_build_local_latent_norm,
+            kv_layernorm=_build_local_latent_norm,
+            core_attention=IdentityOp,
+        )
+    else:
+        _require(
+            HAVE_TE
+            and original.q_layernorm is IdentityOp
+            and original.kv_layernorm is IdentityOp,
+            "TE MLA spec must fuse Q/KV norms into its up projections",
+        )
+        from megatron.core.extensions.transformer_engine import TEDotProductAttention
+
+        _require(
+            original.core_attention is TEDotProductAttention,
+            "TE MLA spec must use TEDotProductAttention",
+        )
+        latent_submodules = replace(original, core_attention=IdentityOp)
+    _validate_supported_submodules(latent_submodules)
     return replace(
         base_mla_spec,
         module=MLAWithLatentCP,
@@ -129,7 +134,7 @@ def _replace_transformer_layer_attention(
             metainfo=dict(layer_spec.metainfo),
             submodules=replace(
                 layer_submodules,
-                self_attention=get_mla_with_latent_cp_spec(),
+                self_attention=make_mla_with_latent_cp_spec(attention_spec),
                 sharded_state_dict_keys_map=dict(
                     layer_submodules.sharded_state_dict_keys_map
                 ),

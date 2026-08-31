@@ -31,7 +31,10 @@ import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.context_parallel_layout.utils import finalize_packed_seq_params
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -317,12 +320,25 @@ def _base_mla_spec():
     ).submodules.self_attention
 
 
+def _base_mla_te_spec():
+    return get_gpt_layer_with_transformer_engine_spec(
+        num_experts=None,
+        moe_grouped_gemm=False,
+        qk_layernorm=True,
+        multi_latent_attention=True,
+    ).submodules.self_attention
+
+
 def _build_layer(
     config: MLATransformerConfig,
     pg: ProcessGroupCollection,
     backend_adapter: latent_cp.DirectAttentionAdapter | None = None,
+    *,
+    base_spec: ModuleSpec | None = None,
 ):
-    spec = latent_cp.make_mla_with_latent_cp_spec(_base_mla_spec())
+    spec = latent_cp.make_mla_with_latent_cp_spec(
+        _base_mla_spec() if base_spec is None else base_spec
+    )
     if backend_adapter is None:
         return build_module(
             spec, config=config, layer_number=1, cp_comm_type="p2p", pg_collection=pg
@@ -346,7 +362,7 @@ def _build_layer(
 def _build_legacy_cp_layer(config: MLATransformerConfig, pg: ProcessGroupCollection):
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
 
-    base = _base_mla_spec()
+    base = _base_mla_te_spec()
     spec = replace(
         base,
         params=dict(base.params),
@@ -631,7 +647,9 @@ class NaiveMLA(nn.Module):
         return self.wo(merged).unsqueeze(1)
 
 
-def _parameter_map(config: MLATransformerConfig) -> dict[str, tuple[str, int | None]]:
+def _parameter_map(
+    config: MLATransformerConfig, *, projection_stack: str = "local"
+) -> dict[str, tuple[str, int | None]]:
     mapping = {
         "wq_a.weight": ("linear_q_down_proj.weight", 0),
         "q_norm.weight": ("q_layernorm.weight", None),
@@ -643,6 +661,19 @@ def _parameter_map(config: MLATransformerConfig) -> dict[str, tuple[str, int | N
     }
     if config.attention_output_gate:
         mapping["gate.weight"] = ("linear_gate.weight", 0)
+    if projection_stack == "transformer_engine":
+        mapping["wq_a.weight"] = ("linear_q_down_proj.weight", None)
+        mapping["wkv_a.weight"] = ("linear_kv_down_proj.weight", None)
+        mapping["q_norm.weight"] = (
+            "linear_q_up_proj.layer_norm_weight",
+            None,
+        )
+        mapping["kv_norm.weight"] = (
+            "linear_kv_up_proj.layer_norm_weight",
+            None,
+        )
+    else:
+        assert projection_stack == "local"
     return mapping
 
 
@@ -686,10 +717,11 @@ def _reconstruct_real_parameter_gradients(
     pg: ProcessGroupCollection,
     *,
     cp_group: dist.ProcessGroup | None = None,
+    projection_stack: str = "local",
 ) -> dict[str, torch.Tensor]:
     real_params = dict(real_layer.named_parameters())
     reconstructed: dict[str, torch.Tensor] = {}
-    parameter_map = _parameter_map(real_layer.config)
+    parameter_map = _parameter_map(real_layer.config, projection_stack=projection_stack)
     tp_size = dist.get_world_size(pg.tp)
     cp_group = pg.cp if cp_group is None else cp_group
     for reference_name, (real_name, shard_dim) in parameter_map.items():
@@ -1199,9 +1231,11 @@ def test_cudnn_selective_recompute_matches_native_projection_gradients():
     query = torch.randn(5, 1, 2, requires_grad=True)
     payload = torch.randn(5, 2, requires_grad=True)
     weight = torch.randn(4, 2, requires_grad=True)
+    norm_weight = torch.randn(2, requires_grad=True)
     query_ref = query.detach().clone().requires_grad_(True)
     payload_ref = payload.detach().clone().requires_grad_(True)
     weight_ref = weight.detach().clone().requires_grad_(True)
+    norm_weight_ref = norm_weight.detach().clone().requires_grad_(True)
     cu = torch.tensor([0, 5], dtype=torch.int32)
     indices = torch.arange(5)
     phase = latent_cp.PhaseSpec(
@@ -1221,23 +1255,26 @@ def test_cudnn_selective_recompute_matches_native_projection_gradients():
     def expand_phase_kv(latent, _phase):
         nonlocal replay_calls
         replay_calls += 1
-        expanded = F.linear(latent, weight).view(5, 1, 4)
+        normalized = F.rms_norm(latent, (2,), norm_weight, eps=1e-6)
+        expanded = F.linear(normalized, weight).view(5, 1, 4)
         return expanded[..., :2], expanded[..., 2:]
 
     adapter = FakeAdapter()
     output, lse = latent_cp_cudnn_backend._CudnnRecomputedPhaseFunction.apply(
         query,
         payload,
-        weight,
         phase,
         1.0,
         adapter,
         expand_phase_kv,
+        weight,
+        norm_weight,
     )
     upstream = torch.randn_like(output).to(torch.bfloat16).float()
     (output * upstream).sum().backward()
 
-    expanded_ref = F.linear(payload_ref, weight_ref).view(5, 1, 4)
+    normalized_ref = F.rms_norm(payload_ref, (2,), norm_weight_ref, eps=1e-6)
+    expanded_ref = F.linear(normalized_ref, weight_ref).view(5, 1, 4)
     reference = query_ref + expanded_ref[..., :2] + expanded_ref[..., 2:]
     (reference * upstream).sum().backward()
     torch.testing.assert_close(output, reference)
@@ -1245,6 +1282,7 @@ def test_cudnn_selective_recompute_matches_native_projection_gradients():
     torch.testing.assert_close(query.grad, query_ref.grad)
     torch.testing.assert_close(payload.grad, payload_ref.grad)
     torch.testing.assert_close(weight.grad, weight_ref.grad)
+    torch.testing.assert_close(norm_weight.grad, norm_weight_ref.grad)
     assert replay_calls == 2
     assert adapter.forward_calls == 1
     assert adapter.backward_calls == 1
@@ -1412,6 +1450,35 @@ def test_spec_factory_is_non_mutating_and_bypasses_core_attention_wrapper():
     assert result.submodules.kv_layernorm is latent_cp._build_local_latent_norm
 
 
+def test_te_spec_factory_preserves_every_projection_module():
+    if not base_mla.HAVE_TE:
+        pytest.skip("Transformer Engine is unavailable")
+    base_layer = get_gpt_layer_with_transformer_engine_spec(
+        num_experts=None,
+        moe_grouped_gemm=False,
+        qk_layernorm=True,
+        multi_latent_attention=True,
+    )
+    base_attention = base_layer.submodules.self_attention
+    original = base_attention.submodules
+    configured_layer = latent_cp.configure_mla_latent_cp_decoder(base_layer)
+    configured = configured_layer.submodules.self_attention
+
+    assert base_layer.submodules.self_attention is base_attention
+    assert base_attention.module is base_mla.MLASelfAttention
+    assert configured.module is latent_cp.MLAWithLatentCP
+    assert configured.submodules is not original
+    assert configured.submodules.core_attention is IdentityOp
+    for name in original.__dataclass_fields__:
+        if name == "core_attention":
+            continue
+        assert getattr(configured.submodules, name) is getattr(original, name), name
+    assert (
+        latent_cp_module._validate_supported_submodules(configured.submodules)
+        == "transformer_engine"
+    )
+
+
 def test_factory_rejects_unsupported_projection_and_mask_specs():
     base = _base_mla_spec()
     outer = get_gpt_layer_local_spec(
@@ -1423,7 +1490,7 @@ def test_factory_rejects_unsupported_projection_and_mask_specs():
     )
     with pytest.raises(ValueError, match="base_mla_spec"):
         latent_cp.make_mla_with_latent_cp_spec(outer)
-    with pytest.raises(ValueError, match="norms"):
+    with pytest.raises(ValueError, match="fuse Q/KV norms"):
         latent_cp.make_mla_with_latent_cp_spec(
             replace(base, submodules=replace(base.submodules, q_layernorm=IdentityOp))
         )
@@ -2070,6 +2137,7 @@ def test_explicit_output_projection_uses_only_injected_group_and_matches_referen
     projection = Projection()
     harness = SimpleNamespace(
         linear_proj=projection,
+        _projection_stack="local",
         pg_collection=SimpleNamespace(tp=tp_group),
         config=SimpleNamespace(
             cpu_offloading=False, _cpu_offloading_context=None, sequence_parallel=True
@@ -3628,18 +3696,23 @@ def _run_production_parity(
 def _run_legacy_full_kv_cp_parity(rope_type: str) -> None:
     runtime = _qualified_real_backend_runtime_or_skip(AttnBackend.fused)
     assertion_eps = EXPECTED_QUALIFICATION_EPS[runtime]
-    with _model_parallel(1, 2) as pg:
+    with _model_parallel(2, 2) as pg:
         torch.manual_seed(_SEED + 30)
         torch.cuda.manual_seed_all(_SEED + 30)
         model_parallel_cuda_manual_seed(_SEED + 30)
         config = _make_config(
-            tp_size=1,
+            tp_size=2,
             cp_size=2,
             backend=AttnBackend.fused,
             rope_type=rope_type,
             production_shape=True,
         )
-        latent_layer = _build_layer(config, pg).cuda().bfloat16().train()
+        latent_layer = (
+            _build_layer(config, pg, base_spec=_base_mla_te_spec())
+            .cuda()
+            .bfloat16()
+            .train()
+        )
         legacy_layer = _build_legacy_cp_layer(config, pg).cuda().bfloat16().train()
         incompatible = legacy_layer.load_state_dict(
             latent_layer.state_dict(), strict=True
@@ -3700,9 +3773,13 @@ def _run_legacy_full_kv_cp_parity(rope_type: str) -> None:
             "latent CP vs legacy full-KV CP input gradient",
         )
 
-        latent_gradients = _reconstruct_real_parameter_gradients(latent_layer, pg)
-        legacy_gradients = _reconstruct_real_parameter_gradients(legacy_layer, pg)
-        parameter_map = _parameter_map(config)
+        latent_gradients = _reconstruct_real_parameter_gradients(
+            latent_layer, pg, projection_stack="transformer_engine"
+        )
+        legacy_gradients = _reconstruct_real_parameter_gradients(
+            legacy_layer, pg, projection_stack="transformer_engine"
+        )
+        parameter_map = _parameter_map(config, projection_stack="transformer_engine")
         assert set(latent_gradients) == set(legacy_gradients) == set(parameter_map)
         for name in sorted(latent_gradients):
             label = f"parameter_gradient/{name}"

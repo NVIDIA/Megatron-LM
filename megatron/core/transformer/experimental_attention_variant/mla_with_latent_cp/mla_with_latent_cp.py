@@ -14,6 +14,7 @@ from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 
 import megatron.core.tensor_parallel as mcore_tp
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -27,6 +28,7 @@ from megatron.core.transformer.multi_latent_attention import (
 )
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.typed_torch import apply_module
 
 from . import layout as latent_cp_layout
 from . import utils as latent_cp_utils
@@ -34,6 +36,19 @@ from .backend import DirectAttentionAdapter, _qualified_backend_adapter
 from .layout import AlreadyZigZagTHDAdapter
 from .transport import LatentCPTransport, P2PRingTransport
 from .utils import LatentCPError, QualifiedBackendTuple, _require
+
+if HAVE_TE:
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TELayerNormColumnParallelLinear,
+        TELinear,
+        TERowParallelLinear,
+    )
+else:
+    TEColumnParallelLinear = None
+    TELayerNormColumnParallelLinear = None
+    TELinear = None
+    TERowParallelLinear = None
 
 
 def _build_local_latent_norm(
@@ -50,7 +65,9 @@ def _build_local_latent_norm(
     return norm
 
 
-def _validate_supported_submodules(submodules: MLASelfAttentionSubmodules) -> None:
+def _validate_supported_submodules(submodules: MLASelfAttentionSubmodules) -> str:
+    """Return the preserved projection-stack kind after fail-closed validation."""
+
     expected_column = (
         "linear_q_proj",
         "linear_q_down_proj",
@@ -58,23 +75,31 @@ def _validate_supported_submodules(submodules: MLASelfAttentionSubmodules) -> No
         "linear_kv_down_proj",
         "linear_kv_up_proj",
     )
-    for name in expected_column:
-        _require(
-            getattr(submodules, name) is ColumnParallelLinear,
-            f"{name} must use the local MCore ColumnParallelLinear spec",
+    local_stack = (
+        all(
+            getattr(submodules, name) is ColumnParallelLinear
+            for name in expected_column
         )
-    _require(
-        submodules.linear_proj is RowParallelLinear,
-        "linear_proj must use the local MCore RowParallelLinear spec",
+        and submodules.linear_proj is RowParallelLinear
+        and submodules.linear_gate in (None, ColumnParallelLinear)
+        and submodules.q_layernorm is _build_local_latent_norm
+        and submodules.kv_layernorm is _build_local_latent_norm
+    )
+    te_stack = bool(HAVE_TE) and (
+        submodules.linear_q_proj is TEColumnParallelLinear
+        and submodules.linear_q_down_proj is TELinear
+        and submodules.linear_q_up_proj is TELayerNormColumnParallelLinear
+        and submodules.linear_kv_down_proj is TELinear
+        and submodules.linear_kv_up_proj is TELayerNormColumnParallelLinear
+        and submodules.linear_proj is TERowParallelLinear
+        and submodules.linear_gate in (None, TEColumnParallelLinear)
+        and submodules.q_layernorm is IdentityOp
+        and submodules.kv_layernorm is IdentityOp
     )
     _require(
-        submodules.linear_gate in (None, ColumnParallelLinear),
-        "linear_gate must use the local MCore ColumnParallelLinear spec",
-    )
-    _require(
-        submodules.q_layernorm is _build_local_latent_norm
-        and submodules.kv_layernorm is _build_local_latent_norm,
-        "Q/KV norms must use the local latent-CP norm builder",
+        local_stack or te_stack,
+        "projection modules must preserve either the supported local MCore stack or the "
+        "supported Transformer Engine MLA stack",
     )
     _require(
         submodules.linear_qkv_down_proj is None,
@@ -84,6 +109,7 @@ def _validate_supported_submodules(submodules: MLASelfAttentionSubmodules) -> No
         submodules.core_attention is IdentityOp,
         "core_attention must be IdentityOp; use make_mla_with_latent_cp_spec",
     )
+    return "local" if local_stack else "transformer_engine"
 
 
 @dataclass(frozen=True)
@@ -129,7 +155,7 @@ class MLAWithLatentCP(MLASelfAttention):
         )
         # TODO(mla-latent-cp): Support MTP before this feature leaves experimental status.
         _require(not is_mtp_layer, "MTP layers are unsupported in v1")
-        _validate_supported_submodules(submodules)
+        projection_stack = _validate_supported_submodules(submodules)
         super().__init__(
             config=config,
             submodules=submodules,
@@ -144,6 +170,7 @@ class MLAWithLatentCP(MLASelfAttention):
         self._cp_comm_type = (
             cp_comm_type if cp_comm_type is not None else config.cp_comm_type
         )
+        self._projection_stack = projection_stack
         self._layout_adapter: latent_cp_layout.LatentCPLayoutAdapter = (
             AlreadyZigZagTHDAdapter()
         )
@@ -263,6 +290,10 @@ class MLAWithLatentCP(MLASelfAttention):
         )
 
     def _validate_projection_groups(self) -> None:
+        def stored_tp_group(module: torch.nn.Module) -> dist.ProcessGroup | None:
+            group = getattr(module, "tp_group", None)
+            return group if group is not None else getattr(module, "_tp_group", None)
+
         for name in (
             "linear_q_down_proj",
             "linear_q_up_proj",
@@ -272,36 +303,46 @@ class MLAWithLatentCP(MLASelfAttention):
         ):
             module = getattr(self, name)
             _require(
-                getattr(module, "tp_group", None) is self.pg_collection.tp,
+                stored_tp_group(module) is self.pg_collection.tp,
                 f"{name} does not retain the injected TP process group",
             )
 
         if self.linear_gate is not None:
             _require(
-                isinstance(self.linear_gate, ColumnParallelLinear),
-                "linear_gate must be a local MCore ColumnParallelLinear",
-            )
-            _require(
-                self.linear_gate.tp_group is self.pg_collection.tp,
+                stored_tp_group(self.linear_gate) is self.pg_collection.tp,
                 "linear_gate does not retain the injected TP process group",
             )
-            _require(
-                not self.linear_gate.gather_output
-                and not self.linear_gate.skip_bias_add
-                and self.linear_gate.bias is None
-                and not self.linear_gate.explicit_expert_comm,
-                "linear_gate must be a bias-free non-expert sharded projection",
-            )
+            if self._projection_stack == "local":
+                _require(
+                    isinstance(self.linear_gate, ColumnParallelLinear)
+                    and not self.linear_gate.gather_output
+                    and not self.linear_gate.skip_bias_add
+                    and self.linear_gate.bias is None
+                    and not self.linear_gate.explicit_expert_comm,
+                    "linear_gate must be a bias-free non-expert sharded projection",
+                )
+            else:
+                _require(
+                    not self.linear_gate.use_bias,
+                    "TE linear_gate must be a bias-free column-parallel projection",
+                )
 
         output_projection = self.linear_proj
-        _require(
-            output_projection.input_is_parallel
-            and output_projection.skip_bias_add
-            and output_projection.sequence_parallel == self.config.sequence_parallel
-            and not output_projection.explicit_expert_comm,
-            "linear_proj must be a non-expert row-parallel projection with parallel input",
-        )
-        _require(output_projection.bias is None, "linear_proj bias is unsupported")
+        if self._projection_stack == "local":
+            _require(
+                output_projection.input_is_parallel
+                and output_projection.skip_bias_add
+                and output_projection.sequence_parallel == self.config.sequence_parallel
+                and not output_projection.explicit_expert_comm
+                and output_projection.bias is None,
+                "linear_proj must be a bias-free non-expert row-parallel projection",
+            )
+        else:
+            _require(
+                output_projection.sequence_parallel == self.config.sequence_parallel
+                and not output_projection.use_bias,
+                "TE linear_proj must be a bias-free row-parallel projection",
+            )
 
     def _validate_forward(
         self,
@@ -447,11 +488,10 @@ class MLAWithLatentCP(MLASelfAttention):
     def _explicit_output_projection(
         self, core_output: Tensor
     ) -> tuple[Tensor, Tensor | None]:
-        """Apply the inherited row-sharded weight without an implicit TP-group lookup."""
+        """Apply the preserved old-path output module, with an explicit local fallback."""
 
         projection = self.linear_proj
         _require(core_output.dtype == torch.bfloat16, "linear_proj input must be BF16")
-        _require(projection.bias is None, "linear_proj bias is unsupported")
         _require(
             not self.config.cpu_offloading
             and self.config._cpu_offloading_context is None,
@@ -461,6 +501,10 @@ class MLAWithLatentCP(MLASelfAttention):
             projection.weight.requires_grad,
             "frozen linear_proj weights are unsupported in v1",
         )
+        if self._projection_stack == "transformer_engine":
+            return apply_module(projection)(core_output)
+
+        _require(projection.bias is None, "linear_proj bias is unsupported")
         output_parallel = mcore_tp.linear_with_grad_accumulation_and_async_allreduce(
             input=core_output,
             weight=projection.weight,
@@ -484,17 +528,19 @@ class MLAWithLatentCP(MLASelfAttention):
 
     def _latent_cp_down_projection(
         self, hidden_states: Tensor
-    ) -> tuple[Tensor, Tensor]:
-        """Run local projection modules and gather every shard with the injected TP group."""
+    ) -> tuple[Tensor, Tensor, bool, bool]:
+        """Run the preserved down projections and explicitly gather feature shards."""
 
         q_compressed, _ = self.linear_q_down_proj(hidden_states)
         kv_combined, _ = self.linear_kv_down_proj(hidden_states)
         expected_kv = self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim
-        if q_compressed.size(-1) != self.config.q_lora_rank:
+        q_was_sharded = q_compressed.size(-1) != self.config.q_lora_rank
+        kv_was_sharded = kv_combined.size(-1) != expected_kv
+        if q_was_sharded:
             q_compressed = tp_mappings.gather_from_tensor_model_parallel_region(
                 q_compressed, group=self.pg_collection.tp
             )
-        if kv_combined.size(-1) != expected_kv:
+        if kv_was_sharded:
             kv_combined = tp_mappings.gather_from_tensor_model_parallel_region(
                 kv_combined, group=self.pg_collection.tp
             )
@@ -506,7 +552,7 @@ class MLAWithLatentCP(MLASelfAttention):
             kv_combined.size(-1) == expected_kv,
             "KV down-projection gather produced the wrong size",
         )
-        return q_compressed, kv_combined
+        return q_compressed, kv_combined, q_was_sharded, kv_was_sharded
 
     def _project_query_and_payload(
         self,
@@ -517,7 +563,9 @@ class MLAWithLatentCP(MLASelfAttention):
     ) -> tuple[Tensor, Tensor]:
         if cp_group is None:
             cp_group = self.pg_collection.cp
-        q_compressed, kv_combined = self._latent_cp_down_projection(hidden_states)
+        q_compressed, kv_combined, q_was_sharded, kv_was_sharded = (
+            self._latent_cp_down_projection(hidden_states)
+        )
         q_compressed = q_compressed.squeeze(1)
         kv_combined = kv_combined.squeeze(1)
         kv_compressed, k_rope_raw = torch.split(
@@ -525,12 +573,19 @@ class MLAWithLatentCP(MLASelfAttention):
             [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim],
             dim=-1,
         )
-        if self.config.sequence_parallel:
+        if self.config.sequence_parallel and q_was_sharded:
             q_compressed = tp_mappings.scatter_to_sequence_parallel_region(
                 q_compressed, group=self.pg_collection.tp
             )
+        if self.config.sequence_parallel and kv_was_sharded:
             kv_compressed = tp_mappings.scatter_to_sequence_parallel_region(
                 kv_compressed, group=self.pg_collection.tp
+            )
+        elif self.config.sequence_parallel:
+            k_rope_raw = tp_mappings.gather_from_sequence_parallel_region(
+                k_rope_raw,
+                tensor_parallel_output_grad=True,
+                group=self.pg_collection.tp,
             )
         q_compressed = self.q_layernorm(q_compressed)
         kv_compressed = self.kv_layernorm(kv_compressed)
@@ -707,6 +762,18 @@ class MLAWithLatentCP(MLASelfAttention):
         merged_lse: Tensor | None = None
         lease_count = 0
         leases = transport.iter_payloads(local_payload, layout.phases)
+        recomputed_forward = getattr(backend, "forward_recomputed_phase", None)
+        projection_parameters: tuple[Tensor, ...] = ()
+        if recomputed_forward is not None:
+            projection_parameters = tuple(
+                parameter
+                for parameter in self.linear_kv_up_proj.parameters()
+                if parameter.requires_grad
+            )
+            _require(
+                projection_parameters,
+                "latent-KV up projection has no trainable parameters",
+            )
         for phase, lease in zip(layout.phases, leases, strict=True):
             lease_count += 1
             _require(
@@ -725,7 +792,6 @@ class MLAWithLatentCP(MLASelfAttention):
                     q_input, payload_input, phase_spec, phase_backend
                 )
 
-            recomputed_forward = getattr(backend, "forward_recomputed_phase", None)
             if recomputed_forward is None:
                 partial_output, partial_lse = checkpoint(
                     run_phase,
@@ -738,10 +804,10 @@ class MLAWithLatentCP(MLASelfAttention):
                 partial_output, partial_lse = recomputed_forward(
                     q_phase,
                     payload_phase,
-                    self.linear_kv_up_proj.weight,
                     phase,
                     self.softmax_scale,
                     self._expand_phase_kv,
+                    *projection_parameters,
                 )
             if merged_output is None:
                 _require(

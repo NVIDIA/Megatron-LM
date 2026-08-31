@@ -197,11 +197,11 @@ class _CudnnRecomputedPhaseFunction(torch.autograd.Function):
         ctx: Any,
         query: Tensor,
         payload: Tensor,
-        projection_weight: Tensor,
         phase: PhaseSpec,
         scale: float,
         adapter: "CudnnFusedAttentionAdapter",
         expand_phase_kv: Callable[[Tensor, PhaseSpec], tuple[Tensor, Tensor]],
+        *projection_parameters: Tensor,
     ) -> tuple[Tensor, Tensor]:
         key, value = expand_phase_kv(payload, phase)
         raw_output, stats = adapter._execute_forward(
@@ -215,7 +215,7 @@ class _CudnnRecomputedPhaseFunction(torch.autograd.Function):
             phase.causal,
             scale,
         )
-        ctx.save_for_backward(query, payload, projection_weight, raw_output, stats)
+        ctx.save_for_backward(query, payload, raw_output, stats, *projection_parameters)
         ctx.phase = phase
         ctx.scale = scale
         ctx.adapter = adapter
@@ -225,8 +225,11 @@ class _CudnnRecomputedPhaseFunction(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx: Any, grad_output: Tensor | None, grad_lse: Tensor | None
-    ) -> tuple[Tensor, Tensor, Tensor | None, None, None, None, None]:
-        query, payload, projection_weight, raw_output, stats = ctx.saved_tensors
+    ) -> tuple[Any, ...]:
+        query, payload, raw_output, stats, *projection_parameters = ctx.saved_tensors
+        _require(
+            projection_parameters, "latent-KV projection has no trainable parameters"
+        )
         phase = ctx.phase
         if grad_output is None:
             grad_output = torch.zeros_like(raw_output, dtype=torch.float32)
@@ -255,14 +258,15 @@ class _CudnnRecomputedPhaseFunction(torch.autograd.Function):
                 phase.causal,
                 ctx.scale,
             )
-            grad_payload, grad_weight = torch.autograd.grad(
+            projection_gradients = torch.autograd.grad(
                 (key, value),
-                (replay_payload, projection_weight),
+                (replay_payload, *projection_parameters),
                 grad_outputs=(dk, dv),
                 allow_unused=True,
             )
+            grad_payload, *grad_parameters = projection_gradients
         _require(grad_payload is not None, "latent-KV replay lost its payload gradient")
-        return dq, grad_payload, grad_weight, None, None, None, None
+        return dq, grad_payload, None, None, None, None, *grad_parameters
 
 
 def _resolve_cudnn_frontend_version(cudnn: Any) -> str:
@@ -922,21 +926,21 @@ class CudnnFusedAttentionAdapter:
         self,
         query: Tensor,
         payload: Tensor,
-        projection_weight: Tensor,
         phase: PhaseSpec,
         scale: float,
         expand_phase_kv: Callable[[Tensor, PhaseSpec], tuple[Tensor, Tensor]],
+        *projection_parameters: Tensor,
     ) -> tuple[Tensor, Tensor]:
         """Execute SDPA while retaining only latent payload plus cuDNN O/LSE state."""
 
         return _CudnnRecomputedPhaseFunction.apply(
             query,
             payload,
-            projection_weight,
             phase,
             scale,
             self,
             expand_phase_kv,
+            *projection_parameters,
         )
 
 
