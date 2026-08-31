@@ -354,6 +354,7 @@ class TestNeedsMxfp8Conversion:
 
         class _Cfg:
             transformer_impl = "inference_optimized"
+            fp8 = "hybrid"
             fp8_recipe = "mxfp8"
 
         class _Model:
@@ -366,6 +367,7 @@ class TestNeedsMxfp8Conversion:
 
         class _Cfg:
             transformer_impl = "transformer_engine"
+            fp8 = "hybrid"
             fp8_recipe = "mxfp8"
 
         class _Model:
@@ -378,7 +380,21 @@ class TestNeedsMxfp8Conversion:
 
         class _Cfg:
             transformer_impl = "inference_optimized"
+            fp8 = "hybrid"
             fp8_recipe = "delayed"
+
+        class _Model:
+            config = _Cfg()
+
+        assert _needs_mxfp8_conversion(_Model()) is False
+
+    def test_inactive_mxfp8_recipe_returns_false(self):
+        from megatron.core.resharding.refit import _needs_mxfp8_conversion
+
+        class _Cfg:
+            transformer_impl = "inference_optimized"
+            fp8 = None
+            fp8_recipe = "mxfp8"
 
         class _Model:
             config = _Cfg()
@@ -391,6 +407,7 @@ class TestNeedsMxfp8Conversion:
 
         class _Cfg:
             transformer_impl = "inference_optimized"
+            fp8 = "hybrid"
             fp8_recipe = "mxfp8"
 
         class _Model:
@@ -445,6 +462,36 @@ class TestSetupMxfp8TransformOnPlan:
 
         _setup_mxfp8_transform_on_plan(plan, _Model())
         assert plan.transform is sentinel
+
+    def test_flashinfer_uses_canonical_triton_buffers(self, monkeypatch):
+        """FlashInfer refit derives Major-K weights from canonical Triton storage."""
+        from megatron.core.resharding import refit
+        from megatron.core.resharding.utils import ReshardPlan
+
+        class _Config:
+            transformer_impl = "inference_optimized"
+            fp8 = "hybrid"
+            fp8_recipe = "mxfp8"
+            inference_grouped_gemm_backend = "flashinfer"
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = _Config()
+                self.decoder = nn.Linear(4, 4, bias=False)
+
+        captured = {}
+
+        def _quantize(_decoder, *, backend):
+            captured["backend"] = backend
+            return {}
+
+        monkeypatch.setattr(refit, "_should_quantize_param", lambda _param: True)
+        monkeypatch.setattr(refit, "quantize_params_to_mxfp8", _quantize)
+
+        plan = ReshardPlan(send_ops=[], recv_ops=[])
+        refit._setup_mxfp8_transform_on_plan(plan, _Model())
+        assert captured["backend"] == plan.transform.backend == "triton"
 
 
 class TestRefitTensorCache:

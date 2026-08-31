@@ -14,6 +14,8 @@ Gated Delta Product prefill calls.
 
 import torch
 
+from megatron.core.ssm.ops.common.determinism import autotune_configs
+
 from .common import HAVE_TRITON, prepare_chunk_indices, tl, triton
 
 
@@ -24,7 +26,9 @@ from .common import HAVE_TRITON, prepare_chunk_indices, tl, triton
     }
 )
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
+    configs=autotune_configs(
+        [triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]]
+    ),
     key=['B', 'H', 'BT', 'IS_VARLEN', 'REVERSE'],
 )
 @triton.jit(do_not_specialize=['T'])

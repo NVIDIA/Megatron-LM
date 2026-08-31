@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -124,7 +125,10 @@ def test_start_server_forwards_multimodal_prompt_config_to_worker(monkeypatch):
 
     assert len(processes) == 1
     assert processes[0].target is text_generation_server._server_process_worker
-    assert processes[0].args[-1] is prompt_config
+    worker_call = inspect.signature(text_generation_server._server_process_worker).bind(
+        *processes[0].args
+    )
+    assert worker_call.arguments["multimodal_prompt_config"] is prompt_config
     assert processes[0].daemon is True
 
 

@@ -20,6 +20,8 @@ capped at 256.
 
 import torch
 
+from megatron.core.ssm.ops.common.determinism import autotune_configs
+
 from .common import HAVE_TRITON, exp2, prepare_chunk_indices, prepare_chunk_offsets, tl, triton
 
 
@@ -34,12 +36,14 @@ from .common import HAVE_TRITON, exp2, prepare_chunk_indices, prepare_chunk_offs
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in [2, 3, 4]
-        for BV in [32, 64]
-    ],
+    configs=autotune_configs(
+        [
+            triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in [2, 4]
+            for num_stages in [2, 3, 4]
+            for BV in [32, 64]
+        ]
+    ),
     key=['H', 'K', 'V', 'BT', 'USE_G'],
 )
 @triton.jit(do_not_specialize=['T'])

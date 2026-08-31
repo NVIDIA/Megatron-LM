@@ -195,17 +195,26 @@ class KVCacheManagementMode(str, Enum):
 class CudaGraphSizingDistribution(str, Enum):
     """How CUDA graph token-count sizes are spaced when generating the captured graphs.
 
-    EXPONENTIAL (default) — token counts halve from `cuda_graph_max_tokens` down to `tp_size`,
+    EXPONENTIAL — token counts halve from `cuda_graph_max_tokens` down to `tp_size`,
     giving a log-spaced distribution. Bounded relative padding (~2x worst case) at every scale and
     `log2(max_tokens)` total graphs.
 
     LINEAR — Include size-1 and size-2 graphs where applicable, linear spacing up until 256, and
     sparser linear spacing past 256. e.g. `[1, 2, 4] + range(8, 256, 8) + range(256, max+1, 16)`.
     Higher graph density at the top end.
+
+    HYBRID (default) — EXPONENTIAL for prefill and mixed graphs, LINEAR for decode-only graphs.
+    The two
+    serve different ranges: prefill token counts span the whole `cuda_graph_max_tokens` (thousands),
+    where log spacing keeps padding bounded at ~2x for a handful of graphs, while decode-only counts
+    are capped at `max_requests * (num_speculative_tokens + 1)` (tens), where halving is far too
+    coarse -- a 33-request step would pad up to a 64-request graph. Linear spacing there covers
+    every small request count densely for little extra capture cost.
     """
 
     EXPONENTIAL = "exponential"
     LINEAR = "linear"
+    HYBRID = "hybrid"
 
 
 class AsyncScheduleMode(str, Enum):
@@ -373,14 +382,14 @@ class InferenceConfig:
     The number of mixed prefill graphs to capture if mixed prefill/decode graphs are enabled.
     """
 
-    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = (
-        CudaGraphSizingDistribution.EXPONENTIAL
-    )
+    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = CudaGraphSizingDistribution.HYBRID
     """
-    How CUDA graph token counts are spaced. EXPONENTIAL (default) halves from
-    `cuda_graph_max_tokens` down to `tp_size` (log-spaced, ~log2(max_tokens) graphs).
-    LINEAR uses a range of linear strides (includes small graphs + mid-range linearity + 
-    a bigger step size at the top end).
+    How CUDA graph token counts are spaced. HYBRID (default) applies EXPONENTIAL to prefill and
+    mixed graphs and LINEAR to decode-only graphs, since the two cover ranges that differ by
+    orders of magnitude. EXPONENTIAL halves from `cuda_graph_max_tokens` down to `tp_size`
+    (log-spaced, ~log2(max_tokens) graphs). LINEAR uses a range of linear strides (includes small
+    graphs + mid-range linearity + a bigger step size at the top end). Set EXPONENTIAL or LINEAR
+    explicitly to apply one distribution to both families.
     """
 
     use_cuda_graphs_for_non_decode_steps: bool = True
@@ -556,8 +565,9 @@ class InferenceConfig:
     enabled), then all DP ranks share the same sampling / generation seed.
     """
 
-    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
-    """Mode used to schedule dynamic batching inference work."""
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.ASYNC
+    """Mode used to schedule dynamic batching inference work. Defaults to async scheduling; use
+    ``AsyncScheduleMode.LEGACY`` to disable it."""
 
     logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
     """Whether returned log-probs are modified by the sampling parameters or not."""

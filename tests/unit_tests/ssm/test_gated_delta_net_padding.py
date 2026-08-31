@@ -28,7 +28,9 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
             # match up to bf16 ULP-level differences for GDN2.
             atol, rtol = 1e-2, 1e-2
         else:
-            atol, rtol = 3e-4, 3e-4
+            # SBHD and padded THD use distinct FLA bf16 kernel paths, which can
+            # differ by one ULP depending on the input and initialized weights.
+            atol, rtol = 5e-3, 5e-3
         sequence_length = 32
         micro_batch_size = 4
 
