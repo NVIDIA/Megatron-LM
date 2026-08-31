@@ -1075,21 +1075,21 @@ class TestParallelHybridBlockCudagraphs:
             return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
         def get_mamba_block(hybrid_layer_pattern):
-            layer_type_list = validate_segment_layers(hybrid_layer_pattern)
             transformer_config = TransformerConfig(
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 # Need to specify num_attention_heads and num_layers or TransformerConfig
                 # will generate errors.
-                num_layers=len(layer_type_list),
+                num_layers=len(hybrid_layer_pattern),
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 cuda_graph_impl="local",
             )
+            layer_config_list = validate_segment_layers(hybrid_layer_pattern, transformer_config)
             modules = hybrid_stack_spec.submodules
             return HybridStack(
                 transformer_config,
                 modules,
-                layer_type_list=layer_type_list,
+                layer_config_list=layer_config_list,
                 pp_layer_offset=0,
                 pg_collection=get_pg_collection(),
             )
@@ -1230,6 +1230,10 @@ class TestTECudaGraphHelper:
         assert (
             'sample_kwargs' in make_graphed_callables_kwargs
         ), "sample_kwargs should be present in make_graphed_callables_kwargs for TE >= 1.10.0"
+        if is_te_min_version("2.19.0"):
+            assert make_graphed_callables_kwargs['clone_param_grads_on_return'] is False
+        else:
+            assert 'clone_param_grads_on_return' not in make_graphed_callables_kwargs
         sample_kwargs = make_graphed_callables_kwargs['sample_kwargs']
 
         # Basic checks

@@ -19,6 +19,7 @@ except ImportError as e:
     HAS_BACKEND = False
 
 import megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints as endpoints
+from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.utils import trace_async_exceptions
 
@@ -50,6 +51,7 @@ async def _run_text_gen_server(
     verbose: bool = False,
     hostname: Optional[str] = None,
     chat_template: Optional[str] = None,
+    multimodal_prompt_config: Optional[MultimodalPromptConfig] = None,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
@@ -86,6 +88,9 @@ async def _run_text_gen_server(
         app.config['parsers'] = parsers
         app.config['verbose'] = verbose
         app.config['chat_template'] = chat_template
+        app.config['multimodal_prompt_config'] = (
+            multimodal_prompt_config or MultimodalPromptConfig()
+        )
 
         # Applying the chat template is synchronous and O(prompt); on the event loop it
         # stalls every other request this replica owns, including delivery of responses
@@ -137,6 +142,7 @@ def _server_process_worker(
     verbose: bool = False,
     hostname: Optional[str] = None,
     chat_template: Optional[str] = None,
+    multimodal_prompt_config: Optional[MultimodalPromptConfig] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -152,6 +158,7 @@ def _server_process_worker(
                 verbose,
                 hostname,
                 chat_template,
+                multimodal_prompt_config,
             )
         )
     except KeyboardInterrupt:
@@ -208,6 +215,7 @@ def start_text_gen_server(
     hostname: Optional[str] = None,
     sock: Optional[socket.socket] = None,
     chat_template: Optional[str] = None,
+    multimodal_prompt_config: Optional[MultimodalPromptConfig] = None,
 ) -> Optional[str]:
     """Start the text generation server.
 
@@ -266,6 +274,7 @@ def start_text_gen_server(
                 verbose,
                 hostname,
                 chat_template,
+                multimodal_prompt_config,
             ),
             daemon=True,
         )

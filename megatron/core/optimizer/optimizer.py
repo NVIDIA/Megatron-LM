@@ -378,15 +378,9 @@ class MegatronOptimizer(ABC):
         norm and clipped independently using their group norm.
         """
         self.grad_norms_by_group = {}
-        params = self.get_parameters()
-        if params:
-            grads_for_norm = self.get_grads_for_grad_norm()
-        else:
-            grads_for_norm = []
-        grad_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
-        )
+        grad_norm = self.get_grad_norm()
 
+        params = self.get_parameters()
         if clip_grad > 0.0 and params:
             # Only reduce group grad norms when clipping can use them.
             self._compute_grad_norms_by_group()
@@ -1008,8 +1002,26 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                         # float16 params:
                         if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                             float16_params_this_group.append(param)
-                            # Create a copy
-                            main_param = param.detach().clone().float()
+                            # Native quantized parameters may retain their pre-quantization
+                            # BF16/FP16 initializer on CPU. Build the FP32 master from that value
+                            # so primary-weight and non-primary-weight runs start identically.
+                            # Falling back to the model parameter is correct for ordinary
+                            # BF16/FP16 parameters and older quantized-tensor implementations.
+                            get_high_precision_init_val = getattr(
+                                param, 'get_high_precision_init_val', None
+                            )
+                            high_precision_init_val = (
+                                get_high_precision_init_val()
+                                if get_high_precision_init_val is not None
+                                else None
+                            )
+                            if high_precision_init_val is not None:
+                                main_param = high_precision_init_val.to(
+                                    device=param.device, dtype=torch.float32, copy=True
+                                )
+                                param.clear_high_precision_init_val()
+                            else:
+                                main_param = param.detach().clone().float()
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
                             tensor_parallel.copy_gtp_attributes(main_param, param)

@@ -8,6 +8,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+from torch.distributed.tensor import DTensor
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -310,6 +311,92 @@ class TestMcoreAdapterDense:
         success, _, _ = optimizer.step()
         assert success
 
+    def test_gradient_clipping_reaches_global_norm(self):
+        """MFSDP v2 reports the true global gradient norm and clips the update to it.
+
+        Clipping is measured through the optimizer update rather than through
+        parameter.grad after the step. _copy_model_grads_to_main_grads installs a
+        dtype-cast copy of each gradient, clip_grad_norm scales that copy, and
+        step_with_ready_grads restores the original afterwards, so the post-step
+        gradient is unclipped by design. Plain SGD at lr=1.0 makes the weight delta
+        exactly the gradient the optimizer stepped with, which keeps this test on the
+        default FP32-main-weight / BF16-gradient configuration.
+        """
+        clip_grad = 1.0
+        learning_rate = 1.0
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=_build_block(config),
+            pg_collection=self.pg_collection,
+        )
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="sgd",
+                lr=learning_rate,
+                weight_decay=0.0,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                use_distributed_optimizer=False,
+                clip_grad=clip_grad,
+            ),
+            [model],
+        )
+
+        def global_norm(local_tensors) -> float:
+            squared_norm = torch.zeros(1, dtype=torch.float32, device="cuda")
+            for local_tensor in local_tensors:
+                squared_norm += local_tensor.float().square().sum()
+            torch.distributed.all_reduce(squared_norm)
+            return squared_norm.sqrt().item()
+
+        optimizer.zero_grad(set_to_none=True)
+        output = model(
+            hidden_states=(
+                torch.arange(1, config.hidden_size + 1, device="cuda", dtype=torch.bfloat16)
+                .view(1, 1, -1)
+                .expand(8, 2, -1)
+                * (torch.distributed.get_rank() + 1)
+            ),
+            attention_mask=None,
+        )
+        output.float().square().sum().backward()
+
+        parameters = [
+            parameter for parameter in optimizer.get_parameters() if parameter.grad is not None
+        ]
+        assert all(isinstance(parameter.grad, DTensor) for parameter in parameters)
+        expected_pre_clip_norm = global_norm([p.grad.to_local() for p in parameters])
+        weights_before = [p.data.to_local().float().clone() for p in parameters]
+
+        success, pre_clip_norm, _ = optimizer.step()
+        updates = [
+            before - parameter.data.to_local().float()
+            for parameter, before in zip(parameters, weights_before)
+        ]
+
+        assert success
+        torch.testing.assert_close(pre_clip_norm.item(), expected_pre_clip_norm)
+        assert (
+            expected_pre_clip_norm > clip_grad
+        ), "Test gradients must exceed the clipping threshold to exercise clipping."
+        torch.testing.assert_close(global_norm(updates), clip_grad, rtol=1e-3, atol=0)
+
 
 class TestMcoreAdapterExpertParallel:
     """Exercise the MFSDP v2 adapter over an MoE model with EP=2."""
@@ -346,8 +433,8 @@ class TestMcoreAdapterExpertParallel:
         torch.distributed.destroy_process_group(self.reference_group)
         Utils.destroy_model_parallel()
 
-    def test_build_train_and_step(self):
-        """Shard experts over expert-DP and dense parameters over full DP."""
+    def test_build_train_step_and_clip(self):
+        """Shard experts over expert-DP and clip their combined gradients."""
         # The in-process EP=1 reference needs rank-invariant initialization. GPU expert
         # initialization instead uses the globally configured EP=2 rank in its RNG seed.
         config = TransformerConfig(
@@ -422,7 +509,7 @@ class TestMcoreAdapterExpertParallel:
         assert isinstance(model.module.decoder.layers[1].mlp.experts, FsdpModule)
 
         optimizer_config = OptimizerConfig(
-            lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=0.0
+            lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
         )
         reference_optimizer = get_megatron_optimizer(
             optimizer_config, [reference_model], use_gloo_process_groups=False
@@ -452,8 +539,11 @@ class TestMcoreAdapterExpertParallel:
                 targets,
             )
             reference_loss.backward()
-            reference_success, _, _ = reference_optimizer.step()
+            reference_success, reference_pre_clip_norm, _ = reference_optimizer.step()
             assert reference_success
+            assert (
+                reference_pre_clip_norm > optimizer_config.clip_grad
+            ), "Reference gradients must exceed the clipping threshold to exercise clipping."
             reference_losses.append(reference_loss.detach())
 
         losses = []

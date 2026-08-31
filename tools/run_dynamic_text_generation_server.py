@@ -20,7 +20,10 @@ if _EXAMPLES_MULTIMODAL not in sys.path:
 import torch  # noqa: E402
 
 from examples.multimodal.multimodal_args import add_multimodal_extra_args  # noqa: E402
-from megatron.core.inference.config import ImageProcessingConfig  # noqa: E402
+from megatron.core.inference.config import (  # noqa: E402
+    ImageProcessingConfig,
+    VideoProcessingConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext  # noqa: E402
 from megatron.core.inference.engines import DynamicInferenceEngine  # noqa: E402
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (  # noqa: E402,E501
@@ -169,6 +172,17 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
         use_thumbnail=getattr(args, 'use_thumbnail', False),
         num_img_embeddings_per_tile=args.num_img_embeddings_per_tile,
     )
+    inference_config.video_preprocessing_config = VideoProcessingConfig(
+        image_config=inference_config.image_preprocessing_config,
+        num_frames=int(getattr(args, "num_frames", 8)),
+        temporal_patch_size=int(
+            getattr(
+                model,
+                "temporal_patch_dim",
+                getattr(getattr(model, "vision_model", None), "temporal_patch_dim", 1),
+            )
+        ),
+    )
 
     context = DynamicInferenceContext(model.config, inference_config)
     wrapped_model = VLMInferenceWrapper(model, context)
@@ -238,6 +252,9 @@ async def run_text_generation_server(
                 num_replicas=num_replicas,
                 hostname=hostname,
                 chat_template=chat_template,
+                multimodal_prompt_config=(
+                    engine.controller.inference_wrapped_model.multimodal_prompt_config
+                ),
             )
 
         if args.frontend_on_all_ranks:
