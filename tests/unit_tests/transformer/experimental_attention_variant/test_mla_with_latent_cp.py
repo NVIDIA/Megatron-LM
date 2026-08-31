@@ -70,7 +70,7 @@ EXPECTED_QUALIFIED_BACKEND_CONFIGS: tuple[latent_cp.QualifiedBackendTuple, ...] 
     (AttnBackend.flash, "4.0.0b11", "flash-attn-4==4.0.0b11", (10, 0)),
 )
 EXPECTED_QUALIFICATION_EPS: dict[latent_cp.QualifiedBackendTuple, float] = {
-    (AttnBackend.fused, "1.22.1", "9.21.0", (9, 0)): 4.5788848699546136e-05,
+    (AttnBackend.fused, "1.22.1", "9.21.0", (9, 0)): 4.561878810305231e-05,
     (AttnBackend.fused, "1.26.0", "9.25.0", (10, 0)): 4.423665134356547e-05,
     (
         AttnBackend.flash,
@@ -79,6 +79,7 @@ EXPECTED_QUALIFICATION_EPS: dict[latent_cp.QualifiedBackendTuple, float] = {
         (10, 0),
     ): 4.3095951884009054e-05,
 }
+_LEGACY_FULL_KV_CP_PARITY_EPS = 1e-4
 
 _PRODUCTION_HIDDEN = 7168
 _PRODUCTION_HEADS = 96
@@ -3699,7 +3700,8 @@ def _run_production_parity(
 
 def _run_legacy_full_kv_cp_parity(rope_type: str) -> None:
     runtime = _qualified_real_backend_runtime_or_skip(AttnBackend.fused)
-    assertion_eps = EXPECTED_QUALIFICATION_EPS[runtime]
+    backend_qualified_eps = EXPECTED_QUALIFICATION_EPS[runtime]
+    assertion_eps = _LEGACY_FULL_KV_CP_PARITY_EPS
     with _model_parallel(2, 2) as pg:
         torch.manual_seed(_SEED + 30)
         torch.cuda.manual_seed_all(_SEED + 30)
@@ -3798,9 +3800,10 @@ def _run_legacy_full_kv_cp_parity(rope_type: str) -> None:
             event="mla_latent_cp_legacy_full_kv_cp_parity",
             metadata={
                 "backend": AttnBackend.fused.name,
+                "backend_qualified_eps": backend_qualified_eps,
                 "legacy_path": "MLASelfAttention+TEDotProductAttention",
+                "legacy_parity_eps": assertion_eps,
                 "rope": rope_type,
-                "qualified_eps": assertion_eps,
                 "runtime_tuple": [
                     runtime[0].name,
                     runtime[1],

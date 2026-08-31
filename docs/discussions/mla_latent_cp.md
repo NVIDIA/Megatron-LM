@@ -650,7 +650,7 @@ The completed sanitized qualification matrix is:
 
 | Hardware | Backend | Frontend/package | Runtime/distribution identity | Evidence epsilon |
 | --- | --- | --- | --- | --- |
-| H100 / SM90 | `AttnBackend.fused` | `1.22.1` | cuDNN `9.21.0` | `4.5788848699546136e-05` |
+| H100 / SM90 | `AttnBackend.fused` | `1.22.1` | cuDNN `9.21.0` | `4.561878810305231e-05` |
 | SM100 | `AttnBackend.fused` | `1.26.0` | cuDNN `9.25.0` | `4.423665134356547e-05` |
 | SM100 | `AttnBackend.flash` | `4.0.0b11` | `flash-attn-4==4.0.0b11` | `4.3095951884009054e-05` |
 
@@ -1010,6 +1010,8 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    directly, then compare every parameter gradient after the same explicit CP reduction and TP
    reconstruction. This accounts for latent recomputation and legacy pre-expansion assigning KV-up
    work to different CP ranks while also protecting the non-CP TE module topology. The
+   old/new comparison uses a strict `1e-4` envelope, separate from the tighter tuple-qualification
+   epsilon because its two distributed BF16 decompositions assign phase work differently. The
    independent pinned `NaiveMLA` parity remains the backend-independent oracle.
    A separate dynamic-CP run constructs one module with static CP=2, then compares effective CP=1
    (including odd lengths) and CP=2 forwards/backwards against the same reference. It requires the
