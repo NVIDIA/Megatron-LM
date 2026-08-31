@@ -7,6 +7,8 @@ import pytest
 import torch
 from megatron.lite.primitive.quantization.mxfp4 import MXFP4_BLOCK_SIZE
 
+pytestmark = pytest.mark.optional
+
 
 def _qat_config(**overrides):
     config = {

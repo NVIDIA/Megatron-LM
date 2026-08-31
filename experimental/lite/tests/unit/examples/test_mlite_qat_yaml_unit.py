@@ -3,6 +3,7 @@
 
 from pathlib import Path
 
+import pytest
 from hydra import compose, initialize_config_module
 from megatron.lite.primitive.quantization.qat import (
     QATSpec,
@@ -10,6 +11,8 @@ from megatron.lite.primitive.quantization.qat import (
     normalize_qat_spec,
 )
 from omegaconf import OmegaConf
+
+pytestmark = pytest.mark.optional
 
 
 def _compose_engine(*overrides: str) -> dict:
