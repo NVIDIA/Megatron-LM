@@ -532,8 +532,11 @@ any of them later requires explicit nested-checkpoint and saved-tensor/offload t
 Before yielding phase `i`, every rank submits the exchange for phase `i+1` on one process/device
 communication stream. The public `torch.distributed.batch_isend_irecv` batch contains `P2POp`
 objects ordered as `[isend(next), irecv(previous)]`, and every operation sets
-`group=effective_cp_group`. The communication stream first waits for the current payload producer;
+`group=effective_cp_group`. For a compute-produced payload, the communication stream waits for its producer;
 each returned `Work.wait` is issued while that stream is current, followed by a CUDA readiness event.
+Only the first hop waits for the ordinary compute stream: later hops relay a read-only receive already
+ordered on the same communication stream, so waiting for the preceding phase's attention kernels
+would create a false dependency. Every backward hop still waits for its compute-produced gradient.
 The generator then yields phase `i` on the ordinary attention stream. When it resumes for phase
 `i+1`, that consumer stream waits on the event, so the intervening attention kernels can overlap the
 one-hop receive without exposing an unready tensor.

@@ -81,6 +81,7 @@ def _launch_ring_exchange(
     receive_peer: int,
     communication_stream: torch.cuda.Stream | None,
     pending: _PendingExchange,
+    wait_for_compute_stream: bool,
 ) -> Tensor:
     """Launch one explicit-group exchange, isolated from the attention stream."""
 
@@ -95,9 +96,9 @@ def _launch_ring_exchange(
         pending.send_tensor = payload
         return receive
 
-    compute_stream = torch.cuda.current_stream(payload.device)
     with torch.cuda.stream(communication_stream):
-        communication_stream.wait_stream(compute_stream)
+        if wait_for_compute_stream:
+            communication_stream.wait_stream(torch.cuda.current_stream(payload.device))
         for work in dist.batch_isend_irecv(operations):
             work.wait()
         ready_event = torch.cuda.Event()
@@ -121,6 +122,7 @@ class _LatentRingExchange(torch.autograd.Function):
         next_peer: int,
         communication_stream: torch.cuda.Stream | None,
         pending: _PendingExchange,
+        wait_for_compute_stream: bool,
     ) -> Tensor:
         """Prefetch the preceding owner's payload on the communication stream."""
         ctx.cp_group = cp_group
@@ -134,12 +136,13 @@ class _LatentRingExchange(torch.autograd.Function):
             previous_peer,
             communication_stream,
             pending,
+            wait_for_compute_stream,
         )
 
     @staticmethod
     def backward(
         ctx: Any, grad_receive: Tensor
-    ) -> tuple[Tensor, None, None, None, None, None]:
+    ) -> tuple[Tensor, None, None, None, None, None, None]:
         """Route the received-payload gradient through the reverse ring hop."""
         grad_receive = grad_receive.contiguous()
         pending = _PendingExchange()
@@ -150,9 +153,10 @@ class _LatentRingExchange(torch.autograd.Function):
             ctx.next_peer,
             ctx.communication_stream,
             pending,
+            True,
         )
         pending.wait_on_current_stream(grad_payload)
-        return grad_payload, None, None, None, None, None
+        return grad_payload, None, None, None, None, None, None
 
 
 class P2PRingTransport:
@@ -202,6 +206,7 @@ class P2PRingTransport:
                     self.next_peer,
                     communication_stream,
                     next_pending,
+                    phase_index == 0,
                 )
 
             yield PayloadLease(owner=phase.owner, tensor=payload)

@@ -2582,6 +2582,7 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         batch_calls = []
         batch_streams = []
         returned_proxies = []
+        wait_for_compute_stream = []
         consumer_stream = torch.cuda.current_stream().cuda_stream
         wait_count = 0
 
@@ -2611,6 +2612,13 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
 
         monkeypatch.setattr(latent_cp.dist, "P2POp", p2p_op)
         monkeypatch.setattr(latent_cp.dist, "batch_isend_irecv", batch)
+        real_launch = latent_cp._transport._launch_ring_exchange
+
+        def launch(*args, **kwargs):
+            wait_for_compute_stream.append(args[-1])
+            return real_launch(*args, **kwargs)
+
+        monkeypatch.setattr(latent_cp._transport, "_launch_ring_exchange", launch)
         lease_iterator = latent_cp.P2PRingTransport(pg.cp).iter_payloads(
             payload, layout.phases
         )
@@ -2648,6 +2656,10 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         assert len(p2p_records) == 2 * len(batch_calls)
         assert returned_proxies and all(proxy.waited for proxy in returned_proxies)
         assert wait_count == len(returned_proxies)
+        assert wait_for_compute_stream[: cp_size - 1] == [True] + [False] * (
+            cp_size - 2
+        )
+        assert wait_for_compute_stream[cp_size - 1 :] == [True] * (cp_size - 1)
         assert len(set(batch_streams)) == 1
         assert batch_streams[0] != consumer_stream
 
