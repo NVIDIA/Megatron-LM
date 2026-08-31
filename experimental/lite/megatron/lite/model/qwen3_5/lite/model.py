@@ -7,13 +7,14 @@ and uses Megatron Lite parallel, TE, RoPE, and MoE primitives directly.
 
 from __future__ import annotations
 
+import os
 from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import transformer_engine.pytorch as te
 
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
@@ -49,6 +50,7 @@ _SP_GRAD_SUFFIXES: tuple[str, ...] = (
     ".full_attn.k_norm.weight",
     ".linear_attn.in_proj.linear.layer_norm_weight",
     ".linear_attn.norm.weight",
+    ".mlp.gate_up.linear.layer_norm_weight",
     ".mlp_norm.weight",
     ".moe.router.gate.weight",
     ".moe.shared_expert.shared_gate.weight",
@@ -77,6 +79,27 @@ def _qwen_mrope_section(config: Qwen35Config) -> list[int]:
     rotary_half = max(int(config.rotary_dim // 2), 1)
     base = rotary_half // 3
     return [base, base, rotary_half - 2 * base]
+
+
+class DenseMLP(nn.Module):
+    def __init__(self, config: Qwen35Config, ps: ParallelState):
+        super().__init__()
+        assert config.intermediate_size is not None
+        self.gate_up = ColumnParallelLinear(
+            config.hidden_size,
+            config.intermediate_size * 2,
+            ps,
+            bias=False,
+            normalization="RMSNorm",
+            eps=config.rms_norm_eps,
+            zero_centered_gamma=True,
+        )
+        self.down = RowParallelLinear(
+            config.intermediate_size, config.hidden_size, ps, bias=False
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(_swiglu(self.gate_up(x)))
 
 
 class SharedExpert(nn.Module):
@@ -273,21 +296,27 @@ class Qwen35Layer(nn.Module):
                 deterministic=deterministic,
                 cp_mode=gdn_cp_mode,
             )
-        self.mlp_norm = te.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True
-        )
-        self.moe = MoELayer(
-            config,
-            ps,
-            use_deepep=use_deepep,
-            router_bias_rate=router_bias_rate,
-            fp8=fp8,
-            moe_act_recompute=moe_act_recompute,
-            router_dtype=torch.float32,
-            preserve_3d_graph=deterministic,
-            shared_expert_plain_te=deterministic,
-            moe_permute_fusion=True,
-        )
+        if config.is_moe:
+            self.mlp_norm: nn.Module | None = te.RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True
+            )
+            self.moe: MoELayer | None = MoELayer(
+                config,
+                ps,
+                use_deepep=use_deepep,
+                router_bias_rate=router_bias_rate,
+                fp8=fp8,
+                moe_act_recompute=moe_act_recompute,
+                router_dtype=torch.float32,
+                preserve_3d_graph=deterministic,
+                shared_expert_plain_te=deterministic,
+                moe_permute_fusion=True,
+            )
+            self.mlp: DenseMLP | None = None
+        else:
+            self.mlp_norm = None
+            self.moe = None
+            self.mlp = DenseMLP(config, ps)
 
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
@@ -300,8 +329,11 @@ class Qwen35Layer(nn.Module):
             h = self.linear_attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
         x = residual + h
         residual = x
-        x = residual + self.moe(self.mlp_norm(x))
-        return x
+        if self.moe is not None:
+            assert self.mlp_norm is not None
+            return residual + self.moe(self.mlp_norm(x))
+        assert self.mlp is not None
+        return residual + self.mlp(x)
 
 
 def _temperature_to_float(temperature: float | torch.Tensor) -> float:
@@ -325,6 +357,31 @@ def _ensure_mrope_position_ids(position_ids: torch.Tensor | None) -> torch.Tenso
     raise ValueError("Qwen3.5 MRoPE expects position_ids shape (B,S), (1,B,S), or (3,B,S).")
 
 
+def _apply_attention_backend_override(backend: str | None) -> None:
+    # Direct protocol users pass None.  Restore TE's automatic selection in
+    # that case so a previously constructed model cannot leak its choice into
+    # Qwen3.5.  The runtime passes an explicit override when one is configured.
+    if backend is None:
+        backend = "auto"
+    env = {
+        "auto": ("1", "1", "1"),
+        "flash": ("1", "0", "0"),
+        "fused": ("0", "1", "0"),
+        "unfused": ("0", "0", "1"),
+        "local": ("0", "0", "1"),
+    }.get(backend)
+    if env is None:
+        raise ValueError(
+            "attention_backend_override must be one of "
+            "{'auto', 'flash', 'fused', 'unfused', 'local'}"
+        )
+    (
+        os.environ["NVTE_FLASH_ATTN"],
+        os.environ["NVTE_FUSED_ATTN"],
+        os.environ["NVTE_UNFUSED_ATTN"],
+    ) = env
+
+
 class Qwen35Model(nn.Module):
     def __init__(
         self,
@@ -344,7 +401,7 @@ class Qwen35Model(nn.Module):
         gdn_cp_mode: str = "headwise",
     ):
         super().__init__()
-        del attention_backend_override
+        _apply_attention_backend_override(attention_backend_override)
         self.config = config
         self.train_config = train_config
         self.ps = ps
@@ -703,6 +760,7 @@ def _build_native_vision_model(hf_path: str) -> nn.Module | None:
 
 
 __all__ = [
+    "DenseMLP",
     "FullAttention",
     "GatedDeltaNet",
     "MoELayer",

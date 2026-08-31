@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import ast
 import builtins
@@ -17,10 +17,12 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.spec_utils import import_module
+from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.training.config import (
     CheckpointConfig,
     DistributedInitConfig,
+    InferenceConfigContainer,
+    InferenceSetupConfig,
     LoggerConfig,
     PretrainConfigContainer,
     ProfilingConfig,
@@ -336,8 +338,8 @@ def _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern):
     else:
         provided = list(args.csa_compress_ratios)
         if len(provided) == compact_len:
-            args.csa_compress_ratios, kw_args['csa_compress_ratios'] = (
-                padded_to_compact_and_full(provided)
+            args.csa_compress_ratios, kw_args['csa_compress_ratios'] = padded_to_compact_and_full(
+                provided
             )
         elif len(provided) == full_len:
             compact = []
@@ -363,6 +365,26 @@ def _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern):
                 f"number of all layers in the hybrid pattern ({full_len}) for pattern "
                 f"'{pattern}'."
             )
+
+
+def _resolve_dsa_kernel_backend_cli_default(args, kw_args):
+    """Resolve an omitted --dsa-kernel-backend flag to its effective backend.
+
+    The CLI flag carries no static default so an omitted flag is distinguishable
+    from an explicit "none". DSv4 hybrid launches historically ran fused kernels
+    by default (the deprecated --no-dsa-kernel-fusion flag defaulted to True), so
+    an omitted flag resolves to "cudnn" for that variant unless the deprecated
+    switch was passed; every other configuration resolves to "none". Runs before
+    TransformerConfig.__post_init__ folds the deprecated switch into
+    dsa_kernel_backend, so explicit legacy values still win.
+    """
+    if 'dsa_kernel_backend' not in kw_args or kw_args['dsa_kernel_backend'] is not None:
+        return
+    variant = kw_args.get('experimental_attention_variant') or kw_args.get('linear_attention_type')
+    if variant == 'dsv4_hybrid' and getattr(args, 'apply_dsa_kernel_fusion', None) is None:
+        kw_args['dsa_kernel_backend'] = 'cudnn'
+    else:
+        kw_args['dsa_kernel_backend'] = 'none'
 
 
 def core_transformer_config_from_args(args, config_class=None):
@@ -441,6 +463,7 @@ def core_transformer_config_from_args(args, config_class=None):
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         pattern = args.hybrid_layer_pattern
+        has_kda = Symbols.KDA in pattern
         has_dsv4_csa = any(s in pattern for s in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA))
         has_dsa = Symbols.DS_ATTENTION in pattern
         if getattr(args, 'experimental_attention_variant', None) is None:
@@ -448,8 +471,12 @@ def core_transformer_config_from_args(args, config_class=None):
                 kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
             elif has_dsa:
                 kw_args['experimental_attention_variant'] = 'dsa'
+            elif has_kda:
+                kw_args['experimental_attention_variant'] = 'kda'
 
         _normalize_dsv4_hybrid_csa_compress_ratios(args, kw_args, pattern)
+
+    _resolve_dsa_kernel_backend_cli_default(args, kw_args)
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -475,8 +502,45 @@ def core_transformer_config_from_args(args, config_class=None):
     if hasattr(args, "kitchen_attention_backend"):
         kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
 
+    # Build config.
+    config = config_class(**kw_args)
+
+    _apply_yarn_config_from_args(config, args)
+
     # Return config.
-    return config_class(**kw_args)
+    return config
+
+
+def _apply_yarn_config_from_args(config, args) -> None:
+    """Populate ``config.yarn_*`` attributes from args for non-MLA YaRN models.
+
+    GPTModel's ``yarn`` branch and ``yarn_rotary_pos_embedding`` read these as
+    dynamic attributes off the config (``getattr(config, "yarn_rotary_scaling_factor")``
+    etc.) with no default, so the attributes must exist whenever
+    ``position_embedding_type == 'yarn'``. The CLI exposes some of these without a
+    ``yarn_`` prefix (``--rotary-scaling-factor``, ``--mscale``, ``--mscale-all-dim``),
+    so the mapping is explicit. Pre-existing values on ``config`` (e.g. from YAML or a
+    ModelOpt GPT-OSS builder) are preserved. Defaults mirror ``YarnRotaryEmbedding``.
+    """
+    if getattr(args, 'position_embedding_type', None) != 'yarn':
+        return
+    if getattr(args, 'multi_latent_attention', False):
+        # MLATransformerConfig declares the unprefixed YaRN fields and its
+        # attention path consumes them directly; do not shadow them here.
+        return
+
+    def _set(attr: str, value, default) -> None:
+        if hasattr(config, attr):
+            return
+        setattr(config, attr, value if value is not None else default)
+
+    _set('yarn_rotary_scaling_factor', args.rotary_scaling_factor, 1.0)
+    _set('yarn_original_max_position_embeddings', args.yarn_original_max_position_embeddings, 4096)
+    _set('yarn_beta_fast', args.yarn_beta_fast, 32.0)
+    _set('yarn_beta_slow', args.yarn_beta_slow, 1.0)
+    _set('yarn_mscale', args.mscale, 1.0)
+    _set('yarn_mscale_all_dim', args.mscale_all_dim, 0.0)
+    _set('yarn_correction_range_round_to_int', args.yarn_correction_range_round_to_int, True)
 
 
 def _default_config_from_args(cls: type, args: Namespace, return_instance: bool = True) -> Any:
@@ -556,7 +620,13 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None = 
             not transformer_cfg.inference_fuse_tp_communication
         ), "inference_fuse_tp_communication is not supported for HybridModel"
     elif args.spec is not None:
-        kwargs["hybrid_stack_spec"] = import_module(args.spec)
+        hybrid_stack_spec = import_module(args.spec)
+        # ModuleSpec implements __call__ to build the described module, so a
+        # generic callable check would instantiate static specs here before a
+        # ProcessGroupCollection exists. Only resolve callable spec factories.
+        if callable(hybrid_stack_spec) and not isinstance(hybrid_stack_spec, ModuleSpec):
+            hybrid_stack_spec = hybrid_stack_spec(transformer_cfg)
+        kwargs["hybrid_stack_spec"] = hybrid_stack_spec
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
@@ -628,6 +698,63 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
         tokenizer=_default_config_from_args(TokenizerConfig, args),
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
+    )
+
+    return cfg
+
+
+def inference_cfg_from_args(args: Namespace) -> InferenceSetupConfig:
+    """Build an InferenceSetupConfig from the argparse arguments.
+
+    InferenceSetupConfig field names map one-to-one onto the argparse ``dest`` names produced
+    by ``_add_inference_args``, so this is a direct copy of the relevant values from ``args``.
+
+    This builds the declarative/serializable inference config. To obtain the runtime engine
+    config (``megatron.core.inference.config.InferenceConfig``), call
+    ``inference_cfg_from_args(args).to_inference_config(model, ...)``.
+    """
+    return _default_config_from_args(InferenceSetupConfig, args)
+
+
+def inference_cfg_container_from_args(args: Namespace, model_cfg=None) -> InferenceConfigContainer:
+    """Build an InferenceConfigContainer from the argparse arguments.
+
+    This mirrors ``pretrain_cfg_container_from_args`` but assembles only the configs that
+    inference needs (no optimizer, scheduler, training, validation, DDP, rerun, or straggler
+    configs). It is intended to be passed to ``initialize_megatron`` from inference entry points.
+
+    Args:
+        args: Parsed and validated argparse namespace (e.g. from ``parse_and_validate_args``).
+        model_cfg: Optional pre-built model config. If None, a model config is constructed from
+            ``args`` (a HybridModelConfig when ``--hybrid-layer-pattern`` is set, otherwise a
+            GPTModelConfig).
+    """
+    if model_cfg is None:
+        if getattr(args, "hybrid_layer_pattern", None) is not None:
+            model_cfg = hybrid_config_from_args(args)
+        else:
+            model_cfg = gpt_config_from_args(args)
+
+    ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
+    ckpt_kwargs["save_optim"] = not args.no_save_optim
+    ckpt_kwargs["save_rng"] = not args.no_save_rng
+    ckpt_kwargs["load_optim"] = not args.no_load_optim
+    ckpt_kwargs["load_rng"] = not args.no_load_rng
+    ckpt_kwargs["fully_parallel_save"] = args.ckpt_fully_parallel_save
+    ckpt_kwargs["fully_parallel_load"] = args.ckpt_fully_parallel_load
+
+    prof_kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
+    prof_kwargs["use_nsys_profiler"] = args.profile
+
+    cfg = InferenceConfigContainer(
+        model=model_cfg,
+        checkpoint=CheckpointConfig(**ckpt_kwargs),
+        inference=inference_cfg_from_args(args),
+        dist=_default_config_from_args(DistributedInitConfig, args),
+        rng=_default_config_from_args(RNGConfig, args),
+        tokenizer=_default_config_from_args(TokenizerConfig, args),
+        logger=_default_config_from_args(LoggerConfig, args),
+        profiling=ProfilingConfig(**prof_kwargs),
     )
 
     return cfg

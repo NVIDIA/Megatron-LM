@@ -8,12 +8,19 @@ import json
 import os
 import re
 import types
+
+try:
+    import yaml
+
+    HAVE_YAML = True
+except ImportError:
+    HAVE_YAML = False
+
 from itertools import chain, starmap
 from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
-import yaml
 
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
@@ -31,8 +38,9 @@ def env_constructor(loader, node):
     return value
 
 
-yaml.add_implicit_resolver("!pathex", env_pattern)
-yaml.add_constructor("!pathex", env_constructor)
+if HAVE_YAML:
+    yaml.add_implicit_resolver("!pathex", env_pattern)
+    yaml.add_constructor("!pathex", env_constructor)
 
 
 str_dtype_to_torch = {
@@ -490,6 +498,10 @@ def core_transformer_config_from_yaml(args, transfomer_key="language_model"):
 
 def load_yaml(yaml_path):
     print(f"warning using experimental yaml arguments feature, argparse arguments will be ignored")
+    if not HAVE_YAML:
+        raise ImportError(
+            "PyYAML is required to load YAML arguments. " "Install via `pip install pyyaml`."
+        )
     with open(yaml_path, "r") as f:
         config = yaml.safe_load(f)
         # Convert to nested namespace

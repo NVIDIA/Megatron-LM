@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import weakref
 from contextlib import contextmanager
 from typing import Optional
 
@@ -11,12 +12,45 @@ from ..optimizer.param_layout import FullParamLayout
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
-from ..utils import log_single_rank
+from ..utils import PARAM_READY_CALLBACK_ATTR, log_single_rank
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers, partition_buckets
 
 logger = logging.getLogger(__name__)
+
+
+class _BucketParamReadyCallback:
+    """Publish one bucket group's parameters before a direct parameter read."""
+
+    def __init__(self, ddp: 'DistributedDataParallel', bucket_group) -> None:
+        self._ddp = weakref.ref(ddp)
+        self._bucket_group = weakref.ref(bucket_group)
+
+    def __call__(self) -> None:
+        bucket_group = self._bucket_group()
+        if bucket_group is None:
+            return
+
+        # This is the hot path for every microbatch after the first one in an iteration.
+        if bucket_group.param_gather_dispatched and bucket_group.param_gather_handle is None:
+            return
+
+        ddp = self._ddp()
+        if ddp is None or is_graph_capturing():
+            return
+
+        # With forward pre-hooks removed, the caller owns the gather schedule. An in-flight
+        # gather still has to finish, but this callback must not dispatch another bucket.
+        ddp_owns_schedule = bool(ddp.remove_forward_pre_hook_handles)
+        if bucket_group.param_gather_handle is not None:
+            if ddp_owns_schedule:
+                ddp._finish_param_sync_for_bucket_group(bucket_group)
+            else:
+                bucket_group.finish_param_sync(skip_next_bucket_dispatch=True)
+        elif ddp_owns_schedule:
+            assert not bucket_group.param_gather_dispatched
+            ddp._finish_param_sync_for_bucket_group(bucket_group)
 
 
 class DistributedDataParallel(_BaseDataParallel):
@@ -333,9 +367,19 @@ class DistributedDataParallel(_BaseDataParallel):
         # Create map from param to bucket group, used in pre_hook.
         for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
             for bucket_group in bucket_groups:
+                ready_callback = (
+                    _BucketParamReadyCallback(self, bucket_group)
+                    if self.ddp_config.overlap_param_gather
+                    else None
+                )
                 for bucket in bucket_group.buckets:
                     for param in bucket.params_list:
                         self.param_to_bucket_group[param] = bucket_group
+                        if ready_callback is not None:
+                            setattr(param, PARAM_READY_CALLBACK_ATTR, ready_callback)
+                        elif hasattr(param, PARAM_READY_CALLBACK_ATTR):
+                            # A re-wrapped model must not retain the previous DDP's callback.
+                            delattr(param, PARAM_READY_CALLBACK_ATTR)
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
         # if we re-mapped parameters (which happens when we use the distributed optimizer).
@@ -442,20 +486,16 @@ class DistributedDataParallel(_BaseDataParallel):
                 if param not in self.param_to_bucket_group:
                     continue
                 assert param.requires_grad
-
-                # If aligning param all-gather across pipeline stages, all-gather is dispatched
-                # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
-                # If overlapping param all-gather with optimizer step, then all-gather has
-                # already been dispatched in optimizer step.
-                skip_next_bucket_dispatch = (
-                    self.ddp_config.align_param_gather
-                    or self.overlap_param_gather_with_optimizer_step
-                )
-                self.param_to_bucket_group[param].finish_param_sync(
-                    skip_next_bucket_dispatch=skip_next_bucket_dispatch
-                )
+                self._finish_param_sync_for_bucket_group(self.param_to_bucket_group[param])
 
         return hook
+
+    def _finish_param_sync_for_bucket_group(self, bucket_group):
+        """Drain one bucket group's param all-gather and run its post-processing."""
+        skip_next_bucket_dispatch = (
+            self.ddp_config.align_param_gather or self.overlap_param_gather_with_optimizer_step
+        )
+        bucket_group.finish_param_sync(skip_next_bucket_dispatch=skip_next_bucket_dispatch)
 
     def _make_backward_post_hook(self, param: torch.nn.Parameter):
         """
@@ -470,7 +510,8 @@ class DistributedDataParallel(_BaseDataParallel):
 
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
-                if self.ddp_config.overlap_grad_reduce:
+                cudagraph_wgrad_ready_event = getattr(param, '_cudagraph_wgrad_ready_event', None)
+                if self.ddp_config.overlap_grad_reduce and cudagraph_wgrad_ready_event is None:
                     assert (
                         param.grad is not None
                     ), 'param.grad being None is not safe when overlap_grad_reduce is True'

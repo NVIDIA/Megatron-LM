@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """General utilities."""
 import json
@@ -42,6 +42,7 @@ from megatron.core.transformer.module import param_is_not_shared
 from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
+    get_pg_rank,
     to_local_if_dtensor,
     unwrap_model,
 )
@@ -292,8 +293,12 @@ def logical_and_across_model_parallel_group(
     return bool(input.item())
 
 
-def report_memory(name):
-    """Simple GPU memory report."""
+def report_memory(name, process_group=None):
+    """Simple GPU memory report.
+
+    process_group: optional data-parallel group to gate the rank-0 print on; None falls back
+        to ``mpu.get_data_parallel_rank()`` (byte-identical for callers passing nothing).
+    """
     args = get_args()
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
@@ -303,7 +308,12 @@ def report_memory(name):
     string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
     if args.log_device_memory_used:
         string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
-    if mpu.get_data_parallel_rank() == 0:
+    is_dp_rank_0 = (
+        get_pg_rank(process_group) == 0
+        if process_group is not None
+        else mpu.get_data_parallel_rank() == 0
+    )
+    if is_dp_rank_0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
 
@@ -520,9 +530,13 @@ def get_blend_and_blend_per_split(args):
     return blend, blend_per_split
 
 
-def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
+def get_batch_on_this_tp_rank(
+    data_iterator, mtp_on_this_rank: bool = False, needs_padding_mask: bool = False
+):
 
     args = get_args()
+    # Optional input structure must be identical across TP ranks and remain
+    # static during full-iteration CUDA Graph capture.
 
     def _broadcast(item):
         if item is not None:
@@ -545,6 +559,9 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 if "attention_mask" not in data
                 else data["attention_mask"].cuda(non_blocking=True)
             ),
+            'padding_mask': (
+                data["padding_mask"].cuda(non_blocking=True) if needs_padding_mask else None
+            ),
             'position_ids': data["position_ids"].cuda(non_blocking=True),
             'cu_seqlens': (
                 None if "cu_seqlens" not in data else data["cu_seqlens"].cuda(non_blocking=True)
@@ -561,9 +578,9 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
         def _broadcast_cu_seqlens(cu_seqlens):
             if getattr(args, 'cuda_graph_impl', 'none') == 'full_iteration':
-                assert cu_seqlens is None, (
-                    "cu_seqlens is not supported with cuda_graph_impl=full_iteration"
-                )
+                assert (
+                    cu_seqlens is None
+                ), "cu_seqlens is not supported with cuda_graph_impl=full_iteration"
                 return
             dev = torch.cuda.current_device()
             n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
@@ -589,6 +606,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['tokens'])
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
+            _broadcast(batch['padding_mask'])
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
             _broadcast_cu_seqlens(batch['cu_seqlens'])
@@ -597,6 +615,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
         elif mpu.is_pipeline_first_stage():
             _broadcast(batch['tokens'])
+            _broadcast(batch['padding_mask'])
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
             _broadcast_cu_seqlens(batch['cu_seqlens'])
@@ -608,7 +627,21 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
+            _broadcast(batch['padding_mask'])
             _broadcast(batch['attention_mask'])
+
+        else:
+            # SBHD validation needs physical padding metadata on intermediate
+            # stages because those stages may also contain MoE layers.
+            _broadcast(batch['padding_mask'])
+            batch['tokens'] = None
+            batch['labels'] = None
+            batch['loss_mask'] = None
+            batch['attention_mask'] = None
+            batch['position_ids'] = None
+            batch['cu_seqlens'] = None
+            batch['max_seqlen'] = None
+            batch['local_cp_size'] = None
 
     else:
         if args.dynamic_context_parallel:
@@ -621,6 +654,11 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         tokens = torch.empty(shape, dtype=torch.int64, device=torch.cuda.current_device())
         labels = torch.empty(shape, dtype=torch.int64, device=torch.cuda.current_device())
         loss_mask = torch.empty(shape, dtype=torch.float32, device=torch.cuda.current_device())
+        padding_mask = (
+            torch.empty(shape, dtype=torch.bool, device=torch.cuda.current_device())
+            if needs_padding_mask
+            else None
+        )
         if args.create_attention_mask_in_dataloader:
             shape_attention_mask = (
                 (args.micro_batch_size, 1, args.seq_length, args.seq_length)
@@ -666,6 +704,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(tokens)
             _broadcast(labels)
             _broadcast(loss_mask)
+            _broadcast(padding_mask)
             _broadcast(attention_mask)
             _broadcast(position_ids)
             cu_seqlens = _broadcast_cu_seqlens()
@@ -677,6 +716,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             loss_mask = None
 
             _broadcast(tokens)
+            _broadcast(padding_mask)
             _broadcast(attention_mask)
             _broadcast(position_ids)
             cu_seqlens = _broadcast_cu_seqlens()
@@ -693,12 +733,26 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
             _broadcast(labels)
             _broadcast(loss_mask)
+            _broadcast(padding_mask)
             _broadcast(attention_mask)
+
+        else:
+            tokens = None
+            labels = None
+            loss_mask = None
+            attention_mask = None
+            position_ids = None
+            cu_seqlens = None
+            max_seqlen = None
+            local_cp_size = None
+
+            _broadcast(padding_mask)
 
         batch = {
             'tokens': tokens,
             'labels': labels,
             'loss_mask': loss_mask,
+            'padding_mask': padding_mask,
             'attention_mask': attention_mask,
             'position_ids': position_ids,
             'cu_seqlens': cu_seqlens,
@@ -751,7 +805,7 @@ def get_nvtx_range():
         time: If True, also track with Megatron timers (default: False)
         log_level: Timer log level (0=always, 1=default, 2=verbose). Default: 1
     """
-    from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+    from megatron.core.utils import nvtx_range as core_nvtx_range
 
     @contextmanager
     def nvtx_range(msg, time=False, log_level=1):
@@ -759,10 +813,9 @@ def get_nvtx_range():
             timers = get_timers()
             timers(msg, log_level=log_level).start()
         try:
-            nvtx_range_push(msg)
-            yield
+            with core_nvtx_range(msg):
+                yield
         finally:
-            nvtx_range_pop(msg)
             if time:
                 timers(msg, log_level=log_level).stop()
 

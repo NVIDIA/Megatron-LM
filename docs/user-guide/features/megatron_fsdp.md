@@ -136,7 +136,7 @@ fsdp_model.load_state_dict(ckpt["model"], strict=False)
 optimizer.load_state_dict(ckpt["optimizer"])
 ```
 
-> ℹ️ `fully_shard` is an _**experimental**_ API. Please check back for updates as we fine-tune our user experience! For more examples using `fully_shard` for Megatron-FSDP, refer to our suite of unit tests: [`tests/unit_tests/distributed/megatron_fsdp/test_mfsdp_fully_shard.py`](../../../tests/unit_tests/distributed/megatron_fsdp/test_mfsdp_fully_shard.py)
+> ℹ️ `fully_shard` is an _**experimental**_ API. Please check back for updates as we fine-tune our user experience! For more examples using `fully_shard` for Megatron-FSDP, refer to our suite of unit tests: [`tests/unit_tests/distributed/mfsdp_v1/test_mfsdp_fully_shard.py`](../../../tests/unit_tests/distributed/mfsdp_v1/test_mfsdp_fully_shard.py)
 
 ### 🤖 Megatron-LM
 
@@ -344,7 +344,9 @@ Source: Feng, Wei, Will Constable, and Yifan Mao. “Getting Started with Fully 
 | Optimization | Description | `Megatron-Core` Config | `fully_shard` Config |
 |--------------|-------------|----------------------|----------------------|
 | **FSDP Unit Modules** | A list of `str` or `class` import paths for `torch.nn.Module`(s) that are considered FSDP unit modules and sharded by Megatron-FSDP. Parameters and sub-modules that are not members of an FSDP unit are not sharded. |  Defaults to supported Megatron-Core modules (`TransformerLayer`, etc.) in Megatron-LM. | `fsdp_unit_modules=[...]` |
-| **FSDP Double Buffer Allocator** | Megatron-FSDP uses the double-buffer allocator, which persistently allocates a buffer pair assigned to alternating FSDP units that temporarily stores parameters and gradients. Automatically used with NCCL user buffer registration. | `--fsdp-double-buffer` | `fsdp_double_buffer=True` |
+| **FSDP Persistent Buffer Pool** | Enables persistent communication-buffer pools. The legacy `double_buffer` name is retained for compatibility, but pool capacity is configurable and defaults to two. Automatically used with NCCL user buffer registration. | `--fsdp-double-buffer` | `fsdp_double_buffer=True` |
+| **FSDP Persistent Buffer Count** | Number of buffers in each persistent communication pool. Must be at least two when the pool is enabled; changing the default while the pool is disabled is invalid. | `--fsdp-buffer-count <int>` | `fsdp_buffer_count=<int>` |
+| **FSDP Max Pool Allocator** | Megatron-FSDP uses the `MaxPoolAllocator`, which supports double buffering hybrid / asymmetrical model architectures by taking the maximum of all layers. Automatically sets `--fsdp-double-buffer`. | `--megatron-fsdp-max-pool-double-buffer` | `maxpool_double_buffer=True` |
 | **Param All-Gather Overlap** | Whether to overlap parameter all-gather with compute. Automatically activated for the ZeRO-3 sharding strategy. | `--overlap-param-gather` | `overlap_param_gather=True` |
 | **Gradient Reduce-Scatter Overlap** | Whether to overlap gradient reduce-scatter or all-reduce with compute. Automatically activated for ZeRO-2 and ZeRO-3 sharding strategies. | `--overlap-grad-reduce` | `overlap_grad_reduce=True` |
 | **FSDP Communication Size** | Customize the size (in `numel()` elements) of AG and RS communications in Megatron-FSDP, by limiting how many elements are concurrently pre-fetched or reduced for AG and RS. Effectively suggests how many FSDP units are processed concurrently, which may launch collectives earlier and improve performance. Optionally, tune this value depending on system memory and performance requirements. | `--suggested-communication-unit-size <num-elements>` | N/A (Megatron-Core Only) |
@@ -394,20 +396,29 @@ To implement these "unit-periodic" mechanics, Megatron-FSDP uses `Module` hooks 
   - When `module.state_dict()` (for any module managed by Megatron-FSDP) is invoked, Megatron-FSDP will swap all parameter references to point to sharded `DTensor` main weights for distributed optimization and checkpointing.
   - When `MegatronFSDP.load_state_dict()` is invoked, both the main and compute weights are updated. When using quantized model compute, the main weights are quantized and sharded.
 
-#### Double Buffering
+#### Persistent Buffer Pools
 
 Megatron-FSDP uses a `Tensor._typed_storage()._resize_(bytes)`-based allocator to instantly allocate and de-allocate memory without depending on the `CUDACachingAllocator` for un-sharded parameters and gradients by default. (Cache fragmentation and garbage collection can procrastinate large quantities of `cudaMalloc` and `cudaFree` operations that can block programs and spike memory, particularly when memory utilization is maxed out.) However, modifying the underlying storage of a buffer is not compatible with NCCL symmetric registration or CUDA graphability, which require a persistent state during runtime.
 
-To support these optimizations, Megatron-FSDP uses **double-buffering**, which assigns 2 persistently-allocated buffers to FSDP units in an alternating pattern, hard-limiting the memory overhead for parameter and gradient buffer allocation and ensuring that no more than 2 FSDP units are computed or communicated concurrently.
+To support these optimizations, Megatron-FSDP can use persistent communication-buffer pools. The legacy `fsdp_double_buffer` option enables these pools, while `fsdp_buffer_count` controls the capacity of each pool. Its default value of 2 preserves conventional double-buffer behavior, but larger values can support schedules with more concurrently live FSDP units.
 
 ```{figure} ../../images/megatron_fsdp/fsdp_double_buffer.png
 :alt: FSDP Double Buffering
 :align: center
 
-Visualization of double buffering in Megatron-FSDP. Even- and odd-indexed FSDP units share the same un-sharded parameter and gradient buffers, overwriting incumbent data as needed during runtime. Megatron-FSDP ensures that no more than two FSDP units are un-sharded at any point during runtime.
+Visualization of the default two-slot persistent pool in Megatron-FSDP. Slots are shared capacity assigned to compatible live buckets at runtime rather than statically dedicated to pipeline-schedule roles. With `fsdp_buffer_count=3`, for example, a current forward unit and two forward-prefetched successors may occupy three slots when the schedule permits it.
 ```
 
-With double-buffering, Megatron-FSDP does not need to allocate memory after initialization, which can reduce memory fragmentation and improve performance. However, double-buffering requires _depth-wise model symmetry_, where even- and odd-indexed FSDP units have identical size during runtime. If double-buffering is utilized, Megatron-FSDP computes the **_mode_** of FSDP unit sizes as the symmetrical double-buffer size, and any FSDP units not symmetrical to the computed size will default to the `_resize_(bytes)`-based allocator (or persistently allocated for extremely large and asymmetrical layers that affect performance significantly like `torch.nn.Embedding` when the low-level argument `fsdp_db_use_persist_buf_on_alloc_fail` is set).
+With persistent pools, Megatron-FSDP does not need to allocate memory after initialization, which can reduce memory fragmentation and improve performance. The `FixedPoolAllocator` requires _depth-wise model symmetry_, where FSDP units have identical bucket layouts during runtime. Megatron-FSDP computes the **_mode_** of FSDP unit sizes as the fixed-pool size, and any FSDP units not symmetrical to the computed size will default to the `_resize_(bytes)`-based allocator (or be persistently allocated for extremely large and asymmetrical layers that affect performance significantly, such as `torch.nn.Embedding`, when the low-level argument `fsdp_db_use_persist_buf_on_alloc_fail` is set).
+
+Not all model architectures support depth-wise model symmetry. For example, hybrid architectures like **Nemotron** are a combination of Transformer, Mamba, and MoE blocks that are asymmetrical in size and data-type. To persistently pool buffers for these model architectures, Megatron-FSDP can compute a pool from the _**maximum**_ requirements of all FSDP units. This `MaxPool` supports the configured number of concurrently live units even when their layouts differ.
+
+```{figure} ../../images/megatron_fsdp/maxpool_allocator.png
+:alt: MaxPoolAllocator
+:align: center
+
+Visualizing the MaxPoolAllocator initialization in Megatron-FSDP. Iterating through all FSDP units, data buckets are categorized by data-type, sorted from small to large, and compared to the current MaxPool. If there are not enough buckets in the pool to support the unit, buckets are added to the pool (with size 0). If the largest buckets of the pool are not large enough to support the buckets in the unit (assigned to the pool from smallest to largest), the buckets in the pool are enlarged. After this process, we arrive at a minimal bucket layout that can persistently buffer every FSDP unit in the model, replicated according to `fsdp_buffer_count`.
+```
 
 ### Data-Parallel Sharding Strategies
 
@@ -590,7 +601,7 @@ Megatron-FSDP sharding and communication buffers support mixed-precision, such t
 
 | Optimization | Description | `Megatron-Core` Config | `fully_shard` Config |
 |--------------|-------------|----------------------|----------------------|
-| **NCCL User Buffers** | Allocate and register Megatron-FSDP communication buffers with NCCL, which enables zero-`COPY`, high-precision reduction, copy-engine collectives, and symmetric kernels. Uses double buffering. | `--use-nccl-ub` | `nccl_ub=True` |
+| **NCCL User Buffers** | Allocate and register Megatron-FSDP communication buffers with NCCL, which enables zero-`COPY`, high-precision reduction, copy-engine collectives, and symmetric kernels. Automatically enables persistent buffer pools with a default capacity of two. | `--use-nccl-ub` | `nccl_ub=True` |
 | **NCCL Manual Registration** | Instead of registering NCCL user buffers on first allocation, batch registration of all communication buffers at the end of the initial training step. Reduces registration latency. | `--fsdp-manual-registration` | N/A (Megatron-Core Only) |
 | **Disable Symmetric Registration** | Disable symmetric registration with NCCL. Optional, as symmetric registration failure defaults to normal registration. | `--disable-symmetric-registration` | `disable_symmetric_registration=True` |
 

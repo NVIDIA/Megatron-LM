@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from unittest.mock import MagicMock, patch
 
@@ -110,11 +110,43 @@ class TestIsLinearAttentionVariant:
 
     @pytest.mark.parametrize(
         "variant, expected",
-        [("gated_delta_net", True), ("dsa", False), (None, False), ("some_unknown_variant", False)],
+        [
+            ("gdn", True),
+            ("kda", True),
+            ("gated_delta_net", True),
+            ("dsa", False),
+            ("dsv4_hybrid", False),
+            (None, False),
+            ("some_unknown_variant", False),
+        ],
     )
     def test_variants(self, variant, expected):
         """Validate linear-attention variant classification across supported and unsupported names."""
         assert self._fn(variant) is expected
+
+
+class TestNormalizeExperimentalAttentionVariant:
+    """Validate canonical variant names and deprecated aliases."""
+
+    @staticmethod
+    def _fn(variant):
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            normalize_experimental_attention_variant,
+        )
+
+        return normalize_experimental_attention_variant(variant)
+
+    @pytest.mark.parametrize("variant", ["gdn", "kda", "dsa", "dsv4_hybrid", None])
+    def test_canonical_names_are_unchanged(self, variant):
+        """Canonical and unrelated variant names pass through unchanged."""
+        assert self._fn(variant) == variant
+
+    def test_legacy_gated_delta_net_alias_warns_and_normalizes(self):
+        """The legacy spelling warns and resolves to canonical GDN."""
+        with pytest.warns(DeprecationWarning, match="Use 'gdn' instead"):
+            normalized = self._fn("gated_delta_net")
+
+        assert normalized == "gdn"
 
 
 # ===================================================================
@@ -244,6 +276,26 @@ class TestGetGatedDeltaNetModuleSpec:
         assert spec.module is GatedDeltaNet
         assert spec.metainfo == {"fuse_input_layernorm": True}
 
+    def test_kda_uses_direct_projection_submodules(self):
+        """KDA uses separate input and beta projections without fused input norm."""
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_gated_delta_net_module_spec,
+        )
+        from megatron.core.ssm.gated_delta_net import (
+            KimiDeltaAttention,
+            KimiDeltaAttentionSubmodules,
+        )
+
+        backend = _make_backend()
+        cfg = _make_config(experimental_attention_variant="kda", normalization="RMSNorm")
+        spec = get_gated_delta_net_module_spec(cfg, backend=backend)
+
+        assert spec.module is KimiDeltaAttention
+        assert isinstance(spec.submodules, KimiDeltaAttentionSubmodules)
+        assert spec.submodules.in_proj == _FakeColumnParallelLinear
+        assert spec.submodules.beta_proj == _FakeColumnParallelLinear
+        assert spec.metainfo == {"fuse_input_layernorm": False}
+
     def test_submodules_use_backend_modules(self):
         """Verify backend-provided projection/norm modules are wired into submodules."""
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -323,12 +375,14 @@ class TestGetDsaModuleSpec:
         with pytest.raises(AssertionError, match="qk_l2_norm is not supported"):
             get_dsa_module_spec_for_backend(cfg, backend=_make_backend())
 
-    def test_returns_mla_self_attention_spec(self):
-        """Verify the returned attention module is MLA self-attention with causal mask."""
-        from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+    def test_returns_absorbed_mla_self_attention_spec(self):
+        """Verify the returned attention module is absorbed MLA with causal mask."""
+        from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+            AbsorbedMLASelfAttention,
+        )
 
         spec = self._call()
-        assert spec.module is MLASelfAttention
+        assert spec.module is AbsorbedMLASelfAttention
         assert spec.params == {"attn_mask_type": AttnMaskType.causal}
         assert spec.metainfo == {"fuse_input_layernorm": False}
 
@@ -414,8 +468,11 @@ class TestGetExperimentalAttentionVariantModuleSpec:
     @pytest.mark.parametrize(
         "variant, target_fn",
         [
+            ("gdn", "get_gated_delta_net_module_spec"),
+            ("kda", "get_gated_delta_net_module_spec"),
             ("gated_delta_net", "get_gated_delta_net_module_spec"),
             ("dsa", "get_dsa_module_spec_for_backend"),
+            ("dsv4_hybrid", "get_dsv4_hybrid_module_spec_for_backend"),
         ],
     )
     def test_dispatches_to_variant_handler(self, variant, target_fn):

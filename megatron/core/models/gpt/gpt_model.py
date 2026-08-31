@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Literal, Optional
@@ -33,6 +33,7 @@ from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_han
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
+    prepare_mtp_sequence_roll_context,
     process_mtp_loss,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -153,6 +154,7 @@ class GPTModel(LanguageModule):
             ignore_virtual=False,
             vp_stage=vp_stage,
         )
+        self._fused_mrope_available = False
 
         self.fuse_linear_cross_entropy = (
             self.config.cross_entropy_loss_fusion
@@ -215,6 +217,13 @@ class GPTModel(LanguageModule):
             assert (
                 self.mrope_section is not None
             ), "mrope require mrope_section setting, but we got None from TransformerConfig"
+            if self.config.apply_rope_fusion and not self.config.rotary_interleaved:
+                try:
+                    from megatron.core.fusions.fused_mrope import is_fused_mrope_available
+
+                    self._fused_mrope_available = is_fused_mrope_available()
+                except ImportError:
+                    self._fused_mrope_available = False
 
         # Cache for RoPE tensors which do not change between iterations.
         self.rotary_pos_emb_cache = {}
@@ -339,6 +348,12 @@ class GPTModel(LanguageModule):
                     f"input_ids shape {input_ids.shape}"
                 )
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            if self.config.sequence_parallel and not self.embedding.scatter_to_sequence_parallel:
+                # The embedding skips SP scatter for models whose outer wrapper scatters instead
+                # (e.g. VLM LMs); scatter here so a standalone LM forward isn't double-gathered.
+                decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
+                    decoder_input, group=self.pg_collection.tp
+                )
             if padding_mask is not None and self.config.sequence_parallel:
                 padding_mask = (
                     tensor_parallel.scatter_to_sequence_parallel_region(
@@ -358,6 +373,9 @@ class GPTModel(LanguageModule):
         rotary_pos_sin = None
         # this is used to store combined cos/sin embeddings, exclusively for flash infer rope
         rotary_pos_cos_sin = None
+        # Model-level rotary_pos_emb is only for regular attention. Regular
+        # attention uses the default zigzag CP RoPE layout; MLA/CSA/DSv4-style
+        # variants must ignore this external RoPE and build/apply RoPE internally.
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             use_flash_infer_fused_rope = (
@@ -417,10 +435,26 @@ class GPTModel(LanguageModule):
                 )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             if not InferenceMode.is_active() or not self.config.flash_decode:
+                packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+                # Inference indexes rotary_pos_emb as seq-major materialized embeddings.
+                # Raw mRoPE freqs are axis-major and are only safe for the normal decoder path,
+                # and fused_single_qkv_rope consumes the materialized embeddings instead. A
+                # provided inference_context counts as inference even when the global
+                # InferenceMode flag is not active.
+                in_inference = in_inference_mode or inference_context is not None
+                use_raw_mrope_freqs = (
+                    self.config.apply_rope_fusion
+                    and not self.config.rotary_interleaved
+                    and not self.config.fused_single_qkv_rope
+                    and not in_inference
+                )
+                use_fused_mrope = use_raw_mrope_freqs and self._fused_mrope_available
                 rotary_pos_emb = self.rotary_pos_emb(
                     position_ids,
                     self.mrope_section,
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                    return_raw_freqs=use_fused_mrope,
+                    packed_seq=packed_seq,
                 )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE
@@ -662,11 +696,44 @@ class GPTModel(LanguageModule):
             and inference_context.is_dynamic_batching()
             and inference_context.num_speculative_tokens > 0
         )
+        mtp_cp_group = None
+        sequence_roll_context = None
+        if (
+            self.config.mtp_num_layers
+            and (mtp_in_postprocess or self.post_process)
+            and not (in_inference_mode or is_spec_decode)
+        ):
+            mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+            # Build layout-specific metadata once, then fetch every locally owned
+            # MTP field's compact successor rows in one grouped operation. The extra
+            # row covers RL's initial label derivation before the per-layer rolls.
+            sequence_roll_context = prepare_mtp_sequence_roll_context(
+                tensor=input_ids if input_ids is not None else labels,
+                cp_group=mtp_cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+            if sequence_roll_context is not None:
+                roll_position_ids = mtp_in_postprocess and getattr(
+                    self.embedding, "add_position_embedding", True
+                )
+                sequence_roll_context = sequence_roll_context.prefetch_halos(
+                    width=self.config.mtp_num_layers + 1,
+                    input_ids=(
+                        input_ids
+                        if mtp_in_postprocess or (self.post_process and labels is None)
+                        else None
+                    ),
+                    position_ids=position_ids if roll_position_ids else None,
+                    labels=labels if self.post_process else None,
+                    loss_mask=loss_mask if self.post_process else None,
+                    padding_mask=padding_mask if mtp_in_postprocess else None,
+                )
 
         # logits and loss
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
+
         if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
             hidden_states = self.mtp(
                 input_ids=input_ids,
@@ -679,6 +746,7 @@ class GPTModel(LanguageModule):
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,
                 packed_seq_params=packed_seq_params,
+                sequence_roll_context=sequence_roll_context,
                 sequence_len_offset=sequence_len_offset,
                 padding_mask=padding_mask,
                 embedding=self.embedding,
@@ -696,7 +764,6 @@ class GPTModel(LanguageModule):
                 self._decoder_hidden_states_cache = hidden_states
             else:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
-                mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
                     labels=labels,
@@ -710,6 +777,7 @@ class GPTModel(LanguageModule):
                     cp_group=mtp_cp_group,
                     tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
+                    sequence_roll_context=sequence_roll_context,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
                 )

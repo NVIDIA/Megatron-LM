@@ -26,4 +26,32 @@ def split_grouped_qkvg(
     )
 
 
-__all__ = ["split_grouped_qkvg"]
+def split_grouped_qkvg_for_tp(
+    qkv: torch.Tensor,
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    tp_rank: int,
+    tp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select one replicated KV group and this TP rank's query heads."""
+    replicas_per_kv_head = ensure_divisible(tp_size, num_kv_heads)
+    q_heads_per_group = ensure_divisible(num_heads, num_kv_heads)
+    q_heads_per_rank = ensure_divisible(q_heads_per_group, replicas_per_kv_head)
+    group_width = (2 * q_heads_per_group + 2) * head_dim
+    kv_group_rank = tp_rank // replicas_per_kv_head
+    q_rank_in_group = tp_rank % replicas_per_kv_head
+    local_group = qkv.narrow(-1, kv_group_rank * group_width, group_width)
+    query, gate, key, value = split_grouped_qkvg(
+        local_group,
+        num_heads=q_heads_per_group,
+        num_kv_heads=1,
+        head_dim=head_dim,
+    )
+    q_start = q_rank_in_group * q_heads_per_rank
+    q_end = q_start + q_heads_per_rank
+    return query[..., q_start:q_end, :], gate[..., q_start:q_end, :], key, value
+
+
+__all__ = ["split_grouped_qkvg", "split_grouped_qkvg_for_tp"]

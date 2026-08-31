@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import hashlib
 import inspect
@@ -36,7 +36,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "actual_vocab_size": 131072,
     "add_bias_linear": False,
     "add_qkv_bias": False,
-    "apply_dsa_kernel_fusion": True,
+    "apply_dsa_kernel_fusion": None,
     "apply_query_key_layer_scaling": False,
     "apply_residual_connection_post_layernorm": False,
     "apply_rope_fusion": False,
@@ -94,10 +94,20 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "disable_parameter_transpose_cache": False,
     "distribute_saved_activations": False,
     "dsa_indexer_head_dim": None,
+    "dsa_indexer_k_norm_epsilon": None,
+    "dsa_indexer_k_norm_fp32": False,
     "dsa_indexer_loss_coeff": None,
     "dsa_indexer_n_heads": None,
+    "dsa_indexer_rope_interleaved": False,
+    "dsa_indexer_rotate_activation": True,
+    "dsa_indexer_scoring_relu": True,
+    "dsa_indexer_weights_proj_output_dtype": "bf16",
+    "dsa_indexer_skip_topk_offset": 0,
     "dsa_indexer_topk": None,
     "dsa_indexer_use_sparse_loss": False,
+    "dsa_indexer_topk_freq": 1,
+    "dsa_indexer_weights_proj_use_quantization": True,
+    "dsa_kernel_backend": "none",
     "embedding_init_method": {},
     "embedding_init_method_std": 0.014,
     "enable_autocast": False,
@@ -105,6 +115,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "enable_hyper_connections": False,
     "ep_overlap_early_attn_memory_release": False,
     "experimental_attention_variant": None,
+    "experimental_attention_variant_loss_scale_func": None,
     "expert_model_parallel_size": 4,
     "expert_tensor_parallel_size": 1,
     "external_cuda_graph": False,
@@ -132,6 +143,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fp8_wgrad": True,
     "fused_residual_rmsnorm": False,
     "fused_single_qkv_rope": False,
+    "gated_attention_proj_granularity": "elementwise",
     "gated_linear_unit": False,
     "glu_linear_offset": 0.0,
     "grad_scale_func": None,
@@ -151,6 +163,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "init_method_std": 0.014,
     "init_model_with_meta_device": False,
     "is_hybrid_model": True,
+    "kda_lower_bound": None,
+    "kda_safe_gate": False,
     "kitchen_attention_backend": "sdpa",
     "kv_channels": 128,
     "layernorm_epsilon": 1e-05,
@@ -174,6 +188,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "masked_softmax_fusion": True,
     "memory_efficient_layer_norm": False,
     "mhc_init_gating_factor": 0.01,
+    "mhc_recompute_attn_cuda_graph_split": False,
     "mhc_recompute_layer_num": None,
     "mhc_sinkhorn_iterations": 20,
     "microbatch_group_size_per_vp_stage": 1,
@@ -186,6 +201,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_expert_rank_capacity_factor": None,
     "moe_ffn_hidden_size": 1856,
     "moe_flex_dispatcher_backend": "deepep",
+    "moe_flex_dispatcher_num_sms": None,
     "moe_grad_scale_func": None,
     "moe_grouped_gemm": True,
     "moe_hybridep_num_sms": None,
@@ -197,6 +213,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
     "moe_n_hash_layers": 0,
+    "moe_ncclep_static_shape": False,
+    "moe_ncclep_use_symm_mem": False,
     "moe_pad_expert_input_to_capacity": False,
     "moe_pad_experts_for_cuda_graph_inference": False,
     "moe_paged_stash": False,
@@ -222,7 +240,9 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_topk_limited_devices": None,
     "moe_router_topk_scaling_factor": 2.5,
     "moe_shared_expert_gate": False,
+    "use_grouped_gemm_for_shared_expert": False,
     "moe_shared_expert_intermediate_size": 3712,
+    "moe_shared_expert_glu_interleave_size": None,
     "moe_shared_expert_overlap": False,
     "moe_token_dispatcher_type": "alltoall",
     "moe_token_drop_policy": "probs",
@@ -288,7 +308,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "symmetric_ar_type": None,
     "tensor_model_parallel_size": 2,
     "test_mode": False,
-    "thd_max_packed_sequences": 32,
+    "thd_max_packed_sequences": None,
     "timers": None,
     "tp_comm_atomic_ag": False,
     "tp_comm_atomic_rs": False,
@@ -357,7 +377,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
 # Fields that are allowed to appear in the live config even if not yet in the golden.
-ALLOW_ADDED_FIELDS = {"pad_packed_seq_alignment", "pad_packed_seq_by_appending_dummy_seq"}
+ALLOW_ADDED_FIELDS = {"pad_packed_seq_alignment", "thd_tail_padding_policy"}
 
 
 def serialize_config(cfg: Any) -> Dict[str, Any]:

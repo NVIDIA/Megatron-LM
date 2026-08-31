@@ -49,6 +49,7 @@ from ..fp8_utils import copy_back_gathered_bf16_into_fp8_param, is_float8tensor
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
+from .cpu_offloading.chunked_optimizer_state_offload import ChunkedOptimizerStateOffloader
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
 
@@ -143,6 +144,12 @@ class MegatronOptimizer(ABC):
         init_state_fn (Callable, optional): Function to initialize optimizer state.
     """
 
+    # ChainedOptimizer intentionally does not call this base class's constructor.
+    # Keep inherited offload helpers safe when they are invoked on that wrapper.
+    _optimizer_state_offloader: ChunkedOptimizerStateOffloader | None = None
+    _defer_optimizer_state_prefetch_to_step = False
+    _defer_optimizer_master_offload_for_param_sync = False
+
     def __init__(
         self,
         optimizer: torch.optim.Optimizer,
@@ -158,6 +165,127 @@ class MegatronOptimizer(ABC):
             )
         self.config = config
         self.init_state_fn = init_state_fn
+        self._optimizer_state_offloader: ChunkedOptimizerStateOffloader | None = None
+        self._defer_optimizer_state_prefetch_to_step = False
+        self._defer_optimizer_master_offload_for_param_sync = False
+
+    def enable_chunked_optimizer_state_offload(
+        self,
+        master_params: List[torch.Tensor],
+        state_dtypes: Tuple[torch.dtype, ...],
+        optimizer_owned_master_dtypes: Dict[torch.Tensor, torch.dtype] | None = None,
+        d2h_stream: torch.cuda.Stream | None = None,
+        h2d_stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        """Enable chunked state execution for this wrapped optimizer.
+
+        Args:
+            master_params: Separate MCore-owned master parameters to offload.
+            state_dtypes: Dtypes of full-size tensor states used by the byte planner.
+            optimizer_owned_master_dtypes: Exact storage dtype for each optimizer-owned
+                master parameter, including native FP32 parameters when the optimizer creates
+                a separate ``master_param`` entry for them.
+            d2h_stream: Optional D2H stream shared by related optimizer wrappers.
+            h2d_stream: Optional H2D stream shared by related optimizer wrappers.
+        """
+
+        if (
+            self.optimizer is None
+            or not self.config.chunked_optimizer_state_offload
+            or self.config.optimizer_state_offload_fraction == 0.0
+        ):
+            return
+        self._optimizer_state_offloader = ChunkedOptimizerStateOffloader(
+            optimizer=self.optimizer,
+            master_params=master_params,
+            chunk_size_bytes=self.config.optimizer_state_offload_chunk_size_mb * 1024 * 1024,
+            offload_fraction=self.config.optimizer_state_offload_fraction,
+            state_dtypes=state_dtypes,
+            optimizer_owned_master_dtypes=optimizer_owned_master_dtypes,
+            d2h_stream=d2h_stream,
+            h2d_stream=h2d_stream,
+        )
+
+    def set_optimizer_state_offload_deferred_lifecycle(
+        self, *, state_prefetch_to_step: bool, master_offload_for_param_sync: bool
+    ) -> None:
+        """Configure deferred work for an optimizer managed by an outer chain.
+
+        Args:
+            state_prefetch_to_step: Restore tensor state from the outer child-step pipeline
+                instead of during gradient finalization.
+            master_offload_for_param_sync: Keep masters resident until the outer optimizer has
+                staged parameters for an explicit pre-forward synchronization.
+        """
+
+        if (
+            state_prefetch_to_step or master_offload_for_param_sync
+        ) and self._optimizer_state_offloader is None:
+            raise RuntimeError("deferred optimizer-state offload requires an enabled offloader")
+        self._defer_optimizer_state_prefetch_to_step = state_prefetch_to_step
+        self._defer_optimizer_master_offload_for_param_sync = master_offload_for_param_sync
+
+    def offload_optimizer_state_for_forward(self, offload_master: bool = True) -> None:
+        """Begin moving optimizer tensor state and, optionally, master weights to CPU."""
+
+        if self._optimizer_state_offloader is not None:
+            self._optimizer_state_offloader.offload_for_forward(offload_master=offload_master)
+
+    def prefetch_optimizer_state_for_step(self) -> None:
+        """Prefetch master weights and the first optimizer-state chunk."""
+
+        if self._optimizer_state_offloader is not None:
+            self._optimizer_state_offloader.prefetch_for_step()
+
+    def prefetch_optimizer_state_for_gradient_finalization(self) -> None:
+        """Start the optimizer prefetch that may overlap gradient finalization."""
+
+        self.prefetch_optimizer_state_for_step()
+
+    def prefetch_optimizer_master_weights_for_step(self) -> None:
+        """Prefetch master weights without restoring an optimizer-state chunk."""
+
+        if self._optimizer_state_offloader is not None:
+            self._optimizer_state_offloader.prefetch_master_for_step()
+
+    def ensure_master_weights_for_param_sync(self) -> None:
+        """Restore all master weights needed by an explicit parameter staging pass."""
+
+        if self._optimizer_state_offloader is not None:
+            self._optimizer_state_offloader.ensure_master_for_param_sync()
+
+    def ensure_master_weights_for_pre_forward_param_sync(self) -> None:
+        """Restore masters only when this optimizer requires pre-forward parameter sync."""
+
+        if self.optimizer_state_offload_requires_pre_forward_param_sync():
+            self.ensure_master_weights_for_param_sync()
+
+    def assert_master_weights_resident(self, operation: str) -> None:
+        """Assert that an external MCore copy can safely read or write master weights."""
+
+        if self._optimizer_state_offloader is not None:
+            self._optimizer_state_offloader.assert_master_weights_resident(operation)
+
+    def synchronize_optimizer_state_for_checkpoint(self) -> None:
+        """Make CPU canonical optimizer tensors stable for checkpointing."""
+
+        if self._optimizer_state_offloader is not None:
+            self._optimizer_state_offloader.synchronize_for_checkpoint()
+
+    def optimizer_state_offload_requires_pre_forward_param_sync(self) -> bool:
+        """Return whether a parameter gather must consume masters before their D2H copy."""
+
+        return self._defer_optimizer_master_offload_for_param_sync
+
+    def start_param_sync_for_bucket_group_subset(self, force_sync: bool = False) -> None:
+        """Synchronize an optimizer-owned DDP bucket subset, if the optimizer has one."""
+
+        if self.optimizer_state_offload_requires_pre_forward_param_sync():
+            raise NotImplementedError(
+                f"{type(self).__name__} must override "
+                "start_param_sync_for_bucket_group_subset when it requires pre-forward "
+                "optimizer parameter synchronization"
+            )
 
     def get_parameters(self) -> List[torch.nn.Parameter]:
         """
@@ -680,6 +808,15 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         """Pre-processing gradients before the optimizer step, returns whether inf/nan is found."""
         timers = self.config.timers
 
+        # The training loop starts this earlier to overlap H2D with gradient finalization.
+        # Keep this idempotent fallback so direct optimizer.step() callers restore the master
+        # parameter device before assigning CUDA gradients to it.
+        if self._optimizer_state_offloader is not None:
+            if self._defer_optimizer_state_prefetch_to_step:
+                self._optimizer_state_offloader.prefetch_master_for_step()
+            else:
+                self._optimizer_state_offloader.prefetch_for_step()
+
         # Copy gradients from model params to main params.
         if timers is not None:
             timers('optimizer-copy-to-main-grad', log_level=1).start(
@@ -721,7 +858,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
-            self.optimizer.step()
+            if self._optimizer_state_offloader is None:
+                self.optimizer.step()
+            else:
+                self._optimizer_state_offloader.step()
         if timers is not None:
             timers('optimizer-inner-step').stop()
 
@@ -946,6 +1086,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                 model_param.grad = model_param.main_grad
 
     def _copy_main_params_to_model_params(self):
+        self.ensure_master_weights_for_param_sync()
+        self.assert_master_weights_resident("_copy_main_params_to_model_params")
+
         # Non-DistOpt LayerWise fp8: route master->model through bf16 (Q(bf16(master))) to match the
         # fp8-param-gather-OFF baseline (a direct fp32->fp8 copy would write Q(fp32 master)). This
         # also covers MoE expert weights at expt_dp==1, which are not gathered.
@@ -991,6 +1134,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
     def _copy_model_params_to_main_params(self, state_dict=None):
         assert state_dict is None, "Initialize main params from state dict is not supported"
+        self.ensure_master_weights_for_param_sync()
+        self.assert_master_weights_resident("_copy_model_params_to_main_params")
         # Only needed for the float16 params.
         model_data, main_data = self._get_model_and_main_params_data_float16()
         _multi_tensor_copy_this_to_that(
@@ -1016,7 +1161,14 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     ):
 
         if is_loading:
-            self.init_state_fn(self.optimizer, self.config)
+            if self._optimizer_state_offloader is not None:
+                self._optimizer_state_offloader.initialize_state_for_loading(
+                    self.init_state_fn, self.config
+                )
+            else:
+                self.init_state_fn(self.optimizer, self.config)
+        else:
+            self.synchronize_optimizer_state_for_checkpoint()
 
         state_dict = self.state_dict()
 
@@ -1099,7 +1251,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         state_dict[optimizer_key]['param_groups'] = self._filter_and_reorder_param_groups(
             self.optimizer.param_groups, state_dict[optimizer_key]['param_groups']
         )
-        self.optimizer.load_state_dict(state_dict[optimizer_key])
+        if self._optimizer_state_offloader is None:
+            self.optimizer.load_state_dict(state_dict[optimizer_key])
+        else:
+            self._optimizer_state_offloader.load_state_dict_without_device_cast(
+                state_dict[optimizer_key]
+            )
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
@@ -1183,6 +1340,11 @@ class FP32Optimizer(MegatronOptimizer):
         """Step the optimizer with ready gradients, return successful."""
         if self.is_stub_optimizer:
             return True
+        if self._optimizer_state_offloader is not None:
+            raise RuntimeError(
+                "FP32Optimizer.step_with_ready_grads does not support chunked optimizer state "
+                "offload"
+            )
         timers = self.config.timers
 
         # Update parameters.
@@ -1343,6 +1505,27 @@ class ChainedOptimizer(MegatronOptimizer):
         else:
             self.is_stub_optimizer = True
         self.chained_optimizers = chained_optimizers
+        self._share_optimizer_state_offload_streams()
+
+    def _share_optimizer_state_offload_streams(self) -> None:
+        """Serialize all nested offload managers on one D2H/H2D stream pair."""
+
+        managers = []
+
+        def collect(current_optimizer: MegatronOptimizer) -> None:
+            manager = getattr(current_optimizer, '_optimizer_state_offloader', None)
+            if manager is not None:
+                managers.append(manager)
+            for child in getattr(current_optimizer, 'chained_optimizers', ()):
+                collect(child)
+
+        collect(self)
+        if len(managers) < 2:
+            return
+
+        d2h_stream, h2d_stream = managers[0].transfer_streams
+        for manager in managers[1:]:
+            manager.use_transfer_streams(d2h_stream, h2d_stream)
 
     @property
     def optimizer(self):
@@ -1381,6 +1564,74 @@ class ChainedOptimizer(MegatronOptimizer):
     def zero_grad(self, set_to_none=True):
         for optimizer in self.chained_optimizers:
             optimizer.zero_grad(set_to_none)
+
+    def offload_optimizer_state_for_forward(self, offload_master: bool = True) -> None:
+        """Begin state and optional master D2H on every optimizer in the chain."""
+
+        for optimizer in self.chained_optimizers:
+            optimizer.offload_optimizer_state_for_forward(offload_master=offload_master)
+
+    def prefetch_optimizer_state_for_step(self) -> None:
+        """Eagerly prefetch state/master data for every optimizer in the chain.
+
+        This general-purpose entry can exceed a configured chunk staging bound because every
+        child may hold a prefetched window concurrently. LayerWise uses a dedicated
+        gradient-finalization policy for its single managed Muon child.
+        """
+
+        for optimizer in self.chained_optimizers:
+            optimizer.prefetch_optimizer_state_for_step()
+
+    def prefetch_optimizer_state_for_gradient_finalization(self) -> None:
+        """Start each child's gradient-finalization prefetch policy."""
+
+        for optimizer in self.chained_optimizers:
+            optimizer.prefetch_optimizer_state_for_gradient_finalization()
+
+    def prefetch_optimizer_master_weights_for_step(self) -> None:
+        """Prefetch only master weights for every optimizer in the chain."""
+
+        for optimizer in self.chained_optimizers:
+            optimizer.prefetch_optimizer_master_weights_for_step()
+
+    def ensure_master_weights_for_param_sync(self) -> None:
+        """Restore all child master weights for a general parameter staging pass."""
+
+        for optimizer in self.chained_optimizers:
+            optimizer.ensure_master_weights_for_param_sync()
+
+    def ensure_master_weights_for_pre_forward_param_sync(self) -> None:
+        """Restore only children that require pre-forward parameter synchronization."""
+
+        for optimizer in self.chained_optimizers:
+            optimizer.ensure_master_weights_for_pre_forward_param_sync()
+
+    def assert_master_weights_resident(self, operation: str) -> None:
+        """Assert that every child can safely access its master weights."""
+
+        for optimizer in self.chained_optimizers:
+            optimizer.assert_master_weights_resident(operation)
+
+    def synchronize_optimizer_state_for_checkpoint(self) -> None:
+        """Make every child optimizer's CPU canonical state checkpoint-safe."""
+
+        for optimizer in self.chained_optimizers:
+            optimizer.synchronize_optimizer_state_for_checkpoint()
+
+    def optimizer_state_offload_requires_pre_forward_param_sync(self) -> bool:
+        """Return whether any child must gather parameters before master offload."""
+
+        return any(
+            optimizer.optimizer_state_offload_requires_pre_forward_param_sync()
+            for optimizer in self.chained_optimizers
+        )
+
+    def start_param_sync_for_bucket_group_subset(self, force_sync: bool = False) -> None:
+        """Synchronize only child subsets that require masters before offload."""
+
+        for optimizer in self.chained_optimizers:
+            if optimizer.optimizer_state_offload_requires_pre_forward_param_sync():
+                optimizer.start_param_sync_for_bucket_group_subset(force_sync=force_sync)
 
     def get_loss_scale(self):
         if self.chained_optimizers:
@@ -1537,10 +1788,14 @@ class ChainedOptimizer(MegatronOptimizer):
 
         return found_inf_flag
 
+    def _before_child_step(self, optimizer_idx: int) -> None:
+        """Hook for subclasses to enqueue work immediately before a child optimizer step."""
+
     def _step(self) -> bool:
         """Step all optimizers in this chain."""
         success = True
         for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+            self._before_child_step(optimizer_idx)
             success &= optimizer.step_with_ready_grads()
             if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
                 assert success
@@ -1823,7 +2078,12 @@ class ChainedOptimizer(MegatronOptimizer):
                         use_decoupled_grad=use_decoupled_grad,
                     )
 
-            if grad_norm > optimizer.config.grad_norm_skip_threshold and main_params:
+            grad_norm_skip_threshold = optimizer.config.grad_norm_skip_threshold
+            if (
+                main_params
+                and math.isfinite(grad_norm_skip_threshold)
+                and grad_norm > grad_norm_skip_threshold
+            ):
                 log_single_rank(
                     logger, logging.INFO, "skipping grad norm because it's too large %s", grad_norm
                 )

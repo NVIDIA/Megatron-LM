@@ -1,6 +1,7 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron Module."""
+
 from functools import partial
 from typing import Optional, Tuple
 
@@ -106,11 +107,13 @@ class MegatronModule(torch.nn.Module):
         """Sets the is_first_microbatch flag if it exists and config.fp8==True.
         When this flag is set, TE modules will update their fp8 parameter cache.
         If kitchen is being used, kitchen controls quantization level.
+        A quant_recipe (e.g. from --te-precision-config-file) also enables the flag.
         """
         if (
             self.config.fp8 is not None
             or self.config.fp4 is not None
             or getattr(self.config, 'use_kitchen', False)
+            or getattr(self.config, 'quant_recipe', None) is not None
         ):
             if not hasattr(self, "modules_with_is_first_microbatch"):
                 self.modules_with_is_first_microbatch = []
@@ -183,6 +186,13 @@ class GraphableMegatronModule(MegatronModule):
             # script with the graphs returned by make_graphed_callables API before the first
             # training step.
             self.cuda_graphs = []
+            # Positional hidden-state inputs used as TE's fixed CUDA Graph input
+            # surfaces, indexed exactly like ``cuda_graphs``.  Most layers do not
+            # need to retain these handles.  They are exposed for eager producers
+            # whose recompute must restore bytes at the address captured by a
+            # downstream graph (for example, mHC aggregation feeding attention).
+            self._te_cuda_graph_static_hidden_inputs = ()
+            self._te_cuda_graph_static_hidden_input_ptrs = ()
             # List to store forward pre-hooks. Forward pre-hooks are not captured into CUDA
             # graphs. Those hooks and args are collected in this list and should be manually
             # triggered before CUDA Graph running. This is required to ensure the correct param
@@ -193,6 +203,48 @@ class GraphableMegatronModule(MegatronModule):
             # calls wgrad computation in attention module (contains attn and shared expert)
             # according to CUDA graph scope.
             self.cuda_graph_backward_dw_wrapper = None
+
+    def set_te_cuda_graph_static_hidden_inputs(self, inputs):
+        """Retain TE's fixed hidden-state input surface for each graph slot.
+
+        ``TECudaGraphHelper`` calls this only after ``make_graphed_callables``
+        returns because TE may rebind sample inputs while optimizing graph-buffer
+        reuse.  Different slots are allowed to alias when their schedule
+        lifetimes do not overlap.
+        """
+        inputs = tuple(inputs)
+        if len(inputs) != len(self.cuda_graphs):
+            raise ValueError(
+                "TE CUDA Graph static-input count must match graph count: "
+                f"got {len(inputs)} inputs and {len(self.cuda_graphs)} graphs"
+            )
+        if not all(isinstance(tensor, torch.Tensor) and tensor.is_cuda for tensor in inputs):
+            raise TypeError("TE CUDA Graph static hidden inputs must be CUDA tensors")
+
+        self._te_cuda_graph_static_hidden_inputs = inputs
+        self._te_cuda_graph_static_hidden_input_ptrs = tuple(tensor.data_ptr() for tensor in inputs)
+
+    def get_te_cuda_graph_static_hidden_input(self, microbatch_idx=None):
+        """Return the fixed hidden-state input for a TE CUDA Graph slot."""
+        if not self._te_cuda_graph_static_hidden_inputs:
+            raise RuntimeError("TE CUDA Graph static hidden inputs have not been attached")
+
+        if microbatch_idx is None:
+            microbatch_idx = getattr(self, 'current_microbatch', 0)
+        graph_index = microbatch_idx % len(self._te_cuda_graph_static_hidden_inputs)
+        tensor = self._te_cuda_graph_static_hidden_inputs[graph_index]
+        expected_ptr = self._te_cuda_graph_static_hidden_input_ptrs[graph_index]
+        if tensor.data_ptr() != expected_ptr:
+            raise RuntimeError(
+                f"TE CUDA Graph static hidden input {graph_index} changed address: "
+                f"expected {expected_ptr}, got {tensor.data_ptr()}"
+            )
+        return tensor
+
+    def clear_te_cuda_graph_static_hidden_inputs(self):
+        """Release retained TE static-input handles when graphs are deleted."""
+        self._te_cuda_graph_static_hidden_inputs = ()
+        self._te_cuda_graph_static_hidden_input_ptrs = ()
 
     def init_backward_dw_wrapper(self):
         """Initialize the backward_dw_wrapper."""
@@ -353,6 +405,9 @@ class GraphableMegatronModule(MegatronModule):
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
 
+            # TE captures/replays the module on its own graph stream. Passing the
+            # offload stream/event in lets TE order graph compute with D2H/H2D
+            # transfers managed by the fine-grained offload manager.
             cudagraph_kwargs['cuda_graph_stream'] = off_interface.cuda_graph_stream()
             cudagraph_kwargs['cuda_graph_event'] = off_interface.cuda_graph_event()
         return cudagraph_args, cudagraph_kwargs

@@ -56,6 +56,6 @@ MODEL_ARGS:
   --dist-ckpt-strictness: log_all
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
-  --attention-backend: flash
+  --attention-backend: fused
   --log-memory-to-tensorboard: true
 TEST_TYPE: ckpt-resume

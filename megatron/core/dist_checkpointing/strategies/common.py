@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 
 def save_common(common_state_dict: StateDict, checkpoint_dir: str):
     """Save common part of the state dict."""
+    logger.warning(
+        "save_common is deprecated and will be removed in a future release. "
+        "`torch_dist` now handles all non-tensor data as part of default PyTorch DCP behavior."
+    )
+
     if torch.distributed.get_rank() == 0:
         path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)
         if MultiStorageClientFeature.is_enabled():
@@ -38,6 +43,11 @@ def load_common(checkpoint_dir: str):
     Returns:
         StateDict: state dict with non-sharded objects from the checkpoint
     """
+    logger.warning(
+        "load_common is deprecated and will be removed in a future release. "
+        "`torch_dist` now handles all non-tensor data as part of default PyTorch DCP behavior."
+    )
+
     load_path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)
     try:
         if MultiStorageClientFeature.is_enabled():

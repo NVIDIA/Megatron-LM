@@ -160,8 +160,13 @@ Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fin
     - Defaults to `False`, but will be automatically enabled in Megatron-LM.
 - `disable_symmetric_registration` will disable NCCL window (i.e. symmetric) registration when using `nccl_ub`. 
     - Defaults to `False`.
-- `fsdp_double_buffer` will use persistently allocated double buffers for temporarily-defined memory needed in `MegatronFSDP` communications. Having persistent double buffers may increase peak VRAM utilization, but is required to register NCCL user buffers (`nccl_ub=True`) for `MegatronFSDP`. Currently, this is only supported for simple repetitive model structures such as GPT.
-    - Defaults to `False`. Automatically overridden to `True` when `nccl_ub` is enabled.
+- `fsdp_double_buffer` is the backward-compatible enable flag for persistent communication-buffer pools used by `MegatronFSDP`. Despite the legacy name, it does not require the pool capacity to remain at two. Having persistent buffers may increase peak VRAM utilization, but is required to register NCCL user buffers (`nccl_ub=True`) for `MegatronFSDP`.
+    - Defaults to `False`. Automatically overridden to `True` when `nccl_ub` or `maxpool_double_buffer` is enabled.
+- `fsdp_buffer_count` controls the number of persistent buffers in each FSDP communication pool.
+    - Defaults to two. A non-default value is invalid unless the persistent pool is enabled. Combined 1F1B overlap with forward prefetch requires at least three because a backward/recompute unit, the current forward unit, and its prefetched successor can be live concurrently.
+    - Slots are shared pool capacity assigned to compatible live buckets at runtime; they are not statically dedicated to particular pipeline-schedule roles.
+- `maxpool_double_buffer` will use a max-pooling algorithm to build a sufficient pool of buffers that can support all layers of hybrid / asymmetrical model architectures like Nemotron.
+    - Defaults to `False`. Highly-recommended for hybrid architectures when using `fsdp_double_buffer=True` to double-buffer every layer of the model.
 - `preproc_state_dict_for_dcp_ckpt` adds `model.state_dict()` and `optimizer.state_dict()` post-hooks that modify the model and optimizer state in preparation for `torch.distributed.checkpoint.{save,load}` ([Torch DCP](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html)) checkpointing. Specifically, it adds `__create_write_items__` and `__create_chunk_list__` methods to Tensors utilized by Torch DCP to redistribute parameters when saving and loading model and optimizer checkpoints. Can be deactivated should the user need a custom distributed checkpointing strategy.
     - Defaults to `True`.
 
@@ -206,4 +211,4 @@ with transformer_engine.pytorch.autocast(recipe=fp8_recipe):
     mfsdp_model(x).sum().backward()
 ```
 
-ℹ️ `TransformerEngine` kernels have various constraints related to quantized Tensors, such as using fused QKV parameters or defining activations and parameters with shapes compatible to CuBLAS kernels on supported hardware from NVIDIA. To properly initialize `TransformerLayer`, you can refer to the example model used in our unit tests: `Megatron-LM/tests/unit_tests/distributed/fsdp/test_mfsdp_fully_shard.py::TestMegatronFsdpFullyShard::test_fully_shard_te_quantized`.
+ℹ️ `TransformerEngine` kernels have various constraints related to quantized Tensors, such as using fused QKV parameters or defining activations and parameters with shapes compatible to CuBLAS kernels on supported hardware from NVIDIA. To properly initialize `TransformerLayer`, you can refer to the example model used in our unit tests: `Megatron-LM/tests/unit_tests/distributed/mfsdp_v1/test_mfsdp_fully_shard.py::TestMegatronFsdpFullyShard::test_fully_shard_te_quantized`.

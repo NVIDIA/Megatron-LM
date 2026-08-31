@@ -6,7 +6,6 @@ from collections import Counter
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
-import pandas as pd
 import torch
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
@@ -205,13 +204,20 @@ class SFTDataset(MegatronDataset):
         adjacent_diffs = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = adjacent_diffs.max()  # max_seqlen is a 0-D tensor
 
+        # Pad cu_seqlens to a fixed length so that default_collate can
+        # stack samples with different numbers of documents.  Trailing
+        # entries are filled with pack_length; the merge helper strips
+        # them later.
+        padded_cu_seqlens = torch.full((pack_length + 1,), pack_length, dtype=torch.int32)
+        padded_cu_seqlens[: cu_seqlens.numel()] = cu_seqlens
+
         return {
             'tokens': input_ids,
             'labels': labels,
             # 'attention_mask': attention_mask,  # PyTorch collate cannot handle NoneType
             'loss_mask': loss_mask,
             'position_ids': position_ids,
-            'cu_seqlens': cu_seqlens,
+            'cu_seqlens': padded_cu_seqlens,
             'max_seqlen': max_seqlen,
         }
 
@@ -221,6 +227,8 @@ class MockSFTLowLevelDataset:
 
     Args:
         mode (str): One of 'file', 'distribution', or 'verification'.
+        vocab_size (Optional[int]): Tokenizer vocabulary size. Required for the generated
+            'file' and 'distribution' modes and ignored by 'verification' mode.
         **kwargs: Additional arguments depending on mode.
             For mode='file': path (str) - path to a CSV file with sequence lengths.
             For mode='distribution': type (str), min_seq_len (int), max_seq_len (int),
@@ -239,11 +247,21 @@ class MockSFTLowLevelDataset:
     size: int = 1000000
     """The hard-coded number of sequence to generate"""
 
-    def __init__(self, mode: str, **kwargs) -> None:
+    def __init__(self, mode: str, vocab_size: Optional[int] = None, **kwargs) -> None:
         np.random.seed(self.seed)
         self.format = kwargs.get("format", "thd")
+        self.vocab_size = vocab_size
+
+        if mode in ("file", "distribution") and (vocab_size is None or vocab_size < 2):
+            raise ValueError(
+                "Generated mock data requires vocab_size >= 2. If tokenizer.vocab_size is "
+                "unavailable, set vocab_size in the mock dataset config JSON; "
+                f"got {vocab_size}."
+            )
 
         if mode == "file":
+            import pandas as pd
+
             self.sequence_lengths = np.array(pd.read_csv(kwargs["path"])).flatten()
             self.size = len(self.sequence_lengths)
         elif mode == "distribution":
@@ -309,7 +327,13 @@ class MockSFTLowLevelDataset:
             assert len(sample) == target
             return sample.astype(np.int64)
         else:
-            return np.arange(1, length, dtype=np.int64)
+            assert self.vocab_size is not None and self.vocab_size >= 2
+            sample = np.arange(1, length, dtype=np.int64)
+            # Preserve the original positive-token invariant while bounding IDs to the
+            # tokenizer vocabulary. In particular, do not synthesize token 0, which is
+            # commonly used as EOD/padding and therefore masked out of the loss.
+            sample = (sample - 1) % (self.vocab_size - 1) + 1
+            return sample
 
 
 class MockSFTDataset(SFTDataset):
@@ -339,6 +363,7 @@ class MockSFTDataset(SFTDataset):
             }
         else:
             mock_config = load_json_arg(config.sft_mock_dataset_config_json)
+        mock_config.setdefault("vocab_size", getattr(config.tokenizer, "vocab_size", None))
         return MockSFTLowLevelDataset(**mock_config)
 
     def __len__(self) -> int:

@@ -13,6 +13,7 @@ from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, Modu
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import MegatronModule
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import unwrap_model
@@ -105,21 +106,22 @@ class MimoModel(MegatronModule):
         sharded_sd = {}
         for name, module in self.named_children():
             if name == 'modality_submodules':
-                # Unwrap DDP, call ModalitySubmodules.sharded_state_dict directly
-                # (which injects dp_cp_group from its pg_collection)
+                # Unwrap DDP/Float16Module (each forwards sharded_state_dict without adding
+                # its own 'module.') and add the prefix per level, then call the submodule
+                # directly (which injects dp_cp_group from its pg_collection).
                 for mod_name, mod in module.items():
-                    is_ddp = isinstance(mod, DistributedDataParallel)
-                    inner = mod.module if is_ddp else mod
+                    inner = mod
                     child_prefix = f'{prefix}{name}.{mod_name}.'
-                    if is_ddp:
+                    while isinstance(inner, (DistributedDataParallel, Float16Module)):
+                        inner = inner.module
                         child_prefix += 'module.'
                     sharded_sd.update(
                         inner.sharded_state_dict(child_prefix, sharded_offsets, metadata)
                     )
             else:
                 # Inject dp_cp_group from pg_collection for language_model
-                inner = module.module if isinstance(module, DistributedDataParallel) else module
-                pg = getattr(inner, 'pg_collection', None)
+                pg_src = module.module if isinstance(module, DistributedDataParallel) else module
+                pg = getattr(pg_src, 'pg_collection', None)
                 mod_metadata = metadata
                 if pg is not None:
                     assert (
@@ -127,10 +129,14 @@ class MimoModel(MegatronModule):
                     ), f"pg_collection on '{name}' is missing dp_cp group"
                     mod_metadata = dict(metadata) if metadata else {}
                     mod_metadata['dp_cp_group'] = pg.dp_cp
+                # Unwrap wrappers so the sharded keys match the raw load_state_dict keys.
+                inner = module
+                child_prefix = f'{prefix}{name}.'
+                while isinstance(inner, (DistributedDataParallel, Float16Module)):
+                    inner = inner.module
+                    child_prefix += 'module.'
                 sharded_sd.update(
-                    sharded_state_dict_default(
-                        module, f'{prefix}{name}.', sharded_offsets, mod_metadata
-                    )
+                    sharded_state_dict_default(inner, child_prefix, sharded_offsets, mod_metadata)
                 )
         return sharded_sd
 

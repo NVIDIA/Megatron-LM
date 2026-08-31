@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain and SFT GPT."""
 
@@ -18,13 +18,14 @@ if rank != 0:
     warnings.filterwarnings("ignore", category=UserWarning)
     warnings.filterwarnings("ignore", category=FutureWarning)
 
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any, List, Optional, Tuple
 
 import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
+from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -34,6 +35,7 @@ from megatron.core.packed_seq_params import (
     PackedSeqParams,
     get_thd_padding_kwargs,
     pad_sequence_for_thd,
+    resolve_thd_tail_padding_policy,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -131,7 +133,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     if args.sequence_packing_scheduler is not None:
         # `get_batch_on_this_rank_for_sequence_packing` owns scheduler THD metadata
         # and returns a 7-tuple including `padding_mask`.
-        return get_batch_on_this_rank_for_sequence_packing(
+        batch = get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
@@ -139,12 +141,16 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             dynamic_cp=args.dynamic_context_parallel,
             config=config,
         )
+        finalize_packed_seq_params(batch[5])
+        return batch
 
     # TODO: this is pretty hacky, find a better way
     is_packed_sequence = args.sft or (args.use_varlen_dataset and not args.varlen_sbhd_validation)
+    needs_padding_mask = args.use_varlen_dataset and args.varlen_sbhd_validation
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
         and not is_packed_sequence
+        and not needs_padding_mask
         and ((not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)))
     ):
         return None, None, None, None, None, None, None
@@ -153,6 +159,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     batch = get_batch_on_this_tp_rank(
         data_iterator,
         mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+        needs_padding_mask=needs_padding_mask,
     )
 
     cu_seqlens = batch.pop('cu_seqlens', None)
@@ -170,22 +177,25 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     # For middle pipeline stages with packed sequences, only cu_seqlens and
     # max_seqlen are needed (for attention masking); skip the full batch.
     if not is_first_or_last_pipeline_stage(vp_stage) and is_packed_sequence:
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=int(max_seqlen[0].item()),
+            max_seqlen_kv=int(max_seqlen[0].item()),
+            qkv_format='thd',
+        )
+        finalize_packed_seq_params(packed_seq_params)
         return (
             None,
             None,
             None,
             None,
             None,
-            PackedSeqParams(
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_kv=cu_seqlens,
-                max_seqlen_q=int(max_seqlen[0].item()),
-                max_seqlen_kv=int(max_seqlen[0].item()),
-                qkv_format='thd',
-            ),
+            packed_seq_params,
             None,
         )
 
+    thd_tail_padding_policy = resolve_thd_tail_padding_policy(config)
     if cu_seqlens is None:
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
@@ -195,9 +205,11 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             batch, cu_seqlens, cu_seqlens_padded, max_seqlen
         )
 
-    # Pad the already-packed THD tensors at the end when requested. CUDA Graph
-    # additionally pads cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
-    padding_mask = None
+    # Pad the already-packed THD tensors at the end when requested. A configured
+    # thd_max_packed_sequences also pads cu_seqlens to a fixed capacity in eager or graph mode.
+    # SBHD validation samples carry physical right-padding metadata. CP has
+    # already partitioned it with the other sequence-dimension tensors.
+    padding_mask = batch.pop('padding_mask', None)
     if config.pad_packed_seq_alignment is not None and packed_seq_params is not None:
         tokens = batch.get('tokens', None)
         labels = batch.get('labels', None)
@@ -219,7 +231,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 alignment=alignment,
                 target_len=target_len,
                 max_num_seqs=max_num_seqs,
-                pad_by_appending_dummy_seq=config.pad_packed_seq_by_appending_dummy_seq,
+                tail_padding_policy=thd_tail_padding_policy,
+                padding_mask=padding_mask,
             )
         )
         if 'tokens' in batch:
@@ -230,6 +243,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             batch['loss_mask'] = loss_mask
         if 'position_ids' in batch:
             batch['position_ids'] = position_ids
+
+    finalize_packed_seq_params(packed_seq_params)
 
     # Unpack explicitly to avoid relying on dict insertion order.
     return (
@@ -245,6 +260,27 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
+
+
+@lru_cache(maxsize=1)
+def _build_cached_logits_loss_func(
+    logprobs_dir, decode_threads, prefetch_factor, msc_prefetch_depth, kd_loss_alpha, ignore_errors
+):
+    """Build (once) the offline knowledge-distillation loss callable for cached logits.
+
+    Memoized so the teacher log-probability reader is constructed a single time per
+    process, replacing the previous module-level mutable global.
+    """
+    from megatron.training.distillation import LossFuncCallable
+
+    return LossFuncCallable(
+        logprobs_dir=logprobs_dir,
+        decode_threads=decode_threads,
+        prefetch_factor=prefetch_factor,
+        msc_prefetch_depth=msc_prefetch_depth,
+        kd_loss_alpha=kd_loss_alpha,
+        ignore_errors=ignore_errors,
+    )
 
 
 def loss_func(
@@ -265,7 +301,18 @@ def loss_func(
     """
     args = get_args()
 
-    if has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
+    if args.logits_load_dir is not None:
+        # Offline knowledge distillation loss using cached teacher log-probabilities.
+        loss_func_cached_logits = _build_cached_logits_loss_func(
+            logprobs_dir=args.logits_load_dir,
+            decode_threads=args.logits_load_decode_threads,
+            prefetch_factor=args.logits_load_prefetch_factor,
+            msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
+            kd_loss_alpha=args.logits_load_kd_loss_alpha,
+            ignore_errors=args.logits_load_ignore_errors,
+        )
+        loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
+    elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
         losses = output_tensor.view(-1).float()
@@ -365,7 +412,12 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence:
+    elif is_packed_sequence or (
+        getattr(args, 'use_varlen_dataset', False)
+        and getattr(args, 'varlen_sbhd_validation', False)
+    ):
+        # Packed THD and SBHD validation both need padding metadata on every
+        # pipeline stage so each MoE layer excludes physical padding.
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank(
         config, ignore_virtual=False, vp_stage=vp_stage
@@ -411,6 +463,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
         "dynamic_context_parallel": args.dynamic_context_parallel,
+        "sft_mock_dataset_config_json": args.sft_mock_dataset_config_json,
         "varlen_mock_dataset_config_json": args.varlen_mock_dataset_config_json,
         "varlen_sbhd_validation": args.varlen_sbhd_validation,
     }
@@ -525,9 +578,9 @@ if __name__ == "__main__":
     pretrain(
         full_config,
         train_valid_test_datasets_provider,
-        partial(model_provider, gpt_builder),
         ModelType.encoder_or_decoder,
         forward_step,
+        model_provider=partial(model_provider, gpt_builder),
         store=store,
         get_embedding_ranks=get_embedding_ranks,
     )

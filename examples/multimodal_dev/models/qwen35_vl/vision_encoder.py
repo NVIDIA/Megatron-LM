@@ -455,7 +455,9 @@ class Qwen35VLVisionEncoder(VisionModule):
             grid_thw: ``[num_images, 3]`` (T, H, W) per image.
 
         Returns:
-            ``[total_patches, head_dim // 2]`` raw RoPE frequencies.
+            Raw sectioned frequencies ``[3, 1, total_patches, head_dim // 2]``
+            when ``config.mrope_section`` is set.  Otherwise returns the legacy
+            ``[total_patches, head_dim // 2]`` row/column frequency tensor.
         """
         merge = self.spatial_merge_size
         grid_thw_list = grid_thw.tolist()
@@ -512,7 +514,27 @@ class Qwen35VLVisionEncoder(VisionModule):
 
         embeddings = freq_table[pos_ids]
         embeddings = embeddings.flatten(1)
-        return embeddings
+
+        mrope_section = getattr(self.config, "mrope_section", None)
+        if mrope_section is None:
+            return embeddings
+
+        sec_t, sec_h, sec_w = (int(section) for section in mrope_section)
+        if sec_t != 0 or sec_h + sec_w != embeddings.shape[-1]:
+            raise ValueError(
+                "Qwen3.5-VL vision RoPE expects mrope_section "
+                f"[0, row_dim, col_dim] summing to {embeddings.shape[-1]}, "
+                f"got {mrope_section}"
+            )
+
+        raw_freqs = embeddings.new_zeros(
+            3, 1, embeddings.shape[0], embeddings.shape[1],
+        )
+        raw_freqs[1, 0, :, :sec_h] = embeddings[:, :sec_h]
+        raw_freqs[2, 0, :, sec_h : sec_h + sec_w] = embeddings[
+            :, sec_h : sec_h + sec_w
+        ]
+        return raw_freqs
 
     # ---------------------------------------------------------------
     # PackedSeqParams for variable-length attention
@@ -575,8 +597,9 @@ class Qwen35VLVisionEncoder(VisionModule):
 
         # 3. 2D Vision RoPE
         rot_freqs = self._compute_rotary_pos_emb(grid_thw)
-        emb = torch.cat((rot_freqs, rot_freqs), dim=-1)
-        rot_freqs_expanded = emb.unsqueeze(1).unsqueeze(1)
+        if getattr(self.config, "mrope_section", None) is None:
+            emb = torch.cat((rot_freqs, rot_freqs), dim=-1)
+            rot_freqs = emb.unsqueeze(1).unsqueeze(1)
 
         # 4. Transformer blocks with PackedSeqParams
         packed_seq_params = self._build_packed_seq_params(grid_thw)
@@ -584,7 +607,7 @@ class Qwen35VLVisionEncoder(VisionModule):
         hidden_states = self.decoder(
             hidden_states=hidden_states,
             attention_mask=None,
-            rotary_pos_emb=rot_freqs_expanded,
+            rotary_pos_emb=rot_freqs,
             packed_seq_params=packed_seq_params,
         )
         hidden_states = hidden_states.squeeze(1)

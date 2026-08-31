@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from megatron.lite.model.protocol_utils import (
     add_cross_entropy_fusion,
     add_loss_context_kwargs,
     pack_thd_forward_kwargs,
+    router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
     unpack_thd_forward_output,
 )
@@ -24,6 +26,11 @@ from megatron.lite.model.qwen3_5.lite.checkpoint import load_hf_weights as _load
 from megatron.lite.model.qwen3_5.lite.checkpoint import save_hf_weights as _save_hf_weights_impl
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
+from megatron.lite.primitive.quantization import (
+    QATSpec,
+    apply_qat_to_chunks,
+    normalize_qat_spec,
+)
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
@@ -72,6 +79,7 @@ class ImplConfig:
     # all heads, best memory; bf16-floor vs CP-off, faithful packing-aware mirror of
     # upstream Megatron linear_cp_mode='chunkwise').
     gdn_cp_mode: str = "headwise"
+    qat: QATSpec | dict | None = None
 
 
 def _full_attn_module(layer, name: str):
@@ -79,14 +87,30 @@ def _full_attn_module(layer, name: str):
     return getattr(full_attn, name, None) if full_attn is not None else None
 
 
+def _maybe(module_name: str) -> Callable[[nn.Module], nn.Module | None]:
+    def getter(layer: nn.Module) -> nn.Module | None:
+        return getattr(layer, module_name, None)
+
+    return getter
+
+
+def _moe_module(name: str) -> Callable[[nn.Module], nn.Module | None]:
+    def getter(layer: nn.Module) -> nn.Module | None:
+        moe = getattr(layer, "moe", None)
+        return getattr(moe, name, None) if moe is not None else None
+
+    return getter
+
+
 MODULE_MAP = {
     "core_attn": lambda layer: _full_attn_module(layer, "core_attn"),
-    "experts": lambda layer: layer.moe.experts,
-    "moe": lambda layer: layer.moe,
-    "router": lambda layer: layer.moe.router,
-    "mlp_norm": lambda layer: layer.mlp_norm,
+    "experts": _moe_module("experts"),
+    "moe": _maybe("moe"),
+    "router": _moe_module("router"),
+    "mlp": _maybe("mlp"),
+    "mlp_norm": _maybe("mlp_norm"),
     "attn_proj": lambda layer: _full_attn_module(layer, "proj"),
-    "linear_attn": lambda layer: layer.linear_attn,
+    "linear_attn": _maybe("linear_attn"),
 }
 
 
@@ -158,6 +182,7 @@ def _build_dist_opt_optimizer(
 
 def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     from megatron.lite.model.qwen3_5.lite.model import Qwen35Model
+    from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
 
     p = impl_cfg.parallel
 
@@ -216,6 +241,14 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
             .cuda()
             for i in range(vpp)
         ]
+
+    # GDN state is physically replicated when TP exceeds its head count.
+    # Synchronize the initial copies before any optimizer/FSDP wrapping so a
+    # from-scratch model is TP-invariant just like a model loaded from HF.
+    for chunk in chunks:
+        for module in chunk.modules():
+            if isinstance(module, GatedDeltaNet):
+                module.sync_tp_replicated_parameters()
     set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 
     if recompute_spec:
@@ -227,6 +260,9 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
         for chunk in chunks:
             apply_offload(chunk.layers, impl_cfg.offload, MODULE_MAP)
+
+    # Parametrize before optimizer construction so it captures the BF16 master.
+    apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
 
     optimizer = None
     finalize_grads = None
@@ -296,9 +332,9 @@ def export_hf_weights(
 
 
 def save_hf_weights(
-    chunks: list[nn.Module], path: str, model_cfg: Qwen35Config, ps: ParallelState
+    chunks: list[nn.Module], path: str, model_cfg: Qwen35Config, ps: ParallelState, **kwargs
 ) -> None:
-    _save_hf_weights_impl(chunks, path, model_cfg, ps)
+    _save_hf_weights_impl(chunks, path, model_cfg, ps, **kwargs)
 
 
 def vocab_size(model_cfg) -> int | None:

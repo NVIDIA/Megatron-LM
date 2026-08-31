@@ -30,6 +30,9 @@ MODEL_ARGS:
   --deterministic-mode: true
   --ckpt-format: "fsdp_dtensor"
   --no-gradient-accumulation-fusion: true
+  --megatron-fsdp-main-params-dtype: fp32
+  --megatron-fsdp-main-grads-dtype: fp32
+  --megatron-fsdp-grad-comm-dtype: fp32
   # Training args
   --use-mcore-models: true
   --sequence-parallel: true

@@ -75,6 +75,16 @@ MODEL_ARGS:
   --rl-use-sequence-packing: true
   --rl-sequence-packing-algo: fifo
   --rl-offload-optimizer-during-inference: true
+  # Pre-generate all trainer batches upfront so iteration-time measures the
+  # training step alone, not the inference critical path. lag=19 sized so
+  # pgt = (lag+1) * grpo_prompts_per_step = 40 = exit_interval * prompts_per_step
+  # groups inflight; G/G yields groups as they complete instead of waiting on
+  # batch order.
+  # TODO: rebaseline iteration-time goldens against the lag=0 steady-state once
+  # post-rollout-refactor throughput targets are settled.
+  --rl-generation-lag: 19
+  --rl-submission-granularity: G
+  --rl-consumption-granularity: G
   --timing-log-level: 1
   --cuda-graph-impl: local
   --micro-batch-size: 1

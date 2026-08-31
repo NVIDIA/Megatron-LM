@@ -29,3 +29,4 @@ from megatron.training.utils.common_utils import (
     warn_rank_0,
 )
 from megatron.training.utils.log_utils import append_to_progress_log
+from megatron.training.utils.utils import start_memory_history_recording

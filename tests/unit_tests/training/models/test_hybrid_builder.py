@@ -323,14 +323,6 @@ class TestHybridModelBuilderBuildModel:
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
     @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
     @patch("megatron.training.models.hybrid.HybridModel")
-    def test_virtual_pipeline_raises(self, mock_model, *_):
-        with pytest.raises(AssertionError, match="Virtual pipeline"):
-            self.builder.build_model(self.pg, vp_stage=0)
-
-    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
-    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
-    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
-    @patch("megatron.training.models.hybrid.HybridModel")
     def test_config_params_passed_to_mcore(self, mock_model, *_):
         config = _make_hybrid_config(
             vocab_size=32000,
@@ -438,6 +430,16 @@ class TestHybridModelBuilderBuildDistributedModels:
         result = self.builder.build_distributed_models(self.pg)
 
         assert result is model_list
+
+    @patch("megatron.training.models.hybrid.compose_hooks")
+    @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")
+    def test_layer_wise_optimizer_flag_forwarded(self, mock_unimodal, mock_compose):
+        mock_unimodal.return_value = [Mock()]
+        mock_compose.return_value = Mock(return_value=None)
+
+        self.builder.build_distributed_models(self.pg, use_layer_wise_distributed_optimizer=True)
+
+        assert mock_unimodal.call_args.kwargs["use_layer_wise_distributed_optimizer"] is True
 
     @patch("megatron.training.models.hybrid.compose_hooks")
     @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")

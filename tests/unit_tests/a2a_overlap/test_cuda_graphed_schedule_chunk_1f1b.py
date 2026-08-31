@@ -274,7 +274,7 @@ class TestPartialCudaGraphedA2AOverlap:
         )
 
         gpt_model, optimizer, _ = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, self.model_provider
         )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
@@ -377,3 +377,42 @@ class TestPartialCudaGraphedA2AOverlap:
                     loss_list[i].mean(), loss_list_ref[i].mean()
                 ), f"scope={cuda_graph_modules}, i={i},loss_list={loss_list[i]}, loss_list_ref={loss_list_ref[i]}"
             print(f"[DEBUG] Pass {cuda_graph_modules}")
+
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+    )
+    def test_mhc_recompute_whole_attention_cudagraph_with_ep_overlap(self):
+        """mHC recompute + attn-scope graph + EP overlap, split switch off.
+
+        This executes the restored non-split overlap replay tail with a live
+        recompute manager: the schedule installs the manager on the layer, the
+        tail registers mlp_hyper_connection and the pre-MLP layernorm checkpoints
+        against it, the group-end node discards, and the barrier node replays
+        before combine backward. The graphed schedule must reproduce the eager
+        schedule's loss series exactly; a mocked-boundary test cannot pin any of
+        that, so this is the executing coverage for the tail.
+        """
+        extra_kwargs = {
+            "moe_layer_freq": 1,
+            "moe_token_dispatcher_type": "alltoall",
+            "enable_hyper_connections": True,
+            "num_residual_streams": 4,
+            "mtp_num_layers": None,  # mHC is incompatible with MTP
+            "recompute_granularity": "selective",
+            "recompute_modules": ["mhc"],
+            "mhc_recompute_layer_num": 2,
+        }
+
+        loss_list_ref = self._run_test_helper(4, "none", None, 3, **extra_kwargs)
+        loss_list = self._run_test_helper(
+            4, "transformer_engine", [CudaGraphModule.attn], 3, ep_overlap=True, **extra_kwargs
+        )
+        assert len(loss_list) == len(loss_list_ref)
+        for i in range(len(loss_list)):
+            assert torch.equal(loss_list[i].mean(), loss_list_ref[i].mean()), (
+                f"mHC recompute whole-attention overlap diverged from eager at i={i}: "
+                f"{loss_list[i]} vs {loss_list_ref[i]}"
+            )

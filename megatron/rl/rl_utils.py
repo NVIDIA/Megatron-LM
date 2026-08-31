@@ -72,6 +72,7 @@ from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
 from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
+from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
 from megatron.rl.sequence_packing_utils import (
     compute_packed_inference_logprobs_stats,
     get_default_packed_seq_params,
@@ -578,14 +579,16 @@ def get_inference_interface(args, loop, model):
 
 
 _ROLLOUT_GENERATOR = None
+_ROLLOUT_AGENT = None
 
 
 def get_rollout_generator(args, inference_interface, n_prompts, samples_per_group):
-    global _ROLLOUT_GENERATOR
+    global _ROLLOUT_GENERATOR, _ROLLOUT_AGENT
     if not (streaming := args.rl_partial_rollouts) or _ROLLOUT_GENERATOR is None:
-        agent = get_agent(args, parallel_generation_tasks=args.rl_parallel_generation_tasks)
+        parallel_generation_tasks = get_rl_parallel_generation_tasks(args)
+        agent = get_agent(args, parallel_generation_tasks=parallel_generation_tasks)
         request = GroupedRolloutRequest(
-            num_groups=args.rl_generation_batch_size if streaming else n_prompts,
+            num_groups=n_prompts,
             streaming=streaming,
             rollouts_per_group=samples_per_group,
             inference_interface=inference_interface,
@@ -596,8 +599,12 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
                 'top_k': args.rl_default_top_k,
             },
             filter_groups_with_same_reward=args.grpo_filter_groups_with_same_reward,
-            enforce_order=args.rl_enforce_generation_order,
+            submission_granularity=args.rl_submission_granularity,
+            consumption_granularity=args.rl_consumption_granularity,
         )
+        # Keep the agent handle so metric logging can read the live rollout
+        # pipelines (see _collect_rollout_pipeline_metrics).
+        _ROLLOUT_AGENT = agent
         _ROLLOUT_GENERATOR = agent.get_grouped_rollouts(request)
     return _ROLLOUT_GENERATOR
 
@@ -1123,6 +1130,95 @@ def prep_wandb_metrics(
     return metrics
 
 
+def _collect_rollout_pipeline_metrics() -> dict:
+    """Snapshot per-pipeline instrumentation into wandb-loggable scalars.
+
+    Walks the live rollout agent (set by get_rollout_generator) and, for each
+    sub-agent with an active _RolloutPipeline, reads queue sizes, gate state,
+    per-stage dwell times, and rate counters. Accumulators are reset after
+    reading; point-in-time values (queue sizes, gate held) are re-read next
+    call. Keys follow the existing f"{env_id}_{metric}" convention.
+    """
+    if _ROLLOUT_AGENT is None:
+        return {}
+    sub_agents = (
+        _ROLLOUT_AGENT.agents if isinstance(_ROLLOUT_AGENT, WeightedMultiTask) else [_ROLLOUT_AGENT]
+    )
+    metrics: dict = {}
+    for sub_agent in sub_agents:
+        pipeline = getattr(sub_agent, "_active_pipeline", None)
+        if pipeline is None:
+            continue
+        env_id = getattr(sub_agent, "env_id", "") or "rollout"
+        gate = pipeline.gate
+        metrics.update(
+            {
+                # Queue sizes and gate held are point-in-time reads.
+                f"{env_id}_pipeline_infer_queue_size": pipeline.infer_queue.qsize(),
+                f"{env_id}_pipeline_assemble_queue_size": pipeline.assemble_queue.qsize(),
+                f"{env_id}_pipeline_output_queue_size": pipeline.output_queue.qsize(),
+                f"{env_id}_pipeline_assemble_pending_groups": len(pipeline._assemble_pending),
+                f"{env_id}_pipeline_consume_pending_groups": len(pipeline._consume_pending),
+                f"{env_id}_pipeline_gate_capacity": gate.capacity,
+                f"{env_id}_pipeline_gate_held": gate.held,
+                f"{env_id}_pipeline_gate_utilization": (
+                    gate.held / gate.capacity if gate.capacity else 0.0
+                ),
+                # Counters below accumulate since the previous collection.
+                f"{env_id}_pipeline_gate_prepare_blocked_seconds": gate.prepare_blocked_seconds,
+                f"{env_id}_pipeline_gate_acquire_calls": gate.acquire_calls,
+                f"{env_id}_pipeline_gate_release_calls": gate.release_calls,
+                f"{env_id}_pipeline_prepared_count": pipeline.prepared_count,
+                f"{env_id}_pipeline_inferred_count": pipeline.inferred_count,
+                f"{env_id}_pipeline_assembled_count": pipeline.assembled_count,
+                f"{env_id}_pipeline_yielded_count": pipeline.yielded_count,
+            }
+        )
+        for name, samples in (
+            ("infer_queue_dwell", pipeline.infer_queue_dwell),
+            ("engine_dwell", pipeline.engine_dwell),
+            ("assemble_queue_dwell", pipeline.assemble_queue_dwell),
+            ("output_queue_dwell", pipeline.output_queue_dwell),
+        ):
+            if samples:
+                arr = np.asarray(samples, dtype=np.float64)
+                metrics[f"{env_id}_pipeline_mean_{name}_s"] = float(arr.mean())
+                metrics[f"{env_id}_pipeline_max_{name}_s"] = float(arr.max())
+                metrics[f"{env_id}_pipeline_p50_{name}_s"] = float(np.percentile(arr, 50))
+                metrics[f"{env_id}_pipeline_p99_{name}_s"] = float(np.percentile(arr, 99))
+        # Reset accumulators; queue sizes and gate held are point-in-time.
+        pipeline.infer_queue_dwell = []
+        pipeline.engine_dwell = []
+        pipeline.assemble_queue_dwell = []
+        pipeline.output_queue_dwell = []
+        pipeline.prepared_count = 0
+        pipeline.inferred_count = 0
+        pipeline.assembled_count = 0
+        pipeline.yielded_count = 0
+        gate.prepare_blocked_seconds = 0.0
+        gate.acquire_calls = 0
+        gate.release_calls = 0
+
+    # WeightedMultiTask work distribution (agent_slots / agent_pgts).
+    dist = getattr(_ROLLOUT_AGENT, "latest_distribution", None)
+    if dist:
+        # An env_id can appear more than once in the config (e.g. an active
+        # entry plus an evaluation-only twin with zero weight). Sum per
+        # env_id so the zero twin does not overwrite the active entry.
+        per_env: dict = {}
+        for env_id, groups, pgt, slots in zip(
+            dist["env_ids"], dist["agent_groups"], dist["agent_pgts"], dist["agent_slots"]
+        ):
+            g, p, s = per_env.get(env_id, (0, 0, 0.0))
+            per_env[env_id] = (g + groups, p + pgt, s + slots)
+        for env_id, (groups, pgt, slots) in per_env.items():
+            metrics[f"{env_id}_agent_groups"] = groups
+            metrics[f"{env_id}_agent_pgts"] = pgt
+            metrics[f"{env_id}_agent_slots"] = slots
+        metrics["multitask_total_pgt"] = dist["total_pgt"]
+    return metrics
+
+
 def maybe_log_training_metrics(
     group_stats: RolloutStats,
     current_iteration: int,
@@ -1144,6 +1240,16 @@ def maybe_log_training_metrics(
         tb_writer.add_scalar(
             'mean_reward', np.mean([np.mean(g) for g in group_stats.rewards]), current_iteration
         )
+
+    # Pipeline instrumentation lives on rank 0 (the only rank that drives
+    # rollout generation), while the wandb writer lives on the last rank.
+    # Collect on rank 0 and broadcast so the writer rank can log it. This is
+    # a collective, so it must run on every rank before the early return.
+    pipeline_metrics = _collect_rollout_pipeline_metrics()
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        payload = [pipeline_metrics]
+        dist.broadcast_object_list(payload, src=0)
+        pipeline_metrics = payload[0]
     if not wandb_writer:
         return
 
@@ -1213,6 +1319,11 @@ def maybe_log_training_metrics(
         )
         for k, v in env_metrics.items():
             metrics[f"{env_id}_{k}"] = v
+
+    # Per-pipeline instrumentation (queue sizes, gate state, per-stage
+    # timings) and the multi-task work distribution, collected on rank 0
+    # and broadcast above.
+    metrics.update(pipeline_metrics)
 
     wandb_writer.log(metrics, step=current_iteration)
 
@@ -2132,11 +2243,13 @@ def megatron_rl_inference_mode(
 def rl_inference_interface_shutdown():
     global _INFERENCE_INTERFACE
     global _ROLLOUT_GENERATOR
+    global _ROLLOUT_AGENT
 
     if _ROLLOUT_GENERATOR is not None:
         loop = get_asyncio_loop()
         loop.run_until_complete(_ROLLOUT_GENERATOR.aclose())
         _ROLLOUT_GENERATOR = None
+    _ROLLOUT_AGENT = None
 
     if _INFERENCE_INTERFACE is not None:
         loop = get_asyncio_loop()

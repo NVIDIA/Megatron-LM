@@ -8,8 +8,6 @@ import time
 
 import torch
 
-from gpt_builders import gpt_builder
-from hybrid_builders import hybrid_builder
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
@@ -31,7 +29,6 @@ from megatron.inference.utils import (
     get_dynamic_inference_engine,
     get_model_for_inference,
 )
-from model_provider import model_provider
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))

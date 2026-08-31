@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import copy
@@ -1009,10 +1009,13 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
         name: str | None = None,
+        eps: float | None = None,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
+            eps (float | None): Epsilon for the fused layer norm. Defaults to
+                ``config.layernorm_epsilon`` when ``None``.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -1117,7 +1120,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             super().__init__(
                 in_features=input_size,
                 out_features=output_size,
-                eps=self.config.layernorm_epsilon,
+                eps=self.config.layernorm_epsilon if eps is None else eps,
                 sequence_parallel=self.config.sequence_parallel,
                 fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
                 tp_group=tp_group if torch.distributed.is_initialized() else None,
@@ -1752,9 +1755,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
 
         # These fields are MCore-only and should not be forwarded to TE attention.
+        # total_tokens and seq_idx are only for Mamba; tokens_per_sample is only for
+        # MoE sequence-level aux loss reshaping; cp_partition_mode and cp_partition_route
+        # are MCore CP metadata.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
+        self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_partition_mode")
+        self.kept_packed_seq_params.discard("cp_partition_route")
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later

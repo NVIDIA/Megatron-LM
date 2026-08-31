@@ -147,6 +147,17 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
         restore_custom_attrs(self.module, attrs)
 
+    def finish_grad_sync(self, force_all_reduce=False):
+        """
+        Finishes grad sync (all-reduce or reduce-scatter) communication operations
+        for all model gradients.
+
+        When overlap_grad_reduce is set to True, waits for asynchronous communication
+        calls to complete. When overlap_grad_reduce is set to False, calls synchronous
+        communication ops.
+        """
+        super().finish_grad_sync()
+
     def load_state_dict(self, state_dict, strict=True):
         """
         No-op because tensors are already loaded in-place by

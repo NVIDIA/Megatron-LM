@@ -406,10 +406,15 @@ class VarlenDataset(SFTDataset):
             loss_mask = torch.ones(max_len, dtype=torch.float32)
             loss_mask[valid_len:] = 0.0  # mask the right-padded tail by position
             loss_mask[labels == IGNORE_INDEX] = 0.0
+            # Keep physical padding separate from the LM loss mask: prompt
+            # tokens may be loss-masked but must still participate in MoE.
+            padding_mask = torch.zeros(max_len, dtype=torch.bool)
+            padding_mask[valid_len:] = True
             return {
                 'tokens': input_ids,
                 'labels': labels,
                 'loss_mask': loss_mask,
+                'padding_mask': padding_mask,
                 'position_ids': torch.arange(max_len, dtype=torch.int64),
             }
 
@@ -481,6 +486,7 @@ class MockVarlenDataset(MockSFTDataset):
             }
         else:
             mock_config = load_json_arg(config.varlen_mock_dataset_config_json)
+        mock_config.setdefault("vocab_size", getattr(config.tokenizer, "vocab_size", None))
         return MockSFTLowLevelDataset(**mock_config)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:

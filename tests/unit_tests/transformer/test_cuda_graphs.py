@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import os
@@ -98,6 +98,62 @@ class TestCudaGraphConfigAndArguments:
     def test_local_impl_defaults_to_layer_scope(self):
         cfg = _base_cuda_graph_config(cuda_graph_impl='local')
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
+
+    def test_local_impl_allows_expert_activation_offload_scope(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='local',
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe_router],
+            fine_grained_activation_offloading=True,
+            offload_modules=['expert_fc1', 'moe_act'],
+            num_moe_experts=4,
+        )
+
+        assert cfg.cuda_graph_impl == 'local'
+        assert CudaGraphModule.attn in cfg.cuda_graph_modules
+        assert CudaGraphModule.moe_router in cfg.cuda_graph_modules
+        assert CudaGraphModule.moe_preprocess in cfg.cuda_graph_modules
+
+    def test_local_impl_rejects_unsupported_activation_offload_scope(self):
+        with pytest.raises(
+            AssertionError,
+            match=(
+                "fine-grained activation offloading with cuda_graph_impl='local'.*"
+                "Unsupported offload_modules: \\['qkv_linear'\\]"
+            ),
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules=[CudaGraphModule.attn],
+                fine_grained_activation_offloading=True,
+                offload_modules=['qkv_linear'],
+            )
+
+    def test_local_impl_rejects_full_layer_graph_with_activation_offload(self):
+        with pytest.raises(
+            AssertionError, match="not supported with whole-layer CUDA graph capture"
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules=[],
+                fine_grained_activation_offloading=True,
+                offload_modules=['expert_fc1'],
+            )
+
+    def test_local_impl_rejects_moe_router_graph_with_mlp_norm_offload(self):
+        with pytest.raises(
+            AssertionError,
+            match=(
+                "fine-grained activation offloading with cuda_graph_impl='local'.*"
+                "Unsupported offload_modules: \\['mlp_norm'\\]"
+            ),
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local',
+                cuda_graph_modules=[CudaGraphModule.moe_router],
+                fine_grained_activation_offloading=True,
+                offload_modules=['mlp_norm'],
+                num_moe_experts=4,
+            )
 
     def test_full_iteration_impl_requires_empty_scope(self):
         with pytest.raises(
@@ -646,6 +702,9 @@ class TestLLaVACudaGraph:
 
         # Move model to CUDA
         self.llava_model.cuda()
+        # Cudagraph backward capture assumes the model has DDP so create main_grads for params
+        for param in self.llava_model.parameters():
+            param.main_grad = torch.zeros_like(param)
 
         set_current_microbatch(self.llava_model.vision_model, 1)
         set_current_microbatch(self.llava_model.language_model, 1)
@@ -852,6 +911,135 @@ class TestParallelHybridBlockCudagraphs:
         )
 
 
+class TestHybridTECudaGraphDiscovery:
+    def test_hybrid_mtp_layers_are_flattened_and_adjacent_layers_are_grouped(self, monkeypatch):
+        from megatron.core.transformer import cuda_graphs
+
+        class FakeGraphLayer(torch.nn.Module):
+            def __init__(self, group_with_next=False, graphable=True):
+                super().__init__()
+                self.group_with_next = group_with_next
+                self.graphable = graphable
+                self.group_tail = None
+
+            def _can_group_te_cuda_graph_with(self, next_layer):
+                return self.group_with_next and next_layer.graphable
+
+            def _set_te_cuda_graph_group_tail(self, next_layer):
+                self.group_tail = next_layer
+
+        head = FakeGraphLayer(group_with_next=True)
+        tail = FakeGraphLayer()
+        eager = FakeGraphLayer(graphable=False)
+        mtp_stack = HybridStack.__new__(HybridStack)
+        torch.nn.Module.__init__(mtp_stack)
+        mtp_stack.layers = torch.nn.ModuleList([head, tail, eager])
+
+        monkeypatch.setattr(
+            cuda_graphs, '_layer_is_graphable', lambda layer, config: layer.graphable
+        )
+        callables = cuda_graphs._get_mtp_te_callables(mtp_stack, object())
+
+        assert callables == [head]
+        assert head.group_tail is tail
+
+        gpt_mtp_layer = FakeGraphLayer()
+        assert cuda_graphs._get_mtp_te_callables(gpt_mtp_layer, object()) == [gpt_mtp_layer]
+
+        class Holder:
+            pass
+
+        mtp_layer = Holder()
+        mtp_layer.mtp_model_layer = mtp_stack
+        chunk = Holder()
+        chunk.mtp = Holder()
+        chunk.mtp.layers = [mtp_layer]
+        assert cuda_graphs._is_mtp_te_callable(head, chunk)
+        assert cuda_graphs._is_mtp_te_callable(tail, chunk)
+        assert not cuda_graphs._is_mtp_te_callable(eager, Holder())
+
+    def test_capture_group_tail_does_not_change_module_registration(self):
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        class Config:
+            recompute_granularity = None
+            recompute_modules = []
+            fp8 = False
+            first_last_layers_bf16 = False
+
+        inner = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(inner)
+        inner.self_attention = torch.nn.Linear(2, 2)
+        inner.cross_attention = IdentityOp()
+        inner.mlp = IdentityOp()
+
+        head = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(head)
+        head.config = Config()
+        head.inner_layer = inner
+
+        tail = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(tail)
+        tail.capture_weight = torch.nn.Parameter(torch.ones(1))
+        object.__setattr__(tail, '_inner_is_partial_moe_capture', lambda: True)
+        object.__setattr__(tail, '_get_submodules_under_cudagraphs', lambda: [tail])
+
+        state_dict_keys = tuple(head.state_dict())
+        head._set_te_cuda_graph_group_tail(tail)
+
+        assert head._get_te_cuda_graph_group_tail() is tail
+        assert '_te_cuda_graph_group_tail' not in head._modules
+        assert tuple(head.state_dict()) == state_dict_keys
+        assert any(param is tail.capture_weight for param in head.parameters())
+
+        head.cuda_graphs = [object()]
+        head.train()
+        assert head._get_active_te_cuda_graph_group_tail() is tail
+        head.eval()
+        assert head._get_active_te_cuda_graph_group_tail() is None
+
+    def test_capture_group_does_not_cross_first_last_bf16_boundary(self):
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        class Config:
+            recompute_granularity = None
+            recompute_modules = []
+            fp8 = True
+            first_last_layers_bf16 = True
+            num_layers_at_start_in_bf16 = 1
+            num_layers_at_end_in_bf16 = 1
+            num_layers = 4
+
+        inner = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(inner)
+        inner.self_attention = torch.nn.Linear(2, 2)
+        inner.cross_attention = IdentityOp()
+        inner.mlp = IdentityOp()
+        inner.is_mtp_layer = False
+
+        head = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(head)
+        head.config = Config()
+        head.inner_layer = inner
+
+        tail = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(tail)
+        object.__setattr__(tail, '_inner_is_partial_moe_capture', lambda: True)
+
+        head.layer_number, tail.layer_number = 1, 2
+        assert not head._can_group_te_cuda_graph_with(tail)
+
+        head.layer_number, tail.layer_number = 2, 3
+        assert head._can_group_te_cuda_graph_with(tail)
+
+        head.layer_number, tail.layer_number = 3, 4
+        assert not head._can_group_te_cuda_graph_with(tail)
+
+        inner.is_mtp_layer = True
+        head.layer_number, tail.layer_number = 1, 2
+        assert head._can_group_te_cuda_graph_with(tail)
+
+
 # Global storage for comparing unique buffer counts across different num_microbatches,
 # keyed by (pp_size, vpp_size)
 _unique_buffer_counts = {}
@@ -868,6 +1056,57 @@ class TestTECudaGraphHelper:
         destroy_num_microbatches_calculator()
         # Note: _unique_buffer_counts is intentionally NOT cleared here so we can
         # compare values across parametrized test runs
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_mhc_static_input_aliasing_requires_disjoint_liveness_windows(self):
+        config = _base_cuda_graph_config(
+            enable_hyper_connections=True,
+            recompute_granularity="selective",
+            recompute_modules=["mhc"],
+            mhc_recompute_layer_num=2,
+            overlap_moe_expert_parallel_comm=True,
+            expert_model_parallel_size=2,
+            num_moe_experts=4,
+            moe_token_dispatcher_type="alltoall",
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            # The aliasing check only runs for the direct-write arena, which is
+            # opt-in: without the switch this shape captures the whole attention
+            # range and has no arena slot to alias.
+            mhc_recompute_attn_cuda_graph_split=True,
+            bf16=True,
+        )
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = config
+
+        shared = torch.randn(4, 2, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        unique = torch.randn_like(shared)
+        # Samples 0 and 2 alias one static buffer (as MCore consumed-sample
+        # reuse and TE _reuse_graph_input_output_buffers legally do); sample 1
+        # owns its own bytes.
+        sample_args = [(shared,), (unique,), (shared.detach().requires_grad_(True),)]
+
+        # Disjoint windows: sample 0 fully retires before sample 2's forward.
+        helper._mhc_sample_order_intervals = {0: [0, 3], 1: [1, 4], 2: [5, 6]}
+        helper._validate_mhc_static_hidden_inputs(sample_args)
+
+        # Overlapping windows on a shared address must fail at capture time:
+        # sample 2's forward starts before sample 0's backward retired, which
+        # is exactly the aliasing that corrupts recompute direct-write replay.
+        helper._mhc_sample_order_intervals = {0: [0, 5], 1: [1, 4], 2: [3, 6]}
+        with pytest.raises(RuntimeError, match="windows overlap"):
+            helper._validate_mhc_static_hidden_inputs(sample_args)
+
+        # An entry whose backward never retires in the order is live forever,
+        # so any aliasing against it fails.
+        helper._mhc_sample_order_intervals = {0: [0, None], 1: [1, 4], 2: [3, 6]}
+        with pytest.raises(RuntimeError, match="windows overlap"):
+            helper._validate_mhc_static_hidden_inputs(sample_args)
+
+        # A sample with no recorded window at all is rejected outright.
+        helper._mhc_sample_order_intervals = {1: [1, 4]}
+        with pytest.raises(RuntimeError, match="no recorded"):
+            helper._validate_mhc_static_hidden_inputs(sample_args)
 
     @pytest.mark.parametrize("num_microbatches", [16, 64, 256])
     @pytest.mark.parametrize("pp_size", [1, 2, 4])
@@ -1179,6 +1418,12 @@ def is_hybrid_ep_available():
     return HAVE_HYBRIDEP
 
 
+def is_nccl_ep_available():
+    from megatron.core.transformer.moe.fused_a2a import HAVE_TE_EP
+
+    return HAVE_TE_EP
+
+
 class TestPartialCudaGraph:
     """Test that CUDA graph outputs match non-CUDA graph outputs for various scopes."""
 
@@ -1339,7 +1584,7 @@ class TestPartialCudaGraph:
         )
 
         gpt_model, optimizer, _ = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, self.model_provider
         )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
@@ -1388,6 +1633,10 @@ class TestPartialCudaGraph:
             loss_list.append(loss.item())
 
         if self.cuda_graph_helper is not None and self.cuda_graph_helper.graphs_created():
+            # Keep the layer handles for post-run assertions: the helper is
+            # nulled below, but the layer objects (and attributes the replay
+            # tail set on them) outlive graph teardown.
+            self.last_flattened_callables = self.cuda_graph_helper.flattened_callables
             self.cuda_graph_helper.delete_cuda_graphs()
             self.cuda_graph_helper = None
 
@@ -1401,7 +1650,7 @@ class TestPartialCudaGraph:
     )
     @pytest.mark.parametrize("ep_size", [1, 4])
     @pytest.mark.parametrize("moe_dropless_dispatcher", [False, True])
-    @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep", "hybridep"])
+    @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep", "hybridep", "ncclep"])
     def test_moe_partial_cudagraph(self, ep_size, moe_dropless_dispatcher, moe_dispatcher_type):
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(
@@ -1423,11 +1672,20 @@ class TestPartialCudaGraph:
                 pytest.skip("Hybrid EP is not available")
             extra_kwargs["moe_token_dispatcher_type"] = "flex"
             extra_kwargs["moe_flex_dispatcher_backend"] = "hybridep"
+        elif moe_dispatcher_type == "ncclep":
+            if not is_nccl_ep_available():
+                pytest.skip("NCCL EP is not available")
+            if ep_size < 2:
+                pytest.skip("NCCL EP requires expert_model_parallel_size >= 2 (ep_bootstrap)")
+            extra_kwargs["moe_token_dispatcher_type"] = "flex"
+            extra_kwargs["moe_flex_dispatcher_backend"] = "ncclep"
+            # ncclep sizes a per-rank recv buffer from this and overflow hard-traps; size generously.
+            extra_kwargs["moe_expert_rank_capacity_factor"] = 8.0
         else:
             extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
         if not moe_dropless_dispatcher:
-            if moe_dispatcher_type == "deepep":
-                pytest.skip("Deep EP doesn't support drop&pad MoE")
+            if moe_dispatcher_type in ("deepep", "ncclep"):
+                pytest.skip(f"{moe_dispatcher_type} doesn't support drop&pad MoE")
             extra_kwargs["moe_expert_capacity_factor"] = 1.0
             extra_kwargs["moe_pad_expert_input_to_capacity"] = True
 
@@ -1444,10 +1702,12 @@ class TestPartialCudaGraph:
                 CudaGraphModule.moe_preprocess,
             ],
         ]:
-            if (moe_dropless_dispatcher or moe_dispatcher_type == "hybridep") and (
+            if (moe_dropless_dispatcher or moe_dispatcher_type in ("hybridep", "ncclep")) and (
                 cuda_graph_modules is None or CudaGraphModule.moe in cuda_graph_modules
             ):
-                # Dropless MoE or Hybrid EP doesn't work with "moe" scope cudagraph. Skip.
+                # Dropless MoE or a dynamic-shape flex backend (Hybrid EP / NCCL EP) can't be
+                # captured at the "moe" scope (the dispatch does a device-to-host sync). Skip;
+                # the surrounding compute submodules are still graphed.
                 continue
             cuda_graph_warmup_steps = 3
             loss_list = self._run_test_helper(
@@ -1461,6 +1721,10 @@ class TestPartialCudaGraph:
 
         if moe_dispatcher_type == "hybridep":
             reset_hybrid_ep_buffer()
+        if moe_dispatcher_type == "ncclep":
+            from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
+
+            nccl_ep_finalize()
         Utils.destroy_model_parallel()
 
     @pytest.mark.flaky
@@ -1517,6 +1781,62 @@ class TestPartialCudaGraph:
                 f"mHC loss mismatch with cuda_graph_modules={cuda_graph_modules}, ep_size={ep_size}. "
                 f"Max diff: {torch.max(torch.abs(loss_list - loss_list_ref))}"
             )
+
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+    )
+    def test_mhc_recompute_whole_attention_cudagraph(self):
+        """mHC selective recompute under whole-attention capture matches eager.
+
+        With mhc_recompute_attn_cuda_graph_split off (the default), an attn-scope
+        graph captures the whole attention range and the replay's non-split tail
+        runs the MLP-side mHC group eagerly: mlp_hyper_connection registers its
+        checkpoints against the manager __call__ stashed on the layer, the block
+        discards at group end, and the unified hook replays them in backward. A
+        graphed run must therefore reproduce the eager loss curve bit for bit --
+        this is the executing coverage for that tail, with a live manager rather
+        than a mocked boundary.
+        """
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=self.tp_size,
+            context_parallel_size=self.cp_size,
+            pipeline_model_parallel_size=1,
+            expert_tensor_parallel_size=self.tp_size,
+            expert_model_parallel_size=1,
+        )
+
+        extra_kwargs = {
+            "enable_hyper_connections": True,
+            "num_residual_streams": 4,
+            "mtp_num_layers": None,  # mHC is incompatible with MTP
+            "recompute_granularity": "selective",
+            "recompute_modules": ["mhc"],
+            "mhc_recompute_layer_num": 2,
+        }
+
+        loss_list_ref = self._run_test_helper(1, "none", None, 0, **extra_kwargs)
+        loss_list = self._run_test_helper(
+            1, "transformer_engine", [CudaGraphModule.attn], 3, **extra_kwargs
+        )
+        assert torch.equal(loss_list, loss_list_ref), (
+            "mHC recompute under whole-attention capture diverged from eager. "
+            f"Max diff: {torch.max(torch.abs(loss_list - loss_list_ref))}"
+        )
+        # Loss parity alone is blind to an inert manager (an empty recompute
+        # group discards and replays nothing, bit-identically), so pin the
+        # layer-side threading directly: the graphed replay tail must have
+        # created the pre-MLP checkpoint against a live manager.
+        layers = self.last_flattened_callables
+        assert any(
+            getattr(layer, "pre_mlp_norm_checkpoint", None) is not None for layer in layers
+        ), (
+            "no layer created pre_mlp_norm_checkpoint during graphed replay: the "
+            "whole-attention tail is not threading the recompute manager"
+        )
 
         Utils.destroy_model_parallel()
 

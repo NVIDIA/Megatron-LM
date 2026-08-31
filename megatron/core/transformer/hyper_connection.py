@@ -13,7 +13,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
 
 if TYPE_CHECKING:
-    from megatron.core.tensor_parallel.random import CheckpointManager
+    from megatron.core.tensor_parallel.random import MHCCheckpointManager
+    from megatron.core.transformer.mhc_recompute import MHCRecomputeArenaSlot
 
 _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
@@ -68,6 +69,62 @@ def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6
 def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
+
+
+class NativeHAggregateInto(torch.autograd.Function):
+    """Native H-aggregate whose result is produced in caller-owned storage.
+
+    The explicit output is needed when the consumer is a CUDA Graph: its input
+    address is part of the captured launch parameters and therefore cannot be
+    repaired by rebinding a logical tensor after recomputation.
+    """
+
+    @staticmethod
+    def forward(ctx, x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
+        """Aggregate into caller-owned ``out`` after validating its contract."""
+        if out.shape != x.shape[:2] + x.shape[3:]:
+            raise ValueError(
+                f"H-aggregate output shape {tuple(out.shape)} does not match "
+                f"{tuple(x.shape[:2] + x.shape[3:])}"
+            )
+        if out.dtype != x.dtype or out.device != x.device:
+            raise ValueError("H-aggregate output dtype/device must match x")
+        # Mirror FusedHAggregateInto.forward's contract exactly: the consumer graph
+        # dereferences the address seen at capture time, so a strided slot would
+        # hand it a layout it was not captured against. Unreachable while the arena
+        # only vends contiguous views -- the point is that both entry points fail
+        # on the same inputs if that ever changes.
+        if not out.is_contiguous():
+            raise ValueError("H-aggregate caller-owned output must be contiguous")
+        if out.requires_grad:
+            raise ValueError("H-aggregate caller-owned output must be a detached tensor")
+
+        ctx.mark_dirty(out)
+        torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
+        ctx.save_for_backward(x, h_pre)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        """Back-propagate the aggregation, accumulating grad_h in fp32."""
+        x, h_pre = ctx.saved_tensors
+        grad_output_expanded = grad_output.unsqueeze(2)
+        grad_x = grad_output_expanded * h_pre.unsqueeze(-1)
+        # grad_h reduces over the hidden dimension, thousands of elements wide,
+        # while the forward only reduces over the handful of residual streams.
+        # Upcast both operands: torch.sum already accumulates bf16 in fp32, so
+        # asking for dtype=float32 would change nothing; the cost is rounding each
+        # product to bf16 before that reduction. h_pre carries the residual mixing
+        # coefficients, so error here shifts how streams combine in every layer.
+        # Matches _torch_h_aggregate_bwd, including its note on why the
+        # temporary-free matmul form is not used.
+        grad_h = torch.sum(grad_output_expanded.float() * x.float(), dim=-1)
+        return grad_x.to(dtype=x.dtype), grad_h.to(dtype=h_pre.dtype), None
+
+
+def native_h_aggregate_into(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
+    """Native weighted aggregation that writes directly to ``out``."""
+    return NativeHAggregateInto.apply(x, h_pre, out)
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
@@ -216,11 +273,16 @@ class HyperConnectionModule(MegatronModule):
         # a trivial a+b+c) is not worth it for a pure memory-bound elementwise op.
         self._fused_add_3_op = native_fused_add_3
 
+        # The fused path computes the projection and compute_h in one op, so
+        # _projection_and_get_norm — and therefore _proj_rms_op — is only ever
+        # reached on the unfused path.
+        self._proj_rms_op = native_proj_rms
+
         if config.use_fused_mhc:
             from megatron.core.fusions.fused_mhc_kernels import (
                 fused_h_aggregate,
+                fused_h_aggregate_into,
                 fused_h_post_bda,
-                fused_proj_rms,
                 fused_proj_rms_compute_h,
                 fused_sinkhorn,
                 log_fused_mhc_backend_once,
@@ -229,14 +291,14 @@ class HyperConnectionModule(MegatronModule):
             log_fused_mhc_backend_once()
             self._sinkhorn_op = fused_sinkhorn
             self._h_aggregate_op = fused_h_aggregate
+            self._h_aggregate_into_op = fused_h_aggregate_into
             self._h_post_bda_op = fused_h_post_bda
-            self._proj_rms_op = fused_proj_rms
             self._proj_rms_compute_h_op = fused_proj_rms_compute_h
         else:
             self._sinkhorn_op = native_sinkhorn
             self._h_aggregate_op = native_h_aggregate
+            self._h_aggregate_into_op = native_h_aggregate_into
             self._h_post_bda_op = native_h_post_bda
-            self._proj_rms_op = native_proj_rms
             self._proj_rms_compute_h_op = None
 
         self._init_weights()
@@ -270,7 +332,7 @@ class HyperConnectionModule(MegatronModule):
         x_2d = x.reshape(s * b, nC).to(torch.float32)
         weight = self.mapping_proj.weight.to(torch.float32)
         proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
-        return proj.view(s, b, -1), r.view(s, b, 1)
+        return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
     @torch.compile
@@ -397,7 +459,7 @@ class HyperConnectionModule(MegatronModule):
         self,
         x_with_bias: Tuple[Tensor, Optional[Tensor]],
         h_post: Tensor,
-        manager: Optional['CheckpointManager'] = None,
+        manager: Optional['MHCCheckpointManager'] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """
         Apply H_post to x and optionally bias, with optional checkpointing.
@@ -410,7 +472,7 @@ class HyperConnectionModule(MegatronModule):
                 - x: [s, b, C] - hidden states
                 - bias: [C] or None - optional bias tensor
             h_post: [s, b, n] - expansion weights
-            manager: Optional CheckpointManager for checkpoint management.
+            manager: Optional MHCCheckpointManager for checkpoint management.
                 When provided, wraps _apply_h_post with CheckpointWithoutOutput.
 
         Returns:
@@ -442,7 +504,7 @@ class HyperConnectionModule(MegatronModule):
 
         return x_out, bias_out
 
-    def aggregate(self, x: Tensor, h_pre: Tensor) -> Tensor:
+    def aggregate(self, x: Tensor, h_pre: Tensor, out: Optional[Tensor] = None) -> Tensor:
         """
         Aggregate n-stream to 1-stream.
 
@@ -456,7 +518,9 @@ class HyperConnectionModule(MegatronModule):
         s, b, _ = x.shape
         C = self.hidden_size
         x_streams = x.view(s, b, self.n, C)
-        return self._h_aggregate_op(x_streams, h_pre)
+        if out is None:
+            return self._h_aggregate_op(x_streams, h_pre)
+        return self._h_aggregate_into_op(x_streams, h_pre, out)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
     @torch.compile
@@ -485,7 +549,10 @@ class HyperConnectionModule(MegatronModule):
         return mixed.view(s, b, n * C)
 
     def forward(
-        self, hidden_states: Tensor, mhc_recompute_manager: Optional['CheckpointManager'] = None
+        self,
+        hidden_states: Tensor,
+        mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
+        output_slot: Optional['MHCRecomputeArenaSlot'] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Full mHC forward pass.
@@ -497,8 +564,10 @@ class HyperConnectionModule(MegatronModule):
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
-            mhc_recompute_manager: Optional CheckpointManager for checkpoint management.
+            mhc_recompute_manager: Optional MHCCheckpointManager for checkpoint management.
                 When provided, uses _forward_with_checkpoint for memory-efficient execution.
+            output_slot: Optional arena slot used as the aggregate kernel's
+                caller-owned output for both forward and recompute.
 
         Returns:
             A 4-tuple. This is an intentional breaking change from the older
@@ -510,8 +579,12 @@ class HyperConnectionModule(MegatronModule):
             residual: [s, b, n*C] - residual view for fused_h_res_h_post_bda
         """
         if mhc_recompute_manager is not None:
-            return self._forward_with_checkpoint(hidden_states, mhc_recompute_manager)
+            return self._forward_with_checkpoint(
+                hidden_states, mhc_recompute_manager, output_slot=output_slot
+            )
         else:
+            if output_slot is not None:
+                raise ValueError("fixed mHC outputs require an mHC recompute manager")
             return self._forward_normal(hidden_states)
 
     def _forward_normal(self, hidden_states: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -542,7 +615,10 @@ class HyperConnectionModule(MegatronModule):
         return aggregated, h_res, h_post, hs_for_residual
 
     def _forward_with_checkpoint(
-        self, hidden_states: Tensor, manager: 'CheckpointManager'
+        self,
+        hidden_states: Tensor,
+        manager: 'MHCCheckpointManager',
+        output_slot: Optional['MHCRecomputeArenaSlot'] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Forward pass with checkpointing for memory efficiency.
@@ -554,7 +630,8 @@ class HyperConnectionModule(MegatronModule):
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
-            manager: CheckpointManager for unified recomputation
+            manager: MHCCheckpointManager for unified recomputation
+            output_slot: Optional direct-write attention CUDA Graph input slot.
 
         Returns:
             aggregated: [s, b, C] - aggregated input for layer computation
@@ -572,9 +649,18 @@ class HyperConnectionModule(MegatronModule):
         h_pre, h_post, h_res = self.compute_mappings(hs_for_mappings)
 
         # Checkpoint aggregate - auto-registers to manager
-        aggregated = CheckpointWithoutOutput(ckpt_manager=manager).checkpoint(
-            self.aggregate, hs_for_aggregate, h_pre
+        # With an arena slot the aggregate direct-writes into the graph consumer's
+        # captured input surface, so forward and recompute land at the same fixed
+        # address. writer is read per call by design: it hands back a fresh view.
+        aggregate_function = (
+            self.aggregate
+            if output_slot is None
+            else lambda x, h: self.aggregate(x, h, out=output_slot.writer)
         )
+
+        aggregated = CheckpointWithoutOutput(
+            ckpt_manager=manager, output_slot=output_slot
+        ).checkpoint(aggregate_function, hs_for_aggregate, h_pre)
 
         return aggregated, h_res, h_post, hs_for_residual
 
@@ -632,7 +718,7 @@ class HyperConnectionModule(MegatronModule):
         dropout_prob: float,
         training: bool,
         fused: bool,
-        manager: Optional['CheckpointManager'] = None,
+        manager: Optional['MHCCheckpointManager'] = None,
     ) -> Tensor:
         """
         Fused kernel combining apply_h_res, apply_h_post and bias-dropout-add.
@@ -655,7 +741,7 @@ class HyperConnectionModule(MegatronModule):
             dropout_prob: Dropout probability
             training: Whether in training mode
             fused: Whether to use fused BDA implementation
-            manager: Optional CheckpointManager for checkpoint management.
+            manager: Optional MHCCheckpointManager for checkpoint management.
                 When provided, each operation is wrapped with CheckpointWithoutOutput.
 
         Returns:
@@ -744,7 +830,7 @@ class HyperConnectionModule(MegatronModule):
         dropout_prob: float,
         training: bool,
         fused: bool,
-        manager: 'CheckpointManager',
+        manager: 'MHCCheckpointManager',
     ) -> Tensor:
         """
         Checkpointed variant of _fused_h_res_h_post_bda_native.
@@ -762,7 +848,7 @@ class HyperConnectionModule(MegatronModule):
             dropout_prob: Dropout probability
             training: Whether in training mode
             fused: Whether to use fused BDA implementation
-            manager: CheckpointManager for checkpoint management
+            manager: MHCCheckpointManager for checkpoint management
 
         Returns:
             output: [s, b, n*C] - final output

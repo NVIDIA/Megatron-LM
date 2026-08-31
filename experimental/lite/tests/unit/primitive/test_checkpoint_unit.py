@@ -10,8 +10,6 @@ import torch.nn as nn
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
-pytestmark = pytest.mark.mlite
-
 
 class TinyMLP(nn.Module):
     def __init__(self):

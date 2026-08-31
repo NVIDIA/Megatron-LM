@@ -23,6 +23,7 @@ MODEL_ARGS:
   --csa-window-size: 128
   --csa-compress-ratios: ([0,4,128,4,128,4])
   --csa-compress-rotary-base: 40000
+  --dsa-kernel-backend: cudnn
   --attention-backend: fused
   --pipeline-model-parallel-layout: "Et|tt|tt|tL"
   --log-params-norm: true

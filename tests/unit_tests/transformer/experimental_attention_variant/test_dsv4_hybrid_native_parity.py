@@ -1,14 +1,18 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
+import logging
 import math
 import os
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -17,9 +21,10 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import transformer_config as transformer_config_module
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from megatron.core.transformer.spec_utils import build_module
-from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
 from tests.unit_tests.test_utilities import Utils
 
@@ -52,7 +57,7 @@ _SEED = 1234
 # * fused vs unfused — the fused path exercises the cudnn DSA kernels + Triton
 #   fused MLA RoPE, whose bf16 numerics (and non-deterministic atomic
 #   reductions) drift ~an order of magnitude more than the pytorch-eager
-#   unfused path. ``apply_rope_fusion`` is coupled to ``apply_dsa_kernel_fusion``.
+#   unfused path. ``apply_rope_fusion`` is coupled to the selected DSA backend.
 # * forward (the layer ``out``) vs backward (``hidden_grad`` + every param
 #   grad) — gradients accumulate kernel noise and need looser floors than the
 #   forward output.
@@ -114,16 +119,22 @@ _DSA_BACKENDS = [
 def _make_config(
     variant: str,
     compress_ratio: int,
-    apply_dsa_kernel_fusion: bool = False,
+    use_fused_kernels: bool = False,
     calculate_per_token_loss: bool = False,
     dsa_indexer_use_sparse_loss: bool = False,
+    legacy_kernel_fusion: bool | None = None,
+    kernel_backend: str | None = None,
+    use_legacy_attention_type: bool = False,
 ) -> MLATransformerConfig:
     shape = _DSV4_VARIANTS[variant]
     mcore_ratio = 0 if compress_ratio == 1 else compress_ratio
     qk_head_dim = shape["v_head_dim"] - shape["qk_pos_emb_head_dim"]
+    if kernel_backend is None:
+        kernel_backend = "cudnn" if use_fused_kernels else "none"
     config = MLATransformerConfig(
         multi_latent_attention=True,
-        experimental_attention_variant="dsv4_hybrid",
+        experimental_attention_variant=None if use_legacy_attention_type else "dsv4_hybrid",
+        linear_attention_type="dsv4_hybrid" if use_legacy_attention_type else None,
         num_layers=1,
         hidden_size=shape["hidden_size"],
         num_attention_heads=shape["num_attention_heads"],
@@ -146,7 +157,8 @@ def _make_config(
         add_bias_linear=False,
         bf16=True,
         params_dtype=torch.bfloat16,
-        layernorm_epsilon=1e-6,
+        layernorm_epsilon=1e-5,
+        attention_latent_norm_epsilon=1e-6,
         normalization="RMSNorm",
         qk_layernorm=True,
         layernorm_zero_centered_gamma=False,
@@ -154,7 +166,7 @@ def _make_config(
         tensor_model_parallel_size=1,
         sequence_parallel=False,
         context_parallel_size=1,
-        rope_type="yarn" if apply_dsa_kernel_fusion else "rope",
+        rope_type="yarn" if use_fused_kernels else "rope",
         rotary_base=10000,
         rotary_percent=1.0,
         csa_compress_rotary_base=shape["csa_compress_rotary_base"],
@@ -178,8 +190,9 @@ def _make_config(
         delay_wgrad_compute=False,
         tp_comm_overlap=False,
         softmax_scale=None,
-        apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
-        apply_rope_fusion=apply_dsa_kernel_fusion,
+        dsa_kernel_backend=kernel_backend,
+        apply_dsa_kernel_fusion=legacy_kernel_fusion,
+        apply_rope_fusion=use_fused_kernels,
     )
     return config
 
@@ -343,130 +356,110 @@ def _native_fused_sparse_indexer_loss(
     index_scores: torch.Tensor,
     topk_indices: torch.Tensor,
     query: torch.Tensor,
-    compressed_kv: torch.Tensor,
+    kv_full: torch.Tensor,
     attn_sink: torch.Tensor,
+    window_indices: torch.Tensor,
+    compressed_kv_offset: int,
     softmax_scale: float,
     loss_coeff: float,
     sparse_loss: bool,
     calculate_per_token_loss: bool,
 ) -> torch.Tensor:
-    batch_size, seqlen, _ = topk_indices.size()
-    num_heads, head_dim = query.size(2), query.size(3)
-    n_compressed = compressed_kv.size(0)
-
-    sink = attn_sink.detach().view(1, num_heads, 1, 1).float()
-    q = query.detach().permute(1, 2, 0, 3).float()
-    compressed_kv_t = compressed_kv.detach().permute(1, 0, 2)
-
-    if sparse_loss:
-        safe_indices = topk_indices.clamp(min=0).long()
-        valid = topk_indices >= 0
-        row_valid = valid.any(dim=-1, keepdim=True)
-
-        predict_logits = torch.gather(index_scores, dim=-1, index=safe_indices)
-        predict_logits = predict_logits.masked_fill(~valid, float("-inf"))
-        predict_logits = predict_logits.masked_fill(~row_valid, 0.0)
-        predict = F.softmax(predict_logits, dim=-1, dtype=torch.float32)
-        predict = predict * row_valid.float()
-
-        selected_kv = torch.gather(
-            compressed_kv_t.unsqueeze(1).expand(-1, seqlen, -1, -1),
-            dim=2,
-            index=safe_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim),
-        )
-        attn_scores = torch.einsum("bhsd,bskd->bhsk", q, selected_kv.float())
-        attn_scores = attn_scores * softmax_scale
-        attn_scores = attn_scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
-    else:
-        # Dense loss: KL is computed over the FULL compressed-KV axis (not
-        # just topk). Index-side and attention-side both use the kernel's
-        # ratio-causal mask, which we derive analytically from the
-        # compress_ratio (= seqlen / n_compressed): position k of the
-        # compressed-KV is valid for query row q iff k < (q + 1) // ratio.
-        compress_ratio = seqlen // n_compressed
-        k_idx = torch.arange(n_compressed, device=index_scores.device)
-        valid_per_q = (
-            torch.arange(1, seqlen + 1, device=index_scores.device) // compress_ratio
-        ).clamp(max=n_compressed)
-        finite_pos = k_idx.view(1, 1, -1) < valid_per_q.view(1, -1, 1)  # (1, sq, n_compressed)
-        finite_pos = finite_pos.expand(batch_size, -1, -1)
-        row_valid = finite_pos.any(dim=-1, keepdim=True)
-
-        predict_logits = index_scores.masked_fill(~finite_pos, float("-inf"))
-        predict_logits = predict_logits.masked_fill(~row_valid, 0.0)
-        predict = F.softmax(predict_logits, dim=-1, dtype=torch.float32)
-        predict = predict * row_valid.float()
-
-        attn_scores = torch.einsum("bhsd,bkd->bhsk", q, compressed_kv_t.float())
-        attn_scores = attn_scores * softmax_scale
-        attn_mask = finite_pos.unsqueeze(1).expand(-1, num_heads, -1, -1)
-        attn_scores = attn_scores.masked_fill(~attn_mask, float("-inf"))
-
-    score_max = torch.max(attn_scores.max(dim=-1, keepdim=True).values, sink)
-    exp_scores = torch.exp(attn_scores - score_max)
-    exp_sink = torch.exp(sink - score_max)
-    attn_probs = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
-    target = attn_probs.sum(dim=1)
-    target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-10)
-    target = target * row_valid.float()
-
-    eps = torch.finfo(torch.float32).tiny
-    target = target.clamp(min=eps)
-    predict = predict.clamp(min=eps)
-    kl_per_row = (target * (torch.log(target) - torch.log(predict))).sum(dim=-1)
-    kl_per_row = torch.where(row_valid.squeeze(-1), kl_per_row, torch.zeros_like(kl_per_row))
-    loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
-    return loss_coeff * loss
+    seqlen = query.shape[0]
+    n_compressed = index_scores.shape[-1]
+    compress_ratio = seqlen // n_compressed
+    compressed_positions = torch.arange(n_compressed, device=query.device).view(1, -1)
+    visible_compressed = torch.arange(1, seqlen + 1, device=query.device).view(-1, 1)
+    causal_mask = torch.where(
+        compressed_positions < visible_compressed // compress_ratio, 0.0, float("-inf")
+    )
+    causal_mask = causal_mask.unsqueeze(0).expand(query.shape[1], -1, -1)
+    return _native_unfused_sparse_indexer_loss(
+        index_scores,
+        topk_indices,
+        query,
+        kv_full,
+        attn_sink,
+        window_indices,
+        compressed_kv_offset,
+        softmax_scale,
+        loss_coeff,
+        sparse_loss,
+        causal_mask,
+        calculate_per_token_loss,
+    )
 
 
 def _native_unfused_sparse_indexer_loss(
     index_scores: torch.Tensor,
     topk_indices: torch.Tensor,
     query: torch.Tensor,
-    compressed_kv: torch.Tensor,
+    kv_full: torch.Tensor,
+    attn_sink: torch.Tensor,
+    window_indices: torch.Tensor,
+    compressed_kv_offset: int,
     softmax_scale: float,
     loss_coeff: float,
     sparse_loss: bool,
     causal_mask: torch.Tensor,
     calculate_per_token_loss: bool,
 ) -> torch.Tensor:
-    sq, batch_size, num_heads, _ = query.size()
-    sk = compressed_kv.size(0)
-    mask = causal_mask.to(dtype=torch.float32)
-
-    attention_scores = torch.einsum(
-        "sbhd,tbd->bhst", query.detach().float(), compressed_kv.detach().float()
-    )
-    attention_scores = attention_scores * softmax_scale
-    attention_scores = attention_scores + mask.view(batch_size, 1, sq, sk)
-    index_scores = index_scores + mask
-
+    sq, batch_size, _, head_dim = query.size()
+    n_compressed = index_scores.shape[-1]
+    causal_valid = causal_mask > float("-inf")
     if sparse_loss:
-        index_mask = torch.full(
-            (batch_size, sq, sk), float("-inf"), dtype=torch.float32, device=index_scores.device
-        ).scatter_(-1, topk_indices.clamp(min=0), 0)
-        attention_scores = attention_scores + index_mask.view(batch_size, 1, sq, sk)
-        index_scores = index_scores + index_mask
+        selected_compressed = topk_indices
+        safe_compressed = selected_compressed.clamp(min=0, max=n_compressed - 1).long()
+        selected_valid = (selected_compressed >= 0) & torch.gather(
+            causal_valid, dim=-1, index=safe_compressed
+        )
+        predict_logits = torch.gather(index_scores, dim=-1, index=safe_compressed)
+    else:
+        selected_compressed = torch.arange(
+            n_compressed, device=index_scores.device, dtype=topk_indices.dtype
+        ).view(1, 1, -1)
+        selected_compressed = selected_compressed.expand(batch_size, sq, -1)
+        safe_compressed = selected_compressed.long()
+        selected_valid = causal_valid
+        predict_logits = index_scores
 
-    row_valid = (mask > float("-inf")).any(dim=-1)
-    attn_row_mask = row_valid.view(batch_size, 1, sq, 1)
-    idx_row_mask = row_valid.view(batch_size, sq, 1)
+    row_valid = selected_valid.any(dim=-1, keepdim=True)
+    predict_logits = predict_logits.masked_fill(~selected_valid, float("-inf"))
+    predict_logits = predict_logits.masked_fill(~row_valid, 0.0)
+    predict_log = F.log_softmax(predict_logits, dim=-1, dtype=torch.float32)
 
-    attention_scores = attention_scores.masked_fill(~attn_row_mask, 0.0)
-    index_scores = index_scores.masked_fill(~idx_row_mask, 0.0)
+    compressed_attention_indices = torch.where(
+        selected_valid, safe_compressed + compressed_kv_offset, torch.full_like(safe_compressed, -1)
+    )
+    attention_indices = torch.cat(
+        [window_indices.to(compressed_attention_indices.dtype), compressed_attention_indices],
+        dim=-1,
+    )
+    safe_attention_indices = attention_indices.clamp(min=0).long()
+    gathered_kv = torch.gather(
+        kv_full.detach().permute(1, 0, 2).unsqueeze(1).expand(-1, sq, -1, -1),
+        dim=2,
+        index=safe_attention_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim),
+    )
+    attention_scores = torch.einsum(
+        "bhsd,bskd->bhsk", query.detach().permute(1, 2, 0, 3).float(), gathered_kv.float()
+    )
+    attention_scores = (attention_scores * softmax_scale).masked_fill(
+        (attention_indices < 0).unsqueeze(1), float("-inf")
+    )
+    sink = attn_sink.detach().view(1, -1, 1, 1).float()
+    score_max = torch.maximum(attention_scores.max(dim=-1, keepdim=True).values, sink)
+    exp_scores = torch.exp(attention_scores - score_max)
+    exp_sink = torch.exp(sink - score_max)
+    attention_probs = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
 
-    attention_probs = F.softmax(attention_scores, dim=-1, dtype=torch.float32)
-    predict = F.softmax(index_scores, dim=-1, dtype=torch.float32)
-    attention_probs = attention_probs * attn_row_mask.float()
-    predict = predict * idx_row_mask.float()
-
-    target = attention_probs.sum(dim=1)
-    target = target / target.sum(dim=-1, keepdim=True)
-    eps = torch.finfo(torch.float32).tiny
-    target = target.clamp(min=eps)
-    predict = predict.clamp(min=eps)
-    kl_per_row = (target * (torch.log(target) - torch.log(predict))).sum(dim=-1)
-    kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
+    compressed_width = compressed_attention_indices.shape[-1]
+    target = attention_probs[..., -compressed_width:].sum(dim=1)
+    eps = 1e-10
+    target = target / target.sum(dim=-1, keepdim=True).clamp(min=eps)
+    target = target * row_valid.float()
+    kl_per_row = (target * (torch.log(target.clamp(min=eps)) - predict_log)).sum(dim=-1)
+    kl_per_row = torch.where(row_valid.squeeze(-1), kl_per_row, torch.zeros_like(kl_per_row))
     loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
     return loss * loss_coeff
 
@@ -563,7 +556,7 @@ class NativeCSAIndexer(nn.Module):
         self.index_topk = config.dsa_indexer_topk
         self.qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
         self.softmax_scale = self.index_head_dim**-0.5
-        self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
+        self.use_fused_kernels = config.dsa_kernel_backend == "cudnn"
         self.rope_base = config.csa_compress_rotary_base
         # CSA indexer is only instantiated for ``compress_ratio == 4``, which is
         # always the YaRN-enabled branch on the production side.
@@ -604,7 +597,7 @@ class NativeCSAIndexer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         q, k, weights = self.forward_before_topk(x, qr)
         weights_scaled = weights.float() * self.softmax_scale
-        if self.apply_dsa_kernel_fusion:
+        if self.use_fused_kernels:
             weights_scaled = weights_scaled.to(weights.dtype).float()
         scores = torch.einsum("sbhd,tbd->sbht", q.float(), k.float())
         scores = torch.relu(scores) * weights_scaled.unsqueeze(-1)
@@ -637,7 +630,7 @@ class NativeCompressedSparseAttention(nn.Module):
         self.indexer_loss_coeff = config.dsa_indexer_loss_coeff
         self.indexer_use_sparse_loss = config.dsa_indexer_use_sparse_loss
         self.calculate_per_token_loss = config.calculate_per_token_loss
-        self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
+        self.use_fused_kernels = config.dsa_kernel_backend == "cudnn"
 
         self.attn_sink = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32))
         self.compressor = (
@@ -684,7 +677,7 @@ class NativeCompressedSparseAttention(nn.Module):
                     topk_compressed >= 0, topk_compressed + offset, -1
                 )
 
-                if not self.apply_dsa_kernel_fusion:
+                if not self.use_fused_kernels:
                     causal_mask = (
                         torch.arange(n_compressed, device=x.device).unsqueeze(0).expand(sq, -1)
                     )
@@ -700,7 +693,10 @@ class NativeCompressedSparseAttention(nn.Module):
                         index_scores,
                         topk_compressed,
                         query.detach(),
-                        compressed_kv.detach(),
+                        kv_full.detach(),
+                        self.attn_sink,
+                        window_idxs,
+                        offset,
                         self.softmax_scale,
                         self.indexer_loss_coeff,
                         self.indexer_use_sparse_loss,
@@ -712,8 +708,10 @@ class NativeCompressedSparseAttention(nn.Module):
                         index_scores,
                         topk_compressed,
                         query,
-                        compressed_kv,
+                        kv_full,
                         self.attn_sink,
+                        window_idxs,
+                        offset,
                         self.softmax_scale,
                         self.indexer_loss_coeff,
                         self.indexer_use_sparse_loss,
@@ -723,7 +721,7 @@ class NativeCompressedSparseAttention(nn.Module):
                 topk_compressed_for_attn = _get_compress_topk_idxs(
                     self.compress_ratio, batch_size, sq, offset, query.device
                 )
-            if self.indexer is not None and self.apply_dsa_kernel_fusion:
+            if self.indexer is not None and self.use_fused_kernels:
                 topk_idxs = torch.cat([topk_compressed_for_attn, window_idxs], dim=-1)
             else:
                 topk_idxs = torch.cat([window_idxs, topk_compressed_for_attn], dim=-1)
@@ -757,12 +755,12 @@ class NativeDSv4HybridAttention(nn.Module):
             self._rope_yarn_kwargs = dict()
 
         self.linear_q_down_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
-        self.q_layernorm = nn.RMSNorm(config.q_lora_rank, eps=config.layernorm_epsilon)
+        self.q_layernorm = nn.RMSNorm(config.q_lora_rank, eps=config.attention_latent_norm_epsilon)
         self.linear_q_up_proj = nn.Linear(
             config.q_lora_rank, config.num_attention_heads * config.v_head_dim, bias=False
         )
         self.linear_kv_proj = nn.Linear(config.hidden_size, config.v_head_dim, bias=False)
-        self.kv_layernorm = nn.RMSNorm(config.v_head_dim, eps=config.layernorm_epsilon)
+        self.kv_layernorm = nn.RMSNorm(config.v_head_dim, eps=config.attention_latent_norm_epsilon)
         self.core_attention = NativeCompressedSparseAttention(config, compress_ratio)
         group_in = (config.num_attention_heads * config.v_head_dim) // config.o_groups
         self.linear_o_group_proj = nn.Parameter(
@@ -885,6 +883,88 @@ def _skip_if_real_kernels_unavailable(*, sm_min: int = 9, need_flash_mla: bool =
         pytest.importorskip("flash_mla")
 
 
+def test_dsv4_backend_default_does_not_use_deprecated_adapter(caplog):
+    caplog.set_level(logging.WARNING, logger=transformer_config_module.__name__)
+
+    config = _make_config("flash", 1)
+
+    assert config.dsa_kernel_backend == "none"
+    assert config.apply_dsa_kernel_fusion is None
+    assert "apply_dsa_kernel_fusion is deprecated" not in caplog.text
+
+
+def _assert_rank_zero_log(caplog, message):
+    assert (message in caplog.text) == (safe_get_rank() == 0)
+
+
+def test_deprecated_dsv4_kernel_fusion_false_maps_to_none(caplog):
+    caplog.set_level(logging.WARNING, logger=transformer_config_module.__name__)
+
+    config = _make_config("flash", 1, legacy_kernel_fusion=False)
+
+    assert config.dsa_kernel_backend == "none"
+    _assert_rank_zero_log(caplog, "use dsa_kernel_backend='none' instead")
+
+
+def test_deprecated_kernel_fusion_is_normalized_after_legacy_attention_type(caplog):
+    caplog.set_level(logging.WARNING, logger=transformer_config_module.__name__)
+
+    with pytest.warns(UserWarning, match="linear_attention_type is deprecated"):
+        config = _make_config(
+            "flash", 1, legacy_kernel_fusion=False, use_legacy_attention_type=True
+        )
+
+    assert config.experimental_attention_variant == "dsv4_hybrid"
+    assert config.linear_attention_type is None
+    assert config.dsa_kernel_backend == "none"
+    _assert_rank_zero_log(caplog, "use dsa_kernel_backend='none' instead")
+    assert "ignored outside" not in caplog.text
+
+
+def test_deprecated_dsv4_kernel_fusion_true_maps_to_cudnn(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger=transformer_config_module.__name__)
+    fake_cudnn = ModuleType("cudnn")
+    fake_cudnn.DSA = SimpleNamespace()
+    monkeypatch.setitem(sys.modules, "cudnn", fake_cudnn)
+    monkeypatch.setattr(
+        transformer_config_module,
+        "_validate_dsa_kernel_backend_dependencies",
+        lambda _backend: None,
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+
+    config = _make_config("flash", 1, legacy_kernel_fusion=True)
+
+    assert config.dsa_kernel_backend == "cudnn"
+    _assert_rank_zero_log(caplog, "use dsa_kernel_backend='cudnn' instead")
+
+
+@pytest.mark.parametrize(
+    ("legacy_kernel_fusion", "kernel_backend"), [(False, "cudnn"), (True, "tilelang")]
+)
+def test_deprecated_dsv4_kernel_fusion_rejects_conflicts(legacy_kernel_fusion, kernel_backend):
+    with pytest.raises(ValueError, match="Conflicting DSA kernel controls"):
+        _make_config(
+            "flash", 1, legacy_kernel_fusion=legacy_kernel_fusion, kernel_backend=kernel_backend
+        )
+
+
+def test_deprecated_kernel_fusion_is_ignored_outside_dsv4(caplog):
+    caplog.set_level(logging.WARNING, logger=transformer_config_module.__name__)
+
+    config = TransformerConfig(
+        num_layers=1, hidden_size=8, num_attention_heads=1, apply_dsa_kernel_fusion=True
+    )
+
+    assert config.dsa_kernel_backend == "none"
+    _assert_rank_zero_log(caplog, "ignored outside")
+
+
+def test_dsv4_rejects_tilelang_backend():
+    with pytest.raises(ValueError, match="does not support.*tilelang"):
+        _make_config("flash", 1, kernel_backend="tilelang")
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
 class TestDSv4HybridNativeParity:
@@ -907,7 +987,7 @@ class TestDSv4HybridNativeParity:
         gc.collect()
         torch.cuda.empty_cache()
 
-    @pytest.mark.parametrize(("backend", "apply_dsa_kernel_fusion"), _DSA_BACKENDS)
+    @pytest.mark.parametrize(("backend", "use_fused_kernels"), _DSA_BACKENDS)
     @pytest.mark.parametrize("variant", ["flash", "pro"])
     @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
     @pytest.mark.parametrize(
@@ -926,36 +1006,33 @@ class TestDSv4HybridNativeParity:
         compress_ratio: int,
         seqlen: int,
         backend: str,
-        apply_dsa_kernel_fusion: bool,
+        use_fused_kernels: bool,
         calculate_per_token_loss: bool,
         dsa_indexer_use_sparse_loss: bool,
+        monkeypatch,
     ):
-        if apply_dsa_kernel_fusion:
-            _skip_if_real_kernels_unavailable()
+        if use_fused_kernels:
+            _skip_if_real_kernels_unavailable(need_flash_mla=True)
         major, _ = torch.cuda.get_device_capability()
         if (
             major == 9
-            and apply_dsa_kernel_fusion
+            and use_fused_kernels
             and compress_ratio == 4
             and not dsa_indexer_use_sparse_loss
         ):
             pytest.skip("cuDNN Frontend SM90 dense DSA is not supported")
-        if major < 10 and not apply_dsa_kernel_fusion and seqlen > 4096:
+        if major < 10 and not use_fused_kernels and seqlen > 4096:
             pytest.skip("seqlen > 4096 may OOM on Hopper with unfused DSA implementation")
 
         config = _make_config(
             variant,
             compress_ratio,
-            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            use_fused_kernels=use_fused_kernels,
             calculate_per_token_loss=calculate_per_token_loss,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = (
-            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
-        )
-        bwd_eps = (
-            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
-        )
+        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
+        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 
@@ -964,6 +1041,27 @@ class TestDSv4HybridNativeParity:
             spec, config=config, layer_number=1, cp_comm_type=None, pg_collection=pg_collection
         ).cuda()
         native_layer = NativeDSv4HybridAttention(config, mcore_ratio).cuda()
+
+        native_q_rms_norm_eps = []
+        native_q_rms_norm = _native_q_rms_norm
+
+        def _tracked_native_q_rms_norm(query, eps):
+            native_q_rms_norm_eps.append(eps)
+            return native_q_rms_norm(query, eps)
+
+        monkeypatch.setattr(sys.modules[__name__], "_native_q_rms_norm", _tracked_native_q_rms_norm)
+
+        for layer in (real_layer, native_layer):
+            assert layer.q_layernorm.eps == pytest.approx(config.attention_latent_norm_epsilon)
+            assert layer.kv_layernorm.eps == pytest.approx(config.attention_latent_norm_epsilon)
+        if compress_ratio > 1:
+            assert real_layer.core_attention.compressor.norm.eps == pytest.approx(
+                config.layernorm_epsilon
+            )
+            assert native_layer.core_attention.compressor.norm.eps == pytest.approx(
+                config.layernorm_epsilon
+            )
+
         real_params = _copy_real_params_to_native(real_layer, native_layer)
 
         bsz = 1
@@ -981,6 +1079,7 @@ class TestDSv4HybridNativeParity:
 
             real_out, _ = real_layer(hidden_states=hidden_states, attention_mask=None)
             native_out, native_indexer_loss = native_layer(hidden_states_native, pg_collection)
+            assert native_q_rms_norm_eps == [config.layernorm_epsilon]
 
             _assert_similarity(
                 real_out.detach(),
@@ -1021,7 +1120,7 @@ class TestDSv4HybridNativeParity:
         gc.collect()
         torch.cuda.empty_cache()
 
-    @pytest.mark.parametrize(("backend", "apply_dsa_kernel_fusion"), _DSA_BACKENDS)
+    @pytest.mark.parametrize(("backend", "use_fused_kernels"), _DSA_BACKENDS)
     @pytest.mark.parametrize("variant", ["flash", "pro"])
     @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
     @pytest.mark.parametrize(
@@ -1034,7 +1133,7 @@ class TestDSv4HybridNativeParity:
         compress_ratio: int,
         seqlen: int,
         backend: str,
-        apply_dsa_kernel_fusion: bool,
+        use_fused_kernels: bool,
         dsa_indexer_use_sparse_loss: bool,
     ):
         """THD (packed-sequence) variant of test_attention_matches_native_reference.
@@ -1043,32 +1142,28 @@ class TestDSv4HybridNativeParity:
         (equivalent to SBHD B=1) and compares forward output and backward
         gradients against the native reference.
         """
-        if apply_dsa_kernel_fusion:
-            _skip_if_real_kernels_unavailable()
+        if use_fused_kernels:
+            _skip_if_real_kernels_unavailable(need_flash_mla=True)
         major, _ = torch.cuda.get_device_capability()
         if (
             major == 9
-            and apply_dsa_kernel_fusion
+            and use_fused_kernels
             and compress_ratio == 4
             and not dsa_indexer_use_sparse_loss
         ):
             pytest.skip("cuDNN Frontend SM90 THD dense DSA has cache and stream bugs")
-        if major < 10 and not apply_dsa_kernel_fusion and seqlen > 4096:
+        if major < 10 and not use_fused_kernels and seqlen > 4096:
             pytest.skip("seqlen > 4096 may OOM on Hopper with unfused DSA implementation")
 
         config = _make_config(
             variant,
             compress_ratio,
-            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            use_fused_kernels=use_fused_kernels,
             calculate_per_token_loss=True,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = (
-            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
-        )
-        bwd_eps = (
-            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
-        )
+        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
+        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 
@@ -1137,7 +1232,7 @@ class TestDSv4HybridNativeParity:
         gc.collect()
         torch.cuda.empty_cache()
 
-    @pytest.mark.parametrize(("backend", "apply_dsa_kernel_fusion"), _DSA_BACKENDS)
+    @pytest.mark.parametrize(("backend", "use_fused_kernels"), _DSA_BACKENDS)
     @pytest.mark.parametrize("variant", ["flash"])
     @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
     @pytest.mark.parametrize(
@@ -1153,7 +1248,7 @@ class TestDSv4HybridNativeParity:
         compress_ratio: int,
         seg_lens: list,
         backend: str,
-        apply_dsa_kernel_fusion: bool,
+        use_fused_kernels: bool,
         dsa_indexer_use_sparse_loss: bool,
     ):
         """Multi-segment THD parity against per-segment native references.
@@ -1172,26 +1267,22 @@ class TestDSv4HybridNativeParity:
         Segment lengths are multiples of 128 (== ``csa_window_size`` and the
         max compress ratio) so compression is exact at every ratio.
         """
-        if apply_dsa_kernel_fusion:
-            _skip_if_real_kernels_unavailable()
+        if use_fused_kernels:
+            _skip_if_real_kernels_unavailable(need_flash_mla=True)
         major, _ = torch.cuda.get_device_capability()
         total_T = sum(seg_lens)
-        if major < 10 and not apply_dsa_kernel_fusion and total_T > 4096:
+        if major < 10 and not use_fused_kernels and total_T > 4096:
             pytest.skip("seqlen > 4096 may OOM on Hopper with unfused DSA implementation")
 
         config = _make_config(
             variant,
             compress_ratio,
-            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            use_fused_kernels=use_fused_kernels,
             calculate_per_token_loss=True,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = (
-            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
-        )
-        bwd_eps = (
-            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
-        )
+        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
+        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 
@@ -1272,7 +1363,7 @@ class TestDSv4HybridNativeParity:
         gc.collect()
         torch.cuda.empty_cache()
 
-    @pytest.mark.parametrize(("backend", "apply_dsa_kernel_fusion"), _DSA_BACKENDS)
+    @pytest.mark.parametrize(("backend", "use_fused_kernels"), _DSA_BACKENDS)
     @pytest.mark.parametrize("variant", ["flash"])
     @pytest.mark.parametrize("compress_ratio", [4, 128])
     @pytest.mark.parametrize("dsa_indexer_use_sparse_loss", [True, False])
@@ -1293,7 +1384,7 @@ class TestDSv4HybridNativeParity:
         pad_max_num_seqs: int,
         backend: str,
         dsa_indexer_use_sparse_loss: bool,
-        apply_dsa_kernel_fusion: bool,
+        use_fused_kernels: bool,
     ):
         """Verify that THD padding does not corrupt real tokens' output.
 
@@ -1302,11 +1393,11 @@ class TestDSv4HybridNativeParity:
         gradients for the real (non-padding) token positions are identical
         within tolerance.
         """
-        if apply_dsa_kernel_fusion:
-            _skip_if_real_kernels_unavailable()
+        if use_fused_kernels:
+            _skip_if_real_kernels_unavailable(need_flash_mla=True)
         if (
             torch.cuda.get_device_capability()[0] == 9
-            and apply_dsa_kernel_fusion
+            and use_fused_kernels
             and compress_ratio == 4
             and not dsa_indexer_use_sparse_loss
         ):
@@ -1319,16 +1410,12 @@ class TestDSv4HybridNativeParity:
         config = _make_config(
             variant,
             compress_ratio,
-            apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
+            use_fused_kernels=use_fused_kernels,
             calculate_per_token_loss=True,
             dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
         )
-        fwd_eps = (
-            _FUSED_FWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_FWD_SIMILARITY_EPS
-        )
-        bwd_eps = (
-            _FUSED_BWD_SIMILARITY_EPS if apply_dsa_kernel_fusion else _UNFUSED_BWD_SIMILARITY_EPS
-        )
+        fwd_eps = _FUSED_FWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_FWD_SIMILARITY_EPS
+        bwd_eps = _FUSED_BWD_SIMILARITY_EPS if use_fused_kernels else _UNFUSED_BWD_SIMILARITY_EPS
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         spec = get_dsv4_hybrid_module_spec_for_backend(config=config, backend=TESpecProvider())
 

@@ -4,7 +4,8 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
+
+from megatron.lite.primitive import transformer_engine as te
 # Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core. The
 # lite CSA module reuses Core's differentiable kernels, CP row-mapping utilities,
 # and CuTeDSL layout kernels rather than vendoring them; see the module docstring
@@ -18,13 +19,21 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,
 )
+# MCore moved the fused CSA entry points in the development branch. Keep the
+# Lite adapter compatible with both layouts while downstream snapshots migrate.
+try:
+    from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+        FusedCSAIndexerSparseAttnFromTopkFunc,
+        csa_sparse_attn,
+    )
+except ImportError:
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
+        FusedCSAIndexerSparseAttnFromTopkFunc,
+        csa_sparse_attn,
+    )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
-)
-from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
-    FusedIndexerSparseAttnFromTopkFunc,
-    dsa_sparse_attn,
 )
 from megatron.lite.primitive.modules.attention.dsa import rotate_activation
 from megatron.lite.primitive.parallel.state import ParallelState
@@ -41,6 +50,9 @@ class GroupedLinear(nn.Module):
         self.out_features = out_features
         self.n_groups = n_groups
         self.weight = nn.Parameter(torch.empty(out_features, in_features_per_group))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -149,13 +161,17 @@ class CompressedSequenceCompressor(nn.Module):
         self.overlap = compress_ratio == 4
         self.coff = 2 if self.overlap else 1
         self.rotate = rotate
+        self.initializer_range = config.initializer_range
         self.wkv = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
         self.wgate = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
         self.ape = nn.Parameter(
             torch.empty(compress_ratio, self.coff * head_dim, dtype=torch.float32)
         )
         self.norm = te.RMSNorm(head_dim, eps=config.rms_norm_eps)
-        nn.init.normal_(self.ape, mean=0.0, std=config.initializer_range)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.ape, mean=0.0, std=self.initializer_range)
 
     def _overlap_transform(self, tensor: torch.Tensor, fill_value: float) -> torch.Tensor:
         bsz, n_blocks, ratio, _, head_dim = tensor.shape
@@ -1007,7 +1023,7 @@ class CompressedSparseAttention(nn.Module):
                 positions = global_rows - cu_seqlens[batch_ids]
                 q_padding_mask = positions >= real_seqlens[batch_ids]
             apply_from_topk = (
-                FusedIndexerSparseAttnFromTopkFunc.apply
+                FusedCSAIndexerSparseAttnFromTopkFunc.apply
                 if self.apply_dsa_kernel_fusion
                 else _unfused_indexer_sparse_attn_from_topk
             )
@@ -1043,7 +1059,7 @@ class CompressedSparseAttention(nn.Module):
             return output.unsqueeze(1)
 
         if self.apply_dsa_kernel_fusion:
-            output = dsa_sparse_attn(
+            output = csa_sparse_attn(
                 query,
                 kv_full_thd,
                 self.sinks.float(),

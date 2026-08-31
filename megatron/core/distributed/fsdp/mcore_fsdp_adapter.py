@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 import logging
 import random
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Type
 
 try:
     import einops
@@ -40,8 +40,9 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
 
 try:
@@ -57,6 +58,17 @@ except ImportError as import_megatron_fsdp_error:
     HAVE_MEGATRON_FSDP = False
 
 logger = logging.getLogger(__name__)
+
+
+def _get_default_fsdp_unit_modules(overlap_moe_expert_parallel_comm: bool) -> List[torch.nn.Module]:
+    fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+
+    if overlap_moe_expert_parallel_comm:
+        return fsdp_unit_modules
+
+    from megatron.core.models.bagel.transformer_mot_layer import MoTTransformerLayer
+
+    return [*fsdp_unit_modules, MoTTransformerLayer]
 
 
 class FullyShardedDataParallel(_BaseDataParallel):
@@ -91,6 +103,32 @@ class FullyShardedDataParallel(_BaseDataParallel):
         },
     }
 
+    @staticmethod
+    def _fine_grained_recurse_module_types(
+        config: TransformerConfig, ddp_config: DistributedDataParallelConfig
+    ) -> Tuple[Type[nn.Module], ...]:
+        """Module classes needing ``parameters(recurse=True)`` for fine-grained hooks."""
+        recurse_types: List[Type[nn.Module]] = []
+
+        if config.dsa_indexer_weights_proj_output_dtype == "fp32":
+            # DSAttention calls DSAIndexer.forward_before_topk directly, bypassing the indexer's
+            # module hooks and the weights projection's module call. Gather its nested parameters
+            # at the DSAttention boundary for both forward and backward.
+            from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+
+            recurse_types.append(DSAttention)
+
+        if (
+            config.overlap_moe_expert_parallel_comm
+            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        ):
+            # Lazy import to avoid circular chain.
+            from megatron.core.transformer.moe.experts import TEGroupedMLP
+            from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+
+            recurse_types.extend((TEGroupedMLP, SharedExpertMLP))
+        return tuple(recurse_types)
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -117,17 +155,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         )
         self.mp_policy = MixedPrecisionPolicy(
             main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
-            # Grandfathered Argument: grad_reduce_in_fp32
-            main_grads_dtype=(
-                torch.float32
-                if ddp_config.grad_reduce_in_fp32
-                else ddp_config.megatron_fsdp_main_grads_dtype
-            ),
-            grad_comm_dtype=(
-                torch.float32
-                if ddp_config.grad_reduce_in_fp32
-                else ddp_config.megatron_fsdp_grad_comm_dtype
-            ),
+            main_grads_dtype=ddp_config.megatron_fsdp_main_grads_dtype,
+            grad_comm_dtype=ddp_config.megatron_fsdp_grad_comm_dtype,
         )
         log_single_rank(
             logger,
@@ -152,17 +181,22 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
             if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                self.fsdp_unit_modules = [TransformerLayer]
+                self.fsdp_unit_modules = _get_default_fsdp_unit_modules(
+                    config.overlap_moe_expert_parallel_comm
+                )
             else:
                 self.fsdp_unit_modules = []
 
         self._annotate_tensor_parallelism(module)
 
         if config.overlap_moe_expert_parallel_comm:
-            assert not ddp_config.fsdp_double_buffer, (
-                "1F1B overlap with FSDP does not support double buffer. "
-                "Please set fsdp_double_buffer=False in the ddp config."
-            )
+            if ddp_config.fsdp_double_buffer:
+                assert ddp_config.fsdp_buffer_count >= 3, (
+                    "1F1B overlap with persistent Megatron-FSDP communication buffers "
+                    "requires fsdp_buffer_count >= 3. A backward/recompute unit, the "
+                    "current forward unit, and its forward-prefetched successor can be "
+                    "live concurrently."
+                )
             assert config.cuda_graph_impl in ("none", "full_iteration"), (
                 "1F1B overlap with FSDP does not support per-layer CUDA graphs "
                 f"(cuda_graph_impl={config.cuda_graph_impl!r}). "
@@ -174,9 +208,14 @@ class FullyShardedDataParallel(_BaseDataParallel):
             config.overlap_moe_expert_parallel_comm
             and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
         ):
-            assert self.fsdp_unit_modules == [TransformerLayer], (
+            supported_fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+            assert self.fsdp_unit_modules and all(
+                module in supported_fsdp_unit_modules for module in self.fsdp_unit_modules
+            ), (
                 "EP overlap with FSDP currently requires fsdp_unit_modules "
-                f"to be [TransformerLayer], got {self.fsdp_unit_modules}."
+                "to contain only supported MCore modules "
+                f"{supported_fsdp_unit_modules}, "
+                f"got {self.fsdp_unit_modules}."
             )
         super().__init__(
             config=config,
@@ -205,6 +244,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 enable_fine_grained_param_gather_backward_hook=(
                     config.overlap_moe_expert_parallel_comm
                     and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+                ),
+                fine_grained_recurse_module_types=self._fine_grained_recurse_module_types(
+                    config, ddp_config
                 ),
             ),
         )

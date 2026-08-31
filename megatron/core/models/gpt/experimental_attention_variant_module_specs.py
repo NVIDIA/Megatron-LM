@@ -1,11 +1,21 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.ssm.gated_delta_net import (
+    GatedDeltaNet,
+    GatedDeltaNetSubmodules,
+    KimiDeltaAttention,
+    KimiDeltaAttentionSubmodules,
+)
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+    AbsorbedMLASelfAttention,
+    AbsorbedMLASelfAttentionSubmodules,
+)
 from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttention,
     CompressedSparseAttentionSubmodules,
@@ -23,13 +33,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerSubmodules,
     DSAttention,
     DSAttentionSubmodules,
+    is_dsa_skip_topk_layer,
+    source_dsa_compute_layer,
 )
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.multi_latent_attention import (
-    MLASelfAttention,
-    MLASelfAttentionSubmodules,
-)
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
@@ -65,6 +73,17 @@ except ImportError:
 
 
 ##########
+# Experimental Attention Variant Names
+##########
+
+# Canonical ``experimental_attention_variant`` names served by the gated delta net family.
+GDN_ATTENTION_VARIANTS = ("gdn", "kda")
+
+# Deprecated ``experimental_attention_variant`` spellings mapped to their canonical name.
+_DEPRECATED_ATTENTION_VARIANT_ALIASES = {"gated_delta_net": "gdn"}
+
+
+##########
 # Experimental Attention Variant Module Specs
 ##########
 
@@ -72,21 +91,33 @@ except ImportError:
 def get_gated_delta_net_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
-    """Build module spec for GatedDeltaNet attention."""
+    """Build a module spec for a GDN-family attention variant."""
 
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
     rms_norm = config.normalization == "RMSNorm"
-    attention = ModuleSpec(
-        module=GatedDeltaNet,
-        submodules=GatedDeltaNetSubmodules(
-            in_proj=backend.column_parallel_layer_norm_linear(),
-            out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
-            out_proj=backend.row_parallel_linear(),
-        ),
-        metainfo={"fuse_input_layernorm": True},
-    )
+    if config.experimental_attention_variant == "kda":
+        attention = ModuleSpec(
+            module=KimiDeltaAttention,
+            submodules=KimiDeltaAttentionSubmodules(
+                in_proj=backend.column_parallel_linear(),
+                beta_proj=backend.column_parallel_linear(),
+                out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+                out_proj=backend.row_parallel_linear(),
+            ),
+            metainfo={"fuse_input_layernorm": False},
+        )
+    else:
+        attention = ModuleSpec(
+            module=GatedDeltaNet,
+            submodules=GatedDeltaNetSubmodules(
+                in_proj=backend.column_parallel_layer_norm_linear(),
+                out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+                out_proj=backend.row_parallel_linear(),
+            ),
+            metainfo={"fuse_input_layernorm": True},
+        )
     return attention
 
 
@@ -123,9 +154,9 @@ def get_dsa_module_spec_for_backend(
     )
 
     attention = ModuleSpec(
-        module=MLASelfAttention,
+        module=AbsorbedMLASelfAttention,
         params={"attn_mask_type": AttnMaskType.causal},
-        submodules=MLASelfAttentionSubmodules(
+        submodules=AbsorbedMLASelfAttentionSubmodules(
             linear_q_proj=backend.column_parallel_linear(),
             linear_q_down_proj=backend.linear(),
             linear_q_up_proj=backend.column_parallel_linear(),
@@ -207,7 +238,7 @@ def get_experimental_attention_variant_module_spec(
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
-    if config.experimental_attention_variant == "gated_delta_net":
+    if is_gated_delta_net_variant(config.experimental_attention_variant):
         return get_gated_delta_net_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
@@ -390,6 +421,7 @@ def get_transformer_block_with_experimental_attention_variant_spec(
         num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
         local_layer_ids = range(offset, offset + num_layers_to_build)
 
+    _validate_dsa_index_share_pipeline_split(config, local_layer_ids)
     layer_specs = [layer_specs[layer_id] for layer_id in local_layer_ids]
 
     # Get GPT decoder block spec
@@ -406,10 +438,72 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 ##########
 
 
+def normalize_experimental_attention_variant(
+    experimental_attention_variant: Optional[str],
+) -> Optional[str]:
+    """Resolve a deprecated attention-variant spelling to its canonical name."""
+    canonical = _DEPRECATED_ATTENTION_VARIANT_ALIASES.get(experimental_attention_variant)
+    if canonical is None:
+        return experimental_attention_variant
+
+    warnings.warn(
+        f"experimental_attention_variant='{experimental_attention_variant}' is deprecated "
+        f"and will be removed in a future release. Use '{canonical}' instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return canonical
+
+
+def is_gated_delta_net_variant(experimental_attention_variant: Optional[str]) -> bool:
+    """Return whether a name selects a GDN-family attention implementation."""
+    canonical = _DEPRECATED_ATTENTION_VARIANT_ALIASES.get(
+        experimental_attention_variant, experimental_attention_variant
+    )
+    return canonical in GDN_ATTENTION_VARIANTS
+
+
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net"]
-    return experimental_attention_variant in linear_attention_variants
+    return is_gated_delta_net_variant(experimental_attention_variant)
+
+
+def _validate_dsa_index_share_pipeline_split(config: TransformerConfig, local_layer_ids) -> None:
+    """Ensure DSA top-k sharing does not require top-k indices from another PP stage."""
+    if (
+        config.experimental_attention_variant != "dsa"
+        or getattr(config, "dsa_indexer_topk_freq", 1) <= 1
+    ):
+        return
+
+    local_layer_ids = list(local_layer_ids)
+    local_layer_positions = {
+        layer_id: position for position, layer_id in enumerate(local_layer_ids)
+    }
+    for position, layer_id in enumerate(local_layer_ids):
+        layer_number = layer_id + 1
+        if not is_dsa_skip_topk_layer(
+            layer_number, config.dsa_indexer_skip_topk_offset, config.dsa_indexer_topk_freq
+        ):
+            continue
+
+        source_layer_number = source_dsa_compute_layer(
+            layer_number, config.dsa_indexer_skip_topk_offset, config.dsa_indexer_topk_freq
+        )
+        source_layer_id = source_layer_number - 1
+        if (
+            source_layer_id not in local_layer_positions
+            or local_layer_positions[source_layer_id] > position
+        ):
+            raise RuntimeError(
+                "DSA index-share pipeline split is invalid: local layer "
+                f"{layer_number} reuses top-k indices from computing layer "
+                f"{source_layer_number}, but that source layer is not earlier in this "
+                "pipeline stage. Cross-layer top-k sharing does not cross PP boundaries. "
+                "Choose a pipeline layout where each stage starts on a computing layer "
+                f"(dsa_indexer_topk_freq={config.dsa_indexer_topk_freq}, "
+                f"dsa_indexer_skip_topk_offset={config.dsa_indexer_skip_topk_offset})."
+            )
 
 
 def get_moe_layer_pattern(config: TransformerConfig) -> List[int]:
