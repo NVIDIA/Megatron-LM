@@ -25,7 +25,7 @@ from megatron.lite.primitive.ckpt.hf_weights import (
 from megatron.lite.primitive.quantization.qat import QATSpec, apply_qat_to_chunks
 
 
-pytestmark = pytest.mark.mlite
+pytestmark = [pytest.mark.mlite, pytest.mark.gpus(1)]
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -126,6 +126,7 @@ def _expert_tensor(global_expert_id: int) -> torch.Tensor:
     return base + global_expert_id * 1000
 
 
+@pytest.mark.gpus(2)
 def test_ep2_export_gather_matches_single_rank_reference_bitwise() -> None:
     _require_two_ranks()
     config = _qwen35_config()
@@ -164,6 +165,7 @@ def test_ep2_export_gather_matches_single_rank_reference_bitwise() -> None:
     assert torch.equal(exported[key], expected)
 
 
+@pytest.mark.gpus(2)
 def test_tp2_fused_gate_up_load_and_export_match_full_tensor_bitwise() -> None:
     _require_two_ranks()
     config = _qwen35_config()
