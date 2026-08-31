@@ -29,6 +29,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import (
+    InferenceMode,
     get_attention_mask,
     set_decode_expert_padding,
     set_moe_metadata_sync,
@@ -820,6 +821,17 @@ class TextGenerationController:
             position_ids (Tensor): The position IDs.
         """
         context = self.inference_wrapped_model.inference_context
+        token_capacity = self.model_config.inference_flashinfer_mxfp8_token_capacity
+        decode_token_upper_bound = (
+            context.max_requests
+            * (self.num_speculative_tokens + 1)
+            * self.model_config.expert_model_parallel_size
+        )
+        InferenceMode.set_bounded_mxfp8_rows(
+            context.is_decode_only()
+            and token_capacity is not None
+            and decode_token_upper_bound <= token_capacity
+        )
         if context.config.materialize_only_last_token_logits:
             logits_seq_len = context.num_last_token_logits
         else:
@@ -3393,11 +3405,15 @@ class TextGenerationController:
         self._validate_async_sched_support_for_step(run_async_overlap)
 
         active_request_count = context.total_request_count - context.paused_request_count
-        if context.active_token_count == 0 and active_request_count == 0 and run_async_overlap:
+        if context.active_token_count == 0 and active_request_count == 0:
+            # A lifecycle reset such as RECOMPUTE suspend/resume can remove every
+            # request represented by a pending forward. Discard those stale logits
+            # before the no-overlap path admits and primes the restored requests.
             self._async_sched_logits.clear()
-            return DynamicBatchControllerStepResult(
-                decode_only=DecodeOnly(consumed=None, launched=None)
-            )
+            if run_async_overlap:
+                return DynamicBatchControllerStepResult(
+                    decode_only=DecodeOnly(consumed=None, launched=None)
+                )
 
         if not run_async_overlap or not self._async_sched_logits.is_valid:
             return await self._run_async_sched_step_no_overlap(
