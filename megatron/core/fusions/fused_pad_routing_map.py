@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from unittest.mock import MagicMock
 
 import torch
@@ -86,6 +87,21 @@ def fused_pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch
         return routing_map
 
     input_map = routing_map.transpose(0, 1).contiguous().int()  # [num_experts, num_tokens]
+
+    # Mirrors pad_routing_map: when an expert has fewer zero entries than the
+    # padding it needs, the kernel below can only flip the zeros that exist and
+    # the result stays unaligned. Warn instead of silently returning a routing
+    # map that does not satisfy the requested alignment.
+    num_ones = input_map.sum(dim=1)
+    num_to_pad = (-num_ones) % pad_multiple
+    num_zeros = num_tokens - num_ones
+    if (num_to_pad > num_zeros).any():
+        warnings.warn(
+            "fused_pad_routing_map: not enough zero entries to pad every expert's "
+            f"token count to a multiple of {pad_multiple}; the returned routing "
+            "map may still have unaligned expert token counts.",
+            stacklevel=2,
+        )
 
     output_map = torch.empty_like(input_map)
 
