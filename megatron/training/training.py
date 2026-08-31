@@ -6331,6 +6331,11 @@ def _resolve_thd_static_batch_pg_collection(pg_collection, model_pg_collection=N
     """
     if pg_collection is None:
         pg_collection = model_pg_collection
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        raise ValueError(
+            "THD full-iteration batch preparation does not support "
+            "MultiModuleProcessGroupCollection."
+        )
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(
             required_pgs=["tp", "pp", "cp", "tp_cp", "dynamic_cp", "dynamic_tp_cp"]

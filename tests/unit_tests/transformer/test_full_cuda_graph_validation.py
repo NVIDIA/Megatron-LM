@@ -13,6 +13,7 @@ from megatron.core.rerun_state_machine import (
     RerunState,
     RerunStateMachine,
 )
+from megatron.core.tensor_parallel.random import initialize_rng_tracker
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -25,6 +26,8 @@ def test_full_cuda_graph_validates_current_replay_before_optimizer(
     bad_value, rejection, mode, reproduced
 ):
     """Replay failures reach rerun decisions without overwriting the retained failed result."""
+    # Capture requires a graph-safe RNG tracker, as initialize.py sets up for CUDA graphs.
+    initialize_rng_tracker(use_cudagraphable_rng=True, force_reset=True)
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
     machine = RerunStateMachine(mode=mode)
     source = torch.ones((), device="cuda")
