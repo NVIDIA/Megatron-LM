@@ -421,7 +421,7 @@ def _model_parallel(tp_size: int, cp_size: int, *, dynamic_cp: bool = False):
     model_parallel_cuda_manual_seed(_SEED)
     try:
         yield ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=["tp", "cp", "tp_cp"]
+            required_pgs=["tp", "cp", "tp_cp", "dp"]
         )
     finally:
         Utils.destroy_model_parallel()
@@ -3181,6 +3181,8 @@ def _aggregate_and_emit_metrics(
         )
         if dist.get_world_size(pg.tp_cp) > 1:
             dist.all_reduce(minima, op=dist.ReduceOp.MIN, group=pg.tp_cp)
+        if dist.get_world_size(pg.dp) > 1:
+            dist.all_reduce(minima, op=dist.ReduceOp.MIN, group=pg.dp)
         cosine, tensor_similarity = (float(value) for value in minima.tolist())
         metrics[label] = {
             "cosine": cosine,
