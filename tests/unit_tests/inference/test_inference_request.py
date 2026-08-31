@@ -434,3 +434,57 @@ def test_dynamic_inference_request_serialize_prompt_length_absent():
 
     assert obj["prompt_length"] is None
     assert obj["prompt_tokens"] is None
+
+
+def test_weight_scoped_salt_partitions_the_hash_space():
+    """Block hashes from different weight generations must never match.
+
+    Under PERSIST the prefix cache survives a refit, so without this a request
+    admitted after new weights land can match KV the old weights computed.
+    """
+    from megatron.core.inference.engines.dynamic_engine import _weight_scoped_salt
+
+    tokens = torch.arange(8, dtype=torch.int64)
+    gen1 = compute_block_hashes_batched(
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(1, None)
+    )
+    gen2 = compute_block_hashes_batched(
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(2, None)
+    )
+    assert gen1 and gen2
+    assert set(gen1).isdisjoint(gen2), "same tokens under different weights must not match"
+    # Deterministic within a generation, or a request could not match itself.
+    assert gen1 == compute_block_hashes_batched(
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(1, None)
+    )
+
+
+def test_weight_scoped_salt_is_inert_before_the_first_resume():
+    """Epoch 0 hashes exactly as an unsalted engine did, media key and all."""
+    from megatron.core.inference.engines.dynamic_engine import _weight_scoped_salt
+
+    assert _weight_scoped_salt(0, None) is None
+    assert _weight_scoped_salt(0, "img-1") == "img-1"
+
+    tokens = torch.arange(8, dtype=torch.int64)
+    assert compute_block_hashes_batched(
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(0, None)
+    ) == compute_block_hashes_batched(tokens, block_size=4)
+
+
+def test_weight_scoped_salt_keeps_media_identity_distinct():
+    """Within one generation, different media must still not share KV."""
+    from megatron.core.inference.engines.dynamic_engine import _weight_scoped_salt
+
+    tokens = torch.arange(8, dtype=torch.int64)
+    a = compute_block_hashes_batched(
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(3, "img-a")
+    )
+    b = compute_block_hashes_batched(
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(3, "img-b")
+    )
+    text = compute_block_hashes_batched(
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(3, None)
+    )
+    assert set(a).isdisjoint(b)
+    assert set(a).isdisjoint(text)

@@ -159,6 +159,33 @@ def format_mem_bytes(mem_bytes):
     return "%d bytes" % mem_bytes
 
 
+def _weight_scoped_salt(weight_epoch: int, media_cache_key: Optional[str]) -> Optional[str]:
+    """Scope a request's block hashes to the weight generation that will serve it.
+
+    Under KVCacheManagementMode.PERSIST the prefix cache survives a refit:
+    reinitialize_inference_state_buffers() only resets metadata on the RECOMPUTE
+    path, so the KV and Mamba hash tables outlive suspend/resume and a request
+    admitted afterwards can match blocks whose KV the previous weights computed.
+    Staleness is then bounded only by eviction pressure, since the engine-side
+    allocator has no TTL.
+
+    Mixing the weight generation into the salt makes chains from different
+    generations disjoint, so stale blocks become unmatchable rather than being
+    freed -- nothing is mutated at refit time, leaving live requests, chunked
+    prefill and pending Mamba restores untouched.
+
+    Composed with the media key rather than replacing it: multimodal requests
+    still need equal token placeholders backed by different media to stay
+    unmatchable. Epoch 0 returns the media key unchanged, so an engine that never
+    resumes hashes exactly as before.
+    """
+    if weight_epoch == 0:
+        return media_cache_key
+    if media_cache_key is None:
+        return f"w{weight_epoch}"
+    return f"w{weight_epoch}\x00{media_cache_key}"
+
+
 def _engine_reply_frames(finished_requests: List[dict]) -> List[bytes]:
     """Frame finished requests as [metadata, body, body, ...] for the coordinator.
 
@@ -287,6 +314,12 @@ class DynamicInferenceEngine(AbstractEngine):
         EngineState.RESUMED,
         EngineState.STOPPED,
     )
+
+    # Class-level default so the attribute is always readable: engines are built
+    # without running __init__ in places (tests, and anything constructing via
+    # object.__new__), and admitting a request reads this. An int is immutable, so
+    # the += in resume() still rebinds onto the instance.
+    _weight_epoch: int = 0
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -496,6 +529,12 @@ class DynamicInferenceEngine(AbstractEngine):
         # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
         self._generation_epoch: Optional[int] = None
+        # Weight generation counter, bumped on every resume. Used only to salt
+        # block hashes so the prefix cache cannot serve KV computed by earlier
+        # weights. Deliberately separate from `_generation_epoch`, which is driven
+        # by the SET_GENERATION_EPOCH control message and stamps per-request
+        # reporting fields.
+        self._weight_epoch: int = 0
         self.local_metadata_ledger_enabled: bool = False
         self.local_metadata_ledger: dict[str, FinishedRequestRecord] = {}
         # Track requests that should stop due to stop words (detected in post_process_requests)
@@ -1190,6 +1229,15 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state not in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
 
+        # A suspend/resume cycle is how a weight refit is staged, so treat resume
+        # as a new weight generation and re-salt the prefix cache. Bumped while
+        # still suspended, before anything can be admitted, so there is no window
+        # in which a post-refit request is admitted under the old salt. Requests
+        # re-added below keep the salt they were constructed with, so a request
+        # that spans the refit republishes under its original generation and is
+        # unmatchable by new arrivals.
+        self._weight_epoch += 1
+
         InferenceMode.set_active()
 
         # Resume.
@@ -1836,7 +1884,9 @@ class DynamicInferenceEngine(AbstractEngine):
             # Recompute the block hashes for multimodal embeddings,
             # which are injected dynamically into the sequence.
             precomputed_block_hashes=[] if request_has_images else (precomputed_block_hashes or []),
-            block_hash_salt=media_cache_key if request_has_images else None,
+            block_hash_salt=_weight_scoped_salt(
+                self._weight_epoch, media_cache_key if request_has_images else None
+            ),
             num_img_embeddings_per_tile=num_img_embeddings_per_tile,
             imgs=imgs,
             num_tiles=num_tiles,
