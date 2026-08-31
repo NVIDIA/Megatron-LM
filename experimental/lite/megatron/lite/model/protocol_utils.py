@@ -287,25 +287,28 @@ def pack_routed_experts(
 def pack_r3_replay_mask(
     model, batch: PackedBatch, *, contiguous: bool = False
 ) -> torch.Tensor:
-    """Build and pack the causal R3 mask from a full-sequence loss mask.
+    """Pack VERL's token-level R3 replay mask for local routers.
 
-    Every row before the final token can influence a response-token logprob.
-    The final row has no consumed next-token logit and stays on native routing.
-    Sequences without response tokens are not replayed.
+    The rollout producer owns the response-token semantics.  In particular, a
+    sequence without response tokens is an all-false row and must not be
+    converted into a causal replay mask here.
     """
+
+    if batch.r3_replay_mask is None:
+        raise ValueError("R3 replay requires PackedBatch.r3_replay_mask.")
 
     rows = []
     offset = 0
     for length_tensor in batch.seq_lens:
         length = int(length_tensor.item())
-        has_response = True
-        if batch.loss_mask is not None:
-            has_response = bool(batch.loss_mask[offset : offset + length].sum().item())
-        row = torch.zeros(length, dtype=torch.long, device=batch.input_ids.device)
-        if has_response and length > 1:
-            row[:-1] = 1
+        row = batch.r3_replay_mask[offset : offset + length]
+        if row.numel() != length:
+            raise ValueError("r3_replay_mask must have one entry for every packed token.")
+        row = row.to(device=batch.input_ids.device, dtype=torch.long)
         rows.append(row[:, None, None])
         offset += length
+    if batch.r3_replay_mask.numel() != offset:
+        raise ValueError("r3_replay_mask must have one entry for every packed token.")
     nested = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
     return pack_routed_experts(model, batch, nested, contiguous=contiguous)[0][
         :, 0

@@ -483,7 +483,7 @@ def test_suite_environment_sanitizes_then_applies_declared_variables(tmp_path):
     assert "PYTEST_ADDOPTS" not in environment
     assert "PYTEST_PLUGINS" not in environment
     assert environment["PYTHONPATH"] == os.pathsep.join(
-        (str(REPO_ROOT), str(TEST_ROOT.parent))
+        (str(TEST_ROOT.parent), str(REPO_ROOT))
     )
     assert environment["MLITE_TEST_HARNESS"] == "1"
     assert "MLITE_TEST_ALLOW_SKIPS" not in environment
