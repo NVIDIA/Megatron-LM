@@ -295,6 +295,10 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         kv_block_allocator=SimpleNamespace(enable_handoff_pinning=False),
     )
     context.is_decode_only = mock.Mock(side_effect=lambda: context.num_prefill_requests == 0)
+    # Bind the real flags so the fake exercises the production no-op-filter gate.
+    context.active_sampling_filter_flags = lambda count=None: (
+        DynamicInferenceContext.active_sampling_filter_flags(context, count)
+    )
     return context
 
 
