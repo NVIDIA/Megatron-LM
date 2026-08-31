@@ -1,12 +1,14 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""CuTeDSL kernels for direct intra-node replica weight movement.
+"""CuTeDSL gradient reduction for intra-node replica weight movement.
 
 Only virtual weights and gradients occupy PyTorch native symmetric memory.
-Source weights remain in parameter or GTP-gather storage: each owner pushes them
-directly into destination virtual slots, and replica gradients are accumulated into
-stable native-wgrad staging before autograd/DDP or GTP finalization. No activation
-transport is involved.
+Replica gradients are accumulated into stable native-wgrad staging before
+autograd/DDP or GTP finalization, and the used local slots are cleared behind the
+transport. No activation transport is involved.
+
+The matching owner push lives in ``replica_weight_triton.py``; this module keeps
+the launch entry points for both halves so callers see one transport surface.
 """
 
 import functools
@@ -15,6 +17,13 @@ from unittest.mock import MagicMock
 
 import torch
 
+from megatron.core.transformer.moe.replica_weight_triton import (
+    MAX_REPLICA_EP_RANKS,
+    MAX_REPLICA_WEIGHT_SMS,
+    as_pointer_table,
+    compile_replica_weight_push,
+    launch_replica_weight_prefetch,
+)
 from megatron.core.utils import null_decorator
 
 try:
@@ -47,7 +56,13 @@ except ImportError:
 
 _GRID_SYNC_TAG = 0x80000000
 _BARRIER_TIMEOUT_CYCLES = 100 * 2_000_000_000
-MAX_REPLICA_WEIGHT_SMS = 32
+
+__all__ = [
+    "MAX_REPLICA_WEIGHT_SMS",
+    "compile_replica_weight_kernels",
+    "launch_replica_grad_reduce",
+    "launch_replica_weight_prefetch",
+]
 
 
 @cute.jit
@@ -234,22 +249,6 @@ def _bulk_load_copy(
         cute.copy(copy_atom, source_bulk, destination_bulk, mbar_ptr=barrier)
 
 
-@cute.jit
-def _bulk_store_copy(
-    copy_atom: cute.CopyAtom,
-    source,
-    destination,
-    bulk_elements: cutlass.Constexpr[int],
-    bulks_per_chunk: cutlass.Constexpr[int],
-):
-    """Issue one warp-collective S2G chunk."""
-    for bulk in cutlass.range_constexpr(bulks_per_chunk):
-        source_bulk = _tensor_1d(source + bulk * bulk_elements, bulk_elements)
-        destination_bulk = _tensor_1d(destination + bulk * bulk_elements, bulk_elements)
-        # CopyBulkS2GOp performs its own full-warp lane election.
-        cute.copy(copy_atom, source_bulk, destination_bulk)
-
-
 class _ReplicaBulkKernel:
     """Configuration shared by the warp-specialized transport kernels."""
 
@@ -271,355 +270,6 @@ class _ReplicaBulkKernel:
         self.fc1_member_chunks = fc1_member_numel // self.CHUNK_ELEMENTS
         self.fc2_member_chunks = fc2_member_numel // self.CHUNK_ELEMENTS
         self.num_sms = num_sms
-
-
-class _ReplicaWeightPushKernel:
-    """Push BF16 or MXFP8 owner-local weight components into replica slots."""
-
-    NUM_THREADS = 64
-    MAX_BULK_ELEMENTS = 8192
-    MAX_DATA_CHUNK_BYTES = 65536
-    MAX_SCALE_CHUNK_BYTES = 8192
-
-    def __init__(
-        self,
-        *,
-        world_size: int,
-        num_local_experts: int,
-        fc1_member_bytes: int,
-        fc2_member_bytes: int,
-        num_sms: int,
-        fc1_scale_bytes: int = 0,
-        fc2_scale_bytes: int = 0,
-    ) -> None:
-        self.world_size = world_size
-        self.num_local_experts = num_local_experts
-        self.fc1_member_bytes = fc1_member_bytes
-        self.fc2_member_bytes = fc2_member_bytes
-        self.fc1_scale_bytes = fc1_scale_bytes
-        self.fc2_scale_bytes = fc2_scale_bytes
-        self.has_scales = fc1_scale_bytes > 0
-        if self.has_scales != (fc2_scale_bytes > 0):
-            raise ValueError("Replica weight projections must either both have scales or neither.")
-        self.num_sms = num_sms
-
-        # BF16 uses 6x32-KiB stages. MXFP8's half-sized data payload uses
-        # 3x64-KiB stages plus a short 2x8-KiB scale phase. Both retain the
-        # same data-pipeline shared-memory footprint and generated schedule as
-        # the formerly separate kernels.
-        self.data_stages = 3 if self.has_scales else 6
-        max_data_chunk_bytes = self.MAX_DATA_CHUNK_BYTES if self.has_scales else 32768
-        self.chunk_bytes = math.gcd(
-            max_data_chunk_bytes, math.gcd(fc1_member_bytes, fc2_member_bytes)
-        )
-        self.chunk_elements = self.chunk_bytes // 2
-        self.bulk_elements = min(self.MAX_BULK_ELEMENTS, self.chunk_elements)
-        self.bulks_per_chunk = self.chunk_elements // self.bulk_elements
-        self.fc1_member_chunks = fc1_member_bytes // self.chunk_bytes
-        self.fc2_member_chunks = fc2_member_bytes // self.chunk_bytes
-
-        self.fc1_data_base_elements = 0
-        self.fc1_scale_base_elements = num_local_experts * fc1_member_bytes // 2
-        self.fc2_data_base_elements = num_local_experts * (fc1_member_bytes + fc1_scale_bytes) // 2
-        self.fc2_scale_base_elements = (
-            num_local_experts * (fc1_member_bytes + fc1_scale_bytes + fc2_member_bytes) // 2
-        )
-        if self.has_scales:
-            self.scale_stages = 2
-            self.scale_chunk_bytes = math.gcd(
-                self.MAX_SCALE_CHUNK_BYTES, math.gcd(fc1_scale_bytes, fc2_scale_bytes)
-            )
-            self.scale_chunk_elements = self.scale_chunk_bytes // 2
-            self.scale_bulk_elements = min(self.MAX_BULK_ELEMENTS, self.scale_chunk_elements)
-            self.scale_bulks_per_chunk = self.scale_chunk_elements // self.scale_bulk_elements
-            self.fc1_scale_chunks = fc1_scale_bytes // self.scale_chunk_bytes
-            self.fc2_scale_chunks = fc2_scale_bytes // self.scale_chunk_bytes
-
-    def _smem_bytes(self) -> int:
-        scale_stages = self.scale_stages if self.has_scales else 0
-        scale_chunk_bytes = self.scale_chunk_bytes if self.has_scales else 0
-        stages = self.data_stages * self.chunk_bytes + scale_stages * scale_chunk_bytes
-        barriers = (self.data_stages + scale_stages) * 2 * 8
-        plan = (3 * self.world_size * self.num_local_experts + 1) * 4
-        return stages + barriers + plan + 256
-
-    @cute.jit
-    def __call__(
-        self,
-        fc1_source_bases_ptr: cute.Pointer,
-        fc2_source_bases_ptr: cute.Pointer,
-        fc1_scale_bases_ptr: cute.Pointer,
-        fc2_scale_bases_ptr: cute.Pointer,
-        peer_base_ptr: cute.Pointer,
-        signal_base_ptr: cute.Pointer,
-        experts_ptr: cute.Pointer,
-        grid_barrier_ptr: cute.Pointer,
-        rank: Int32,
-        stream: cuda.CUstream,
-    ):
-        fc1_source_bases = _tensor_1d(fc1_source_bases_ptr, self.num_local_experts)
-        fc2_source_bases = _tensor_1d(fc2_source_bases_ptr, self.num_local_experts)
-        fc1_scale_bases = _tensor_1d(fc1_scale_bases_ptr, self.num_local_experts)
-        fc2_scale_bases = _tensor_1d(fc2_scale_bases_ptr, self.num_local_experts)
-        peer_bases = _tensor_1d(peer_base_ptr, self.world_size)
-        signal_bases = _tensor_1d(signal_base_ptr, self.world_size)
-        experts = _tensor_1d(experts_ptr, self.world_size * self.num_local_experts)
-        self.kernel(
-            fc1_source_bases,
-            fc2_source_bases,
-            fc1_scale_bases,
-            fc2_scale_bases,
-            peer_bases,
-            signal_bases,
-            experts,
-            grid_barrier_ptr,
-            rank,
-        ).launch(
-            grid=(self.num_sms, 1, 1),
-            block=(self.NUM_THREADS, 1, 1),
-            smem=self._smem_bytes(),
-            stream=stream,
-            cooperative=True,
-        )
-
-    @cute.kernel
-    def kernel(
-        self,
-        fc1_source_bases: cute.Tensor,
-        fc2_source_bases: cute.Tensor,
-        fc1_scale_bases: cute.Tensor,
-        fc2_scale_bases: cute.Tensor,
-        peer_bases: cute.Tensor,
-        signal_bases: cute.Tensor,
-        experts: cute.Tensor,
-        grid_barrier,
-        rank: Int32,
-    ):
-        tid, _, _ = cute.arch.thread_idx()
-        block, _, _ = cute.arch.block_idx()
-        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        stages = cutlass.const_expr(self.data_stages)
-        smem = utils.SmemAllocator()
-        load_mbar = smem.allocate_array(Int64, num_elems=2 * stages)
-        owner_experts = smem.allocate_tensor(
-            Int32, cute.make_layout((self.world_size * self.num_local_experts,)), byte_alignment=16
-        )
-        destinations = smem.allocate_tensor(
-            Int32, cute.make_layout((self.world_size * self.num_local_experts,)), byte_alignment=16
-        )
-        destination_slots = smem.allocate_tensor(
-            Int32, cute.make_layout((self.world_size * self.num_local_experts,)), byte_alignment=16
-        )
-        active_count = smem.allocate_tensor(Int32, cute.make_layout((1,)), byte_alignment=4)
-        stage_smem = smem.allocate_tensor(
-            BFloat16,
-            cute.make_ordered_layout((self.chunk_elements, stages), order=(0, 1)),
-            byte_alignment=128,
-        )
-        if cutlass.const_expr(self.has_scales):
-            scale_stages = cutlass.const_expr(self.scale_stages)
-            scale_load_mbar = smem.allocate_array(Int64, num_elems=2 * scale_stages)
-            scale_stage_smem = smem.allocate_tensor(
-                BFloat16,
-                cute.make_ordered_layout((self.scale_chunk_elements, scale_stages), order=(0, 1)),
-                byte_alignment=128,
-            )
-
-        if tid == 0:
-            count = Int32(0)
-            plan_entries = cutlass.const_expr(self.world_size * self.num_local_experts)
-            # Keep this latency-sensitive scan as one compact runtime loop.
-            for entry in cutlass.range(0, plan_entries, 1, unroll=1):
-                destination = entry // self.num_local_experts
-                slot = entry - destination * self.num_local_experts
-                expert = experts[entry]
-                owner_expert = expert - rank * self.num_local_experts
-                if owner_expert >= Int32(0) and owner_expert < Int32(self.num_local_experts):
-                    owner_experts[count] = owner_expert
-                    destinations[count] = destination
-                    destination_slots[count] = slot
-                    count += Int32(1)
-            active_count[0] = count
-        cute.arch.sync_threads()
-
-        load_pipe = pipeline.PipelineTmaAsync.create(
-            barrier_storage=load_mbar,
-            num_stages=stages,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=cutlass.const_expr(self.chunk_bytes),
-        )
-        if cutlass.const_expr(self.has_scales):
-            scale_load_pipe = pipeline.PipelineTmaAsync.create(
-                barrier_storage=scale_load_mbar,
-                num_stages=scale_stages,
-                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-                tx_count=cutlass.const_expr(self.scale_chunk_bytes),
-            )
-        load_atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), BFloat16)
-        store_atom = cute.make_copy_atom(cpasync.CopyBulkS2GOp(), BFloat16)
-        chunks_per_replica = cutlass.const_expr(self.fc1_member_chunks + self.fc2_member_chunks)
-        remote_work = active_count[0] * chunks_per_replica
-        if warp == 0:
-            load_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, stages)
-            for work in cutlass.range(block, remote_work, self.num_sms, unroll=1):
-                member_chunk = work // active_count[0]
-                active = work - member_chunk * active_count[0]
-                owner_expert = owner_experts[active]
-                source = cute.make_ptr(
-                    BFloat16,
-                    fc1_source_bases[owner_expert],
-                    cute.AddressSpace.gmem,
-                    assumed_align=16,
-                )
-                projection_chunk = member_chunk
-                if member_chunk >= self.fc1_member_chunks:
-                    source = cute.make_ptr(
-                        BFloat16,
-                        fc2_source_bases[owner_expert],
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    projection_chunk = member_chunk - self.fc1_member_chunks
-                source_offset = Int64(projection_chunk * self.chunk_elements)
-                load_pipe.producer_acquire(load_state)
-                stage = stage_smem[(None, load_state.index)]
-                _bulk_load_copy(
-                    load_atom,
-                    source + source_offset,
-                    stage.iterator,
-                    load_pipe.producer_get_barrier(load_state),
-                    cutlass.const_expr(self.bulk_elements),
-                    cutlass.const_expr(self.bulks_per_chunk),
-                )
-                load_pipe.producer_commit(load_state)
-                load_state.advance()
-        elif warp == 1:
-            consume_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, stages)
-            for work in cutlass.range(block, remote_work, self.num_sms, unroll=1):
-                member_chunk = work // active_count[0]
-                active = work - member_chunk * active_count[0]
-                destination = destinations[active]
-                slot = destination_slots[active]
-                member_elements = cutlass.const_expr(self.fc1_member_bytes // 2)
-                projection_base = Int64(self.fc1_data_base_elements)
-                projection_chunk = member_chunk
-                if member_chunk >= self.fc1_member_chunks:
-                    member_elements = cutlass.const_expr(self.fc2_member_bytes // 2)
-                    projection_base = Int64(self.fc2_data_base_elements)
-                    projection_chunk = member_chunk - self.fc1_member_chunks
-                destination_offset = (
-                    projection_base
-                    + Int64(slot) * member_elements
-                    + Int64(projection_chunk * self.chunk_elements)
-                )
-                peer = cute.make_ptr(
-                    BFloat16, peer_bases[destination], cute.AddressSpace.gmem, assumed_align=16
-                )
-                load_pipe.consumer_wait(consume_state)
-                stage = stage_smem[(None, consume_state.index)]
-                _bulk_store_copy(
-                    store_atom,
-                    stage.iterator,
-                    peer + destination_offset,
-                    cutlass.const_expr(self.bulk_elements),
-                    cutlass.const_expr(self.bulks_per_chunk),
-                )
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
-                load_pipe.consumer_release(consume_state)
-                consume_state.advance()
-        if cutlass.const_expr(self.has_scales):
-            # One CTA bulk-copy engine serves both phases, so finish data before
-            # issuing the much smaller scale transfer.
-            cute.arch.sync_threads()
-            scale_chunks_per_replica = cutlass.const_expr(
-                self.fc1_scale_chunks + self.fc2_scale_chunks
-            )
-            scale_work = active_count[0] * scale_chunks_per_replica
-            if warp == 0:
-                scale_load_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, scale_stages
-                )
-                for work in cutlass.range(block, scale_work, self.num_sms, unroll=1):
-                    member_chunk = work // active_count[0]
-                    active = work - member_chunk * active_count[0]
-                    owner_expert = owner_experts[active]
-                    source = cute.make_ptr(
-                        BFloat16,
-                        fc1_scale_bases[owner_expert],
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    projection_chunk = member_chunk
-                    if member_chunk >= self.fc1_scale_chunks:
-                        source = cute.make_ptr(
-                            BFloat16,
-                            fc2_scale_bases[owner_expert],
-                            cute.AddressSpace.gmem,
-                            assumed_align=16,
-                        )
-                        projection_chunk = member_chunk - self.fc1_scale_chunks
-                    source_offset = Int64(projection_chunk * self.scale_chunk_elements)
-                    scale_load_pipe.producer_acquire(scale_load_state)
-                    stage = scale_stage_smem[(None, scale_load_state.index)]
-                    _bulk_load_copy(
-                        load_atom,
-                        source + source_offset,
-                        stage.iterator,
-                        scale_load_pipe.producer_get_barrier(scale_load_state),
-                        cutlass.const_expr(self.scale_bulk_elements),
-                        cutlass.const_expr(self.scale_bulks_per_chunk),
-                    )
-                    scale_load_pipe.producer_commit(scale_load_state)
-                    scale_load_state.advance()
-            elif warp == 1:
-                scale_consume_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, scale_stages
-                )
-                for work in cutlass.range(block, scale_work, self.num_sms, unroll=1):
-                    member_chunk = work // active_count[0]
-                    active = work - member_chunk * active_count[0]
-                    destination = destinations[active]
-                    slot = destination_slots[active]
-                    member_elements = cutlass.const_expr(self.fc1_scale_bytes // 2)
-                    projection_base = Int64(self.fc1_scale_base_elements)
-                    projection_chunk = member_chunk
-                    if member_chunk >= self.fc1_scale_chunks:
-                        member_elements = cutlass.const_expr(self.fc2_scale_bytes // 2)
-                        projection_base = Int64(self.fc2_scale_base_elements)
-                        projection_chunk = member_chunk - self.fc1_scale_chunks
-                    destination_offset = (
-                        projection_base
-                        + Int64(slot) * member_elements
-                        + Int64(projection_chunk * self.scale_chunk_elements)
-                    )
-                    peer = cute.make_ptr(
-                        BFloat16, peer_bases[destination], cute.AddressSpace.gmem, assumed_align=16
-                    )
-                    scale_load_pipe.consumer_wait(scale_consume_state)
-                    stage = scale_stage_smem[(None, scale_consume_state.index)]
-                    _bulk_store_copy(
-                        store_atom,
-                        stage.iterator,
-                        peer + destination_offset,
-                        cutlass.const_expr(self.scale_bulk_elements),
-                        cutlass.const_expr(self.scale_bulks_per_chunk),
-                    )
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    scale_load_pipe.consumer_release(scale_consume_state)
-                    scale_consume_state.advance()
-
-        _cross_rank_barrier(
-            signal_bases,
-            grid_barrier,
-            rank,
-            cutlass.const_expr(self.world_size),
-            Int32(self.num_sms),
-            tid,
-        )
 
 
 class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
@@ -1011,13 +661,10 @@ def _validate_compile_shape(
             "Replica CuTeDSL weight kernels are limited to "
             f"{MAX_REPLICA_WEIGHT_SMS} SMs, got {num_sms}."
         )
-    # One thread of the first block signals each peer across the barrier, so no
-    # transport block may be narrower than the rank count. The push kernel is
-    # the narrowest of the two.
-    max_ranks = _ReplicaWeightPushKernel.NUM_THREADS
-    if world_size > max_ranks:
+    if world_size > MAX_REPLICA_EP_RANKS:
         raise ValueError(
-            "Replica CuTeDSL supports at most " f"{max_ranks} EP ranks, got {world_size}."
+            "Replica CuTeDSL supports at most "
+            f"{MAX_REPLICA_EP_RANKS} EP ranks, got {world_size}."
         )
     tile_elements = _ReplicaGradReduceKernel.CHUNK_ELEMENTS
     if fc1_member_numel % tile_elements or fc2_member_numel % tile_elements:
@@ -1026,33 +673,6 @@ def _validate_compile_shape(
             f"{tile_elements} elements "
             f"per expert, got {(fc1_member_numel, fc2_member_numel)}."
         )
-
-
-@functools.lru_cache(maxsize=None)
-def _get_compiled_bf16_weight_push(
-    world_size: int,
-    num_local_experts: int,
-    fc1_member_numel: int,
-    fc2_member_numel: int,
-    num_sms: int,
-    device_index: int,
-):
-    _validate_compile_shape(
-        world_size, num_local_experts, fc1_member_numel, fc2_member_numel, num_sms
-    )
-    kernel = _ReplicaWeightPushKernel(
-        world_size=world_size,
-        num_local_experts=num_local_experts,
-        fc1_member_bytes=2 * fc1_member_numel,
-        fc2_member_bytes=2 * fc2_member_numel,
-        num_sms=num_sms,
-    )
-    i32_ptr = make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=16)
-    i64_ptr = make_ptr(Int64, 0, cute.AddressSpace.gmem, assumed_align=8)
-    pointer_args = (i64_ptr, i64_ptr, i64_ptr, i64_ptr, i64_ptr, i64_ptr, i32_ptr, i32_ptr)
-    stream = cuda.CUstream(0)
-    with torch.cuda.device(device_index):
-        return cute.compile(kernel, *pointer_args, Int32(0), stream)
 
 
 @functools.lru_cache(maxsize=None)
@@ -1112,103 +732,15 @@ def compile_replica_weight_kernels(
         device_index,
         grad_dtype,
     )
-    if rowwise_scale_numels is None and columnwise_scale_numels is None:
-        _get_compiled_bf16_weight_push(
-            world_size, num_local_experts, member_numels[0], member_numels[1], num_sms, device_index
-        )
-        return
-    if rowwise_scale_numels is None or columnwise_scale_numels is None:
-        raise ValueError("MXFP8 compilation requires both rowwise and columnwise scale shapes.")
-    _get_compiled_mxfp8_weight_kernels(
-        world_size,
-        num_local_experts,
-        member_numels[0],
-        member_numels[1],
-        rowwise_scale_numels[0],
-        rowwise_scale_numels[1],
-        columnwise_scale_numels[0],
-        columnwise_scale_numels[1],
-        num_sms,
-        device_index,
+    compile_replica_weight_push(
+        world_size=world_size,
+        num_local_experts=num_local_experts,
+        member_numels=member_numels,
+        num_sms=num_sms,
+        device_index=device_index,
+        rowwise_scale_numels=rowwise_scale_numels,
+        columnwise_scale_numels=columnwise_scale_numels,
     )
-
-
-def _validate_mxfp8_compile_shape(
-    world_size: int,
-    num_local_experts: int,
-    member_numels: tuple[int, int],
-    rowwise_scale_numels: tuple[int, int],
-    columnwise_scale_numels: tuple[int, int],
-    num_sms: int,
-) -> None:
-    """Validate the aligned native MXFP8 byte layout used by the push kernels."""
-    _validate_compile_shape(
-        world_size, num_local_experts, member_numels[0], member_numels[1], num_sms
-    )
-    for projection, member_numel in enumerate(member_numels):
-        for orientation, scale_numels in (
-            ("rowwise", rowwise_scale_numels),
-            ("columnwise", columnwise_scale_numels),
-        ):
-            scale_numel = scale_numels[projection]
-            if scale_numel <= 0 or scale_numel % 2:
-                raise ValueError(
-                    "Replica CuTeDSL MXFP8 scales must contain a positive even number "
-                    f"of bytes; {orientation} projection {projection} has {scale_numel}."
-                )
-            if scale_numel * 32 != member_numel:
-                raise ValueError(
-                    "Replica CuTeDSL MXFP8 requires one E8M0 scale byte per 32 "
-                    f"weight bytes; {orientation} projection {projection} has "
-                    f"weight_bytes={member_numel}, scale_bytes={scale_numel}."
-                )
-
-
-@functools.lru_cache(maxsize=None)
-def _get_compiled_mxfp8_weight_kernels(
-    world_size: int,
-    num_local_experts: int,
-    fc1_member_numel: int,
-    fc2_member_numel: int,
-    fc1_rowwise_scale_numel: int,
-    fc2_rowwise_scale_numel: int,
-    fc1_columnwise_scale_numel: int,
-    fc2_columnwise_scale_numel: int,
-    num_sms: int,
-    device_index: int,
-):
-    member_numels = (fc1_member_numel, fc2_member_numel)
-    rowwise_scale_numels = (fc1_rowwise_scale_numel, fc2_rowwise_scale_numel)
-    columnwise_scale_numels = (fc1_columnwise_scale_numel, fc2_columnwise_scale_numel)
-    _validate_mxfp8_compile_shape(
-        world_size,
-        num_local_experts,
-        member_numels,
-        rowwise_scale_numels,
-        columnwise_scale_numels,
-        num_sms,
-    )
-    common = dict(world_size=world_size, num_local_experts=num_local_experts, num_sms=num_sms)
-    i32_ptr = make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=16)
-    i64_ptr = make_ptr(Int64, 0, cute.AddressSpace.gmem, assumed_align=8)
-    pointer_args = (i64_ptr, i64_ptr, i64_ptr, i64_ptr, i64_ptr, i64_ptr, i32_ptr, i32_ptr)
-
-    def orientation_kernel(fc1_scale_numel: int, fc2_scale_numel: int):
-        return _ReplicaWeightPushKernel(
-            **common,
-            fc1_member_bytes=fc1_member_numel,
-            fc2_member_bytes=fc2_member_numel,
-            fc1_scale_bytes=fc1_scale_numel,
-            fc2_scale_bytes=fc2_scale_numel,
-        )
-
-    kernels = (
-        orientation_kernel(fc1_rowwise_scale_numel, fc2_rowwise_scale_numel),
-        orientation_kernel(fc1_columnwise_scale_numel, fc2_columnwise_scale_numel),
-    )
-    stream = cuda.CUstream(0)
-    with torch.cuda.device(device_index):
-        return tuple(cute.compile(kernel, *pointer_args, Int32(0), stream) for kernel in kernels)
 
 
 def _runtime_ptr(dtype, tensor_or_address, *, assumed_align: int = 16):
@@ -1219,130 +751,6 @@ def _runtime_ptr(dtype, tensor_or_address, *, assumed_align: int = 16):
         else int(tensor_or_address)
     )
     return make_ptr(dtype, address, cute.AddressSpace.gmem, assumed_align=assumed_align)
-
-
-def _as_pointer_table(
-    tensor: torch.Tensor, num_local_experts: int, *, dtype: torch.dtype
-) -> torch.Tensor:
-    """Return a stable device table containing one data pointer per local expert.
-
-    The public kernel helpers historically accepted one contiguous ``[expert, ...]``
-    tensor.  Replica bridges can now pass an ``int64`` pointer table instead, which
-    also represents TE's independently allocated ``weight0..weightN`` parameters.
-    """
-    if tensor.dtype == torch.int64:
-        if (
-            tensor.device.type != "cuda"
-            or tensor.ndim != 1
-            or tensor.numel() != num_local_experts
-            or not tensor.is_contiguous()
-        ):
-            raise ValueError(
-                "Replica CuTeDSL pointer tables must be contiguous CUDA int64 tensors "
-                f"with {num_local_experts} entries."
-            )
-        return tensor
-    if (
-        tensor.device.type != "cuda"
-        or tensor.dtype != dtype
-        or tensor.ndim < 2
-        or tensor.shape[0] != num_local_experts
-        or not tensor.is_contiguous()
-    ):
-        raise ValueError(
-            "Replica CuTeDSL sources and native grads must be contiguous CUDA tensors "
-            f"with shape [{num_local_experts}, ...] and dtype {dtype}."
-        )
-    return torch.tensor(
-        [tensor[index].data_ptr() for index in range(num_local_experts)],
-        dtype=torch.int64,
-        device=tensor.device,
-    )
-
-
-def launch_replica_weight_prefetch(
-    *,
-    sources: tuple[torch.Tensor, torch.Tensor],
-    arena: torch.Tensor,
-    peer_bases: torch.Tensor,
-    signal_bases: torch.Tensor,
-    experts_to_copy: torch.Tensor,
-    grid_barrier: torch.Tensor,
-    rank: int,
-    world_size: int,
-    num_local_experts: int,
-    member_numels: tuple[int, int],
-    num_sms: int,
-    scale_sources: tuple[torch.Tensor, torch.Tensor] | None = None,
-    rowwise_scale_numels: tuple[int, int] | None = None,
-    columnwise_scale_numels: tuple[int, int] | None = None,
-    orientation: str | None = None,
-) -> None:
-    """Launch a BF16 or MXFP8 owner-push into destination virtual slots."""
-    device_index = arena.device.index
-    if device_index is None:
-        raise ValueError("Replica CuTeDSL arena must be a CUDA tensor.")
-    if scale_sources is None:
-        if any(
-            value is not None
-            for value in (rowwise_scale_numels, columnwise_scale_numels, orientation)
-        ):
-            raise ValueError("BF16 prefetch does not accept MXFP8 scale metadata.")
-        if arena.dtype != torch.bfloat16:
-            raise ValueError(
-                f"Replica CuTeDSL BF16 arena must use torch.bfloat16, got {arena.dtype}."
-            )
-        kernel = _get_compiled_bf16_weight_push(
-            world_size, num_local_experts, member_numels[0], member_numels[1], num_sms, device_index
-        )
-        source_dtype = torch.bfloat16
-    else:
-        if rowwise_scale_numels is None or columnwise_scale_numels is None:
-            raise ValueError("MXFP8 prefetch requires rowwise and columnwise scale shapes.")
-        if orientation not in ("rowwise", "columnwise"):
-            raise ValueError(
-                "Replica CuTeDSL MXFP8 orientation must be 'rowwise' or 'columnwise', "
-                f"got {orientation!r}."
-            )
-        if arena.dtype != torch.uint8:
-            raise ValueError(
-                f"Replica CuTeDSL MXFP8 arena must use torch.uint8, got {arena.dtype}."
-            )
-        kernel = _get_compiled_mxfp8_weight_kernels(
-            world_size,
-            num_local_experts,
-            member_numels[0],
-            member_numels[1],
-            rowwise_scale_numels[0],
-            rowwise_scale_numels[1],
-            columnwise_scale_numels[0],
-            columnwise_scale_numels[1],
-            num_sms,
-            device_index,
-        )[0 if orientation == "rowwise" else 1]
-        source_dtype = torch.uint8
-    stream = cuda.CUstream(torch.cuda.current_stream(arena.device).cuda_stream)
-    source_bases = tuple(
-        _as_pointer_table(source, num_local_experts, dtype=source_dtype) for source in sources
-    )
-    scale_bases = source_bases
-    if scale_sources is not None:
-        scale_bases = tuple(
-            _as_pointer_table(source, num_local_experts, dtype=torch.uint8)
-            for source in scale_sources
-        )
-    kernel(
-        _runtime_ptr(Int64, source_bases[0], assumed_align=8),
-        _runtime_ptr(Int64, source_bases[1], assumed_align=8),
-        _runtime_ptr(Int64, scale_bases[0], assumed_align=8),
-        _runtime_ptr(Int64, scale_bases[1], assumed_align=8),
-        _runtime_ptr(Int64, peer_bases, assumed_align=8),
-        _runtime_ptr(Int64, signal_bases, assumed_align=8),
-        _runtime_ptr(Int32, experts_to_copy),
-        _runtime_ptr(Int32, grid_barrier),
-        Int32(rank),
-        stream,
-    )
 
 
 def launch_replica_grad_reduce(
@@ -1383,7 +791,7 @@ def launch_replica_grad_reduce(
     )
     stream = cuda.CUstream(torch.cuda.current_stream(arena.device).cuda_stream)
     native_grad_bases = tuple(
-        _as_pointer_table(native_grad, num_local_experts, dtype=arena.dtype)
+        as_pointer_table(native_grad, num_local_experts, dtype=arena.dtype)
         for native_grad in native_grads
     )
     compiled(
