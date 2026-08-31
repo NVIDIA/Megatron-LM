@@ -667,6 +667,12 @@ class MLAWithLatentCP(MLASelfAttention):
         latent, k_rope = torch.split(
             payload, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
         )
+        phase_rows_selected = not self.config.sequence_parallel
+        if phase_rows_selected:
+            # TP1 has no sequence gather inside the up projection. Select the compact
+            # rectangular phase first so lower phases do not expand unused KV rows.
+            latent = self._phase_rows(latent, phase.kv_indices, phase.kv_slice)
+            k_rope = self._phase_rows(k_rope, phase.kv_indices, phase.kv_slice)
         latent = latent.contiguous()
         k_rope = k_rope.contiguous()
         expanded, _ = self.linear_kv_up_proj(latent)
@@ -679,8 +685,11 @@ class MLAWithLatentCP(MLASelfAttention):
             self.num_attention_heads_per_partition,
             self.config.qk_head_dim + self.config.v_head_dim,
         )
-        expanded = self._phase_rows(expanded, phase.kv_indices, phase.kv_slice)
-        k_rope = self._phase_rows(k_rope, phase.kv_indices, phase.kv_slice)
+        if not phase_rows_selected:
+            # TP>1 sequence-parallel projections and the positional gather first
+            # reconstruct the complete local token axis, then apply the phase view.
+            expanded = self._phase_rows(expanded, phase.kv_indices, phase.kv_slice)
+            k_rope = self._phase_rows(k_rope, phase.kv_indices, phase.kv_slice)
         k_content, value = torch.split(
             expanded, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
         )

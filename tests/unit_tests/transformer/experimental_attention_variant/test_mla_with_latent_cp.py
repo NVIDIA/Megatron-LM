@@ -2711,11 +2711,10 @@ def test_finalized_metadata_projection_groups_rope_and_checkpoint_lifetime(
         assert all(call["max_seqlen"] == layout.max_global for call in rope_calls)
         assert all(call["cp_group"] is pg.cp for call in rope_calls)
 
-        up_projection_calls = 0
+        up_projection_input_shapes = []
 
-        def count_up_projection(_module, _inputs, _output):
-            nonlocal up_projection_calls
-            up_projection_calls += 1
+        def record_up_projection(_module, inputs, _output):
+            up_projection_input_shapes.append(tuple(inputs[0].shape))
 
         expected_query_shapes = [
             (
@@ -2725,13 +2724,17 @@ def test_finalized_metadata_projection_groups_rope_and_checkpoint_lifetime(
             )
             for phase in layout.phases
         ]
-        # Checkpoint receives the full ring lease; phase KV slicing happens after up-projection.
+        # Checkpoint retains the full ring lease, while TP1 selects rectangular KV rows
+        # before the phase up projection.
         expected_latent_shapes = [
             (layout.local_tokens, config.kv_lora_rank + _ROPE_DIM)
             for _phase in layout.phases
         ]
+        expected_projection_shapes = [
+            (phase.kv_indices.numel(), config.kv_lora_rank) for phase in layout.phases
+        ]
         retained = _SavedTensorRecorder()
-        handle = layer.linear_kv_up_proj.register_forward_hook(count_up_projection)
+        handle = layer.linear_kv_up_proj.register_forward_hook(record_up_projection)
         try:
             with torch.autograd.graph.saved_tensors_hooks(
                 retained.pack, retained.unpack
@@ -2766,12 +2769,14 @@ def test_finalized_metadata_projection_groups_rope_and_checkpoint_lifetime(
                 assert output.dtype == torch.bfloat16
                 assert backend.forward_calls == 2
                 assert backend.raw_output_dtypes == [torch.bfloat16, torch.bfloat16]
-                assert up_projection_calls == 2
+                assert up_projection_input_shapes == expected_projection_shapes
                 torch.cuda.synchronize()
                 gc.collect()
                 assert all(reference() is None for reference in backend.expanded_refs)
             output.backward(torch.randn_like(output))
-            assert up_projection_calls == 4
+            assert sorted(up_projection_input_shapes) == sorted(
+                2 * expected_projection_shapes
+            )
             assert backend.forward_calls == 4
         finally:
             handle.remove()

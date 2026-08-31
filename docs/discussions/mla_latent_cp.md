@@ -171,8 +171,12 @@ rank enters with a contiguous `[T_r/N, 1, hidden_size]` sequence shard. The exac
    Because splitting the contiguous ring payload along its channel dimension produces strided views,
    both the latent and positional slices are materialized as contiguous tensors before either TP
    collective; the collective boundary never relies on backend acceptance of noncontiguous inputs.
-   Phase Q/KV rows use first-dimension views when the planner recorded a contiguous span, including
-   the single-packed-sequence benchmark path, and retain `index_select` for general packed rows.
+   TP1 has no sequence gather inside the up projection, so it selects the compact phase rows before
+   KV expansion; a lower rectangular phase therefore never projects its unused second half. TP>1
+   sequence-parallel execution first reconstructs the complete local token axis and then selects
+   phase rows. Phase Q/KV rows use first-dimension views when the planner recorded a contiguous span,
+   including the single-packed-sequence benchmark path, and retain `index_select` for general packed
+   rows.
    The gather's backward reduce-scatter is the single TP sum for the shared positional-key gradient;
    the KV up-projection supplies the corresponding latent-input reduce-scatter.
 5. The merged `[T_r, H_tp, D_v]` output is flattened and cast once to BF16. If
@@ -249,6 +253,10 @@ K = concat(K_content, expand_heads(K_pos), dim=-1)
   -> [T_r, H_tp, D_qk]
 V -> [T_r, H_tp, D_v]
 ```
+
+For TP1, `sequence_shard` above is first narrowed to the phase's KV rows. For TP>1/SP, the
+sequence-parallel projection and positional gather must reconstruct the complete local token axis
+before the same phase view is applied.
 
 The legacy full-K/V payload per TP lane has `T_r * H_tp * (D_qk + D_v)` elements. The latent
 payload per TP lane has `(T_r/N) * (C + D_r)` elements, for the communication ratio
