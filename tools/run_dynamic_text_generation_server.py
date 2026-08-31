@@ -35,10 +35,12 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server impo
     start_text_gen_server,
     stop_text_gen_server,
 )
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_dynamic_inference import (  # noqa: E402,E501
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_dynamic_inference import (
     _detect_vlm_from_checkpoint,
     _print_resolved_args,
     add_vlm_inference_args,
+)
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_dynamic_inference import (  # noqa: E402,E501
     get_model as get_vlm_model,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer  # noqa: E402
@@ -123,9 +125,8 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
     # image-expanded prompt, matching vlm_server.py's pre-engine bookkeeping.
     args.num_img_embeddings_per_tile = 0
     if hasattr(args, 'patch_dim'):
-        dynamic_res = (
-            getattr(args, 'dynamic_resolution', False)
-            and not getattr(args, 'use_tiling', False)
+        dynamic_res = getattr(args, 'dynamic_resolution', False) and not getattr(
+            args, 'use_tiling', False
         )
         if dynamic_res:
             max_patches = getattr(args, 'dynamic_resolution_max_patches', 128)
@@ -138,6 +139,7 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
             )
         else:
             from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+
             args.num_img_embeddings_per_tile = get_num_image_embeddings(
                 args.img_h,
                 args.img_w,
@@ -163,12 +165,8 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
         use_tiling=getattr(args, 'use_tiling', False),
         pixel_shuffle=getattr(args, 'pixel_shuffle', False),
         spatial_merge_size=getattr(args, 'spatial_merge_size', 1),
-        dynamic_resolution_min_patches=getattr(
-            args, 'dynamic_resolution_min_patches', 1
-        ),
-        dynamic_resolution_max_patches=getattr(
-            args, 'dynamic_resolution_max_patches', 128
-        ),
+        dynamic_resolution_min_patches=getattr(args, 'dynamic_resolution_min_patches', 1),
+        dynamic_resolution_max_patches=getattr(args, 'dynamic_resolution_max_patches', 128),
         vision_model_type=getattr(args, 'vision_model_type', 'radio'),
         pixel_mean=getattr(args, 'pixel_mean', None),
         pixel_std=getattr(args, 'pixel_std', None),
@@ -250,6 +248,13 @@ async def run_text_generation_server(
                 default_top_p=default_top_p,
                 default_top_k=default_top_k,
                 eval_mode=eval_mode,
+                # Taken from the engine so the frontend hashes on the same block
+                # boundaries the engine caches on; a mismatch would name blocks it
+                # never held and every routing decision would miss.
+                block_size_tokens=engine.context.block_size_tokens,
+                prefix_caching_coordinator_policy=(
+                    engine.context.prefix_caching_coordinator_policy
+                ),
             )
 
         # Await the engine loop directly since the server is running in a separate process
@@ -295,13 +300,17 @@ if __name__ == "__main__":
         # store_true flags have no negating counterpart, so we only inject
         # those when the user hasn't set a conflicting explicit value.
         _defaults = [
-            "--micro-batch-size", "1",
-            "--inference-dynamic-batching-buffer-size-gb", "2.0",
+            "--micro-batch-size",
+            "1",
+            "--inference-dynamic-batching-buffer-size-gb",
+            "2.0",
             # Placeholders for add_multimodal_extra_args' required args. These
             # are injected as defaults, so _detect_vlm_from_checkpoint will
             # replace them with the checkpoint's real values when loading a VLM.
-            "--language-model-type", "placeholder",
-            "--tokenizer-prompt-format", "mistral",
+            "--language-model-type",
+            "placeholder",
+            "--tokenizer-prompt-format",
+            "mistral",
         ]
         # store_true flags: only inject when the user hasn't expressed a
         # conflicting choice on the CLI.

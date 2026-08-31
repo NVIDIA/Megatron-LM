@@ -68,7 +68,9 @@ async def test_add_request_streaming_emits_partials_then_final():
     assert isinstance(iterator, AsyncStream)
     assert params.streaming is True
     assert 0 in client.streams
-    submit_meta, _ = fake_socket.send_multipart.call_args.args[0]
+    submit_meta, _prompt, block_hashes = fake_socket.send_multipart.call_args.args[0]
+    # No hashes passed, so the frame is present but empty: the coordinator hashes.
+    assert msgpack.unpackb(block_hashes, raw=False) == []
     submit_payload = msgpack.unpackb(submit_meta, raw=False)
     assert submit_payload[0] == Headers.SUBMIT_REQUEST.value
     assert submit_payload[2]["streaming"] is True
