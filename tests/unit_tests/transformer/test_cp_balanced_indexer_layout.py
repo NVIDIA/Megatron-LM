@@ -9,6 +9,7 @@ zigzag layout per-sequence-interleaved (``[seq0 head, seq0 tail, seq1 head, ...]
 These tests pin the two implementations to one canonical layout definition.
 """
 
+import inspect
 import os
 import subprocess
 import sys
@@ -1202,6 +1203,14 @@ def test_fused_multi_offset_packed_layout():
     on the REAL kernel, with tie-free signature data, that a plan's head/tail packed
     calls select exactly the same keys as one full fused reference call."""
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils as _cu
+
+    from cudnn import DSA
+
+    if "q_causal_offsets" not in inspect.signature(DSA.indexer_forward_wrapper).parameters:
+        pytest.skip(
+            "multi-offset fused indexer coverage requires a cuDNN Frontend "
+            "indexer_forward_wrapper with q_causal_offsets support"
+        )
 
     torch.manual_seed(29)
     dev = torch.device("cuda")
