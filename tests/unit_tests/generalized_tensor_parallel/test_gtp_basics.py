@@ -47,6 +47,7 @@ from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
 import megatron.core.tensor_parallel.gtp_cuda_graphs as gtp_cuda_graphs
+import megatron.core.transformer.cuda_graphs as cuda_graphs_module
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
@@ -1602,6 +1603,72 @@ class TestActivationRecomputePhaseFlag:
 
 
 class TestGTPCaptureParamReadiness:
+    def test_wgrad_finalization_registration_matches_hook_calls(self, monkeypatch):
+        hook_calls = []
+
+        class Param:
+            main_grad = torch.empty(2, 3)
+            dtype = torch.float32
+            zero_out_wgrad = False
+
+            def __init__(self):
+                self.chain_id = GTPChain.GRAPHED.value
+                self._grad_accum_hook = lambda: hook_calls.append(self)
+                self.rs_states = []
+
+            def _set_rs_state(self, state):
+                self.rs_states.append(state)
+
+        param = Param()
+        dummy_wgrad = object()
+        monkeypatch.setattr(gtp_module, "get_dummy_wgrad", lambda *args, **kwargs: dummy_wgrad)
+
+        with gtp_cuda_graphs.track_gtp_capture_comms() as capture:
+            assert GTPShardedParam._handle_megatron_grad_accum(param) is dummy_wgrad
+            assert GTPShardedParam._handle_megatron_grad_accum(param) is dummy_wgrad
+            param.chain_id = GTPChain.UNGRAPHED.value
+            assert GTPShardedParam._handle_megatron_grad_accum(param) is dummy_wgrad
+            param._grad_accum_hook = None
+            assert GTPShardedParam._handle_megatron_grad_accum(param) is dummy_wgrad
+
+        assert capture.finalized_params == [param, param]
+        assert hook_calls == [param, param, param]
+        assert param.rs_states == [gtp_module.GTPWeightState.NONE] * 4
+
+    def test_finalize_hook_plan_groups_streams_and_preserves_occurrences(self, monkeypatch):
+        dense_group = object()
+        expert_group = object()
+        pg_collection = type(
+            "ProcessGroups", (), {"gtp_remat": dense_group, "expt_gtp_remat": expert_group}
+        )()
+        monkeypatch.setattr(
+            cuda_graphs_module.ProcessGroupCollection,
+            "use_mpu_process_groups",
+            staticmethod(lambda required_pgs: pg_collection),
+        )
+        monkeypatch.setattr(
+            cuda_graphs_module, "get_rs_stream", lambda chain_id, group: (chain_id, group)
+        )
+
+        class Param:
+            def __init__(self, chain_id, *, allreduce=True):
+                self.chain_id = chain_id
+                self.allreduce = allreduce
+
+        dense = Param(GTPChain.GRAPHED.value)
+        expert = Param(GTPChain.GRAPHED.value, allreduce=False)
+        runner = type("Runner", (), {"gtp_remat": True})()
+
+        cuda_graphs_module._CudaGraphRunner._set_gtp_finalize_hook_plan(
+            runner, [dense, expert, dense]
+        )
+
+        assert runner.finalized_during_bwd_capture == [dense, expert, dense]
+        assert runner._gtp_finalize_hook_plan == [
+            ((GTPChain.GRAPHED.value, dense_group), [dense, dense]),
+            ((GTPChain.GRAPHED.value, expert_group), [expert]),
+        ]
+
     def test_forward_gather_registers_params_before_ensuring_readiness(self, monkeypatch):
         class StopAfterReadiness(Exception):
             pass
