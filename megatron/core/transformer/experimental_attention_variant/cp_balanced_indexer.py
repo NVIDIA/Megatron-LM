@@ -134,6 +134,13 @@ _GRAPH_DYNAMIC_LAYOUT_FIELDS = (
 )
 _GRAPH_DYNAMIC_ROUTE_FIELDS = ("src_slot", "relay_perm", "dst_slot")
 
+# cuDNN Frontend's fused indexer requires each packed-layout tensor pointer to
+# be 16-byte aligned.  A view of a contiguous owner is still contiguous even
+# when its storage offset is unaligned, so the two-buffer ABI must align every
+# logical int32 field explicitly instead of relying on ``Tensor.contiguous()``.
+_GRAPH_DYNAMIC_LAYOUT_ALIGNMENT_BYTES = 16
+_GRAPH_DYNAMIC_LAYOUT_ALIGNMENT_ELEMS = _GRAPH_DYNAMIC_LAYOUT_ALIGNMENT_BYTES // 4
+
 
 def _is_capturing() -> bool:
     """True only while a CUDA stream capture is in progress.
@@ -826,6 +833,57 @@ def _tensor_byte_range(tensor):
     return start, start + tensor.numel() * tensor.element_size()
 
 
+def _align_graph_dynamic_layout_offset(offset):
+    """Round an int32 owner offset up to the fused indexer's alignment."""
+    alignment = _GRAPH_DYNAMIC_LAYOUT_ALIGNMENT_ELEMS
+    return (offset + alignment - 1) // alignment * alignment
+
+
+def _graph_dynamic_layout_numel(cu_entries, l_local):
+    """Return the aligned int32-owner size for ``cu_entries`` and ``l_local``.
+
+    Every field except the final one is padded so the next field starts on a
+    16-byte boundary.  Leaving the final K-entry field unpadded also makes this
+    size strictly increasing in K, allowing host-only schema recovery from the
+    owner shape without reading a CUDA tensor value during graph capture.
+    """
+    half = l_local // 2
+    counts = (
+        cu_entries,
+        half,
+        half,
+        cu_entries + 1,
+        cu_entries + 1,
+        cu_entries,
+        cu_entries,
+        cu_entries + 1,
+        cu_entries,
+    )
+    offset = 0
+    for count in counts[:-1]:
+        offset = _align_graph_dynamic_layout_offset(offset + count)
+    return offset + counts[-1]
+
+
+def _infer_graph_dynamic_cu_entries(layout_numel, l_local):
+    """Recover K from the strictly increasing aligned layout-size contract."""
+    low, high = 2, max(2, layout_numel)
+    while low <= high:
+        candidate = (low + high) // 2
+        candidate_numel = _graph_dynamic_layout_numel(candidate, l_local)
+        if candidate_numel == layout_numel:
+            return candidate
+        if candidate_numel < layout_numel:
+            low = candidate + 1
+        else:
+            high = candidate - 1
+    raise ValueError(
+        "invalid graph-dynamic balanced CP layout buffer length: expected the "
+        "16-byte-aligned two-buffer schema with K >= 2 "
+        f"(L={l_local}, got {layout_numel})"
+    )
+
+
 def _validate_graph_dynamic_cp_rank(cp_rank, cp_size):
     """Validate an optional host-side CP-local rank tag."""
     if cp_rank is not None and (
@@ -875,14 +933,13 @@ def _validate_graph_dynamic_buffers(layout_i32, route_i64, cp_size, l_local, *, 
         raise ValueError(
             "graph-dynamic balanced CP layout and route buffers must not overlap in storage"
         )
-
-    cu_payload = layout_i32.numel() - l_local - 3
-    if cu_payload < 14 or cu_payload % 7 != 0:
+    if layout_start % _GRAPH_DYNAMIC_LAYOUT_ALIGNMENT_BYTES != 0:
         raise ValueError(
-            "invalid graph-dynamic balanced CP layout buffer length: expected "
-            f"L + 7*K + 3 with K >= 2 (L={l_local}, got {layout_i32.numel()})"
+            "graph-dynamic balanced CP layout owner must be 16-byte aligned for the "
+            "fused indexer backend"
         )
-    cu_entries = cu_payload // 7
+
+    cu_entries = _infer_graph_dynamic_cu_entries(layout_i32.numel(), l_local)
     route_rows = _graph_dynamic_route_rows(cp_size, l_local)
     expected_route_numel = 2 * l_local + route_rows + route_padding
     if route_i64.numel() != expected_route_numel:
@@ -899,9 +956,10 @@ def _graph_dynamic_plan_from_buffers(
 ):
     """Validate the two-buffer ABI and reconstruct its logical tensor views.
 
-    The layout buffer length is ``L + 7*K + 3``, where ``K`` is the number of
-    padded-cu entries. The route buffer length is ``2*L + R``. Validation is
-    host-only, so this is safe to use for CUDA graph input reconstruction.
+    The layout buffer stores nine logical fields with 16-byte-aligned starts;
+    ``K`` (the number of padded-cu entries) is recovered from that strictly
+    increasing size contract. The route buffer length is ``2*L + R``.
+    Validation is host-only, so this is safe during CUDA graph reconstruction.
     """
     cu_entries, route_rows = _validate_graph_dynamic_buffers(
         layout_i32, route_i64, cp_size, l_local, route_padding=route_padding
@@ -910,10 +968,12 @@ def _graph_dynamic_plan_from_buffers(
 
     layout_offset = 0
 
-    def _layout_view(count):
+    def _layout_view(count, *, final=False):
         nonlocal layout_offset
         result = layout_i32.narrow(0, layout_offset, count)
         layout_offset += count
+        if not final:
+            layout_offset = _align_graph_dynamic_layout_offset(layout_offset)
         return result
 
     half = l_local // 2
@@ -925,7 +985,7 @@ def _graph_dynamic_plan_from_buffers(
     head_offsets = _layout_view(cu_entries)
     tail_offsets = _layout_view(cu_entries)
     output_cu_q = _layout_view(cu_entries + 1)
-    output_offsets = _layout_view(cu_entries)
+    output_offsets = _layout_view(cu_entries, final=True)
     if layout_offset != layout_i32.numel():
         raise RuntimeError("internal graph-dynamic balanced CP layout schema mismatch")
 
@@ -1023,7 +1083,18 @@ def _pack_graph_dynamic_plan(raw_plan, cp_size, cp_rank, l_local):
     if raw_plan["output_cu_kv"].data_ptr() != raw_plan["score_cu_kv"].data_ptr():
         raise RuntimeError("raw graph-dynamic output_cu_kv must alias score_cu_kv")
 
-    layout_i32 = torch.cat(tuple(raw_plan[name] for name in _GRAPH_DYNAMIC_LAYOUT_FIELDS))
+    layout_parts = []
+    layout_offset = 0
+    for field_index, name in enumerate(_GRAPH_DYNAMIC_LAYOUT_FIELDS):
+        tensor = raw_plan[name]
+        layout_parts.append(tensor)
+        layout_offset += tensor.numel()
+        if field_index + 1 < len(_GRAPH_DYNAMIC_LAYOUT_FIELDS):
+            aligned_offset = _align_graph_dynamic_layout_offset(layout_offset)
+            if aligned_offset != layout_offset:
+                layout_parts.append(tensor.new_zeros(aligned_offset - layout_offset))
+                layout_offset = aligned_offset
+    layout_i32 = torch.cat(tuple(layout_parts))
     route_i64 = torch.cat(tuple(raw_plan[name] for name in _GRAPH_DYNAMIC_ROUTE_FIELDS))
     return _graph_dynamic_plan_from_buffers(
         layout_i32, route_i64, cp_size, l_local, cp_rank=cp_rank
