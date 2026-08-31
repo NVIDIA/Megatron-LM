@@ -1,0 +1,81 @@
+# Inference functional test: GDP (Gated Delta Product) hybrid dynamic inference.
+# H100 counterpart of hybrid_gdp_dynamic_inference_tp1_pp1_dp4_800m; identical
+# model/sampling config, but the h100 recipe leaves GPUS_PER_NODE at its default
+# of 8, so this runs dp8. Loads the synthetic GDP checkpoint (gdp_hybrid_800m).
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+  TRITON_CACHE_AUTOTUNING: 0
+  MAMBA_DETERMINISTIC: 1
+TEST_TYPE: frozen-start
+MODE: inference
+MODEL_ARGS:
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --timing-log-level: 0
+  --load: ${CHECKPOINT_LOAD_PATH}/model/gdp_hybrid_800m/dcp/mcore-v1_bf16/checkpoint
+  --tokenizer-model: ${CHECKPOINT_LOAD_PATH}/model/gdp_hybrid_800m/dcp/mcore-v1_bf16/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+  --tokenizer-type: TikTokenizer
+  --tiktoken-pattern: v2
+  --distributed-backend: nccl
+  --log-interval: 1
+  --transformer-impl: transformer_engine
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --expert-model-parallel-size: 1
+  --use-mcore-models: true
+  --model-provider: hybrid
+  --untie-embeddings-and-output-weights: true
+  --disable-bias-linear: true
+  --init-method-std: 0.02
+  --position-embedding-type: none
+  --hidden-size: 1024
+  --ffn-hidden-size: 4096
+  --swiglu: true
+  --num-attention-heads: 16
+  --group-query-attention: true
+  --num-query-groups: 8
+  --mamba-num-heads: 32
+  --hybrid-layer-pattern: M-M-M--M-*M-M-M-M--*M-M-M-M-*M--M-M-M-*M-M--M-M-
+  --spec: megatron.core.models.hybrid.hybrid_layer_specs gdp_stack_spec
+  --normalization: RMSNorm
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --seq-length: 4096
+  --max-position-embeddings: 4096
+  --micro-batch-size: 1
+  --ckpt-format: torch_dist
+  --ckpt-fully-parallel-save: true
+  --ckpt-fully-parallel-load: true
+  --ckpt-assume-constant-structure: true
+  --dist-ckpt-strictness: log_unexpected
+  --bf16: true
+  --attention-backend: flash
+  --no-create-attention-mask-in-dataloader: true
+  --num-workers: 8
+  --use-checkpoint-args: true
+  --no-use-tokenizer-model-from-checkpoint-args: true
+  --no-load-optim: true
+  --deterministic-mode: true
+  --save-interval: 2000
+  --temperature: 1.0
+  --top_k: 1
+  --return-log-probs: true
+  --num-tokens-to-generate: 30
+  --max-tokens-to-oom: 3600000
+  --inference-max-seq-length: 4096
+  --output-path: ${INFERENCE_OUTPUT_PATH}
+  --prompts: "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies."
+  --incoming-requests-per-step: 32
+  --inference-repeat-n: 3
+  --no-record-throughput: true
+  --mamba-inference-conv-states-dtype: fp32
+  --mamba-inference-ssm-states-dtype: fp32
+METRICS:
+  - "generated_tokens"
+  - "logprobs"
+LAUNCHER: ft_launcher

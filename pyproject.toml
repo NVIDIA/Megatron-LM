@@ -217,7 +217,7 @@ requires-dist = []
 
 [[tool.uv.dependency-metadata]]
 name = "transformer-engine"
-version = "2.17.1+4329ff84"
+version = "2.18.0+27486e03"
 requires-dist = [
     # Cap below 2.14: pydantic 2.14 breaks langchain_core's module-level
     # RunnablePassthrough() instantiation, which is imported transitively in
@@ -230,6 +230,7 @@ requires-dist = [
     "onnxscript",
     "onnx",
     "nvdlfw-inspect",
+    "nvidia-cudnn-frontend>=1.25.0",
 ]
 
 [[tool.uv.dependency-metadata]]
@@ -243,7 +244,7 @@ flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "nv_dev" },
 ]
 deep_gemm = { git = "https://github.com/deepseek-ai/DeepGEMM.git", rev = "714dd1a4a980f7937a74343d19a8eba4fe321480" }
-transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "4329ff84bfbdaa778a33cba02a15fb0807c64689" }
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "27486e03cfc1fa41f6932dcecdc47c71c47eac3e" }
 nemo-run = { git = "https://github.com/NVIDIA-NeMo/Run.git", rev = "e3935393a290aed1822af52139b4b8ee270fed1f" }
 emerging_optimizers = { git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git", rev = "v0.3.0" }
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", rev = "f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" }

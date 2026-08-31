@@ -121,7 +121,7 @@ CLI flags below are verified to exist in `megatron/training/arguments.py` and/or
 | Family | Features |
 |---|---|
 | Hybrid (Mamba+Attn) | `--mamba-inference-conv-states-dtype`, `--mamba-inference-ssm-states-dtype`, mamba chunk size |
-| MoE | `--moe-enable-routing-replay` (router replay), `--moe-grouped-gemm`, `--moe-token-dispatcher-type` |
+| MoE | `--moe-enable-routing-replay` (router replay; requires `--inference-dynamic-batching-async-sched-mode legacy`), `--moe-grouped-gemm`, `--moe-token-dispatcher-type` |
 
 ---
 

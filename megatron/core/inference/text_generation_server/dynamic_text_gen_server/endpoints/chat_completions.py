@@ -720,6 +720,9 @@ try:
         parsers = current_app.config['parsers']
 
         req = await request.get_json()
+        prevent_retokenization = req.get(
+            "prevent_retokenization", not current_app.config.get('eval_mode', False)
+        )
         tools = req.get("tools", None)
         tool_choice = req.get("tool_choice", None)
         parallel_tool_calls = req.get("parallel_tool_calls", True)
@@ -801,7 +804,7 @@ try:
                         )
                     )
 
-                if req.get("prevent_retokenization", True):
+                if prevent_retokenization:
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
                     # This improves prefix cache hits and reduces logprob variation between training and inference.
 
@@ -902,9 +905,13 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(_get_non_none(req, "temperature", 1.0))
-            top_p = float(_get_non_none(req, "top_p", 1.0))
-            top_k = int(_get_non_none(req, "top_k", 0))
+            temperature = float(
+                _get_non_none(
+                    req, "temperature", current_app.config.get('default_temperature', 1.0)
+                )
+            )
+            top_p = float(_get_non_none(req, "top_p", current_app.config.get('default_top_p', 1.0)))
+            top_k = int(_get_non_none(req, "top_k", current_app.config.get('default_top_k', 0)))
             n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
 
             if temperature == 0.0:
@@ -937,7 +944,6 @@ try:
             # engine need to keep the prompt_tokens tensor on the response payload.
             # return_tokenized_data (implied by prevent_retokenization) needs the ids;
             # return_raw_text needs the ids to detokenize the prompt into raw_text.
-            prevent_retokenization = req.get("prevent_retokenization", True)
             return_tokenized_data = (
                 req.get("return_tokenized_data", False) or prevent_retokenization
             )

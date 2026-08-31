@@ -126,9 +126,9 @@ class InferenceSetupConfig:
     inference_dynamic_batching_cuda_graph_mixed_prefill_count: int = 16
     """Number of mixed prefill requests to capture in a cuda graph."""
 
-    inference_dynamic_batching_cuda_graph_sizing_distribution: Literal["exponential", "linear"] = (
-        "exponential"
-    )
+    inference_dynamic_batching_cuda_graph_sizing_distribution: Literal[
+        "exponential", "linear", "hybrid"
+    ] = "hybrid"
     """Spacing of CUDA graph token counts. "exponential" (default) halves from cuda_graph_max_tokens
     down to tp_size, giving a log-spaced distribution with bounded relative padding. "linear" uses
     varying linear strides across the range."""
@@ -142,10 +142,10 @@ class InferenceSetupConfig:
     generation seed. Disable with --use-same-sampling-seed-across-dp-ranks. Also forced off when
     --deterministic-mode is enabled."""
 
-    inference_dynamic_batching_async_sched_mode: Literal["legacy", "async"] = "legacy"
-    """Async scheduling mode for dynamic batching. "legacy" (default) preserves the
-    existing resolve-before-prepare path. "async" overlaps asynchronous scheduling phases by
-    reordering them to prepare-before-resolve."""
+    inference_dynamic_batching_async_sched_mode: Literal["async", "legacy"] = "async"
+    """Async scheduling mode for dynamic batching. "async" (default) overlaps asynchronous
+    scheduling phases by reordering them to prepare-before-resolve. Select "legacy" to disable
+    async scheduling and use the resolve-before-prepare path."""
 
     inference_dynamic_batching_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
         "raw_logprobs"

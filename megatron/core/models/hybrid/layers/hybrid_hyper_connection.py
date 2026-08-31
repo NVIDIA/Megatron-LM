@@ -7,6 +7,7 @@ from torch import Tensor
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
@@ -55,6 +56,7 @@ class HyperConnectionHybridLayer(MegatronModule):
         rotary_pos_emb: Optional[Tensor],
         sequence_len_offset: Optional[Tensor],
         packed_seq_params: Optional[PackedSeqParams],
+        packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata],
         padding_mask: Optional[Tensor],
     ) -> Tuple[Tensor, Optional[Tensor]]:
         if isinstance(self.inner_layer, TransformerLayer):
@@ -69,11 +71,15 @@ class HyperConnectionHybridLayer(MegatronModule):
             )
         else:
             # Mamba-like layers only consume the common HybridStack arguments.
+            extra_kwargs = {}
+            if packed_sequence_cp_metadata is not None:
+                extra_kwargs["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
             output = self.inner_layer(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
                 packed_seq_params=packed_seq_params,
+                **extra_kwargs,
             )
 
         if isinstance(output, tuple):
@@ -149,6 +155,7 @@ class HyperConnectionHybridLayer(MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
+        packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata] = None,
         mhc_recompute_manager=None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update."""
@@ -173,6 +180,7 @@ class HyperConnectionHybridLayer(MegatronModule):
                 rotary_pos_emb,
                 sequence_len_offset,
                 packed_seq_params,
+                packed_sequence_cp_metadata,
                 padding_mask,
             )
             if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:

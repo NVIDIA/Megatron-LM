@@ -38,7 +38,10 @@ def add_convert_args(parser):
     """Add additional arguments for ModelOpt checkpoint convertion."""
     group = parser.add_argument_group(title='ModelOpt MCore checkpoint convertion')
     group.add_argument(
-        "--pretrained-model-path", type=str, default=None, help="HuggingFace pretrained model"
+        "--pretrained-model-path",
+        type=str,
+        default=None,
+        help="Deprecated: Hugging Face pretrained model. Use Megatron-Bridge to import checkpoints.",
     )
     group.add_argument(
         "--extra-model-path", type=str, default=None, help="Extra module weights to load"
@@ -132,6 +135,14 @@ if __name__ == "__main__":
     unwrapped_model = unwrap_model(model)[0]
 
     if args.pretrained_model_path is not None:
+        warnings.warn(
+            "Importing Hugging Face checkpoints with --pretrained-model-path is deprecated. "
+            "Use Megatron-Bridge to create a Megatron-Core checkpoint, then load it with --load. "
+            "For Hugging Face quantization workflows, see "
+            "https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/quantization.",
+            FutureWarning,
+            stacklevel=2,
+        )
         import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")

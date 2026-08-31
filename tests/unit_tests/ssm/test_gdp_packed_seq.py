@@ -1,9 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""GDP v4 packed-sequence + context-parallel equivalence tests.
+"""GDP v4 context-parallel equivalence tests.
 
 Verifies that ``GatedDeltaProductMixer`` (v4) produces forward outputs and
-parameter gradients under ``cp_size=2`` that match a ``cp_size=1`` reference
+parameter gradients under context parallelism that match a ``cp_size=1`` reference
 run on the same packed (THD/SFT-format) input.
 
 Style mirrors ``test_mamba_context_parallel.py``: ``Utils.initialize_model_parallel``,
@@ -31,12 +31,14 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.ssm.gated_delta_product import (
     GatedDeltaProductMixer,
     GatedDeltaProductMixerSubmodules,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import is_causal_conv1d_min_version
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -104,10 +106,11 @@ def _make_packed_seq_params(seq_lens: List[int]) -> PackedSeqParams:
         cu_seqlens_kv_padded=None,
         max_seqlen_q=total,
         max_seqlen_kv=total,
+        total_tokens=total,
     )
 
 
-def _make_config(cp_size: int) -> TransformerConfig:
+def _make_config(cp_size: int, linear_cp_mode: str = "headwise") -> TransformerConfig:
     """Small-but-shape-valid TransformerConfig for the v4 GDP mixer."""
     return TransformerConfig(
         num_layers=1,
@@ -124,12 +127,14 @@ def _make_config(cp_size: int) -> TransformerConfig:
         tensor_model_parallel_size=1,
         sequence_parallel=False,
         context_parallel_size=cp_size,
+        linear_cp_mode=linear_cp_mode,
+        linear_cp_layout="contiguous" if linear_cp_mode == "chunkwise" else "zigzag",
     )
 
 
-def _build_mixer(cp_group):
+def _build_mixer(cp_group, linear_cp_mode: str = "headwise"):
     """Construct a v4 GDP mixer wired to the given CP group."""
-    config = _make_config(cp_group.size())
+    config = _make_config(cp_group.size(), linear_cp_mode=linear_cp_mode)
     pg = ProcessGroupCollection(tp=parallel_state.get_tensor_model_parallel_group(), cp=cp_group)
     submodules = GatedDeltaProductMixerSubmodules(
         in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
@@ -151,10 +156,10 @@ def _sync_weights_from_rank0(mixer):
         torch.distributed.broadcast(p.data, src=0)
 
 
-def _build_cp_pair():
-    """Build CP=2 + per-rank CP=1 reference mixers with identical weights.
+def _build_cp_pair(linear_cp_mode: str = "headwise"):
+    """Build a CP mixer and per-rank CP=1 reference mixers with identical weights.
 
-    Returns ``(mixer_cp2, mixer_cp1, config, cp_group, cp_rank)``. The cp=1
+    Returns ``(mixer_cp, mixer_cp1, config, cp_group, cp_rank)``. The cp=1
     instance lives in a 1-rank subgroup (containing only this rank), so the
     same mixer code path runs in cp=1 mode and provides a numerical reference.
     """
@@ -166,17 +171,17 @@ def _build_cp_pair():
     cp1_groups = [torch.distributed.new_group(ranks=[r]) for r in range(world_size)]
     cp1_group = cp1_groups[global_rank]
 
-    mixer_cp2, _ = _build_mixer(cp_group)
-    mixer_cp1, config = _build_mixer(cp1_group)
-    _sync_weights_from_rank0(mixer_cp2)
-    mixer_cp1.load_state_dict(mixer_cp2.state_dict())
-    return mixer_cp2, mixer_cp1, config, cp_group, cp_rank
+    mixer_cp, _ = _build_mixer(cp_group, linear_cp_mode=linear_cp_mode)
+    mixer_cp1, config = _build_mixer(cp1_group, linear_cp_mode=linear_cp_mode)
+    _sync_weights_from_rank0(mixer_cp)
+    mixer_cp1.load_state_dict(mixer_cp.state_dict())
+    return mixer_cp, mixer_cp1, config, cp_group, cp_rank
 
 
 def _make_hidden_packed(seq_lens, hidden_size):
     """Build a packed [total_tokens, 1, hidden] input + matching PackedSeqParams.
 
-    The tensor is broadcast from rank 0 so cp=1 reference and cp=2 sliced
+    The tensor is broadcast from rank 0 so the CP=1 reference and CP-sliced
     paths see bit-identical input.
     """
     psp = _make_packed_seq_params(seq_lens)
@@ -185,6 +190,67 @@ def _make_hidden_packed(seq_lens, hidden_size):
     hidden_full = torch.randn(total_tokens, 1, hidden_size, device="cuda", dtype=torch.bfloat16)
     torch.distributed.broadcast(hidden_full, src=0)
     return hidden_full, psp
+
+
+def _assert_chunkwise_equivalence(
+    mixer_cp, mixer_reference, cp_group, cp_rank, hidden_full, packed_seq_params=None
+):
+    """Compare one contiguous-CP GDP forward/backward against a full-sequence reference."""
+    mixer_cp.eval()
+    mixer_reference.eval()
+    for parameter in mixer_reference.parameters():
+        parameter.grad = None
+    for parameter in mixer_cp.parameters():
+        parameter.grad = None
+
+    local_sequence_length = hidden_full.shape[0] // cp_group.size()
+    local_slice = slice(cp_rank * local_sequence_length, (cp_rank + 1) * local_sequence_length)
+
+    reference_input = hidden_full.detach().clone().requires_grad_(True)
+    reference_output = mixer_reference(reference_input, packed_seq_params=packed_seq_params)[0]
+    reference_loss = reference_output.float().square().sum()
+    reference_loss.backward()
+
+    local_input = hidden_full[local_slice].detach().clone().requires_grad_(True)
+    packed_sequence_cp_metadata = None
+    if packed_seq_params is not None:
+        packed_sequence_cp_metadata = build_packed_sequence_cp_metadata(
+            packed_seq_params.seq_idx, cp_rank=cp_rank, cp_size=cp_group.size()
+        )
+    local_output = mixer_cp(
+        local_input,
+        packed_seq_params=packed_seq_params,
+        packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+    )[0]
+    local_loss = local_output.float().square().sum()
+    local_loss.backward()
+
+    reference_parameters = dict(mixer_reference.named_parameters())
+    local_parameters = dict(mixer_cp.named_parameters())
+    reduced_gradients = []
+    for name, local_parameter in local_parameters.items():
+        local_grad = local_parameter.grad
+        reference_parameter = reference_parameters.get(name)
+        reference_grad = None if reference_parameter is None else reference_parameter.grad
+        reduced_grad = (
+            torch.zeros_like(local_parameter)
+            if local_grad is None
+            else local_grad.clone().contiguous()
+        )
+        torch.distributed.all_reduce(reduced_grad, group=cp_group)
+        reduced_gradients.append((name, local_grad, reference_grad, reduced_grad))
+
+    torch.testing.assert_close(local_output, reference_output[local_slice], atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(
+        local_input.grad, reference_input.grad[local_slice], atol=8e-2, rtol=8e-2
+    )
+    assert set(reference_parameters) == set(local_parameters)
+    for name, local_grad, reference_grad, reduced_grad in reduced_gradients:
+        if local_grad is None and reference_grad is None:
+            continue
+        assert local_grad is not None, f"chunkwise CP has no gradient for {name}"
+        assert reference_grad is not None, f"reference has no gradient for {name}"
+        torch.testing.assert_close(reduced_grad, reference_grad, atol=8e-2, rtol=8e-2)
 
 
 @pytest.mark.internal
@@ -196,7 +262,7 @@ def _make_hidden_packed(seq_lens, hidden_size):
 @pytest.mark.skipif(not HAVE_MAMBA_DEPS, reason="GDP mixer requires mamba_ssm + einops")
 @pytest.mark.skipif(not HAVE_FLA, reason="GDP mixer requires fla")
 class TestGDPPackedSequence:
-    """v4 GDP forward + backward equivalence under CP=2 with packed (THD) input."""
+    """v4 GDP forward + backward equivalence under CP=2."""
 
     @pytest.fixture(autouse=True)
     def setup_method(self):
@@ -318,3 +384,63 @@ class TestGDPPackedSequence:
             + "\n".join(f"  {n} {s}: {m}" for n, s, m in mismatches)
         )
         assert n_compared > 0, "no parameters received a gradient — test setup is wrong"
+
+    @pytest.mark.parametrize("packed", [False, True], ids=["blh", "thd"])
+    def test_chunkwise_forward_and_backward_equivalence(self, packed):
+        """Contiguous GDP CP matches a full-sequence FLA run for BLH and THD."""
+        if packed and not is_causal_conv1d_min_version("1.7.0"):
+            pytest.skip("THD CP causal convolution requires causal-conv1d >= 1.7.0")
+        mixer_cp, mixer_reference, config, cp_group, cp_rank = _build_cp_pair(
+            linear_cp_mode="chunkwise"
+        )
+        if packed:
+            hidden_full, packed_seq_params = _make_hidden_packed([20, 28], config.hidden_size)
+        else:
+            packed_seq_params = None
+            torch.manual_seed(0)
+            hidden_full = torch.randn(
+                48, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16
+            )
+            torch.distributed.broadcast(hidden_full, src=0)
+
+        _assert_chunkwise_equivalence(
+            mixer_cp, mixer_reference, cp_group, cp_rank, hidden_full, packed_seq_params
+        )
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA + NCCL")
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 4 if torch.cuda.is_available() else True,
+    reason="CP=4 test requires at least 4 GPUs",
+)
+@pytest.mark.skipif(_WORLD_SIZE < 4, reason="CP=4 test requires at least 4 distributed ranks")
+@pytest.mark.skipif(not HAVE_MAMBA_DEPS, reason="GDP mixer requires mamba_ssm + einops")
+@pytest.mark.skipif(not HAVE_FLA, reason="GDP mixer requires fla")
+@pytest.mark.skipif(
+    not is_causal_conv1d_min_version("1.7.0"),
+    reason="THD CP causal convolution requires causal-conv1d >= 1.7.0",
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([10, 44, 10], id="spans-all-ranks"),
+        pytest.param([16, 16, 32], id="truncated-summary-slices"),
+    ],
+)
+def test_chunkwise_thd_forward_and_backward_equivalence(seq_lens):
+    """Verify CP=4 THD matches CP=1 for full-span and truncated summary slices."""
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=4
+    )
+    try:
+        model_parallel_cuda_manual_seed(123)
+        mixer_cp, mixer_reference, config, cp_group, cp_rank = _build_cp_pair(
+            linear_cp_mode="chunkwise"
+        )
+        hidden_full, packed_seq_params = _make_hidden_packed(seq_lens, config.hidden_size)
+        _assert_chunkwise_equivalence(
+            mixer_cp, mixer_reference, cp_group, cp_rank, hidden_full, packed_seq_params
+        )
+    finally:
+        Utils.destroy_model_parallel()

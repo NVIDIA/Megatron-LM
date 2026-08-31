@@ -288,6 +288,7 @@ def _needs_mxfp8_conversion(model) -> bool:
     config = lm.config
     return (
         getattr(config, 'transformer_impl', None) == 'inference_optimized'
+        and bool(getattr(config, 'fp8', None))
         and getattr(config, 'fp8_recipe', None) == 'mxfp8'
     )
 
@@ -322,7 +323,10 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
         if _should_quantize_param(param):
             convertible.add(f"decoder.{name}")
 
-    # 2. Quantize decoder weights → persistent MXFP8Tensor buffers.
+    # 2. Quantize decoder weights -> persistent MXFP8Tensor buffers.
+    # Routed FlashInfer MoE weights are derived from MCore's canonical Triton/cublas
+    # representation. The reshard transform updates those canonical buffers, then
+    # refresh_flashinfer_mxfp8_weights refreshes the derived buffers in place.
     backend = resolve_mxfp8_backend(lm.config.inference_grouped_gemm_backend)
     persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
 
@@ -350,17 +354,16 @@ def prepare_swap_model_weights(
     same module-level cache as swap_model_weights, so subsequent calls reuse it
     without needing to inspect named_parameters() again.
 
-    If the *target_model* uses an inference-optimized layer spec with MXFP8
-    (``config.transformer_impl == 'inference_optimized'`` and
-    ``config.fp8_recipe == 'mxfp8'``), this function also:
+    If the target_model uses an inference-optimized layer spec with MXFP8
+    (config.transformer_impl == 'inference_optimized' and
+    config.fp8 is not None and config.fp8_recipe == 'mxfp8'), this function also:
       - computes which parameters are eligible for MXFP8 conversion,
       - quantizes the target decoder weights to persistent MXFP8Tensor buffers
         (whose addresses are later baked into CUDA graphs),
-      - creates an ``MXFP8ReshardTransform`` that subsequent
-        ``swap_model_weights`` calls use automatically.
+      - creates an MXFP8ReshardTransform that subsequent
+        swap_model_weights calls use automatically.
 
-    Callers do **not** need to know about MXFP8 — the transform is created and
-    cached transparently.
+    Callers do not need to know about MXFP8; the transform is created and cached transparently.
 
     All participating ranks must call this simultaneously — the plan builder uses
     collective communication internally.
@@ -581,3 +584,13 @@ def reshard_model_weights(
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform
     )
+    if tgt_core is not None and isinstance(transform, MXFP8ReshardTransform):
+        refreshed = False
+        for module in tgt_core.modules():
+            refresh = getattr(module, "refresh_flashinfer_mxfp8_weights", None)
+            if refresh is not None:
+                refreshed = bool(refresh()) or refreshed
+        if refreshed:
+            # Repacking is asynchronous. Synchronize before another stream replays graphs
+            # that read these derived weight buffers.
+            torch.cuda.synchronize()

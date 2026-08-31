@@ -11,6 +11,7 @@ import torch
 from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_routed_mxfp8
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
@@ -377,6 +378,9 @@ class MoELayer(BaseMoELayer):
                     "Install flashinfer-python or set "
                     "inference_grouped_gemm_backend to 'torch' or 'vllm'."
                 )
+                fp8_recipe = getattr(config.fp8_recipe, "value", config.fp8_recipe)
+                if config.fp8 and fp8_recipe == "mxfp8":
+                    require_flashinfer_routed_mxfp8()
 
                 # Verify that pre-compiled FlashInfer CUTLASS kernels are available
                 # when using the FlashInfer backend. The flashinfer-jit-cache package

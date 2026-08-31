@@ -400,7 +400,7 @@ def set_model_to_sequence_parallel(model, set_to=False, exclude_modules=None):
     if _sequence_parallel_attr_cache is None or model_id not in _sequence_parallel_attr_cache:
         _init_sequence_parallel_cache(model, exclude_modules)
 
-    model.config.sequence_parallel = set_to
+    set_model_config_attribute(model, "sequence_parallel", set_to)
 
     # Set all cached attributes to desired value
     for attr, modules in _sequence_parallel_attr_cache[model_id].items():
@@ -484,7 +484,7 @@ def toggle_cuda_graphs(model, set_to="none"):
         init_cuda_graph_cache(model)
 
     assert set_to in ["none", "local"], f"Invalid CUDA graph implementation: {set_to}"
-    model.config.cuda_graph_impl = set_to
+    set_model_config_attribute(model, "cuda_graph_impl", set_to)
 
     # Collect all modules that have any of the CUDA graph attributes
     for attribute, modules in cuda_graph_attr_cache[model_id].items():

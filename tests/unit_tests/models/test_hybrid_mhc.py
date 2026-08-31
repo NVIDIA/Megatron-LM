@@ -134,8 +134,11 @@ class TestHybridStackMHC:
         stack = _get_stack(config, num_local_layers=3)
 
         assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in stack.layers)
-        assert all(layer.inner_layer.config is config for layer in stack.layers)
-        assert all(layer.inner_layer.config.enable_mhc_connections for layer in stack.layers)
+        assert all(
+            layer.config is layer_config and layer.inner_layer.config is layer_config
+            for layer, layer_config in zip(stack.layers, stack.layer_config_list, strict=True)
+        )
+        assert all(layer_config.enable_mhc_connections for layer_config in stack.layer_config_list)
         assert stack.hc_head_fn.shape == (
             config.mhc_num_residual_streams,
             config.hidden_size * config.mhc_num_residual_streams,

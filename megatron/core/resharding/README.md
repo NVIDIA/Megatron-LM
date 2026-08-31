@@ -187,8 +187,8 @@ work; this module does not currently add or remove ranks from a running group.
 ## MXFP8 Transform
 
 When the target model uses `transformer_impl='inference_optimized'` with
-`fp8_recipe='mxfp8'`, an `MXFP8ReshardTransform` is automatically created
-and attached to the cached plan.
+FP8 enabled and `fp8_recipe='mxfp8'`, an `MXFP8ReshardTransform` is
+automatically created and attached to the cached plan.
 
 The transform handles two scale layouts:
 

@@ -593,13 +593,14 @@ class TestChunkedPrefillCudaGraphs:
             ("baseline", baseline_snapshots, baseline_prefill_steps),
             ("chunked", chunked_snapshots, chunked_prefill_steps),
         ):
-            # The first generated token comes out of the final prefill step, so
-            # the rest cost one decode step each. Checked rather than assumed: a
-            # different prompt split would otherwise leave the comparison below
-            # on two decode-step snapshots, which match no matter what.
-            assert len(snapshots) == prefill_steps + num_tokens_to_generate - 1, (
+            # Async scheduling launches the first prefill as a primer-only step,
+            # then resolves each generated token in a subsequent step. Checked
+            # rather than assumed: a different prompt split would otherwise leave
+            # the comparison below on two decode-step snapshots, which match no
+            # matter what.
+            assert len(snapshots) == prefill_steps + num_tokens_to_generate, (
                 f"{name}: expected {prefill_steps} prefill steps and "
-                f"{num_tokens_to_generate - 1} decode steps, got {len(snapshots)} steps"
+                f"{num_tokens_to_generate} sampling steps, got {len(snapshots)} steps"
             )
 
         baseline_conv = baseline_snapshots[baseline_prefill_steps - 1]
