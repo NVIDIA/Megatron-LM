@@ -1679,35 +1679,13 @@ class TestGraphDynamicRouteMetadataArena:
                 is_first_microbatch=False,
             ):
                 del is_first_microbatch
-                # Keep this signal bitwise deterministic across independently captured graph
-                # slots. CUDA reductions are allowed to choose a different reduction schedule,
-                # which would make the cross-slot replay assertion test reduction ordering
-                # instead of the fixed-address route-metadata contract.
-                layout = dsa_cp_graph_layout_buffer.to(hidden_states.dtype)
-                route = dsa_cp_graph_route_buffer.to(hidden_states.dtype)
-                cu_q = cu_seqlens_q.to(hidden_states.dtype)
-                cu_kv = cu_seqlens_kv.to(hidden_states.dtype)
-                cu_q_padded = cu_seqlens_q_padded.to(hidden_states.dtype)
-                cu_kv_padded = cu_seqlens_kv_padded.to(hidden_states.dtype)
                 signal = (
-                    (layout[0] + 2 * layout[1] + 3 * layout[2] + 4 * layout[3]) * 0.01
-                    + (route[0] + 2 * route[1] + 3 * route[2] + 4 * route[3]) * 0.001
-                    + (cu_q[0] + 2 * cu_q[1] + 3 * cu_q[2] + 4 * cu_q[3]) * 0.0001
-                    + (cu_kv[0] + 2 * cu_kv[1] + 3 * cu_kv[2] + 4 * cu_kv[3]) * 0.0001
-                    + (
-                        cu_q_padded[0]
-                        + 2 * cu_q_padded[1]
-                        + 3 * cu_q_padded[2]
-                        + 4 * cu_q_padded[3]
-                    )
-                    * 0.0001
-                    + (
-                        cu_kv_padded[0]
-                        + 2 * cu_kv_padded[1]
-                        + 3 * cu_kv_padded[2]
-                        + 4 * cu_kv_padded[3]
-                    )
-                    * 0.0001
+                    dsa_cp_graph_layout_buffer[:4].to(hidden_states.dtype).sum() * 0.01
+                    + dsa_cp_graph_route_buffer[:4].to(hidden_states.dtype).sum() * 0.001
+                    + cu_seqlens_q.to(hidden_states.dtype).sum() * 0.0001
+                    + cu_seqlens_kv.to(hidden_states.dtype).sum() * 0.0001
+                    + cu_seqlens_q_padded.to(hidden_states.dtype).sum() * 0.0001
+                    + cu_seqlens_kv_padded.to(hidden_states.dtype).sum() * 0.0001
                 )
                 return hidden_states * (self.gain + signal * 0.001) + self.bias * signal * 0.01
 
@@ -1765,6 +1743,14 @@ class TestGraphDynamicRouteMetadataArena:
         )
         source_ptrs = tuple(tuple(owner.data_ptr() for owner in pair) for pair in source_pairs)
         source_snapshots = tuple(tuple(owner.clone() for owner in pair) for pair in source_pairs)
+        cu_names = ("cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded", "cu_seqlens_kv_padded")
+        source_cu_ptrs = tuple(
+            tuple(getattr(packed, name).data_ptr() for name in cu_names) for packed in source_packs
+        )
+        source_cu_snapshots = tuple(
+            tuple(getattr(packed, name).clone() for name in cu_names) for packed in source_packs
+        )
+        source_cu_ptr_set = {ptr for ptrs in source_cu_ptrs for ptr in ptrs}
 
         sample_args = tuple(
             (torch.full((8, 4), 0.125 * (sample_idx + 1), device="cuda", requires_grad=True),)
@@ -1772,15 +1758,21 @@ class TestGraphDynamicRouteMetadataArena:
         )
         sample_kwargs = [
             {
-                "cu_seqlens_q": source_packs[0].cu_seqlens_q,
-                "cu_seqlens_kv": source_packs[0].cu_seqlens_kv,
-                "cu_seqlens_q_padded": source_packs[0].cu_seqlens_q_padded,
-                "cu_seqlens_kv_padded": source_packs[0].cu_seqlens_kv_padded,
+                # TE uses sample tensors as mutable static replay surfaces. Keep capture
+                # inputs disjoint from runtime pack metadata, whose ownership stays with the
+                # data pipeline and must survive later graph-input copies unchanged.
+                "cu_seqlens_q": source_packs[0].cu_seqlens_q.clone(),
+                "cu_seqlens_kv": source_packs[0].cu_seqlens_kv.clone(),
+                "cu_seqlens_q_padded": source_packs[0].cu_seqlens_q_padded.clone(),
+                "cu_seqlens_kv_padded": source_packs[0].cu_seqlens_kv_padded.clone(),
                 "dsa_cp_graph_layout_buffer": source_pairs[0][0],
                 "dsa_cp_graph_route_buffer": source_pairs[0][1],
             }
             for _ in range(4)
         ]
+        capture_cu_ptrs = {kwargs[name].data_ptr() for kwargs in sample_kwargs for name in cu_names}
+        assert len(capture_cu_ptrs) == len(sample_kwargs) * len(cu_names)
+        assert capture_cu_ptrs.isdisjoint(source_cu_ptr_set)
         route_arenas = helper._canonicalize_graph_dynamic_route_inputs(sample_kwargs)
 
         graphed = ()
@@ -1810,6 +1802,9 @@ class TestGraphDynamicRouteMetadataArena:
 
         try:
             assert len(graphed) == 4
+            assert {
+                kwargs[name].data_ptr() for kwargs in sample_kwargs for name in cu_names
+            }.isdisjoint(source_cu_ptr_set)
             helper._attach_graph_dynamic_route_arenas(sample_kwargs, route_arenas)
             arenas = block._te_cuda_graph_route_metadata_arenas
             assert tuple(pair[1].numel() for pair in arenas) == (
@@ -1878,6 +1873,10 @@ class TestGraphDynamicRouteMetadataArena:
                 staged = block._stage_te_cuda_graph_route_metadata(source)
                 staged_pair = cp_balanced_indexer.get_graph_dynamic_plan_buffers(staged)
                 assert tuple(owner.data_ptr() for owner in staged_pair) == arena_ptrs[slot]
+                torch.testing.assert_close(staged_pair[0], source_pair[0], rtol=0, atol=0)
+                torch.testing.assert_close(
+                    staged_pair[1][:logical_route_numel], source_pair[1], rtol=0, atol=0
+                )
                 assert tuple(owner._version for owner in arenas[slot]) == tuple(
                     version + 1 for version in selected_versions
                 )
@@ -1960,6 +1959,16 @@ class TestGraphDynamicRouteMetadataArena:
                 for actual_pair, expected_pair in zip(source_pairs, source_snapshots):
                     for actual, expected in zip(actual_pair, expected_pair):
                         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                assert (
+                    tuple(
+                        tuple(getattr(packed, name).data_ptr() for name in cu_names)
+                        for packed in source_packs
+                    )
+                    == source_cu_ptrs
+                )
+                for packed, expected_pack in zip(source_packs, source_cu_snapshots):
+                    for name, expected in zip(cu_names, expected_pack):
+                        torch.testing.assert_close(getattr(packed, name), expected, rtol=0, atol=0)
 
                 if pack_idx in first_outputs:
                     torch.testing.assert_close(
