@@ -654,6 +654,9 @@ def validate_args(args, defaults={}):
     _normalize_cuda_graph_modules_args(args)
     _normalize_inference_cuda_graph_scope_arg(args)
     assert (
+        not args.cuda_graph_coalesce_partial_captures or args.cuda_graph_impl == "local"
+    ), "--cuda-graph-coalesce-partial-captures requires --cuda-graph-impl=local."
+    assert (
         args.inference_cuda_graph_scope
         in ALLOWED_INFERENCE_SCOPES[args.cuda_graph_impl]
     ), (

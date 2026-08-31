@@ -334,6 +334,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         add_layer_offset: bool = True,
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
+        create_cudagraph_manager: bool = True,
     ):
         """
         Args:
@@ -344,7 +345,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Dense layers need a default before that hook runs, while MoETransformerLayer sets this
         # to True before entering this constructor.
         self.is_moe_layer = getattr(self, "is_moe_layer", False)
-        super().__init__(config=config, vp_stage=vp_stage)
+        super().__init__(
+            config=config, vp_stage=vp_stage, create_cudagraph_manager=create_cudagraph_manager
+        )
 
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -2096,12 +2099,14 @@ class MoETransformerLayer(TransformerLayer):
             return False
         return super()._should_call_local_cudagraph(*args, **kwargs)
 
-    def transition_cudagraph_scope(self, mode):
+    def transition_cudagraph_scope(self, mode, *, create_managers=True):
         """Transition between full-layer and partial CUDA graph capture.
 
         Args:
             mode: 'full' for inference (full-layer capture) or 'partial' for training
-            (router + postprocess captured, expert dispatch runs eagerly).
+                (router + postprocess captured, expert dispatch runs eagerly).
+            create_managers: Whether partial mode should install separate router and postprocess
+                CUDA-graph managers. Coalesced spans own those operations directly.
         """
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
@@ -2112,11 +2117,11 @@ class MoETransformerLayer(TransformerLayer):
                 and "moe" in self.config.recompute_modules
                 and self.config.cuda_graph_impl == "local"
             )
-            if not hasattr(self, 'cudagraph_manager_router'):
+            if create_managers and not hasattr(self, 'cudagraph_manager_router'):
                 self.cudagraph_manager_router = CudaGraphManager(
                     self.config, self, function_name="_forward_mlp_router"
                 )
-            if not hasattr(self, 'cudagraph_manager_postprocess'):
+            if create_managers and not hasattr(self, 'cudagraph_manager_postprocess'):
                 self.cudagraph_manager_postprocess = CudaGraphManager(
                     self.config, self, function_name="_forward_mlp_postprocess"
                 )

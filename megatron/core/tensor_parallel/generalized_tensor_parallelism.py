@@ -390,7 +390,7 @@ def get_rs_stream(chain_id: str = GTPChain.GRAPHED.value, group=None) -> torch.c
 
 
 def initialize_graph_wgrad_rings() -> None:
-    """Allocate persistent wgrad inputs before local CUDA-graph capture."""
+    """Allocate persistent wgrad inputs for per-module local CUDA-graph runners."""
     allocate_graph_wgrad_rings(
         _GTP_PARAMS,
         full_iteration=_FULL_ITERATION,
@@ -448,7 +448,7 @@ class GTPRematConfig:
     # wire, but accumulation no longer loses precision as the axis grows. Bypassed at axis size
     # <= 2. Independent of the DDP-axis --ddp-reduce-scatter-with-fp32-accumulation.
     reduce_scatter_with_fp32_accumulation: bool = False
-    # Persistent wgrad slots per scheduling/shape domain for partial-CG asynchronous reduce-scatter.
+    # Persistent wgrad slots per scheduling/shape domain for non-span local-CG async RS.
     # Two slots cover the usual case of one same-key writer per graph. A graph containing multiple
     # same-key writers may need more slots to keep all in-flight RS inputs distinct.
     # TODO: Infer each domain's ring size automatically.

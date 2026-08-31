@@ -8,6 +8,15 @@ import torch
 import megatron.core.models.hybrid.hybrid_block as hybrid_block_module
 import megatron.core.transformer.utils as transformer_utils
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
+from megatron.core.models.hybrid.cuda_graph_spans import (
+    HybridCudaGraphEagerExpertSpec,
+    HybridCudaGraphOperation,
+    HybridCudaGraphOperationSpec,
+    HybridCudaGraphSpan,
+    HybridCudaGraphSpanSpec,
+    build_hybrid_cuda_graph_span_plan,
+    should_use_hybrid_cuda_graph_spans,
+)
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import (
@@ -24,6 +33,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
 )
@@ -38,6 +48,144 @@ from tests.unit_tests.test_utilities import Utils
 
 def _make_pg_collection():
     return SimpleNamespace(pp=None, tp=None, cp=SimpleNamespace(size=lambda: 1), tp_cp=None)
+
+
+def test_hybrid_cuda_graph_plan_coalesces_adjacent_modules_around_eager_experts():
+    config = TransformerConfig(
+        num_layers=5,
+        hidden_size=64,
+        num_attention_heads=4,
+        num_moe_experts=8,
+        cuda_graph_impl="local",
+        cuda_graph_modules=[
+            CudaGraphModule.mamba,
+            CudaGraphModule.attn,
+            CudaGraphModule.moe_router,
+        ],
+        cuda_graph_coalesce_partial_captures=True,
+    )
+    layer_configs = validate_segment_layers("MEM*E", config)
+
+    assert should_use_hybrid_cuda_graph_spans(config)
+    plan = build_hybrid_cuda_graph_span_plan(layer_configs, config.cuda_graph_modules)
+
+    assert len(plan) == 5
+    assert isinstance(plan[0], HybridCudaGraphSpanSpec)
+    assert [(op.operation, op.layer_index) for op in plan[0].operations] == [
+        (HybridCudaGraphOperation.LAYER, 0),
+        (HybridCudaGraphOperation.MOE_ROUTER, 1),
+    ]
+    assert plan[1] == HybridCudaGraphEagerExpertSpec(1)
+    assert isinstance(plan[2], HybridCudaGraphSpanSpec)
+    assert [(op.operation, op.layer_index) for op in plan[2].operations] == [
+        (HybridCudaGraphOperation.MOE_POSTPROCESS, 1),
+        (HybridCudaGraphOperation.LAYER, 2),
+        (HybridCudaGraphOperation.LAYER, 3),
+        (HybridCudaGraphOperation.MOE_ROUTER, 4),
+    ]
+    assert plan[3] == HybridCudaGraphEagerExpertSpec(4)
+    assert isinstance(plan[4], HybridCudaGraphSpanSpec)
+    assert [(op.operation, op.layer_index) for op in plan[4].operations] == [
+        (HybridCudaGraphOperation.MOE_POSTPROCESS, 4)
+    ]
+    assert all(
+        not isinstance(left, HybridCudaGraphSpanSpec)
+        or not isinstance(right, HybridCudaGraphSpanSpec)
+        for left, right in zip(plan, plan[1:])
+    )
+
+
+def test_hybrid_cuda_graph_span_exposes_layers_without_duplicate_state_dict_paths(monkeypatch):
+    class FakeCudaGraphManager(torch.nn.Module):
+
+        def __init__(self, config):
+            super().__init__()
+
+    class FakeLayer(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.projection = torch.nn.Linear(4, 4, bias=False)
+            self.register_buffer("running_value", torch.ones(1))
+
+    import megatron.core.transformer.cuda_graphs as cuda_graphs
+
+    monkeypatch.setattr(cuda_graphs, "CudaGraphManager", FakeCudaGraphManager)
+    monkeypatch.setattr(cuda_graphs, "_CUDA_GRAPH_STREAM_POOL_SIZE", 3)
+    monkeypatch.setattr(cuda_graphs, "_CUDA_GRAPH_STREAM_POOLS", None)
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=4,
+        num_attention_heads=1,
+        cuda_graph_impl="local",
+        cuda_graph_modules=[CudaGraphModule.mamba],
+    )
+    layers = torch.nn.ModuleList([FakeLayer(), FakeLayer()])
+    span = HybridCudaGraphSpan(
+        config,
+        HybridCudaGraphSpanSpec(
+            (
+                HybridCudaGraphOperationSpec(HybridCudaGraphOperation.LAYER, 0),
+                HybridCudaGraphOperationSpec(HybridCudaGraphOperation.LAYER, 1),
+            )
+        ),
+        layers,
+    )
+
+    model = torch.nn.Module()
+    model.layers = layers
+    model.cuda_graph_spans = torch.nn.ModuleList([span])
+
+    assert {id(param) for param in span.parameters()} == {
+        id(param) for layer in layers for param in layer.parameters()
+    }
+    assert {id(buffer) for buffer in span.buffers()} == {
+        id(buffer) for layer in layers for buffer in layer.buffers()
+    }
+    assert list(span.parameters(recurse=False)) == []
+    assert list(span.buffers(recurse=False)) == []
+    assert not any(key.startswith("cuda_graph_spans.") for key in model.state_dict())
+    assert cuda_graphs._CUDA_GRAPH_STREAM_POOL_SIZE == 1
+
+
+def test_gtp_local_cuda_graph_falls_back_for_non_span_scope():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=4,
+        num_attention_heads=1,
+        gtp_weight_remat_size=2,
+        cuda_graph_impl="local",
+        cuda_graph_modules=[CudaGraphModule.mlp],
+        cuda_graph_coalesce_partial_captures=True,
+    )
+
+    assert not should_use_hybrid_cuda_graph_spans(config)
+
+
+def test_hybrid_cuda_graph_spans_require_opt_in():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=4,
+        num_attention_heads=1,
+        cuda_graph_impl="local",
+        cuda_graph_modules=[CudaGraphModule.mamba],
+    )
+
+    assert not should_use_hybrid_cuda_graph_spans(config)
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_hybrid_cuda_graph_spans_fall_back_for_context_parallelism(cp_size):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=4,
+        num_attention_heads=1,
+        cuda_graph_impl="local",
+        cuda_graph_modules=[CudaGraphModule.mamba],
+        cuda_graph_coalesce_partial_captures=True,
+    )
+
+    assert not should_use_hybrid_cuda_graph_spans(config, cp_size=cp_size)
 
 
 @pytest.mark.parametrize(
