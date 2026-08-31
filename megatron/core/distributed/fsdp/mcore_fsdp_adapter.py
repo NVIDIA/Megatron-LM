@@ -65,6 +65,8 @@ logger = logging.getLogger(__name__)
 
 def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> None:
     """Materialize and initialize one module's direct meta parameters."""
+    # Container modules may have parameterized children but no direct parameters or
+    # reset_parameters() method; their children are materialized separately.
     if not any(parameter.is_meta for parameter in module.parameters(recurse=False)):
         return
 

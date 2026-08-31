@@ -105,6 +105,7 @@ class TestMcoreAdapterDense:
         for name, parameter in parameters.items():
             local_parameter = parameter.to_local()
 
+            # Biases and layer norms use their module-specific initialization values.
             if name.endswith("bias"):
                 expected_value = 0.0
             elif "layernorm" in name or "layer_norm" in name:
