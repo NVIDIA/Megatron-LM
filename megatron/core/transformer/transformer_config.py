@@ -903,9 +903,10 @@ class TransformerConfig(ModelParallelConfig):
     This is an experimental feature for benchmarking purposes."""
 
     moe_n_hash_layers: int = 0
-    """Number of leading transformer layers that use hash-based MoE routing.
-    Layers with layer_number <= moe_n_hash_layers use a pre-computed tid2eid
-    lookup table for expert selection instead of learned top-k routing."""
+    """Number of leading layers that use hash-based MoE routing. Standard transformer
+    stacks compare this value with layer_number; hybrid stacks count only MoE positions
+    in the hybrid layer pattern. Hash layers use a pre-computed tid2eid lookup table for
+    expert selection instead of learned top-k routing."""
 
     actual_vocab_size: Optional[int] = None
     """Padded actual vocabulary size. Required when moe_n_hash_layers > 0 for the
