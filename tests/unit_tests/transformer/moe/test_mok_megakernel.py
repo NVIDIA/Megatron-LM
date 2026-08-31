@@ -130,19 +130,63 @@ def test_swizzle_mxfp8_scale_refreshes_existing_output_in_place():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_mxfp8_backward_views_keep_native_columnwise_payload_zero_copy():
+def test_single_grouped_mxfp8_view_builds_and_refreshes_scales(monkeypatch):
+    from megatron.core import fp8_utils
+
+    class GroupedWeight:
+        def __init__(self, shape):
+            self.shape = shape
+            self.rowwise_data = object()
+            self.columnwise_data = object()
+
     num_experts, rows, columns = 1, 256, 128
-    row_data = torch.empty((num_experts, rows, columns))
-    row_scale = torch.zeros((num_experts, rows, columns // 32), dtype=torch.uint8)
-    column_data = torch.empty_like(row_data)
-    column_scale = torch.zeros((num_experts, columns, rows // 32), dtype=torch.uint8)
-    native = (row_data, row_scale, column_data, column_scale, True)
+    weight = GroupedWeight((num_experts, rows, columns))
+    scales = {}
+    swizzle_calls = []
 
-    actual = mok_weights._mok_mxfp8_backward_weight_views(native, rows=rows, columns=columns)
+    monkeypatch.setattr(fp8_utils, "is_grouped_mxfp8tensor", lambda param: True)
+    monkeypatch.setattr(
+        mok_weights, "_storage_view", lambda storage, shape, **kwargs: storage
+    )
 
-    assert actual[0].data_ptr() == row_data.data_ptr()
-    assert actual[2].data_ptr() == column_data.data_ptr()
-    assert actual[4] is True
+    def fake_scale_view(param, member_attr, shape, *, name):
+        del name
+        # The native columnwise path transposes its logical scale tensor before
+        # swizzling. Keep the fixture tensor-like so the test exercises that
+        # production path rather than failing on an opaque sentinel object.
+        return scales.setdefault((id(param), member_attr), torch.empty(shape))
+
+    def fake_swizzle(scale, *, rows, columns, out=None):
+        result = object() if out is None else out
+        swizzle_calls.append((scale, rows, columns, out, result))
+        return result
+
+    monkeypatch.setattr(mok_weights, "_single_grouped_mxfp8_scale_view", fake_scale_view)
+    monkeypatch.setattr(mok_weights, "_swizzle_mxfp8_scale", fake_swizzle)
+
+    first = mok_weights._native_single_grouped_weight_view(
+        weight,
+        num_experts=num_experts,
+        rows=rows,
+        columns=columns,
+        use_mxfp8=True,
+    )
+    assert first[0] is weight.rowwise_data
+    assert first[2] is weight.columnwise_data
+    assert [call[3] for call in swizzle_calls] == [None, None]
+
+    swizzle_calls.clear()
+    refreshed = mok_weights._native_single_grouped_weight_view(
+        weight,
+        num_experts=num_experts,
+        rows=rows,
+        columns=columns,
+        use_mxfp8=True,
+        cached_view=first,
+    )
+    expected_outputs = [first[1], first[3]]
+    assert [call[3] for call in swizzle_calls] == expected_outputs
+    assert [refreshed[1], refreshed[3]] == expected_outputs
 
 
 def test_mxfp8_scale_layout_cache_refreshes_once_per_optimizer_iteration(monkeypatch):
@@ -151,43 +195,35 @@ def test_mxfp8_scale_layout_cache_refreshes_once_per_optimizer_iteration(monkeyp
     module.native_single_grouped_weights = True
     module.use_mxfp8_weights = True
     module.is_first_microbatch = True
-    module._prepared_routed_weight_cache = None
+    module._routed_weight_view_cache = None
     module.routed_fc1_weight = object()
     module.routed_fc2_weight = object()
     module.num_local_experts = 2
     module.intermediate_size = 128
     module.hidden_size = 256
 
-    native_calls = []
-    prepare_calls = []
+    view_calls = []
 
-    def fake_native_views(*args, **kwargs):
+    def fake_view(*args, cached_view=None, **kwargs):
         del args, kwargs
-        native_calls.append(True)
-        fc1 = (object(),)
-        fc2 = (object(),)
-        return fc1, fc2
+        view_calls.append(cached_view)
+        return object()
 
-    def fake_prepare(native, *, rows, columns):
-        prepare_calls.append((rows, columns))
-        return (native[0], object(), object(), object(), True)
-
-    monkeypatch.setattr(mok_megakernel, "_native_single_grouped_weight_views", fake_native_views)
-    monkeypatch.setattr(mok_megakernel, "_mok_mxfp8_backward_weight_views", fake_prepare)
+    monkeypatch.setattr(
+        mok_megakernel, "_native_single_grouped_weight_view", fake_view
+    )
 
     first = module.quantized_routed_weights()
     second = module.quantized_routed_weights()
 
     assert second is first
-    assert len(native_calls) == 1
-    assert prepare_calls == [(256, 256), (256, 128)]
+    assert view_calls == [None, None]
 
     module.is_first_microbatch = True
     third = module.quantized_routed_weights()
 
     assert third is not first
-    assert len(native_calls) == 2
-    assert prepare_calls == [(256, 256), (256, 128)] * 2
+    assert view_calls == [None, None, first[0], first[1]]
 
 
 def _split_module(*, use_mxfp8_weights):
@@ -196,7 +232,7 @@ def _split_module(*, use_mxfp8_weights):
     module.native_single_grouped_weights = False
     module.use_mxfp8_weights = use_mxfp8_weights
     module.is_first_microbatch = True
-    module._prepared_routed_weight_cache = None
+    module._routed_weight_view_cache = None
     module.intermediate_size = 4
     module.hidden_size = 8
     module._routed_fc1_parameter_names = ("routed_fc1_weight0", "routed_fc1_weight1")
@@ -233,8 +269,8 @@ def test_bf16_split_descriptors_are_cached(monkeypatch):
     module = _split_module(use_mxfp8_weights=False)
     calls = []
 
-    def fake_split(params, *, rows, columns, use_mxfp8):
-        calls.append((params, rows, columns, use_mxfp8))
+    def fake_split(params, *, rows, columns, use_mxfp8, cached_view=None):
+        calls.append((params, rows, columns, use_mxfp8, cached_view))
         return object()
 
     monkeypatch.setattr(mok_megakernel, "_native_split_weight_view", fake_split)
@@ -243,7 +279,7 @@ def test_bf16_split_descriptors_are_cached(monkeypatch):
     second = module.quantized_routed_weights()
 
     assert second is first
-    assert [(rows, columns, use_mxfp8) for _, rows, columns, use_mxfp8 in calls] == [
+    assert [(rows, columns, use_mxfp8) for _, rows, columns, use_mxfp8, _ in calls] == [
         (8, 8, False),
         (8, 4, False),
     ]
@@ -252,35 +288,26 @@ def test_bf16_split_descriptors_are_cached(monkeypatch):
 
 def test_mxfp8_split_scale_and_descriptor_cache_refreshes_per_iteration(monkeypatch):
     module = _split_module(use_mxfp8_weights=True)
-    build_calls = []
-    refresh_calls = []
+    view_calls = []
 
-    def fake_split(params, *, rows, columns, use_mxfp8):
-        build_calls.append((params, rows, columns, use_mxfp8))
-        return object()
-
-    def fake_refresh(prepared, params, *, rows, columns):
-        refresh_calls.append((prepared, params, rows, columns))
+    def fake_split(params, *, rows, columns, use_mxfp8, cached_view=None):
+        view_calls.append((params, rows, columns, use_mxfp8, cached_view))
+        return object() if cached_view is None else cached_view
 
     monkeypatch.setattr(mok_megakernel, "_native_split_weight_view", fake_split)
-    monkeypatch.setattr(mok_megakernel, "_refresh_native_split_weight_scales", fake_refresh)
 
     first = module.quantized_routed_weights()
     second = module.quantized_routed_weights()
 
     assert second is first
-    assert len(build_calls) == 2
-    assert not refresh_calls
+    assert [call[-1] for call in view_calls] == [None, None]
 
     module.is_first_microbatch = True
     third = module.quantized_routed_weights()
 
-    assert third is first
-    assert len(build_calls) == 2
-    assert [(prepared, rows, columns) for prepared, _, rows, columns in refresh_calls] == [
-        (first[0], 8, 8),
-        (first[1], 8, 4),
-    ]
+    assert third[0] is first[0]
+    assert third[1] is first[1]
+    assert [call[-1] for call in view_calls] == [None, None, first[0], first[1]]
 
 
 def test_mxfp8_split_scales_use_per_expert_descriptor_tables(monkeypatch):
@@ -327,44 +354,49 @@ def test_mxfp8_split_scales_use_per_expert_descriptor_tables(monkeypatch):
 
     monkeypatch.setattr(ops, "make_routed_scale_storage_table", fake_scale_table)
 
-    prepared = mok_weights._native_split_weight_view(
+    weight_view = mok_weights._native_split_weight_view(
         tuple(params), rows=rows, columns=columns, use_mxfp8=True
     )
 
     assert len(scale_table_inputs) == 2
     assert all(
         actual is expected
-        for actual, expected in zip(prepared.scale_tensors, scale_table_inputs[0], strict=True)
+        for actual, expected in zip(weight_view.scale_tensors, scale_table_inputs[0], strict=True)
     )
     assert all(
         actual is expected
         for actual, expected in zip(
-            prepared.transposed_scale_tensors, scale_table_inputs[1], strict=True
+            weight_view.transposed_scale_tensors, scale_table_inputs[1], strict=True
         )
     )
-    assert tuple(prepared.scale.shape) == (rows // 128, columns // 128, 32, 16)
-    assert tuple(prepared.transposed_scale.shape) == (columns // 128, rows // 128, 32, 16)
-    assert prepared.scale_tensors[0].data_ptr() != prepared.scale_tensors[1].data_ptr()
+    assert tuple(weight_view.scale.shape) == (rows // 128, columns // 128, 32, 16)
+    assert tuple(weight_view.transposed_scale.shape) == (columns // 128, rows // 128, 32, 16)
+    assert weight_view.scale_tensors[0].data_ptr() != weight_view.scale_tensors[1].data_ptr()
     assert (
-        prepared.transposed_scale_tensors[0].data_ptr()
-        != prepared.transposed_scale_tensors[1].data_ptr()
+        weight_view.transposed_scale_tensors[0].data_ptr()
+        != weight_view.transposed_scale_tensors[1].data_ptr()
     )
 
-    row_ptrs = tuple(tensor.data_ptr() for tensor in prepared.scale_tensors)
-    column_ptrs = tuple(tensor.data_ptr() for tensor in prepared.transposed_scale_tensors)
-    row_table = prepared.scale_storage_table
-    column_table = prepared.transposed_scale_storage_table
+    row_ptrs = tuple(tensor.data_ptr() for tensor in weight_view.scale_tensors)
+    column_ptrs = tuple(tensor.data_ptr() for tensor in weight_view.transposed_scale_tensors)
+    row_table = weight_view.scale_storage_table
+    column_table = weight_view.transposed_scale_storage_table
     params[0]._rowwise_scale_inv.fill_(9)
     params[1]._columnwise_scale_inv.fill_(11)
 
-    mok_weights._refresh_native_split_weight_scales(
-        prepared, tuple(params), rows=rows, columns=columns
+    refreshed = mok_weights._native_split_weight_view(
+        tuple(params),
+        rows=rows,
+        columns=columns,
+        use_mxfp8=True,
+        cached_view=weight_view,
     )
+    assert refreshed is weight_view
 
-    assert tuple(tensor.data_ptr() for tensor in prepared.scale_tensors) == row_ptrs
-    assert tuple(tensor.data_ptr() for tensor in prepared.transposed_scale_tensors) == column_ptrs
-    assert prepared.scale_storage_table is row_table
-    assert prepared.transposed_scale_storage_table is column_table
+    assert tuple(tensor.data_ptr() for tensor in weight_view.scale_tensors) == row_ptrs
+    assert tuple(tensor.data_ptr() for tensor in weight_view.transposed_scale_tensors) == column_ptrs
+    assert weight_view.scale_storage_table is row_table
+    assert weight_view.transposed_scale_storage_table is column_table
     for expert, param in enumerate(params):
         expected_row = mok_weights._swizzle_mxfp8_scale(
             param._rowwise_scale_inv.unsqueeze(0), rows=rows, columns=columns
@@ -372,9 +404,9 @@ def test_mxfp8_split_scales_use_per_expert_descriptor_tables(monkeypatch):
         expected_column = mok_weights._swizzle_mxfp8_scale(
             param._columnwise_scale_inv.transpose(-2, -1).unsqueeze(0), rows=columns, columns=rows
         )
-        torch.testing.assert_close(prepared.scale_tensors[expert], expected_row, rtol=0, atol=0)
+        torch.testing.assert_close(weight_view.scale_tensors[expert], expected_row, rtol=0, atol=0)
         torch.testing.assert_close(
-            prepared.transposed_scale_tensors[expert], expected_column, rtol=0, atol=0
+            weight_view.transposed_scale_tensors[expert], expected_column, rtol=0, atol=0
         )
 
 
@@ -387,12 +419,18 @@ def test_native_single_grouped_bf16_views_alias_authoritative_parameters():
         torch.randn(num_experts, hidden_size, intermediate_size, dtype=torch.bfloat16)
     )
 
-    fc1_view, fc2_view = mok_weights._native_single_grouped_weight_views(
+    fc1_view = mok_weights._native_single_grouped_weight_view(
         fc1,
+        num_experts=num_experts,
+        rows=2 * intermediate_size,
+        columns=hidden_size,
+        use_mxfp8=False,
+    )
+    fc2_view = mok_weights._native_single_grouped_weight_view(
         fc2,
         num_experts=num_experts,
-        intermediate_size=intermediate_size,
-        hidden_size=hidden_size,
+        rows=hidden_size,
+        columns=intermediate_size,
         use_mxfp8=False,
     )
 
@@ -418,12 +456,18 @@ def test_native_single_grouped_bf16_views_use_rowwise_storage(monkeypatch):
 
     monkeypatch.setattr(mok_weights, "_storage_view", fake_storage_view)
 
-    fc1_view, fc2_view = mok_weights._native_single_grouped_weight_views(
+    fc1_view = mok_weights._native_single_grouped_weight_view(
         fc1,
+        num_experts=num_experts,
+        rows=2 * intermediate_size,
+        columns=hidden_size,
+        use_mxfp8=False,
+    )
+    fc2_view = mok_weights._native_single_grouped_weight_view(
         fc2,
         num_experts=num_experts,
-        intermediate_size=intermediate_size,
-        hidden_size=hidden_size,
+        rows=hidden_size,
+        columns=intermediate_size,
         use_mxfp8=False,
     )
 
@@ -537,7 +581,7 @@ def test_native_checkpoint_load_uses_only_canonical_weights(single_grouped):
     mok = mok_megakernel.MoKMegakernel.__new__(mok_megakernel.MoKMegakernel)
     torch.nn.Module.__init__(mok)
     mok.native_single_grouped_weights = single_grouped
-    mok._prepared_routed_weight_cache = object()
+    mok._routed_weight_view_cache = object()
     mok._split_main_grad_descriptor_cache = object()
     mok.is_first_microbatch = False
     if single_grouped:
@@ -567,6 +611,6 @@ def test_native_checkpoint_load_uses_only_canonical_weights(single_grouped):
     torch.testing.assert_close(routed_fc2, tuple(routed_checkpoint.values())[1])
     torch.testing.assert_close(shared_fc1, checkpoint["shared_experts.linear_fc1.weight"])
     torch.testing.assert_close(shared_fc2, checkpoint["shared_experts.linear_fc2.weight"])
-    assert mok._prepared_routed_weight_cache is None
+    assert mok._routed_weight_view_cache is None
     assert mok._split_main_grad_descriptor_cache is None
     assert mok.is_first_microbatch
