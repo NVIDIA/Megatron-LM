@@ -301,7 +301,7 @@ class TestSubmitDoesNotDecodePrompt:
 
     UNDECODABLE_PROMPT = b"\xc1not-valid-msgpack"
 
-    def _submit(self, coordinator):
+    def _submit(self, coordinator, block_hashes=None):
         """Drive handle_submit_request once and return the frames sent onward."""
         coordinator.known_clients = {b"client-A"}
         coordinator.next_request_id = 0
@@ -313,27 +313,104 @@ class TestSubmitDoesNotDecodePrompt:
         coordinator.router_socket = MagicMock()
 
         metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}, None]
-        handle_submit_request(coordinator, b"client-A", metadata, [self.UNDECODABLE_PROMPT])
+        bodies = [self.UNDECODABLE_PROMPT, msgpack.packb(block_hashes, use_bin_type=True)]
+        handle_submit_request(coordinator, b"client-A", metadata, bodies)
         return coordinator.router_socket.send_multipart.call_args.args[0]
 
     def test_load_balanced_forwards_prompt_verbatim(self):
         """LOAD_BALANCED ignores hashes, so the prompt is never decoded."""
         coordinator = make_coordinator_direct(data_parallel_size=2)
         coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
-        _identity, _metadata, prompt_frame = self._submit(coordinator)
+        _identity, _metadata, prompt_frame = self._submit(coordinator, block_hashes=[])
         assert prompt_frame is self.UNDECODABLE_PROMPT
 
     def test_disabled_prefix_caching_forwards_prompt_verbatim(self):
         """With prefix caching off there are no hashes to compute either."""
         coordinator = make_coordinator_direct(data_parallel_size=2, enable_prefix_caching=False)
-        _identity, _metadata, prompt_frame = self._submit(coordinator)
+        _identity, _metadata, prompt_frame = self._submit(coordinator, block_hashes=[])
         assert prompt_frame is self.UNDECODABLE_PROMPT
+
+    def test_prefix_routing_uses_frontend_hashes_without_decoding_prompt(self):
+        """Prefix-affinity routing reads the frontend's hashes, not the prompt.
+
+        This is the case the split exists for: the coordinator has to route on
+        prefix affinity *and* still never look at the prompt. It only holds
+        because the frontend hashed the tokens it already had.
+        """
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = (
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+        )
+        _identity, _metadata, prompt_frame = self._submit(coordinator, block_hashes=[11, 22])
+        assert prompt_frame is self.UNDECODABLE_PROMPT
+
+    def test_frontend_hashes_are_recorded_against_the_chosen_rank(self):
+        """The supplied hashes drive affinity, so they must reach the rank table."""
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = (
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+        )
+        identity, _metadata, _prompt = self._submit(coordinator, block_hashes=[11, 22])
+        # A second request with the same prefix must now land on the same rank.
+        again, _m, _p = self._submit(coordinator, block_hashes=[11, 22])
+        assert again == identity
+
+    def test_unhashed_prompt_falls_back_to_the_coordinator(self):
+        """A client that could not hash sends None, and the coordinator hashes.
+
+        That happens for a string prompt, which needs a tokenizer the client does
+        not have. It is the only case that still decodes the prompt here, and it
+        is distinct from an empty list, which means the client hashed and the
+        prompt was shorter than one block.
+        """
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = (
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+        )
+        coordinator.known_clients = {b"client-A"}
+        coordinator.next_request_id = 0
+        coordinator.request_id_to_client_id = {}
+        coordinator.request_id_to_client_request_id = {}
+        coordinator.client_request_to_request_id = {}
+        coordinator.request_id_to_rank = {}
+        coordinator.schedule_records = None
+        coordinator.router_socket = MagicMock()
+        coordinator.compute_request_hashes = MagicMock(return_value=[5])
+
+        metadata = [
+            Headers.SUBMIT_REQUEST.value,
+            7,
+            {"temperature": 1.0},
+            {"media_cache_key": "img-1"},
+        ]
+        prompt = msgpack.packb([1, 2, 3], use_bin_type=True)
+        handle_submit_request(
+            coordinator, b"client-A", metadata, [prompt, msgpack.packb(None, use_bin_type=True)]
+        )
+
+        # Decoded here, and salted with whatever media key the metadata carried.
+        coordinator.compute_request_hashes.assert_called_once_with([1, 2, 3], cache_salt="img-1")
+
+    def test_empty_hash_list_is_not_a_fallback(self):
+        """An empty list means "hashed, no complete blocks" -- do not re-hash.
+
+        Treating it as unhashed would decode the prompt on this loop for every
+        short request, which is exactly the cost this design removes.
+        """
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.prefix_caching_coordinator_policy = (
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+        )
+        coordinator.compute_request_hashes = MagicMock(return_value=[5])
+        _identity, _metadata, prompt_frame = self._submit(coordinator, block_hashes=[])
+        assert prompt_frame is self.UNDECODABLE_PROMPT
+        coordinator.compute_request_hashes.assert_not_called()
 
     def test_metadata_frame_is_rewritten_with_server_request_id(self):
         """The client's request id is swapped for the coordinator's own."""
         coordinator = make_coordinator_direct(data_parallel_size=2)
         coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
-        _identity, metadata_frame, _prompt = self._submit(coordinator)
+        _identity, metadata_frame, _prompt = self._submit(coordinator, block_hashes=[])
         header, request_id, sampling_params, multi_modal_data = msgpack.unpackb(
             metadata_frame, raw=False
         )

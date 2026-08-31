@@ -178,6 +178,10 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         0.8,
         5,
         True,
+        # block_size_tokens / prefix_caching_coordinator_policy: unset here, so the
+        # frontend does not hash and the coordinator keeps doing it.
+        None,
+        None,
     )
     assert captured["blocking"] is False
     assert captured["inheritable"] is True
@@ -194,8 +198,15 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
     captured = {}
 
     class FakeInferenceClient:
-        def __init__(self, coordinator_addr, deserialize):
+        def __init__(
+            self,
+            coordinator_addr,
+            deserialize,
+            block_size_tokens=None,
+            prefix_caching_coordinator_policy=None,
+        ):
             captured["client_init"] = (coordinator_addr, deserialize)
+            captured["client_hashing"] = (block_size_tokens, prefix_caching_coordinator_policy)
 
         def start(self):
             captured["client_started"] = True
@@ -231,6 +242,8 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
 
     app_config = captured["app"].config
     assert captured["client_init"] == ("tcp://coord:5555", False)
+    # Unset here, so this client does not hash and the coordinator keeps doing it.
+    assert captured["client_hashing"] == (None, None)
     assert captured["client_started"] is True
     assert captured["client_stopped"] is True
     assert app_config["tokenizer"] is tokenizer

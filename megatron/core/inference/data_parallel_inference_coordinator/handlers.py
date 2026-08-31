@@ -91,9 +91,12 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         where ``sampling_params`` is the serialized dict and ``multi_modal_data``
         carries the media identity the routing policy keys on. Both are
         constant-size, which is why they are decoded here on every request.
-    ``bodies``: ``[prompt]`` -- one frame holding the packed prompt (a string or
-        a token id list). Forwarded to the engine untouched, and decoded here
-        only when the routing policy needs block hashes.
+    ``bodies``: ``[prompt, block_hashes]``. The prompt is a string or token id
+        list, forwarded to the engine untouched. ``block_hashes`` is the routing
+        hashes the client computed from the tokens it already held, salted with
+        the media key for multimodal requests. It is ``None`` when the client
+        could not hash -- a string prompt, which needs a tokenizer it does not
+        have -- and only then is the prompt decoded here.
 
     Returns True (stopping the loop) if no engines are reachable.
     """
@@ -134,9 +137,15 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         and coordinator.prefix_caching_coordinator_policy
         != PrefixCachingCoordinatorPolicy.LOAD_BALANCED
     ):
-        request_hashes = coordinator.compute_request_hashes(
-            msgpack.unpackb(prompt_frame, raw=False), cache_salt=media_cache_key
-        )
+        request_hashes = msgpack.unpackb(bodies[1], raw=False)
+        if request_hashes is None:
+            # The client could not hash: it was handed a string prompt and has no
+            # tokenizer. This one has, so it hashes here and pays the decode.
+            # Distinct from an empty list, which means the client hashed and the
+            # prompt was shorter than a block.
+            request_hashes = coordinator.compute_request_hashes(
+                msgpack.unpackb(prompt_frame, raw=False), cache_salt=media_cache_key
+            )
     else:
         request_hashes = []
 
