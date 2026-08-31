@@ -75,21 +75,24 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
         "--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response"
     )
     parser.add_argument(
-        "--frontend-replicas", type=int, default=-1,
+        "--frontend-replicas",
+        type=int,
+        default=-1,
         help="Number of HTTP frontend processes spawned per hosting rank. "
-             "-1 (default) uses max(data parallel size, 4), or a flat 4 with "
-             "--frontend-on-all-ranks, where capacity already scales with the "
-             "number of ranks hosting a frontend.",
+        "-1 (default) uses max(data parallel size, 4), or a flat 4 with "
+        "--frontend-on-all-ranks, where capacity already scales with the "
+        "number of ranks hosting a frontend.",
     )
     parser.add_argument(
-        "--frontend-on-all-ranks", action="store_true",
+        "--frontend-on-all-ranks",
+        action="store_true",
         help="Run HTTP frontends on every rank instead of only rank 0, and "
-             "return every rank's URL for the caller to spread requests over. "
-             "Frontend work (chat template, detokenize, parsers, JSON) is "
-             "CPU-bound and otherwise confined to the hosting rank's CPU "
-             "allocation, which leaves the rest of the job's cores unused. "
-             "Ranks still share one DP coordinator; only the HTTP tier is "
-             "replicated.",
+        "return every rank's URL for the caller to spread requests over. "
+        "Frontend work (chat template, detokenize, parsers, JSON) is "
+        "CPU-bound and otherwise confined to the hosting rank's CPU "
+        "allocation, which leaves the rest of the job's cores unused. "
+        "Ranks still share one DP coordinator; only the HTTP tier is "
+        "replicated.",
     )
     # NOTE: --chat-template is already declared by upstream's TrainingConfig
     # (megatron/training/config/training_config.py); we don't re-register it.
@@ -145,9 +148,8 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
     # image-expanded prompt, matching vlm_server.py's pre-engine bookkeeping.
     args.num_img_embeddings_per_tile = 0
     if hasattr(args, 'patch_dim'):
-        dynamic_res = (
-            getattr(args, 'dynamic_resolution', False)
-            and not getattr(args, 'use_tiling', False)
+        dynamic_res = getattr(args, 'dynamic_resolution', False) and not getattr(
+            args, 'use_tiling', False
         )
         if dynamic_res:
             max_patches = getattr(args, 'dynamic_resolution_max_patches', 128)
@@ -160,6 +162,7 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
             )
         else:
             from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+
             args.num_img_embeddings_per_tile = get_num_image_embeddings(
                 args.img_h,
                 args.img_w,
@@ -185,12 +188,8 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
         use_tiling=getattr(args, 'use_tiling', False),
         pixel_shuffle=getattr(args, 'pixel_shuffle', False),
         spatial_merge_size=getattr(args, 'spatial_merge_size', 1),
-        dynamic_resolution_min_patches=getattr(
-            args, 'dynamic_resolution_min_patches', 1
-        ),
-        dynamic_resolution_max_patches=getattr(
-            args, 'dynamic_resolution_max_patches', 128
-        ),
+        dynamic_resolution_min_patches=getattr(args, 'dynamic_resolution_min_patches', 1),
+        dynamic_resolution_max_patches=getattr(args, 'dynamic_resolution_max_patches', 128),
         vision_model_type=getattr(args, 'vision_model_type', 'radio'),
         pixel_mean=getattr(args, 'pixel_mean', None),
         pixel_std=getattr(args, 'pixel_std', None),
@@ -254,9 +253,9 @@ async def run_text_generation_server(
         hostname=hostname,
     )
 
-    num_replicas = args.frontend_replicas
+    num_replicas = getattr(args, 'frontend_replicas', -1)
     if num_replicas < 0:
-        if args.frontend_on_all_ranks:
+        if getattr(args, 'frontend_on_all_ranks', False):
             # Capacity now scales with the number of ranks, so the per-rank
             # replica count stays flat rather than tracking DP size on top of it.
             num_replicas = 4
@@ -268,7 +267,7 @@ async def run_text_generation_server(
     if rank == 0:
         logging.info("Starting %d HTTP frontend replica(s) per hosting rank.", num_replicas)
 
-    if args.frontend_on_all_ranks:
+    if getattr(args, 'frontend_on_all_ranks', False):
         # Only the DP coordinator rank learns the coordinator's address: the
         # engine broadcasts it over the DP group, which is a singleton when data
         # parallel size is 1. Every rank needs it here, since every rank's
@@ -280,13 +279,13 @@ async def run_text_generation_server(
 
     try:
         url = None
-        if args.frontend_on_all_ranks or rank == 0:
+        if getattr(args, 'frontend_on_all_ranks', False) or rank == 0:
             url = start_text_gen_server(
                 coordinator_addr=coordinator_addr,
                 tokenizer=engine.controller.tokenizer,
                 parsers=args.parsers,
                 rank=rank,
-                server_port=0 if args.frontend_on_all_ranks else server_port,
+                server_port=0 if getattr(args, 'frontend_on_all_ranks', False) else server_port,
                 verbose=args.inference_text_gen_server_logging,
                 num_replicas=num_replicas,
                 hostname=hostname,
@@ -300,7 +299,7 @@ async def run_text_generation_server(
                 eval_mode=eval_mode,
             )
 
-        if args.frontend_on_all_ranks:
+        if getattr(args, 'frontend_on_all_ranks', False):
             # Unlike callers that already collect a URL per worker, this entry
             # point has to gather them itself before it can report the set.
             urls = [None] * torch.distributed.get_world_size()
@@ -354,13 +353,17 @@ if __name__ == "__main__":
         # store_true flags have no negating counterpart, so we only inject
         # those when the user hasn't set a conflicting explicit value.
         _defaults = [
-            "--micro-batch-size", "1",
-            "--inference-dynamic-batching-buffer-size-gb", "2.0",
+            "--micro-batch-size",
+            "1",
+            "--inference-dynamic-batching-buffer-size-gb",
+            "2.0",
             # Placeholders for add_multimodal_extra_args' required args. These
             # are injected as defaults, so _detect_vlm_from_checkpoint will
             # replace them with the checkpoint's real values when loading a VLM.
-            "--language-model-type", "placeholder",
-            "--tokenizer-prompt-format", "mistral",
+            "--language-model-type",
+            "placeholder",
+            "--tokenizer-prompt-format",
+            "mistral",
         ]
         # store_true flags: only inject when the user hasn't expressed a
         # conflicting choice on the CLI.

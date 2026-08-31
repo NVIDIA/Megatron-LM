@@ -107,7 +107,7 @@ async def _run_text_gen_server(
         app.config['tokenize_executor'] = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="tokenize"
         )
-        app.config['tokenize_tokenizer'] = copy.deepcopy(tokenizer)
+        app.config['tokenizer_copy'] = copy.deepcopy(tokenizer)
 
         # Register all blueprints from the 'endpoints' package
         for endpoint in endpoints.__all__:

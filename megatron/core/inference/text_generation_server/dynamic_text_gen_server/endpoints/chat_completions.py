@@ -792,7 +792,10 @@ try:
 
         # Same resolution against the private copy the worker thread applies the
         # template with; `chat_tok` above is only read for the capability checks.
-        tokenize_tok = current_app.config['tokenize_tokenizer']
+        # Falls back to the shared tokenizer when no private copy is registered:
+        # callers that build the app config directly do not set one, and the copy
+        # is a thread-safety isolation measure rather than a correctness one.
+        tokenize_tok = current_app.config.get('tokenizer_copy', tokenizer)
         tokenize_hf_tok = getattr(getattr(tokenize_tok, '_tokenizer', None), 'tokenizer', None)
         tokenize_chat_tok = tokenize_hf_tok if tokenize_hf_tok is not None else tokenize_tok
 
@@ -831,7 +834,7 @@ try:
                     )
                 else:
                     prompt_tokens = await asyncio.get_running_loop().run_in_executor(
-                        current_app.config['tokenize_executor'],
+                        current_app.config.get('tokenize_executor'),
                         partial(
                             _apply_chat_template_sync,
                             tokenize_chat_tok,
@@ -902,7 +905,7 @@ try:
                         else:
                             retokenized_previous_turn_token_ids = (
                                 await asyncio.get_running_loop().run_in_executor(
-                                    current_app.config['tokenize_executor'],
+                                    current_app.config.get('tokenize_executor'),
                                     partial(
                                         _apply_chat_template_sync,
                                         tokenize_chat_tok,
