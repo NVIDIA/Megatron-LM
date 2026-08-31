@@ -50,6 +50,7 @@ from megatron.core.transformer.moe.replica_planner import (
     ReplicaCuTeDSLWeightBridge,
     ReplicaPlan,
     ReplicaPlannerWorkspace,
+    extract_semantic_routes,
     map_replica_plan_to_hybridep,
     plan_replica_routes,
     start_replica_grad_reduce_after_expert_backward,
@@ -1533,25 +1534,14 @@ class _ReplicaHybridEPManager(_ReplicaPlannedManagerMixin, _HybridEPManager):
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = int(routing_map.shape[0])
-        semantic_probs = probs.reshape(num_tokens, self.semantic_num_experts)
-        semantic_routing_map = routing_map.reshape(
-            num_tokens, self.semantic_num_experts
-        )
-        # The routing map is authoritative. Selecting directly from dense
-        # probabilities can silently change a zero-probability route when
-        # several unselected experts tie at zero.
-        routed_probs = semantic_probs.masked_fill(~semantic_routing_map, float("-inf"))
-        self.semantic_token_probs, self.semantic_token_indices = torch.topk(
-            routed_probs, self.router_topk, dim=-1
-        )
-        self.semantic_token_indices = self.semantic_token_indices.to(torch.int32)
-        self.semantic_tokens_per_expert = torch.zeros(
-            self.semantic_num_experts, dtype=torch.int32, device=semantic_probs.device
-        )
-        self.semantic_tokens_per_expert.scatter_add_(
-            0,
-            self.semantic_token_indices.reshape(-1).to(torch.int64),
-            torch.ones_like(self.semantic_token_indices.reshape(-1), dtype=torch.int32),
+        (
+            self.semantic_token_probs,
+            self.semantic_token_indices,
+            self.semantic_tokens_per_expert,
+        ) = extract_semantic_routes(
+            routing_map.reshape(num_tokens, self.semantic_num_experts),
+            probs.reshape(num_tokens, self.semantic_num_experts),
+            self.router_topk,
         )
         self.num_local_tokens = num_tokens
         self.token_probs = self.semantic_token_probs
