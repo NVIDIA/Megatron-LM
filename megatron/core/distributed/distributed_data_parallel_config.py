@@ -36,6 +36,11 @@ class DistributedDataParallelConfig:
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.
     """
 
+    expert_num_distributed_optimizer_instances: int | None = None
+    """Number of optimizer instances across the expert-DP domain for MFSDP v2.
+       When unset, expert HSDP is disabled.
+    """
+
     check_for_nan_in_grad: bool = False
     """
     If true, check for NaNs and Infs in gradients _before_ communication collective.
