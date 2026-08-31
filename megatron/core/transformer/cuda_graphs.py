@@ -1388,6 +1388,8 @@ class _CudaGraphRunner(torch.nn.Module):
 
             elif is_dataclass(ref.value):
                 for field in dataclasses.fields(ref.value):
+                    if field.metadata.get("cuda_graph_ignore", False):
+                        continue
                     check(
                         ArgMetadata(getattr(val.value, field.name)),
                         ArgMetadata(getattr(ref.value, field.name)),
