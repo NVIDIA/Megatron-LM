@@ -140,11 +140,15 @@ async def test_add_request_with_kv_handoff_returns_future():
     assert params.streaming is False
     assert client.completion_futures == {0: future}
     assert client.streams == {}
-    payload = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
-    assert payload[0] == Headers.SUBMIT_REQUEST_WITH_KV.value
-    assert payload[1] == 0
-    assert payload[2] == [1, 2, 3]
-    assert payload[3]["streaming"] is False
-    assert payload[4] == {"agent": "prefill"}
-    assert payload[5] == [10, 11]
+    # Framed as [metadata, prompt, src_block_ids]: src_block_ids names one block
+    # per block_size_tokens of prompt, so it grows with the prompt and travels as
+    # its own body rather than in the metadata frame the coordinator decodes.
+    meta_frame, prompt_frame, blocks_frame = fake_socket.send_multipart.call_args.args[0]
+    metadata = msgpack.unpackb(meta_frame, raw=False)
+    assert metadata[0] == Headers.SUBMIT_REQUEST_WITH_KV.value
+    assert metadata[1] == 0
+    assert metadata[2]["streaming"] is False
+    assert metadata[3] == {"agent": "prefill"}
+    assert msgpack.unpackb(prompt_frame, raw=False) == [1, 2, 3]
+    assert msgpack.unpackb(blocks_frame, raw=False) == [10, 11]
     future.cancel()
