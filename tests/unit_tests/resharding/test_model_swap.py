@@ -236,6 +236,31 @@ def _mamba_layer_pattern(base: str, num_layers: int, pp_size: int) -> str:
     return "|".join([stage] * pp_size)
 
 
+class _DSAGQAIndexerProxy(torch.nn.Module):
+    """Replicated DSA-GQA indexer parameter present in the target checkpoint."""
+
+    def __init__(self, hidden_size: int, indexer_head_dim: int, layer_number: int, is_src: bool):
+        super().__init__()
+        self._layer_number = layer_number
+        self.linear_q = torch.nn.Linear(hidden_size, indexer_head_dim, bias=False)
+        setattr(self.linear_q.weight, "tensor_model_parallel", False)
+        setattr(self.linear_q.weight, "allreduce", True)
+        with torch.no_grad():
+            self.linear_q.weight.fill_(float(layer_number) if is_src else -1.0)
+
+
+def _attach_dsa_gqa_indexers(model, hidden_size: int, indexer_head_dim: int, is_src: bool):
+    """Add the simplified DSA-GQA indexer to every attention layer in a hybrid model."""
+    for layer in model.decoder.layers:
+        attention = getattr(layer, "self_attention", None)
+        if attention is None or not hasattr(attention, "linear_qkv"):
+            continue
+        attention.core_attention.add_module(
+            "indexer",
+            _DSAGQAIndexerProxy(hidden_size, indexer_head_dim, layer.layer_number, is_src),
+        )
+
+
 def _mp_config() -> ModelParallelConfig:
     return ModelParallelConfig(
         params_dtype=torch.float32,
@@ -796,6 +821,170 @@ def test_router_expert_bias_refit_non_collocated(refit_backend: str):
     "refit_backend",
     [
         pytest.param(
+            "nccl_m2n",
+            marks=pytest.mark.skipif(
+                not has_nccl_m2n, reason="NVIDIA/nccl-extensions and NCCL4Py are not installed"
+            ),
+        ),
+        "nccl",
+    ],
+)
+@pytest.mark.parametrize(
+    "src_world,src_tp,src_pp,dst_world,dst_tp,dst_pp",
+    [
+        # Four-rank Blackwell CI: two disjoint ranks per side, including native M2N.
+        (2, 1, 1, 2, 2, 1),  # TP1,DP2 -> TP2
+        (2, 2, 1, 2, 1, 1),  # TP2 -> TP1,DP2
+        (2, 1, 1, 2, 1, 2),  # PP1,DP2 -> PP2
+        (2, 1, 2, 2, 1, 1),  # PP2 -> PP1,DP2
+        (2, 2, 1, 2, 1, 2),  # TP2,PP1 -> TP1,PP2
+        (2, 1, 2, 2, 2, 1),  # TP1,PP2 -> TP2,PP1
+        # Eight-rank H100 CI: four disjoint ranks per side (NCCL, plus M2N if installed).
+        (4, 1, 1, 4, 4, 1),  # TP1,DP4 -> TP4
+        (4, 4, 1, 4, 1, 1),  # TP4 -> TP1,DP4
+        (4, 1, 1, 4, 1, 2),  # PP1,DP4 -> PP2,DP2
+        (4, 1, 2, 4, 1, 1),  # PP2,DP2 -> PP1,DP4
+        (4, 4, 1, 4, 2, 2),  # TP4,PP1 -> TP2,PP2
+        (4, 2, 2, 4, 4, 1),  # TP2,PP2 -> TP4,PP1
+    ],
+)
+@pytest.mark.launch_on_gb200
+def test_swap_mamba_dsa_gqa_non_collocated(
+    refit_backend: str,
+    src_world: int,
+    src_tp: int,
+    src_pp: int,
+    dst_world: int,
+    dst_tp: int,
+    dst_pp: int,
+):
+    """Refit the checkpoint-shaped hybrid model across disjoint rank windows."""
+    if not has_mamba_deps:
+        pytest.skip("Mamba dependencies (mamba_ssm, einops) not available")
+    if Utils.world_size != src_world + dst_world:
+        pytest.skip("Test requires a world containing exactly the source and destination ranks")
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+    from math import lcm
+
+    from megatron.core.inference.shards import build_inference_pg_collection
+
+    rank = dist.get_rank()
+    is_src = rank < src_world
+    is_dst = src_world <= rank < src_world + dst_world
+    model_parallel_cuda_manual_seed(1234)
+    torch.manual_seed(1234)
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+
+    src_pgs = build_inference_pg_collection(
+        world_size=src_world, tp_size=src_tp, pp_size=src_pp, rank_offset=0
+    )
+    dst_pgs = build_inference_pg_collection(
+        world_size=dst_world, tp_size=dst_tp, pp_size=dst_pp, rank_offset=src_world
+    )
+
+    base_pattern = "M*"
+    num_layers = lcm(src_pp, dst_pp) * len(base_pattern)
+    cfg = TransformerConfig(
+        num_layers=num_layers,
+        hidden_size=256,
+        num_attention_heads=8,
+        num_query_groups=1,
+        use_cpu_initialization=True,
+        pipeline_dtype=torch.float32,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+    )
+    src_pattern = _mamba_layer_pattern(base_pattern, num_layers, src_pp)
+    dst_pattern = _mamba_layer_pattern(base_pattern, num_layers, dst_pp)
+
+    src_model = None
+    dst_model = None
+    if is_src:
+        src_model = _build_mamba(
+            cfg,
+            vocab_size=128,
+            seq_len=8,
+            pg_collection=src_pgs,
+            hybrid_layer_pattern=src_pattern,
+            parallel_output=False,
+        )
+        _attach_dsa_gqa_indexers(src_model, cfg.hidden_size, indexer_head_dim=16, is_src=True)
+        src_model = src_model.to(device).eval()
+    elif is_dst:
+        dst_model = _build_mamba(
+            cfg,
+            vocab_size=128,
+            seq_len=8,
+            pg_collection=dst_pgs,
+            hybrid_layer_pattern=dst_pattern,
+            parallel_output=False,
+        )
+        _attach_dsa_gqa_indexers(dst_model, cfg.hidden_size, indexer_head_dim=16, is_src=False)
+        dst_model = dst_model.to(device).eval()
+
+    batch = 2
+    seq_len = 8
+    vocab_size = 128
+    tokens = torch.arange(batch * seq_len, device=device, dtype=torch.long).view(batch, seq_len)
+    position_ids = (
+        torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
+    )
+    attention_mask = torch.ones((batch, 1, seq_len, seq_len), device=device, dtype=torch.bool)
+
+    ref_logits = torch.empty(batch, seq_len, vocab_size, device=device, dtype=torch.float32)
+    if is_src:
+        with torch.no_grad():
+            src_out = _run_forward(src_model, tokens, position_ids, attention_mask, src_pgs)
+        if rank == src_world - 1:
+            ref_logits.copy_(src_out)
+    dist.broadcast(ref_logits, src=src_world - 1)
+
+    swap_model_weights(
+        [src_model] if src_model is not None else None,
+        [dst_model] if dst_model is not None else None,
+        refit_method=refit_backend,
+    )
+    torch.cuda.synchronize()
+
+    dst_logits = torch.empty_like(ref_logits)
+    if is_dst:
+        with torch.no_grad():
+            dst_out = _run_forward(dst_model, tokens, position_ids, attention_mask, dst_pgs)
+        if rank == src_world + dst_world - 1:
+            dst_logits.copy_(dst_out)
+    dist.broadcast(dst_logits, src=src_world + dst_world - 1)
+
+    max_diff = (dst_logits - ref_logits).abs().max().item()
+    assert torch.allclose(dst_logits, ref_logits, atol=1e-3, rtol=1e-3), (
+        f"Non-collocated Mamba DSA-GQA refit via {refit_backend} "
+        f"src(TP={src_tp},PP={src_pp})->dst(TP={dst_tp},PP={dst_pp}) "
+        f"outputs differ (max_diff={max_diff:.6f})"
+    )
+    if dst_model is not None:
+        for module in dst_model.modules():
+            if isinstance(module, _DSAGQAIndexerProxy):
+                expected = torch.full_like(module.linear_q.weight, float(module._layer_number))
+                assert torch.equal(module.linear_q.weight, expected)
+
+    dist.barrier()
+    if src_model is not None:
+        del src_model
+    if dst_model is not None:
+        del dst_model
+    clear_all_caches()
+    _destroy_pg_collection(src_pgs)
+    _destroy_pg_collection(dst_pgs)
+    Utils.destroy_model_parallel()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize(
+    "refit_backend",
+    [
+        pytest.param(
             "nvshmem",
             marks=pytest.mark.skipif(
                 not has_nvshmem,
@@ -813,9 +1002,20 @@ def test_router_expert_bias_refit_non_collocated(refit_backend: str):
         (2, 1, 1, 1),  # TP2 -> TP1
         (1, 1, 2, 1),  # TP1 -> TP2
         (2, 1, 4, 1),  # TP2 -> TP4
+        (4, 1, 1, 1),  # TP4 -> TP1
+        (1, 1, 4, 1),  # TP1 -> TP4
+        (8, 1, 1, 1),  # Eight-GPU H100 CI: checkpoint layout TP8 -> TP1
+        (1, 1, 8, 1),  # Eight-GPU H100 CI: reverse TP1 -> TP8
+        # PP only changes (exercises global layer-name resolution)
+        (1, 1, 1, 2),  # PP1 -> PP2
+        (1, 2, 1, 1),  # PP2 -> PP1
         # TP + PP change together
         (1, 1, 2, 2),  # TP1,PP1 -> TP2,PP2
         (2, 1, 1, 2),  # TP2,PP1 -> TP1,PP2
+        (4, 1, 2, 2),  # TP4,PP1 -> TP2,PP2
+        (2, 2, 4, 1),  # TP2,PP2 -> TP4,PP1
+        (8, 1, 4, 2),  # Eight-GPU H100 CI: TP8,PP1 -> TP4,PP2
+        (4, 2, 8, 1),  # Eight-GPU H100 CI: reverse TP4,PP2 -> TP8,PP1
     ],
 )
 def test_swap_mamba_parametrized(
@@ -824,13 +1024,12 @@ def test_swap_mamba_parametrized(
     if not has_mamba_deps:
         pytest.skip("Mamba dependencies (mamba_ssm, einops) not available")
 
+    world = Utils.world_size
+    if (world % (src_tp * src_pp) != 0) or (world % (dst_tp * dst_pp) != 0):
+        pytest.skip("WORLD_SIZE must be divisible by both src_tp*src_pp and dst_tp*dst_pp")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=src_tp, pipeline_model_parallel_size=src_pp
     )
-    world = dist.get_world_size()
-    if (world % (src_tp * src_pp) != 0) or (world % (dst_tp * dst_pp) != 0):
-        Utils.destroy_model_parallel()
-        pytest.skip("WORLD_SIZE must be divisible by both src_tp*src_pp and dst_tp*dst_pp")
 
     model_parallel_cuda_manual_seed(1234)
     torch.manual_seed(1234)
@@ -854,7 +1053,8 @@ def test_swap_mamba_parametrized(
         num_layers=num_layers,
         hidden_size=256,
         num_attention_heads=8,
-        num_query_groups=4,
+        # Match the DSA-GQA checkpoint's TP > GQA layout (TP=8, one query group).
+        num_query_groups=1,
         use_cpu_initialization=True,
         pipeline_dtype=torch.float32,
         hidden_dropout=0.0,
@@ -867,16 +1067,12 @@ def test_swap_mamba_parametrized(
     src_pattern = _mamba_layer_pattern(base_pattern, num_layers, src_pp)
     dst_pattern = _mamba_layer_pattern(base_pattern, num_layers, dst_pp)
 
-    src_model = (
-        _build_mamba(cfg, vocab_size, seq_len, src_pgs, src_pattern, parallel_output=False)
-        .to(device)
-        .eval()
-    )
-    dst_model = (
-        _build_mamba(cfg, vocab_size, seq_len, dst_pgs, dst_pattern, parallel_output=False)
-        .to(device)
-        .eval()
-    )
+    src_model = _build_mamba(cfg, vocab_size, seq_len, src_pgs, src_pattern, parallel_output=False)
+    dst_model = _build_mamba(cfg, vocab_size, seq_len, dst_pgs, dst_pattern, parallel_output=False)
+    _attach_dsa_gqa_indexers(src_model, cfg.hidden_size, indexer_head_dim=16, is_src=True)
+    _attach_dsa_gqa_indexers(dst_model, cfg.hidden_size, indexer_head_dim=16, is_src=False)
+    src_model = src_model.to(device).eval()
+    dst_model = dst_model.to(device).eval()
 
     # Inputs
     batch = 2
@@ -915,10 +1111,14 @@ def test_swap_mamba_parametrized(
     assert ref_logits.shape == dst_logits.shape
     max_diff = (dst_logits - ref_logits).abs().max().item()
     assert torch.allclose(dst_logits, ref_logits, atol=1e-3, rtol=1e-3), (
-        f"Mamba refit src(TP={src_tp},PP={src_pp})"
+        f"Mamba DSA-GQA refit src(TP={src_tp},PP={src_pp})"
         f"->dst(TP={dst_tp},PP={dst_pp}) "
         f"outputs differ (max_diff={max_diff:.6f})"
     )
+    for module in dst_model.modules():
+        if isinstance(module, _DSAGQAIndexerProxy):
+            expected = torch.full_like(module.linear_q.weight, float(module._layer_number))
+            assert torch.equal(module.linear_q.weight, expected)
     dist.barrier()
 
     # Free GPU memory to prevent OOM across the many parametrized test cases

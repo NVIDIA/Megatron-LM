@@ -434,6 +434,43 @@ class TestLogicalShardPlanner:
 class TestPlanMultiDimLcm:
     """Tests for the LCM-based TP planner."""
 
+    @pytest.mark.parametrize("src_tp,dst_tp", [(8, 1), (1, 8), (8, 4), (4, 8)])
+    @pytest.mark.parametrize(
+        "param_name,global_shape,partition_dim",
+        [("linear_qkv.weight", (6528, 4096), 0), ("linear_proj.weight", (4096, 6144), 1)],
+    )
+    def test_dsa_gqa_checkpoint_tp_layout(
+        self, src_tp, dst_tp, param_name, global_shape, partition_dim
+    ):
+        """Cover the TP=8 DSA-GQA attention shapes recorded in the checkpoint."""
+        src_ranks = list(range(src_tp))
+        dst_ranks = list(range(8, 8 + dst_tp))
+        src_shape = list(global_shape)
+        dst_shape = list(global_shape)
+        src_shape[partition_dim] //= src_tp
+        dst_shape[partition_dim] //= dst_tp
+        src = _meta(
+            name=param_name,
+            shape=tuple(src_shape),
+            is_tp=src_tp > 1,
+            partition_dim=partition_dim,
+            tp_ranks=src_ranks,
+        )
+        dst = _meta(
+            name=param_name,
+            shape=tuple(dst_shape),
+            is_tp=dst_tp > 1,
+            partition_dim=partition_dim,
+            tp_ranks=dst_ranks,
+        )
+        desc = _tp_descriptor(dim=partition_dim, src_ranks=src_ranks, dst_ranks=dst_ranks)
+
+        for rank in dst_ranks:
+            ops = _plan_tp(param_name, src, dst, [desc], my_global_rank=rank)
+            _verify_full_coverage(
+                ops, dim=partition_dim, expected_full_len=dst_shape[partition_dim]
+            )
+
     def test_tp2_to_tp1(self):
         """TP2 → TP1: destination rank 0 should receive from both source ranks."""
         # Source: TP2, each rank has shape (64, 64) on dim 1
@@ -545,6 +582,44 @@ class TestPlanMultiDimLcm:
 
 class TestPlanBlockInterleaved:
     """Tests for the block-interleaved TP planner (Mamba in_proj style)."""
+
+    @pytest.mark.parametrize("src_tp,dst_tp", [(8, 1), (1, 8), (8, 4), (4, 8)])
+    @pytest.mark.parametrize(
+        "param_name,global_partition_sizes,trailing_shape",
+        [
+            ("mixer.in_proj.weight", [8192, 8192, 1024, 1024, 128], (4096,)),
+            ("mixer.conv1d_weight", [8192, 1024, 1024], (1, 4)),
+        ],
+    )
+    def test_dsa_gqa_checkpoint_mamba_layout(
+        self, src_tp, dst_tp, param_name, global_partition_sizes, trailing_shape
+    ):
+        """Cover the checkpoint's packed Mamba tensors at each requested TP transition."""
+        src_ranks = list(range(src_tp))
+        dst_ranks = list(range(8, 8 + dst_tp))
+        src_sizes = [size // src_tp for size in global_partition_sizes]
+        dst_sizes = [size // dst_tp for size in global_partition_sizes]
+        src = _meta(
+            name=param_name,
+            shape=(sum(src_sizes), *trailing_shape),
+            is_tp=src_tp > 1,
+            partition_dim=0,
+            partition_sizes=src_sizes,
+            tp_ranks=src_ranks,
+        )
+        dst = _meta(
+            name=param_name,
+            shape=(sum(dst_sizes), *trailing_shape),
+            is_tp=dst_tp > 1,
+            partition_dim=0,
+            partition_sizes=dst_sizes,
+            tp_ranks=dst_ranks,
+        )
+        desc = _tp_descriptor(dim=0, src_ranks=src_ranks, dst_ranks=dst_ranks)
+
+        for rank in dst_ranks:
+            ops = _plan_tp(param_name, src, dst, [desc], my_global_rank=rank)
+            _verify_full_coverage(ops, dim=0, expected_full_len=sum(dst_sizes))
 
     def test_tp2_to_tp1_two_blocks(self):
         """TP2 → TP1 with two blocks of different sizes."""
@@ -954,6 +1029,104 @@ def test_centralized_planner_compatibility_wrapper(monkeypatch):
 
 class TestTensorReshardSpecs:
     """Whole-parameter metadata retained for native reshard backends."""
+
+    @pytest.mark.parametrize("src_tp,dst_tp", [(8, 1), (1, 8), (8, 4), (4, 8)])
+    def test_dsa_gqa_checkpoint_native_specs(self, src_tp, dst_tp):
+        """M2N preserves the checkpoint's TP=8 attention, Mamba, and indexer layouts."""
+        src_mesh = list(range(src_tp))
+        dst_mesh = list(range(src_tp, src_tp + dst_tp))
+        mamba_global_sizes = [8192, 8192, 1024, 1024, 128]
+        src_mamba_sizes = [size // src_tp for size in mamba_global_sizes]
+        dst_mamba_sizes = [size // dst_tp for size in mamba_global_sizes]
+        conv_global_sizes = [8192, 1024, 1024]
+        src_conv_sizes = [size // src_tp for size in conv_global_sizes]
+        dst_conv_sizes = [size // dst_tp for size in conv_global_sizes]
+        parameters = [
+            ("linear_qkv.weight", (6528 // src_tp, 4096), (6528 // dst_tp, 4096), 0, None, None),
+            ("linear_proj.weight", (4096, 6144 // src_tp), (4096, 6144 // dst_tp), 1, None, None),
+            ("indexer.linear_q.weight", (192, 4096), (192, 4096), 0, None, None),
+            (
+                "mixer.in_proj.weight",
+                (sum(src_mamba_sizes), 4096),
+                (sum(dst_mamba_sizes), 4096),
+                0,
+                src_mamba_sizes,
+                dst_mamba_sizes,
+            ),
+            (
+                "mixer.conv1d_weight",
+                (sum(src_conv_sizes), 1, 4),
+                (sum(dst_conv_sizes), 1, 4),
+                0,
+                src_conv_sizes,
+                dst_conv_sizes,
+            ),
+        ]
+        src = {}
+        dst = {rank: {} for rank in dst_mesh}
+        for name, src_shape, dst_shape, partition_dim, src_sizes, dst_sizes in parameters:
+            src[name] = [
+                _meta(
+                    name=name,
+                    shape=src_shape,
+                    is_tp=name != "indexer.linear_q.weight" and src_tp > 1,
+                    partition_dim=partition_dim,
+                    partition_sizes=src_sizes,
+                    owner_rank=rank,
+                    tp_ranks=src_mesh,
+                    dp_ranks=[rank],
+                )
+                for rank in src_mesh
+            ]
+            for rank in dst_mesh:
+                dst[rank][name] = _meta(
+                    name=name,
+                    shape=dst_shape,
+                    is_tp=name != "indexer.linear_q.weight" and dst_tp > 1,
+                    partition_dim=partition_dim,
+                    partition_sizes=dst_sizes,
+                    owner_rank=rank,
+                    tp_ranks=dst_mesh,
+                    dp_ranks=[rank],
+                )
+
+        src_specs, error = _build_tensor_reshard_specs(dst, src, my_global_rank=src_mesh[0])
+        dst_specs, dst_error = _build_tensor_reshard_specs(dst, src, my_global_rank=dst_mesh[0])
+
+        assert error is None
+        assert dst_error is None
+        assert len(src_specs) == len(dst_specs) == 11
+        by_name = {}
+        for spec in src_specs:
+            by_name.setdefault(spec.resolved_name, []).append(spec)
+
+        qkv = by_name["linear_qkv.weight"][0]
+        assert qkv.global_shape == (6528, 4096)
+        assert qkv.src_shard_dim == (0 if src_tp > 1 else None)
+        assert qkv.dst_shard_dim == (0 if dst_tp > 1 else None)
+        proj = by_name["linear_proj.weight"][0]
+        assert proj.global_shape == (4096, 6144)
+        assert proj.src_shard_dim == (1 if src_tp > 1 else None)
+        assert proj.dst_shard_dim == (1 if dst_tp > 1 else None)
+        indexer = by_name["indexer.linear_q.weight"][0]
+        assert indexer.global_shape == (192, 4096)
+        assert indexer.src_shard_dim is indexer.dst_shard_dim is None
+
+        mamba = by_name["mixer.in_proj.weight"]
+        assert [spec.global_shape for spec in mamba] == [
+            (8192, 4096),
+            (8192, 4096),
+            (1024, 4096),
+            (1024, 4096),
+            (128, 4096),
+        ]
+        assert [spec.src_local_shape[0] for spec in mamba] == src_mamba_sizes
+        assert [spec.dst_local_shape[0] for spec in mamba] == dst_mamba_sizes
+
+        conv = by_name["mixer.conv1d_weight"]
+        assert [spec.global_shape for spec in conv] == [(8192, 1, 4), (1024, 1, 4), (1024, 1, 4)]
+        assert [spec.src_local_shape[0] for spec in conv] == src_conv_sizes
+        assert [spec.dst_local_shape[0] for spec in conv] == dst_conv_sizes
 
     def test_tp_transition_uses_local_names_and_global_shape(self):
         resolved_name = "decoder.layers.7.linear.weight"
