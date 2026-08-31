@@ -87,8 +87,10 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
 
     Sent by ``InferenceClient.add_request`` / ``add_request_streaming``.
 
-    ``metadata``: ``[header, client_request_id, sampling_params]``, where
-        ``sampling_params`` is the serialized dict.
+    ``metadata``: ``[header, client_request_id, sampling_params, multi_modal_data]``,
+        where ``sampling_params`` is the serialized dict and ``multi_modal_data``
+        carries the media identity the routing policy keys on. Both are
+        constant-size, which is why they are decoded here on every request.
     ``bodies``: ``[prompt]`` -- one frame holding the packed prompt (a string or
         a token id list). Forwarded to the engine untouched, and decoded here
         only when the routing policy needs block hashes.
