@@ -536,6 +536,8 @@ communication stream. The public `torch.distributed.batch_isend_irecv` batch con
 objects ordered as `[isend(next), irecv(previous)]`, and every operation sets
 `group=effective_cp_group`. For a compute-produced payload, the communication stream waits for its producer;
 each returned `Work.wait` is issued while that stream is current, followed by a CUDA readiness event.
+The producer stream is captured before entering the communication-stream context; querying the current
+stream after that switch would return the communication stream itself and silently remove the dependency.
 Only the first hop waits for the ordinary compute stream. Before a later hop is exposed to attention,
 the communication stream copies the received latent payload into a dedicated relay buffer and records
 a new readiness event. The consumer waits only for that small D2D staging copy; attention reads the

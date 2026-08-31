@@ -117,9 +117,11 @@ def _launch_ring_exchange(
         pending.send_tensor = payload
         return receive
 
+    producer_stream = torch.cuda.current_stream(payload.device)
     with torch.cuda.stream(communication_stream):
         if wait_for_compute_stream:
-            communication_stream.wait_stream(torch.cuda.current_stream(payload.device))
+            # current_stream() is the communication stream inside this context.
+            communication_stream.wait_stream(producer_stream)
         for work in dist.batch_isend_irecv(operations):
             work.wait()
         ready_event = torch.cuda.Event()
