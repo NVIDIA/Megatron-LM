@@ -273,6 +273,13 @@ def _add_quant_cfg_entry(quant_cfg, quantizer_name, config):
         quant_cfg.append({"quantizer_name": quantizer_name, **config})
 
 
+def _megatron_prefill_for_calibration(model, input_ids):
+    prefill_kwargs = {}
+    if "skip_return_logits" in inspect.signature(megatron_prefill).parameters:
+        prefill_kwargs["skip_return_logits"] = True
+    return megatron_prefill(model, input_ids, **prefill_kwargs)
+
+
 def get_modelopt_torch_quantization_config():
     """Return a quantization config."""
     args = get_args()
@@ -586,7 +593,7 @@ if __name__ == "__main__":
                 sample = get_batch_on_this_cp_rank(
                     sample, is_hybrid_cp=False, cp_group=get_context_parallel_group()
                 )
-                megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
+                _megatron_prefill_for_calibration(model, sample["input_ids"])
 
     unwrapped_model = unwrap_model(model)[0]
 
