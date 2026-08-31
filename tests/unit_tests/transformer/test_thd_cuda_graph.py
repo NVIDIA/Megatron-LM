@@ -1200,11 +1200,735 @@ def test_balanced_static_pack_pp_allows_graph_scope_outside_attention(monkeypatc
             {"delay_wgrad_compute": True},
             "does not yet support overlap_moe_expert_parallel_comm or delay_wgrad_compute",
         ),
+        (
+            {
+                "mtp_num_layers": 1,
+                "recompute_granularity": "full",
+                "recompute_method": "uniform",
+                "recompute_num_layers": 1,
+            },
+            "does not yet support full activation recompute with MTP",
+        ),
     ],
 )
 def test_balanced_dynamic_packs_validates_opt_in_contract(monkeypatch, overrides, match):
     with pytest.raises(ValueError, match=match):
         _make_balanced_dynamic_pack_config(monkeypatch, **overrides)
+
+
+@pytest.mark.internal
+def test_direct_layer_route_decompose_rejects_wrong_rank_before_flattening(monkeypatch):
+    """Direct/MTP replay must validate the eager host rank tag before TE drops it."""
+    from megatron.core import parallel_state
+    from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+    class RankOneCPGroup:
+        @staticmethod
+        def size():
+            return 2
+
+        @staticmethod
+        def rank():
+            return 1
+
+    class RankZeroCPGroup:
+        @staticmethod
+        def size():
+            return 2
+
+        @staticmethod
+        def rank():
+            return 0
+
+    cu = torch.tensor([0, 8, 16, 16], dtype=torch.int32)
+    plan = cp_balanced_indexer.build_graph_dynamic_plan(cu, RankOneCPGroup(), 16)
+    packed = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu.clone(),
+        cu_seqlens_q_padded=cu.clone(),
+        cu_seqlens_kv_padded=cu.clone(),
+        max_seqlen_q=16,
+        max_seqlen_kv=16,
+    )
+    cp_balanced_indexer.attach_graph_dynamic_plan(packed, plan)
+    layer = SimpleNamespace(
+        config=SimpleNamespace(context_parallel_size=2, max_seqlen_per_dp_cp_rank=8),
+        pg_collection=SimpleNamespace(cp=RankZeroCPGroup()),
+        _uses_graph_dynamic_dsa_route=lambda: True,
+        _set_te_cuda_graph_route_replay_state=lambda _packed: pytest.fail(
+            "wrong-rank route reached replay-state setup"
+        ),
+    )
+    # A conflicting global rank proves the direct path consults its explicit group.
+    monkeypatch.setattr(parallel_state, "get_context_parallel_rank", lambda: 1)
+
+    with pytest.raises(ValueError, match="current rank-local contract"):
+        TransformerLayer._decompose_packed_seq_params_to_kwargs(
+            layer, {"packed_seq_params": packed}
+        )
+
+
+def _make_cpu_route_arena_block(num_slots=2):
+    """Construct only the TransformerBlock state exercised by route-arena unit tests."""
+    from megatron.core.transformer.transformer_block import TransformerBlock
+
+    block = object.__new__(TransformerBlock)
+    torch.nn.Module.__init__(block)
+    block.config = SimpleNamespace(
+        dsa_cp_balance_indexer_graph_dynamic_packs=True,
+        context_parallel_size=2,
+        max_seqlen_per_dp_cp_rank=8,
+    )
+    block.pg_collection = SimpleNamespace(cp=SimpleNamespace(size=lambda: 2, rank=lambda: 0))
+    block.current_microbatch = 0
+    block._te_cuda_graph_route_metadata_arenas = ()
+    block._te_cuda_graph_route_metadata_arena_ptrs = ()
+    logical_route_numel = 20
+    arenas = tuple(
+        (
+            torch.zeros(12, dtype=torch.int32),
+            torch.cat(
+                (
+                    torch.zeros(logical_route_numel, dtype=torch.int64),
+                    torch.full((slot + 1,), slot + 1, dtype=torch.int64),
+                )
+            ),
+        )
+        for slot in range(num_slots)
+    )
+    block.set_te_cuda_graph_route_metadata_arenas(arenas, logical_route_numel=logical_route_numel)
+    return block, arenas
+
+
+class TestGraphDynamicRouteMetadataArena:
+
+    @pytest.mark.internal
+    def test_block_stages_exactly_two_owners_once_and_preserves_source(self, monkeypatch):
+        """Layer count does not multiply route copies; the caller's PSP stays untouched."""
+        from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+        block, arenas = _make_cpu_route_arena_block(num_slots=2)
+        block.layers = torch.nn.ModuleList([torch.nn.Identity() for _ in range(6)])
+        block.current_microbatch = 3  # slot 1 by modulo
+        source_layout = torch.arange(12, dtype=torch.int32)
+        source_route = torch.arange(20, dtype=torch.int64)
+        source = SimpleNamespace(route_buffers=(source_layout, source_route))
+
+        monkeypatch.setattr(
+            cp_balanced_indexer,
+            "get_graph_dynamic_plan_buffers",
+            lambda params: params.route_buffers,
+        )
+        monkeypatch.setattr(
+            cp_balanced_indexer,
+            "get_graph_dynamic_plan",
+            lambda _params: {"cp_size": 2, "cp_rank": 0, "l_local": 8, "route_padding": 0},
+        )
+
+        def attach(
+            params, layout_i32, route_i64, _cp_size, _l_local, *, route_padding=0, cp_rank=None
+        ):
+            params.route_buffers = (layout_i32, route_i64)
+            params.route_padding = route_padding
+            params.cp_rank = cp_rank
+
+        monkeypatch.setattr(cp_balanced_indexer, "attach_graph_dynamic_plan_buffers", attach)
+
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as prof:
+            staged = block._stage_te_cuda_graph_route_metadata(source)
+
+        copy_events = [event for event in prof.events() if event.name == "aten::copy_"]
+        assert len(copy_events) == 2
+        assert staged is not source
+        assert staged.route_buffers[0] is arenas[1][0]
+        assert staged.route_buffers[1] is arenas[1][1]
+        assert staged.route_padding == 2
+        assert staged.cp_rank == 0
+        assert staged._te_cuda_graph_route_microbatch_id == 3
+        assert staged._te_cuda_graph_route_slot == 1
+        assert torch.equal(arenas[1][0], source_layout)
+        assert torch.equal(arenas[1][1][: source_route.numel()], source_route)
+        assert torch.equal(arenas[1][1][source_route.numel() :], torch.full((2,), 2))
+        assert torch.count_nonzero(arenas[0][0]) == 0
+        assert torch.count_nonzero(arenas[0][1][: source_route.numel()]) == 0
+        assert source.route_buffers[0] is source_layout
+        assert source.route_buffers[1] is source_route
+
+    @pytest.mark.internal
+    def test_block_rejects_unknown_rank_source_before_staging(self, monkeypatch):
+        """A tensor-only reconstructed plan cannot be relabeled as a runtime rank."""
+        from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+        block, _ = _make_cpu_route_arena_block(num_slots=2)
+        source = SimpleNamespace(
+            route_buffers=(torch.arange(12, dtype=torch.int32), torch.arange(20, dtype=torch.int64))
+        )
+        monkeypatch.setattr(
+            cp_balanced_indexer,
+            "get_graph_dynamic_plan_buffers",
+            lambda params: params.route_buffers,
+        )
+        monkeypatch.setattr(
+            cp_balanced_indexer,
+            "get_graph_dynamic_plan",
+            lambda _params: {"cp_size": 2, "cp_rank": None, "l_local": 8, "route_padding": 0},
+        )
+
+        with pytest.raises(ValueError, match="exact rank-local source plan"):
+            block._stage_te_cuda_graph_route_metadata(source)
+
+    @pytest.mark.internal
+    def test_slot_modulo_schema_and_pointer_guards(self):
+        block, arenas = _make_cpu_route_arena_block(num_slots=2)
+        selected = block.get_te_cuda_graph_route_metadata_arena(5)
+        assert selected[0] is arenas[1][0]
+        assert selected[1] is arenas[1][1]
+
+        with pytest.raises(TypeError, match="int32 layout, int64 route"):
+            block.set_te_cuda_graph_route_metadata_arenas(
+                ((torch.zeros(12, dtype=torch.int64), torch.zeros(21, dtype=torch.int64)),),
+                logical_route_numel=20,
+            )
+        with pytest.raises(ValueError, match="must not alias"):
+            block.set_te_cuda_graph_route_metadata_arenas(
+                (arenas[0], arenas[0]), logical_route_numel=20
+            )
+
+        block._te_cuda_graph_route_metadata_arenas = ((arenas[0][0].clone(), arenas[0][1]),) + (
+            arenas[1],
+        )
+        with pytest.raises(RuntimeError, match="changed address"):
+            block.get_te_cuda_graph_route_metadata_arena(0)
+
+    @staticmethod
+    def _make_capture_helper(num_chunks=2, num_slots=2, num_layers=2):
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        class RouteLayer:
+            def _uses_graph_dynamic_dsa_route(self):
+                return True
+
+        class ArenaBlock:
+            def __init__(self, layers):
+                self.layers = layers
+                self.arenas = ()
+                self.pg_collection = SimpleNamespace(
+                    cp=SimpleNamespace(size=lambda: 2, rank=lambda: 0)
+                )
+
+            def set_te_cuda_graph_route_metadata_arenas(
+                self, arenas, *, logical_route_numel, cp_rank=None
+            ):
+                self.arenas = tuple(arenas)
+                self.logical_route_numel = logical_route_numel
+                self.cp_rank = cp_rank
+
+            def clear_te_cuda_graph_route_metadata_arenas(self):
+                self.arenas = ()
+
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = SimpleNamespace(
+            dsa_cp_balance_indexer_graph_dynamic_packs=True,
+            context_parallel_size=2,
+            overlap_moe_expert_parallel_comm=False,
+            delay_wgrad_compute=False,
+        )
+        helper.num_microbatches = num_slots
+        helper.callables_per_chunk = []
+        helper.callables_per_chunk_is_mtp = []
+        helper.chunks_with_decoder = []
+        for _ in range(num_chunks):
+            layers = [RouteLayer() for _ in range(num_layers)]
+            block = ArenaBlock(layers)
+            helper.callables_per_chunk.append(layers)
+            helper.callables_per_chunk_is_mtp.append([False] * num_layers)
+            helper.chunks_with_decoder.append(SimpleNamespace(decoder=block))
+        helper.flattened_callables = [
+            layer for layers in helper.callables_per_chunk for layer in layers
+        ]
+
+        sample_kwargs = []
+        for sample_idx in range(len(helper.flattened_callables) * num_slots):
+            sample_kwargs.append(
+                {
+                    "dsa_cp_graph_layout_buffer": torch.full((12,), sample_idx, dtype=torch.int32),
+                    "dsa_cp_graph_route_buffer": torch.full((20,), sample_idx, dtype=torch.int64),
+                    "unrelated": torch.tensor(sample_idx),
+                }
+            )
+        return helper, sample_kwargs
+
+    @pytest.mark.internal
+    def test_capture_shares_within_chunk_slot_and_isolates_vpp_chunks_and_slots(self):
+        helper, sample_kwargs = self._make_capture_helper()
+        unrelated_ptrs = [kwargs["unrelated"].data_ptr() for kwargs in sample_kwargs]
+        route_arenas = helper._canonicalize_graph_dynamic_route_inputs(sample_kwargs)
+
+        all_ptrs = set()
+        route_lengths = set()
+        for chunk_idx in range(2):
+            chunk_base = chunk_idx * 2 * 2
+            for slot in range(2):
+                first_idx = chunk_base + slot * 2
+                second_idx = first_idx + 1
+                first_pair = (
+                    sample_kwargs[first_idx]["dsa_cp_graph_layout_buffer"],
+                    sample_kwargs[first_idx]["dsa_cp_graph_route_buffer"],
+                )
+                second_pair = (
+                    sample_kwargs[second_idx]["dsa_cp_graph_layout_buffer"],
+                    sample_kwargs[second_idx]["dsa_cp_graph_route_buffer"],
+                )
+                assert first_pair[0].data_ptr() == second_pair[0].data_ptr()
+                assert first_pair[1].data_ptr() == second_pair[1].data_ptr()
+                assert first_pair[0].data_ptr() not in all_ptrs
+                assert first_pair[1].data_ptr() not in all_ptrs
+                all_ptrs.update((first_pair[0].data_ptr(), first_pair[1].data_ptr()))
+                assert first_pair[1].numel() not in route_lengths
+                route_lengths.add(first_pair[1].numel())
+        assert [kwargs["unrelated"].data_ptr() for kwargs in sample_kwargs] == unrelated_ptrs
+
+        helper._attach_graph_dynamic_route_arenas(sample_kwargs, route_arenas)
+        assert all(len(chunk.decoder.arenas) == 2 for chunk in helper.chunks_with_decoder)
+
+        old_ptrs = set(all_ptrs)
+        helper._clear_graph_dynamic_route_arenas()
+        assert all(not chunk.decoder.arenas for chunk in helper.chunks_with_decoder)
+
+        next_kwargs = self._make_capture_helper()[1]
+        next_arenas = helper._canonicalize_graph_dynamic_route_inputs(next_kwargs)
+        helper._attach_graph_dynamic_route_arenas(next_kwargs, next_arenas)
+        next_ptrs = {
+            tensor.data_ptr()
+            for chunk in helper.chunks_with_decoder
+            for pair in chunk.decoder.arenas
+            for tensor in pair
+        }
+        assert old_ptrs.isdisjoint(next_ptrs)
+
+    @pytest.mark.internal
+    def test_post_capture_pointer_drift_fails_closed(self):
+        helper, sample_kwargs = self._make_capture_helper(num_chunks=1)
+        route_arenas = helper._canonicalize_graph_dynamic_route_inputs(sample_kwargs)
+        sample_kwargs[0]["dsa_cp_graph_layout_buffer"] = sample_kwargs[0][
+            "dsa_cp_graph_layout_buffer"
+        ].clone()
+
+        with pytest.raises(RuntimeError, match="split one canonical DSA route arena"):
+            helper._attach_graph_dynamic_route_arenas(sample_kwargs, route_arenas)
+
+    @pytest.mark.internal
+    def test_post_te_rebind_uses_final_common_pair(self):
+        helper, sample_kwargs = self._make_capture_helper(num_chunks=1, num_slots=1)
+        route_arenas = helper._canonicalize_graph_dynamic_route_inputs(sample_kwargs)
+        expected_pair = route_arenas[(0, 0)]["pair"]
+        final_pair = (torch.zeros_like(expected_pair[0]), torch.zeros_like(expected_pair[1]))
+        for graph_idx in route_arenas[(0, 0)]["graph_indices"]:
+            sample_kwargs[graph_idx]["dsa_cp_graph_layout_buffer"] = final_pair[0]
+            sample_kwargs[graph_idx]["dsa_cp_graph_route_buffer"] = final_pair[1]
+
+        helper._attach_graph_dynamic_route_arenas(sample_kwargs, route_arenas)
+        attached = helper.chunks_with_decoder[0].decoder.arenas[0]
+        assert attached[0] is final_pair[0]
+        assert attached[1] is final_pair[1]
+
+    @pytest.mark.internal
+    def test_rank_without_route_callable_is_noop_and_mtp_keeps_direct_fallback(self):
+        helper, _sample_kwargs = self._make_capture_helper(num_chunks=1)
+        helper.callables_per_chunk[0] = []
+        helper.callables_per_chunk_is_mtp[0] = []
+        helper.flattened_callables = []
+        assert helper._canonicalize_graph_dynamic_route_inputs([]) == {}
+
+        helper, sample_kwargs = self._make_capture_helper(num_chunks=1, num_slots=1, num_layers=1)
+        helper.callables_per_chunk_is_mtp = [[True]]
+        original_ptrs = (
+            sample_kwargs[0]["dsa_cp_graph_layout_buffer"].data_ptr(),
+            sample_kwargs[0]["dsa_cp_graph_route_buffer"].data_ptr(),
+        )
+        assert helper._canonicalize_graph_dynamic_route_inputs(sample_kwargs) == {}
+        assert (
+            sample_kwargs[0]["dsa_cp_graph_layout_buffer"].data_ptr(),
+            sample_kwargs[0]["dsa_cp_graph_route_buffer"].data_ptr(),
+        ) == original_ptrs
+
+    @pytest.mark.internal
+    def test_transformer_and_hybrid_stacks_share_route_arena_owner_methods(self):
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+        from megatron.core.transformer.module import MegatronModule
+        from megatron.core.transformer.transformer_block import TransformerBlock
+
+        assert (
+            TransformerBlock._stage_te_cuda_graph_route_metadata
+            is MegatronModule._stage_te_cuda_graph_route_metadata
+        )
+        assert (
+            HybridStack._stage_te_cuda_graph_route_metadata
+            is MegatronModule._stage_te_cuda_graph_route_metadata
+        )
+
+        hybrid = object.__new__(HybridStack)
+        torch.nn.Module.__init__(hybrid)
+        hybrid.config = SimpleNamespace(context_parallel_size=1)
+        hybrid.pg_collection = SimpleNamespace(cp=SimpleNamespace(size=lambda: 1, rank=lambda: 0))
+        arenas = ((torch.zeros(12, dtype=torch.int32), torch.zeros(21, dtype=torch.int64)),)
+        hybrid.set_te_cuda_graph_route_metadata_arenas(arenas, logical_route_numel=20)
+        selected = hybrid.get_te_cuda_graph_route_metadata_arena(0)
+        assert selected[0] is arenas[0][0]
+        assert selected[1] is arenas[0][1]
+
+    @pytest.mark.internal
+    def test_set_current_microbatch_updates_owning_block(self, monkeypatch):
+        from megatron.core.transformer import cuda_graphs
+
+        block = SimpleNamespace(layers=[])
+        wrapped = SimpleNamespace(decoder=block)
+
+        def get_wrapped(_model, attr, **_kwargs):
+            if attr == "decoder":
+                return wrapped
+            if attr == "vision_model":
+                return None
+            raise AssertionError(attr)
+
+        monkeypatch.setattr(cuda_graphs, "get_attr_wrapped_model", get_wrapped)
+        cuda_graphs.set_current_microbatch(object(), 7)
+        assert block.current_microbatch == 7
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_real_te_shared_route_arenas_replay_30_dynamic_packs(self, monkeypatch):
+        """Real TE graphs share one two-copy route arena per stack slot for 30 replays."""
+        from transformer_engine.pytorch.graph import make_graphed_callables
+
+        from megatron.core import parallel_state
+        from megatron.core.transformer.cuda_graphs import (
+            TECudaGraphHelper,
+            _set_capture_end,
+            _set_capture_start,
+        )
+        from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+        from megatron.core.transformer.module import GraphableMegatronModule
+        from megatron.core.transformer.transformer_block import TransformerBlock
+        from megatron.core.utils import is_te_min_version
+
+        if not is_te_min_version("2.7.0"):
+            pytest.skip("route-arena integration requires TE >= 2.7")
+
+        # Keep this test topology-local. The route builder and owner attach still use the
+        # production CP=2, rank-0 contract, but no process group or collective is required.
+        monkeypatch.setattr(parallel_state, "get_context_parallel_rank", lambda: 0)
+        config = SimpleNamespace(
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[],
+            fine_grained_activation_offloading=False,
+            delay_offload_until_cuda_graph=False,
+            dsa_cp_balance_indexer_graph_dynamic_packs=True,
+            context_parallel_size=2,
+            max_seqlen_per_dp_cp_rank=8,
+            overlap_moe_expert_parallel_comm=False,
+            delay_wgrad_compute=False,
+        )
+
+        class LocalCPGroup:
+            @staticmethod
+            def size():
+                return 2
+
+            @staticmethod
+            def rank():
+                return 0
+
+        class RouteToyLayer(GraphableMegatronModule):
+            def __init__(self, layer_number):
+                # A tiny test-only Graphable module avoids constructing a full TransformerLayer,
+                # while exercising GraphableMegatronModule's real TE replay/slot selection.
+                torch.nn.Module.__init__(self)
+                self.config = config
+                self.pg_collection = SimpleNamespace(cp=LocalCPGroup())
+                self.layer_number = layer_number
+                self.gain = torch.nn.Parameter(
+                    torch.linspace(
+                        0.9 + 0.1 * layer_number, 1.2 + 0.1 * layer_number, 4, device="cuda"
+                    )
+                )
+                self.bias = torch.nn.Parameter(
+                    torch.linspace(-0.2, 0.1, 4, device="cuda") + 0.05 * layer_number
+                )
+                self.cuda_graphs = []
+                self.cuda_graph_manual_hooks = []
+                self._te_cuda_graph_route_replay_state = None
+
+            @staticmethod
+            def _uses_graph_dynamic_dsa_route():
+                return True
+
+            def _decompose_packed_seq_params_to_kwargs(self, kwargs):
+                # Exercise the production rank check and staged-slot tag plumbing.
+                return TransformerLayer._decompose_packed_seq_params_to_kwargs(self, kwargs)
+
+            def _te_cuda_graph_replay(self, *args, **kwargs):
+                # The production replay wrapper owns PackedSeqParams decomposition.
+                return TransformerLayer._te_cuda_graph_replay(self, *args, **kwargs)
+
+            def _te_cuda_graph_replay_impl(self, args, kwargs, context):
+                assert context is None
+                return GraphableMegatronModule._te_cuda_graph_replay(self, *args, **kwargs)
+
+            def forward(
+                self,
+                hidden_states,
+                cu_seqlens_q,
+                cu_seqlens_kv,
+                cu_seqlens_q_padded,
+                cu_seqlens_kv_padded,
+                dsa_cp_graph_layout_buffer,
+                dsa_cp_graph_route_buffer,
+                is_first_microbatch=False,
+            ):
+                del is_first_microbatch
+                signal = (
+                    dsa_cp_graph_layout_buffer[:4].to(hidden_states.dtype).sum() * 0.01
+                    + dsa_cp_graph_route_buffer[:4].to(hidden_states.dtype).sum() * 0.001
+                    + cu_seqlens_q.to(hidden_states.dtype).sum() * 0.0001
+                    + cu_seqlens_kv.to(hidden_states.dtype).sum() * 0.0001
+                    + cu_seqlens_q_padded.to(hidden_states.dtype).sum() * 0.0001
+                    + cu_seqlens_kv_padded.to(hidden_states.dtype).sum() * 0.0001
+                )
+                return hidden_states * (self.gain + signal * 0.001) + self.bias * signal * 0.01
+
+        graph_layers = torch.nn.ModuleList((RouteToyLayer(0), RouteToyLayer(1)))
+        eager_layers = torch.nn.ModuleList((RouteToyLayer(0), RouteToyLayer(1)))
+        for graph_layer, eager_layer in zip(graph_layers, eager_layers):
+            eager_layer.load_state_dict(graph_layer.state_dict())
+            graph_layer.train()
+            eager_layer.train()
+
+        block = object.__new__(TransformerBlock)
+        torch.nn.Module.__init__(block)
+        block.config = config
+        block.layers = graph_layers
+        block.pg_collection = SimpleNamespace(cp=LocalCPGroup())
+        block.current_microbatch = 0
+        block.clear_te_cuda_graph_route_metadata_arenas()
+
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = config
+        helper.num_microbatches = 2
+        helper.callables_per_chunk = [list(graph_layers)]
+        helper.callables_per_chunk_is_mtp = [[False, False]]
+        helper.chunks_with_decoder = [SimpleNamespace(decoder=block)]
+        helper.flattened_callables = list(graph_layers)
+
+        # These are three genuine fixed-capacity zigzag plans. K=4 for each plan,
+        # CP=2, L=8, and every sequence length is divisible by 2*CP.
+        source_packs = []
+        for boundaries in ((0, 8, 16, 16), (0, 8, 8, 16), (0, 0, 8, 16)):
+            cu = torch.tensor(boundaries, dtype=torch.int32, device="cuda")
+            built = cp_balanced_indexer.build_graph_dynamic_plan(cu, LocalCPGroup(), 16)
+            packed = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu,
+                cu_seqlens_kv=cu.clone(),
+                cu_seqlens_q_padded=cu.clone(),
+                cu_seqlens_kv_padded=cu.clone(),
+                max_seqlen_q=16,
+                max_seqlen_kv=16,
+            )
+            cp_balanced_indexer.attach_graph_dynamic_plan_buffers(
+                packed, built["layout_i32"], built["route_i64"], 2, 8, cp_rank=0
+            )
+            source_packs.append(packed)
+
+        source_pairs = tuple(
+            cp_balanced_indexer.get_graph_dynamic_plan_buffers(packed) for packed in source_packs
+        )
+        logical_route_numel = source_pairs[0][1].numel()
+        assert logical_route_numel == 26
+        assert all(
+            cp_balanced_indexer.get_graph_dynamic_plan(packed)["route_padding"] == 0
+            for packed in source_packs
+        )
+        source_ptrs = tuple(tuple(owner.data_ptr() for owner in pair) for pair in source_pairs)
+        source_snapshots = tuple(tuple(owner.clone() for owner in pair) for pair in source_pairs)
+
+        sample_args = tuple(
+            (torch.full((8, 4), 0.125 * (sample_idx + 1), device="cuda", requires_grad=True),)
+            for sample_idx in range(4)
+        )
+        sample_kwargs = [
+            {
+                "cu_seqlens_q": source_packs[0].cu_seqlens_q,
+                "cu_seqlens_kv": source_packs[0].cu_seqlens_kv,
+                "cu_seqlens_q_padded": source_packs[0].cu_seqlens_q_padded,
+                "cu_seqlens_kv_padded": source_packs[0].cu_seqlens_kv_padded,
+                "dsa_cp_graph_layout_buffer": source_pairs[0][0],
+                "dsa_cp_graph_route_buffer": source_pairs[0][1],
+            }
+            for _ in range(4)
+        ]
+        route_arenas = helper._canonicalize_graph_dynamic_route_inputs(sample_kwargs)
+
+        graphed = ()
+        _set_capture_start()
+        try:
+            graphed = make_graphed_callables(
+                tuple(graph_layers),
+                sample_args,
+                sample_kwargs=sample_kwargs,
+                allow_unused_input=True,
+                num_warmup_iters=1,
+                _order=[1, -1, 1, -1],
+                _num_layers_per_chunk=[2],
+                retain_graph_in_backward=False,
+                _reuse_graph_input_output_buffers=True,
+                fp8_enabled=False,
+            )
+        finally:
+            _set_capture_end()
+
+        try:
+            assert len(graphed) == 4
+            helper._attach_graph_dynamic_route_arenas(sample_kwargs, route_arenas)
+            arenas = block._te_cuda_graph_route_metadata_arenas
+            assert tuple(pair[1].numel() for pair in arenas) == (
+                logical_route_numel + 1,
+                logical_route_numel + 2,
+            )
+            assert len({pair[1].shape for pair in arenas}) == 2
+
+            # The two layer graphs for a slot must expose the same final TE static owners.
+            for slot in range(2):
+                arena_ptrs = tuple(owner.data_ptr() for owner in arenas[slot])
+                for layer_number in range(2):
+                    graph_idx = slot * 2 + layer_number
+                    assert (
+                        sample_kwargs[graph_idx]["dsa_cp_graph_layout_buffer"].data_ptr(),
+                        sample_kwargs[graph_idx]["dsa_cp_graph_route_buffer"].data_ptr(),
+                    ) == arena_ptrs
+                graph_layers[0].cuda_graphs.append(graphed[slot * 2])
+                graph_layers[1].cuda_graphs.append(graphed[slot * 2 + 1])
+
+            arena_ptrs = tuple(tuple(owner.data_ptr() for owner in pair) for pair in arenas)
+            suffixes = tuple(
+                pair[1]
+                .narrow(0, logical_route_numel, pair[1].numel() - logical_route_numel)
+                .clone()
+                for pair in arenas
+            )
+            assert torch.equal(suffixes[0], torch.ones(1, dtype=torch.int64, device="cuda"))
+            assert torch.equal(suffixes[1], torch.full((2,), 2, dtype=torch.int64, device="cuda"))
+
+            for layer in tuple(graph_layers) + tuple(eager_layers):
+                for parameter in layer.parameters():
+                    parameter.grad = None
+
+            hidden_template = torch.linspace(-0.75, 0.75, 32, device="cuda").view(8, 4)
+            grad_output = torch.linspace(0.5, -0.5, 32, device="cuda").view(8, 4)
+            first_outputs = {}
+            for replay_idx in range(30):
+                pack_idx = replay_idx % 3
+                source = source_packs[pack_idx]
+                source_pair = source_pairs[pack_idx]
+                slot = replay_idx % 2
+                other_slot = 1 - slot
+                block.current_microbatch = replay_idx
+
+                selected_versions = tuple(owner._version for owner in arenas[slot])
+                other_versions = tuple(owner._version for owner in arenas[other_slot])
+                other_snapshot = tuple(owner.clone() for owner in arenas[other_slot])
+                staged = block._stage_te_cuda_graph_route_metadata(source)
+                staged_pair = cp_balanced_indexer.get_graph_dynamic_plan_buffers(staged)
+                assert tuple(owner.data_ptr() for owner in staged_pair) == arena_ptrs[slot]
+                assert tuple(owner._version for owner in arenas[slot]) == tuple(
+                    version + 1 for version in selected_versions
+                )
+
+                graph_hidden = hidden_template.clone().requires_grad_(True)
+                graph_output = graph_hidden
+                for layer in graph_layers:
+                    # Simulate checkpoint recompute after the global layer state advanced to
+                    # another slot. The staged invocation must still select its retained graph.
+                    layer.current_microbatch = replay_idx + 1
+                    graph_output = layer(graph_output, packed_seq_params=staged)
+                    assert layer._te_cuda_graph_route_replay_state is None
+                graph_output.backward(grad_output)
+
+                eager_hidden = hidden_template.clone().requires_grad_(True)
+                eager_output = eager_hidden
+                for layer in eager_layers:
+                    eager_output = layer(
+                        eager_output,
+                        cu_seqlens_q=source.cu_seqlens_q,
+                        cu_seqlens_kv=source.cu_seqlens_kv,
+                        cu_seqlens_q_padded=source.cu_seqlens_q_padded,
+                        cu_seqlens_kv_padded=source.cu_seqlens_kv_padded,
+                        dsa_cp_graph_layout_buffer=source_pair[0],
+                        dsa_cp_graph_route_buffer=source_pair[1],
+                    )
+                eager_output.backward(grad_output)
+
+                torch.testing.assert_close(graph_output, eager_output, rtol=0, atol=0)
+                torch.testing.assert_close(graph_hidden.grad, eager_hidden.grad, rtol=0, atol=0)
+                for graph_layer, eager_layer in zip(graph_layers, eager_layers):
+                    for (graph_name, graph_param), (eager_name, eager_param) in zip(
+                        graph_layer.named_parameters(), eager_layer.named_parameters()
+                    ):
+                        assert graph_name == eager_name
+                        assert graph_param.grad is not None and eager_param.grad is not None
+                        torch.testing.assert_close(
+                            graph_param.grad, eager_param.grad, rtol=0, atol=0
+                        )
+
+                # Exactly the stack-level two copies may update owner versions. A drift to the
+                # other layer slot would trigger TE input copies and mutate that static arena.
+                assert tuple(owner._version for owner in arenas[slot]) == tuple(
+                    version + 1 for version in selected_versions
+                )
+                assert tuple(owner._version for owner in arenas[other_slot]) == other_versions
+                for actual, expected in zip(arenas[other_slot], other_snapshot):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                for current_suffix, expected_suffix in zip(
+                    (
+                        pair[1].narrow(
+                            0, logical_route_numel, pair[1].numel() - logical_route_numel
+                        )
+                        for pair in arenas
+                    ),
+                    suffixes,
+                ):
+                    torch.testing.assert_close(current_suffix, expected_suffix, rtol=0, atol=0)
+                assert (
+                    tuple(tuple(owner.data_ptr() for owner in pair) for pair in arenas)
+                    == arena_ptrs
+                )
+                assert (
+                    tuple(tuple(owner.data_ptr() for owner in pair) for pair in source_pairs)
+                    == source_ptrs
+                )
+                for actual_pair, expected_pair in zip(source_pairs, source_snapshots):
+                    for actual, expected in zip(actual_pair, expected_pair):
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+                if pack_idx in first_outputs:
+                    torch.testing.assert_close(
+                        graph_output, first_outputs[pack_idx], rtol=0, atol=0
+                    )
+                else:
+                    first_outputs[pack_idx] = graph_output.detach().clone()
+
+            assert len(first_outputs) == 3
+            assert not torch.equal(first_outputs[0], first_outputs[1])
+            assert not torch.equal(first_outputs[1], first_outputs[2])
+        finally:
+            torch.cuda.synchronize()
+            for graph in graphed:
+                if hasattr(graph, "reset"):
+                    graph.reset()
+            for layer in graph_layers:
+                layer.cuda_graphs.clear()
+            block.clear_te_cuda_graph_route_metadata_arenas()
 
 
 class TestDynamicMicrobatchSlots:

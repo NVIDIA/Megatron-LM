@@ -78,6 +78,9 @@ _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
 logger = logging.getLogger(__name__)
 
+_DSA_GRAPH_LAYOUT_BUFFER_KWARG = "dsa_cp_graph_layout_buffer"
+_DSA_GRAPH_ROUTE_BUFFER_KWARG = "dsa_cp_graph_route_buffer"
+
 
 def _set_skip_fp8_weight_update_tensor(skip: bool) -> None:
     """Toggle TE's FP8 "skip weight refresh" flag between microbatches.
@@ -1829,6 +1832,328 @@ class TECudaGraphHelper:
 
         return uses_mhc_recompute_attn_cuda_graph_split(self.config)
 
+    def _uses_graph_dynamic_dsa_route_arena(self):
+        """Whether this capture needs block-owned, fixed-address DSA route metadata."""
+        return bool(getattr(self.config, "dsa_cp_balance_indexer_graph_dynamic_packs", False))
+
+    @staticmethod
+    def _validate_graph_dynamic_route_pair(layout_i32, route_i64, *, name):
+        """Validate the two physical owners passed to a captured DSA route."""
+        if not isinstance(layout_i32, torch.Tensor) or not isinstance(route_i64, torch.Tensor):
+            raise TypeError(f"{name} must contain two torch.Tensor owners")
+        if layout_i32.dtype != torch.int32 or route_i64.dtype != torch.int64:
+            raise TypeError(
+                f"{name} must be (int32 layout, int64 route), got "
+                f"({layout_i32.dtype}, {route_i64.dtype})"
+            )
+        if layout_i32.dim() != 1 or route_i64.dim() != 1:
+            raise ValueError(
+                f"{name} owners must be flat, got "
+                f"{tuple(layout_i32.shape)} and {tuple(route_i64.shape)}"
+            )
+        if not layout_i32.is_contiguous() or not route_i64.is_contiguous():
+            raise ValueError(f"{name} owners must be contiguous")
+        if layout_i32.device != route_i64.device:
+            raise ValueError(
+                f"{name} owners must share a device, got "
+                f"{layout_i32.device} and {route_i64.device}"
+            )
+        if layout_i32.numel() == 0 or route_i64.numel() == 0:
+            raise ValueError(f"{name} owners must be non-empty")
+
+    def _canonicalize_graph_dynamic_route_inputs(self, sample_kwargs):
+        """Create one route owner pair per ``(model chunk, live graph slot)``.
+
+        ``_get_sample_arguments`` and TE 2.7 may reuse general graph inputs according to
+        schedule liveness. Route metadata has a stronger identity contract: every captured
+        DSA layer in one chunk/slot must consume the same pair, while distinct chunks or live
+        slots must remain isolated. Canonicalizing the kwargs before capture establishes that
+        contract without disabling reuse for any other input.
+        """
+        if not self._uses_graph_dynamic_dsa_route_arena():
+            return {}
+        if self.config.overlap_moe_expert_parallel_comm or self.config.delay_wgrad_compute:
+            raise RuntimeError(
+                "Graph-dynamic DSA route arenas do not support overlap/delayed-wgrad capture"
+            )
+        if not isinstance(sample_kwargs, list):
+            raise TypeError("TE CUDA Graph sample_kwargs must be a list for DSA route capture")
+
+        expected_count = len(self.flattened_callables) * self.num_microbatches
+        if len(sample_kwargs) != expected_count:
+            raise ValueError(
+                "TE CUDA Graph DSA route sample count mismatch: "
+                f"expected {expected_count}, got {len(sample_kwargs)}"
+            )
+
+        route_arenas = {}
+        used_ptrs = set()
+        used_route_lengths = set()
+        logical_route_numel_by_chunk = {}
+        layers_before_chunk = 0
+        for chunk_idx, layers in enumerate(self.callables_per_chunk):
+            layers_are_mtp = self.callables_per_chunk_is_mtp[chunk_idx]
+            mtp_route_layer_numbers = [
+                layer_number
+                for layer_number, layer in enumerate(layers)
+                if layers_are_mtp[layer_number]
+                and hasattr(layer, "_uses_graph_dynamic_dsa_route")
+                and layer._uses_graph_dynamic_dsa_route()
+            ]
+            if mtp_route_layer_numbers:
+                logger.warning(
+                    "Graph-dynamic DSA MTP callables in model chunk %d keep their direct-layer "
+                    "two-buffer TE inputs; block-level two-copy arena staging applies only to "
+                    "the main decoder stack.",
+                    chunk_idx,
+                )
+            route_layer_numbers = [
+                layer_number
+                for layer_number, layer in enumerate(layers)
+                if not layers_are_mtp[layer_number]
+                and hasattr(layer, "_uses_graph_dynamic_dsa_route")
+                and layer._uses_graph_dynamic_dsa_route()
+            ]
+            if not route_layer_numbers:
+                layers_before_chunk += len(layers)
+                continue
+
+            chunk_with_decoder = self.chunks_with_decoder[chunk_idx]
+            decoder_layers = tuple(chunk_with_decoder.decoder.layers)
+            if any(
+                layers[layer_number] not in decoder_layers for layer_number in route_layer_numbers
+            ):
+                raise RuntimeError(
+                    "Graph-dynamic DSA route arenas currently require route-enabled callables "
+                    "to belong to the model chunk's main decoder stack"
+                )
+
+            for slot in range(self.num_microbatches):
+                graph_indices = tuple(
+                    layers_before_chunk * self.num_microbatches + slot * len(layers) + layer_number
+                    for layer_number in route_layer_numbers
+                )
+                first_kwargs = sample_kwargs[graph_indices[0]]
+                if not isinstance(first_kwargs, dict):
+                    raise TypeError(
+                        f"TE CUDA Graph sample kwargs {graph_indices[0]} must be a dict"
+                    )
+                missing = {
+                    _DSA_GRAPH_LAYOUT_BUFFER_KWARG,
+                    _DSA_GRAPH_ROUTE_BUFFER_KWARG,
+                } - first_kwargs.keys()
+                if missing:
+                    raise RuntimeError(
+                        f"TE CUDA Graph DSA route sample {graph_indices[0]} is missing {missing}"
+                    )
+                source_layout = first_kwargs[_DSA_GRAPH_LAYOUT_BUFFER_KWARG]
+                source_route = first_kwargs[_DSA_GRAPH_ROUTE_BUFFER_KWARG]
+                self._validate_graph_dynamic_route_pair(
+                    source_layout,
+                    source_route,
+                    name=f"TE CUDA Graph DSA route sample {graph_indices[0]}",
+                )
+
+                # Allocate fresh owners even if the generic sample-input reuse pass supplied
+                # an older slot's tensors. The unique positive route suffix makes the whole
+                # TE sample signature distinct for every chunk/slot, so TE 2.7 can keep its
+                # global input/output reuse optimization without rebinding these live arenas.
+                signature_padding = chunk_idx * self.num_microbatches + slot + 1
+                canonical_layout = source_layout.clone()
+                canonical_route = torch.cat(
+                    (
+                        source_route,
+                        torch.full(
+                            (signature_padding,),
+                            signature_padding,
+                            dtype=source_route.dtype,
+                            device=source_route.device,
+                        ),
+                    )
+                )
+                previous_logical_route_numel = logical_route_numel_by_chunk.setdefault(
+                    chunk_idx, source_route.numel()
+                )
+                if previous_logical_route_numel != source_route.numel():
+                    raise ValueError(
+                        f"Graph-dynamic DSA route logical length changed within chunk {chunk_idx}"
+                    )
+                if canonical_route.numel() in used_route_lengths:
+                    raise RuntimeError(
+                        "Graph-dynamic DSA route signature padding did not produce globally "
+                        "unique route shapes"
+                    )
+                used_route_lengths.add(canonical_route.numel())
+                canonical_ptrs = (canonical_layout.data_ptr(), canonical_route.data_ptr())
+                if any(ptr in used_ptrs for ptr in canonical_ptrs):
+                    raise RuntimeError(
+                        "TE CUDA Graph allocator unexpectedly aliased distinct DSA route arenas"
+                    )
+                used_ptrs.update(canonical_ptrs)
+
+                schema = (
+                    source_layout.shape,
+                    source_route.shape,
+                    source_layout.device,
+                    source_route.device,
+                )
+                for graph_idx in graph_indices:
+                    layer_kwargs = sample_kwargs[graph_idx]
+                    if not isinstance(layer_kwargs, dict):
+                        raise TypeError(f"TE CUDA Graph sample kwargs {graph_idx} must be a dict")
+                    if (
+                        _DSA_GRAPH_LAYOUT_BUFFER_KWARG not in layer_kwargs
+                        or _DSA_GRAPH_ROUTE_BUFFER_KWARG not in layer_kwargs
+                    ):
+                        raise RuntimeError(
+                            f"TE CUDA Graph DSA route sample {graph_idx} is missing its two owners"
+                        )
+                    layout_i32 = layer_kwargs[_DSA_GRAPH_LAYOUT_BUFFER_KWARG]
+                    route_i64 = layer_kwargs[_DSA_GRAPH_ROUTE_BUFFER_KWARG]
+                    self._validate_graph_dynamic_route_pair(
+                        layout_i32, route_i64, name=f"TE CUDA Graph DSA route sample {graph_idx}"
+                    )
+                    if (
+                        layout_i32.shape,
+                        route_i64.shape,
+                        layout_i32.device,
+                        route_i64.device,
+                    ) != schema:
+                        raise ValueError(
+                            "All route-enabled layers in one model chunk must expose the same "
+                            f"graph metadata schema; sample {graph_idx} differs"
+                        )
+
+                    # sample kwargs dictionaries may themselves be shared by the generic
+                    # liveness reuse pass. Isolate the mapping before rebinding these two keys.
+                    canonical_kwargs = layer_kwargs.copy()
+                    canonical_kwargs[_DSA_GRAPH_LAYOUT_BUFFER_KWARG] = canonical_layout
+                    canonical_kwargs[_DSA_GRAPH_ROUTE_BUFFER_KWARG] = canonical_route
+                    sample_kwargs[graph_idx] = canonical_kwargs
+
+                route_arenas[(chunk_idx, slot)] = {
+                    "pair": (canonical_layout, canonical_route),
+                    "graph_indices": graph_indices,
+                    "logical_route_numel": source_route.numel(),
+                    "route_padding": signature_padding,
+                }
+            layers_before_chunk += len(layers)
+
+        return route_arenas
+
+    def _attach_graph_dynamic_route_arenas(self, sample_kwargs, route_arenas):
+        """Validate post-TE pointer identity and attach each chunk's slot arenas."""
+        if not route_arenas:
+            return
+
+        final_ptrs = set()
+        arenas_by_chunk = defaultdict(dict)
+        logical_route_numel_by_chunk = {}
+        for (chunk_idx, slot), arena in route_arenas.items():
+            expected_layout, expected_route = arena["pair"]
+            logical_route_numel = arena["logical_route_numel"]
+            route_padding = arena["route_padding"]
+            expected_padding = chunk_idx * self.num_microbatches + slot + 1
+            if (
+                route_padding != expected_padding
+                or expected_route.numel() != logical_route_numel + route_padding
+            ):
+                raise RuntimeError(
+                    "TE CUDA Graph DSA route signature-padding bookkeeping is malformed for "
+                    f"chunk {chunk_idx}, slot {slot}: logical={logical_route_numel}, "
+                    f"padding={route_padding}, physical={expected_route.numel()}"
+                )
+            final_pair = None
+            for graph_idx in arena["graph_indices"]:
+                layer_kwargs = sample_kwargs[graph_idx]
+                if not isinstance(layer_kwargs, dict):
+                    raise RuntimeError(
+                        f"TE replaced DSA route sample kwargs {graph_idx} with a malformed value"
+                    )
+                try:
+                    actual_layout = layer_kwargs[_DSA_GRAPH_LAYOUT_BUFFER_KWARG]
+                    actual_route = layer_kwargs[_DSA_GRAPH_ROUTE_BUFFER_KWARG]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"TE removed a captured DSA route owner from sample {graph_idx}"
+                    ) from exc
+                self._validate_graph_dynamic_route_pair(
+                    actual_layout,
+                    actual_route,
+                    name=f"post-capture TE CUDA Graph DSA route sample {graph_idx}",
+                )
+                actual_ptrs = (actual_layout.data_ptr(), actual_route.data_ptr())
+                if (
+                    actual_layout.shape != expected_layout.shape
+                    or actual_route.shape != expected_route.shape
+                    or actual_layout.device != expected_layout.device
+                    or actual_route.device != expected_route.device
+                ):
+                    raise RuntimeError(
+                        "TE CUDA Graph input-buffer reuse changed the DSA route schema for "
+                        f"chunk {chunk_idx}, slot {slot}, sample {graph_idx}"
+                    )
+                if final_pair is None:
+                    final_pair = (actual_layout, actual_route)
+                elif actual_ptrs != (final_pair[0].data_ptr(), final_pair[1].data_ptr()):
+                    raise RuntimeError(
+                        "TE CUDA Graph input-buffer reuse split one canonical DSA route "
+                        f"arena across layers for chunk {chunk_idx}, slot {slot}: expected "
+                        f"{(final_pair[0].data_ptr(), final_pair[1].data_ptr())}, got "
+                        f"{actual_ptrs} at sample {graph_idx}"
+                    )
+
+            if final_pair is None:
+                raise RuntimeError(
+                    f"TE CUDA Graph DSA route chunk {chunk_idx}, slot {slot} has no samples"
+                )
+            pair_ptrs = (final_pair[0].data_ptr(), final_pair[1].data_ptr())
+            if any(ptr in final_ptrs for ptr in pair_ptrs):
+                raise RuntimeError(
+                    "TE CUDA Graph DSA route arenas alias across model chunks or live slots"
+                )
+            final_ptrs.update(pair_ptrs)
+            arenas_by_chunk[chunk_idx][slot] = final_pair
+            previous_logical_route_numel = logical_route_numel_by_chunk.setdefault(
+                chunk_idx, logical_route_numel
+            )
+            if previous_logical_route_numel != logical_route_numel:
+                raise RuntimeError(
+                    f"TE CUDA Graph DSA route logical length changed within chunk {chunk_idx}"
+                )
+
+        for chunk_idx, slots in arenas_by_chunk.items():
+            if set(slots) != set(range(self.num_microbatches)):
+                raise RuntimeError(
+                    f"TE CUDA Graph DSA route arenas for chunk {chunk_idx} have slots "
+                    f"{sorted(slots)}, expected 0..{self.num_microbatches - 1}"
+                )
+            block = self.chunks_with_decoder[chunk_idx].decoder
+            if not hasattr(block, "set_te_cuda_graph_route_metadata_arenas"):
+                raise RuntimeError(
+                    f"Model chunk {chunk_idx} does not expose a route-metadata arena owner"
+                )
+            cp_group = getattr(getattr(block, "pg_collection", None), "cp", None)
+            if cp_group is None or cp_group.size() != self.config.context_parallel_size:
+                raise RuntimeError(
+                    "TE CUDA Graph DSA route arena requires the model chunk's explicit CP "
+                    f"group to have size {self.config.context_parallel_size}"
+                )
+            block.set_te_cuda_graph_route_metadata_arenas(
+                tuple(slots[slot] for slot in range(self.num_microbatches)),
+                logical_route_numel=logical_route_numel_by_chunk[chunk_idx],
+                cp_rank=cp_group.rank(),
+            )
+
+    def _clear_graph_dynamic_route_arenas(self):
+        """Drop block-owned arena handles after their captured graphs are reset."""
+        for chunk in self.chunks_with_decoder:
+            if chunk is None:
+                continue
+            block = chunk.decoder
+            if hasattr(block, "clear_te_cuda_graph_route_metadata_arenas"):
+                block.clear_te_cuda_graph_route_metadata_arenas()
+
     def _validate_mhc_static_hidden_inputs(self, sample_args):
         """Ensure aliased static inputs have disjoint [fwd, bwd] liveness windows.
 
@@ -2772,6 +3097,8 @@ class TECudaGraphHelper:
         else:
             # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
             sample_args, kwargs = self._get_cuda_graph_input_data()
+            sample_kwargs = kwargs.get('sample_kwargs', [])
+            route_arenas = self._canonicalize_graph_dynamic_route_inputs(sample_kwargs)
             if self.config.sequence_parallel:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
@@ -2826,6 +3153,11 @@ class TECudaGraphHelper:
                         layer.set_te_cuda_graph_static_hidden_inputs(static_hidden_inputs)
                 num_layers_accumulated += len(layers)
 
+            # TE 2.7 may rebind general graph inputs after capture. Adopt the final common
+            # pair for each chunk/slot, while rejecting a split pair or cross-slot alias,
+            # before exposing the fixed addresses to eager block-level staging.
+            self._attach_graph_dynamic_route_arenas(sample_kwargs, route_arenas)
+
             self._graphs_created = True
 
         self._finish_capturing(start_time)
@@ -2859,6 +3191,7 @@ class TECudaGraphHelper:
                 layer.cuda_graphs = []
                 layer.cuda_graph_manual_hooks = []
                 layer.clear_te_cuda_graph_static_hidden_inputs()
+        self._clear_graph_dynamic_route_arenas()
 
         log_on_each_pipeline_stage(
             logger=logger,
@@ -3023,6 +3356,7 @@ def set_current_microbatch(model, microbatch_id):
     except RuntimeError:
         decoder_exists = False
     if decoder_exists and model_with_decoder is not None:
+        model_with_decoder.decoder.current_microbatch = microbatch_id
         for layer in model_with_decoder.decoder.layers:
             layer.current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):
@@ -3050,6 +3384,7 @@ def set_current_microbatch(model, microbatch_id):
     if model_with_vision is not None and hasattr(model_with_vision, 'vision_model'):
         vision_model = model_with_vision.vision_model
         if hasattr(vision_model, 'decoder') and hasattr(vision_model.decoder, 'layers'):
+            vision_model.decoder.current_microbatch = microbatch_id
             for layer in vision_model.decoder.layers:
                 layer.current_microbatch = microbatch_id
 

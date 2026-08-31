@@ -27,9 +27,11 @@ from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexe
     _graph_dynamic_zigzag_plan,
     _zigzag_plan,
     add_graph_dynamic_plan_to_kwargs,
+    attach_graph_dynamic_plan_buffers,
     build_graph_dynamic_plan,
     copy_graph_dynamic_plan_,
     get_graph_dynamic_plan,
+    get_graph_dynamic_plan_buffers,
     pack_eligible_for_zigzag,
     pop_graph_dynamic_plan_from_kwargs,
     prebuild_balanced_layouts,
@@ -332,40 +334,58 @@ def test_graph_dynamic_prebuild_validates_without_publishing_host_state():
     assert (key, group.rank()) in M._LAST_PLAN
 
 
-def test_graph_dynamic_plan_tensor_kwargs_roundtrip_and_refresh():
-    """TE graph inputs preserve every route leaf and can be refreshed in-place."""
+def test_graph_dynamic_two_buffer_views_match_raw_builder():
     group = _StubGroup(4, 1)
+    cu = torch.tensor([0, 16, 48, 96], dtype=torch.int32)
+    raw = _graph_dynamic_zigzag_plan(cu, _comp_cu(cu), 4, 24, 1, torch.device("cpu"))
+    packed = build_graph_dynamic_plan(cu, group, 96)
+    for key in (
+        "validated_cu",
+        "pos_head",
+        "pos_tail",
+        "score_cu_q",
+        "score_cu_kv",
+        "head_offsets",
+        "tail_offsets",
+        "output_cu_q",
+        "output_cu_kv",
+        "output_offsets",
+        "src_slot",
+        "relay_perm",
+        "dst_slot",
+    ):
+        assert torch.equal(packed[key], raw[key]), key
+
+
+def test_graph_dynamic_plan_two_buffer_schema_roundtrip_and_refresh():
+    """TE exposes two owners; logical views alias them and refresh with two copies."""
+    group = _StubGroup(4, 1)
+    target = _packed_params([0, 16, 48, 96], 96)
     pack_a = _packed_params([0, 16, 48, 96], 96)
     pack_b = _packed_params([0, 32, 64, 96], 96)
-    for pack in (pack_a, pack_b):
+    for pack in (target, pack_a, pack_b):
         prebuild_balanced_layouts(pack, cp_group=group, capacity=96, graph_dynamic_packs=True)
 
     kwargs = {}
-    add_graph_dynamic_plan_to_kwargs(pack_a, kwargs, required=True)
+    add_graph_dynamic_plan_to_kwargs(target, kwargs, required=True)
+    assert set(kwargs) == {"dsa_cp_graph_layout_buffer", "dsa_cp_graph_route_buffer"}
+    assert kwargs["dsa_cp_graph_layout_buffer"].dtype == torch.int32
+    assert kwargs["dsa_cp_graph_route_buffer"].dtype == torch.int64
+    # K=4 padded-cu entries, L=24 local rows, C=min(24, 24/4+3)=9,
+    # R=36: layout=L+7K+3, route=2L+R.
+    assert kwargs["dsa_cp_graph_layout_buffer"].shape == (24 + 7 * 4 + 3,)
+    assert kwargs["dsa_cp_graph_route_buffer"].shape == (2 * 24 + 36,)
+
+    layout_ptr = kwargs["dsa_cp_graph_layout_buffer"].data_ptr()
+    route_ptr = kwargs["dsa_cp_graph_route_buffer"].data_ptr()
     reconstructed = pop_graph_dynamic_plan_from_kwargs(kwargs, cp_size=4, l_local=24)
     assert kwargs == {}
-    original = get_graph_dynamic_plan(pack_a)
-    for key in (
-        "validated_cu",
-        "pos_head",
-        "pos_tail",
-        "score_cu_q",
-        "score_cu_kv",
-        "head_offsets",
-        "tail_offsets",
-        "output_cu_q",
-        "output_cu_kv",
-        "output_offsets",
-        "src_slot",
-        "relay_perm",
-        "dst_slot",
-    ):
-        assert reconstructed[key].data_ptr() == original[key].data_ptr()
+    original = get_graph_dynamic_plan(target)
+    assert reconstructed["layout_i32"].data_ptr() == layout_ptr
+    assert reconstructed["route_i64"].data_ptr() == route_ptr
+    assert reconstructed["output_cu_kv"] is reconstructed["score_cu_kv"]
 
-    copy_graph_dynamic_plan_(pack_a, pack_b)
-    refreshed = get_graph_dynamic_plan(pack_a)
-    source = get_graph_dynamic_plan(pack_b)
-    for key in (
+    layout_fields = (
         "validated_cu",
         "pos_head",
         "pos_tail",
@@ -376,11 +396,191 @@ def test_graph_dynamic_plan_tensor_kwargs_roundtrip_and_refresh():
         "output_cu_q",
         "output_cu_kv",
         "output_offsets",
-        "src_slot",
-        "relay_perm",
-        "dst_slot",
-    ):
-        assert torch.equal(refreshed[key], source[key])
+    )
+    route_fields = ("src_slot", "relay_perm", "dst_slot")
+    for key in layout_fields + route_fields:
+        assert reconstructed[key].data_ptr() == original[key].data_ptr()
+    expected_layout_offsets = {
+        "validated_cu": 0,
+        "pos_head": 4,
+        "pos_tail": 16,
+        "score_cu_q": 28,
+        "score_cu_kv": 33,
+        "output_cu_kv": 33,
+        "head_offsets": 38,
+        "tail_offsets": 42,
+        "output_cu_q": 46,
+        "output_offsets": 51,
+    }
+    for key in layout_fields:
+        assert reconstructed[key].untyped_storage().data_ptr() == layout_ptr
+        assert reconstructed[key].storage_offset() == expected_layout_offsets[key]
+    expected_route_offsets = {"src_slot": 0, "relay_perm": 24, "dst_slot": 60}
+    for key in route_fields:
+        assert reconstructed[key].untyped_storage().data_ptr() == route_ptr
+        assert reconstructed[key].storage_offset() == expected_route_offsets[key]
+
+    # A/B/A replay refreshes values but never replaces either owner. Tensor
+    # version counters pin this to one copy_ per owner, not one per logical leaf.
+    target_layout, target_route = get_graph_dynamic_plan_buffers(target)
+    owner_ptrs = (target_layout.data_ptr(), target_route.data_ptr())
+    versions = (target_layout._version, target_route._version)
+    copy_graph_dynamic_plan_(target, pack_b)
+    assert (target_layout._version, target_route._version) == (versions[0] + 1, versions[1] + 1)
+    for key in layout_fields + route_fields:
+        assert torch.equal(get_graph_dynamic_plan(target)[key], get_graph_dynamic_plan(pack_b)[key])
+    copy_graph_dynamic_plan_(target, pack_a)
+    assert (target_layout.data_ptr(), target_route.data_ptr()) == owner_ptrs
+    assert (target_layout._version, target_route._version) == (versions[0] + 2, versions[1] + 2)
+    for key in layout_fields + route_fields:
+        assert torch.equal(get_graph_dynamic_plan(target)[key], get_graph_dynamic_plan(pack_a)[key])
+
+
+def test_graph_dynamic_plan_buffers_fail_closed_on_malformed_inputs():
+    group = _StubGroup(4, 0)
+    source = _packed_params([0, 16, 48, 96], 96)
+    prebuild_balanced_layouts(source, cp_group=group, capacity=96, graph_dynamic_packs=True)
+    layout, route = get_graph_dynamic_plan_buffers(source)
+
+    missing = _packed_params([0, 96], 96)
+    with pytest.raises(RuntimeError, match="missing its per-pack route"):
+        get_graph_dynamic_plan_buffers(missing)
+    with pytest.raises(TypeError, match="layout buffer must have dtype torch.int32"):
+        attach_graph_dynamic_plan_buffers(missing, layout.long(), route, cp_size=4, l_local=24)
+    with pytest.raises(TypeError, match="route buffer must have dtype torch.int64"):
+        attach_graph_dynamic_plan_buffers(missing, layout, route.int(), cp_size=4, l_local=24)
+    with pytest.raises(ValueError, match="must be one-dimensional"):
+        attach_graph_dynamic_plan_buffers(missing, layout.view(1, -1), route, cp_size=4, l_local=24)
+    noncontiguous_route = torch.empty(route.numel() * 2, dtype=torch.int64)[::2]
+    with pytest.raises(ValueError, match="must be contiguous"):
+        attach_graph_dynamic_plan_buffers(
+            missing, layout, noncontiguous_route, cp_size=4, l_local=24
+        )
+    with pytest.raises(ValueError, match="layout buffer length"):
+        attach_graph_dynamic_plan_buffers(missing, layout[:-1], route, cp_size=4, l_local=24)
+    with pytest.raises(ValueError, match="route buffer length"):
+        attach_graph_dynamic_plan_buffers(missing, layout, route[:-1], cp_size=4, l_local=24)
+
+    incomplete_kwargs = {"dsa_cp_graph_layout_buffer": layout}
+    with pytest.raises(RuntimeError, match="incomplete graph-dynamic"):
+        pop_graph_dynamic_plan_from_kwargs(incomplete_kwargs, cp_size=4, l_local=24)
+    assert set(incomplete_kwargs) == {"dsa_cp_graph_layout_buffer"}
+    route_only_kwargs = {"dsa_cp_graph_route_buffer": route}
+    with pytest.raises(RuntimeError, match="incomplete graph-dynamic"):
+        pop_graph_dynamic_plan_from_kwargs(route_only_kwargs, cp_size=4, l_local=24)
+    assert set(route_only_kwargs) == {"dsa_cp_graph_route_buffer"}
+
+    # Owners are copied independently, so overlapping storage would make the
+    # second copy overwrite bytes owned by the first one.
+    shared_storage = torch.empty(
+        max(layout.numel() * layout.element_size(), route.numel() * route.element_size()),
+        dtype=torch.uint8,
+    )
+    overlapping_layout = torch.empty(0, dtype=torch.int32).set_(
+        shared_storage.untyped_storage(), 0, layout.shape, (1,)
+    )
+    overlapping_route = torch.empty(0, dtype=torch.int64).set_(
+        shared_storage.untyped_storage(), 0, route.shape, (1,)
+    )
+    with pytest.raises(ValueError, match="must not overlap"):
+        attach_graph_dynamic_plan_buffers(
+            missing, overlapping_layout, overlapping_route, cp_size=4, l_local=24
+        )
+
+    # Each pair can be internally disjoint while a destination owner still
+    # overlaps the other plan's non-corresponding source owner. The first copy
+    # would then mutate bytes that the second copy has not read yet.
+    cross_storage = torch.empty(4096, dtype=torch.uint8).untyped_storage()
+    cross_source_layout = torch.empty(0, dtype=torch.int32).set_(
+        cross_storage, 0, layout.shape, (1,)
+    )
+    cross_source_route = torch.empty(0, dtype=torch.int64).set_(
+        cross_storage, 128, route.shape, (1,)
+    )
+    cross_destination_layout = torch.empty(0, dtype=torch.int32).set_(
+        cross_storage, 448, layout.shape, (1,)
+    )
+    cross_destination_route = torch.empty(0, dtype=torch.int64).set_(
+        cross_storage, 0, route.shape, (1,)
+    )
+    cross_source = _packed_params([0, 16, 48, 96], 96)
+    cross_destination = _packed_params([0, 16, 48, 96], 96)
+    attach_graph_dynamic_plan_buffers(
+        cross_source, cross_source_layout, cross_source_route, 4, 24, cp_rank=0
+    )
+    attach_graph_dynamic_plan_buffers(
+        cross_destination, cross_destination_layout, cross_destination_route, 4, 24, cp_rank=0
+    )
+    with pytest.raises(ValueError, match="source and destination owners must not overlap"):
+        copy_graph_dynamic_plan_(cross_destination, cross_source)
+
+    # Same physical capacity but a different number of cu entries has a
+    # different layout schema and must be rejected before either owner changes.
+    incompatible = _packed_params([0, 24, 48, 72, 96], 96)
+    prebuild_balanced_layouts(incompatible, cp_group=group, capacity=96, graph_dynamic_packs=True)
+    destination_layout = layout.clone()
+    destination_route = route.clone()
+    target = _packed_params([0, 16, 48, 96], 96)
+    attach_graph_dynamic_plan_buffers(
+        target, destination_layout, destination_route, 4, 24, cp_rank=0
+    )
+    before_layout = destination_layout.clone()
+    before_route = destination_route.clone()
+    with pytest.raises(ValueError, match="incompatible shapes"):
+        copy_graph_dynamic_plan_(target, incompatible)
+    assert torch.equal(destination_layout, before_layout)
+    assert torch.equal(destination_route, before_route)
+
+    wrong_rank = _packed_params([0, 16, 48, 96], 96)
+    prebuild_balanced_layouts(
+        wrong_rank, cp_group=_StubGroup(4, 1), capacity=96, graph_dynamic_packs=True
+    )
+    with pytest.raises(ValueError, match="same known CP-local rank"):
+        copy_graph_dynamic_plan_(target, wrong_rank)
+
+    unknown_rank = _packed_params([0, 16, 48, 96], 96)
+    attach_graph_dynamic_plan_buffers(unknown_rank, layout.clone(), route.clone(), 4, 24)
+    with pytest.raises(ValueError, match="same known CP-local rank"):
+        copy_graph_dynamic_plan_(target, unknown_rank)
+
+
+def test_graph_dynamic_route_owner_padding_is_not_part_of_logical_views():
+    """Arena identity padding changes TE's owner shape, not the logical A2A route."""
+    group = _StubGroup(4, 1)
+    source = _packed_params([0, 16, 48, 96], 96)
+    prebuild_balanced_layouts(source, cp_group=group, capacity=96, graph_dynamic_packs=True)
+    source_plan = get_graph_dynamic_plan(source)
+    layout, route = get_graph_dynamic_plan_buffers(source)
+
+    route_padding = 7
+    padded_route = torch.cat(
+        (route, torch.full((route_padding,), -1, dtype=route.dtype, device=route.device))
+    )
+    staged = _packed_params([0, 16, 48, 96], 96)
+    attach_graph_dynamic_plan_buffers(
+        staged,
+        layout.clone(),
+        padded_route,
+        cp_size=4,
+        l_local=24,
+        route_padding=route_padding,
+        cp_rank=1,
+    )
+    staged_plan = get_graph_dynamic_plan(staged)
+    assert staged_plan["route_padding"] == route_padding
+    assert staged_plan["route_i64"].shape == (route.numel() + route_padding,)
+    assert torch.equal(staged_plan["route_i64"][-route_padding:], torch.full((7,), -1))
+    for key in ("src_slot", "relay_perm", "dst_slot"):
+        assert torch.equal(staged_plan[key], source_plan[key])
+
+    kwargs = {}
+    add_graph_dynamic_plan_to_kwargs(staged, kwargs, required=True)
+    reconstructed = pop_graph_dynamic_plan_from_kwargs(kwargs, cp_size=4, l_local=24)
+    assert reconstructed["cp_rank"] is None
+    assert reconstructed["route_padding"] == route_padding
+    assert reconstructed["route_i64"].data_ptr() == padded_route.data_ptr()
+    for key in ("src_slot", "relay_perm", "dst_slot"):
+        assert torch.equal(reconstructed[key], source_plan[key])
 
 
 def test_graph_dynamic_prebuild_rejects_ineligible_pack_instead_of_falling_back():

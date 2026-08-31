@@ -75,11 +75,33 @@ _DSV4_CP_RAGGED_PADDED_SEG_LENS = (5, 127, 1000, 23, 129, 900, 55, 257, 800, 95,
 # cu_seqlens_padded rather than from capture-time host sizes.
 _DSV4_CP_REPLAY_PADDED_SEG_LENS = (8, 128, 1000, 32, 132, 904, 64, 260, 804, 96, 512, 156)
 
-# Both compositions have the same fixed 4096-row capacity, sequence-count
+# All compositions have the same fixed 4096-row capacity, sequence-count
 # capacity, and max sequence length. Every physical segment is divisible by
 # 2*CP for both CP2 and CP4, which is the balanced indexer's zigzag contract.
 _DSV4_CP_BALANCED_CAPTURE_SEG_LENS = (256, 768, 1024, 2048)
 _DSV4_CP_BALANCED_REPLAY_SEG_LENS = (512, 512, 1024, 2048)
+_DSV4_CP_BALANCED_THIRD_SEG_LENS = (384, 640, 1024, 2048)
+
+_DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS = ("dsa_cp_graph_layout_buffer", "dsa_cp_graph_route_buffer")
+
+# Probe the logical route schema, not its packed TE owner mapping. The packed
+# owner mapping intentionally has only two entries and is not a logical-field
+# inventory.
+_DSV4_CP_GRAPH_DYNAMIC_PROBE_KEYS = (
+    "validated_cu",
+    "pos_head",
+    "pos_tail",
+    "score_cu_q",
+    "score_cu_kv",
+    "head_offsets",
+    "tail_offsets",
+    "output_cu_q",
+    "output_cu_kv",
+    "output_offsets",
+    "src_slot",
+    "relay_perm",
+    "dst_slot",
+)
 
 
 class _RoutePlanEchoAttention(torch.nn.Module):
@@ -1208,26 +1230,34 @@ class TestDSv4HybridAttentionTHDCP:
         del graph_out, graph_hidden_grad, eager_hidden
         _clear_cuda_test_state()
 
-    def test_balanced_dynamic_pack_graph_replays_a_b_a(self):
-        """The opt-in graph consumes refreshed fixed-shape route inputs for A/B/A packs."""
+    def test_balanced_dynamic_pack_graph_replays_30_iterations(self):
+        """The raw graph refreshes two fixed-shape route owners for 30 A/B/C replays."""
         if not self.fused_kernels_available:
             pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
 
-        from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
-            copy_graph_dynamic_plan_,
-            prebuild_balanced_layouts,
+        from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+        segment_compositions = (
+            _DSV4_CP_BALANCED_CAPTURE_SEG_LENS,
+            _DSV4_CP_BALANCED_REPLAY_SEG_LENS,
+            _DSV4_CP_BALANCED_THIRD_SEG_LENS,
+        )
+        source_packs = tuple(_make_thd_packed_seq_params(lens) for lens in segment_compositions)
+        # Keep the graph input separate from the immutable A/B/C sources. In-place
+        # replay refreshes must never overwrite the source used to restore pack A.
+        graph_packed = _make_thd_packed_seq_params(_DSV4_CP_BALANCED_CAPTURE_SEG_LENS)
+        total_rows = sum(_DSV4_CP_BALANCED_CAPTURE_SEG_LENS)
+        for packed in source_packs:
+            assert total_rows == int(packed.cu_seqlens_q_padded[-1].item())
+            assert packed.cu_seqlens_q.shape == graph_packed.cu_seqlens_q.shape
+            assert packed.max_seqlen_q == graph_packed.max_seqlen_q
+        assert all(
+            not torch.equal(source_packs[index].cu_seqlens_q, source_packs[index + 1].cu_seqlens_q)
+            for index in range(len(source_packs) - 1)
         )
 
-        packed_a = _make_thd_packed_seq_params(_DSV4_CP_BALANCED_CAPTURE_SEG_LENS)
-        packed_b = _make_thd_packed_seq_params(_DSV4_CP_BALANCED_REPLAY_SEG_LENS)
-        total_rows = sum(_DSV4_CP_BALANCED_CAPTURE_SEG_LENS)
-        assert total_rows == sum(_DSV4_CP_BALANCED_REPLAY_SEG_LENS)
-        assert packed_a.cu_seqlens_q.shape == packed_b.cu_seqlens_q.shape
-        assert packed_a.max_seqlen_q == packed_b.max_seqlen_q
-        assert not torch.equal(packed_a.cu_seqlens_q, packed_b.cu_seqlens_q)
-
-        for packed in (packed_a, packed_b):
-            prebuild_balanced_layouts(
+        for packed in (*source_packs, graph_packed):
+            cp_balanced_indexer.prebuild_balanced_layouts(
                 packed,
                 cp_group=self.pg.cp,
                 capacity=total_rows,
@@ -1266,11 +1296,71 @@ class TestDSv4HybridAttentionTHDCP:
         static_grad = local_grad.detach().clone()
 
         graph, graph_output = _capture_dsv4_attention_forward_backward(
-            graph_attn, static_hidden, static_grad, packed_a
+            graph_attn, static_hidden, static_grad, graph_packed
         )
 
-        def _snapshot_graph():
-            return (
+        def _owner_kwargs(packed):
+            kwargs = {}
+            cp_balanced_indexer.add_graph_dynamic_plan_to_kwargs(packed, kwargs, required=True)
+            assert set(kwargs) == set(_DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS)
+            plan = cp_balanced_indexer.get_graph_dynamic_plan(packed)
+            assert plan is not None
+            assert kwargs["dsa_cp_graph_layout_buffer"] is plan["layout_i32"]
+            assert kwargs["dsa_cp_graph_route_buffer"] is plan["route_i64"]
+            assert kwargs["dsa_cp_graph_layout_buffer"].dtype == torch.int32
+            assert kwargs["dsa_cp_graph_route_buffer"].dtype == torch.int64
+            assert all(kwargs[name].is_contiguous() for name in kwargs)
+            torch.testing.assert_close(
+                plan["validated_cu"], packed.cu_seqlens_q_padded, rtol=0, atol=0
+            )
+            return kwargs
+
+        def _load_metadata(source):
+            with torch.no_grad():
+                graph_packed.cu_seqlens_q.copy_(source.cu_seqlens_q)
+                graph_packed.cu_seqlens_kv.copy_(source.cu_seqlens_kv)
+                graph_packed.cu_seqlens_q_padded.copy_(source.cu_seqlens_q_padded)
+                graph_packed.cu_seqlens_kv_padded.copy_(source.cu_seqlens_kv_padded)
+                cp_balanced_indexer.copy_graph_dynamic_plan_(graph_packed, source)
+
+        source_owner_kwargs = tuple(_owner_kwargs(packed) for packed in source_packs)
+        for owner_name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS:
+            assert len({kwargs[owner_name].data_ptr() for kwargs in source_owner_kwargs}) == 3
+        graph_owner_ptrs = tuple(
+            _owner_kwargs(graph_packed)[name].data_ptr()
+            for name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS
+        )
+
+        # Eager execution is deterministic for a fixed pack, so cache one full
+        # forward/backward reference per composition and compare every replay to
+        # its corresponding eager result.
+        eager_results = tuple(
+            _run_dsv4_attention_forward_backward(
+                eager_attn, local_hidden.detach().clone().requires_grad_(True), local_grad, packed
+            )
+            for packed in source_packs
+        )
+        first_graph_outputs = {}
+        for replay_index in range(30):
+            pack_index = replay_index % len(source_packs)
+            source = source_packs[pack_index]
+            source_kwargs = source_owner_kwargs[pack_index]
+            _load_metadata(source)
+
+            graph_kwargs = _owner_kwargs(graph_packed)
+            assert (
+                tuple(graph_kwargs[name].data_ptr() for name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS)
+                == graph_owner_ptrs
+            )
+            for owner_name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS:
+                torch.testing.assert_close(
+                    graph_kwargs[owner_name], source_kwargs[owner_name], rtol=0, atol=0
+                )
+
+            _zero_existing_grads(graph_attn, static_hidden)
+            graph.replay()
+            torch.cuda.synchronize()
+            graph_result = (
                 graph_output.detach().clone(),
                 static_hidden.grad.detach().clone(),
                 {
@@ -1279,59 +1369,8 @@ class TestDSv4HybridAttentionTHDCP:
                     if param.grad is not None
                 },
             )
-
-        def _load_metadata(source):
-            with torch.no_grad():
-                packed_a.cu_seqlens_q.copy_(source.cu_seqlens_q)
-                packed_a.cu_seqlens_kv.copy_(source.cu_seqlens_kv)
-                packed_a.cu_seqlens_q_padded.copy_(source.cu_seqlens_q_padded)
-                packed_a.cu_seqlens_kv_padded.copy_(source.cu_seqlens_kv_padded)
-                copy_graph_dynamic_plan_(packed_a, source)
-
-        # A captured graph owns static output/gradient buffers, but those
-        # buffers are only a valid execution result after replay.  Exercise A
-        # explicitly before changing the metadata to B.
-        _zero_existing_grads(graph_attn, static_hidden)
-        graph.replay()
-        torch.cuda.synchronize()
-        graph_a_first = _snapshot_graph()
-        _load_metadata(packed_b)
-        _zero_existing_grads(graph_attn, static_hidden)
-        graph.replay()
-        torch.cuda.synchronize()
-        graph_b = _snapshot_graph()
-
-        # Restore pack A after replaying B. This catches implementations that
-        # accidentally pin the first route-input values in the captured graph.
-        packed_a_template = _make_thd_packed_seq_params(_DSV4_CP_BALANCED_CAPTURE_SEG_LENS)
-        prebuild_balanced_layouts(
-            packed_a_template,
-            cp_group=self.pg.cp,
-            capacity=total_rows,
-            graphs_enabled=True,
-            graph_dynamic_packs=True,
-        )
-        _load_metadata(packed_a_template)
-        _zero_existing_grads(graph_attn, static_hidden)
-        graph.replay()
-        torch.cuda.synchronize()
-        graph_a_replay = _snapshot_graph()
-
-        eager_a = _run_dsv4_attention_forward_backward(
-            eager_attn,
-            local_hidden.detach().clone().requires_grad_(True),
-            local_grad,
-            packed_a_template,
-        )
-        eager_b = _run_dsv4_attention_forward_backward(
-            eager_attn, local_hidden.detach().clone().requires_grad_(True), local_grad, packed_b
-        )
-
-        for label, graph_result, eager_result in (
-            ("replay_a_first", graph_a_first, eager_a),
-            ("replay_b", graph_b, eager_b),
-            ("replay_a", graph_a_replay, eager_a),
-        ):
+            eager_result = eager_results[pack_index]
+            label = f"replay_{replay_index:02d}_pack_{pack_index}"
             _assert_cp_graph_bitwise_match(
                 graph_result[0], eager_result[0], f"balanced_dynamic:{label}:output"
             )
@@ -1344,12 +1383,33 @@ class TestDSv4HybridAttentionTHDCP:
                     graph_grad, eager_result[2][name], f"balanced_dynamic:{label}:param_grad:{name}"
                 )
 
-        # A/B only change boundaries in the first half of the global pack, so
-        # CP ranks that own the unchanged final sequence may legitimately see
+            # Neither the in-place metadata refresh nor graph replay may replace
+            # either graph-owned storage allocation.
+            assert (
+                tuple(
+                    _owner_kwargs(graph_packed)[name].data_ptr()
+                    for name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS
+                )
+                == graph_owner_ptrs
+            )
+            if pack_index in first_graph_outputs:
+                _assert_cp_graph_bitwise_match(
+                    graph_result[0],
+                    first_graph_outputs[pack_index],
+                    f"balanced_dynamic:{label}:repeat_restore",
+                )
+            else:
+                first_graph_outputs[pack_index] = graph_result[0]
+
+        assert len(first_graph_outputs) == 3
+        # Some compositions only change boundaries on another CP rank, so CP
+        # ranks that own the unchanged final sequence may legitimately see
         # identical local outputs.  Require a difference somewhere globally.
-        assert _max_int_across_world(int(not torch.equal(graph_a_first[0], graph_b[0]))) == 1
-        _assert_cp_graph_bitwise_match(
-            graph_a_first[0], graph_a_replay[0], "balanced_dynamic:a_b_a_restore"
+        assert (
+            _max_int_across_world(
+                int(not torch.equal(first_graph_outputs[0], first_graph_outputs[1]))
+            )
+            == 1
         )
 
         graph.reset()
@@ -1357,8 +1417,8 @@ class TestDSv4HybridAttentionTHDCP:
         del full_hidden, full_grad, local_hidden, local_grad
         _clear_cuda_test_state()
 
-    def test_balanced_dynamic_pack_te_layer_graph_replays_a_b_a(self):
-        """Real TE layer graphs refresh every route kwarg across A/B/A replays."""
+    def test_balanced_dynamic_pack_te_layer_graph_replays_30_iterations(self):
+        """The direct TE layer fallback refreshes two owner kwargs for 30 A/B/C replays."""
         # The real-TE plumbing is topology-independent once the route tensors reach the
         # TransformerLayer kwarg boundary, so capture it once under CP2.  The raw graph
         # test above exercises the balanced route itself under both CP2 and CP4; repeating
@@ -1379,14 +1439,15 @@ class TestDSv4HybridAttentionTHDCP:
 
         # The raw graph test above owns fused A2A/top-k/attention forward-backward parity.
         # This test isolates the real TransformerLayer -> TE kwargs copy -> reconstruction
-        # boundary with a compact, fixed-capacity pair of route plans.
-        capture_seg_lens = (32, 96, 128, 256)
-        replay_seg_lens = (64, 64, 128, 256)
-        packed_a = _make_thd_packed_seq_params(capture_seg_lens)
-        packed_b = _make_thd_packed_seq_params(replay_seg_lens)
+        # boundary with compact, fixed-capacity route plans. The full
+        # TransformerBlock graph-slot arena is covered separately; a directly
+        # captured layer intentionally exercises the per-layer fallback.
+        segment_compositions = ((32, 96, 128, 256), (64, 64, 128, 256), (48, 80, 128, 256))
+        source_packs = tuple(_make_thd_packed_seq_params(lens) for lens in segment_compositions)
+        capture_seg_lens = segment_compositions[0]
         total_rows = sum(capture_seg_lens)
         local_rows = total_rows // self.cp_size
-        for packed in (packed_a, packed_b):
+        for packed in source_packs:
             prebuild_balanced_layouts(
                 packed,
                 cp_group=self.pg.cp,
@@ -1397,21 +1458,27 @@ class TestDSv4HybridAttentionTHDCP:
 
         from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
-        plan_a = cp_balanced_indexer.get_graph_dynamic_plan(packed_a)
-        plan_b = cp_balanced_indexer.get_graph_dynamic_plan(packed_b)
+        plans = tuple(cp_balanced_indexer.get_graph_dynamic_plan(packed) for packed in source_packs)
+        assert all(plan is not None for plan in plans)
         probe_points = []
         changed_keys = []
-        for key in cp_balanced_indexer._GRAPH_DYNAMIC_PLAN_KWARGS:
-            a = plan_a[key].reshape(-1)
-            b = plan_b[key].reshape(-1)
-            assert a.shape == b.shape
-            changed = torch.nonzero(a != b).flatten()
+        for key in _DSV4_CP_GRAPH_DYNAMIC_PROBE_KEYS:
+            values = tuple(plan[key].reshape(-1) for plan in plans)
+            assert all(value.shape == values[0].shape for value in values[1:])
+            changed = torch.nonzero(
+                torch.stack(tuple(value != values[0] for value in values[1:])).any(dim=0)
+            ).flatten()
             index = int(changed[0].item()) if changed.numel() else 0
             probe_points.append((key, index))
             if changed.numel():
                 changed_keys.append(key)
         assert "validated_cu" in changed_keys
         assert any(key != "validated_cu" for key in changed_keys)
+        probe_signatures = {
+            tuple(int(plan[key].reshape(-1)[index].item()) for key, index in probe_points)
+            for plan in plans
+        }
+        assert len(probe_signatures) == 3
 
         torch.manual_seed(_SEED + 1153)
         model_parallel_cuda_manual_seed(_SEED + 1153)
@@ -1474,8 +1541,13 @@ class TestDSv4HybridAttentionTHDCP:
         )
         static_hidden = static_inputs.pop("hidden_states")
         assert static_hidden.shape == local_hidden.shape
-        for kwarg_key in cp_balanced_indexer._GRAPH_DYNAMIC_PLAN_KWARGS.values():
-            assert kwarg_key in static_inputs
+        assert {key for key in static_inputs if key.startswith("dsa_cp_graph_")} == set(
+            _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS
+        )
+        graph_static_owners = tuple(
+            static_inputs[name] for name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS
+        )
+        graph_static_owner_ptrs = tuple(owner.data_ptr() for owner in graph_static_owners)
         capture_kwargs = {
             "sample_kwargs": (static_inputs,),
             "allow_unused_input": True,
@@ -1496,6 +1568,29 @@ class TestDSv4HybridAttentionTHDCP:
             _set_capture_end()
         graph_layer.cuda_graphs = [graphed[0]]
         graph_layer.current_microbatch = 0
+
+        def _source_owner_kwargs(packed):
+            kwargs = {}
+            cp_balanced_indexer.add_graph_dynamic_plan_to_kwargs(packed, kwargs, required=True)
+            assert set(kwargs) == set(_DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS)
+            plan = cp_balanced_indexer.get_graph_dynamic_plan(packed)
+            assert kwargs["dsa_cp_graph_layout_buffer"] is plan["layout_i32"]
+            assert kwargs["dsa_cp_graph_route_buffer"] is plan["route_i64"]
+            assert kwargs["dsa_cp_graph_layout_buffer"].dtype == torch.int32
+            assert kwargs["dsa_cp_graph_route_buffer"].dtype == torch.int64
+            assert all(kwargs[name].is_contiguous() for name in kwargs)
+            torch.testing.assert_close(
+                plan["validated_cu"], packed.cu_seqlens_q_padded, rtol=0, atol=0
+            )
+            return kwargs
+
+        source_owner_kwargs = tuple(_source_owner_kwargs(packed) for packed in source_packs)
+        source_owner_snapshots = tuple(
+            {name: kwargs[name].detach().clone() for name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS}
+            for kwargs in source_owner_kwargs
+        )
+        for owner_name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS:
+            assert len({kwargs[owner_name].data_ptr() for kwargs in source_owner_kwargs}) == 3
 
         def _run_layer(layer, packed, microbatch_idx, reset_parameter_grads):
             hidden = local_hidden.detach().clone().requires_grad_(True)
@@ -1524,21 +1619,38 @@ class TestDSv4HybridAttentionTHDCP:
                 },
             )
 
-        # Model one optimizer step with A/B/A microbatches. TE graph backward
+        # Model one optimizer step with 30 A/B/C microbatches. TE graph backward
         # accumulates parameter gradients across microbatches, so the eager
-        # reference must use the same accumulation lifecycle.
-        graph_a_first = _run_layer(graph_layer, packed_a, 0, True)
-        graph_b = _run_layer(graph_layer, packed_b, 1, False)
-        graph_a_replay = _run_layer(graph_layer, packed_a, 2, False)
-        eager_a_first = _run_layer(eager_layer, packed_a, 0, True)
-        eager_b = _run_layer(eager_layer, packed_b, 1, False)
-        eager_a_replay = _run_layer(eager_layer, packed_a, 2, False)
+        # reference follows the same lifecycle and is checked after every replay.
+        first_graph_outputs = {}
+        for replay_index in range(30):
+            pack_index = replay_index % len(source_packs)
+            packed = source_packs[pack_index]
+            source_kwargs = _source_owner_kwargs(packed)
+            assert tuple(
+                source_kwargs[name].data_ptr() for name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS
+            ) == tuple(
+                source_owner_kwargs[pack_index][name].data_ptr()
+                for name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS
+            )
+            for owner_name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS:
+                torch.testing.assert_close(
+                    source_kwargs[owner_name],
+                    source_owner_snapshots[pack_index][owner_name],
+                    rtol=0,
+                    atol=0,
+                )
 
-        for label, graph_result, eager_result in (
-            ("te_replay_a_first", graph_a_first, eager_a_first),
-            ("te_replay_b", graph_b, eager_b),
-            ("te_replay_a", graph_a_replay, eager_a_replay),
-        ):
+            graph_result = _run_layer(
+                graph_layer, packed, replay_index, reset_parameter_grads=replay_index == 0
+            )
+            assert (
+                tuple(owner.data_ptr() for owner in graph_static_owners) == graph_static_owner_ptrs
+            )
+            eager_result = _run_layer(
+                eager_layer, packed, replay_index, reset_parameter_grads=replay_index == 0
+            )
+            label = f"te_replay_{replay_index:02d}_pack_{pack_index}"
             _assert_cp_graph_bitwise_match(
                 graph_result[0], eager_result[0], f"balanced_dynamic:{label}:output"
             )
@@ -1552,9 +1664,21 @@ class TestDSv4HybridAttentionTHDCP:
                     graph_grad, eager_result[2][name], f"balanced_dynamic:{label}:param_grad:{name}"
                 )
 
-        assert _max_int_across_world(int(not torch.equal(graph_a_first[0], graph_b[0]))) == 1
-        _assert_cp_graph_bitwise_match(
-            graph_a_first[0], graph_a_replay[0], "balanced_dynamic:te_a_b_a_restore"
+            if pack_index in first_graph_outputs:
+                _assert_cp_graph_bitwise_match(
+                    graph_result[0],
+                    first_graph_outputs[pack_index],
+                    f"balanced_dynamic:{label}:repeat_restore",
+                )
+            else:
+                first_graph_outputs[pack_index] = graph_result[0]
+
+        assert len(first_graph_outputs) == 3
+        assert (
+            _max_int_across_world(
+                int(not torch.equal(first_graph_outputs[0], first_graph_outputs[1]))
+            )
+            == 1
         )
 
         if hasattr(graph_layer.cuda_graphs[0], "reset"):
