@@ -50,7 +50,7 @@ from megatron.core.transformer.enums import (
     InferenceCudaGraphScope,
 )
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -1784,6 +1784,39 @@ class _RepeatedParameterModule(MegatronModule):
         return x + self.weight
 
 
+class _TemporaryBufferModule(MegatronModule):
+    """Mimic the expert-bias token accumulator updated by a captured training graph."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.projection = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.register_buffer("expert_bias", torch.zeros(1))
+        self.register_buffer("local_tokens_per_expert", torch.zeros(1))
+
+    def forward(self, x):
+        return self.project(x)
+
+    def project(self, x):
+        if torch.is_grad_enabled():
+            self.local_tokens_per_expert.add_(1)
+        return self.projection(x)
+
+
+class _WholeGraphTemporaryBufferModule(GraphableMegatronModule):
+    """Whole-module variant of the temporary-buffer test module."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.projection = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.register_buffer("expert_bias", torch.zeros(1))
+        self.register_buffer("local_tokens_per_expert", torch.zeros(1))
+
+    def forward(self, x):
+        if torch.is_grad_enabled():
+            self.local_tokens_per_expert.add_(1)
+        return self.projection(x)
+
+
 class _SimpleNonModule:
     """non-nn.Module base_module for testing the function_name= form of `CudaGraphManager`."""
 
@@ -1800,6 +1833,97 @@ def _make_simple_module(config):
 
 def _make_simple_non_module(config):
     return _SimpleNonModule(config)
+
+
+class TestLocalCudaGraphEvaluation:
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        if _CudagraphGlobalRecord.cudagraph_created:
+            delete_cuda_graphs()
+        else:
+            _CudagraphGlobalRecord.cudagraph_record = []
+            _CudagraphGlobalRecord.cudagraph_inference_record = []
+            CudaGraphManager.global_mempool = None
+        torch.cuda.set_stream(torch.cuda.default_stream())
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    @pytest.mark.parametrize("whole_module", [False, True], ids=["wrapped_method", "whole_module"])
+    def test_training_graph_temporary_state_is_reset_when_training_resumes(self, whole_module):
+        def first_output(output):
+            return output[0] if isinstance(output, tuple) else output
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            cuda_graph_warmup_steps=0,
+            moe_router_enable_expert_bias=True,
+            moe_router_score_function="sigmoid",
+        )
+        if whole_module:
+            module = _WholeGraphTemporaryBufferModule(config).cuda()
+            manager = module.cudagraph_manager
+        else:
+            module = _TemporaryBufferModule(config).cuda()
+            manager = CudaGraphManager(
+                config, base_module=module, function_name="project", need_backward=True
+            )
+            module.cudagraph_manager = manager
+        ddp_model = DistributedDataParallel(
+            config,
+            DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=1_000_000),
+            module,
+        )
+        test_input = torch.randn(4, config.hidden_size, device="cuda", requires_grad=True)
+
+        ddp_model.zero_grad_buffer()
+        first_output(ddp_model(test_input)).sum().backward()
+        ddp_model.finish_grad_sync()
+        assert module.local_tokens_per_expert.item() == 1
+
+        create_cudagraphs()
+        assert module.local_tokens_per_expert.item() == 1
+        runner = manager.cudagraph_runners[0]
+        runner_status = runner.status
+
+        # Match the end-of-training-step reset before validation begins.
+        module.local_tokens_per_expert.zero_()
+        module.expert_bias.fill_(2)
+
+        ddp_model.eval()
+        with torch.no_grad():
+            eval_output = ddp_model(test_input.detach())
+            if whole_module:
+                reference_output = module.forward(test_input.detach())
+            else:
+                reference_output = module.project(test_input.detach(), eager=True)
+
+        torch.testing.assert_close(first_output(eval_output), first_output(reference_output))
+        # no_grad does not change the operations already captured in the training graph.
+        assert module.local_tokens_per_expert.item() == 1
+        assert manager.cudagraph_runners == [runner]
+        assert runner.status is runner_status
+
+        ddp_model.train()
+        assert module.local_tokens_per_expert.item() == 0
+        assert module.expert_bias.item() == 2
+
+        ddp_model.zero_grad_buffer()
+        replay_input = test_input.detach().clone().requires_grad_()
+        first_output(ddp_model(replay_input)).sum().backward()
+        ddp_model.finish_grad_sync()
+
+        assert module.local_tokens_per_expert.item() == 1
 
 
 class TestCheckpointParameterDiscovery:
