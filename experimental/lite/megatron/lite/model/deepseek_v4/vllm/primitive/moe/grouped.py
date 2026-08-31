@@ -16,6 +16,14 @@ _M_ALIGNMENT = 128
 _PACK_DEBUG_SYNC = os.getenv("MLITE_VLLM_PACK_DEBUG_SYNC") == "1"
 
 
+def _direct_ceil_ue8m0_activation_packing(value: torch.Tensor) -> bool:
+    """Use v9's ceil-UE8M0 activation packing only on Blackwell."""
+    if not value.is_cuda:
+        return False
+    major, _minor = torch.cuda.get_device_capability(value.device)
+    return major >= 10
+
+
 @contextmanager
 def _nvtx_range(name: str):
     torch.cuda.nvtx.range_push(name)
@@ -99,6 +107,7 @@ def _vllm_quantize_contiguous_input(
         tma_aligned_scales=bool(envs.VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES),
         use_ue8m0=(
             scale_format == DeepGemmQuantScaleFMT.FLOAT32_CEIL_UE8M0
+            and _direct_ceil_ue8m0_activation_packing(value)
         ),
     )
 

@@ -22,6 +22,19 @@ triton = ds4_quantization.triton
 tl = ds4_quantization.tl
 
 
+def _direct_ue8m0_weight_packing(weight: torch.Tensor) -> bool:
+    """Keep direct UE8M0 weight packing on Blackwell, not Hopper.
+
+    The v9 direct/fused weight-quantization kernels were developed for SM100.
+    Hopper retains the v4 canonical FP32-scale path followed by vLLM's
+    architecture-aware post-processing.
+    """
+    if not weight.is_cuda:
+        return False
+    major, _minor = torch.cuda.get_device_capability(weight.device)
+    return major >= 10
+
+
 if triton is not None:
 
     @triton.jit
@@ -199,7 +212,11 @@ def quantize_block_fp8_weight(weight: torch.Tensor):
         scales is not None
         and getattr(weight, "_fp8_source_scale_version", None) == weight._version
     ):
-        if weight.is_cuda and ds4_quantization.triton is not None:
+        if (
+            weight.is_cuda
+            and ds4_quantization.triton is not None
+            and _direct_ue8m0_weight_packing(weight)
+        ):
             # Checkpoint loading already validates positivity, finiteness, and
             # exact BF16->FP8 reversibility before binding these source scales.
             # Repeating torch.all(...)->bool for every lazy deployment pack
@@ -224,6 +241,7 @@ def quantize_block_fp8_weight(weight: torch.Tensor):
         if (
             weight.is_cuda
             and triton is not None
+            and _direct_ue8m0_weight_packing(weight)
             and os.environ.get("MLITE_VLLM_FUSED_WEIGHT_QUANT", "1") != "0"
         ):
             if (
@@ -247,7 +265,12 @@ def _grouped_checkpoint_weights(
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Requantize trusted source weights directly into their final stack."""
 
-    if not weights or not weights[0].is_cuda or ds4_quantization.triton is None:
+    if (
+        not weights
+        or not weights[0].is_cuda
+        or not _direct_ue8m0_weight_packing(weights[0])
+        or ds4_quantization.triton is None
+    ):
         return None
     scales = tuple(getattr(weight, "_fp8_source_scales", None) for weight in weights)
     if any(
@@ -289,6 +312,7 @@ def _quantize_grouped_block_fp8_weights_direct(
     if (
         not weights
         or not weights[0].is_cuda
+        or not _direct_ue8m0_weight_packing(weights[0])
         or triton is None
         or os.environ.get("MLITE_VLLM_FUSED_WEIGHT_QUANT", "1") == "0"
         or os.environ.get("MLITE_VLLM_FUSED_UE8M0_WEIGHT_QUANT", "1") == "0"
@@ -326,6 +350,7 @@ def _quantize_concatenated_block_fp8_weights_direct(
     if (
         not weights
         or not weights[0].is_cuda
+        or not _direct_ue8m0_weight_packing(weights[0])
         or triton is None
         or os.environ.get("MLITE_VLLM_FUSED_WEIGHT_QUANT", "1") == "0"
         or os.environ.get("MLITE_VLLM_FUSED_UE8M0_WEIGHT_QUANT", "1") == "0"
