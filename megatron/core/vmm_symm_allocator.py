@@ -2,7 +2,7 @@
 #
 # See LICENSE for license information.
 
-"""CUDA VMM allocator for the GTP symmetric-memory pools.
+"""CUDA VMM (Virtual Memory Management) allocator for NCCL symmetric-memory pools.
 
 Implements NCCL's requirements on user-allocated communication buffers
 (https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#memory-allocator)
@@ -10,14 +10,17 @@ minimally: VMM allocations at the recommended granularity, exportable handle
 types (POSIX FD, plus FABRIC when supported — dropped on retry if cuMemCreate
 rejects it), and GPUDirect-RDMA-capable physical memory when supported.
 
-Unlike ``ncclMemAlloc``, the memory is mapped only on the allocation's device
-— the requirements ask for no more, and ncclMemAlloc's extra mappings on every
-P2P-visible peer GPU slow CPU-side kernel launching for the whole training
-step.
+``ncclMemAlloc`` uses the same VMM driver calls; the difference is that this
+allocator maps memory only on the allocation's device (peers access it through
+NCCL windows), while ``ncclMemAlloc`` additionally maps every allocation on all
+P2P-visible peer GPUs — and those persistent peer mappings slow CPU-side kernel
+launching for the whole training step.
 
-Window registration is still delegated to ``nccl_allocator.register_mem_pool``
+Window registration is delegated to ``nccl_allocator.register_mem_pool``
 (which calls ``ncclCommWindowRegister``), which accepts this memory and runs its
-symmetric kernels on it.
+symmetric kernels on it. Building the extension requires nvcc and libcuda at
+runtime; ``init``/``create_vmm_mem_pool`` raise if it cannot build, and callers
+decide whether to fall back to ``ncclMemAlloc``-backed pools.
 """
 
 import logging
@@ -36,13 +39,20 @@ from megatron.core.utils import log_single_rank
 logger = logging.getLogger(__name__)
 
 _allocator = None
+_build_error = None
 
 
 def _build_vmm_allocator():
-    global _allocator
-    # If the allocator is already built, return
+    global _allocator, _build_error
+    # If the allocator is already built, return; if the build already failed, do not
+    # retry the compilation on every call.
     if _allocator is not None:
         return
+    if _build_error is not None:
+        raise RuntimeError(
+            "[MCORE][VMM_SYMM_ALLOCATOR] The VMM allocator extension failed to build "
+            "(requires nvcc and libcuda at runtime)."
+        ) from _build_error
 
     vmm_allocator_source = """
     #include <c10/cuda/CUDACachingAllocator.h>
@@ -83,7 +93,7 @@ def _build_vmm_allocator():
             return types;
         }
 
-        void* gtp_vmm_alloc_plug(size_t size, int device, void* stream) {
+        void* vmm_alloc_plug(size_t size, int device, void* stream) {
             (void)stream;
             // Make the allocation's device current for the driver calls.
             c10::cuda::CUDAGuard device_guard(static_cast<c10::DeviceIndex>(device));
@@ -146,7 +156,7 @@ def _build_vmm_allocator():
             return (void*)address;
         }
 
-        void gtp_vmm_free_plug(void* ptr, size_t size, int device, void* stream) {
+        void vmm_free_plug(void* ptr, size_t size, int device, void* stream) {
             (void)size;
             (void)stream;
             c10::cuda::CUDAGuard device_guard(static_cast<c10::DeviceIndex>(device));
@@ -171,7 +181,7 @@ def _build_vmm_allocator():
             if (!vmm_allocator) {
                 vmm_allocator = std::make_shared<
                     torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator>(
-                    gtp_vmm_alloc_plug, gtp_vmm_free_plug);
+                    vmm_alloc_plug, vmm_free_plug);
             }
         }
 
@@ -186,16 +196,14 @@ def _build_vmm_allocator():
         };
     }
     """
-    # Same shared build dir as the nccl allocator extension; torch's file lock
-    # serializes concurrent builds across local ranks.
     # Own subdirectory: load_inline writes a fixed main.cpp per build dir, so sharing
     # nccl_allocator's dir would clobber sources. Torch's file lock serializes ranks.
-    module_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    build_dir = os.path.join(module_dir, "build", "gtp_vmm_allocator")
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    build_dir = os.path.join(module_dir, "build", "vmm_symm_allocator")
     os.makedirs(build_dir, exist_ok=True)
     try:
         vmm_allocator = torch.utils.cpp_extension.load_inline(
-            name="gtp_vmm_allocator",
+            name="vmm_symm_allocator",
             cpp_sources=vmm_allocator_source,
             with_cuda=True,
             extra_ldflags=["-lcuda"],
@@ -204,10 +212,10 @@ def _build_vmm_allocator():
             build_directory=build_dir,
         )
     except Exception as e:
+        _build_error = e
         raise RuntimeError(
-            "[GTP] Failed to build the GTP VMM allocator extension; "
-            "--gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require nvcc and libcuda "
-            "at runtime."
+            "[MCORE][VMM_SYMM_ALLOCATOR] Failed to build the VMM allocator extension "
+            "(requires nvcc and libcuda at runtime)."
         ) from e
 
     _allocator = vmm_allocator.get_vmm_allocator()
@@ -215,8 +223,8 @@ def _build_vmm_allocator():
 
 def create_vmm_mem_pool() -> torch.cuda.MemPool:
     """
-    Create a symmetric memory pool using the VMM allocator. GTP symmetric pools are
-    always symmetric (register_gtp_symm_pool enforces the torch >= 2.9 floor).
+    Create a symmetric memory pool using the VMM allocator. Callers enforce the
+    torch >= 2.9 floor that symmetric pools need.
     """
     _build_vmm_allocator()
     assert _allocator is not None, "VMM allocator is not initialized"
@@ -241,12 +249,12 @@ def init() -> None:
     # Disables the use of the tensor register allocator hook
     os.environ["TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK"] = "0"
     _build_vmm_allocator()
-    log_single_rank(logger, logging.INFO, "[MCORE][GTP] Initialized the VMM Allocator")
+    log_single_rank(logger, logging.INFO, "[MCORE][VMM_SYMM_ALLOCATOR] Initialized the VMM Allocator")
 
 
 def register_mem_pool(pool: torch.cuda.MemPool, group) -> None:
     """
-    Window-register a VMM pool's segments on ``group`` (always symmetric).
+    Window-register a pool's segments on ``group`` (always symmetric).
     Delegating to nccl_allocator is safe because its (de)registration walks the
     pool's segments and never touches the allocator that produced them.
     """
@@ -255,6 +263,6 @@ def register_mem_pool(pool: torch.cuda.MemPool, group) -> None:
 
 def deregister_mem_pool(pool: torch.cuda.MemPool, group) -> None:
     """
-    Deregister a VMM pool's windows from ``group``. Delegates to nccl_allocator.
+    Deregister a pool's windows from ``group``. Delegates to nccl_allocator.
     """
     nccl_allocator.deregister_mem_pool(pool, group)

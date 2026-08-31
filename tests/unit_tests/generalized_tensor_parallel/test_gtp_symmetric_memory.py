@@ -131,24 +131,24 @@ class TestRegisterVersionGuard:
 def _vmm_pool_or_skip():
     import shutil
 
-    import megatron.core.tensor_parallel.gtp_vmm_allocator as gtp_vmm
+    import megatron.core.vmm_symm_allocator as vmm_alloc
 
     # Preflight only: skip where the extension cannot possibly build, but let a real
     # build failure FAIL the test (a broad skip would turn compiler regressions green).
     if shutil.which("nvcc") is None:
         pytest.skip("nvcc unavailable; cannot build the VMM allocator extension")
-    return gtp_vmm.create_vmm_mem_pool()
+    return vmm_alloc.create_vmm_mem_pool()
 
 
 class TestVmmAllocatorModule:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA allocator test")
     def test_build_is_cached(self):
-        import megatron.core.tensor_parallel.gtp_vmm_allocator as gtp_vmm
+        import megatron.core.vmm_symm_allocator as vmm_alloc
 
         _vmm_pool_or_skip()
-        first = gtp_vmm._allocator
+        first = vmm_alloc._allocator
         _vmm_pool_or_skip()
-        assert first is not None and gtp_vmm._allocator is first
+        assert first is not None and vmm_alloc._allocator is first
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA allocator test")
     def test_pool_alloc_write_read_recycle(self):
@@ -176,9 +176,9 @@ class TestVmmAllocatorModule:
 class TestSymmPoolBackend:
     def test_pools_are_vmm_backed(self, monkeypatch):
         calls = []
-        monkeypatch.setattr(gtp_symm.gtp_vmm_allocator, "init", lambda: calls.append("init"))
+        monkeypatch.setattr(gtp_symm.vmm_symm_allocator, "init", lambda: calls.append("init"))
         monkeypatch.setattr(
-            gtp_symm.gtp_vmm_allocator,
+            gtp_symm.vmm_symm_allocator,
             "create_vmm_mem_pool",
             lambda: calls.append("pool") or object(),
         )
@@ -187,6 +187,27 @@ class TestSymmPoolBackend:
             assert calls == ["init", "pool"]
         finally:
             gtp_symm._pools.pop("backend_default_group", None)
+
+    def test_falls_back_to_nccl_when_vmm_unavailable(self, monkeypatch):
+        calls = []
+
+        def _boom():
+            raise RuntimeError("extension failed to build")
+
+        monkeypatch.setattr(gtp_symm.vmm_symm_allocator, "init", _boom)
+        monkeypatch.setattr(
+            gtp_symm.nccl_allocator, "init", lambda: calls.append("nccl_init")
+        )
+        monkeypatch.setattr(
+            gtp_symm.nccl_allocator,
+            "create_nccl_mem_pool",
+            lambda symmetric: calls.append("nccl_pool") or object(),
+        )
+        try:
+            gtp_symm._get_gtp_symm_pool(_StubGroup(name="fallback_group"))
+            assert calls == ["nccl_init", "nccl_pool"]
+        finally:
+            gtp_symm._pools.pop("fallback_group", None)
 
 
 class TestRegisteredLIFOPool:
