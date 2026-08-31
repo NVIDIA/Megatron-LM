@@ -338,6 +338,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_te_activation_func": False,
     "use_te_rng_tracker": False,
     "variable_seq_lengths": False,
+    "pipeline_p2p_fixed_shape": False,
     "virtual_pipeline_model_parallel_size": None,
     "wgrad_deferral_limit": 0,
     "window_attn_skip_freq": None,

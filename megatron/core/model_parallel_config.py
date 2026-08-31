@@ -377,6 +377,15 @@ class ModelParallelConfig:
         should only be set if the sequence length varies by microbatch within a global batch.
     """
 
+    pipeline_p2p_fixed_shape: bool = False
+    """Skip pipeline shape exchange when packed tensors are padded to a fixed local size.
+
+    This preserves variable-sequence-length semantics for sequence packing while using
+    ``max_seqlen_per_dp_cp_rank`` to determine the pipeline receive-buffer shape. It requires a
+    sequence-packing scheduler, maximum-size packed-sequence padding, and static context
+    parallelism.
+    """
+
     overlap_p2p_comm: bool = False
     """When True some of the peer to peer communication for pipeline parallelism will overlap with
        computation. Must be False if batch_p2p_comm is true.
@@ -549,6 +558,21 @@ class ModelParallelConfig:
                         f"({self.max_seqlen_per_dp_cp_rank}), got "
                         f"{self.pad_packed_seq_alignment}."
                     )
+
+        if self.pipeline_p2p_fixed_shape:
+            if self.sequence_packing_scheduler is None:
+                raise ValueError("pipeline_p2p_fixed_shape requires a sequence_packing_scheduler.")
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape is not supported with dynamic_context_parallel."
+                )
+            if self.pad_packed_seq_alignment not in ("max", self.max_seqlen_per_dp_cp_rank):
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape requires pad_packed_seq_alignment='max' or "
+                    "pad_packed_seq_alignment equal to max_seqlen_per_dp_cp_rank "
+                    f"({self.max_seqlen_per_dp_cp_rank}), got "
+                    f"{self.pad_packed_seq_alignment}."
+                )
 
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
