@@ -5455,7 +5455,12 @@ def training_log(
             # by the scheduled microbatch count for this step.
             mtp_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         MTPLossLoggingHelper.track_mtp_metrics(
-            mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
+            mtp_loss_scale,
+            iteration,
+            writer,
+            wandb_writer,
+            total_loss_dict,
+            preserve_groups=args.cuda_graph_impl != "none",
         )
 
     # Track sparse attention indexer loss.
@@ -6235,6 +6240,16 @@ def checkpoint_and_decide_exit(
     return False
 
 
+def _resolve_thd_static_batch_pg_collection(pg_collection):
+    """Resolve the language-model process groups used by THD batch preparation."""
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        raise ValueError(
+            "THD full-iteration batch preparation does not support "
+            "MultiModuleProcessGroupCollection."
+        )
+    return pg_collection
+
+
 def train(
     forward_step_func,
     model,
@@ -6534,10 +6549,12 @@ def train(
             # canonicalized to graph-static shapes outside the captured region
             # (this path issues TP broadcasts), and a fixed num_microbatches
             # per step (enforced via the wrapper's capture signature).
+            thd_pg_collection = _resolve_thd_static_batch_pg_collection(pg_collection)
             thd_batch_preparation_fn = functools.partial(
                 prepare_thd_static_batch_for_full_iteration_cuda_graph,
                 config=config,
                 vpp_size=config.virtual_pipeline_model_parallel_size,
+                pg_collection=thd_pg_collection,
             )
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,

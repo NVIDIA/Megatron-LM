@@ -5914,10 +5914,18 @@ class TransformerConfig(ModelParallelConfig):
                     "('alltoall', 'flex'), "
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
+                # THD full-iteration CUDA graphs need no runtime equalization: every rank's
+                # packed tokens are padded to the static max_seqlen_per_dp_cp_rank capacity
+                # (validated below; the static batch preparation asserts it for every
+                # microbatch, and the eager THD path pads to it whenever a CUDA graph is
+                # configured), so all dispatcher ranks see equal token counts. The padding
+                # option would add a host-synchronizing all-reduce to every dispatch inside
+                # the captured iteration.
                 if (
                     self.moe_token_dispatcher_type == "flex"
                     and self.moe_flex_dispatcher_backend == "hybridep"
                     and not self.moe_hybridep_pad_variable_tokens
+                    and self.cuda_graph_impl != "full_iteration"
                 ):
                     raise ValueError(
                         "sequence_packing with HybridEP requires "
@@ -5968,6 +5976,12 @@ class TransformerConfig(ModelParallelConfig):
                     "THD full-iteration CUDA graph does not support standalone MTP: "
                     "its PP shape handshake is not graph-capturable."
                 )
+                if self.context_parallel_size > 1:
+                    assert self.cuda_graph_warmup_steps > 0, (
+                        "THD full-iteration CUDA graph with context parallelism requires "
+                        "cuda_graph_warmup_steps > 0 so consumers can materialize "
+                        "host-derived device layout caches before graph capture."
+                    )
                 assert (
                     self.pipeline_p2p_fixed_shape
                 ), "THD full-iteration CUDA graph requires fixed-shape pipeline communication."

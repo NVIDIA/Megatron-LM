@@ -8,13 +8,22 @@ import logging
 import torch
 
 from megatron.core.tensor_parallel.random import (
+    convert_cuda_rng_state,
     cudagraph_needs_generator_registration,
     get_all_rng_states,
+    get_cuda_rng_tracker,
+    is_graph_safe_cuda_rng_tracker,
     prime_cuda_rng_states_for_graph_capture,
 )
 from megatron.core.transformer.experimental_attention_variant import dsa_logging
 
 logger = logging.getLogger(__name__)
+
+# Optional pure-Python metadata attached to an input batch whose values are baked
+# into the captured graph (for example, packed-CP route split sizes).  Tensor
+# payloads may change between replays, but this metadata must remain identical for
+# each static-buffer slot.
+FULL_CUDA_GRAPH_STATIC_METADATA_KEY = 'full_cuda_graph_static_metadata'
 
 # Process-wide handle so full-iter and optimizer graph captures share one pool and one
 # non-default stream (per-stream alloc segments can inflate memory_reserved; see
@@ -96,6 +105,12 @@ def clone_tensors_in_struct(tgt, src):
         if not isinstance(tgt, dict):
             return copy_tensors_in_struct(src)
         for k in src:
+            # This metadata was compared before any static-buffer update and is
+            # immutable for the lifetime of the graph.  Keep the captured copy
+            # instead of descending into pure-Python tuples such as CP split
+            # sizes and packed boundaries.
+            if k == FULL_CUDA_GRAPH_STATIC_METADATA_KEY:
+                continue
             if isinstance(src[k], (tuple, list, dict, torch.Tensor)):
                 clone_tensors_in_struct(tgt[k], src[k])
             else:
@@ -117,13 +132,15 @@ class StaticBufferLoader:
         self.stream = torch.cuda.Stream()
 
     @classmethod
-    def reset(cls):
+    def reset(cls, stage=None):
         """Drop all static buffers (e.g. between models or tests).
 
         Only call after the CUDA graphs referencing these buffers have been
         destroyed via ``FullCudaGraphWrapper.reset_cuda_graph``.
         """
-        cls.static_buffers = {'training': [], 'validation': []}
+        for reset_stage in ('training', 'validation'):
+            if stage is None or stage == reset_stage:
+                cls.static_buffers[reset_stage] = []
 
     def __call__(self, inputs, stage, microbatch):
         assert stage in ['training', 'validation']
@@ -137,6 +154,18 @@ class StaticBufferLoader:
             with torch.cuda.stream(self.stream):
                 StaticBufferLoader.static_buffers[stage].append(copy_tensors_in_struct(inputs))
         else:
+            incoming_static_metadata = inputs.get(FULL_CUDA_GRAPH_STATIC_METADATA_KEY)
+            captured_static_metadata = StaticBufferLoader.static_buffers[stage][microbatch].get(
+                FULL_CUDA_GRAPH_STATIC_METADATA_KEY
+            )
+            if incoming_static_metadata != captured_static_metadata:
+                raise RuntimeError(
+                    "Full-iteration CUDA graph static input metadata changed for "
+                    f"{stage} microbatch slot {microbatch}. The captured graph contains "
+                    "Python-derived layout values (such as packed-CP route/split metadata), "
+                    "so replay with a different layout would be incorrect. Keep the packed "
+                    "geometry fixed for each microbatch slot or reset and recapture the graph."
+                )
 
             for k in inputs.keys():
                 if k not in StaticBufferLoader.static_buffers[stage][microbatch]:
@@ -166,6 +195,63 @@ class FullCudaGraphWrapper:
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
     capture_signature = {'training': None, 'validation': None}
+
+    @staticmethod
+    def _get_graphable_rng_states():
+        """Validate and return the graph-safe generators used during capture."""
+        tracker = get_cuda_rng_tracker()
+        if not is_graph_safe_cuda_rng_tracker(tracker):
+            raise RuntimeError(
+                "Full-iteration CUDA graph capture requires a graph-safe CUDA RNG tracker. "
+                "Initialize the native tracker with use_cudagraphable_rng=True."
+            )
+
+        tracker_states = tracker.get_states()
+        invalid_states = {
+            name: type(state).__name__
+            for name, state in tracker_states.items()
+            if not isinstance(state, (torch.Tensor, torch.Generator))
+        }
+        if invalid_states:
+            raise RuntimeError(
+                "Full-iteration CUDA graph capture requires tensor or generator RNG states; "
+                f"tracker returned unsupported states: {invalid_states}."
+            )
+
+        if any(isinstance(state, torch.Tensor) for state in tracker_states.values()):
+            tracker_states = {
+                name: convert_cuda_rng_state(state, to_graphable=True)
+                for name, state in tracker_states.items()
+            }
+        # Besides updating the tracker, this synchronizes TE's process-global
+        # state registry and discards any states left by an older tracker.
+        tracker.set_states(tracker_states)
+        graphable_states = get_all_rng_states()
+
+        invalid_states = {
+            name: type(state).__name__
+            for name, state in graphable_states.items()
+            if not isinstance(state, torch.Generator)
+        }
+        if invalid_states:
+            raise RuntimeError(
+                "Full-iteration CUDA graph capture requires graphable RNG generators; "
+                f"tracker returned non-generator states: {invalid_states}."
+            )
+
+        detached_states = [
+            name
+            for name, state in graphable_states.items()
+            if tracker.get_states().get(name) is not state
+        ]
+        missing_states = set(tracker.get_states()) ^ set(graphable_states)
+        if detached_states or missing_states:
+            raise RuntimeError(
+                "Full-iteration CUDA graph capture requires the registered generators to be "
+                "owned by the active RNG tracker; "
+                f"detached states: {detached_states}, mismatched names: {sorted(missing_states)}."
+            )
+        return graphable_states
 
     def __init__(
         self,
@@ -315,10 +401,11 @@ class FullCudaGraphWrapper:
             gc.collect()
             torch.cuda.empty_cache()
             assert FullCudaGraphWrapper.cuda_graph[training_str] is None
+            graphable_rng_states = self._get_graphable_rng_states()
             FullCudaGraphWrapper.capture_signature[training_str] = signature
             FullCudaGraphWrapper.cuda_graph[training_str] = torch.cuda.CUDAGraph()
             if cudagraph_needs_generator_registration():
-                for _, state in get_all_rng_states().items():
+                for state in graphable_rng_states.values():
                     FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
@@ -390,4 +477,5 @@ class FullCudaGraphWrapper:
             cls.result[reset_stage] = None
             cls.curr_iteration[reset_stage] = 0
             cls.capture_signature[reset_stage] = None
+            StaticBufferLoader.reset(stage=reset_stage)
         gc.collect()
