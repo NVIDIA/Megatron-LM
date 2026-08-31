@@ -501,7 +501,18 @@ def _measure_cuda_graph_time(attn, static_hidden, static_grad, packed_seq_params
         end_event.record()
         torch.cuda.synchronize()
         timings.append(float(start_event.elapsed_time(end_event)))
-    return _max_float_across_world(statistics.median(timings))
+    measured = _max_float_across_world(statistics.median(timings))
+
+    # A CUDAGraph private pool is not an ordinary caching-allocator segment.
+    # Tear down the executable and every tensor that can keep the pool alive
+    # before this helper returns; later tests in the same pytest worker include
+    # a long-sequence attention case whose workspace nearly fills an H100.
+    graph.reset()
+    attn.zero_grad(set_to_none=True)
+    static_hidden.grad = None
+    del graph, _graph_output, start_event, end_event
+    _clear_cuda_test_state()
+    return measured
 
 
 def _format_scale_report(metric, layer_number, cp_size, baseline, measured, scale, limit):
@@ -1086,6 +1097,7 @@ class TestDSv4HybridAttentionTHDCP:
             }
             # The unfused graph pool is large on H100. Its results are cloned, so
             # release it before allocating the eager reference's backward buffers.
+            graph.reset()
             del graph, graph_output, graph_attn, full_hidden, test_hidden
             del static_hidden, static_grad
             _clear_cuda_test_state()
@@ -1225,6 +1237,7 @@ class TestDSv4HybridAttentionTHDCP:
                 f"layer={layer_number}:metadata_replay:param_grad:{name}",
             )
 
+        graph.reset()
         del graph, graph_output, graph_attn, eager_attn, capture_full_hidden, replay_full_hidden
         del capture_hidden, replay_hidden, capture_grad, replay_grad, static_hidden, static_grad
         del graph_out, graph_hidden_grad, eager_hidden

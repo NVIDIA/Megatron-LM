@@ -99,6 +99,8 @@ def get_batch(data_iterator, vp_stage=None):
 
     args = get_args()
     config = core_transformer_config_from_args(args)
+    balance_indexer = getattr(config, "dsa_cp_balance_indexer", False)
+    graph_dynamic_packs = getattr(config, "dsa_cp_balance_indexer_graph_dynamic_packs", False)
 
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
@@ -131,7 +133,7 @@ def get_batch(data_iterator, vp_stage=None):
             config=config,
         )
         finalize_packed_seq_params(packed_seq_params)
-        if config.dsa_cp_balance_indexer:
+        if balance_indexer:
             # Same data-prep hook as pretrain_gpt.get_batch: prebuild the balanced
             # indexer's zigzag plan/routes where host syncs are free, and record the
             # composition observation the CUDA-graph static-composition gate compares
@@ -142,11 +144,11 @@ def get_batch(data_iterator, vp_stage=None):
                 pad_alignment=config.pad_packed_seq_alignment,
                 capacity=(
                     config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
-                    if config.dsa_cp_balance_indexer_graph_dynamic_packs
+                    if graph_dynamic_packs
                     else None
                 ),
                 graphs_enabled=cuda_graph_captures_attention(config),
-                graph_dynamic_packs=config.dsa_cp_balance_indexer_graph_dynamic_packs,
+                graph_dynamic_packs=graph_dynamic_packs,
             )
         return (
             attention_mask,
@@ -360,12 +362,14 @@ def forward_step(data_iterator, model: HybridModel):
         # expose raw cu_seqlens instead, so their params are first constructed
         # here and need the same hook exactly once.
         config = get_attr_wrapped_model(model, "config")
-        if config.dsa_cp_balance_indexer:
+        if getattr(config, "dsa_cp_balance_indexer", False):
             prebuild_balanced_layouts(
                 packed_seq_params,
                 pad_alignment=config.pad_packed_seq_alignment,
                 graphs_enabled=cuda_graph_captures_attention(config),
-                graph_dynamic_packs=config.dsa_cp_balance_indexer_graph_dynamic_packs,
+                graph_dynamic_packs=getattr(
+                    config, "dsa_cp_balance_indexer_graph_dynamic_packs", False
+                ),
             )
 
     timers('batch-generator').stop()

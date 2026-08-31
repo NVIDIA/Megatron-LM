@@ -133,6 +133,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """
     args = get_args()
     config = core_transformer_config_from_args(args)
+    balance_indexer = getattr(config, "dsa_cp_balance_indexer", False)
+    graph_dynamic_packs = getattr(config, "dsa_cp_balance_indexer_graph_dynamic_packs", False)
 
     if args.sequence_packing_scheduler is not None:
         # `get_batch_on_this_rank_for_sequence_packing` owns scheduler THD metadata
@@ -146,17 +148,17 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             config=config,
         )
         finalize_packed_seq_params(batch[5])
-        if config.dsa_cp_balance_indexer:
+        if balance_indexer:
             prebuild_balanced_layouts(
                 batch[5],
                 pad_alignment=config.pad_packed_seq_alignment,
                 capacity=(
                     config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
-                    if config.dsa_cp_balance_indexer_graph_dynamic_packs
+                    if graph_dynamic_packs
                     else None
                 ),
                 graphs_enabled=cuda_graph_captures_attention(config),
-                graph_dynamic_packs=config.dsa_cp_balance_indexer_graph_dynamic_packs,
+                graph_dynamic_packs=graph_dynamic_packs,
             )
         return batch
 
@@ -201,7 +203,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             qkv_format='thd',
         )
         finalize_packed_seq_params(packed_seq_params)
-        if config.dsa_cp_balance_indexer:
+        if balance_indexer:
             # Middle-stage PackedSeqParams carry the raw cu; the hidden states are
             # padded, so probe/build at the physical capacity. Eligibility still
             # comes from the actual sequence boundaries plus that capacity tail;
@@ -211,7 +213,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 pad_alignment=config.pad_packed_seq_alignment,
                 capacity=args.seq_length,
                 graphs_enabled=cuda_graph_captures_attention(config),
-                graph_dynamic_packs=config.dsa_cp_balance_indexer_graph_dynamic_packs,
+                graph_dynamic_packs=graph_dynamic_packs,
             )
         return (None, None, None, None, None, packed_seq_params, None)
 
@@ -265,12 +267,12 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             batch['position_ids'] = position_ids
 
     finalize_packed_seq_params(packed_seq_params)
-    if config.dsa_cp_balance_indexer:
+    if balance_indexer:
         prebuild_balanced_layouts(
             packed_seq_params,
             pad_alignment=config.pad_packed_seq_alignment,
             graphs_enabled=cuda_graph_captures_attention(config),
-            graph_dynamic_packs=config.dsa_cp_balance_indexer_graph_dynamic_packs,
+            graph_dynamic_packs=graph_dynamic_packs,
         )
 
     # Unpack explicitly to avoid relying on dict insertion order.

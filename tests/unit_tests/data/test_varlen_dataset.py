@@ -12,6 +12,7 @@ ValueError on unsupported shapes).
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -738,9 +739,12 @@ def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
 
     monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_tp_rank", get_batch_on_this_tp_rank)
     monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_cp_rank", lambda batch: batch)
+    prebuild = MagicMock()
+    monkeypatch.setattr(pretrain_gpt, "prebuild_balanced_layouts", prebuild)
 
     *_, returned_padding_mask = pretrain_gpt.get_batch(iter(()))
     assert torch.equal(returned_padding_mask, padding_mask)
+    prebuild.assert_not_called()
 
 
 def test_sbhd_dataset_is_built_on_intermediate_pipeline_stage(monkeypatch):
