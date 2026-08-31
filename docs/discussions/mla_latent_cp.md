@@ -785,10 +785,12 @@ passes each existing MLA attention spec through `make_mla_with_latent_cp_spec`, 
 projection stack. `configure_mla_latent_cp_decoder()` accepts either one transformer-layer `ModuleSpec` or a
 `TransformerBlockSubmodules`, replaces only exact ordinary `MLASelfAttention` slots, and leaves GDN,
 KDA, DSA/CSA/HCA, Mamba, MLP, and MoE slots untouched, and returns only the fresh spec.
-`configure_mla_latent_cp_hybrid_stack()` derives its ordinary attention slot from the Hybrid stack's
-own `mla_layer` template, replaces that template's attention, and returns a fresh root spec while
-preserving the original stack module. Neither path mutates its input spec, nests the decoder under a
-wrapper module, changes state-dict keys, or imports GPT code from the Hybrid layer-spec file.
+`configure_mla_latent_cp_hybrid_stack()` uses the feature-owned local projection profile for the
+ordinary attention slot and returns a fresh root spec while preserving the original stack module.
+The default Hybrid `mla_layer` template is not config-aware: it pairs unfused TE up projections with
+identity latent norms, so it must not be misclassified as one of the qualified old-path profiles.
+Neither path mutates its input spec, nests the decoder under a wrapper module, changes state-dict
+keys, or imports GPT code from the Hybrid layer-spec file.
 Ordinary `TransformerBlock` and `HybridStack` call `preprocess_mla_latent_cp` before entering their
 layer loop; the feature does not synthesize a decoder subclass or maintain forward-scoped state.
 

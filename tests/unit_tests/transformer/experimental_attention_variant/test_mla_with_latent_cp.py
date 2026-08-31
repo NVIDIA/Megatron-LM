@@ -1576,6 +1576,10 @@ def test_feature_configures_hybrid_stack_without_mutation():
         latent_stack.submodules.attention_layer.submodules.self_attention.module
         is latent_cp.MLAWithLatentCP
     )
+    assert (
+        latent_stack.submodules.attention_layer.submodules.self_attention.submodules.linear_q_up_proj
+        is latent_cp.ColumnParallelLinear
+    )
     assert hybrid_stack_spec.submodules.attention_layer is base_attention
     assert base_attention.submodules.self_attention.module is SelfAttention
 

@@ -115,6 +115,7 @@ def get_mla_with_latent_cp_spec() -> ModuleSpec:
 
 def _replace_transformer_layer_attention(
     layer_spec: ModuleSpec,
+    replacement_attention: ModuleSpec | None = None,
 ) -> tuple[ModuleSpec, bool]:
     """Replace one ordinary MLA attention slot without mutating its layer spec."""
 
@@ -127,6 +128,8 @@ def _replace_transformer_layer_attention(
         or attention_spec.module is not MLASelfAttention
     ):
         return layer_spec, False
+    if replacement_attention is None:
+        replacement_attention = make_mla_with_latent_cp_spec(attention_spec)
     return (
         replace(
             layer_spec,
@@ -134,7 +137,7 @@ def _replace_transformer_layer_attention(
             metainfo=dict(layer_spec.metainfo),
             submodules=replace(
                 layer_submodules,
-                self_attention=make_mla_with_latent_cp_spec(attention_spec),
+                self_attention=replacement_attention,
                 sharded_state_dict_keys_map=dict(
                     layer_submodules.sharded_state_dict_keys_map
                 ),
@@ -183,7 +186,13 @@ def configure_mla_latent_cp_hybrid_stack(stack_spec: ModuleSpec) -> ModuleSpec:
         isinstance(mla_layer, ModuleSpec),
         "hybrid stack must provide its ordinary MLA layer template",
     )
-    latent_layer, replaced = _replace_transformer_layer_attention(mla_layer)
+    # The default Hybrid template is not config-aware and uses unfused TE up projections
+    # with Identity latent norms. It is therefore not one of the qualified old-path
+    # projection profiles. Keep the established feature-owned local profile here rather
+    # than misclassifying that template as a supported TE stack.
+    latent_layer, replaced = _replace_transformer_layer_attention(
+        mla_layer, get_mla_with_latent_cp_spec()
+    )
     _require(replaced, "hybrid MLA layer template has no ordinary MLA attention slot")
     return replace(
         stack_spec,
