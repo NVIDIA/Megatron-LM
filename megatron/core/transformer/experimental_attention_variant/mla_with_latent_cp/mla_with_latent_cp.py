@@ -583,8 +583,10 @@ class MLAWithLatentCP(MLASelfAttention):
             )
         elif self.config.sequence_parallel:
             k_rope_raw = tp_mappings.gather_from_sequence_parallel_region(
+                # The phase gather supplies the TP gradient sum; this pre-RoPE
+                # gather only restores rows, so its backward must only split.
                 k_rope_raw,
-                tensor_parallel_output_grad=True,
+                tensor_parallel_output_grad=False,
                 group=self.pg_collection.tp,
             )
         q_compressed = self.q_layernorm(q_compressed)

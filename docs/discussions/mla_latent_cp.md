@@ -159,8 +159,11 @@ rank enters with a contiguous `[T_r/N, 1, hidden_size]` sequence shard. The exac
 3. The preserved sequence-parallel Q up projection gathers Q shards and produces full local query
    rows `[T_r,H_tp,D_qk]`; on TE it also performs the fused RMSNorm. For duplicated TE down
    projections, the positional K sequence shard is explicitly gathered before owner-local RoPE and
-   scattered afterward. The local feature-sharded path already has full rows before RoPE and performs
-   the same final scatter. A no-RoPE layer concatenates the raw branches unchanged.
+   scattered afterward. That pre-RoPE gather uses
+   `tensor_parallel_output_grad=False`: its backward only returns each lane's slice because the
+   later phase gather already performs the single TP gradient sum over local heads. The local
+   feature-sharded path already has full rows before RoPE and performs the same final scatter. A
+   no-RoPE layer concatenates the raw branches unchanged.
 4. For every received shard, the preserved sequence-parallel KV up projection gathers latent KV
    over TP before producing local K-content/V heads; on TE it also performs fused RMSNorm. The
    module independently gathers the received K positional shard
@@ -444,9 +447,11 @@ Gradient ownership is:
 
 - Q gradients accumulate over all local phases and flow through the local Q projection;
 - payload gradients follow the reverse ring on the same TP sequence lane. The latent component is
-  TP-reduce-scattered by sequence-parallel `linear_kv_up_proj`; the shared K-positional component is
-  TP-reduce-scattered by its explicit sequence gather. The earlier sequence scatters then
-  all-gather both gradients before owner-local RoPE/KV norm and KV down projection;
+  TP-reduce-scattered by sequence-parallel `linear_kv_up_proj`; the shared K-positional component's
+  phase gather supplies its sole TP reduce-scatter. The post-RoPE sequence scatter then all-gathers
+  that already-summed positional gradient, and the pre-RoPE gather's nonreducing backward splits it
+  back to the owner lane. This avoids a second TP sum before the duplicated TE KV down projection.
+  The latent gradient reaches that projection on its original lane directly;
 - `linear_kv_up_proj` parameter gradients sum its phase uses locally; and
 - normal MCore distributed parameter buffers reduce replicated parameter gradients over DP-CP.
   The module does not add another parameter all-reduce.
