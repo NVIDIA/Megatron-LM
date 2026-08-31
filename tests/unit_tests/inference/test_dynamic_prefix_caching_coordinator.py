@@ -312,16 +312,14 @@ class TestSubmitDoesNotDecodePrompt:
         coordinator.schedule_records = None
         coordinator.router_socket = MagicMock()
 
-        metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}]
+        metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}, None]
         handle_submit_request(coordinator, b"client-A", metadata, [self.UNDECODABLE_PROMPT])
         return coordinator.router_socket.send_multipart.call_args.args[0]
 
     def test_load_balanced_forwards_prompt_verbatim(self):
         """LOAD_BALANCED ignores hashes, so the prompt is never decoded."""
         coordinator = make_coordinator_direct(data_parallel_size=2)
-        coordinator.prefix_caching_coordinator_policy = (
-            PrefixCachingCoordinatorPolicy.LOAD_BALANCED
-        )
+        coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
         _identity, _metadata, prompt_frame = self._submit(coordinator)
         assert prompt_frame is self.UNDECODABLE_PROMPT
 
@@ -334,14 +332,15 @@ class TestSubmitDoesNotDecodePrompt:
     def test_metadata_frame_is_rewritten_with_server_request_id(self):
         """The client's request id is swapped for the coordinator's own."""
         coordinator = make_coordinator_direct(data_parallel_size=2)
-        coordinator.prefix_caching_coordinator_policy = (
-            PrefixCachingCoordinatorPolicy.LOAD_BALANCED
-        )
+        coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
         _identity, metadata_frame, _prompt = self._submit(coordinator)
-        header, request_id, sampling_params = msgpack.unpackb(metadata_frame, raw=False)
+        header, request_id, sampling_params, multi_modal_data = msgpack.unpackb(
+            metadata_frame, raw=False
+        )
         assert header == Headers.SUBMIT_REQUEST.value
         assert request_id == 0  # server-side id, not the client's 7
         assert sampling_params == {"temperature": 1.0}
+        assert multi_modal_data is None
         assert coordinator.request_id_to_client_request_id[0] == 7
 
 
