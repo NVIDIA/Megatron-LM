@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCCheckpointManager
+    from megatron.core.transformer.multi_token_prediction import MTPDSAIterationContext
 
 import torch
 import torch.distributed
@@ -692,6 +693,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
+        mtp_dsa_context: Optional[MTPDSAIterationContext] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -759,6 +761,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
+        attention_variant_kwargs = {}
+        if mtp_dsa_context is not None:
+            attention_variant_kwargs["mtp_dsa_context"] = mtp_dsa_context
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
@@ -770,6 +775,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **attention_variant_kwargs,
         )
         nvtx_range_pop(suffix="self_attention")
 
@@ -2196,6 +2202,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
+        mtp_dsa_context: Optional[MTPDSAIterationContext] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -2229,6 +2236,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
+        attention_variant_kwargs = {}
+        if mtp_dsa_context is not None:
+            attention_variant_kwargs["mtp_dsa_context"] = mtp_dsa_context
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
@@ -2240,6 +2250,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **attention_variant_kwargs,
         )
         nvtx_range_pop(suffix="self_attention")
 

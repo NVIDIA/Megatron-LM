@@ -37,6 +37,7 @@ from megatron.core.utils import ensure_params_ready, get_pg_size
 
 logger = logging.getLogger(__name__)
 _DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED = False
+_warned_mtp_sharing_fused_bypass = False
 
 try:
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
@@ -1964,6 +1965,29 @@ class DSAttention(MegatronModule):
         self.skip_topk = self.index_share and is_dsa_skip_topk_layer(
             self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
         )
+        self.mtp_index_share = self.config.dsa_mtp_index_kv_share and is_mtp_layer
+        global _warned_mtp_sharing_fused_bypass
+        if (
+            self.mtp_index_share
+            and dsa_kernels.use_fused_dsa_kernels(self.config)
+            and not _warned_mtp_sharing_fused_bypass
+        ):
+            _warned_mtp_sharing_fused_bypass = True
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "dsa_mtp_index_kv_share=True requires reusable top-k indices, which the "
+                "combined fused DSA kernel does not expose. The repeated MTP layer therefore "
+                "uses the separable top-k and sparse-attention path; configured fused kernels "
+                "for those operations remain eligible. Benchmark this tradeoff for the target "
+                "MTP depth.",
+            )
+        if self.mtp_index_share and self.skip_topk:
+            raise ValueError(
+                "dsa_mtp_index_kv_share requires the repeated MTP layer to compute "
+                "its own top-k. Adjust dsa_indexer_skip_topk_offset/topk_freq so MTP layer "
+                f"{self.layer_number} is a computing layer."
+            )
         self.source_layer = (
             source_dsa_compute_layer(
                 self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
@@ -2041,6 +2065,7 @@ class DSAttention(MegatronModule):
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
         up_v_weight: Optional[torch.Tensor] = None,
+        mtp_dsa_context=None,
     ):
         """
         Forward pass for Sparse Attention.
@@ -2060,6 +2085,18 @@ class DSAttention(MegatronModule):
         Returns:
             output: Output tensor [sq, b, hidden_size]
         """
+        if self.mtp_index_share and mtp_dsa_context is None:
+            raise RuntimeError(
+                "The repeated MTP DSA layer requires an explicit per-iteration sharing context. "
+                "Serial compute_mtp_single_step speculative inference does not provide this "
+                "context; disable dsa_mtp_index_kv_share or speculative decoding."
+            )
+        if not self.mtp_index_share and mtp_dsa_context is not None:
+            raise RuntimeError(
+                "Received an MTP DSA sharing context for an attention layer that is not "
+                "configured for MTP iteration sharing."
+            )
+        reuse_mtp_source = bool(mtp_dsa_context is not None and mtp_dsa_context.reuses_source)
         query, _ = dsa_layout.ensure_sbhd(query, "query")
         key, _ = dsa_layout.ensure_sbhd(key, "key")
         if value is not None:
@@ -2268,6 +2305,11 @@ class DSAttention(MegatronModule):
 
         skv = key.size(0)
 
+        if mtp_dsa_context is not None and mtp_dsa_context.is_source:
+            source_key = key
+        else:
+            source_key = None
+
         if not packed_thd and sequence_parallel_query_is_local:
             nonpacked_query_positions = dsa_layout.extract_query_positions_from_position_ids(
                 position_ids, sq, query.device
@@ -2292,7 +2334,7 @@ class DSAttention(MegatronModule):
         qr = qr.detach()
 
         indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
-        computes_topk = not self.skip_topk
+        computes_topk = not self.skip_topk and not reuse_mtp_source
         use_indexer_loss = (
             self.training and torch.is_grad_enabled() and indexer_loss_coeff > 0 and computes_topk
         )
@@ -2362,7 +2404,15 @@ class DSAttention(MegatronModule):
             local_packed_cp_query_start = sequence_parallel_tp_row_start
             local_packed_cp_query_len = sequence_parallel_tp_full_rows
 
-        if self.skip_topk:
+        if reuse_mtp_source:
+            if mtp_dsa_context.shared_tensors is None:
+                raise RuntimeError(
+                    f"MTP iteration {mtp_dsa_context.iteration} requires iteration-0 "
+                    "DSA KV/top-k tensors."
+                )
+            topk_indices = mtp_dsa_context.shared_tensors.topk_indices
+            topk_length = mtp_dsa_context.shared_tensors.optional_topk_length()
+        elif self.skip_topk:
             assert topk_holder is not None
             if self.source_layer not in topk_holder:
                 raise RuntimeError(
@@ -2438,7 +2488,7 @@ class DSAttention(MegatronModule):
             )
 
         fused_output = None
-        if use_fused_kernels and not self.index_share:
+        if use_fused_kernels and not self.index_share and not self.mtp_index_share:
             assert q is not None and k is not None and weights is not None
             fused_output = dsa_kernels.run_fused_dsa_attention(
                 config=self.config,
@@ -2626,6 +2676,10 @@ class DSAttention(MegatronModule):
             topk_holder[self.layer_number] = topk_indices
             if topk_length_holder is not None and topk_length is not None:
                 topk_length_holder[self.layer_number] = topk_length
+
+        if mtp_dsa_context is not None and mtp_dsa_context.is_source:
+            assert source_key is not None and topk_indices is not None
+            mtp_dsa_context.capture(source_key, topk_indices, topk_length)
 
         # ===================================
         # Run sparse attention kernel
