@@ -119,7 +119,6 @@ class _GDNBase(MegatronModule):
         conv_bias: bool = False,
         conv_init: float | None = None,
         use_qk_l2norm: bool = True,
-        use_qk_l2norm_in_kernel: bool | None = None,
         A_init_range: tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
         *,
@@ -136,8 +135,6 @@ class _GDNBase(MegatronModule):
             conv_bias: Whether to use bias in the causal convolution.
             conv_init: The initialization range for the causal convolution weights.
             use_qk_l2norm: Whether to L2-normalize q and k.
-            use_qk_l2norm_in_kernel: Whether to perform q/k L2 normalization in the gated delta
-                rule kernel. When unset, uses ``config.use_qk_l2norm_in_kernel``.
             A_init_range: The initialization range for the attention weights.
             pg_collection: The required process groups to use for tensor model parallel and context
                 parallel.
@@ -164,11 +161,10 @@ class _GDNBase(MegatronModule):
         assert A_init_range[0] >= 0 and A_init_range[1] >= A_init_range[0]
         self.A_init_range = A_init_range
         self.use_qk_l2norm = use_qk_l2norm
-        self.use_qk_l2norm_in_kernel = (
-            config.use_qk_l2norm_in_kernel
-            if use_qk_l2norm_in_kernel is None
-            else use_qk_l2norm_in_kernel
-        )
+        self.use_qk_l2norm_in_kernel = config.gdn_use_qk_l2norm_in_kernel
+        assert (
+            self.use_qk_l2norm or not self.use_qk_l2norm_in_kernel
+        ), "gdn_use_qk_l2norm_in_kernel requires use_qk_l2norm=True"
         assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNet"
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
