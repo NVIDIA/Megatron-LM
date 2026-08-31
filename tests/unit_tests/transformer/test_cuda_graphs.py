@@ -281,6 +281,39 @@ class TestCudaGraphConfigAndArguments:
                 cuda_graph_impl='full_iteration', cuda_graph_modules=[CudaGraphModule.attn]
             )
 
+    def test_thd_full_iteration_cp_requires_eager_warmup(self):
+        with pytest.raises(
+            AssertionError,
+            match=(
+                "THD full-iteration CUDA graph with context parallelism requires "
+                "cuda_graph_warmup_steps > 0"
+            ),
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='full_iteration',
+                cuda_graph_modules=[],
+                cuda_graph_warmup_steps=0,
+                context_parallel_size=2,
+                sequence_packing_scheduler='dp_balanced',
+                pad_packed_seq_alignment='max',
+                max_seqlen_per_dp_cp_rank=64,
+                thd_max_packed_sequences=8,
+            )
+
+    def test_thd_full_iteration_cp1_allows_zero_warmup(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='full_iteration',
+            cuda_graph_modules=[],
+            cuda_graph_warmup_steps=0,
+            context_parallel_size=1,
+            sequence_packing_scheduler='dp_balanced',
+            pad_packed_seq_alignment='max',
+            max_seqlen_per_dp_cp_rank=64,
+            thd_max_packed_sequences=8,
+        )
+
+        assert cfg.thd_static_pp_communication
+
     def test_full_iteration_scope_string_in_config_migrated(self):
         with pytest.warns(DeprecationWarning, match="deprecated"):
             cfg = _base_cuda_graph_config(

@@ -310,6 +310,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "tensor_model_parallel_size": 2,
     "test_mode": False,
     "thd_max_packed_sequences": None,
+    "thd_static_pp_communication": False,
     "timers": None,
     "tp_comm_atomic_ag": False,
     "tp_comm_atomic_rs": False,

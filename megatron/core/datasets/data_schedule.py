@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Type
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.context_parallel_layout import ThdCpRoute, finalize_packed_seq_params
 from megatron.core.datasets.data_schedule_utils import (
     align_sample_id_groups,
     broadcast_scalars,
@@ -16,6 +17,7 @@ from megatron.core.datasets.data_schedule_utils import (
     next_hdp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
 )
+from megatron.core.full_cuda_graph import FULL_CUDA_GRAPH_STATIC_METADATA_KEY
 from megatron.core.packed_seq_params import (
     PackedSeqParams,
     extend_thd_padding_before_cp_slice,
@@ -26,6 +28,283 @@ from megatron.core.packed_seq_params import (
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
+
+# Sentinel key marking a batch that was already canonicalized to the THD
+# full-iteration CUDA graph static-input contract outside the captured region.
+THD_FULL_ITERATION_STATIC_BATCH_KEY = 'thd_full_iteration_static_batch'
+_THD_FULL_ITERATION_CP_METADATA_KEY = 'thd_full_iteration_cp_metadata'
+_THD_FULL_ITERATION_PACKED_SEQ_PARAMS_KEY = '_thd_full_iteration_packed_seq_params'
+
+
+def _materialize_thd_cp_layout_signatures(
+    packed_seq_params: PackedSeqParams,
+    host_cu_q: Optional[List[int]],
+    host_cu_kv: Optional[List[int]],
+):
+    """Return exact Q/KV CP boundaries with at most one normal host transfer."""
+    if host_cu_q is not None and host_cu_kv is not None:
+        return tuple(host_cu_q), tuple(host_cu_kv)
+
+    cu_q = (
+        packed_seq_params.cu_seqlens_q_padded
+        if packed_seq_params.cu_seqlens_q_padded is not None
+        else packed_seq_params.cu_seqlens_q
+    )
+    cu_kv = (
+        packed_seq_params.cu_seqlens_kv_padded
+        if packed_seq_params.cu_seqlens_kv_padded is not None
+        else packed_seq_params.cu_seqlens_kv
+    )
+    assert cu_q is not None and cu_kv is not None
+    if cu_q is cu_kv:
+        values = tuple(cu_q.detach().to(device='cpu', dtype=torch.int64).tolist())
+        return values, values
+    if cu_q.device != cu_kv.device:
+        return (
+            tuple(cu_q.detach().to(device='cpu', dtype=torch.int64).tolist()),
+            tuple(cu_kv.detach().to(device='cpu', dtype=torch.int64).tolist()),
+        )
+    q_numel = cu_q.numel()
+    values = torch.cat((cu_q.detach(), cu_kv.detach())).to(device='cpu', dtype=torch.int64).tolist()
+    return tuple(values[:q_numel]), tuple(values[q_numel:])
+
+
+def _build_thd_full_iteration_cp_metadata(packed_seq_params: PackedSeqParams) -> Dict[str, Any]:
+    """Serialize finalized CP tensor inputs into containers understood by StaticBufferLoader."""
+    route = packed_seq_params.cp_partition_route
+    return {
+        'cp_group': packed_seq_params.cp_group,
+        'zigzag_index': None if route is None else route.zigzag_index,
+        'contiguous_index': None if route is None else route.contiguous_index,
+    }
+
+
+def _build_thd_full_iteration_cp_layout_signature(
+    packed_seq_params: PackedSeqParams,
+) -> Optional[Dict[str, Any]]:
+    """Return the exact packed geometry baked into CP>1 Python route metadata."""
+    cp_group = packed_seq_params.cp_group
+    if cp_group is None or cp_group.size() <= 1:
+        return None
+    route = packed_seq_params.cp_partition_route
+    assert route is not None, "CP>1 THD static batches require a prebuilt partition route."
+
+    # PRs layered on top of the generic THD graph support may attach compact
+    # host boundaries for consumers such as DSA. Keep them in the immutable
+    # metadata certificate without making this module depend on those consumers.
+    host_cu_q = getattr(packed_seq_params, 'thd_cp_host_cu_seqlens_q', None)
+    host_cu_kv = getattr(packed_seq_params, 'thd_cp_host_cu_seqlens_kv', None)
+    cp_cu_q, cp_cu_kv = _materialize_thd_cp_layout_signatures(
+        packed_seq_params, host_cu_q, host_cu_kv
+    )
+    return {
+        'version': 1,
+        'cp_size': cp_group.size(),
+        'cp_rank': cp_group.rank(),
+        'cp_partition_mode': packed_seq_params.cp_partition_mode,
+        'cp_cu_seqlens_q': cp_cu_q,
+        'cp_cu_seqlens_kv': cp_cu_kv,
+        'zigzag_index_is_none': route.zigzag_index is None,
+        'zigzag_split_sizes': tuple(route.zigzag_split_sizes),
+        'contiguous_index_is_none': route.contiguous_index is None,
+        'contiguous_split_sizes': tuple(route.contiguous_split_sizes),
+        'thd_cp_host_cu_seqlens_q': None if host_cu_q is None else tuple(host_cu_q),
+        'thd_cp_host_cu_seqlens_kv': None if host_cu_kv is None else tuple(host_cu_kv),
+    }
+
+
+def _restore_thd_full_iteration_cp_route(
+    tensor_metadata: Dict[str, Any], layout_metadata: Optional[Dict[str, Any]]
+):
+    """Rebuild the lightweight route wrapper around static-buffer payloads."""
+    if layout_metadata is None:
+        return None
+    for layout in ('zigzag', 'contiguous'):
+        index = tensor_metadata[f'{layout}_index']
+        if (index is None) != layout_metadata[f'{layout}_index_is_none']:
+            raise RuntimeError(
+                f"THD full-iteration {layout} route index presence does not match its "
+                "graph-static metadata certificate."
+            )
+    return ThdCpRoute(
+        zigzag_index=tensor_metadata['zigzag_index'],
+        zigzag_split_sizes=list(layout_metadata['zigzag_split_sizes']),
+        contiguous_index=tensor_metadata['contiguous_index'],
+        contiguous_split_sizes=list(layout_metadata['contiguous_split_sizes']),
+    )
+
+
+def _unpack_thd_full_iteration_static_batch(batch: Dict[str, Any]):
+    """Rebuild ``get_batch`` outputs from a pre-canonicalized static batch.
+
+    Inside a captured full-iteration CUDA graph, batch tensors must be read
+    from fixed addresses without shape discovery, host synchronization, or
+    collective communication, so this only re-wraps the static tensors
+    prepared by ``prepare_thd_static_batch_for_full_iteration_cuda_graph``.
+    """
+    layout_metadata = batch.get(FULL_CUDA_GRAPH_STATIC_METADATA_KEY, {}).get('thd_cp_layout')
+    # Only CP>1 geometry is immutable across a static-buffer slot.  At CP1,
+    # packed boundaries may change between replays, so do not retain consumer
+    # caches attached to a PackedSeqParams instance from an earlier batch.
+    packed_seq_params = (
+        batch.get(_THD_FULL_ITERATION_PACKED_SEQ_PARAMS_KEY)
+        if layout_metadata is not None
+        else None
+    )
+    if packed_seq_params is None:
+        cp_metadata = batch[_THD_FULL_ITERATION_CP_METADATA_KEY]
+        packed_seq_params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=batch['cu_seqlens'],
+            cu_seqlens_kv=batch['cu_seqlens'],
+            cu_seqlens_q_padded=batch['cu_seqlens_padded'],
+            cu_seqlens_kv_padded=batch['cu_seqlens_padded'],
+            max_seqlen_q=batch['max_seqlen'],
+            max_seqlen_kv=batch['max_seqlen'],
+            local_cp_size=None,
+            cp_group=cp_metadata['cp_group'],
+            cp_partition_mode=batch['cp_partition_mode'],
+            pad_between_seqs=batch['pad_between_seqs'],
+            cp_partition_route=_restore_thd_full_iteration_cp_route(cp_metadata, layout_metadata),
+        )
+        for name in ('thd_cp_host_cu_seqlens_q', 'thd_cp_host_cu_seqlens_kv'):
+            value = None if layout_metadata is None else layout_metadata.get(name)
+            if value is not None:
+                setattr(packed_seq_params, name, list(value))
+        # ``pretrain_{gpt,hybrid}.get_batch`` finalizes every ordinary THD
+        # batch. This marker makes that operation idempotent for metadata that
+        # was already finalized outside capture.
+        packed_seq_params._full_cuda_graph_cp_metadata_prebuilt = True
+        if layout_metadata is not None:
+            # The CP>1 static buffer owns this object for the lifetime of the
+            # graph. In addition to preserving route tensor addresses, this
+            # lets consumers populate per-layout caches during eager warmup and
+            # reuse them during capture without rebuilding host-derived tensors.
+            batch[_THD_FULL_ITERATION_PACKED_SEQ_PARAMS_KEY] = packed_seq_params
+    return (
+        batch['tokens'],
+        batch['labels'],
+        batch['loss_mask'],
+        None,
+        batch['position_ids'],
+        packed_seq_params,
+        batch['padding_mask'],
+    )
+
+
+def prepare_thd_static_batch_for_full_iteration_cuda_graph(
+    data_iterator,
+    vp_stage: Optional[int] = None,
+    *,
+    config,
+    vpp_size: Optional[int] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> Dict[str, Any]:
+    """Canonicalize one packed THD microbatch outside the full-iteration graph.
+
+    Runs the eager THD batch path (padding-mask construction, CP slicing, TP
+    broadcast and static-shape padding) so every tensor reaches the fixed
+    shapes required for CUDA graph capture and replay: token-like tensors at
+    the per-rank token capacity ``max_seqlen_per_dp_cp_rank`` and cu_seqlens
+    tensors at ``thd_max_packed_sequences + 1`` entries, with
+    ``max_seqlen_q/kv`` pinned to the static config upper bound. This function
+    issues TP broadcasts, so all ranks must call it in the same order.
+
+    Returns a dict suitable for ``StaticBufferLoader``. The captured
+    ``get_batch_on_this_rank_for_sequence_packing`` path recognizes it via
+    ``THD_FULL_ITERATION_STATIC_BATCH_KEY`` and reads the static tensors
+    without further shape discovery.
+    """
+    # Static-shape requirements (max_seqlen_per_dp_cp_rank, thd_max_packed_sequences,
+    # no dynamic CP) are validated once at TransformerConfig construction time.
+    assert config is not None, "THD full-iteration batch preparation requires a config."
+    assert getattr(config, 'cuda_graph_impl', 'none') == 'full_iteration', (
+        "prepare_thd_static_batch_for_full_iteration_cuda_graph requires "
+        f"cuda_graph_impl='full_iteration', got {getattr(config, 'cuda_graph_impl', 'none')}."
+    )
+    max_seqlen_per_dp_cp_rank = config.max_seqlen_per_dp_cp_rank
+    thd_max_packed_sequences = config.thd_max_packed_sequences
+
+    # Canonicalization mutates the batch dict in place (padding-mask insertion,
+    # 2D views, sanitized values). Work on a shallow copy so callers that replay
+    # the same raw batch — e.g. the PagedStashRunner overflow fallback — can
+    # canonicalize it again.
+    if data_iterator is not None:
+        raw_batch = next(data_iterator)
+        if isinstance(raw_batch, dict):
+            raw_batch = dict(raw_batch)
+        data_iterator = iter([raw_batch])
+
+    tokens, labels, loss_mask, _, position_ids, packed_seq_params, padding_mask = (
+        get_batch_on_this_rank_for_sequence_packing(
+            data_iterator,
+            vpp_size=vpp_size,
+            mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+            vp_stage=vp_stage,
+            dynamic_cp=False,
+            pg_collection=pg_collection,
+            config=config,
+        )
+    )
+
+    # CP route construction reads packed boundaries on the host and creates
+    # Python split metadata. Do it before StaticBufferLoader hands the batch to
+    # the captured forward, then preserve the resulting tensors and lists in
+    # the static slot. The exact CP>1 geometry is part of the graph contract;
+    # StaticBufferLoader rejects a later batch that would invalidate it.
+    finalize_packed_seq_params(packed_seq_params)
+    cp_metadata = _build_thd_full_iteration_cp_metadata(packed_seq_params)
+    cp_layout_signature = _build_thd_full_iteration_cp_layout_signature(packed_seq_params)
+
+    # Enforce the static-input contract before the tensors reach graph buffers.
+    expected_entries = thd_max_packed_sequences + 1
+    for name, cu in (
+        ('cu_seqlens', packed_seq_params.cu_seqlens_q),
+        ('cu_seqlens_padded', packed_seq_params.cu_seqlens_q_padded),
+    ):
+        assert cu is not None and cu.numel() == expected_entries, (
+            f"THD full-iteration static batch expects {name} with {expected_entries} entries "
+            f"(thd_max_packed_sequences + 1), got "
+            f"{None if cu is None else cu.numel()}."
+        )
+    for name, t in (
+        ('tokens', tokens),
+        ('labels', labels),
+        ('loss_mask', loss_mask),
+        ('position_ids', position_ids),
+        ('padding_mask', padding_mask),
+    ):
+        assert t is None or t.shape[-1] == max_seqlen_per_dp_cp_rank, (
+            f"THD full-iteration static batch expects {name} padded to the per-rank token "
+            f"capacity ({max_seqlen_per_dp_cp_rank}), got {t.shape[-1]}."
+        )
+    assert isinstance(packed_seq_params.max_seqlen_q, int), (
+        "THD full-iteration static batch expects a Python int max_seqlen (static upper bound), "
+        f"got {type(packed_seq_params.max_seqlen_q)}."
+    )
+    assert packed_seq_params.pad_between_seqs is True, (
+        "THD full-iteration static batch requires the batch-independent "
+        "pad_between_seqs=True contract, "
+        f"got {packed_seq_params.pad_between_seqs!r}."
+    )
+
+    static_batch = {
+        THD_FULL_ITERATION_STATIC_BATCH_KEY: True,
+        'tokens': tokens,
+        'labels': labels,
+        'loss_mask': loss_mask,
+        'position_ids': position_ids,
+        'padding_mask': padding_mask,
+        'cu_seqlens': packed_seq_params.cu_seqlens_q,
+        'cu_seqlens_padded': packed_seq_params.cu_seqlens_q_padded,
+        'max_seqlen': packed_seq_params.max_seqlen_q,
+        'cp_partition_mode': packed_seq_params.cp_partition_mode,
+        'pad_between_seqs': packed_seq_params.pad_between_seqs,
+        _THD_FULL_ITERATION_CP_METADATA_KEY: cp_metadata,
+    }
+    if cp_layout_signature is not None:
+        static_batch[FULL_CUDA_GRAPH_STATIC_METADATA_KEY] = {'thd_cp_layout': cp_layout_signature}
+    return static_batch
 
 
 def _build_thd_padding_mask(
@@ -583,6 +862,18 @@ def get_batch_on_this_rank_for_sequence_packing(
         packed_seq_params, padding_mask)
     """
 
+    # Full-iteration CUDA graph feeds every rank a pre-canonicalized static
+    # batch (see prepare_thd_static_batch_for_full_iteration_cuda_graph). The
+    # captured path must read those tensors from fixed addresses without shape
+    # discovery, host synchronization, or dynamic allocation.
+    prefetched_batch = None
+    if data_iterator is not None:
+        prefetched_batch = next(data_iterator)
+        if isinstance(prefetched_batch, dict) and prefetched_batch.get(
+            THD_FULL_ITERATION_STATIC_BATCH_KEY, False
+        ):
+            return _unpack_thd_full_iteration_static_batch(prefetched_batch)
+
     if pg_collection is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         pp_group = parallel_state.get_pipeline_model_parallel_group()
@@ -616,8 +907,8 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     # Get a batch from data_iterator or create an emtpy batch.
     if is_tp_rank_0:
-        assert data_iterator is not None
-        batch = next(data_iterator)
+        assert prefetched_batch is not None, "TP rank 0 requires a data_iterator"
+        batch = prefetched_batch
         for key in batch_keys:
             assert key in batch, f"{key} is missing in current batch."
     else:

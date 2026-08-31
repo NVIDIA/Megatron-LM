@@ -9,7 +9,7 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
@@ -30,10 +30,7 @@ rank = Utils.rank
 
 def _reset_full_cuda_graph_state():
     """Drop process-global graph inputs and outputs between unit tests."""
-    FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
-    FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
-    FullCudaGraphWrapper.result = {'training': None, 'validation': None}
-    StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
+    FullCudaGraphWrapper.reset_cuda_graph()
 
 
 @pytest.fixture(autouse=True)
@@ -282,7 +279,7 @@ def test_full_cuda_graph_training_with_mhc_recompute():
     recompute, and storage rebind captured inside the graph replay correctly.
     """
     from megatron.core.enums import ModelType
-    from megatron.core.full_cuda_graph import StaticBufferLoader, get_shared_capture_stream
+    from megatron.core.full_cuda_graph import get_shared_capture_stream
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
     from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -296,10 +293,7 @@ def test_full_cuda_graph_training_with_mhc_recompute():
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 
     def reset_wrapper_state():
-        FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
-        FullCudaGraphWrapper.result = {'training': None, 'validation': None}
-        FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
-        StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
+        FullCudaGraphWrapper.reset_cuda_graph()
 
     def build_model():
         model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
@@ -429,9 +423,5 @@ def test_full_cuda_graph_training_with_mhc_recompute():
                 compared += 1
         assert compared > 0, "no gradients were compared"
     finally:
-        try:
-            FullCudaGraphWrapper.cuda_graph['training'] = None
-            FullCudaGraphWrapper.cuda_graph['validation'] = None
-        finally:
-            reset_wrapper_state()
-            Utils.destroy_model_parallel()
+        reset_wrapper_state()
+        Utils.destroy_model_parallel()
