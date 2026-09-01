@@ -14,8 +14,8 @@ spec:
     set -euo pipefail
     unset https_proxy
     umask 077
-    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> /root/.netrc
-    trap 'rm -f /root/.netrc; unset RO_API_TOKEN' EXIT
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
 
     # Checkout latest
     cd /opt
@@ -35,10 +35,10 @@ spec:
     git checkout $MCORE_BACKWARDS_COMMIT
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
-    rm -f /root/.netrc
+    rm -f "$HOME/.netrc"
     unset RO_API_TOKEN
   script: |-
-    rm -f /root/.netrc
+    rm -f "${{HOME}}/.netrc"
     unset RO_API_TOKEN
     set -euo pipefail
     ls
@@ -89,6 +89,18 @@ products:
         scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp4_pp1_ep4_16B_inference_optimized_swiglu_logitsmatch]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
+  # Regression guard for the MTP + sequence-parallel all-gather fixes in
+  # https://github.com/NVIDIA/Megatron-LM/pull/5748 (under block-scope CUDA
+  # graphs, MTP slices each rank's valid local SP shard before the all-gather).
+  # Loads the small proxy MoE+MTP checkpoint staged at model/mtp_proxy_moe_pyt
+  # in the CI artifacts tree -- a tiny arch saved with --mtp-num-layers so the
+  # mtp.* ShardedTensorFactory entries apply_factory_merges requires are present.
+  # golden_values_dev_dgx_h100.json was recorded from that checkpoint.
+  - test_case: [gpt_dynamic_inference_tp4_pp1_ep4_16B_mtp_sp_block_cudagraphs]
     products:
       - environment: [dev]
         scope: [mr, mr-github]

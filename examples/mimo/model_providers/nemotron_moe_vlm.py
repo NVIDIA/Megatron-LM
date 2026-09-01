@@ -12,6 +12,7 @@ from examples.mimo.model_providers import MimoProvider
 from examples.mimo.model_providers.radio_encoder import (
     RADIO_ENCODER_MODULE_NAME,
     _base_config,
+    _disable_gtp,
     _make_dense_non_hybrid,
     add_radio_encoder_args,
     radio_vision_config,
@@ -21,6 +22,7 @@ from examples.mimo.utils.hetero import get_grid_dim_size
 from megatron.core.activations import squared_relu
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.hyper_comm_grid import _is_process_group_member as is_process_group_member
+from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
@@ -105,6 +107,22 @@ def nemotron_language_config(
     config.expert_tensor_parallel_size = expt_tp_size
     config.tensor_model_parallel_size = tp_size
     config.pipeline_model_parallel_size = pp_size
+    config.tensor_parallel_num_weight_shards, config.gtp_weight_remat_size = (
+        resolve_tensor_parallel_weight_shards(
+            tp_size,
+            getattr(args, "tensor_parallel_num_weight_shards", None),
+            getattr(args, "gtp_weight_remat_size", 1),
+        )
+    )
+    config.expert_tensor_parallel_num_weight_shards, config.expert_gtp_weight_remat_size = (
+        resolve_tensor_parallel_weight_shards(
+            expt_tp_size,
+            getattr(args, "expert_tensor_parallel_num_weight_shards", None),
+            getattr(args, "expert_gtp_weight_remat_size", 1),
+            shards_field="expert_tensor_parallel_num_weight_shards",
+            tp_field="expert_tensor_parallel_size",
+        )
+    )
     config.sequence_parallel = tp_size > 1
     config.position_embedding_type = "none"
     return config
@@ -142,6 +160,7 @@ def nemotron_projection_config(
     config.normalization = "RMSNorm"
     _make_dense_non_hybrid(config)  # Projection inherits no MoE/Mamba/hybrid settings.
     config.tensor_model_parallel_size = tp_size
+    _disable_gtp(config)
     config.sequence_parallel = False
     return config
 
@@ -164,8 +183,8 @@ def language_model_spec(
         pp_rank = 0
         pp_size = get_grid_dim_size(llm_grid, "pp")
         tp_size = get_grid_dim_size(llm_grid, "tp")
-        ep_size = getattr(args, "llm_ep", 1)
-        expt_tp_size = getattr(args, "llm_expt_tp", None) or 1
+        ep_size = getattr(args, "mimo_llm_ep", 1)
+        expt_tp_size = getattr(args, "mimo_llm_expt_tp", None) or 1
     else:
         assert all(
             getattr(pg_collection, name, None) is not None for name in ("pp", "tp", "ep", "expt_tp")

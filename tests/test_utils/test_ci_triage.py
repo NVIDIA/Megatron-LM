@@ -121,19 +121,30 @@ def test_error_extraction_is_opt_in_for_generated_jobs(
 
 def test_cerno_hard_cutover_contract():
     pipeline = yaml.safe_load(Path(".gitlab-ci.yml").read_text())
+    config = yaml.safe_load(Path(".gitlab/cerno.yml").read_text())
     triage = Path(".gitlab/stages/06.triage.yml").read_text()
     dockerfile = Path("docker/Dockerfile.linting").read_text()
     build_script = Path(".gitlab/scripts/build.sh").read_text()
 
     assert pipeline["variables"]["CERNO_CONFIG"] == ".gitlab/cerno.yml"
+    assert config["report_artifacts"] == {}
+    assert config["error_extraction"]["resolution_configs"] == {}
     assert triage.count("cerno-linear") == 3
     assert triage.count("cerno-notify") == 2
     assert triage.count('--config "${CERNO_CONFIG}"') == 3
-    assert "ARG CERNO_COMMIT=5a5fb5360e67f8f09d189871bbc0d768c09c43fa" in dockerfile
     assert '"cerno @ git+${CI_SERVER_URL}/dl/nemo/cerno.git@${CERNO_COMMIT}"' in dockerfile
     assert "id=CERNO_TOKEN" in dockerfile
     assert "/run/secrets/CERNO_TOKEN" in dockerfile
     assert "--secret id=CERNO_TOKEN,env=PAT" in build_script
+
+
+def test_linear_write_assigns_new_issues_to_scheduled_oncall():
+    triage = yaml.safe_load(Path(".gitlab/stages/06.triage.yml").read_text())
+    script = "\n".join(triage["triage:linear_write"]["script"])
+
+    assert "resolve_oncall_assignee.py" in script
+    assert "--schedule-file .github/oncall_schedule.json" in script
+    assert '--assignee "${ONCALL_ASSIGNEE}"' in script
 
 
 def test_notification_rules_use_expected_pipeline_sources():
@@ -396,6 +407,7 @@ def test_triage_config_selects_megatron_and_enables_write_actions():
                 "reconcile_proposal": True,
                 "team_key": "MCORE",
                 "project_template": "MCore CI Testing",
+                "linear_issue_status": "Need Triage",
                 "enable_linear_open": True,
                 "enable_linear_modify": True,
                 "enable_linear_close": True,
@@ -405,6 +417,7 @@ def test_triage_config_selects_megatron_and_enables_write_actions():
     assert linear_write.write_gates(config) == {
         linear_ci.LINEAR_MODULE: {"open": True, "modify": True, "close": True}
     }
+    assert linear_write.issue_statuses(config) == {linear_ci.LINEAR_MODULE: "Need Triage"}
 
 
 def test_slack_followup_uses_upstream_detailed_and_execution_summaries():

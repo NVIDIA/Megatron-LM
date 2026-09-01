@@ -1159,7 +1159,20 @@ class Attention(MegatronModule, ABC):
             # the number of tokens per request. Reshape to (B, S, H, D) so the
             # decode kernel sees batch=num_requests and seqlen_q=tokens_per_request.
             num_requests = seqlens_k.shape[0]
-            tokens_per_request = q.shape[0] // num_requests
+            if self.batch_invariant_mode:
+                # Batch-invariant CUDA-graph buckets can append token-only padding so
+                # model-wide M dimensions stay aligned. Those rows do not represent
+                # requests and must not be passed to attention.
+                input_token_count = q.shape[0]
+                tokens_per_request = int(max_seqlen_q)
+                metadata_token_count = num_requests * tokens_per_request
+                assert metadata_token_count <= input_token_count, (
+                    "Batch-invariant decode metadata describes more query tokens "
+                    f"({metadata_token_count}) than q contains ({input_token_count})."
+                )
+                q = q[:metadata_token_count]
+            else:
+                tokens_per_request = q.shape[0] // num_requests
             q = q.reshape(num_requests, tokens_per_request, q.shape[2], q.shape[3])
 
             # If using MLA we use the FlashMLA kernel
@@ -1273,6 +1286,20 @@ class Attention(MegatronModule, ABC):
             output_total = output_total.reshape(
                 num_requests * tokens_per_request, 1, *output_total.shape[2:]
             )
+            if self.batch_invariant_mode:
+                padding_token_count = input_token_count - output_total.shape[0]
+                assert padding_token_count >= 0, (
+                    "Batch-invariant attention produced more query rows "
+                    f"({output_total.shape[0]}) than q contained ({input_token_count})."
+                )
+                if padding_token_count > 0:
+                    output_total = torch.cat(
+                        (
+                            output_total,
+                            output_total.new_zeros(padding_token_count, 1, *output_total.shape[2:]),
+                        ),
+                        dim=0,
+                    )
 
         return output_total
 
@@ -1490,8 +1517,16 @@ class Attention(MegatronModule, ABC):
                     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
                 else:
                     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+                rope_max_seqlen_q = packed_seq_params.max_seqlen_q
+                rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
+                rope_freqs_max_seqlen = (
+                    max(rope_max_seqlen_q, rope_max_seqlen_kv)
+                    if rope_max_seqlen_q is not None and rope_max_seqlen_kv is not None
+                    else None
+                )
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
+                rope_freqs_max_seqlen = None
 
             if split_qkv:
                 if q_pos_emb is not None:
@@ -1504,6 +1539,7 @@ class Attention(MegatronModule, ABC):
                             cu_seqlens=cu_seqlens_q,
                             mscale=self._yarn_concentration_factor,
                             cp_group=self.pg_collection.cp,
+                            max_seqlen=rope_freqs_max_seqlen,
                         )
                     else:
                         query = inference_context.apply_rotary_emb_query(
@@ -1522,6 +1558,7 @@ class Attention(MegatronModule, ABC):
                         cu_seqlens=cu_seqlens_kv,
                         mscale=self._yarn_concentration_factor,
                         cp_group=self.pg_collection.cp,
+                        max_seqlen=rope_freqs_max_seqlen,
                     )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
