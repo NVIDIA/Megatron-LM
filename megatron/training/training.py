@@ -40,10 +40,11 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 # measurement (kept for backwards compatibility).
 _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
+from megatron.core import mpu, nccl_allocator, tensor_parallel
+
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core import mpu, nccl_allocator, tensor_parallel
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
+from megatron.core.datasets.data_schedule import wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -96,7 +97,7 @@ from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_model_parallel,
     get_context_parallel_group,
-    get_hybrid_data_context_parallel_groups,
+    get_dynamic_data_context_parallel_groups,
     update_pg_timeout,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -312,10 +313,10 @@ def set_startup_timestamps(
 
 # OTel: module-level helpers imported once at startup.
 try:
-    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
     from nemo.lens.helpers import managed_span as _otel_managed_span
     from nemo.lens.helpers import safe_set_span_attributes as _otel_safe_set_attrs
     from nemo.lens.helpers import trace_fn as _otel_trace_fn
+    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
 except ImportError:
     from megatron.core.telemetry.fallbacks import is_span_group_enabled as _otel_sg_enabled
     from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
@@ -429,9 +430,10 @@ def _start_otel_job_spans(model_type, program_start):
     if not _otel_sg_enabled('job'):
         return
 
-    from opentelemetry import context as _otel_ctx, trace as _otel_trace
-    from opentelemetry.context import Context as _OtelContext
     from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+    from opentelemetry import context as _otel_ctx
+    from opentelemetry import trace as _otel_trace
+    from opentelemetry.context import Context as _OtelContext
 
     _otel_ctx_module = _otel_ctx
     _otel_tracer = get_telemetry().tracer
@@ -585,7 +587,8 @@ def _reroot_otel_interval():
     global _otel_interval_span, _otel_interval_ctx_token
     if get_telemetry() is None or not _otel_sg_enabled('job'):
         return
-    from opentelemetry import context as _octx, trace as _otr
+    from opentelemetry import context as _octx
+    from opentelemetry import trace as _otr
     from opentelemetry.context import Context
     from opentelemetry.trace import Link
     prev = _otel_interval_span
@@ -1514,17 +1517,6 @@ def preprocess_common_state_dict(common_state_dict):
                     reorder_inner_param_groups(optimizer_state_dict[i])
 
     return preprocessed_common_state_dict
-
-
-def wrap_hybrid_cp_data_iterator(train_data_iterator, config):
-    """Wrap the training data iterator for hybrid context parallelism.
-
-    The rerun state machine asserts that every training data iterator is a
-    RerunDataIterator; a raw iter() around HybridCPDataLoaderWrapper would
-    strip the wrapping applied at dataloader build time and fail that assert
-    on the first train step.
-    """
-    return RerunDataIterator(iter(HybridCPDataLoaderWrapper(train_data_iterator, config)))
 
 
 def pretrain(
@@ -3000,7 +2992,7 @@ def dummy_train_step(data_iterator):
     args = get_args()
     tp_rank = mpu.get_tensor_model_parallel_rank()
     has_cu_seqlens = getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
-    is_hybrid_cp = args.hybrid_context_parallel
+    is_hybrid_cp = args.dynamic_context_parallel
 
     BATCH_KEYS = [
         "tokens", "labels", "loss_mask", "position_ids", "attention_mask",
@@ -3038,7 +3030,7 @@ def dummy_train_step(data_iterator):
                 batch,
                 is_hybrid_cp=is_hybrid_cp,
                 cp_group=get_context_parallel_group(),
-                hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+                hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
             )
 
 
@@ -3056,10 +3048,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # OTel: set up per-step sub-span support.
     _otel_step_tracer = None
     if _otel_sg_enabled('forward_backward') or _otel_sg_enabled('optimizer'):
-        from nemo.lens.helpers import span_cm, safe_set_span_attributes as _otel_set_attrs
+        from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+        from nemo.lens.helpers import span_cm
         _otel_step_tracer = get_telemetry().tracer
 
     rerun_state_machine = get_rerun_state_machine()
+    packed_data_iterator = None
+    has_wrapped_data_iterator = False
+    rerun_data_iterator = data_iterator
     save_params_in_this_iteration = (args.save_params_interval is not None and
                                      (iteration + 1) % args.save_params_interval == 0)
     save_activations_in_this_iteration = (args.save_activations_interval is not None and
@@ -3070,7 +3066,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
-    while rerun_state_machine.should_run_forward_backward(data_iterator):
+    while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -3125,18 +3121,23 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     optim_instance._copy_main_params_to_param_buffer()
 
         if getattr(config, "sequence_packing_scheduler", None) is not None:
-            (
-                data_iterator,
-                scheduled_num_microbatches,
-                total_real_tokens_in_batch,
-                seqlen_squared_sum_in_batch,
-            ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
-            set_seqlen_stats_in_iteration(
-                total_real_tokens_in_batch,
-                seqlen_squared_sum_in_batch,
-            )
+            if not has_wrapped_data_iterator:
+                (
+                    packed_data_iterator,
+                    scheduled_num_microbatches,
+                    total_real_tokens_in_batch,
+                    seqlen_squared_sum_in_batch,
+                ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
+                set_seqlen_stats_in_iteration(
+                    total_real_tokens_in_batch,
+                    seqlen_squared_sum_in_batch,
+                )
+                has_wrapped_data_iterator = True
+                rerun_data_iterator = packed_data_iterator
+            forward_backward_data_iterator = packed_data_iterator
         else:
             scheduled_num_microbatches = get_num_microbatches()
+            forward_backward_data_iterator = data_iterator
 
         # Forward pass.
         if save_activations_in_this_iteration:
@@ -3153,7 +3154,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         with grad_context, _fb_cm:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
+                data_iterator=forward_backward_data_iterator,
                 model=model,
                 num_microbatches=scheduled_num_microbatches,
                 seq_length=args.seq_length,
@@ -3882,7 +3883,8 @@ def save_checkpoint_and_time(
     _exposed_save_span = None
     _exposed_save_token = None
     if _otel_sg_enabled('checkpoint'):
-        from opentelemetry import context as _octx, trace as _otr
+        from opentelemetry import context as _octx
+        from opentelemetry import trace as _otr
         _exposed_save_span = get_telemetry().tracer.start_span('megatron.checkpoint.exposed_save')
         _otel_mark_goodput(_exposed_save_span)
         _exposed_save_span.set_attribute('megatron.iteration', iteration)
@@ -4351,9 +4353,6 @@ def train(
 
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
-
-    if args.hybrid_context_parallel:
-        train_data_iterator = wrap_hybrid_cp_data_iterator(train_data_iterator, config)
 
     if args.run_workload_inspector_server:
         try:
@@ -4922,7 +4921,8 @@ def train(
         _report_span = None
         _report_token = None
         if _otel_sg_enabled('step'):
-            from opentelemetry import context as _octx, trace as _otr
+            from opentelemetry import context as _octx
+            from opentelemetry import trace as _otr
             _report_span = get_telemetry().tracer.start_span('megatron.train.iteration_report')
             _otel_mark_goodput(_report_span)
             _report_token = _octx.attach(_otr.set_span_in_context(_report_span))

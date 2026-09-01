@@ -8,6 +8,38 @@ from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.training.arguments import parse_args, validate_args
 
 
+def test_dynamic_cp_selects_default_scheduler_and_variable_lengths():
+    config = ModelParallelConfig(dynamic_context_parallel=True, max_seqlen_per_dp_cp_rank=4096)
+
+    assert config.sequence_packing_scheduler == "default_dynamic_cp"
+    assert config.variable_seq_lengths is True
+
+
+def test_dynamic_cp_rejects_non_dynamic_scheduler():
+    with pytest.raises(ValueError, match="requires.*default_dynamic_cp"):
+        ModelParallelConfig(
+            dynamic_context_parallel=True,
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=4096,
+        )
+
+
+def test_default_dynamic_cp_scheduler_requires_dynamic_cp():
+    with pytest.raises(ValueError, match="requires.*dynamic_context_parallel=True"):
+        ModelParallelConfig(
+            sequence_packing_scheduler="default_dynamic_cp", max_seqlen_per_dp_cp_rank=4096
+        )
+
+
+def test_hybrid_cp_alias_normalizes_to_dynamic_cp():
+    with pytest.warns(DeprecationWarning, match="deprecated"):
+        config = ModelParallelConfig(hybrid_context_parallel=True, max_seqlen_per_dp_cp_rank=4096)
+
+    assert config.dynamic_context_parallel is True
+    assert config.hybrid_context_parallel is False
+    assert config.sequence_packing_scheduler == "default_dynamic_cp"
+
+
 def test_te_cross_entropy_loss_fusion_warns_in_model_parallel_config():
     with pytest.warns(UserWarning, match="known stability issues"):
         config = ModelParallelConfig(cross_entropy_loss_fusion=True, cross_entropy_fusion_impl='te')

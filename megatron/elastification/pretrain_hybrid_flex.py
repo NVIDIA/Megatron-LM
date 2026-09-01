@@ -21,7 +21,7 @@ from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_data_parallel_rank,
     get_data_parallel_world_size,
-    get_hybrid_data_context_parallel_groups,
+    get_dynamic_data_context_parallel_groups,
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_group,
@@ -180,7 +180,7 @@ def get_batch(data_iterator, vp_stage=None):
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_sft = args.sft
     has_cu_seqlens = is_sft or getattr(args, 'dataloader_inter_document_masking', False)
-    is_hybrid_cp = args.hybrid_context_parallel
+    is_hybrid_cp = args.dynamic_context_parallel
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
@@ -230,7 +230,7 @@ def get_batch(data_iterator, vp_stage=None):
         batch,
         is_hybrid_cp=is_hybrid_cp,
         cp_group=get_context_parallel_group(),
-        hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+        hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
         use_per_sequence_balancing=(
             getattr(args, 'dataloader_inter_document_masking', False) and not is_sft
         ),
