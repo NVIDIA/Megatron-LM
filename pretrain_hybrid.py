@@ -29,8 +29,8 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -76,7 +76,10 @@ try:
     from megatron.post_training.utils import maybe_enable_modelopt
 
     has_nvidia_modelopt = True
-except ImportError:
+except ImportError as error:
+    missing_module = error.name or ""
+    if missing_module != "modelopt" and not missing_module.startswith("modelopt."):
+        raise
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
