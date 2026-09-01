@@ -71,9 +71,12 @@ def _squared_relu_with_probs_kernel(
 ):
     """Apply squared ReLU and router probabilities in training order.
 
-    With CLAMP set this reproduces training's ``weighted_clamped_squared_relu`` bit for bit:
-    the soft-clamped pre-activation is rounded to BF16, squared and rounded to BF16 again,
-    and only then multiplied by the FP32 routing probability before the final BF16 round.
+    With CLAMP set this reproduces training's fused ``weighted_clamped_squared_relu`` bit
+    for bit: the soft-clamped pre-activation and the square both stay in FP32, and the only
+    BF16 round is the final one after the FP32 routing probability is applied.
+
+    Without CLAMP the square is materialized in BF16 first, matching the unclamped
+    ``weighted_squared_relu``, which squares a BF16 ReLU output.
     """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
@@ -90,13 +93,14 @@ def _squared_relu_with_probs_kernel(
                     value = tl.load(input_ptr + row * hidden_size + cols, mask=mask).to(tl.float32)
                     value = tl.maximum(value, 0.0)
                     if CLAMP:
-                        value = (
-                            (clamp_scale * libdevice.tanh(value / clamp_scale))
-                            .to(tl.bfloat16)
-                            .to(tl.float32)
-                        )
-                    value = (value * value).to(tl.bfloat16)
-                    value = (value.to(tl.float32) * prob).to(tl.bfloat16)
+                        value = clamp_scale * libdevice.tanh(value / clamp_scale)
+                    value = value * value
+                    if not CLAMP:
+                        # Unclamped training (weighted_squared_relu) squares a BF16 ReLU
+                        # output, so the BF16 materialization is part of matching it. The
+                        # clamped path stays in FP32 to the single final round instead.
+                        value = value.to(tl.bfloat16).to(tl.float32)
+                    value = (value * prob).to(tl.bfloat16)
                     tl.store(output_ptr + row * hidden_size + cols, value, mask=mask)
 
 

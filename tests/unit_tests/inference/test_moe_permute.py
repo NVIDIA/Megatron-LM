@@ -81,8 +81,14 @@ def test_batch_invariant_squared_relu_applies_probs_before_fc2():
 
 
 def test_padded_squared_relu_applies_tanh_soft_clamp():
-    """config.activation_func_tanh_clamp_scale bounds the activation by ``s ** 2``."""
-    from megatron.core.activations import squared_relu, tanh_soft_clamp
+    """config.activation_func_tanh_clamp_scale bounds the activation by ``s ** 2``.
+
+    The reference keeps the clamped pre-activation in FP32 to match training's fused
+    ``weighted_clamped_squared_relu``, rather than composing
+    ``squared_relu(tanh_soft_clamp(x, s))`` — ``tanh_soft_clamp`` downcasts on return, so
+    that composition squares a BF16 value instead.
+    """
+    from megatron.core.activations import squared_relu
     from megatron.core.inference.moe.activations import padded_squared_relu
 
     torch.manual_seed(23)
@@ -93,16 +99,24 @@ def test_padded_squared_relu_applies_tanh_soft_clamp():
     permutation_map = torch.arange(rows, device="cuda", dtype=torch.int32)
 
     clamped = padded_squared_relu(x, permutation_map, _vt(rows), clamp_scale=clamp_scale)
-    expected = squared_relu(tanh_soft_clamp(x, clamp_scale))
+    c = clamp_scale * torch.tanh(torch.clamp(x.float(), min=0.0) / clamp_scale)
+    expected = (c**2).to(torch.bfloat16)
 
-    torch.testing.assert_close(clamped, expected, rtol=1e-2, atol=1e-2)
+    # Bit-exact: no GEMM is involved, so the only op that could differ from the reference
+    # is libdevice.tanh vs torch.tanh, and those agree in fp32.
+    assert torch.equal(clamped, expected)
     assert clamped.max().item() <= clamp_scale**2
     # clamp_scale=None must leave the existing unclamped path bit-identical.
     assert torch.equal(padded_squared_relu(x, permutation_map, _vt(rows)), squared_relu(x))
 
 
 def test_batch_invariant_clamped_squared_relu_matches_training_rounding():
-    """The clamped batch-invariant kernel reproduces training's rounding sequence exactly."""
+    """The clamped batch-invariant kernel reproduces training's rounding sequence exactly.
+
+    Compares against the fused training kernel itself, so a change to its rounding order
+    surfaces here rather than silently diverging.
+    """
+    from megatron.core.fusions.fused_weighted_squared_relu import weighted_clamped_squared_relu
     from megatron.core.inference.moe.batch_invariant import squared_relu_with_probs
 
     torch.manual_seed(29)
@@ -112,11 +126,9 @@ def test_batch_invariant_clamped_squared_relu_matches_training_rounding():
     permutation_map = torch.arange(rows, device="cuda", dtype=torch.int32)
 
     actual = squared_relu_with_probs(x, permutation_map, _vt(rows), probs, clamp_scale)
+    # Training applies the routing probability as a [rows, 1] weight broadcast over hidden.
+    expected = weighted_clamped_squared_relu(x, probs.unsqueeze(1), clamp_scale)
 
-    # Training's weighted_clamped_squared_relu: round the clamped pre-activation to BF16,
-    # square it, then apply the FP32 probability and round again.
-    c = (clamp_scale * torch.tanh(torch.clamp(x.float(), min=0.0) / clamp_scale)).to(torch.bfloat16)
-    expected = ((c.float() ** 2).to(torch.bfloat16).float() * probs.unsqueeze(1)).to(torch.bfloat16)
     assert torch.equal(actual, expected)
 
 

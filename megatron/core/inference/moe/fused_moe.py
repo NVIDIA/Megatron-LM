@@ -7,7 +7,7 @@ All permutation logic is handled internally — callers invoke a single function
 
 from enum import Enum
 from functools import partial
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 import torch
 
@@ -75,20 +75,30 @@ def _mxfp8_grouped_mm(act: MXFP8Tensor, weight: MXFP8Tensor, offs: torch.Tensor)
 
 
 def _get_activation_func(
-    activation_type: ActivationType, fused_quant: bool = False, clamp_scale: Optional[float] = None
+    activation_type: ActivationType,
+    fused_quant: bool = False,
+    activation_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Callable:
     """Resolve ActivationType enum to a concrete kernel.
 
-    If fused_quant=True, returns the fused activation + MXFP8 quantize kernel.
-    If clamp_scale is set, the squared-ReLU kernels soft-clamp the pre-activation first.
+    Args:
+        activation_type: which activation the kernel should implement.
+        fused_quant: if True, return the fused activation + MXFP8 quantize kernel.
+        activation_kwargs: activation-specific options, extracted per activation below.
+            ``clamp_scale`` (squared ReLU): soft-clamp the pre-activation first.
+
+    Returns:
+        The kernel, partially applied with whichever options the activation consumes.
     """
+    activation_kwargs = activation_kwargs or {}
     if activation_type == ActivationType.SQUARED_RELU:
+        clamp_scale = activation_kwargs.get("clamp_scale")
         func = squared_relu_and_quantize_mxfp8 if fused_quant else padded_squared_relu
         return func if clamp_scale is None else partial(func, clamp_scale=clamp_scale)
     elif activation_type == ActivationType.SWIGLU:
         if fused_quant:
             raise NotImplementedError("SWIGLU + MXFP8 fused-quant not implemented (bf16 only)")
-        if clamp_scale is not None:
+        if activation_kwargs.get("clamp_scale") is not None:
             raise NotImplementedError(
                 "activation_func_tanh_clamp_scale is only implemented for squared ReLU here; "
                 "the gated form (SiTU-GLU) has no inference kernel yet."
@@ -180,7 +190,9 @@ def mcore_fused_moe(
         expert_alignment = 16
 
     activation_func = _get_activation_func(
-        activation_type, fused_quant=use_fused_quant, clamp_scale=activation_clamp_scale
+        activation_type,
+        fused_quant=use_fused_quant,
+        activation_kwargs={"clamp_scale": activation_clamp_scale},
     )
 
     # --- Pre-processing: permute ---

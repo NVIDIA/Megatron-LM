@@ -213,16 +213,11 @@ def _fused_moe_kernel(
                     # activation_func_tanh_clamp_scale), bounding the squared-relu output
                     # by s**2.  Applied after the relu rather than before, which is exact:
                     # s * tanh(x / s) is non-decreasing and maps 0 to 0, so it commutes
-                    # with the relu.  Rounded to bf16 before the square so the value
-                    # squared here is the value training's weighted_clamped_squared_relu
-                    # squares.
-                    accumulator = (
-                        (
-                            activation_clamp_scale
-                            * libdevice.tanh(accumulator / activation_clamp_scale)
-                        )
-                        .to(tl.bfloat16)
-                        .to(tl.float32)
+                    # with the relu.  Kept in fp32 through the square, matching training's
+                    # fused weighted_clamped_squared_relu, which has no intermediate
+                    # downcast between the clamp and the square.
+                    accumulator = activation_clamp_scale * libdevice.tanh(
+                        accumulator / activation_clamp_scale
                     )
                 accumulator *= accumulator
 

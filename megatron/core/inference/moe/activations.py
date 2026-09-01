@@ -44,13 +44,15 @@ def _clamped_relu(x, clamp_scale, CLAMP: tl.constexpr):
     Returns the pre-square value of the squared-ReLU activation. When ``CLAMP`` is set this
     is ``clamp_scale * tanh(ReLU(x) / clamp_scale)``, which equals training's
     ``ReLU(clamp_scale * tanh(x / clamp_scale))``: the soft clamp is non-decreasing and maps
-    0 to 0, so it commutes with the ReLU. The clamped result is rounded to BF16 before being
-    returned so that the caller squares the same value training's
-    ``weighted_clamped_squared_relu`` squares.
+    0 to 0, so it commutes with the ReLU.
+
+    The clamped value stays in FP32, matching training's fused
+    ``weighted_clamped_squared_relu``, which squares ``clamp_scale * tanh(...)`` directly
+    with no intermediate downcast.
     """
     r = tl.maximum(x, 0.0)
     if CLAMP:
-        r = (clamp_scale * libdevice.tanh(r / clamp_scale)).to(tl.bfloat16).to(tl.float32)
+        r = clamp_scale * libdevice.tanh(r / clamp_scale)
     return r
 
 

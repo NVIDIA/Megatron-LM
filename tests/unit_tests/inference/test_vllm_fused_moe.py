@@ -1116,8 +1116,8 @@ def _ref_sequential_moe_clamped(
     the pre-activation is large, and at that scale the roundings move the result by more
     than the tolerance:
 
-      1. the clamped pre-activation is rounded to BF16 before the square, matching
-         training's ``weighted_clamped_squared_relu`` (a 2x relative error once squared);
+      1. the clamped pre-activation stays in FP32 through the square, matching training's
+         fused ``weighted_clamped_squared_relu``;
       2. the squared activation is rounded to BF16 on its way into the FC1 output buffer,
          which is what FC2 actually reads.
 
@@ -1133,11 +1133,35 @@ def _ref_sequential_moe_clamped(
             if not 0 <= lid < num_local_experts:
                 continue
             fc1_out = hidden_states[t].float() @ fc1_weight[lid].float().T
-            clamped = (clamp_scale * torch.tanh(fc1_out / clamp_scale)).to(torch.bfloat16)
-            activated = (torch.clamp(clamped.float(), min=0.0) ** 2).to(torch.bfloat16)
+            clamped = clamp_scale * torch.tanh(fc1_out / clamp_scale)
+            activated = (torch.clamp(clamped, min=0.0) ** 2).to(torch.bfloat16)
             fc2_out = (activated.float() @ fc2_weight[lid].float().T).to(torch.bfloat16)
             out[t] += probs[t, k].item() * fc2_out.float()
     return out
+
+
+def _assert_close_to_bf16_ulp(actual, expected):
+    """Compare two MoE outputs to the precision a BF16 MoE can carry.
+
+    Both the kernel and the sequential reference round the FC1 and FC2 outputs to BF16, but
+    they reach those roundings through different fp32 accumulation orders: grouped_mm tiles
+    the K loop while the reference does a per-token matmul. A value sitting within one fp32
+    ULP of a BF16 rounding boundary rounds one way in the kernel and the other way in the
+    reference, and that ``2 ** -8`` relative step then propagates through FC2. Exact
+    agreement is therefore unattainable here, unlike in the activation-only tests where no
+    GEMM is re-derived; the achievable bound is one BF16 ULP.
+
+    Scaling ``atol`` by the reference's own magnitude keeps that bound meaningful across
+    input regimes: saturating weights produce outputs orders of magnitude larger than
+    small-weight inputs do, and a fixed absolute tolerance is either vacuous or
+    accidentally tight depending on which regime it was chosen for. A dropped or
+    mis-scaled activation clamp moves the result by orders of magnitude, well outside
+    this bound.
+    """
+    bf16_ulp = 2.0**-8
+    torch.testing.assert_close(
+        actual, expected, atol=bf16_ulp * expected.abs().max().item(), rtol=bf16_ulp
+    )
 
 
 @pytest.mark.internal
@@ -1178,7 +1202,7 @@ class TestFusedMoeActivationClamp:
         )
 
         assert result.shape == (max_tokens, hidden_size)
-        torch.testing.assert_close(result, expected, atol=5e-2, rtol=5e-2)
+        _assert_close_to_bf16_ulp(result, expected)
 
     def test_clamp_changes_the_result(self):
         """Guard against the clamp being silently dropped: it must alter the output."""
@@ -1252,4 +1276,34 @@ class TestFusedMoeActivationClamp:
         expected = _ref_sequential_moe_clamped(
             hidden, probs, fc1_weight, fc2_weight, routing_map, num_experts, CLAMP_SCALE
         )
-        torch.testing.assert_close(result.float(), expected, atol=5e-2, rtol=5e-2)
+        _assert_close_to_bf16_ulp(result.float(), expected)
+
+    def test_mxfp8_fused_quant_kernel_receives_clamp_scale(self):
+        """The MXFP8 route binds the clamp onto the fused activation+quantize kernel.
+
+        The kernel's numerics are covered in test_mxfp8_utils.py; this pins the dispatch,
+        which is the only place the MXFP8 path could silently drop the clamp.
+        """
+        from functools import partial
+
+        from megatron.core.inference.moe.activations import squared_relu_and_quantize_mxfp8
+        from megatron.core.inference.moe.fused_moe import ActivationType, _get_activation_func
+
+        bound = _get_activation_func(
+            ActivationType.SQUARED_RELU,
+            fused_quant=True,
+            activation_kwargs={"clamp_scale": CLAMP_SCALE},
+        )
+        assert isinstance(bound, partial)
+        assert bound.func is squared_relu_and_quantize_mxfp8
+        assert bound.keywords == {"clamp_scale": CLAMP_SCALE}
+
+        # An unset clamp must leave the kernel unwrapped so the default path is unchanged.
+        assert (
+            _get_activation_func(
+                ActivationType.SQUARED_RELU,
+                fused_quant=True,
+                activation_kwargs={"clamp_scale": None},
+            )
+            is squared_relu_and_quantize_mxfp8
+        )
