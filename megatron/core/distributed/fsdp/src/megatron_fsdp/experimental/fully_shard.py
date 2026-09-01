@@ -144,7 +144,8 @@ def fully_shard(
                 "fully_shard_context."
             )
 
-    _validate_dp_axes(mesh, placements.dp_axes)
+    dp_axes = _normalize_dp_axes(mesh, placements.dp_axes)
+    dp_mesh = _select_dp_mesh(mesh, dp_axes)
     mixed_precision_policy = mixed_precision_policy or MixedPrecisionPolicy()
     original_cls = module.__class__
     _attach_mixin(module)
@@ -153,7 +154,9 @@ def fully_shard(
         FsdpModule.__init__(
             module,
             context=context,
-            mesh=mesh,
+            mesh=dp_mesh,
+            parent_mesh=mesh,
+            dp_axes=dp_axes,
             model_weight_placements=tuple(placements.parameter),
             main_grad_placements=tuple(placements.gradient),
             main_weight_placements=tuple(placements.optimizer),
@@ -166,17 +169,35 @@ def fully_shard(
         raise
 
 
-def _validate_dp_axes(mesh: DeviceMesh, dp_axes: Sequence[MeshAxis]) -> None:
-    """Validate the parent mesh's data-parallel axes."""
+def _normalize_dp_axes(mesh: DeviceMesh, dp_axes: Sequence[MeshAxis]) -> tuple[int, ...]:
+    """Resolve ``dp_axes`` to distinct parent-mesh axis indices in mesh-axis order."""
     normalized_dp_axes = tuple(_axis_index(mesh, axis) for axis in dp_axes)
+    if not normalized_dp_axes:
+        raise ValueError("MFSDP requires at least one data-parallel mesh axis.")
     if len(set(normalized_dp_axes)) != len(normalized_dp_axes):
         raise ValueError(f"Data-parallel axes must be distinct, got {dp_axes!r}.")
     if normalized_dp_axes != tuple(sorted(normalized_dp_axes)):
         raise ValueError(f"Data-parallel axes must be in mesh-axis order, got {dp_axes!r}.")
-    if normalized_dp_axes != tuple(range(mesh.ndim)):
-        raise NotImplementedError(
-            "MFSDP currently requires dp_axes to match every mesh axis in mesh order."
+    return normalized_dp_axes
+
+
+def _select_dp_mesh(mesh: DeviceMesh, dp_axes: Sequence[int]) -> DeviceMesh:
+    """Select the data-parallel submesh MFSDP shards over.
+
+    Axes not named by ``dp_axes`` belong to other parallelisms; MFSDP does not shard
+    over them, and what they mean is the caller's concern rather than this function's.
+    """
+    if tuple(dp_axes) == tuple(range(mesh.ndim)):
+        return mesh
+
+    dim_names = mesh.mesh_dim_names
+    if dim_names is None:
+        raise ValueError(
+            "A mesh with non-data-parallel axes must have dim names so the "
+            "data-parallel submesh can be selected by name."
         )
+    dp_names = tuple(dim_names[axis] for axis in dp_axes)
+    return mesh[dp_names[0]] if len(dp_names) == 1 else mesh[dp_names]
 
 
 def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:

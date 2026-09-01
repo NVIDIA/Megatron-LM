@@ -242,6 +242,16 @@ class DBuffer:
             A DBuffer whose real local storage matches ``placements``. Ranges
             corresponding to meta tensors are left uninitialized.
         """
+        # A DBuffer holds plain data-parallel-local storage: its mesh is the DP submesh and
+        # its layout is expressed in local elements. A parameter already sharded on another
+        # mesh axis (expert parallelism) arrives as a DTensor, whose .shape is the *global*
+        # extent and which cannot be the source of a plain copy_. Reduce it to its local
+        # shard so the layout math and the copy below both operate on ordinary tensors.
+        # Preserving the DTensor's mesh and placements is the caller's job --
+        # FsdpParameterGroup.get_dtensor lifts the result back onto the parent mesh.
+        tensors = tuple(
+            tensor.to_local() if isinstance(tensor, DTensor) else tensor for tensor in tensors
+        )
         tensors = tuple(tensor.detach().contiguous() for tensor in tensors)
         if not tensors:
             raise ValueError("DBuffer.distribute_tensors() requires at least one tensor.")
