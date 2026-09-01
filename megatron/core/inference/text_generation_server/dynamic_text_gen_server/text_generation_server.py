@@ -255,8 +255,6 @@ def start_text_gen_server(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
-):
-    """Start the text generation server."""
 ) -> Optional[str]:
     """Start the text generation server.
 
