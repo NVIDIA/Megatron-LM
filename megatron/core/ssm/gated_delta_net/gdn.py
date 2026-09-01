@@ -29,9 +29,19 @@ from megatron.core.ssm.gated_delta_net.common import (
 )
 from megatron.core.ssm.gated_delta_net.internal_gdn_backend.chunk import (
     chunk_gated_delta_rule as internal_chunk_gated_delta_rule,
+)
+from megatron.core.ssm.gated_delta_net.internal_gdn_backend.chunk import (
     prepare_validated_chunk_metadata as prepare_internal_gdr_chunk_metadata,
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+
+
+def _bind_cutedsl_cp_context_metadata(context, global_cu_seqlens_cpu: torch.Tensor):
+    """Attach immutable global offsets needed for rank-invariant local CP dispatch."""
+    global_offsets = global_cu_seqlens_cpu.to(device="cpu", dtype=torch.long).clone()
+    context.global_num_seqs = len(global_offsets) - 1
+    context.global_cu_seqlens_cpu = global_offsets
+    return context
 
 
 class GatedDeltaNet(_GDNBase):
@@ -246,6 +256,10 @@ class GatedDeltaNet(_GDNBase):
                         group=cp_group_chunkwise,
                         conv1d_kernel_size=self.conv_kernel_dim,
                     )
+                    _bind_cutedsl_cp_context_metadata(
+                        cached_ctx,
+                        torch.tensor([0, seq_len_global], dtype=torch.long),
+                    )
                     cached = (cached_cu_seqlens, cached_ctx)
                     self._chunkwise_cp_context_cache[cache_key] = cached
                 cu_seqlens_q, chunkwise_cp_context = cached
@@ -254,6 +268,9 @@ class GatedDeltaNet(_GDNBase):
                     cu_seqlens=cu_seqlens_q,
                     group=cp_group_chunkwise,
                     conv1d_kernel_size=self.conv_kernel_dim,
+                )
+                _bind_cutedsl_cp_context_metadata(
+                    chunkwise_cp_context, cu_seqlens_q_cpu
                 )
         else:
             chunkwise_cp_context = None

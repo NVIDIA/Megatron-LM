@@ -36,6 +36,11 @@ from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.index import prepare_chunk_indices
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
+from .kernels.fused_gdr_cp_cute import (
+    try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl,
+    try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl,
+)
+
 try:
     from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_intra
 except ModuleNotFoundError as exc:
@@ -282,6 +287,53 @@ def _call_fla_compat(function, **kwargs):
     return function(**kwargs)
 
 
+def _cp_forward_preprocess(**kwargs):
+    """Prefer the in-tree CuTeDSL CP boundary kernel, then fall back to FLA."""
+    cutedsl_initial_state = try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl(
+        k=kwargs["k"],
+        w=kwargs["w"],
+        u=kwargs["u"],
+        g=kwargs.get("g"),
+        gk=kwargs.get("gk"),
+        bg=kwargs.get("bg"),
+        v=kwargs.get("v"),
+        chunk_size=kwargs.get("chunk_size", _CHUNK_SIZE),
+        state_v_first=kwargs.get(
+            "state_v_first", kwargs.get("transpose_state_layout", False)
+        ),
+        cu_seqlens=kwargs.get("cu_seqlens"),
+        context=kwargs.get("context"),
+    )
+    if cutedsl_initial_state is not None:
+        return cutedsl_initial_state
+    return _call_fla_compat(chunk_gated_delta_rule_fwd_h_pre_process, **kwargs)
+
+
+def _cp_backward_preprocess(**kwargs):
+    """Prefer the in-tree CuTeDSL CP terminal-gradient kernel, then fall back to FLA."""
+    cutedsl_dht = try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl(
+        q=kwargs["q"],
+        k=kwargs["k"],
+        w=kwargs["w"],
+        do=kwargs["do"],
+        dv=kwargs["dv"],
+        g=kwargs.get("g"),
+        gk=kwargs.get("gk"),
+        bg=kwargs.get("bg"),
+        scale=kwargs.get("scale"),
+        state_v_first=kwargs.get(
+            "state_v_first", kwargs.get("transpose_state_layout", False)
+        ),
+        cu_seqlens=kwargs.get("cu_seqlens"),
+        dht=kwargs.get("dht"),
+        chunk_size=kwargs.get("chunk_size", _CHUNK_SIZE),
+        context=kwargs.get("context"),
+    )
+    if cutedsl_dht is not None:
+        return cutedsl_dht, None
+    return _call_fla_compat(chunk_gated_delta_rule_bwd_dhu_pre_process, **kwargs)
+
+
 def _call_fla_gated_delta_rule(**kwargs):
     """Call FLA's GDR operator, slicing dense CP batches as required by FLA v0.5.x."""
     q = kwargs["q"]
@@ -343,8 +395,7 @@ def _fla_backward(
         chunk_bwd_dv_local, q=q, k=k, g=g, do=do, scale=scale, use_exp2=True, **common
     )
     if cp_context is not None:
-        dht, initial_state = _call_fla_compat(
-            chunk_gated_delta_rule_bwd_dhu_pre_process,
+        dht, initial_state = _cp_backward_preprocess(
             q=q,
             k=k,
             w=w,
@@ -437,8 +488,7 @@ def _fla_cp_forward_preprocess_dense_batch(
     for batch_index in range(k.shape[0]):
         batch_slice = slice(batch_index, batch_index + 1)
         states.append(
-            _call_fla_compat(
-                chunk_gated_delta_rule_fwd_h_pre_process,
+            _cp_forward_preprocess(
                 k=k[batch_slice],
                 w=w[batch_slice],
                 u=u[batch_slice],
@@ -470,8 +520,7 @@ def _fla_cp_backward_preprocess_dense_batch(
     terminal_gradients = []
     for batch_index in range(q.shape[0]):
         batch_slice = slice(batch_index, batch_index + 1)
-        batch_dht, _ = _call_fla_compat(
-            chunk_gated_delta_rule_bwd_dhu_pre_process,
+        batch_dht, _ = _cp_backward_preprocess(
             q=q[batch_slice],
             k=k[batch_slice],
             w=w[batch_slice],
@@ -566,8 +615,7 @@ def _fla_cp_backward_preprocess(
             cp_context=cp_context,
         )
     else:
-        dht, _ = _call_fla_compat(
-            chunk_gated_delta_rule_bwd_dhu_pre_process,
+        dht, _ = _cp_backward_preprocess(
             q=q,
             k=k,
             w=w,
@@ -1034,8 +1082,7 @@ def _fla_forward_for_fused_bwd(
                 k=k, w=w, u=u, g=g, cp_context=cp_context
             )
         else:
-            initial_state = _call_fla_compat(
-                chunk_gated_delta_rule_fwd_h_pre_process,
+            initial_state = _cp_forward_preprocess(
                 k=k,
                 w=w,
                 u=u,
