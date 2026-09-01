@@ -1044,10 +1044,10 @@ class DynamicInferenceRequestRecord:
         """
 
         def merge_lists(key):
-            if getattr(self.requests[0], key) is None:
+            values = [getattr(request, key) for request in self.requests]
+            if all(value is None for value in values):
                 return None
-            else:
-                return [v for r in self.requests for v in getattr(r, key)]
+            return [item for value in values if value is not None for item in value]
 
         first_request = self.requests[0]
         prompt_tokens = first_request.prompt_tokens

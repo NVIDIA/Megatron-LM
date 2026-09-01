@@ -126,11 +126,15 @@ class PrefixCachingTestBase:
         )
 
     @staticmethod
-    def _req(ctx, prompt_tokens, request_id=1, *, enable_prefix_caching=True):
+    def _req(ctx, prompt_tokens, request_id=1, *, enable_prefix_caching=True, sampling_params=None):
         return DynamicInferenceRequest(
             request_id=request_id,
             prompt_tokens=prompt_tokens,
-            sampling_params=SamplingParams(num_tokens_to_generate=10),
+            sampling_params=(
+                sampling_params
+                if sampling_params is not None
+                else SamplingParams(num_tokens_to_generate=10)
+            ),
             block_size_tokens=ctx.block_size_tokens,
             enable_prefix_caching=enable_prefix_caching,
         )
@@ -1972,6 +1976,78 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
 
 class TestPerBlockRouting(PrefixCachingTestBase):
     """Tests for per-block routing storage and reconstruction."""
+
+    @pytest.mark.internal
+    def test_finished_checkpointed_request_reconstructs_full_routing(self):
+        ctx = self._ctx()
+        bs = ctx.block_size_tokens
+        generated = [bs + 1, bs + 2, bs + 3, bs + 4]
+        prompt = self._prompt(2 * bs)
+        producer = self._req(ctx, prompt.clone(), request_id=99)
+        ctx.add_request(producer)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        request = self._req(
+            ctx,
+            prompt,
+            request_id=0,
+            sampling_params=SamplingParams(
+                num_tokens_to_generate=4,
+                termination_id=-1,
+                return_log_probs=True,
+                skip_prompt_log_probs=True,
+            ),
+        )
+        ctx.add_request(request)
+        assert request.num_cached_tokens == 2 * bs
+        engine = _StubEngine(ctx)
+        future = engine._add_request(request)
+        engine.waiting_request_ids.clear()
+        record = engine.requests[request.request_id].record
+        record.checkpoint()
+        current = record[-1]
+        current.generated_tokens = generated[:3]
+        current.generated_log_probs = [-0.1, -0.2, -0.3]
+        assert len(record.requests) == 2
+        assert all(part.routing_indices is None for part in record.requests)
+
+        block_ids = self._block_ids(ctx, 1, 2)
+        block_ids += ctx.kv_block_allocator.allocate_memory_blocks(1).tolist()
+        routing = np.arange(3 * bs * 4, dtype=np.int16).reshape(3 * bs, 2, 2)
+        for block_idx, block_id in enumerate(block_ids):
+            start = block_idx * bs
+            ctx.kv_block_allocator.store_block_routing(
+                block_id, np.arange(bs), routing[start : start + bs]
+            )
+
+        engine.finished_request_count = 0
+        engine.evicted_request_count = 0
+        engine.track_generated_token_events = False
+        engine.num_speculative_tokens = 0
+        engine.stop_word_being_finished_ids = set()
+        active_ids, finished_records = engine.post_process_requests(
+            request_ids=torch.tensor([request.request_id]),
+            finished_request_ids=torch.tensor([request.request_id]),
+            evict_request_ids=torch.empty(0, dtype=torch.int64),
+            step_time=0.0,
+            sample=torch.tensor(generated[3:]),
+            accepted_tokens=None,
+            log_probs=[[-0.4]],
+            consumed_chunked_prefill_request_id=-1,
+            finished_routing_block_ids={request.request_id: block_ids},
+        )
+
+        expected = routing[: 2 * bs + 3]
+        merged = record.merge()
+        assert active_ids == []
+        assert finished_records == [record]
+        assert future.result() is record
+        assert merged.generated_tokens == generated
+        assert merged.generated_log_probs == [-0.1, -0.2, -0.3, -0.4]
+        np.testing.assert_array_equal(current.routing_indices, expected)
+        np.testing.assert_array_equal(merged.routing_indices, expected)
+        assert merged.routing_indices.shape[0] == (
+            len(merged.prompt_tokens) + len(merged.generated_tokens) - 1
+        )
 
     @pytest.mark.internal
     def test_store_and_get_block_routing(self):
