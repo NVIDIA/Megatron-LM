@@ -1556,15 +1556,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
-            # At the (k - 1)-th MTP module, concatenates the i-th token's hidden_states
-            # and the (i + K)-th token's embedding, and combine them with linear projection.
             hidden_states = torch.cat((decoder_input, hidden_states), -1)
             hidden_states, _ = self.eh_proj(hidden_states)
-            # For tensor parallel we need to gather the tensor across the model-parallel
-            # ranks after the linear projection.
             if InferenceMode.is_active():
-                # This all-gather immediately follows the input all-gather inside eh_proj
-                # on the same symmetric buffer, so it must barrier before overwriting.
                 hidden_states = inference_all_gather_from_tensor_model_parallel_region(
                     hidden_states, self.tp_group, self.config, barrier_before=True
                 )

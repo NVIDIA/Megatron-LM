@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import Optional
 from unittest.mock import MagicMock
 
 import torch
@@ -25,47 +24,6 @@ except ImportError:
 from .barrier import symm_mem_sync
 from .multimem_asm import ld_128, st_128
 from .utils import are_tensors_nvls_eligible, get_flat_tid, sync_threads
-
-# ---------------------------------------------------------------------------
-# Symmetric-buffer collective ordering
-#
-# Consecutive all-gathers that reuse the same symmetric-memory buffer must insert
-# a barrier before overwriting it, so that every rank has finished reading the
-# buffer's previous contents. A reduce-scatter performs this synchronization
-# inside its own kernel, so an all-gather that directly follows a reduce-scatter
-# on the same buffer does not need the extra barrier.
-#
-# We track the last collective performed on each buffer (keyed by its multicast
-# pointer) so an all-gather can decide whether the barrier is required from the
-# actual op sequence on the buffer, rather than from the identity of the calling
-# module. The decision is baked into the kernel as a constexpr at launch time;
-# under CUDA graph capture the launch order is fixed, so the value recorded
-# during capture is what the replayed graph uses.
-# ---------------------------------------------------------------------------
-ALL_GATHER = "all_gather"
-REDUCE_SCATTER = "reduce_scatter"
-
-# Maps a symmetric buffer's multicast pointer -> the last collective run on it.
-_last_collective_by_buffer: dict[int, str] = {}
-
-
-def record_collective(symm_mem_hdl, kind: str) -> None:
-    """Record ``kind`` as the most recent collective performed on this buffer."""
-    _last_collective_by_buffer[symm_mem_hdl.multicast_ptr] = kind
-
-
-def all_gather_needs_barrier(symm_mem_hdl) -> bool:
-    """Whether an all-gather on this buffer must barrier before reusing it.
-
-    Required only when the previous collective on the buffer was itself an
-    all-gather; a preceding reduce-scatter already established the ordering.
-    """
-    return _last_collective_by_buffer.get(symm_mem_hdl.multicast_ptr) == ALL_GATHER
-
-
-def reset_collective_ordering() -> None:
-    """Clear all tracked state (e.g. when symmetric buffers are destroyed)."""
-    _last_collective_by_buffer.clear()
 
 
 @triton.jit
@@ -313,9 +271,6 @@ def multimem_all_gather(
         and output_tensor.numel() // input_tensor.numel() == symm_mem_hdl.world_size
     ), "Output numel must be exactly world_size * input numel for all-gather."
 
-    auto_barrier = all_gather_needs_barrier(symm_mem_hdl)
-    barrier_before = auto_barrier if barrier_before is None else (barrier_before or auto_barrier)
-
     numel_per_thread, num_blocks, config = _kernel_launch_config(
         input_tensor.element_size(), output_tensor.numel(), symm_mem_hdl.world_size, **kwargs
     )
@@ -332,7 +287,6 @@ def multimem_all_gather(
         BARRIER_BEFORE=barrier_before,
         num_warps=config["num_warps"],
     )
-    record_collective(symm_mem_hdl, ALL_GATHER)
 
     return output_tensor
 
@@ -388,7 +342,6 @@ def multimem_all_gather_fused(
         WORLD_SIZE=symm_mem_hdl.world_size,
         num_warps=config["num_warps"],
     )
-    record_collective(symm_mem_hdl, ALL_GATHER)
 
 
 def multimem_reduce_scatter(
@@ -435,6 +388,5 @@ def multimem_reduce_scatter(
         num_warps=config["num_warps"],
         REDUCE_F32=reduce_f32,
     )
-    record_collective(symm_mem_hdl, REDUCE_SCATTER)
 
     return output_tensor
