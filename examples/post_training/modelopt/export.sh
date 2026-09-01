@@ -26,8 +26,6 @@ if [ "${TP}" != "1" ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}TP${WHITE} is forced to be 1 during export!!\n"
 fi
 
-shift
-
 ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/export.py \
     ${MODEL_ARGS} \
     --tensor-model-parallel-size ${TP} \
@@ -36,4 +34,4 @@ ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/export.py \
     --load ${MLM_MODEL_CKPT} \
     --pretrained-model-name ${HF_MODEL_CKPT} \
     --export-dir ${EXPORT_DIR} \
-    ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS} "$@"
+    ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS}
