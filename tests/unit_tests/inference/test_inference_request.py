@@ -16,6 +16,7 @@ from megatron.core.inference.inference_request import (
     compute_block_hashes_batched,
     deserialize_ndarray,
     deserialize_tensor,
+    overwrite_epoch_span,
     serialize_ndarray,
     serialize_tensor,
     unwrap_serialized_tensors,
@@ -363,3 +364,47 @@ def test_dynamic_inference_request_serialize_prompt_length_absent():
 
     assert obj["prompt_length"] is None
     assert obj["prompt_tokens"] is None
+
+
+@pytest.mark.parametrize(
+    "boundaries,span,expected",
+    [
+        # Whole prompt served from an older epoch: the leading stamp is replaced
+        # and the current epoch resumes where the cache hit ends.
+        ([(0, 5)], (0, 256, 3), [(0, 3), (256, 5)]),
+        # A cached span in the middle keeps the epoch on both sides.
+        ([(0, 5)], (256, 512, 3), [(0, 5), (256, 3), (512, 5)]),
+        # Rewriting to the epoch already in force coalesces away.
+        ([(0, 5)], (0, 512, 5), [(0, 5)]),
+        # A later boundary (an epoch change mid-generation) survives untouched.
+        ([(0, 5), (799, 6)], (0, 768, 4), [(0, 4), (768, 5), (799, 6)]),
+        # An empty span is a no-op.
+        ([(0, 5)], (128, 128, 3), [(0, 5)]),
+    ],
+)
+def test_overwrite_epoch_span(boundaries, span, expected):
+    """Epoch boundaries are a step function over token positions; rewriting one
+    span must leave every other token's epoch alone."""
+    start, end, epoch = span
+    assert overwrite_epoch_span(boundaries, start, end, epoch) == expected
+
+
+def test_epoch_boundaries_replays_cached_prefix_spans():
+    """A request stamped with the current epoch must still report the epochs
+    that actually produced the prefix it was served from the cache -- including
+    when the stamp is rebuilt later, after a checkpoint reset it to None."""
+    req = _make_dynamic_request()
+
+    # Recorded before any stamp exists: nothing to rewrite yet, but remembered.
+    req.record_cached_prefix_epoch(0, 256, 3)
+    req.record_cached_prefix_epoch(256, 512, 4)
+    assert req.policy_epoch is None and req.kv_cache_epoch is None
+
+    assert req.epoch_boundaries(7) == [(0, 3), (256, 4), (512, 7)]
+
+    # Once stamped, a further cache hit is applied to the live fields too.
+    req.kv_cache_epoch = req.epoch_boundaries(7)
+    req.policy_epoch = req.epoch_boundaries(7)
+    req.record_cached_prefix_epoch(512, 768, 6)
+    assert req.kv_cache_epoch == [(0, 3), (256, 4), (512, 6), (768, 7)]
+    assert req.policy_epoch == req.kv_cache_epoch

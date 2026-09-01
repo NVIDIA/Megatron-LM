@@ -538,6 +538,12 @@ class InferenceConfig:
                 f"got {self.prefix_caching_routing_alpha}"
             )
 
+        if self.prefix_caching_lease_epochs is not None and self.prefix_caching_lease_epochs < 0:
+            raise ValueError(
+                f"prefix_caching_lease_epochs must be non-negative (0 tolerates no staleness, "
+                f"None disables lease-based eviction), got {self.prefix_caching_lease_epochs}"
+            )
+
         if self.logprobs_mode not in ("raw_logprobs", "processed_logprobs"):
             raise ValueError(
                 f"Unsupported logprobs_mode {self.logprobs_mode!r}. "

@@ -120,16 +120,24 @@ class KVBlockAllocator:
                     (self.pool_size,), dtype=torch.int64, device='cpu'
                 )
 
+            # block_epoch[b] = generation epoch during which b was registered in
+            # the prefix cache; -1 when b is not registered. This is the epoch
+            # whose model weights produced b's contents, so it serves two
+            # purposes and is therefore maintained for all prefix caching, not
+            # only when a lease is configured:
+            #
+            #   - It dates a cache hit. A request that matches b is served KV
+            #     produced by epoch block_epoch[b], not by the current epoch,
+            #     which is what `kv_cache_epoch` / `policy_epoch` must report
+            #     (see DynamicInferenceContext.stamp_cached_prefix_epochs).
+            #   - It bounds staleness. Recording the birth epoch is equivalent
+            #     to the "decrement every block each epoch, evict at zero"
+            #     formulation, without touching the whole pool per epoch: b's
+            #     remaining lease is
+            #       lease_epochs - (current_epoch - block_epoch[b]).
+            self.block_epoch = torch.full((self.pool_size,), -1, dtype=torch.int64, device='cpu')
+
             if self.lease_enabled:
-                # block_lease_epoch[b] = epoch during which b was registered in the
-                # prefix cache; -1 when b is not registered. Recording the birth
-                # epoch is equivalent to the "decrement every block each epoch,
-                # evict at zero" formulation, without touching the whole pool per
-                # epoch: b's remaining lease is
-                #   lease_epochs - (current_epoch - block_lease_epoch[b]).
-                self.block_lease_epoch = torch.full(
-                    (self.pool_size,), -1, dtype=torch.int64, device='cpu'
-                )
                 # Lower bound on the oldest registered block's birth epoch, used to
                 # skip the sweep entirely when nothing can have expired yet. Only
                 # lowered by registration and recomputed exactly after each sweep,
@@ -342,8 +350,8 @@ class KVBlockAllocator:
             if self.track_prefix_chain:
                 self.block_parent_id.fill_(-1)
                 self.block_child_count.fill_(0)
+            self.block_epoch.fill_(-1)
             if self.lease_enabled:
-                self.block_lease_epoch.fill_(-1)
                 self._min_lease_epoch = None
 
         # Clear per-block routing storage
@@ -358,7 +366,7 @@ class KVBlockAllocator:
         block_ids: list[int],
         block_hashes: list[int],
         parent_hashes: Optional[list[int]] = None,
-    ) -> None:
+    ) -> bool:
         """Register blocks in the hash-to-block mapping for discovery (batch).
 
         Registration is idempotent: a block that already carries the hash being
@@ -385,9 +393,16 @@ class KVBlockAllocator:
                 length as block_ids); 0 marks a root block with no parent. Used
                 by LRU eviction to avoid evicting a parent before its children.
                 If None, parents default to 0.
+
+        Returns:
+            True if every block in the batch is cached on return (registered
+            here or already registered), False if the batch was rejected
+            wholesale because its prefix is no longer cached. Callers that
+            advertise cached blocks to the outside world — the Dynamo
+            ``kv_stored`` event, which steers routing — must not do so on False.
         """
         if not block_ids:
-            return
+            return True
         if parent_hashes is not None:
             assert len(parent_hashes) == len(block_ids)
         # Tensor views of the batch, used to index the per-block state arrays.
@@ -415,7 +430,7 @@ class KVBlockAllocator:
             # hash-map update and the child-count bumps all see the same subset.
             keep = torch.nonzero(~already_registered, as_tuple=True)[0]
             if keep.numel() == 0:
-                return
+                return True
             keep_list = keep.tolist()
             block_ids = [block_ids[i] for i in keep_list]
             block_hashes = [block_hashes[i] for i in keep_list]
@@ -425,7 +440,8 @@ class KVBlockAllocator:
             hash_tensor = hash_tensor[keep]
 
         if (
-            parent_hashes is not None
+            self.lease_enabled
+            and parent_hashes is not None
             and parent_hashes[0] != 0
             and parent_hashes[0] not in self.kv_hash_to_block_id
         ):
@@ -441,8 +457,10 @@ class KVBlockAllocator:
             # earlier chunk of this request, both pinned by a live reference. Lease
             # expiry is what breaks that, since it unregisters stale blocks in
             # place while a request still holds them, and a later chunk of that
-            # same request then arrives parented to one of them.
-            return
+            # same request then arrives parented to one of them. That is why this
+            # is gated on `lease_enabled`: no other path unregisters a block that
+            # a live request still holds.
+            return False
 
         self.block_hashes[id_tensor] = hash_tensor
         # Add the new blocks to the hash map first so that a block whose parent is
@@ -450,12 +468,13 @@ class KVBlockAllocator:
         # Skipped blocks are already in the map, so they resolve as parents too.
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
 
+        # Date the blocks by the epoch whose weights produced them, and start any
+        # bounded-staleness lease there. Blocks are stamped on registration
+        # rather than on allocation because that is when their contents become
+        # visible to other requests.
+        epoch = self.context.prefix_cache_epoch
+        self.block_epoch[id_tensor] = epoch
         if self.lease_enabled:
-            # Start the bounded-staleness lease at the current epoch. Blocks are
-            # stamped on registration rather than on allocation because that is
-            # when their contents become visible to other requests.
-            epoch = self.context.prefix_cache_epoch
-            self.block_lease_epoch[id_tensor] = epoch
             self._min_lease_epoch = (
                 epoch if self._min_lease_epoch is None else min(self._min_lease_epoch, epoch)
             )
@@ -537,8 +556,7 @@ class KVBlockAllocator:
             self.block_child_count[block_ids] = 0
         if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
             self.block_timestamps[block_ids] = 0
-        if self.lease_enabled:
-            self.block_lease_epoch[block_ids] = -1
+        self.block_epoch[block_ids] = -1
         self.block_hashes[block_ids] = -1
 
         return block_ids_list, keys_to_delete
@@ -723,8 +741,26 @@ class KVBlockAllocator:
         return True
 
     # =========================================================================
-    # Bounded staleness (lease) eviction
+    # Block epochs and bounded staleness (lease) eviction
     # =========================================================================
+
+    def get_block_epochs(self, block_ids: list[int]) -> list[int]:
+        """Generation epoch whose weights produced each block's cached contents.
+
+        Args:
+            block_ids: Block IDs to query; each must be registered in the
+                prefix cache.
+
+        Returns:
+            One epoch per block, in the order given.
+        """
+        assert self.enable_prefix_caching, "block epochs are only tracked for prefix caching"
+        epochs = self.block_epoch[torch.tensor(block_ids, dtype=torch.int64)].tolist()
+        assert all(epoch >= 0 for epoch in epochs), (
+            "block epoch requested for an unregistered block: "
+            f"{[b for b, e in zip(block_ids, epochs) if e < 0]}"
+        )
+        return epochs
 
     def get_block_remaining_lease(self, block_id: int) -> Optional[int]:
         """Further epochs a cached block may survive, or None if it has no lease.
@@ -742,7 +778,7 @@ class KVBlockAllocator:
         """
         if not self.lease_enabled:
             return None
-        birth_epoch = int(self.block_lease_epoch[block_id])
+        birth_epoch = int(self.block_epoch[block_id])
         if birth_epoch < 0:
             return None
         age = self.context.prefix_cache_epoch - birth_epoch
@@ -785,9 +821,9 @@ class KVBlockAllocator:
 
         # An entry survives while its age is within the tolerated lag, so a lease
         # of N covers ages 0..N and eviction starts at N + 1.
-        registered_mask = self.block_lease_epoch >= 0
+        registered_mask = self.block_epoch >= 0
         expired_mask = registered_mask & (
-            (epoch - self.block_lease_epoch) > self.prefix_caching_lease_epochs
+            (epoch - self.block_epoch) > self.prefix_caching_lease_epochs
         )
 
         # Children of each registered block, so the sweep can walk from expired
@@ -833,7 +869,7 @@ class KVBlockAllocator:
         self.block_child_count[expired_ids] = 0
 
         # Recompute the skip bound exactly over what survived.
-        surviving = self.block_lease_epoch[self.block_lease_epoch >= 0]
+        surviving = self.block_epoch[self.block_epoch >= 0]
         self._min_lease_epoch = int(surviving.min()) if surviving.numel() > 0 else None
 
         return len(expired)

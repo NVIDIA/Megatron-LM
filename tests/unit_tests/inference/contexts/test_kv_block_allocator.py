@@ -817,9 +817,9 @@ def test_lease_of_zero_tolerates_no_staleness():
     "policy", [PrefixCachingEvictionPolicy.REF_ZERO, PrefixCachingEvictionPolicy.LRU]
 )
 def test_lease_disabled_by_default(policy):
-    """With no lease configured (the default is None, not 0), no lease
-    bookkeeping is allocated and cached blocks survive arbitrarily many
-    epochs."""
+    """With no lease configured (the default is None, not 0), cached blocks
+    survive arbitrarily many epochs -- but they are still dated, since that is
+    what a cache hit reports as its `kv_cache_epoch`."""
     ctx = _make_context()
     a = KVBlockAllocator(
         ctx,
@@ -829,15 +829,41 @@ def test_lease_disabled_by_default(policy):
         prefix_caching_eviction_policy=policy,
     )
     assert a.lease_enabled is False
-    assert not hasattr(a, "block_lease_epoch")
 
+    ctx.prefix_cache_epoch = 7
     block = int(a.allocate_memory_blocks(1)[0])
     a.register_kv_block_hashes(block_ids=[block], block_hashes=[11], parent_hashes=[0])
+    assert a.get_block_epochs([block]) == [7]
 
     ctx.prefix_cache_epoch = 10_000
     assert a.expire_leased_blocks() == 0
     assert a.kv_hash_to_block_id == {11: block}
     assert a.get_block_remaining_lease(block) is None
+    # Dated by the epoch that produced it, not by the current one.
+    assert a.get_block_epochs([block]) == [7]
+
+
+def test_registration_reports_whether_the_batch_is_cached():
+    """`register_kv_block_hashes` reports whether the batch ended up cached.
+
+    A batch parented to a prefix that expired out from under it is rejected
+    wholesale, and the caller must not then advertise those blocks as stored.
+    """
+    ctx, a = _leased_allocator(lease_epochs=0)
+
+    parent = int(a.allocate_memory_blocks(1)[0])
+    assert a.register_kv_block_hashes([parent], [11], [0]) is True
+    # Re-offering an already registered block is still "cached on return".
+    assert a.register_kv_block_hashes([parent], [11], [0]) is True
+
+    # The parent expires while its request still holds it, so the next chunk of
+    # that request arrives parented to a block that is no longer cached.
+    ctx.prefix_cache_epoch = 1
+    assert a.expire_leased_blocks() == 1
+    child = int(a.allocate_memory_blocks(1)[0])
+    assert a.register_kv_block_hashes([child], [22], [11]) is False
+    assert a.kv_hash_to_block_id == {}
+    assert a.block_epoch[child].item() == -1
 
 
 def test_lease_expires_block_exactly_at_end_of_lease():
@@ -866,7 +892,7 @@ def test_lease_expires_block_exactly_at_end_of_lease():
     assert a.expire_leased_blocks() == 1
     assert a.kv_hash_to_block_id == {}
     assert a.block_hashes[block].item() == -1
-    assert a.block_lease_epoch[block].item() == -1
+    assert a.block_epoch[block].item() == -1
     assert a.pool_avail == avail_cached + 1
     assert a.get_block_remaining_lease(block) is None
     # Nothing registered: a further epoch is a cheap no-op.
@@ -995,7 +1021,7 @@ def test_lease_reset_clears_bookkeeping():
     a.register_kv_block_hashes(block_ids=[block], block_hashes=[11], parent_hashes=[0])
 
     a.reset()
-    assert a.block_lease_epoch[block].item() == -1
+    assert a.block_epoch[block].item() == -1
     assert a._min_lease_epoch is None
     ctx.prefix_cache_epoch = 100
     assert a.expire_leased_blocks() == 0
@@ -1129,7 +1155,7 @@ def test_lease_expiry_subtree_closure_under_random_forests():
 
         for i in expected:
             assert a.block_hashes[ids[i]].item() == -1
-            assert a.block_lease_epoch[ids[i]].item() == -1
+            assert a.block_epoch[ids[i]].item() == -1
             assert a.block_parent_id[ids[i]].item() == -1
             assert a.block_child_count[ids[i]].item() == 0
 

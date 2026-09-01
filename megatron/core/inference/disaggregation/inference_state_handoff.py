@@ -241,8 +241,9 @@ class InferenceStateHandoffMixin:
         # while the peer is still reading them); expiry would have to be
         # coordinated across the pair and ordered against handoff pinning.
         assert not allocator.lease_enabled, (
-            "KV handoff does not support prefix cache leases yet; set "
-            "--inference-dynamic-batching-prefix-caching-lease-epochs 0."
+            "KV handoff does not support prefix cache leases yet; leave "
+            "--inference-dynamic-batching-prefix-caching-lease-epochs unset (a lease of 0 "
+            "does not disable leasing, it tolerates no staleness at all)."
         )
         allocator.enable_handoff_pinning = role == "prefill"
 
