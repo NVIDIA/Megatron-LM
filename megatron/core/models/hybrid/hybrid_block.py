@@ -43,7 +43,7 @@ from megatron.core.transformer.module import (
 )
 from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import TransformerLayer, _get_offloading_interface
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
@@ -151,6 +151,13 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         self.inner_layer = layer
         self.layer_number = layer.layer_number
         self.hyper_connection = HyperConnectionModule(config=config, layer_number=self.layer_number)
+        # This wrapper is the TE graph callable, so it also owns the offload
+        # capture/replay boundary. Reuse the inner TransformerLayer interface when
+        # available; non-Transformer hybrid layers still need the interface to flush
+        # delayed groups left by a preceding partial-MoE wrapper.
+        self.off_interface = getattr(layer, 'off_interface', None)
+        if self.off_interface is None:
+            self.off_interface = _get_offloading_interface()
         if config.params_dtype is not None:
             convert_module_to_dtype_except_fp32_marked(self.hyper_connection, config.params_dtype)
         if hasattr(layer, 'tp_group'):
@@ -240,6 +247,59 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             and CudaGraphModule.moe_router in self.config.cuda_graph_modules
         )
 
+    def _inner_has_offload_module_in_cuda_graph(self) -> bool:
+        """Whether this wrapper's captured inner body contains an offload boundary.
+
+        HybridStack can split attention and MoE into separate TransformerLayers while
+        sharing one global config. Consequently, the inner layer's cached flag is not
+        sufficient: a MoE-only layer with Identity attention may still report that
+        ``core_attn`` is offloaded. Inspect the concrete modules captured by this
+        wrapper instead.
+        """
+        if not self.config.fine_grained_activation_offloading or not isinstance(
+            self.inner_layer, TransformerLayer
+        ):
+            return False
+
+        layer = self.inner_layer
+        has_attention = not (
+            isinstance(layer.self_attention, IdentityOp)
+            and isinstance(layer.cross_attention, IdentityOp)
+        )
+        captured_attention = has_attention and (
+            not self._inner_is_partial_moe_capture()
+            or not self.config.cuda_graph_modules
+            or CudaGraphModule.attn in self.config.cuda_graph_modules
+        )
+        if captured_attention and (
+            layer.offload_attn_norm
+            or layer.offload_qkv_linear
+            or layer.offload_core_attn
+            or layer.offload_attn_proj
+        ):
+            return True
+
+        # Non-MoE wrappers capture their whole forward once selected as a TE
+        # callable. The pre-MLP norm is the only dense MLP offload boundary that
+        # contributes to the graph-level stream/event handshake.
+        return bool(
+            not layer.is_moe_layer
+            and not isinstance(layer.mlp, IdentityOp)
+            and layer.offload_mlp_norm
+        )
+
+    def _has_offload_module_in_cuda_graph(self) -> bool:
+        """Return the effective offload state for this complete TE callable."""
+        if self._inner_has_offload_module_in_cuda_graph():
+            return True
+        group_tail = self._get_te_cuda_graph_group_tail()
+        return bool(group_tail is not None and group_tail._inner_has_offload_module_in_cuda_graph())
+
+    @property
+    def offload_module_in_cuda_graph(self) -> bool:
+        """Whether TE must join the wrapper graph with offload streams."""
+        return self._has_offload_module_in_cuda_graph()
+
     def _can_group_te_cuda_graph_with(self, next_layer: MegatronModule) -> bool:
         """Whether this attention layer and the following MoE prefix can share one TE graph.
 
@@ -326,20 +386,42 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         """
         self._reconstruct_packed_seq_params_from_kwargs(kwargs)
 
+        # The Hybrid wrapper, not its inner TransformerLayer(s), is the TE graph
+        # callable. Place the offload events at this outer boundary so every D2H/H2D
+        # stream dependency belongs to the graph being captured.
+        if self.offload_module_in_cuda_graph:
+            if args:
+                hidden_states = self.off_interface.backward_record(args[0])
+                args = (hidden_states,) + args[1:]
+            else:
+                hidden_states = self.off_interface.backward_record(kwargs.pop('hidden_states'))
+                kwargs['hidden_states'] = hidden_states
+
+        cuda_graph_outputs = self._te_cuda_graph_capture_impl(*args, **kwargs)
+
+        if self.offload_module_in_cuda_graph:
+            self.off_interface.forward_record()
+        return cuda_graph_outputs
+
+    def _te_cuda_graph_capture_impl(self, *args, **kwargs):
+        """Capture the wrapper body without adding offload boundary events."""
+
         group_tail = self._get_te_cuda_graph_group_tail()
         if group_tail is not None:
             hidden_states, context = self.forward(*args, **kwargs)
             assert context is None, "Grouped hybrid CUDA graphs do not support cross-attention."
             tail_kwargs = dict(kwargs)
             tail_kwargs.pop("hidden_states", None)
-            return group_tail._te_cuda_graph_capture(hidden_states, **tail_kwargs)
+            return group_tail._te_cuda_graph_capture_impl(hidden_states, **tail_kwargs)
 
         if self._inner_is_partial_moe_capture():
             hidden_states = args[0] if args else kwargs["hidden_states"]
             aggregated, h_res, h_post, residual = self.hyper_connection(hidden_states)
             inner_kwargs = dict(kwargs)
             inner_kwargs.pop("hidden_states", None)
-            inner_out = list(self.inner_layer._te_cuda_graph_capture(aggregated, **inner_kwargs))
+            inner_out = list(
+                self.inner_layer._te_cuda_graph_capture_impl(aggregated, **inner_kwargs)
+            )
             # inner_out = router/preprocess intermediates ending in the inner residual;
             # append the mHC state AND the n-stream `residual` returned by the (graphed)
             # hyper_connection. Routing `residual` through the graph as an output keeps its
@@ -368,16 +450,29 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         """
         self._decompose_packed_seq_params_to_kwargs(kwargs)
 
+        if self.config.delay_offload_until_cuda_graph:
+            self.off_interface.enter_replay()
+
+        try:
+            return self._te_cuda_graph_replay_impl(args, kwargs)
+        finally:
+            if self.config.delay_offload_until_cuda_graph:
+                self.off_interface.exit_replay()
+
+    def _te_cuda_graph_replay_impl(self, args, kwargs):
+        """Replay the wrapper graph, then run any eager continuation."""
+
         group_tail = self._get_te_cuda_graph_group_tail()
+        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
+        if self.config.delay_offload_until_cuda_graph:
+            self.off_interface.flush_delayed_groups()
+
         if group_tail is not None:
-            out = list(super()._te_cuda_graph_replay(*args, **kwargs))
-            return group_tail._resume_partial_moe_cuda_graph(out)
+            return group_tail._resume_partial_moe_cuda_graph(cuda_graph_output)
 
         if self._inner_is_partial_moe_capture():
-            out = list(super()._te_cuda_graph_replay(*args, **kwargs))
-            return self._resume_partial_moe_cuda_graph(out)
+            return self._resume_partial_moe_cuda_graph(cuda_graph_output)
 
-        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
         return cuda_graph_output[0], None
 
     def _resume_partial_moe_cuda_graph(self, out: List[Tensor]) -> Tuple[Tensor, Optional[Tensor]]:
