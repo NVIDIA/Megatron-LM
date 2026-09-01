@@ -759,6 +759,14 @@ try:
         prevent_retokenization = req.get(
             "prevent_retokenization", not current_app.config.get('eval_mode', False)
         )
+        # Client-supplied token ids of the conversation through its last assistant message.
+        # They replace the previous turn's compact prompt + generation ids as the stitched prefix.
+        required_prefix_token_ids = req.get("required_prefix_token_ids") or None
+        if required_prefix_token_ids is not None and not (
+            isinstance(required_prefix_token_ids, list)
+            and all(isinstance(token_id, int) for token_id in required_prefix_token_ids)
+        ):
+            return Response("'required_prefix_token_ids' must be a list of token ids", status=400)
         tools = req.get("tools", None)
         tool_choice = req.get("tool_choice", None)
         parallel_tool_calls = req.get("parallel_tool_calls", True)
@@ -859,7 +867,7 @@ try:
                         ),
                     )
 
-                if prevent_retokenization:
+                if prevent_retokenization or required_prefix_token_ids is not None:
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
                     # This improves prefix cache hits and reduces logprob variation between training and inference.
 
@@ -875,13 +883,20 @@ try:
                         if last_assistant_message_idx is not None
                         else None
                     )
+                    if required_prefix_token_ids is not None and last_assistant_message is None:
+                        raise ValueError(
+                            "'required_prefix_token_ids' was supplied but the conversation "
+                            "has no assistant message to anchor the provided tokens."
+                        )
 
                     # Only proceed if the last assistant message has the token IDs from a previous generation.
                     # Dataset-provided conversation history won't have these fields.
-                    if (
-                        last_assistant_message is not None
-                        and isinstance(last_assistant_message.get("prompt_token_ids"), list)
-                        and isinstance(last_assistant_message.get("generation_token_ids"), list)
+                    if last_assistant_message is not None and (
+                        required_prefix_token_ids is not None
+                        or (
+                            isinstance(last_assistant_message.get("prompt_token_ids"), list)
+                            and isinstance(last_assistant_message.get("generation_token_ids"), list)
+                        )
                     ):
                         messages_to_last_assistant_message = template_messages[
                             : last_assistant_message_idx + 1
@@ -892,7 +907,9 @@ try:
                         previous_prompt_token_ids = last_assistant_message.get(
                             "compact_prompt_token_ids"
                         )
-                        if not isinstance(previous_prompt_token_ids, list):
+                        if required_prefix_token_ids is None and not isinstance(
+                            previous_prompt_token_ids, list
+                        ):
                             raise ValueError(
                                 "Prefix stitching requires compact_prompt_token_ids "
                                 "from the previous Megatron-Inference response."
@@ -938,10 +955,14 @@ try:
                                 )
                             )
 
-                        previous_turn_token_ids = (
-                            previous_prompt_token_ids
-                            + last_assistant_message["generation_token_ids"]
-                        )
+                        if required_prefix_token_ids is not None:
+                            # Tokens for the previous turn are supplied by the user.
+                            previous_turn_token_ids = required_prefix_token_ids
+                        else:
+                            previous_turn_token_ids = (
+                                previous_prompt_token_ids
+                                + last_assistant_message["generation_token_ids"]
+                            )
                         prompt_tokens = _replace_prefix_tokens(
                             eos_token_id,
                             previous_turn_token_ids,
