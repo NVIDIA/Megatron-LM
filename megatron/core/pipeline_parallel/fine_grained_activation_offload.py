@@ -351,11 +351,17 @@ class OffloadTensorGroup:
     A group of tensors to be offloaded together.
     """
 
-    def __init__(self, name):
+    def __init__(self, name, enable_offload_throttle: bool = False):
         self._name = name
         self._tensors = {}
         self._offload_event = torch.cuda.Event()
         self._reload_event = torch.cuda.Event()
+        # Keep throttling separate from the internal offload/reload handshake.
+        # External events capture record/wait as explicit graph nodes, allowing
+        # separate module graphs to synchronize through the same event.
+        self._offload_throttle_event: Optional[torch.cuda.Event] = (
+            torch.cuda.Event(external=True) if enable_offload_throttle else None
+        )
         self.offload = True
         self.total_offload_bytes = 0
         self.total_tensor_count = 0
@@ -382,6 +388,11 @@ class OffloadTensorGroup:
     def wait_offload_event(self, stream):
         """Wait for the offload event."""
         stream.wait_event(self._offload_event)
+
+    def record_offload_throttle_event(self, stream):
+        """Record the external event used only for max-inflight throttling."""
+        assert self._offload_throttle_event is not None
+        self._offload_throttle_event.record(stream)
 
     def record_reload_event(self, stream):
         """Record the reload event."""
@@ -599,10 +610,8 @@ class PipelineOffloadManager:
         for chunk in self._cached_chunks_backward:
             for group in chunk.offload_groups:
                 if group.offload and keep_on_gpu_bytes > 0:
-                    debug_rank(
-                        f"group {group._name} offload {group.offload} \
-                        keep_on_gpu_bytes {keep_on_gpu_bytes}"
-                    )
+                    debug_rank(f"group {group._name} offload {group.offload} \
+                        keep_on_gpu_bytes {keep_on_gpu_bytes}")
                     keep_on_gpu_bytes -= group.total_offload_bytes
                     group.offload = False
         # Disable the later groups to meet the activation offload fraction.
@@ -1017,14 +1026,16 @@ class ChunkOffloadHandler:
                     tensor_on_device.record_stream(self.d2h_stream)
                     group_to_offload.push_tensor(tensor_tag, state)
             group_to_offload.record_offload_event(self.d2h_stream)
+            if self._max_inflight_offloads is not None:
+                group_to_offload.record_offload_throttle_event(self.d2h_stream)
         nvtx_range_pop(nvtx_msg)
-        # Under full-iteration CG capture, the main stream may not wait on d2h
-        # events; optional max-inflight enqueues each group's offload event and
-        # has main wait on older events for this group name when its pending
-        # count exceeds the cap (each name is tracked separately).
+        # Max-inflight uses its dedicated external event rather than the internal
+        # reload dependency, whose capture-local semantics must remain unchanged.
         if self._max_inflight_offloads is not None:
             gname = group_to_offload._name
-            self._offload_pending_by_name[gname].append(group_to_offload._offload_event)
+            throttle_event = group_to_offload._offload_throttle_event
+            assert throttle_event is not None
+            self._offload_pending_by_name[gname].append(throttle_event)
             self._drain_offload_pending(gname)
 
     def get_max_deduplicated_groups(self):
@@ -1179,7 +1190,11 @@ class ChunkOffloadHandler:
         debug_rank(f"--on_group_start_forward {name}")
         self._offloaded_group_index = self._offloaded_group_index + 1
         if self.is_warmup:
-            self.offload_groups.append(OffloadTensorGroup(name))
+            self.offload_groups.append(
+                OffloadTensorGroup(
+                    name, enable_offload_throttle=self._max_inflight_offloads is not None
+                )
+            )
             self._max_group_size = max(self._max_group_size, self._offloaded_group_index)
             debug_rank(f"max group size {self._max_group_size}")
         else:
