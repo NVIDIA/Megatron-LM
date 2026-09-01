@@ -4,7 +4,7 @@ from __future__ import annotations
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -1212,15 +1212,21 @@ class MultiTokenPredictionLayer(MegatronModule):
         layer_number: int = 1,
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        # For hybrid path - pattern and submodules to build inner layers directly
+        # Hybrid path: pattern or direct config template, plus stack submodules.
         mtp_layer_pattern: Optional[str] = None,
         hybrid_submodules: Optional[HybridStackSubmodules] = None,
         mamba_submodules: Optional[HybridStackSubmodules] = None,
         name: str | None = None,
+        mtp_layer_config_list: Sequence[TransformerConfig] | None = None,
+        is_hybrid_mtp: bool = False,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
+            mtp_layer_config_list (Sequence[TransformerConfig] | None): Marker-free layer-config
+                template for the HybridStack inside this MTP layer.
+            is_hybrid_mtp (bool): Whether the MTP inner model is a HybridStack. Legacy callers
+                that provide ``mtp_layer_pattern`` are treated as Hybrid MTP automatically.
         """
         super().__init__(config=config)
         if mamba_submodules is not None:
@@ -1235,12 +1241,32 @@ class MultiTokenPredictionLayer(MegatronModule):
                 stacklevel=2,
             )
             hybrid_submodules = mamba_submodules
-        if self.config.enable_mhc_connections and (
-            mtp_layer_pattern is None or hybrid_submodules is None
-        ):
+        if mtp_layer_pattern is not None and mtp_layer_config_list is not None:
+            raise ValueError("Cannot specify both mtp_layer_pattern and mtp_layer_config_list.")
+        if mtp_layer_config_list is not None and not is_hybrid_mtp:
+            raise ValueError("mtp_layer_config_list requires is_hybrid_mtp=True.")
+
+        self.is_hybrid_mtp = is_hybrid_mtp or mtp_layer_pattern is not None
+        if self.is_hybrid_mtp:
+            if hybrid_submodules is None:
+                raise ValueError("Hybrid MTP requires hybrid_submodules.")
+            if mtp_layer_pattern is None and mtp_layer_config_list is None:
+                raise ValueError("Hybrid MTP requires mtp_layer_pattern or mtp_layer_config_list.")
+            if mtp_layer_config_list is not None:
+                if len(mtp_layer_config_list) == 0:
+                    raise ValueError("mtp_layer_config_list must not be empty.")
+                if not all(
+                    isinstance(layer_config, TransformerConfig)
+                    for layer_config in mtp_layer_config_list
+                ):
+                    raise TypeError(
+                        "Every mtp_layer_config_list entry must be a TransformerConfig."
+                    )
+
+        if self.config.enable_mhc_connections and not self.is_hybrid_mtp:
             raise ValueError(
                 "Multi-token prediction with hyper connections requires the HybridModel "
-                "MTP contract: both mtp_layer_pattern and hybrid_submodules must be provided."
+                "MTP contract."
             )
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
@@ -1347,16 +1373,30 @@ class MultiTokenPredictionLayer(MegatronModule):
                 self.eh_proj.set_barrier_before_all_gather(True)
 
         # Build inner layers: two possible paths
-        # 1. Hybrid path: use HybridStack for hybrid pattern support
+        # 1. Hybrid path: use HybridStack for a pattern or direct config template
         # 2. GPT path: single TransformerLayer
-        if mtp_layer_pattern is not None and hybrid_submodules is not None:
+        if self.is_hybrid_mtp:
             from megatron.core.models.hybrid.hybrid_block import HybridStack
-            from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+
+            if mtp_layer_config_list is not None:
+                # Each physical HybridStack owns independent configs. This is important when a
+                # recipe constructs its template with list multiplication or reuses it for every
+                # MTP depth.
+                layer_config_list = [
+                    type(layer_config).from_config(layer_config)
+                    for layer_config in mtp_layer_config_list
+                ]
+            else:
+                from megatron.core.models.hybrid.hybrid_layer_allocation import (
+                    validate_segment_layers,
+                )
+
+                layer_config_list = validate_segment_layers(mtp_layer_pattern, self.config)
 
             self.mtp_model_layer = HybridStack(
                 config=self.config,
                 submodules=hybrid_submodules,
-                layer_config_list=validate_segment_layers(mtp_layer_pattern, self.config),
+                layer_config_list=layer_config_list,
                 pp_layer_offset=0,
                 pre_process=True,  # Always receives input from eh_proj
                 post_layer_norm=False,  # MTP has its own final_layernorm
@@ -1385,7 +1425,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         # between, so it must barrier before overwriting. Later all-gathers in the inner
         # block are each preceded by a reduce-scatter and need no barrier. modules() yields
         # in forward order, so the first inference column-parallel linear is that all-gather.
-        if self.mtp_layer_pattern is not None:
+        if self.is_hybrid_mtp:
             # Hybrid path: HybridStack of layers.
             first_inner_layer = self.mtp_model_layer.layers[0]
         else:
@@ -1613,7 +1653,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             # transformer layer is cudagraphed, the FP8GlobalStateManager.is_first_fp8_module() is
             # True so that the fp8 weight caching can be triggered correctly.
             with transformer_layer_fp8_context:
-                if self.mtp_layer_pattern is not None:
+                if self.is_hybrid_mtp:
                     hidden_states = self.mtp_model_layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
@@ -1985,9 +2025,8 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         # Backward compatibility: GPT MTP checkpoints were saved with the submodule
         # named 'transformer_layer'. Remap checkpoint keys so old checkpoints load
-        # correctly. Mamba MTP models keep 'mtp_model_layer' as their native format
-        # since no older checkpoints exist for them.
-        if self.mtp_layer_pattern is None:
+        # correctly. Hybrid MTP models keep 'mtp_model_layer' as their native format.
+        if not self.is_hybrid_mtp:
             apply_prefix_mapping(
                 sharded_state_dict, {f'{prefix}mtp_model_layer.': f'{prefix}transformer_layer.'}
             )
@@ -2070,16 +2109,22 @@ class MultiTokenPredictionBlock(MegatronModule):
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        # New: For hybrid path with unified pattern syntax
+        # Hybrid path: pattern or direct config template.
         mtp_layer_pattern: Optional[str] = None,
         mtp_num_depths: int = 0,
         hybrid_submodules: Optional["HybridStackSubmodules"] = None,
         mamba_submodules: Optional["HybridStackSubmodules"] = None,
         name: str | None = None,
+        mtp_layer_config_list: Sequence[TransformerConfig] | None = None,
+        is_hybrid_mtp: bool = False,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
+            mtp_layer_config_list (Sequence[TransformerConfig] | None): Marker-free layer-config
+                template for every physical HybridStack built by this MTP block.
+            is_hybrid_mtp (bool): Whether MTP uses HybridStack inner layers. Legacy callers that
+                provide ``mtp_layer_pattern`` are treated as Hybrid MTP automatically.
         """
         super().__init__(config=config)
         if mamba_submodules is not None:
@@ -2094,6 +2139,28 @@ class MultiTokenPredictionBlock(MegatronModule):
                 stacklevel=2,
             )
             hybrid_submodules = mamba_submodules
+        if mtp_layer_pattern is not None and mtp_layer_config_list is not None:
+            raise ValueError("Cannot specify both mtp_layer_pattern and mtp_layer_config_list.")
+        if mtp_layer_config_list is not None and not is_hybrid_mtp:
+            raise ValueError("mtp_layer_config_list requires is_hybrid_mtp=True.")
+
+        self.is_hybrid_mtp = is_hybrid_mtp or mtp_layer_pattern is not None
+        if self.is_hybrid_mtp:
+            if hybrid_submodules is None:
+                raise ValueError("Hybrid MTP requires hybrid_submodules.")
+            if mtp_layer_pattern is None and mtp_layer_config_list is None:
+                raise ValueError("Hybrid MTP requires mtp_layer_pattern or mtp_layer_config_list.")
+            if mtp_layer_config_list is not None:
+                if len(mtp_layer_config_list) == 0:
+                    raise ValueError("mtp_layer_config_list must not be empty.")
+                if not all(
+                    isinstance(layer_config, TransformerConfig)
+                    for layer_config in mtp_layer_config_list
+                ):
+                    raise TypeError(
+                        "Every mtp_layer_config_list entry must be a TransformerConfig."
+                    )
+
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self.vp_stage = vp_stage
@@ -2128,7 +2195,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     pg_collection, 'dp'
                 ), "MultiTokenPredictionBlock with HSM requires a dp process group"
 
-        self._build_layers(pg_collection)
+        self._build_layers(pg_collection, mtp_layer_config_list)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
@@ -2146,7 +2213,11 @@ class MultiTokenPredictionBlock(MegatronModule):
             for param in self.parameters():
                 param.grad_norm_group = 'mtp'
 
-    def _build_layers(self, pg_collection):
+    def _build_layers(
+        self,
+        pg_collection: ProcessGroupCollection,
+        mtp_layer_config_list: Sequence[TransformerConfig] | None,
+    ) -> None:
         # Determine number of depths to build
         if self.mtp_num_depths > 0:
             num_depths = self.mtp_num_depths
@@ -2168,10 +2239,8 @@ class MultiTokenPredictionBlock(MegatronModule):
                 )
             return module
 
-        def build_layer_with_pattern(
-            layer_spec, layer_number, mtp_layer_pattern, hybrid_submodules
-        ):
-            """Build layer using pattern-based approach (new Mamba path)."""
+        def build_hybrid_layer(layer_spec, layer_number):
+            """Build one Hybrid MTP layer from the selected architecture source."""
             fp8_init_context = get_fp8_context(self.config, is_init=True)
             with fp8_init_context:
                 module = build_module(
@@ -2180,35 +2249,29 @@ class MultiTokenPredictionBlock(MegatronModule):
                     layer_number=layer_number,
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
-                    mtp_layer_pattern=mtp_layer_pattern,
-                    hybrid_submodules=hybrid_submodules,
+                    mtp_layer_pattern=self.mtp_layer_pattern,
+                    hybrid_submodules=self.hybrid_submodules,
                     name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
+                    mtp_layer_config_list=mtp_layer_config_list,
+                    is_hybrid_mtp=self.is_hybrid_mtp,
                 )
             return module
 
-        # New Mamba path: use mtp_layer_pattern and hybrid_submodules
-        if self.mtp_layer_pattern is not None and self.hybrid_submodules is not None:
+        if self.is_hybrid_mtp:
             if self.mtp_use_repeated_layer:
                 # Shared/repeated layer: build one layer, use it for all depths
                 layer_spec = self.submodules.layer_specs[0]
-                shared_layer = build_layer_with_pattern(
-                    layer_spec,
-                    layer_number=1,
-                    mtp_layer_pattern=self.mtp_layer_pattern,
-                    hybrid_submodules=self.hybrid_submodules,
-                )
+                shared_layer = build_hybrid_layer(layer_spec, layer_number=1)
                 self.layers = torch.nn.ModuleList([shared_layer])
             else:
                 # Non-shared: each depth gets its own layers
                 self.layers = torch.nn.ModuleList(
                     [
-                        build_layer_with_pattern(
+                        build_hybrid_layer(
                             self.submodules.layer_specs[
                                 min(i, len(self.submodules.layer_specs) - 1)
                             ],
                             layer_number=i + 1,
-                            mtp_layer_pattern=self.mtp_layer_pattern,
-                            hybrid_submodules=self.hybrid_submodules,
                         )
                         for i in range(num_depths)
                     ]

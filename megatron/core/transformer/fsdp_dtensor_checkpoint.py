@@ -788,14 +788,15 @@ MTP_INNER_LAYER_CHECKPOINT_NAME = 'transformer_layer'
 def get_mtp_inner_layer_paths(model):
     """Paths of MTP layers whose inner layer is renamed on disk.
 
-    Mamba MTP layers (``mtp_layer_pattern`` set) are excluded, matching
-    ``MultiTokenPredictionLayer.sharded_state_dict``: for them ``mtp_model_layer`` is
-    already the native checkpoint name.
+    Hybrid MTP layers are excluded, matching
+    ``MultiTokenPredictionLayer.sharded_state_dict``: for them ``mtp_model_layer`` is already
+    the native checkpoint name. ``MultiTokenPredictionLayer`` exposes ``is_hybrid_mtp``
+    explicitly for both config-list and legacy-pattern construction.
     """
     return [
         _strip_wrapper_prefixes(name)
         for name, mod in model.named_modules()
-        if hasattr(mod, MTP_INNER_LAYER) and getattr(mod, 'mtp_layer_pattern', None) is None
+        if hasattr(mod, MTP_INNER_LAYER) and not getattr(mod, 'is_hybrid_mtp', False)
     ]
 
 
