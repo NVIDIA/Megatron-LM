@@ -5,16 +5,10 @@ from unittest.mock import MagicMock, patch
 
 import msgpack
 import pytest
-import torch
 import zmq
 
-from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
-from megatron.core.inference.inference_request import (
-    compute_block_hashes_batched,
-    compute_media_cache_key,
-)
 from megatron.core.inference.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.asyncio
@@ -80,7 +74,7 @@ async def test_inference_client_lifecycle():
 
     # add_request frames the submission as [metadata, prompt, block_hashes] so the
     # coordinator can route it without decoding the prompt.
-    fut = client.add_request("hello", SamplingParams(temperature=0.5))
+    fut = client.add_request("hello", SamplingParams(temperature=0.5), block_hashes=[7, 9])
     assert isinstance(fut, asyncio.Future)
     assert client.next_request_id == 1
     assert 0 in client.request_submission_times
@@ -90,9 +84,9 @@ async def test_inference_client_lifecycle():
     assert submit_payload[1] == 0
     assert submit_payload[2]["temperature"] == 0.5
     assert msgpack.unpackb(submit_prompt, raw=False) == "hello"
-    # This client has no block size configured, so it does not hash and sends an
-    # empty list; the coordinator will not look at it either.
-    assert msgpack.unpackb(submit_hashes, raw=False) == []
+    # Hashes ride in their own frame: the coordinator reads them without touching
+    # the prompt, which is the whole reason the frontend computes them.
+    assert msgpack.unpackb(submit_hashes, raw=False) == [7, 9]
 
     # Listener delivers the reply: future resolves with payload + injected latency.
     # Submission-time entry is popped on completion.
@@ -161,75 +155,3 @@ async def test_add_request_with_kv_handoff_returns_future():
     assert msgpack.unpackb(prompt_frame, raw=False) == [1, 2, 3]
     assert msgpack.unpackb(blocks_frame, raw=False) == [10, 11]
     future.cancel()
-
-
-async def test_client_hashes_prompt_and_salts_multimodal_with_the_media_key():
-    """The client hashes, and multimodal prompts are salted with the media key.
-
-    Hashing on the client is what keeps the prompt decode off the coordinator's
-    single serial loop. Multimodal goes through the same path rather than being
-    left behind: the media key it salts with is reused from the media it just
-    serialized, so deriving it -- which digests the media itself -- happens once.
-    """
-    fake_socket = MagicMock(name="zmq_socket")
-    fake_context = MagicMock(name="zmq_context")
-    fake_context.socket.return_value = fake_socket
-    with patch("megatron.core.inference.inference_client.zmq.Context", return_value=fake_context):
-        client = InferenceClient(
-            "tcp://127.0.0.1:5555",
-            block_size_tokens=4,
-            prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
-        )
-
-    tokens = list(range(8))
-    client.add_request(tokens, SamplingParams()).cancel()
-    _meta, _prompt, text_frame = fake_socket.send_multipart.call_args.args[0]
-    text_hashes = msgpack.unpackb(text_frame, raw=False)
-    assert text_hashes == compute_block_hashes_batched(
-        torch.tensor(tokens, dtype=torch.int64), block_size=4
-    )
-
-    client.add_request(tokens, SamplingParams(), multi_modal_data={"image": b"jpeg-bytes"}).cancel()
-    _meta, _prompt, media_frame = fake_socket.send_multipart.call_args.args[0]
-    media_hashes = msgpack.unpackb(media_frame, raw=False)
-    # Same tokens, different hashes: equal placeholders backed by different media
-    # must not be able to share KV.
-    assert media_hashes != text_hashes
-    salt = compute_media_cache_key("image", [b"jpeg-bytes"])
-    assert media_hashes == compute_block_hashes_batched(
-        torch.tensor(tokens, dtype=torch.int64), block_size=4, cache_salt=salt
-    )
-
-
-async def test_client_leaves_string_prompts_for_the_coordinator():
-    """No tokenizer here, so a string prompt is sent unhashed as None."""
-    fake_socket = MagicMock(name="zmq_socket")
-    fake_context = MagicMock(name="zmq_context")
-    fake_context.socket.return_value = fake_socket
-    with patch("megatron.core.inference.inference_client.zmq.Context", return_value=fake_context):
-        client = InferenceClient(
-            "tcp://127.0.0.1:5555",
-            block_size_tokens=4,
-            prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
-        )
-
-    client.add_request("some prompt text", SamplingParams()).cancel()
-    _meta, _prompt, hash_frame = fake_socket.send_multipart.call_args.args[0]
-    assert msgpack.unpackb(hash_frame, raw=False) is None
-
-
-async def test_client_skips_hashing_when_nobody_routes_on_prefix():
-    """Under LOAD_BALANCED the coordinator discards hashes, so do not compute."""
-    fake_socket = MagicMock(name="zmq_socket")
-    fake_context = MagicMock(name="zmq_context")
-    fake_context.socket.return_value = fake_socket
-    with patch("megatron.core.inference.inference_client.zmq.Context", return_value=fake_context):
-        client = InferenceClient(
-            "tcp://127.0.0.1:5555",
-            block_size_tokens=4,
-            prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy.LOAD_BALANCED,
-        )
-
-    client.add_request(list(range(8)), SamplingParams()).cancel()
-    _meta, _prompt, hash_frame = fake_socket.send_multipart.call_args.args[0]
-    assert msgpack.unpackb(hash_frame, raw=False) == []

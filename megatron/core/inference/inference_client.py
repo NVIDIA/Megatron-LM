@@ -9,10 +9,8 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core.inference.async_stream import AsyncStream
-from megatron.core.inference.config import routes_on_prefix
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
-    compute_block_hashes_batched,
     serialize_multimodal_data,
 )
 from megatron.core.inference.sampling_params import SamplingParams
@@ -60,13 +58,7 @@ class InferenceClient:
             completed requests.
     """
 
-    def __init__(
-        self,
-        inference_coordinator_address: str,
-        deserialize: bool = False,
-        block_size_tokens: Optional[int] = None,
-        prefix_caching_coordinator_policy=None,
-    ):
+    def __init__(self, inference_coordinator_address: str, deserialize: bool = False):
         """
         Initializes the InferenceClient.
 
@@ -76,12 +68,6 @@ class InferenceClient:
             deserialize (bool): If True, deserialize completed requests
                 into DynamicInferenceRequest objects. If False (default), return
                 the raw serialized dict for lower overhead.
-            block_size_tokens (Optional[int]): Token block size to hash prompts
-                on. Must match the engine's KV block size, or the hashes name
-                blocks the engine never cached. None disables client-side
-                hashing, leaving it to the coordinator.
-            prefix_caching_coordinator_policy: The coordinator's routing policy,
-                which decides whether anyone reads the hashes at all.
         """
         assert (
             HAVE_ZMQ
@@ -106,42 +92,6 @@ class InferenceClient:
         self.next_request_id = 0
         self.streams: dict[int, AsyncStream[dict]] = {}
         self.aborted_request_ids: set[int] = set()
-        self.block_size_tokens = block_size_tokens
-        self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
-
-    def _block_hashes(self, prompt, serialized_multi_modal_data):
-        """Hash the prompt into per-block routing hashes.
-
-        Hashing here rather than at the coordinator is the point: the tokens are
-        already in hand, clients are many against the coordinator's one serial
-        loop, and hashing there would mean decoding the prompt frame that the
-        metadata/body split exists to avoid.
-
-        Multimodal prompts are salted with the media key so that equal token
-        placeholders backed by different media cannot share KV. The key is reused
-        from the already-serialized media rather than recomputed: deriving it
-        digests the media itself, which runs to hundreds of MB for video.
-
-        Returns None when this client cannot hash -- a string prompt, which needs
-        a tokenizer it does not have. The coordinator hashes those itself, so
-        None means "unhashed", distinct from an empty list meaning "no complete
-        blocks".
-        """
-        if self.block_size_tokens is None or not routes_on_prefix(
-            self.prefix_caching_coordinator_policy
-        ):
-            return []
-        if isinstance(prompt, str):
-            return None
-        tokens = prompt.tolist() if isinstance(prompt, torch.Tensor) else list(prompt)
-        cache_salt = (
-            serialized_multi_modal_data.get("media_cache_key")
-            if isinstance(serialized_multi_modal_data, dict)
-            else None
-        )
-        return compute_block_hashes_batched(
-            torch.tensor(tokens, dtype=torch.int64), self.block_size_tokens, cache_salt=cache_salt
-        )
 
     def add_request(
         self,
@@ -149,6 +99,7 @@ class InferenceClient:
         sampling_params: SamplingParams,
         *,
         multi_modal_data=None,
+        block_hashes: Optional[List[int]] = None,
     ) -> asyncio.Future:
         """
         Submits a new inference request to the coordinator.
@@ -181,9 +132,6 @@ class InferenceClient:
         """
         request_id = self.next_request_id
         self.next_request_id += 1
-        # Serialized once and used twice: it goes on the wire, and its media key
-        # salts the hashes. Deriving that key digests the media itself, so doing
-        # it a second time would mean re-hashing up to hundreds of MB of video.
         serialized_multi_modal_data = serialize_multimodal_data(multi_modal_data)
         frames = [
             msgpack.packb(
@@ -205,9 +153,11 @@ class InferenceClient:
             # but that is a change to multimodal routing rather than to the wire
             # format, and is left alone here.
             self._pack_prompt(prompt),
-            msgpack.packb(
-                self._block_hashes(prompt, serialized_multi_modal_data), use_bin_type=True
-            ),
+            # Routing hashes, when the caller computed them. None means it did
+            # not, and the coordinator hashes the prompt itself -- deliberately
+            # distinct from an empty list, which means the caller hashed and the
+            # prompt was shorter than one block.
+            msgpack.packb(block_hashes, use_bin_type=True),
         ]
         return self._submit_request(frames, request_id)
 
@@ -343,6 +293,7 @@ class InferenceClient:
         sampling_params: SamplingParams,
         *,
         multi_modal_data=None,
+        block_hashes: Optional[List[int]] = None,
     ) -> AsyncStream[dict]:
         """Submit a streaming inference request.
 
@@ -380,9 +331,6 @@ class InferenceClient:
         sampling_params.streaming = True
         request_id = self.next_request_id
         self.next_request_id += 1
-        # Serialized once and used twice: it goes on the wire, and its media key
-        # salts the hashes. Deriving that key digests the media itself, so doing
-        # it a second time would mean re-hashing up to hundreds of MB of video.
         serialized_multi_modal_data = serialize_multimodal_data(multi_modal_data)
         frames = [
             msgpack.packb(
@@ -404,9 +352,11 @@ class InferenceClient:
             # but that is a change to multimodal routing rather than to the wire
             # format, and is left alone here.
             self._pack_prompt(prompt),
-            msgpack.packb(
-                self._block_hashes(prompt, serialized_multi_modal_data), use_bin_type=True
-            ),
+            # Routing hashes, when the caller computed them. None means it did
+            # not, and the coordinator hashes the prompt itself -- deliberately
+            # distinct from an empty list, which means the caller hashed and the
+            # prompt was shorter than one block.
+            msgpack.packb(block_hashes, use_bin_type=True),
         ]
         return self._submit_stream(frames, request_id)
 

@@ -20,8 +20,13 @@ _MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB
 _MAX_VIDEO_BYTES = 256 * 1024 * 1024  # 256 MiB
 _MEDIA_FETCH_USER_AGENT = "megatron-inference"
 
-from megatron.core.inference.config import MultimodalPromptConfig
-from megatron.core.inference.inference_request import unwrap_serialized_tensors
+import torch
+
+from megatron.core.inference.config import MultimodalPromptConfig, routes_on_prefix
+from megatron.core.inference.inference_request import (
+    compute_block_hashes_batched,
+    unwrap_serialized_tensors,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
@@ -982,6 +987,27 @@ try:
         # them as a serialized tensor dict on the wire, skip the encoder for
         # admissions 2..n). Kept as a known limitation for a follow-up so this
         # PR stays scoped.
+        # Hash here rather than at the coordinator: the tokens are already in hand,
+        # frontends run many-to-one against a single serial coordinator loop, and
+        # hashing there would mean decoding the prompt frame the metadata/body
+        # split was introduced to avoid. Skipped unless the coordinator routes on
+        # prefix affinity, since otherwise nobody reads them.
+        #
+        # Multimodal requests are left to the coordinator. Their hashes are salted
+        # with a media key derived inside serialize_multimodal_data, and deriving
+        # it digests the media itself -- hundreds of MB for video -- so doing it
+        # again here to salt them would cost more than the decode it saves.
+        block_size_tokens = current_app.config.get('block_size_tokens')
+        block_hashes = (
+            compute_block_hashes_batched(
+                torch.tensor(prompt_tokens, dtype=torch.int64), block_size_tokens
+            )
+            if block_size_tokens
+            and multi_modal_data is None
+            and routes_on_prefix(current_app.config.get('prefix_caching_coordinator_policy'))
+            else None
+        )
+
         stream_requested = bool(req.get("stream", False))
         if stream_requested:
             # Streaming currently supports only Hugging Face fast tokenizers.
@@ -995,7 +1021,10 @@ try:
 
             streams = [
                 client.add_request_streaming(
-                    prompt_tokens, sampling_params, multi_modal_data=multi_modal_data
+                    prompt_tokens,
+                    sampling_params,
+                    multi_modal_data=multi_modal_data,
+                    block_hashes=block_hashes,
                 )
                 for _ in range(n)
             ]
@@ -1050,7 +1079,12 @@ try:
             return response
 
         tasks = [
-            client.add_request(prompt_tokens, sampling_params, multi_modal_data=multi_modal_data)
+            client.add_request(
+                prompt_tokens,
+                sampling_params,
+                multi_modal_data=multi_modal_data,
+                block_hashes=block_hashes,
+            )
             for _ in range(n)
         ]
 

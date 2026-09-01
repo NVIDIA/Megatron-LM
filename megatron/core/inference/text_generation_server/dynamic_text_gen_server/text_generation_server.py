@@ -67,16 +67,7 @@ async def _run_text_gen_server(
         raise RuntimeError(f"Web backend framework (Quart) not available")
 
     # Create and start the client locally inside this process
-    # The client hashes prompts for prefix-affinity routing so the coordinator
-    # does not have to on its single serial loop. The policy decides whether
-    # anyone reads the hashes; the block size is only the granularity, and must
-    # match the engine's KV block size or the hashes name blocks it never cached.
-    inference_client = InferenceClient(
-        coordinator_addr,
-        deserialize=False,
-        block_size_tokens=block_size_tokens,
-        prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
-    )
+    inference_client = InferenceClient(coordinator_addr, deserialize=False)
     inference_client.start()
     logger.info(f"Rank {rank}: InferenceClient connected.")
 
@@ -106,6 +97,12 @@ async def _run_text_gen_server(
         app.config['default_top_p'] = default_top_p
         app.config['default_top_k'] = default_top_k
         app.config['eval_mode'] = eval_mode
+        # The frontend hashes the prompt it already holds so the coordinator does
+        # not have to on its single serial loop. The policy decides whether anyone
+        # reads the hashes; the block size is only the granularity, and must match
+        # the engine's KV block size or the hashes name blocks it never cached.
+        app.config['block_size_tokens'] = block_size_tokens
+        app.config['prefix_caching_coordinator_policy'] = prefix_caching_coordinator_policy
 
         # Register all blueprints from the 'endpoints' package
         for endpoint in endpoints.__all__:
