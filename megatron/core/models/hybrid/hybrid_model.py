@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-from typing import Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 import torch
 from torch import Tensor
@@ -443,7 +443,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
         compute_mtp_loss: bool = True,
-    ) -> Tensor:
+        output_processor: Optional[Callable[..., Any]] = None,
+        output_processor_context: Optional[Any] = None,
+    ) -> Any:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
         processing layer (optional).
@@ -456,6 +458,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 loaded. This does not control speculative decoding. On post-process stages,
                 ``labels`` still determine whether the model returns loss or logits.
                 Defaults to True.
+            output_processor (Callable, optional): Custom postprocess hook that receives
+                decoder hidden states and output-layer helpers, then returns the model output.
+            output_processor_context (Any, optional): User-defined context object forwarded to
+                `output_processor`.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -625,6 +631,26 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     ),
                 )
         sequence_parallel_override = False
+
+        if output_processor is not None:
+            return output_processor(
+                hidden_states=hidden_states,
+                output_layer=self.output_layer,
+                output_weight=output_weight,
+                labels=labels,
+                loss_mask=loss_mask,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                decoder_input=decoder_input,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+                runtime_gather_output=runtime_gather_output,
+                context=output_processor_context,
+                compute_language_model_loss=self.compute_language_model_loss,
+                scale_logits=self._scale_logits,
+                config=self.config,
+            )
         if (
             in_inference_mode
             and inference_context is not None
