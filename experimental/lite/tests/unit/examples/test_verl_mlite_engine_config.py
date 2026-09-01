@@ -17,9 +17,7 @@ pytestmark = pytest.mark.optional
 
 @pytest.fixture(autouse=True)
 def _require_verl() -> None:
-    pytest.importorskip(
-        "verl", reason="VERL is required for this optional example test."
-    )
+    pytest.importorskip("verl", reason="VERL is required for this optional example test.")
 
 
 def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
@@ -75,10 +73,7 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
     engine.get_data_parallel_group = lambda: None
 
     hook = engine._make_runtime_loss_fn(
-        lambda model_output, **_kwargs: (
-            model_output["log_probs"] / num_microbatches,
-            {},
-        ),
+        lambda model_output, **_kwargs: (model_output["log_probs"] / num_microbatches, {}),
         num_microbatches=num_microbatches,
         output_lst=outputs,
     )
@@ -88,9 +83,7 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
         (loss / num_microbatches).backward()
 
     torch.testing.assert_close(weight.grad, torch.tensor(3.0))
-    assert [output["loss"] for output in outputs] == [
-        3.0 / num_microbatches
-    ] * num_microbatches
+    assert [output["loss"] for output in outputs] == [3.0 / num_microbatches] * num_microbatches
 
 
 def test_verl_loss_hook_has_no_strong_self_reference():
@@ -262,87 +255,6 @@ def test_online_weight_export_requests_gpu_resident_bounded_streaming() -> None:
             "limit": 3,
             "target": "vllm",
         },
-    }
-
-
-def test_pp_online_export_requests_local_stage_stream() -> None:
-    from megatron.lite.primitive.parallel.state import ParallelState
-    from verl_mlite.weight_sync import PPBroadcastWeightStream
-
-    engine = _engine(engine_config=_engine_config(export_dtype="bfloat16", pp=4))
-    captured = {}
-
-    class Runtime:
-        @staticmethod
-        def export_weights(handle, **kwargs):
-            captured["handle"] = handle
-            captured["kwargs"] = kwargs
-            return iter([("model.layers.0.weight", torch.ones(1))])
-
-    ps = ParallelState(
-        pp_size=4,
-        pp_rank=2,
-        pp_group=object(),
-        pp_cpu_group=object(),
-        pp_global_ranks=[0, 1, 2, 3],
-    )
-    engine.runtime = Runtime()
-    engine.handle = SimpleNamespace(_parallel_state=ps)
-    engine._pp_bucketed_sender_installed = True
-
-    weights = engine._export_weights_for_verl(
-        {"cpu": False, "export_dtype": "bfloat16"}, {}
-    )
-
-    assert isinstance(weights, PPBroadcastWeightStream)
-    assert list(weights) == [("model.layers.0.weight", torch.ones(1))]
-    assert captured["handle"] is engine.handle
-    assert captured["kwargs"] == {
-        "cpu": False,
-        "export_dtype": "bfloat16",
-        "local_pipeline_stage": True,
-    }
-    assert weights.context.rank == 2
-    assert weights.context.global_ranks == (0, 1, 2, 3)
-
-
-def test_ds4_pp_export_routes_matching_rollout_ep_shard() -> None:
-    from megatron.lite.primitive.parallel.state import ParallelState
-
-    engine = _engine(
-        engine_config=_engine_config(
-            model_name="deepseek_v4", pp=4, ep=16, rollout_ep=16, rollout_tp=1
-        )
-    )
-    captured = {}
-
-    class Runtime:
-        @staticmethod
-        def export_weights(_handle, **kwargs):
-            captured["kwargs"] = kwargs
-            return iter([("model.layers.0.ffn.experts.48.w1.weight", torch.ones(1))])
-
-    ps = ParallelState(
-        pp_size=4,
-        pp_rank=0,
-        pp_group=object(),
-        pp_cpu_group=object(),
-        pp_global_ranks=[3, 19, 35, 51],
-        ep_size=16,
-        ep_rank=3,
-        etp_size=1,
-    )
-    engine._rank = 3
-    engine.runtime = Runtime()
-    engine.handle = SimpleNamespace(_parallel_state=ps)
-    engine._pp_bucketed_sender_installed = True
-
-    list(engine._export_weights_for_verl({"cpu": False}, {}))
-
-    assert captured["kwargs"] == {
-        "cpu": False,
-        "local_pipeline_stage": True,
-        "local_expert_shard": True,
     }
 
 

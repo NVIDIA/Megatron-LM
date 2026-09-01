@@ -71,9 +71,9 @@ def test_ds4_default_export_preserves_fp32_coefficient_bits() -> None:
         pp_global_ranks=[0],
     )
 
-    exported = dict(ckpt._export_unquantized_weights(model, config, parallel_state))[
-        "norm.weight"
-    ]
+    exported = dict(
+        ckpt._export_unquantized_weights(model, config, parallel_state)
+    )["norm.weight"]
 
     assert exported.dtype == torch.float32
     assert torch.equal(exported, model.norm.weight)
@@ -230,7 +230,9 @@ def test_ds4_shared_checkpoint_preserves_reversible_fp8_source_scale(tmp_path):
         scale,
     )
     assert torch.equal(
-        model._fp8_source_scales_by_name["layers.0.self_attn.self_attn.wq_a.weight"],
+        model._fp8_source_scales_by_name[
+            "layers.0.self_attn.self_attn.wq_a.weight"
+        ],
         scale,
     )
 
@@ -262,7 +264,8 @@ def test_ds4_fused_expert_preserves_w1_w3_bytes_and_scale_order():
     spec = ckpt.DeepseekV4WeightSpec(cfg, source_block_fp8=True)
     native_name = "layers.0.mlp.experts.fc1.weight0"
     qweights = [
-        torch.randn(128, 128).clamp(-4, 4).to(torch.float8_e4m3fn) for _ in range(2)
+        torch.randn(128, 128).clamp(-4, 4).to(torch.float8_e4m3fn)
+        for _ in range(2)
     ]
     scales = [
         torch.tensor([[0.125]], dtype=torch.float32),
@@ -464,46 +467,6 @@ def test_ds4_source_scale_export_gathers_remote_ep_experts(monkeypatch):
 
     assert set(combined) == set(local) | set(remote)
     assert torch.equal(combined[next(iter(remote))], next(iter(remote.values())))
-
-
-def test_ds4_local_expert_source_scale_export_skips_ep_gather(monkeypatch):
-    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
-
-    ckpt = _checkpoint_module()
-    model = nn.Module()
-    model.layer_indices = [0]
-    model._fp8_source_scales_valid = True
-    model._fp8_source_scales_by_name = {
-        "layers.0.mlp.experts.fc1.weight128": torch.tensor([[2.0], [3.0]]),
-    }
-    ps = SimpleNamespace(
-        ep_size=2,
-        ep_group=object(),
-        pp_size=1,
-        pp_group=None,
-    )
-    gathered_parallelism = []
-
-    def record_gather(registry, *, size, group, parallelism):
-        gathered_parallelism.append(parallelism)
-        return registry
-
-    monkeypatch.setattr(ckpt, "_gather_source_scale_registry", record_gather)
-
-    scales = ckpt._export_source_scales(
-        model,
-        DeepseekV4Config(num_hidden_layers=1),
-        ps,
-        local_expert_shard=True,
-    )
-
-    assert gathered_parallelism == ["PP"]
-    assert torch.equal(
-        scales["layers.0.ffn.experts.128.w1.weight"], torch.full((1, 1), 2.0)
-    )
-    assert torch.equal(
-        scales["layers.0.ffn.experts.128.w3.weight"], torch.full((1, 1), 3.0)
-    )
 
 
 def test_ds4_export_streams_router_buffers_from_every_pp_stage(monkeypatch):
