@@ -523,6 +523,15 @@ class InferenceConfig:
     Only applies when enable_prefix_caching is True and using a coordinator.
     """
 
+    prefix_cache_ttl_seconds: float = 300.0
+    """How long the coordinator assumes an engine still holds a block it routed there.
+
+    The coordinator sees blocks being routed but never blocks being evicted, so its view of
+    each engine's cache only gets staler. Entries untouched for this long are dropped. Too long
+    and it claims hits on blocks already evicted, routing for affinity and paying a cold prefill
+    anyway; too short and it forgets blocks the engine still holds.
+    """
+
     media_cache_coordinator_policy: MediaCacheCoordinatorPolicy = (
         MediaCacheCoordinatorPolicy.AFFINITY
     )

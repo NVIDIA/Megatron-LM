@@ -200,6 +200,10 @@ class InferenceSetupConfig:
     measured against the fleet mean. 0 is pure prefix affinity; higher values divert to idle ranks
     more readily as the fleet becomes lopsided. Dimensionless and not capped at 1."""
 
+    inference_dynamic_batching_prefix_cache_ttl_seconds: float = 300.0
+    """How long the coordinator assumes an engine still holds a block it routed there. It never
+    observes evictions, so entries untouched for this long are dropped rather than kept forever."""
+
     inference_dynamic_batching_media_cache_coordinator_policy: Literal[
         "affinity", "load_balanced"
     ] = "affinity"
@@ -388,6 +392,7 @@ class InferenceSetupConfig:
                 self.inference_dynamic_batching_prefix_caching_coordinator_policy
             ),
             prefix_caching_routing_alpha=self.inference_dynamic_batching_prefix_caching_routing_alpha,
+            prefix_cache_ttl_seconds=self.inference_dynamic_batching_prefix_cache_ttl_seconds,
             media_cache_coordinator_policy=MediaCacheCoordinatorPolicy(
                 self.inference_dynamic_batching_media_cache_coordinator_policy
             ),

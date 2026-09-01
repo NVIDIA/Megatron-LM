@@ -6,6 +6,7 @@ import json
 import logging
 import signal
 import socket
+import time
 from collections import OrderedDict, deque
 from multiprocessing import Event
 from multiprocessing.connection import Connection
@@ -106,6 +107,7 @@ class DataParallelInferenceCoordinator:
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         prefix_caching_routing_alpha: float = 0.5,
+        prefix_cache_ttl_seconds: float = 300.0,
         media_cache_coordinator_policy: MediaCacheCoordinatorPolicy = (
             MediaCacheCoordinatorPolicy.AFFINITY
         ),
@@ -127,6 +129,8 @@ class DataParallelInferenceCoordinator:
                 expected to connect.
             tokenizer: The tokenizer to use for prompt tokenization and detokenization.
             inference_coordinator_port (Optional[int]): The TCP port number to bind the server to.
+            prefix_cache_ttl_seconds (float): How long a routed block is assumed to
+                still be held by the engine it was routed to.
             prefix_caching_routing_alpha (float): How hard to penalise load when
                 routing on prefix affinity: score = cache_score - alpha *
                 relative_load, measured against the fleet mean. Dimensionless and
@@ -220,6 +224,7 @@ class DataParallelInferenceCoordinator:
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
         self.prefix_caching_routing_alpha = prefix_caching_routing_alpha
+        self.prefix_cache_ttl_seconds = prefix_cache_ttl_seconds
         self.media_cache_coordinator_policy = media_cache_coordinator_policy
         self.media_cache_routing_weight = media_cache_routing_weight
         self.vision_embedding_cache_enabled = vision_embedding_cache_enabled
@@ -243,11 +248,15 @@ class DataParallelInferenceCoordinator:
         self._identities_list = list(sorted_identities)  # rank_index → identity
         self._pending_counts = np.zeros(n_ranks, dtype=np.int32)
 
-        # Hash → {rank_idx: timestamp} dict for prefix cache affinity routing.
-        # Each key is a block hash; each value maps rank indices to assignment
-        # timestamps (positive int).  Missing entries are implicitly zero.
-        self._hash_table: dict[int, dict[int, int]] = {}
-        self._hash_assignment_counter = 0
+        # Hash → {rank_idx: touch_time} dict for prefix cache affinity routing.
+        # Each key is a block hash; each value maps rank indices to the monotonic
+        # time that rank was last routed the block. Missing entries are misses.
+        self._hash_table: dict[int, dict[int, float]] = {}
+        # (touch_time, hash) in insertion order, so expiry is a sweep from the
+        # front costing only what it evicts. Deliberately not keyed on rank index:
+        # removing an engine renumbers the ranks, which would leave queued entries
+        # pointing at the wrong one.
+        self._hash_expiry: deque = deque()
         self._media_cache_affinity: OrderedDict[str, bytes] = OrderedDict()
         self._media_cache_affinity_max_entries = _DEFAULT_MEDIA_CACHE_AFFINITY_MAX_ENTRIES
 
@@ -494,10 +503,44 @@ class DataParallelInferenceCoordinator:
             request_hashes: List of block hashes assigned to this rank.
         """
         rank_idx = self.identity_to_rank_index[rank_identity]
-        self._hash_assignment_counter += 1
-        ts = self._hash_assignment_counter
+        # One timestamp for the whole call keeps the expiry queue sorted.
+        now = time.monotonic()
         for h in request_hashes:
-            self._hash_table.setdefault(h, {})[rank_idx] = ts
+            self._hash_table.setdefault(h, {})[rank_idx] = now
+            self._hash_expiry.append((now, h))
+        # Swept here rather than on a timer: the coordinator is a single event
+        # loop with nothing else to run it, and expiry only needs to keep pace
+        # with the traffic that grows the table.
+        self._expire_rank_hashes(now)
+
+    def _expire_rank_hashes(self, now):
+        """Drop hash entries no request has touched for the TTL.
+
+        The coordinator's table is a guess about what each engine still holds: it
+        sees blocks being routed, never blocks being evicted. Left alone the guess
+        only gets staler, and the coordinator keeps sending requests to a rank for
+        a prefix it dropped long ago, paying a cold prefill and passing up a rank
+        that could have served it.
+
+        The queue is insertion-ordered, so expired entries form a prefix of it and
+        the sweep stops at the first live one -- the cost is what it evicts, not
+        the size of the table. An entry re-routed since it was queued carries a
+        newer timestamp than the queue entry and is left alone, which is what
+        makes a stale duplicate harmless.
+        """
+        ttl = self.prefix_cache_ttl_seconds
+        while self._hash_expiry:
+            ts, h = self._hash_expiry[0]
+            if now - ts <= ttl:
+                break
+            self._hash_expiry.popleft()
+            row = self._hash_table.get(h)
+            if row is None:
+                continue
+            for rank_idx in [r for r, touched in row.items() if touched <= ts]:
+                del row[rank_idx]
+            if not row:
+                del self._hash_table[h]
 
     def _prefix_depth_vector(self, hashes):
         """Return each rank's contiguous prefix depth, in blocks.
@@ -603,6 +646,7 @@ class DataParallelInferenceCoordinator:
             PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
         ),
         prefix_caching_routing_alpha: float = 0.5,
+        prefix_cache_ttl_seconds: float = 300.0,
         media_cache_coordinator_policy: MediaCacheCoordinatorPolicy = (
             MediaCacheCoordinatorPolicy.AFFINITY
         ),
@@ -648,6 +692,7 @@ class DataParallelInferenceCoordinator:
             enable_prefix_caching=enable_prefix_caching,
             prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
             prefix_caching_routing_alpha=prefix_caching_routing_alpha,
+            prefix_cache_ttl_seconds=prefix_cache_ttl_seconds,
             media_cache_coordinator_policy=media_cache_coordinator_policy,
             media_cache_routing_weight=media_cache_routing_weight,
             vision_embedding_cache_enabled=vision_embedding_cache_enabled,

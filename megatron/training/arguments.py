@@ -2244,6 +2244,13 @@ def _add_inference_args(parser):
                        '0 is pure prefix affinity; higher values divert to idle ranks '
                        'more readily as the fleet becomes lopsided. Dimensionless and '
                        'not capped at 1. Default: 0.5.')
+    group.add_argument('--inference-dynamic-batching-prefix-cache-ttl-seconds',
+                       type=float, default=300.0,
+                       dest='inference_dynamic_batching_prefix_cache_ttl_seconds',
+                       help='How long the coordinator assumes an engine still holds a '
+                       'block it routed there. The coordinator never observes evictions, '
+                       'so entries untouched for this long are dropped rather than kept '
+                       'forever. Default: 300.0.')
     group.add_argument('--inference-dynamic-batching-media-cache-coordinator-policy',
                        type=str, default='affinity',
                        choices=['affinity', 'load_balanced'],

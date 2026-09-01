@@ -9,6 +9,7 @@ prefix match, and maintains per-rank shadow state (cached hashes and timestamps)
 
 import asyncio
 import itertools
+import time
 from collections import deque
 from typing import Dict, Optional
 from unittest.mock import MagicMock
@@ -208,6 +209,7 @@ def make_coordinator_direct(
     enable_prefix_caching=True,
     deterministic_mode=True,
     prefix_caching_routing_alpha=0.5,
+    prefix_cache_ttl_seconds=300.0,
     media_policy=MediaCacheCoordinatorPolicy.AFFINITY,
     vision_embedding_cache_enabled=True,
     max_requests=10,
@@ -227,6 +229,7 @@ def make_coordinator_direct(
         enable_prefix_caching=enable_prefix_caching,
         deterministic_mode=deterministic_mode,
         prefix_caching_routing_alpha=prefix_caching_routing_alpha,
+        prefix_cache_ttl_seconds=prefix_cache_ttl_seconds,
         media_policy=media_policy,
         vision_embedding_cache_enabled=vision_embedding_cache_enabled,
         max_requests=max_requests,
@@ -614,16 +617,25 @@ class TestCoordinatorShadowState:
         coordinator._update_rank_hashes(rank_0, [100, 200, 300])
         assert all(coordinator._hash_table.get(h, {}).get(idx_0, 0) > 0 for h in [100, 200, 300])
 
-    def test_update_rank_hashes_increments_counter(self):
-        """Each call to _update_rank_hashes increments the assignment counter."""
+    def test_update_rank_hashes_stamps_the_current_time(self, monkeypatch):
+        """Entries carry the time they were routed, which is what expiry reads.
+
+        A monotonic clock replaced the assignment counter: ordering alone cannot
+        say whether an entry is older than the TTL.
+        """
         coordinator = make_coordinator_direct()
         rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_idx = coordinator.identity_to_rank_index[rank_0]
 
-        assert coordinator._hash_assignment_counter == 0
+        monkeypatch.setattr(time, "monotonic", lambda: 500.0)
         coordinator._update_rank_hashes(rank_0, [100])
-        assert coordinator._hash_assignment_counter == 1
+        assert coordinator._hash_table[100][rank_idx] == 500.0
+
+        monkeypatch.setattr(time, "monotonic", lambda: 700.0)
         coordinator._update_rank_hashes(rank_0, [200])
-        assert coordinator._hash_assignment_counter == 2
+        assert coordinator._hash_table[200][rank_idx] == 700.0
+        # One queue entry per (touch, hash), so expiry can sweep in order.
+        assert list(coordinator._hash_expiry) == [(500.0, 100), (700.0, 200)]
 
     def test_timestamps_updated_on_reassignment(self):
         """Re-assigning a hash to the same rank updates its timestamp."""
@@ -1042,3 +1054,98 @@ class TestScoringFunctionRouting:
         coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 5
         coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 1
         assert coordinator.get_best_data_parallel_rank(hashes) == rank_1
+
+
+class TestPrefixCacheTTL:
+    """Entries the coordinator has not routed for the TTL stop counting as hits.
+
+    The coordinator only ever observes blocks being routed, never blocks being
+    evicted, so without expiry its view of each engine's cache is monotonically
+    optimistic and it keeps routing for prefixes that are long gone.
+    """
+
+    def _coord(self, ttl=300.0):
+        coordinator = make_coordinator_direct(
+            prefix_caching_routing_alpha=0.0, prefix_cache_ttl_seconds=ttl
+        )
+        coordinator.request_id_to_hashes = {}
+        return coordinator
+
+    def test_untouched_entries_are_dropped_after_the_ttl(self, monkeypatch):
+        coordinator = self._coord(ttl=300.0)
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
+
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
+        coordinator._update_rank_hashes(rank_0, hashes)
+        assert hashes[0] in coordinator._hash_table
+
+        # Still inside the TTL: another request touching different blocks must not
+        # evict this one.
+        monkeypatch.setattr(time, "monotonic", lambda: 1200.0)
+        coordinator._update_rank_hashes(rank_0, coordinator.compute_request_hashes([9, 9, 9, 9]))
+        assert hashes[0] in coordinator._hash_table
+
+        # Past it now.
+        monkeypatch.setattr(time, "monotonic", lambda: 1400.0)
+        coordinator._update_rank_hashes(rank_0, coordinator.compute_request_hashes([8, 8, 8, 8]))
+        assert hashes[0] not in coordinator._hash_table
+
+    def test_rerouting_a_block_refreshes_it(self, monkeypatch):
+        """A block still in use must survive its original queue entry."""
+        coordinator = self._coord(ttl=300.0)
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
+
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
+        coordinator._update_rank_hashes(rank_0, hashes)
+        monkeypatch.setattr(time, "monotonic", lambda: 1250.0)
+        coordinator._update_rank_hashes(rank_0, hashes)
+
+        # The 1000.0 queue entry expires here, but the block was re-routed at
+        # 1250.0 and carries the newer timestamp, so it is left alone.
+        monkeypatch.setattr(time, "monotonic", lambda: 1400.0)
+        coordinator._update_rank_hashes(rank_0, coordinator.compute_request_hashes([7, 7, 7, 7]))
+        assert hashes[0] in coordinator._hash_table
+
+    def test_expired_entries_stop_winning_routing(self, monkeypatch):
+        """The point of expiring: a cold rank must stop attracting requests."""
+        coordinator = self._coord(ttl=300.0)
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+        hashes = coordinator.compute_request_hashes([1, 2, 3, 4])
+
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
+        coordinator._update_rank_hashes(rank_0, hashes)
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_0]] = 2
+        coordinator._pending_counts[coordinator.identity_to_rank_index[rank_1]] = 0
+        assert coordinator.get_best_data_parallel_rank(hashes) == rank_0
+
+        monkeypatch.setattr(time, "monotonic", lambda: 1400.0)
+        coordinator._update_rank_hashes(rank_1, coordinator.compute_request_hashes([5, 5, 5, 5]))
+        # rank_0's claim has aged out, so this falls back to load balancing.
+        assert coordinator.get_best_data_parallel_rank(hashes) == rank_1
+
+    def test_expiry_survives_an_engine_being_removed(self, monkeypatch):
+        """Removing an engine renumbers ranks; queued expiry must not follow stale indices.
+
+        The queue is keyed on the hash rather than the rank index for exactly this
+        reason: after a renumber, an index queued earlier names a different rank.
+        """
+        coordinator = self._coord(ttl=300.0)
+        rank_0 = coordinator.identities_of_data_parallel_ranks[0]
+        rank_1 = coordinator.identities_of_data_parallel_ranks[1]
+        kept = coordinator.compute_request_hashes([1, 2, 3, 4])
+
+        monkeypatch.setattr(time, "monotonic", lambda: 1000.0)
+        coordinator._update_rank_hashes(rank_0, kept)
+        monkeypatch.setattr(time, "monotonic", lambda: 1100.0)
+        coordinator._update_rank_hashes(rank_1, kept)
+
+        coordinator._remove_engine(rank_0)
+
+        # rank_1's entry, now at a shifted index, must still be here and must not
+        # be evicted by the queue entry that was made for rank_0.
+        monkeypatch.setattr(time, "monotonic", lambda: 1350.0)
+        coordinator._update_rank_hashes(rank_1, coordinator.compute_request_hashes([6, 6, 6, 6]))
+        assert kept[0] in coordinator._hash_table

@@ -977,6 +977,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "enable_prefix_caching": self.context.enable_prefix_caching,
                     "prefix_caching_coordinator_policy": self.context.prefix_caching_coordinator_policy,
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
+                    "prefix_cache_ttl_seconds": self.context.prefix_cache_ttl_seconds,
                     "media_cache_coordinator_policy": getattr(
                         self.context,
                         "media_cache_coordinator_policy",
