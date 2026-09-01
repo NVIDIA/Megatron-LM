@@ -10,6 +10,7 @@ from megatron.core.distributed.distributed_data_parallel_config import Distribut
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
+    get_transformer_layer_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
@@ -437,7 +438,16 @@ def mtp_block_spec(
     if config.transformer.mtp_num_layers is not None:
         from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 
-        if (
+        if transformer_cfg.experimental_attention_variant is not None:
+            # An MTP-only pipeline stage has no local decoder spec to copy. Preserve the
+            # configured experimental attention variant instead of selecting standard attention.
+            experimental_layer_specs = (
+                get_transformer_layer_with_experimental_attention_variant_spec(
+                    config=transformer_cfg
+                )
+            )
+            spec = experimental_layer_specs[-1]
+        elif (
             hasattr(transformer_layer_spec, "layer_specs")
             and len(transformer_layer_spec.layer_specs) == 0
         ):

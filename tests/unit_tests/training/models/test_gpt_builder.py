@@ -836,6 +836,7 @@ class TestMtpBlockSpec:
         config.transformer.transformer_impl = transformer_impl
         config.transformer.normalization = "LayerNorm"
         config.transformer.qk_l2_norm = False
+        config.transformer.experimental_attention_variant = None
         return config
 
     def test_returns_none_when_mtp_num_layers_is_none(self):
@@ -878,6 +879,28 @@ class TestMtpBlockSpec:
         mock_te_or_local.assert_called_once_with(config, 4)
         passed_spec = mock_get_mtp.call_args.args[1]
         assert passed_spec is fallback_spec
+
+    @patch("megatron.training.models.gpt._te_or_local_layer_spec")
+    @patch(
+        "megatron.training.models.gpt.get_transformer_layer_with_experimental_attention_variant_spec"
+    )
+    @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
+    def test_experimental_attention_precedes_empty_stage_fallback(
+        self, mock_get_mtp, mock_experimental_specs, mock_te_or_local
+    ):
+        config = self._make_config(mtp_num_layers=7)
+        config.transformer.experimental_attention_variant = "dsa"
+        empty_block = Mock()
+        empty_block.layer_specs = []
+        expected_spec = Mock(spec=ModuleSpec)
+        mock_experimental_specs.return_value = [Mock(spec=ModuleSpec), expected_spec]
+        mock_get_mtp.return_value = Mock(spec=ModuleSpec)
+
+        mtp_block_spec(config, empty_block, vp_stage=3)
+
+        mock_experimental_specs.assert_called_once_with(config=config.transformer)
+        mock_te_or_local.assert_not_called()
+        assert mock_get_mtp.call_args.args[1] is expected_spec
 
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
     def test_passes_vp_stage_and_use_te_to_get_gpt_mtp_block_spec(self, mock_get_mtp):
