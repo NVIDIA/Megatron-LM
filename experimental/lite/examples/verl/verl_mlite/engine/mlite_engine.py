@@ -478,6 +478,9 @@ class MegatronLiteEngine(BaseEngine):
         if not can_export_local_pp:
             return self.runtime.export_weights(self.handle, **export_kwargs)
 
+        export_kwargs = dict(export_kwargs)
+        if self._can_route_local_expert_shard(ps):
+            export_kwargs["local_expert_shard"] = True
         local_weights = self.runtime.export_weights(
             self.handle, local_pipeline_stage=True, **export_kwargs
         )
@@ -489,6 +492,33 @@ class MegatronLiteEngine(BaseEngine):
             cpu_group=getattr(ps, "pp_cpu_group", None),
         )
         return PPBroadcastWeightStream(local_weights, context, self._pp_weight_plan)
+
+    def _can_route_local_expert_shard(self, ps) -> bool:
+        """Whether the paired vLLM rank owns the actor rank's EP shard.
+
+        The colocated VERL mesh is row-major.  With rollout TP=1 its expert
+        coordinate is ``global_rank % rollout_ep``.  mLite's expert layout has
+        the same coordinate, and every rank in one PP group keeps that EP rank.
+        Requiring all of these invariants makes the fast path topology-driven;
+        mismatched or unsupported layouts retain the full-EP export path.
+        """
+        ep_size = int(getattr(ps, "ep_size", 1) or 1)
+        rollout_ep = int(getattr(self.engine_config, "rollout_ep", 1) or 1)
+        rollout_tp = int(getattr(self.engine_config, "rollout_tp", 1) or 1)
+        if (
+            self._resolve_model_name() != "deepseek_v4"
+            or ep_size <= 1
+            or rollout_ep != ep_size
+            or rollout_tp != 1
+            or int(getattr(ps, "etp_size", 1) or 1) != 1
+        ):
+            return False
+        global_rank = dist.get_rank() if dist.is_initialized() else self._rank
+        ep_rank = int(getattr(ps, "ep_rank", 0))
+        pp_ranks = tuple(getattr(ps, "pp_global_ranks", ()) or ())
+        return global_rank % rollout_ep == ep_rank and all(
+            rank % rollout_ep == ep_rank for rank in pp_ranks
+        )
 
     def get_data_parallel_size(self):
         if self.handle is None:

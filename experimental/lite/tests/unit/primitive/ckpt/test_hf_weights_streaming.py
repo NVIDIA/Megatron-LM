@@ -562,6 +562,64 @@ def test_expert_export_yields_when_bounded_ep_bucket_fills(monkeypatch) -> None:
     )
 
 
+def test_local_expert_shard_exports_global_ids_without_ep_gather(monkeypatch) -> None:
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.experts = nn.Module()
+            self.experts.register_parameter(
+                "weight0", nn.Parameter(torch.tensor([10.0]))
+            )
+            self.experts.register_parameter(
+                "weight1", nn.Parameter(torch.tensor([11.0]))
+            )
+
+    class Spec:
+        num_experts = 4
+
+        @staticmethod
+        def is_expert(name):
+            return name.startswith("experts.")
+
+        @staticmethod
+        def tp_spec(name):
+            return None
+
+        @staticmethod
+        def native_to_hf(name, tensor):
+            return [(name, tensor)]
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 2,
+            "ep_rank": 1,
+            "ep_group": "ep",
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+
+    def unexpected_gather(*_args, **_kwargs):
+        raise AssertionError("EP gather must be skipped for a local expert shard")
+
+    monkeypatch.setattr(
+        torch.distributed, "all_gather_into_tensor", unexpected_gather
+    )
+
+    exported = dict(
+        export_hf_weights(Model(), Spec(), ps, local_expert_shard=True)
+    )
+
+    assert list(exported) == ["experts.weight2", "experts.weight3"]
+    assert torch.equal(exported["experts.weight2"], torch.tensor([10.0]))
+    assert torch.equal(exported["experts.weight3"], torch.tensor([11.0]))
+
+
 def test_packed_expert_export_rejects_incomplete_group() -> None:
     class Model(nn.Module):
         def __init__(self) -> None:

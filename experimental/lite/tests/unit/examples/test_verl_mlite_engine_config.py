@@ -306,6 +306,46 @@ def test_pp_online_export_requests_local_stage_stream() -> None:
     assert weights.context.global_ranks == (0, 1, 2, 3)
 
 
+def test_ds4_pp_export_routes_matching_rollout_ep_shard() -> None:
+    from megatron.lite.primitive.parallel.state import ParallelState
+
+    engine = _engine(
+        engine_config=_engine_config(
+            model_name="deepseek_v4", pp=4, ep=16, rollout_ep=16, rollout_tp=1
+        )
+    )
+    captured = {}
+
+    class Runtime:
+        @staticmethod
+        def export_weights(_handle, **kwargs):
+            captured["kwargs"] = kwargs
+            return iter([("model.layers.0.ffn.experts.48.w1.weight", torch.ones(1))])
+
+    ps = ParallelState(
+        pp_size=4,
+        pp_rank=0,
+        pp_group=object(),
+        pp_cpu_group=object(),
+        pp_global_ranks=[3, 19, 35, 51],
+        ep_size=16,
+        ep_rank=3,
+        etp_size=1,
+    )
+    engine._rank = 3
+    engine.runtime = Runtime()
+    engine.handle = SimpleNamespace(_parallel_state=ps)
+    engine._pp_bucketed_sender_installed = True
+
+    list(engine._export_weights_for_verl({"cpu": False}, {}))
+
+    assert captured["kwargs"] == {
+        "cpu": False,
+        "local_pipeline_stage": True,
+        "local_expert_shard": True,
+    }
+
+
 def test_online_weight_export_preserves_model_dtypes_by_default() -> None:
     engine = _engine(engine_config=_engine_config())
     captured = {}

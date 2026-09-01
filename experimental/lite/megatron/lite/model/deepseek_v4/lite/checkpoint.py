@@ -574,7 +574,11 @@ def invalidate_bound_source_scales(model: nn.Module) -> None:
 
 
 def _export_source_scales(
-    model, config: DeepseekV4Config, ps: ParallelState
+    model,
+    config: DeepseekV4Config,
+    ps: ParallelState,
+    *,
+    local_expert_shard: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Collect initial checkpoint scales under their exported HF names."""
 
@@ -599,12 +603,13 @@ def _export_source_scales(
                     raise RuntimeError(f"conflicting source scales for {name}")
                 local[name] = value
 
-    local = _gather_source_scale_registry(
-        local,
-        size=ps.ep_size,
-        group=ps.ep_group,
-        parallelism="EP",
-    )
+    if not local_expert_shard:
+        local = _gather_source_scale_registry(
+            local,
+            size=ps.ep_size,
+            group=ps.ep_group,
+            parallelism="EP",
+        )
     return _gather_source_scale_registry(
         local,
         size=ps.pp_size,
@@ -654,10 +659,13 @@ def export_hf_weights(model, config: DeepseekV4Config, ps: ParallelState, **kwar
     """
     target = kwargs.pop("target", "hf")
     resync_config = kwargs.pop("resync_config", None)
+    local_expert_shard = bool(kwargs.get("local_expert_shard", False))
     if target not in {"hf", ResyncFormat.BF16.value, *_QUANTIZED_RESYNC_TARGETS}:
         raise ValueError(f"Unsupported DeepSeek-V4 export target: {target!r}")
     source_scales = (
-        _export_source_scales(model, config, ps)
+        _export_source_scales(
+            model, config, ps, local_expert_shard=local_expert_shard
+        )
         if target in _QUANTIZED_RESYNC_TARGETS
         else {}
     )

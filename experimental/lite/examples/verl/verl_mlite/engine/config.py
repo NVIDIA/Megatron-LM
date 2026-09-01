@@ -26,6 +26,10 @@ class MegatronLiteEngineConfig(EngineConfig):
     pp: int = 1
     vpp: int = 1
     cp: int = 1
+    # Colocated rollout topology.  When it matches the actor's EP layout,
+    # verl_mlite can route only the expert shard owned by the paired vLLM rank.
+    rollout_ep: int = 1
+    rollout_tp: int = 1
 
     attention_backend_override: str | None = "flash"
     router_aux_loss_coef: float | None = None
@@ -47,6 +51,8 @@ class MegatronLiteEngineConfig(EngineConfig):
             raise ValueError(
                 f"MegatronLiteEngineConfig expects strategy='mlite', got {self.strategy!r}"
             )
+        if self.rollout_ep < 1 or self.rollout_tp < 1:
+            raise ValueError("rollout_ep and rollout_tp must be positive")
         if self.custom_backend_module:
             importlib.import_module(self.custom_backend_module)
         if self.resync_format is not None:

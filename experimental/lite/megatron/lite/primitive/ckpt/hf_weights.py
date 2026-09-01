@@ -1463,6 +1463,7 @@ def export_hf_weights(
     export_dtype: str | torch.dtype | None = None,
     cpu: bool = False,
     buffer_max_size_bytes: int = DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+    local_expert_shard: bool = False,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Export model weights as HF-format (name, tensor) pairs.
 
@@ -1535,7 +1536,7 @@ def export_hf_weights(
         packed_expert_buffers: dict[str, dict[int, torch.Tensor]] = {}
         expert_bucket_limit_bytes = (
             buffer_max_size_bytes
-            if ps.ep_size <= 1
+            if ps.ep_size <= 1 or local_expert_shard
             else max(buffer_max_size_bytes // ps.ep_size, 1)
         )
         dense_bucket: list[tuple[str, torch.Tensor]] = []
@@ -1578,6 +1579,36 @@ def export_hf_weights(
         def _flush_expert_bucket():
             nonlocal expert_bucket, expert_bucket_bytes
             if not expert_bucket:
+                return
+            if local_expert_shard:
+                experts_per_rank = spec.num_experts // ps.ep_size
+                if experts_per_rank * ps.ep_size != spec.num_experts:
+                    raise ValueError(
+                        f"{type(spec).__name__} has {spec.num_experts} experts, "
+                        f"which is not divisible by EP={ps.ep_size}"
+                    )
+                local_bucket = expert_bucket
+                expert_bucket = []
+                expert_bucket_bytes = 0
+                for native_name, tensor in local_bucket:
+                    packed_group_name = getattr(
+                        spec, "packed_expert_group_name", None
+                    )
+                    if callable(packed_group_name) and packed_group_name(native_name):
+                        raise ValueError(
+                            "local_expert_shard does not support packed expert groups"
+                        )
+                    local_idx = parse_expert_idx(native_name)
+                    if local_idx >= experts_per_rank:
+                        raise ValueError(
+                            f"Local expert index {local_idx} is outside the EP shard "
+                            f"size {experts_per_rank} for {native_name!r}"
+                        )
+                    global_idx = ps.ep_rank * experts_per_rank + local_idx
+                    global_name = set_expert_idx(native_name, global_idx)
+                    yield from _iter_mapped(
+                        {global_name: _maybe_cpu(tensor, cpu=cpu)}
+                    )
                 return
             gathered_bucket = bucketed_all_gather_into_tensor(
                 expert_bucket,
