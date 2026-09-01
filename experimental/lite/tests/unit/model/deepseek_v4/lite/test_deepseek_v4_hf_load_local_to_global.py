@@ -256,6 +256,54 @@ def test_ds4_optimizer_invalidation_removes_parameter_source_scale_state():
     assert model._fp8_source_scales_valid is False
 
 
+def test_ds4_resume_invalidation_requantizes_first_export_from_current_weight():
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+    from megatron.lite.primitive.parallel.state import ParallelState
+    from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
+
+    ckpt = _checkpoint_module()
+    model = _QATStage([0], 128)
+    parameter = model.layers["0"].self_attn.self_attn.wq_a.weight
+    native_name = "layers.0.self_attn.self_attn.wq_a.weight"
+    hf_name = "layers.0.attn.wq_a.weight"
+    stale_scale = torch.tensor([[0.25]], dtype=torch.float32)
+    model._fp8_source_scales_valid = True
+    model._fp8_source_scales_by_name = {native_name: stale_scale}
+    parameter._fp8_source_scales = stale_scale
+    parameter._fp8_source_scale_version = parameter._version
+
+    with torch.no_grad():
+        parameter.fill_(1.0)
+
+    config = DeepseekV4Config(
+        num_hidden_layers=1,
+        n_routed_experts=8,
+        expert_dtype="fp8",
+        quantization_config={"weight_block_size": [128, 128]},
+    )
+    export_kwargs = {
+        "target": "block_fp8",
+        "resync_config": {"expert_dtype": "fp8"},
+    }
+    stale_export = dict(
+        ckpt.export_hf_weights(model, config, ParallelState(), **export_kwargs)
+    )
+    assert torch.equal(stale_export["layers.0.attn.wq_a.scale"], stale_scale)
+
+    ckpt.invalidate_bound_source_scales(model)
+    current_export = dict(
+        ckpt.export_hf_weights(model, config, ParallelState(), **export_kwargs)
+    )
+    expected_weight, expected_scale = quantize_block_fp8(
+        parameter, (128, 128), scale_format="float32"
+    )
+
+    assert torch.equal(current_export[hf_name], expected_weight)
+    assert torch.equal(current_export["layers.0.attn.wq_a.scale"], expected_scale)
+    assert not torch.equal(stale_export[hf_name], current_export[hf_name])
+    assert not torch.equal(expected_scale, stale_scale)
+
+
 def test_ds4_fused_expert_preserves_w1_w3_bytes_and_scale_order():
     from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
 

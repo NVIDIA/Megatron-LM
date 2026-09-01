@@ -692,6 +692,9 @@ class MegatronLiteEngine(BaseEngine):
                 load_model=True,
                 load_optimizer=True,
             )
+            post_update_hook = self.handle._extras.get("post_optimizer_step_hook")
+            if callable(post_update_hook):
+                post_update_hook()
             scheduler_path = os.path.join(local_path, _LR_SCHEDULER_STATE)
             if self.handle._lr_scheduler is not None and os.path.exists(scheduler_path):
                 state = torch.load(

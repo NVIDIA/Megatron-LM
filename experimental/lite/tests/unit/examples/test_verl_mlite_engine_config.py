@@ -357,6 +357,65 @@ def test_qat_export_rejects_native_resync_format_double_quantization() -> None:
         _engine_config(qat={"enable": True, "mode": "mxfp4"}, resync_format="mxfp4")
 
 
+@pytest.mark.parametrize("loaded_step", [0, 5])
+def test_checkpoint_resume_invalidates_post_update_state(
+    monkeypatch, tmp_path, loaded_step
+) -> None:
+    engine = _engine(engine_config=_engine_config())
+    calls = []
+    engine.runtime = object()
+    engine.module = torch.nn.Linear(1, 1)
+    engine.handle = SimpleNamespace(
+        _optimizer=object(),
+        _config=SimpleNamespace(parallel=object()),
+        _parallel_state=object(),
+        _lr_scheduler=None,
+        _extras={
+            "protocol": None,
+            "post_optimizer_step_hook": lambda: calls.append("post_update"),
+        },
+    )
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.load_training_checkpoint",
+        lambda *_args, **_kwargs: loaded_step,
+    )
+
+    engine.load_checkpoint(str(tmp_path))
+
+    assert calls == ["post_update"]
+
+
+def test_checkpoint_load_failure_does_not_run_post_load_hook(
+    monkeypatch, tmp_path
+) -> None:
+    engine = _engine(engine_config=_engine_config())
+    calls = []
+    engine.runtime = object()
+    engine.module = torch.nn.Linear(1, 1)
+    engine.handle = SimpleNamespace(
+        _optimizer=object(),
+        _config=SimpleNamespace(parallel=object()),
+        _parallel_state=object(),
+        _lr_scheduler=None,
+        _extras={
+            "protocol": None,
+            "post_optimizer_step_hook": lambda: calls.append("post_update"),
+        },
+    )
+
+    def fail_load(*_args, **_kwargs):
+        raise RuntimeError("checkpoint load failed")
+
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.load_training_checkpoint", fail_load
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint load failed"):
+        engine.load_checkpoint(str(tmp_path))
+
+    assert calls == []
+
+
 def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
     from verl_mlite.engine.mlite_engine import _build_lr_scheduler
 

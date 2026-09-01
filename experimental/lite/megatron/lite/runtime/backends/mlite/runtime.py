@@ -369,7 +369,8 @@ class MegatronLiteRuntime(RuntimeBase):
             )
         )
         get_placements, is_expert = _checkpoint_hooks(handle)
-        return load_training_checkpoint(
+        load_model = kwargs.pop("load_model", True)
+        step = load_training_checkpoint(
             _checkpoint_model(handle, use_dcp=use_dcp),
             handle._optimizer,
             path,
@@ -380,10 +381,15 @@ class MegatronLiteRuntime(RuntimeBase):
             use_dcp=use_dcp,
             load_rng=load_rng,
             load_parameter_state_update_legacy_format=update_legacy_format,
-            load_model=kwargs.pop("load_model", True),
+            load_model=load_model,
             load_optimizer=kwargs.pop("load_optimizer", True),
             **kwargs,
         )
+        if load_model:
+            post_update_hook = handle._extras.get("post_optimizer_step_hook")
+            if callable(post_update_hook):
+                post_update_hook()
+        return step
 
     def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
         model_chunks = handle._extras.get("model_chunks", [handle._model])

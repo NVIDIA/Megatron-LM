@@ -406,3 +406,30 @@ def test_runtime_checkpoint_api_passes_current_training_checkpoint_signature(
         },
     )
     assert loaded_step == 7
+
+
+@pytest.mark.parametrize("load_model, expected_calls", [(True, 1), (False, 0)])
+def test_runtime_checkpoint_invalidates_state_only_after_model_load(
+    monkeypatch, tmp_path, load_model, expected_calls
+) -> None:
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.load_training_checkpoint",
+        lambda *_args, **_kwargs: 0,
+    )
+    calls = []
+    model = torch.nn.Linear(1, 1)
+    handle = ModelHandle(
+        model=model,
+        optimizer=object(),
+        parallel_state=object(),
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(tp=1, etp=1, ep=1, pp=1, cp=1)
+        ),
+        _extras={"post_optimizer_step_hook": lambda: calls.append("post_update")},
+    )
+
+    MegatronLiteRuntime.__new__(MegatronLiteRuntime).load_checkpoint(
+        handle, str(tmp_path), load_model=load_model
+    )
+
+    assert calls == ["post_update"] * expected_calls

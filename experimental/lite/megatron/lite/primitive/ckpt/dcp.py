@@ -121,6 +121,8 @@ def load_training_checkpoint(
             path,
             load_rng=load_rng,
             load_parameter_state_update_legacy_format=load_parameter_state_update_legacy_format,
+            load_model=load_model,
+            load_optimizer=load_optimizer,
         )
     ckpt_path = _resolve_step_checkpoint_path(path)
     if _supports_dist_opt_distckpt(model, optimizer):
@@ -485,18 +487,21 @@ def _load_local_training_checkpoint(
     *,
     load_rng: bool = True,
     load_parameter_state_update_legacy_format: bool = False,
+    load_model: bool = True,
+    load_optimizer: bool = True,
 ) -> int:
     ckpt_file = _local_checkpoint_file(path)
     state = torch.load(ckpt_file, map_location="cpu", weights_only=False)
     if state.get("format") != "megatron_lite.local_training.v1":
         raise RuntimeError(f"Unsupported local checkpoint format in {ckpt_file}")
-    chunks = _model_chunks(model)
-    chunk_states = state.get("model")
-    if not isinstance(chunk_states, list) or len(chunk_states) != len(chunks):
-        raise RuntimeError("Checkpoint model chunk count does not match target model.")
-    for chunk, chunk_state in zip(chunks, chunk_states, strict=True):
-        _load_chunk_tensor_state(chunk, chunk_state)
-    if optimizer is not None and state.get("optimizer") is not None:
+    if load_model:
+        chunks = _model_chunks(model)
+        chunk_states = state.get("model")
+        if not isinstance(chunk_states, list) or len(chunk_states) != len(chunks):
+            raise RuntimeError("Checkpoint model chunk count does not match target model.")
+        for chunk, chunk_state in zip(chunks, chunk_states, strict=True):
+            _load_chunk_tensor_state(chunk, chunk_state)
+    if load_optimizer and optimizer is not None and state.get("optimizer") is not None:
         optimizer.load_state_dict(state["optimizer"])
         parameter_state_name = state.get("optimizer_parameter_state")
         load_parameter_state = getattr(optimizer, "load_parameter_state", None)
