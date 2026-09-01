@@ -65,6 +65,59 @@ from tests.unit_tests.test_utilities import Utils
 fp8_available, _ = check_fp8_support()
 
 
+def test_backward_runner_links_follow_recorded_order():
+    """Backward prefetch links use recorded schedule order and include empty runners."""
+
+    class Runner:
+        next_bwd_runner = None
+
+    first, empty, last = Runner(), Runner(), Runner()
+    old_record = _CudagraphGlobalRecord.cudagraph_record
+    old_runners = _CudagraphGlobalRecord.backward_runners
+    try:
+        _CudagraphGlobalRecord.cudagraph_record = [
+            (first, "fwd", (), {}, None),
+            (first, "bwd"),
+            (empty, "bwd"),
+            (last, "bwd"),
+        ]
+        _CudagraphGlobalRecord._link_backward_runners()
+
+        assert first.next_bwd_runner is empty
+        assert empty.next_bwd_runner is last
+        assert last.next_bwd_runner is None
+    finally:
+        _CudagraphGlobalRecord.cudagraph_record = old_record
+        _CudagraphGlobalRecord.backward_runners = old_runners
+
+
+def test_backward_runner_links_assign_ping_pong_banks():
+    """Resident local-graph slots follow the recorded backward consumption order."""
+
+    class Runner:
+        next_bwd_runner = None
+
+        def __init__(self, uses_local_offload):
+            self.uses_local_offload = uses_local_offload
+
+        def _uses_local_graph_activation_offload(self):
+            return self.uses_local_offload
+
+    runners = [Runner(True), Runner(False), Runner(True)]
+    old_record = _CudagraphGlobalRecord.cudagraph_record
+    old_runners = _CudagraphGlobalRecord.backward_runners
+    try:
+        _CudagraphGlobalRecord.cudagraph_record = [(runner, "bwd") for runner in runners]
+        _CudagraphGlobalRecord._link_backward_runners()
+        assert [runner.local_graph_slot_bank for runner in runners] == [0, None, 1]
+        assert runners[0].next_bwd_runner is runners[1]
+        assert runners[1].next_bwd_runner is runners[2]
+        assert runners[2].next_bwd_runner is None
+    finally:
+        _CudagraphGlobalRecord.cudagraph_record = old_record
+        _CudagraphGlobalRecord.backward_runners = old_runners
+
+
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
     return TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, **kwargs)
 

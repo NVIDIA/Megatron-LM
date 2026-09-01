@@ -489,6 +489,7 @@ class _CudagraphGlobalRecord:
     cudagraph_record: list[tuple] = []
     cudagraph_inference_record: list[tuple] = []
     _saved_tensors_observer = None
+    backward_runners: list = []
 
     @classmethod
     def _enable_saved_tensors_observer(cls):
@@ -530,6 +531,24 @@ class _CudagraphGlobalRecord:
         cls.cudagraph_record.append((runner, "bwd"))
 
     @classmethod
+    def _link_backward_runners(cls):
+        """Link runners in the backward order observed by autograd and the schedule."""
+        cls.backward_runners = [g[0] for g in cls.cudagraph_record if g[1] == "bwd"]
+        local_graph_offload_index = 0
+        for runner in cls.backward_runners:
+            runner.next_bwd_runner = None
+            uses_local_offload = getattr(
+                runner, "_uses_local_graph_activation_offload", lambda: False
+            )()
+            runner.local_graph_slot_bank = (
+                local_graph_offload_index % 2 if uses_local_offload else None
+            )
+            if uses_local_offload:
+                local_graph_offload_index += 1
+        for runner, next_runner in zip(cls.backward_runners, cls.backward_runners[1:]):
+            runner.next_bwd_runner = next_runner
+
+    @classmethod
     def create_cudagraphs(cls):
         """Create recorded CUDA graphs, then remove the saved-tensor observer."""
         try:
@@ -560,6 +579,17 @@ class _CudagraphGlobalRecord:
                 base_module = g[0].base_module
                 has_te_modules = has_te_modules or any(
                     [isinstance(m, TransformerEngineBaseModule) for m in base_module.modules()]
+                )
+
+        # Persist the actual autograd/schedule backward order before the global
+        # creation record is cleared. Local activation reload uses only the
+        # immediate successor, bounding look-ahead physical backing to one runner.
+        cls._link_backward_runners()
+
+        for runner in cls.backward_runners:
+            if runner.local_graph_offload_groups:
+                runner._local_graph_offload_manager().prepare_local_graph_ping_pong(
+                    runner, runner.local_graph_slot_bank
                 )
 
         progress_bar = enumerate(cls.cudagraph_record)
@@ -698,10 +728,15 @@ def delete_cuda_graphs():
         runner.bwd_graph = None
         runner.mempool = None
 
+    for runner in _CudagraphGlobalRecord.backward_runners:
+        runner.next_bwd_runner = None
+        runner.local_graph_reload_state = None
+
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
+    _CudagraphGlobalRecord.backward_runners = []
     _GTP_RUNNER_STREAMS.clear()
 
     # TODO: Optional?: Force garbage collection to clean up memory
@@ -804,6 +839,10 @@ class _CudagraphReplayNode(torch.autograd.Function):
                 _set_skip_fp8_weight_update_tensor(not is_first_microbatch)
                 runner.fp8_param_cache_updated = is_first_microbatch
 
+        if runner.local_graph_offload_groups:
+            offload_manager = runner._local_graph_offload_manager()
+            replay_stream = runner.stream if runner.use_stream else torch.cuda.current_stream()
+            offload_manager.local_graph_forward_wait_ready(runner, replay_stream)
         if runner.use_stream:
             runner.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(runner.stream):
@@ -812,7 +851,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
         else:
             runner.fwd_graph.replay()
         if runner.local_graph_offload_groups:
-            runner._local_graph_offload_manager().local_graph_forward_replay(runner)
+            offload_manager.local_graph_forward_replay(runner)
         return runner.fwd_graph_output_surface
 
     @staticmethod
@@ -837,18 +876,38 @@ class _CudagraphReplayNode(torch.autograd.Function):
             if user_output_grad.data_ptr() != cudagraph_output_grad.data_ptr():
                 cudagraph_output_grad.copy_(user_output_grad)
 
+        offload_manager = None
+        next_runner = runner.next_bwd_runner
+        next_prepared = False
         if runner.local_graph_offload_groups:
-            runner._local_graph_offload_manager().local_graph_backward_replay(runner)
+            offload_manager = runner._local_graph_offload_manager()
+            replay_stream = runner.stream if runner.use_stream else torch.cuda.current_stream()
+            offload_manager.local_graph_backward_wait_ready(runner, replay_stream)
+        if next_runner is not None and next_runner.local_graph_offload_groups:
+            if offload_manager is None:
+                offload_manager = next_runner._local_graph_offload_manager()
+            next_prepared = offload_manager.local_graph_backward_prepare(next_runner)
 
-        if runner.use_stream:
-            runner.stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(runner.stream):
+        try:
+            if runner.use_stream:
+                runner.stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(runner.stream):
+                    runner.bwd_graph.replay()
+                torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
+            else:
                 runner.bwd_graph.replay()
-            torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
-        else:
-            runner.bwd_graph.replay()
+        finally:
+            # The current graph has already been submitted. Waiting for the
+            # successor's remap worker and enqueueing H2D now overlaps both with
+            # current-runner GPU execution.
+            if next_prepared:
+                offload_manager.local_graph_backward_finish_prepare(next_runner)
 
         runner.bwd_graph_replay_complete_event.record(torch.cuda.current_stream())
+        if runner.local_graph_offload_groups:
+            offload_manager.local_graph_backward_mark_consumed(
+                runner, runner.bwd_graph_replay_complete_event
+            )
         for param in runner.params_to_backprop:
             param._cudagraph_wgrad_ready_event = runner.bwd_graph_replay_complete_event
         runner.status = _GraphStatus.FWD_READY
@@ -908,6 +967,10 @@ class _CudaGraphRunner(torch.nn.Module):
         self.bwd_graph = None
         self.bwd_graph_replay_complete_event = torch.cuda.Event()
         self.local_graph_offload_groups = []
+        self.next_bwd_runner = None
+        self.local_graph_slot_bank = None
+        self.local_graph_reload_state = None
+        self.local_graph_reload_event = None
 
         self.fwd_graph_recorded = False
         self.bwd_graph_recorded = False
@@ -1381,6 +1444,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 else:
                     if local_offload_manager is not None:
                         local_offload_manager.end_local_graph_capture()
+                        local_offload_manager.local_graph_capture_snapshot(self)
                 finally:
                     # A failed graph capture must not leave GC frozen.
                     if FREEZE_GC:
@@ -1481,6 +1545,11 @@ class _CudaGraphRunner(torch.nn.Module):
                 else:
                     out_grad = alloc_tensor_from_graph_mempool(o)
             self.static_grad_outputs.append(out_grad)
+
+        # Shared ping-pong slots may have been overwritten while later forward
+        # graphs were captured. Restore this runner before capturing its consumers.
+        if self.local_graph_offload_groups:
+            self._local_graph_offload_manager().local_graph_capture_restore(self)
 
         # Freeze GC, to speed up capture time ~15-20x.
         if FREEZE_GC:
