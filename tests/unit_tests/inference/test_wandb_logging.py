@@ -104,6 +104,7 @@ class TestInferenceWandbLogging:
         assert stats['paused_request_count'] == 0
         assert stats['active_token_count'] == 0
         assert stats['total_request_count'] == 0
+        assert stats['block_count_avail'] == dynamic_context.kv_block_allocator.pool_avail
 
         # Now add a request and verify stats update correctly
         context_length = 144
@@ -145,11 +146,12 @@ class TestInferenceWandbLogging:
 
         # Verify block availability decreased after allocation
         assert stats_after['block_count_avail'] < stats['block_count_avail']
+        assert stats_after['block_count_avail'] == dynamic_context.kv_block_allocator.pool_avail
 
-        # Verify relationship: allocated_blocks + block_count_avail + 1 (dummy) = total
+        # Physical occupancy plus raw free blocks and the dummy block equals total.
         assert (
             stats_after['allocated_blocks'] + stats_after['block_count_avail'] + 1
-            == dynamic_context.kv_block_allocator.total_count
+            == dynamic_context.kv_block_allocator.pool_size
         )
 
         # Verify utilization bounds [0, 1]
@@ -219,6 +221,8 @@ class TestInferenceWandbLogging:
         mock_controller.inference_wrapped_model.model = Mock()
         mock_controller.inference_wrapped_model.model.config = Mock()
         mock_controller.inference_wrapped_model.model.config.cuda_graph_impl = "none"
+        mock_controller.inference_wrapped_model.model.config.moe_enable_routing_replay = False
+        mock_controller.num_mtp_depths = 0
 
         engine = DynamicInferenceEngine(controller=mock_controller, context=dynamic_context)
 
@@ -272,6 +276,8 @@ class TestInferenceWandbLogging:
         mock_controller.inference_wrapped_model.model = Mock()
         mock_controller.inference_wrapped_model.model.config = Mock()
         mock_controller.inference_wrapped_model.model.config.cuda_graph_impl = "none"
+        mock_controller.inference_wrapped_model.model.config.moe_enable_routing_replay = False
+        mock_controller.num_mtp_depths = 0
 
         # Should not raise error even with logging interval set
         engine = DynamicInferenceEngine(controller=mock_controller, context=dynamic_context)

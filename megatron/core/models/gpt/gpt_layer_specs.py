@@ -613,7 +613,7 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
-            moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+            moe_use_legacy_grouped_gemm=getattr(config, "moe_use_legacy_grouped_gemm", False),
         )
     else:
         layer_norm_impl = LNImpl
@@ -782,7 +782,7 @@ def get_gpt_mtp_block_spec_for_backend(
         mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
 
     if not config.mtp_use_repeated_layer:
-        offset = get_mtp_layer_offset(config, vp_stage=vp_stage)
+        offset = get_mtp_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
         # Split the MTP layer specs to only include the layers that are built in this
         # pipeline stage.
         mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]

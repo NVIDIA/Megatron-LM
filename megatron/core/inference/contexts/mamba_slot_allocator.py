@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
+from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
 
 if TYPE_CHECKING:
     from .dynamic_context import DynamicInferenceContext
@@ -14,6 +15,18 @@ if TYPE_CHECKING:
 # are: KV divergence boundary, last block-aligned boundary, and penultimate
 # block boundary (see compute_and_store_offsets for details).
 MAX_INTERMEDIATE_OFFSETS_PER_REQUEST = 3
+
+
+class MambaSlotCapacityError(RuntimeError):
+    """Raised when the durable Mamba cache cannot satisfy an allocation."""
+
+    def __init__(self, required: int, available: int):
+        self.required = required
+        self.available = available
+        super().__init__(
+            f"Mamba cache requires {required} new durable slots, but only "
+            f"{available} free or evictable slots are available"
+        )
 
 
 class MambaSlotAllocator:
@@ -47,8 +60,26 @@ class MambaSlotAllocator:
         self.max_slots = max_slots
         self.num_mamba_layers = num_mamba_layers
 
+        # compute_and_store_offsets() records extraction offsets on the model-wide
+        # SSM chunk quantum, and each mixer converts those offsets to a row of its
+        # own per-chunk states using its own chunk size. That conversion is exact
+        # only if the quantum is a multiple of that chunk size. Which chunk size to
+        # check against follows from the Householder count: ssm_chunking() asserts a
+        # homogeneous SSM stack, so a nonzero count means every SSM layer is Gated
+        # Delta Product, whose prefill kernels chunk at their own fixed size and for
+        # which mamba_chunk_size is an unused default.
+        if context.gdp_num_householder > 0:
+            assert context.ssm_chunk_alignment % GDP_CHUNK_SIZE == 0, (
+                f"SSM chunk alignment must be a multiple of the GDP chunk size "
+                f"({GDP_CHUNK_SIZE}); got {context.ssm_chunk_alignment}."
+            )
+        else:
+            assert context.ssm_chunk_alignment % context.mamba_chunk_size == 0, (
+                "SSM chunk alignment must be a multiple of mamba_chunk_size "
+                f"({context.mamba_chunk_size}); got {context.ssm_chunk_alignment}."
+            )
         gpu_device = torch.cuda.current_device()
-        num_blocks = context.kv_block_allocator.total_count
+        num_blocks = context.kv_block_allocator.pool_size
 
         # Block <-> slot mappings (CPU for bookkeeping).
         self.block_to_slot = torch.full((num_blocks,), -1, dtype=torch.int32, device='cpu')
@@ -159,6 +190,18 @@ class MambaSlotAllocator:
         if num_new == 0:
             return existing_slots
 
+        # Reserve the full batch atomically. A failed eviction must not consume
+        # the free portion of the request.
+        need_evict = max(0, num_new - self.free_count)
+        evictable_block_ids = (
+            self._evictable_block_ids()
+            if need_evict > 0
+            else torch.empty(0, dtype=torch.int64, device=device)
+        )
+        available = self.free_count + evictable_block_ids.numel()
+        if available < num_new:
+            raise MambaSlotCapacityError(required=num_new, available=available)
+
         # Phase 3: Get slots from free pool, evicting if necessary
         from_free = min(num_new, self.free_count)
         new_slots = []
@@ -169,7 +212,7 @@ class MambaSlotAllocator:
 
         need_evict = num_new - from_free
         if need_evict > 0:
-            new_slots.extend(self._evict_lru_slots_batch(need_evict))
+            new_slots.extend(self._evict_lru_slots_batch(need_evict, evictable_block_ids))
 
         # Phase 4: Batch GPU writes for new mappings
         new_bid_tensor = torch.tensor(new_bids, dtype=torch.int64, device=device)
@@ -188,32 +231,34 @@ class MambaSlotAllocator:
                 result.append(alloc_bid_to_slot[bid])
         return result
 
-    def _evict_lru_slots_batch(self, num_needed: int) -> list:
+    def _evictable_block_ids(self) -> Tensor:
+        """Return blocks whose durable Mamba slots have no live KV owner."""
+
+        kv_alloc = self.context.kv_block_allocator
+        has_slot_mask = self.block_to_slot[: kv_alloc.pool_size] >= 0
+        ref_zero_mask = kv_alloc.block_ref_counts[: kv_alloc.pool_size] == 0
+        return torch.nonzero(has_slot_mask & ref_zero_mask, as_tuple=True)[0]
+
+    def _evict_lru_slots_batch(self, num_needed: int, candidate_ids: Tensor) -> list:
         """Evict the least recently used Mamba cache slots.
 
         Does NOT return slots to the free pool — caller takes ownership.
 
         Args:
             num_needed: Number of slots to evict.
+            candidate_ids: Blocks confirmed to be evictable for this allocation.
 
         Returns:
             List of freed slot indices.
         """
         kv_alloc = self.context.kv_block_allocator
-        # Find blocks that have mamba slots and ref_count == 0
-        has_slot_mask = self.block_to_slot[: kv_alloc.total_count] >= 0
-        ref_zero_mask = kv_alloc.block_ref_counts[: kv_alloc.total_count] == 0
-        candidates = has_slot_mask & ref_zero_mask
-        candidate_ids = torch.nonzero(candidates, as_tuple=True)[0]
-
-        if candidate_ids.numel() < num_needed:
-            raise RuntimeError("No evictable Mamba cache slots available")
+        assert candidate_ids.numel() >= num_needed
 
         # Pick oldest blocks by timestamp (LRU) or first N (REF_ZERO)
         if self.context.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
             timestamps = kv_alloc.block_timestamps[candidate_ids]
-            sorted_indices = torch.argsort(timestamps)[:num_needed]
-            evict_ids = candidate_ids[sorted_indices]
+            _, oldest_indices = torch.topk(timestamps, k=num_needed, largest=False, sorted=False)
+            evict_ids = candidate_ids[oldest_indices]
         else:
             evict_ids = candidate_ids[:num_needed]
 
@@ -432,17 +477,18 @@ class MambaSlotAllocator:
         last_aligned_abs = (prompt_len // bs) * bs  # last complete block boundary
         penultimate_abs = (overall_required_blocks - 1) * bs
 
-        # SSM chunk size the mamba kernel actually runs with. States can only be
-        # extracted at multiples of this value, and it must match the value used
-        # in MambaMetadata (offset -> chunk-index conversion) to stay consistent.
-        mamba_chunk_size = ctx.mamba_chunk_size
+        # Quantum every SSM mixer in the model agrees is a chunk boundary. States
+        # can only be extracted there, and it is a multiple of the Mamba kernel
+        # chunk size (asserted in __init__), so the offset -> chunk-index
+        # conversion in MambaMetadata stays consistent.
+        ssm_chunk_alignment = ctx.ssm_chunk_alignment
 
         # Keep only boundaries that land inside this chunk's computed tokens and on
-        # a mamba-chunk boundary (required for mid-sequence state extraction).
+        # an SSM chunk boundary (required for mid-sequence state extraction).
         offsets_set = set()
         for abs_pos in (kv_div_abs, last_aligned_abs, penultimate_abs):
             offset = abs_pos - chunk_start
-            if offset > 0 and offset < seq_len and offset % mamba_chunk_size == 0:
+            if offset > 0 and offset < seq_len and offset % ssm_chunk_alignment == 0:
                 offsets_set.add(offset)
 
         offsets = sorted(offsets_set)
@@ -533,12 +579,39 @@ class MambaSlotAllocator:
             return
         intermediate_bids, src_offsets, eos_bids, eos_ctx_indices, all_hashes = collected
 
-        # Allocate all slots in one batch (intermediates + EOS)
+        # These snapshots only improve future cache hits; the active requests
+        # continue from their live Mamba state if durable capacity is exhausted.
         all_bids = intermediate_bids + eos_bids
-        all_slots = self.allocate_slots_batch(all_bids)
+        n_intermediate = len(intermediate_bids)
+        try:
+            all_slots = self.allocate_slots_batch(all_bids)
+        except MambaSlotCapacityError as error:
+            existing_slots = self.block_to_slot[all_bids].tolist()
+            kept_indices = []
+            kept_new_bids = set()
+            for index, (block_id, slot) in enumerate(zip(all_bids, existing_slots)):
+                if slot >= 0 or block_id in kept_new_bids:
+                    kept_indices.append(index)
+                elif len(kept_new_bids) < error.available:
+                    kept_new_bids.add(block_id)
+                    kept_indices.append(index)
+
+            if not kept_indices:
+                self._clear_intermediate_state()
+                return
+
+            all_bids = [all_bids[index] for index in kept_indices]
+            all_hashes = [all_hashes[index] for index in kept_indices]
+            src_offsets = [src_offsets[index] for index in kept_indices if index < n_intermediate]
+            eos_ctx_indices = [
+                eos_ctx_indices[index - n_intermediate]
+                for index in kept_indices
+                if index >= n_intermediate
+            ]
+            all_slots = self.allocate_slots_batch(all_bids)
+            n_intermediate = len(src_offsets)
 
         # Copy intermediate states from output buffers to cache
-        n_intermediate = len(intermediate_bids)
         self._copy_intermediate_to_cache(src_offsets, all_slots[:n_intermediate])
 
         # Copy EOS states from live buffers to cache
@@ -651,7 +724,7 @@ class MambaSlotAllocator:
         """Reset all state (mappings, free pool, cache, intermediate tracking)."""
         self.block_to_slot.fill_(-1)
         self.slot_to_block.fill_(-1)
-        self.free_slots = torch.arange(self.max_slots, dtype=torch.int32, device='cpu')
+        torch.arange(self.max_slots, out=self.free_slots)
         self.free_count = self.max_slots
         self.hash_to_block_id.clear()
         self.intermediate_ssm_out.zero_()

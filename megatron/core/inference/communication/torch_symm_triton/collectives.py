@@ -100,7 +100,7 @@ def _ag_phase(
             + (RANK * numel_per_rank + offsets) * 2
         )
         local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
-        (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+        x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
         st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
 
         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
@@ -256,7 +256,7 @@ def _multimem_reduce_scatter_kernel(
             multicast_ptr.to(tl.pointer_type(tl.uint64)) + (RANK * numel_per_rank + offsets) * 2
         )
         local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
-        (x, y, z, w) = ld_128(multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32)
+        x, y, z, w = ld_128(multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32)
         st_128(local_ptrs, x, y, z, w, mask=mask, multicast_op=False)
 
         block_start += tl.num_programs(axis=0) * BLOCK_SIZE
@@ -290,7 +290,7 @@ def multimem_all_gather(
     input_tensor: torch.Tensor,
     symm_mem_hdl: _SymmetricMemory,
     byte_offset: int = 0,
-    barrier_before: Optional[bool] = None,
+    barrier_before: bool = False,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -298,10 +298,11 @@ def multimem_all_gather(
     Output tensor must be a symmetric memory buffer.
     Input tensor can be a regular torch tensor.
 
-    ``barrier_before`` controls the pre-all-gather buffer-reuse barrier. When left
-    as ``None`` (the default) it is derived from the last collective on this buffer
-    (see the module header): the barrier is inserted only when the previous op was
-    itself an all-gather. Passing an explicit ``True`` forces the barrier on.
+    ``barrier_before`` inserts a pre-all-gather barrier so every rank has finished
+    reading the buffer's previous contents before this all-gather overwrites them.
+    It must be set by the caller whenever this all-gather directly follows another
+    all-gather on the same symmetric buffer with no reduce-scatter in between (a
+    reduce-scatter already establishes that ordering inside its own kernel).
     """
     assert HAVE_TRITON, "Triton is required for multimem all-gather."
     assert are_tensors_nvls_eligible(

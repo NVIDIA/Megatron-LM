@@ -87,18 +87,17 @@ if not HAVE_FA3:
 # `flash_attn.cute.__version__` (which is 0.0.0), so we cannot use
 # `is_fa_min_version` here.
 _MIN_FA4_VERSION = "4.0.0b20"
+flash_attn4_varlen_func = None
 try:
     from importlib.metadata import PackageNotFoundError
     from importlib.metadata import version as _get_dist_version
 
-    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
     from packaging.version import Version as _Version
 
-    try:
-        HAVE_FA4 = _Version(_get_dist_version("flash-attn-4")) >= _Version(_MIN_FA4_VERSION)
-    except PackageNotFoundError:
-        HAVE_FA4 = False
-except ImportError:
+    HAVE_FA4 = _Version(_get_dist_version("flash-attn-4")) >= _Version(_MIN_FA4_VERSION)
+    if HAVE_FA4:
+        from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+except (ImportError, PackageNotFoundError):
     HAVE_FA4 = False
 
 try:
@@ -421,6 +420,7 @@ class Attention(MegatronModule, ABC):
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".linear_proj") if name is not None else None,
         )
 
@@ -468,7 +468,7 @@ class Attention(MegatronModule, ABC):
                 checkpoint_inputs.append(kwarg_value)
 
         def custom_forward(*inputs):
-            (query, key, value, attention_mask, _, attn_mask_type, *tensor_kwarg_values) = inputs
+            query, key, value, attention_mask, _, attn_mask_type, *tensor_kwarg_values = inputs
             attn_mask_type = AttnMaskType(attn_mask_type.item())
             extra_kwargs = dict(core_attention_extra_kwargs)
             for name, kwarg_value in zip(tensor_kwarg_names, tensor_kwarg_values):
@@ -1158,7 +1158,20 @@ class Attention(MegatronModule, ABC):
             # the number of tokens per request. Reshape to (B, S, H, D) so the
             # decode kernel sees batch=num_requests and seqlen_q=tokens_per_request.
             num_requests = seqlens_k.shape[0]
-            tokens_per_request = q.shape[0] // num_requests
+            if self.batch_invariant_mode:
+                # Batch-invariant CUDA-graph buckets can append token-only padding so
+                # model-wide M dimensions stay aligned. Those rows do not represent
+                # requests and must not be passed to attention.
+                input_token_count = q.shape[0]
+                tokens_per_request = int(max_seqlen_q)
+                metadata_token_count = num_requests * tokens_per_request
+                assert metadata_token_count <= input_token_count, (
+                    "Batch-invariant decode metadata describes more query tokens "
+                    f"({metadata_token_count}) than q contains ({input_token_count})."
+                )
+                q = q[:metadata_token_count]
+            else:
+                tokens_per_request = q.shape[0] // num_requests
             q = q.reshape(num_requests, tokens_per_request, q.shape[2], q.shape[3])
 
             # If using MLA we use the FlashMLA kernel
@@ -1272,6 +1285,20 @@ class Attention(MegatronModule, ABC):
             output_total = output_total.reshape(
                 num_requests * tokens_per_request, 1, *output_total.shape[2:]
             )
+            if self.batch_invariant_mode:
+                padding_token_count = input_token_count - output_total.shape[0]
+                assert padding_token_count >= 0, (
+                    "Batch-invariant attention produced more query rows "
+                    f"({output_total.shape[0]}) than q contained ({input_token_count})."
+                )
+                if padding_token_count > 0:
+                    output_total = torch.cat(
+                        (
+                            output_total,
+                            output_total.new_zeros(padding_token_count, 1, *output_total.shape[2:]),
+                        ),
+                        dim=0,
+                    )
 
         return output_total
 
@@ -1489,8 +1516,16 @@ class Attention(MegatronModule, ABC):
                     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
                 else:
                     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+                rope_max_seqlen_q = packed_seq_params.max_seqlen_q
+                rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
+                rope_freqs_max_seqlen = (
+                    max(rope_max_seqlen_q, rope_max_seqlen_kv)
+                    if rope_max_seqlen_q is not None and rope_max_seqlen_kv is not None
+                    else None
+                )
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
+                rope_freqs_max_seqlen = None
 
             if split_qkv:
                 if q_pos_emb is not None:
@@ -1503,6 +1538,7 @@ class Attention(MegatronModule, ABC):
                             cu_seqlens=cu_seqlens_q,
                             mscale=self._yarn_concentration_factor,
                             cp_group=self.pg_collection.cp,
+                            max_seqlen=rope_freqs_max_seqlen,
                         )
                     else:
                         query = inference_context.apply_rotary_emb_query(
@@ -1521,6 +1557,7 @@ class Attention(MegatronModule, ABC):
                         cu_seqlens=cu_seqlens_kv,
                         mscale=self._yarn_concentration_factor,
                         cp_group=self.pg_collection.cp,
+                        max_seqlen=rope_freqs_max_seqlen,
                     )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(
@@ -1689,6 +1726,7 @@ class SelfAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".linear_qkv") if name is not None else None,
         )
 
@@ -1881,9 +1919,9 @@ class SelfAttention(Attention):
             ]
 
             if SplitAlongDim is not None:
-                (query, gate, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+                query, gate, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)
             else:
-                (query, gate, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
+                query, gate, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
         else:
             # If no output gate: [sq, b, ng, (np/ng + 2) * hn]
             # --> [sq, b, ng, np/ng * hn], None, [sq, b, ng, hn], [sq, b, ng, hn]
@@ -1898,9 +1936,9 @@ class SelfAttention(Attention):
                 return mixed_qkv, split_arg_list
 
             if SplitAlongDim is not None:
-                (query, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+                query, key, value = SplitAlongDim(mixed_qkv, 3, split_arg_list)
             else:
-                (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
+                query, key, value = torch.split(mixed_qkv, split_arg_list, dim=3)
 
         # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
@@ -2144,7 +2182,7 @@ class CrossAttention(Attention):
         mixed_kv = mixed_kv.view(*new_tensor_shape)
 
         # [sk, b, np, 2 * hn] --> 2 [sk, b, np, hn]
-        (key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
+        key, value = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
 
         # Attention head [sq, b, h] --> [sq, b, hp]
         query, _ = apply_module(self.linear_q)(hidden_states)

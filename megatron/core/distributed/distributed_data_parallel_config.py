@@ -90,6 +90,9 @@ class DistributedDataParallelConfig:
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
 
+    megatron_fsdp_version: int = 1
+    """Megatron-FSDP implementation version. Valid values are 1 and 2."""
+
     use_custom_fsdp: bool = False
     """
     NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
@@ -100,6 +103,10 @@ class DistributedDataParallelConfig:
     data_parallel_sharding_strategy: str = 'no_shard'
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
       'optim_grads', 'optim_grads_params'."""
+
+    expert_data_parallel_sharding_strategy: str | None = None
+    """Optional expert-parameter sharding strategy for MFSDP v2. When unset, experts use
+      ``data_parallel_sharding_strategy``."""
 
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
@@ -246,10 +253,48 @@ class DistributedDataParallelConfig:
     FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
     """
 
+    hfsdp_param_gather_overlap: bool = False
+    """If true, pipeline HFSDP parameter gathers across the DP-Outer and DP-Inner
+    communication domains. DP-Inner retains its size-based prefetch policy, while
+    DP-Outer is prefetched one additional FSDP unit beyond the DP-Inner frontier.
+    Only effective with ``outer_dp_sharding_strategy='optim'``.
+    """
+
+    @property
+    def param_sync_via_bucket_group(self) -> bool:
+        """Whether DP parameter synchronization is dispatched through DDP bucket groups.
+
+        ``True``:
+        ``_ParamAndGradBucketGroup.start_param_sync()`` is the collective entry point. This is
+        the standard DistributedOptimizer path. LayerWise also uses it when overlap needs
+        bucket-level prefetch, or when MXFP8 reuse needs ``bucket.grad_data`` as the gather
+        buffer. With overlap, the current bucket's forward pre-hook waits for its gather and
+        dispatches the next bucket's gather before computation starts, allowing communication
+        for the next bucket to overlap with the current computation.
+
+        ``False``:
+        DDP bucket groups do not launch parameter all-gather. Then either:
+
+        - No gather is needed because every DP rank runs the same optimizer update.
+        - Another component performs the gather. With ``LayerWiseDistributedOptimizer``, this
+          happens when ``use_layer_wise_param_layout=False``, parameter-gather overlap is disabled,
+          and MXFP8 grad-buffer reuse is disabled. Each rank updates only its assigned parameters,
+          then the optimizer calls ``allgather_params()`` synchronously after the step.
+        """
+        if self.use_distributed_optimizer:
+            return True
+
+        # When standard DistOpt is disabled, these flags select the legacy LayerWise
+        # bucket-group path: forward-scheduled overlap or synchronous grad-buffer reuse.
+        return self.overlap_param_gather or self.reuse_grad_buf_for_mxfp8_param_ag
+
     def __post_init__(self):
         import os
 
         """Check the validity of the config."""
+        if self.megatron_fsdp_version not in (1, 2):
+            raise ValueError("megatron_fsdp_version must be either 1 or 2")
+
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
 

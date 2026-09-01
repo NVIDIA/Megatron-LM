@@ -31,6 +31,59 @@ class TestMambaMetadata:
         yield metadata
         metadata.reset()
 
+    @pytest.mark.internal
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+    def test_decode_indices_dtype(self, dtype):
+        metadata = MambaMetadata(
+            max_requests=4, max_tokens=16, max_intermediate_count=1, decode_indices_dtype=dtype
+        )
+
+        assert metadata._batch_indices_decode_buffer.dtype == dtype
+
+    def test_free_unbound_live_slot(self):
+        metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
+
+        slot = int(metadata.allocate_slot())
+        assert metadata.mamba_state_free_slot_count == 1
+
+        metadata.free_slot(slot)
+
+        assert metadata.mamba_state_free_slot_count == 2
+        assert int(metadata.allocate_slot()) == slot
+
+    def test_allocated_slots_do_not_alias_free_slot_stack(self):
+        metadata = MambaMetadata(max_requests=3, max_tokens=4, max_intermediate_count=1)
+
+        slot_to_release = metadata.allocate_slot()
+        allocated_slot = metadata.allocate_slot()
+        metadata.free_slot(slot_to_release)
+
+        assert isinstance(allocated_slot, int)
+        assert allocated_slot == 1
+
+        metadata.reset()
+        slot_to_release = metadata.allocate_slot()
+        allocated_slots = metadata.batch_allocate_slots(2)
+        metadata.free_slot(slot_to_release)
+
+        assert torch.equal(allocated_slots, torch.tensor([0, 1], dtype=torch.int32))
+
+    def test_detached_live_slot_survives_request_cleanup(self):
+        metadata = MambaMetadata(max_requests=2, max_tokens=4, max_intermediate_count=1)
+        slot = int(metadata.allocate_slot())
+        metadata.request_to_mamba_state_idx[0] = slot
+
+        assert metadata.detach_state_slot(0) == slot
+        metadata.free_slots(torch.tensor([0], dtype=torch.int64))
+
+        assert metadata.mamba_state_free_slot_count == 1
+        assert int(metadata.allocate_slot()) != slot
+
+        metadata.free_slot(slot)
+
+        assert metadata.mamba_state_free_slot_count == 1
+        assert int(metadata.allocate_slot()) == slot
+
     def _run_update_test(
         self,
         metadata: MambaMetadata,
@@ -505,3 +558,119 @@ class TestMambaMetadata:
         expected_seq_idx = torch.cat([expected_seq_idx_0, expected_seq_idx_1], dim=1)
 
         assert torch.equal(metadata_context.seq_idx, expected_seq_idx)
+
+
+class TestGDPIntermediateChunkIndices:
+    """The offset -> chunk-row mapping GDP prefix caching extracts state with.
+
+    GDP cannot reuse the Mamba mapping. It chunks at a fixed 64 rather than
+    `mamba_chunk_size`, and its per-chunk states are the states *entering* each
+    chunk, so the state after `offset` tokens is row `offset // 64` of the
+    sequence's chunk range -- where Mamba, whose states come *out* of each chunk,
+    needs a `- 1`. Getting that off by one silently caches a state 64 tokens
+    away from the boundary it is registered against.
+    """
+
+    NUM_HOUSEHOLDER = 2
+    GDP_CHUNK = 64
+
+    def _metadata(self, max_requests=8, max_tokens=2048, max_intermediate_count=16):
+        return MambaMetadata(
+            max_requests=max_requests,
+            max_tokens=max_tokens,
+            max_intermediate_count=max_intermediate_count,
+            d_conv=4,
+            gdp_num_householder=self.NUM_HOUSEHOLDER,
+        )
+
+    def _update(self, metadata, seq_lengths, offsets_per_request):
+        """Run one prefill-only update with the given per-request extraction offsets."""
+        device = metadata.device
+        num_requests = len(seq_lengths)
+        cu = [0]
+        for length in seq_lengths:
+            cu.append(cu[-1] + length)
+
+        token_to_req = []
+        for req_idx, length in enumerate(seq_lengths):
+            token_to_req.extend([req_idx] * length)
+
+        assert max(len(o) for o in offsets_per_request) <= 3
+        offsets = torch.zeros((num_requests, 3), dtype=torch.int32, device=device)
+        counts = torch.zeros(num_requests, dtype=torch.int32, device=device)
+        for i, req_offsets in enumerate(offsets_per_request):
+            offsets[i, : len(req_offsets)] = torch.tensor(req_offsets, dtype=torch.int32)
+            counts[i] = len(req_offsets)
+
+        dims = InferenceBatchDimensions(
+            token_count=cu[-1], prefill_req_count=num_requests, decode_req_count=0
+        )
+        metadata.update(
+            active_mamba_indices=torch.arange(num_requests, dtype=torch.int32, device=device),
+            token_to_request_idx=torch.tensor(token_to_req, dtype=torch.int32, device=device),
+            cu_seqlens=torch.tensor(cu, dtype=torch.int32, device=device),
+            batch_dimensions=dims,
+            padded_batch_dimensions=dims,
+            enable_chunked_prefill=False,
+            intermediate_offsets_gpu=offsets,
+            intermediate_counts_gpu=counts,
+        )
+        return cu
+
+    @pytest.mark.internal
+    def test_single_request_offsets_map_to_their_own_chunk_rows(self):
+        metadata = self._metadata()
+        self._update(metadata, [512], [[128, 256]])
+
+        assert metadata.intermediate_count == 2
+        got = metadata.gdp_intermediate_chunk_indices[:2].tolist()
+        # Sequence 0 starts at chunk row 0, so offset o lands on row o // 64.
+        assert got == [128 // 64, 256 // 64]
+
+    @pytest.mark.internal
+    def test_offsets_are_biased_by_the_preceding_requests_chunks(self):
+        metadata = self._metadata()
+        seq_lengths = [512, 320, 256]
+        self._update(metadata, seq_lengths, [[256], [128], [64]])
+
+        # chunk_offsets is the running sum of ceil(len / 64) per sequence.
+        starts, running = [], 0
+        for length in seq_lengths:
+            starts.append(running)
+            running += (length + self.GDP_CHUNK - 1) // self.GDP_CHUNK
+
+        got = metadata.gdp_intermediate_chunk_indices[:3].tolist()
+        assert got == [starts[0] + 256 // 64, starts[1] + 128 // 64, starts[2] + 64 // 64]
+        assert torch.equal(
+            metadata.gdp_chunk_offsets[: len(seq_lengths)],
+            torch.tensor(starts, dtype=torch.int32, device=metadata.device),
+        )
+
+    @pytest.mark.internal
+    def test_row_zero_is_the_sequence_start_state(self):
+        """Row `chunk_offsets[i]` is the state before any of sequence i's tokens.
+
+        This is what pins the absence of Mamba's `- 1`: an offset of exactly one
+        chunk must map one row past the sequence's first, not onto it.
+        """
+        metadata = self._metadata()
+        self._update(metadata, [256, 256], [[64], [64]])
+
+        got = metadata.gdp_intermediate_chunk_indices[:2].tolist()
+        assert got[0] == 1, "offset 64 of sequence 0 must be its second chunk row"
+        assert got[1] == 4 + 1, "sequence 1 owns 4 chunks' worth of rows before its own"
+
+    @pytest.mark.internal
+    def test_not_built_when_the_model_has_no_gdp_layers(self):
+        metadata = MambaMetadata(max_requests=4, max_tokens=512, max_intermediate_count=4, d_conv=4)
+        dims = InferenceBatchDimensions(token_count=256, prefill_req_count=1, decode_req_count=0)
+        metadata.update(
+            active_mamba_indices=torch.tensor([0], dtype=torch.int32, device=metadata.device),
+            token_to_request_idx=torch.zeros(256, dtype=torch.int32, device=metadata.device),
+            cu_seqlens=torch.tensor([0, 256], dtype=torch.int32, device=metadata.device),
+            batch_dimensions=dims,
+            padded_batch_dimensions=dims,
+            enable_chunked_prefill=False,
+        )
+        assert metadata.gdp_intermediate_chunk_indices is None
+        assert metadata.gdp_chunk_offsets is None
