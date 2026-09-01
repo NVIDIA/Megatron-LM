@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import enum
+import importlib
 import inspect
 import io
 import os
@@ -83,6 +84,21 @@ except ImportError:
 
         te = MagicMock()
         HAVE_TE = False
+
+def _get_te_linear_attention() -> type[torch.nn.Module] | None:
+    """Return TE's LinearAttention (Gated DeltaNet) module, if available."""
+    if not HAVE_TE:
+        return None
+    try:
+        te_pytorch = importlib.import_module("transformer_engine.pytorch")
+        importlib.import_module("transformer_engine.pytorch.attention.linear_attention.gdn")
+        return te_pytorch.LinearAttention
+    except (AttributeError, ImportError):
+        return None
+
+
+_TE_LINEAR_ATTENTION = _get_te_linear_attention()
+HAVE_TE_GDN = _TE_LINEAR_ATTENTION is not None
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
@@ -2036,6 +2052,74 @@ class TERowParallelLinear(TELinear):
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
         if self.config.delay_wgrad_compute:
             super().backward_dw()
+
+
+class TEGatedDeltaNetAttention(torch.nn.Module):
+    """Adapt Megatron GDN kernel inputs to Transformer Engine's LinearAttention."""
+
+    def __init__(
+        self,
+        num_attention_heads: int,
+        qk_head_dim: int,
+        value_head_dim: int,
+        layer_number: int,
+    ) -> None:
+        super().__init__()
+        if not HAVE_TE_GDN:
+            raise ImportError("Transformer Engine LinearAttention (GDN) is not available.")
+        assert _TE_LINEAR_ATTENTION is not None
+        self.value_head_dim = value_head_dim
+        self.te_attention = _TE_LINEAR_ATTENTION(
+            num_attention_heads=num_attention_heads,
+            kv_channels=(qk_head_dim, value_head_dim),
+            qkv_format="bshd",
+            attn_mask_type="causal",
+            layer_number=layer_number,
+        )
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        use_qk_l2norm_in_kernel: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run TE GDN through the FLA-compatible Megatron kernel interface."""
+        del kwargs
+
+        batch, sequence = q.shape[:2]
+        qkv_format = "bshd"
+        if cu_seqlens is not None:
+            qkv_format = "thd"
+            q, k, v = (tensor.reshape(-1, *tensor.shape[2:]) for tensor in (q, k, v))
+            g, beta = (tensor.reshape(-1, tensor.shape[-1]) for tensor in (g, beta))
+
+        result = self.te_attention(
+            q,
+            k,
+            v,
+            qkv_format=qkv_format,
+            cu_seqlens_q=cu_seqlens,
+            g=g.float(),
+            beta=beta.float(),
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        )
+        if output_final_state:
+            output, final_state = result
+        else:
+            output = result
+            final_state = None
+
+        output = output.reshape(batch, sequence, -1, self.value_head_dim)
+        return output, final_state
 
 
 class TEDotProductAttention(te.pytorch.DotProductAttention):
