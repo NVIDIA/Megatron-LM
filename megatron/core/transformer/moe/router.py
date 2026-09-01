@@ -255,6 +255,29 @@ class TopKRouter(Router):
             self.local_tokens_per_expert = None
             self.expert_bias = None
 
+        self.enable_vl_expert_bias = self.config.moe_router_enable_vl_bias
+        if self.enable_vl_expert_bias:
+            self.register_buffer(
+                'local_tokens_per_expert_vl',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'expert_bias_vl',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    dtype=torch.float32,
+                    device=torch.cuda.current_device(),
+                ),
+            )
+        else:
+            self.local_tokens_per_expert_vl = None
+            self.expert_bias_vl = None
+
         # Initialize global tokens per expert for global aux loss
         if self.get_aux_loss_coeff("global_aux_loss") > 0:
             self.register_buffer(
@@ -289,6 +312,9 @@ class TopKRouter(Router):
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+        if hasattr(self, 'expert_bias_vl') and self.expert_bias_vl is not None:
+            if self.expert_bias_vl.dtype != torch.float32:
+                self.expert_bias_vl.data = self.expert_bias_vl.data.to(torch.float32)
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -716,13 +742,16 @@ class TopKRouter(Router):
 
     @jit_fuser
     def _apply_expert_bias(
-        self, routing_map: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+        self,
+        routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+        input_ids: Optional[torch.Tensor] = None,
     ):
         """
         Update expert bias and tokens_per_expert
         Prevent extra local tokens accumulation on evaluation or activation recomputation
         """
-        if self.enable_expert_bias and torch.is_grad_enabled():
+        if (self.enable_expert_bias or self.enable_vl_expert_bias) and torch.is_grad_enabled():
             with torch.no_grad():
                 if padding_mask is not None:
                     flat_mask = padding_mask.reshape(-1)
@@ -730,7 +759,24 @@ class TopKRouter(Router):
                         flat_mask.shape[0] == routing_map.shape[0]
                     ), f"padding_mask flat {flat_mask.shape} vs routing_map {routing_map.shape}"
                     routing_map = routing_map & (~flat_mask).unsqueeze(-1)
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+                if self.enable_vl_expert_bias:
+                    assert (
+                        input_ids is not None
+                    ), "input_ids are required when moe_router_enable_vl_bias=True."
+                    flat_ids = input_ids.T.reshape(-1)
+                    assert (
+                        flat_ids.shape[0] == routing_map.shape[0]
+                    ), f"input_ids flat {flat_ids.shape} vs routing_map {routing_map.shape}"
+                    image_mask = flat_ids >= self.config.actual_vocab_size
+                    self.local_tokens_per_expert_vl += (routing_map & image_mask.unsqueeze(-1)).sum(
+                        dim=0
+                    )
+                    if self.enable_expert_bias:
+                        self.local_tokens_per_expert += (
+                            routing_map & (~image_mask).unsqueeze(-1)
+                        ).sum(dim=0)
+                elif self.enable_expert_bias:
+                    self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def _hash_routing(self, logits: torch.Tensor, input_ids: torch.Tensor):
         """Hash-based routing: expert indices come from the tid2eid lookup table.
@@ -759,7 +805,19 @@ class TopKRouter(Router):
         # input_ids is [b, s] from the model, but hidden_states are [s, b, h]
         # and get flattened to [s*b, h]. Transpose to match.
         flat_ids = input_ids.T.reshape(-1)
-        top_indices = self.tid2eid[flat_ids].long()  # [num_tokens, topk]
+        image_mask = flat_ids >= self.config.actual_vocab_size
+        if image_mask.any() and not self.enable_vl_expert_bias:
+            raise ValueError(
+                "Hash routing received synthetic vision token IDs, but "
+                "moe_router_enable_vl_bias is disabled."
+            )
+        lookup_ids = torch.where(image_mask, torch.zeros_like(flat_ids), flat_ids)
+        top_indices = self.tid2eid[lookup_ids].long()  # [num_tokens, topk]
+        if self.enable_vl_expert_bias:
+            _, vl_indices = torch.topk(
+                scores + self.expert_bias_vl.to(dtype=scores.dtype), k=self.topk, dim=1
+            )
+            top_indices = torch.where(image_mask.unsqueeze(-1), vl_indices, top_indices)
         if (
             self.config.moe_router_force_load_balancing
             or self.config.moe_router_force_biased is not None
@@ -822,6 +880,18 @@ class TopKRouter(Router):
         elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         else:
+            expert_bias = self.expert_bias
+            if self.enable_vl_expert_bias:
+                assert (
+                    input_ids is not None
+                ), "input_ids are required when moe_router_enable_vl_bias=True."
+                flat_ids = input_ids.T.reshape(-1)
+                image_mask = flat_ids >= self.config.actual_vocab_size
+                expert_bias = torch.where(
+                    image_mask.unsqueeze(-1),
+                    self.expert_bias_vl.unsqueeze(0),
+                    self.expert_bias.unsqueeze(0),
+                )
             probs, routing_map = topk_routing_with_score_function(
                 logits,
                 self.topk,
@@ -830,8 +900,10 @@ class TopKRouter(Router):
                 group_topk=self.config.moe_router_group_topk,
                 scaling_factor=self.config.moe_router_topk_scaling_factor,
                 score_function=self.score_function,
-                expert_bias=self.expert_bias,
-                fused=self.config.moe_router_fusion,
+                expert_bias=expert_bias,
+                # Transformer Engine's fused router currently accepts a single
+                # per-expert bias, not the per-token text/VL bias matrix.
+                fused=self.config.moe_router_fusion and not self.enable_vl_expert_bias,
                 router_replay=self.router_replay,
             )
 
@@ -894,7 +966,7 @@ class TopKRouter(Router):
             )
 
         # Optionally apply expert bias
-        self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+        self._apply_expert_bias(routing_map, padding_mask=padding_mask, input_ids=input_ids)
 
         return probs, routing_map
 

@@ -2,7 +2,7 @@
 
 """Base multimodal model for FSDP + EP training.
 
-Composes a vision encoder and a ``GPTModel`` language decoder.  Designed
+Composes a vision encoder and either a ``GPTModel`` or ``HybridModel`` language decoder. Designed
 for FSDP + EP: always builds the **full** model on every rank (no PP
 flags).  PP support is only available through the MIMO ``MimoModel``
 assembly path.
@@ -19,6 +19,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.gpt import GPTModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -82,7 +83,7 @@ def _thd_cp_partition_index(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
 class MultimodalModel(MegatronModule):
     """Base class for multimodal vision-language models.
 
-    Composes a pre-constructed vision encoder and a ``GPTModel`` language
+    Composes a pre-constructed vision encoder and a language decoder.
     decoder.  Designed for FSDP + EP; always builds the full model on
     every rank.
 
@@ -100,6 +101,9 @@ class MultimodalModel(MegatronModule):
         mtp_block_spec: Optional MTP block spec.
         parallel_output: Keep outputs split across TP ranks.
         share_embeddings_and_output_weights: Tie input/output embeddings.
+        hybrid_stack_spec: Optional HybridModel stack spec. When supplied,
+            ``language_spec`` must be ``None``.
+        hybrid_layer_pattern: Unified HybridModel layer pattern.
     """
 
     def __init__(
@@ -117,26 +121,57 @@ class MultimodalModel(MegatronModule):
         mtp_block_spec: Optional[ModuleSpec] = None,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
+        hybrid_stack_spec: Optional[ModuleSpec] = None,
+        hybrid_layer_pattern: Optional[str] = None,
     ):
         super().__init__(config=language_config)
 
         self.image_token_id = image_token_id
 
         self.vision_model = vision_encoder
-        self.language_model = GPTModel(
-            config=language_config,
-            transformer_layer_spec=language_spec,
-            vocab_size=vocab_size,
-            max_sequence_length=max_sequence_length,
-            pre_process=True,
-            post_process=True,
-            parallel_output=parallel_output,
-            share_embeddings_and_output_weights=(share_embeddings_and_output_weights),
-            position_embedding_type=position_embedding_type,
-            rotary_percent=rotary_percent,
-            rotary_base=rotary_base,
-            mtp_block_spec=mtp_block_spec,
-        )
+        if hybrid_stack_spec is not None or hybrid_layer_pattern is not None:
+            if hybrid_stack_spec is None or hybrid_layer_pattern is None:
+                raise ValueError(
+                    "Hybrid multimodal decoders require both hybrid_stack_spec and "
+                    "hybrid_layer_pattern."
+                )
+            if language_spec is not None:
+                raise ValueError("language_spec and hybrid_stack_spec are mutually exclusive.")
+            if mtp_block_spec is not None:
+                raise ValueError(
+                    "HybridModel expresses MTP in hybrid_layer_pattern; mtp_block_spec is invalid."
+                )
+            self.language_model = HybridModel(
+                config=language_config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=vocab_size,
+                max_sequence_length=max_sequence_length,
+                hybrid_layer_pattern=hybrid_layer_pattern,
+                pre_process=True,
+                post_process=True,
+                parallel_output=parallel_output,
+                share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+                position_embedding_type=position_embedding_type,
+                rotary_percent=rotary_percent,
+                rotary_base=rotary_base,
+            )
+        else:
+            if language_spec is None:
+                raise ValueError("GPTModel multimodal decoders require language_spec.")
+            self.language_model = GPTModel(
+                config=language_config,
+                transformer_layer_spec=language_spec,
+                vocab_size=vocab_size,
+                max_sequence_length=max_sequence_length,
+                pre_process=True,
+                post_process=True,
+                parallel_output=parallel_output,
+                share_embeddings_and_output_weights=(share_embeddings_and_output_weights),
+                position_embedding_type=position_embedding_type,
+                rotary_percent=rotary_percent,
+                rotary_base=rotary_base,
+                mtp_block_spec=mtp_block_spec,
+            )
 
     def set_input_tensor(self, input_tensor):
         """Route input tensors (simplified, no PP routing)."""
@@ -146,7 +181,11 @@ class MultimodalModel(MegatronModule):
         self.language_model.set_input_tensor(input_tensor[0])
 
     def _scatter_vision_embeddings(
-        self, input_ids: Tensor, text_embeddings: Tensor, vision_embeddings: Tensor
+        self,
+        input_ids: Tensor,
+        text_embeddings: Tensor,
+        vision_embeddings: Tensor,
+        vision_token_indices: Tensor = None,
     ) -> Tensor:
         """Replace image-token positions with vision embeddings.
 
@@ -171,15 +210,55 @@ class MultimodalModel(MegatronModule):
             )
 
         combined = text_embeddings.transpose(0, 1).contiguous()
-        image_mask = input_ids == self.image_token_id
-        mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
-        combined = combined.masked_scatter(mask_expanded, vision_embeddings)
+        if vision_token_indices is None:
+            image_mask = input_ids == self.image_token_id
+            num_slots = int(image_mask.sum())
+            if vision_embeddings.ndim != 2 or vision_embeddings.shape[0] != num_slots:
+                raise ValueError(
+                    f"Found {num_slots} image-token positions but received vision embeddings "
+                    f"with shape {tuple(vision_embeddings.shape)}."
+                )
+            mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
+            combined = combined.masked_scatter(
+                mask_expanded, vision_embeddings.to(device=combined.device, dtype=combined.dtype)
+            )
+        else:
+            if vision_token_indices.ndim == 2 and vision_token_indices.shape[1] == 2:
+                vision_token_indices = (
+                    vision_token_indices[:, 0] * input_ids.shape[1] + vision_token_indices[:, 1]
+                )
+            if vision_token_indices.ndim != 1:
+                raise ValueError(
+                    "vision_token_indices must be flattened [N] or (batch, sequence) pairs [N, 2]."
+                )
+            if vision_embeddings.ndim != 2 or vision_embeddings.shape[0] != len(
+                vision_token_indices
+            ):
+                raise ValueError(
+                    f"Received {len(vision_token_indices)} vision token positions but vision "
+                    f"embeddings have shape {tuple(vision_embeddings.shape)}."
+                )
+            flat = combined.view(-1, combined.shape[-1])
+            flat = flat.index_copy(
+                0,
+                vision_token_indices.to(device=flat.device, dtype=torch.long),
+                vision_embeddings.to(device=flat.device, dtype=flat.dtype),
+            )
+            combined = flat.view_as(combined)
         combined = combined.transpose(0, 1).contiguous()
 
         if sp:
             combined = tensor_parallel.scatter_to_sequence_parallel_region(combined)
 
         return combined
+
+    def _embed_input_ids(self, input_ids: Tensor) -> Tensor:
+        """Embed decoder token IDs. Subclasses may sanitize synthetic IDs."""
+        return self.language_model.embedding(input_ids=input_ids, position_ids=None)
+
+    def prepare_attention_mask(self, input_ids: Tensor, attention_mask, packed_seq_params=None):
+        """Build model-specific attention metadata before CP partitioning."""
+        return attention_mask
 
     def compute_position_ids(
         self, input_ids: Tensor, image_grid_thw: Optional[Tensor] = None, packed_seq_params=None
@@ -217,8 +296,13 @@ class MultimodalModel(MegatronModule):
         cp_size = parallel_state.get_context_parallel_world_size()
         if cp_size <= 1:
             return (
-                decoder_input, input_ids, labels, loss_mask,
-                attention_mask, position_ids, padding_mask,
+                decoder_input,
+                input_ids,
+                labels,
+                loss_mask,
+                attention_mask,
+                position_ids,
+                padding_mask,
             )
         cp_rank = parallel_state.get_context_parallel_rank()
 
@@ -245,7 +329,11 @@ class MultimodalModel(MegatronModule):
                 return (
                     None
                     if t is None
-                    else _cp_split_tensor(t, seq_dim=seq_dim, cp_size=cp_size, cp_rank=cp_rank)
+                    else (
+                        _cp_split_tensor(t, seq_dim=seq_dim, cp_size=cp_size, cp_rank=cp_rank)
+                        if isinstance(t, Tensor)
+                        else t
+                    )
                 )
 
             decoder_input = _split(decoder_input, 0)
@@ -256,8 +344,13 @@ class MultimodalModel(MegatronModule):
             padding_mask = _split(padding_mask, 1)
 
         return (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
         )
 
     @staticmethod
@@ -315,6 +408,8 @@ class MultimodalModel(MegatronModule):
         pixel_values: Tensor = None,
         image_grid_thw: Tensor = None,
         decoder_input: Tensor = None,
+        vision_embeddings: Tensor = None,
+        vision_token_indices: Tensor = None,
         packed_seq_params=None,
         **kwargs,
     ):
@@ -335,6 +430,10 @@ class MultimodalModel(MegatronModule):
             pixel_values: Preprocessed image pixels.
             image_grid_thw: ``[num_images, 3]`` grid dimensions.
             decoder_input: Pre-computed decoder input (skip embed).
+            vision_embeddings: Pre-computed visual embeddings. This bypasses
+                ``vision_model`` and is the stable injection point for MDP.
+            vision_token_indices: Optional flattened ``[B*S]`` decoder positions
+                for externally supplied visual rows.
             packed_seq_params: ``PackedSeqParams`` for THD attention.
 
         Returns:
@@ -347,23 +446,36 @@ class MultimodalModel(MegatronModule):
                 packed_seq_params=packed_seq_params,
             )
 
-        vision_embeddings = None
-        if self.vision_model is not None and pixel_values is not None:
+        if vision_embeddings is not None and pixel_values is not None:
+            raise ValueError("Pass either pixel_values or vision_embeddings, not both.")
+        if vision_embeddings is None and self.vision_model is not None and pixel_values is not None:
             vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
 
         if decoder_input is None and self.language_model is not None:
-            text_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
+            text_embeddings = self._embed_input_ids(input_ids)
 
             if vision_embeddings is not None:
                 decoder_input = self._scatter_vision_embeddings(
-                    input_ids, text_embeddings, vision_embeddings
+                    input_ids,
+                    text_embeddings,
+                    vision_embeddings,
+                    vision_token_indices=vision_token_indices,
                 )
             else:
                 decoder_input = text_embeddings
 
+        attention_mask = self.prepare_attention_mask(
+            input_ids, attention_mask, packed_seq_params=packed_seq_params
+        )
+
         (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
         ) = self._cp_split_for_forward(
             decoder_input=decoder_input,
             input_ids=input_ids,

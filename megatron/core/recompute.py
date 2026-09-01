@@ -51,10 +51,24 @@ def checkpointed_forward(
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
 
+    # ``CheckpointFunction`` can save only tensors (and ``None``). Some sparse-attention
+    # variants carry compact, read-only metadata objects as ``attention_mask`` instead of a
+    # dense tensor. Keep that metadata in this invocation's closure and pass a ``None``
+    # placeholder through the checkpoint autograd function. The metadata is derived from token
+    # IDs, never requires gradients, and the same object must be reused during recomputation.
+    attention_mask_metadata = (
+        attention_mask
+        if attention_mask is not None and not isinstance(attention_mask, Tensor)
+        else None
+    )
+    checkpoint_attention_mask = None if attention_mask_metadata is not None else attention_mask
+
     def custom(start: int, end: int):
         def custom_forward(
             hidden_states, attention_mask, context, context_mask, rotary_pos_emb, padding_mask=None
         ):
+            if attention_mask_metadata is not None:
+                attention_mask = attention_mask_metadata
             for index in range(start, end):
                 # Use self.layers[index] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
@@ -124,7 +138,14 @@ def checkpointed_forward(
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
         nonlocal hidden_states, context
         cf = custom(start, end)
-        args = (hidden_states, attention_mask, context, context_mask, rotary_pos_emb, padding_mask)
+        args = (
+            hidden_states,
+            checkpoint_attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb,
+            padding_mask,
+        )
         if use_checkpoint:
             # Precision-aware activation checkpoint: TE under FP8/FP4,
             # tensor_parallel under BF16/FP16/FP32.

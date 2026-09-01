@@ -887,6 +887,14 @@ class TransformerConfig(ModelParallelConfig):
     The routing decision is based on the sum of the routing scores and the expert bias.
     See https://arxiv.org/abs/2408.15664 for details."""
 
+    moe_router_enable_vl_bias: bool = False
+    """Use a second dynamic expert-selection bias for vision-language tokens.
+
+    Tokens whose IDs are greater than or equal to ``actual_vocab_size`` use the VL bias.
+    This matches DeepSeek-V4-Vision, where synthetic image token IDs use learned routing in
+    hash-routed layers and a distinct expert bias in the remaining MoE layers.
+    """
+
     moe_router_bias_update_rate: float = 1e-3
     """The expert bias is updated based on the number of assigned tokens to each expert
     in a global batch, where the bias is increased for the experts with less assigned tokens
@@ -2986,6 +2994,16 @@ class TransformerConfig(ModelParallelConfig):
                 "score functions. Please set --moe-router-score-function to 'sigmoid' or "
                 "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
             )
+
+        if self.moe_router_enable_vl_bias:
+            if not self.moe_router_enable_expert_bias:
+                raise ValueError(
+                    "Vision-language expert bias requires moe_router_enable_expert_bias=True."
+                )
+            if self.actual_vocab_size is None:
+                raise ValueError(
+                    "actual_vocab_size must be set when moe_router_enable_vl_bias=True."
+                )
 
         if self.moe_n_hash_layers > 0:
             assert (

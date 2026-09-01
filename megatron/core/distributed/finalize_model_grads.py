@@ -326,6 +326,12 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
             ):
                 module.local_tokens_per_expert.zero_()
             if (
+                config.moe_router_enable_vl_bias
+                and hasattr(module, 'expert_bias_vl')
+                and module.expert_bias_vl is not None
+            ):
+                module.local_tokens_per_expert_vl.zero_()
+            if (
                 config.moe_router_load_balancing_type == "global_aux_loss"
                 or "global_aux_loss" in config.moe_router_load_balancing_type
             ) and hasattr(module, 'reset_global_aux_loss_tracker'):
@@ -349,14 +355,15 @@ def _update_router_expert_bias(
             # cases where only the student is in training mode but the teacher is in eval mode
             # when using online knoweldge-distillation with Model-Optimizer. In this case, we want
             # to avoid updating teacher's expert_bias.
-            if (
-                hasattr(module, 'expert_bias')
-                and module.training
-                and module.expert_bias is not None
-                and not getattr(module, 'frozen_expert_bias', False)
-            ):
-                tokens_per_expert_list.append(module.local_tokens_per_expert)
-                expert_bias_list.append(module.expert_bias)
+            if module.training and not getattr(module, 'frozen_expert_bias', False):
+                for bias_name, counts_name in (
+                    ('expert_bias', 'local_tokens_per_expert'),
+                    ('expert_bias_vl', 'local_tokens_per_expert_vl'),
+                ):
+                    expert_bias = getattr(module, bias_name, None)
+                    if expert_bias is not None:
+                        tokens_per_expert_list.append(getattr(module, counts_name))
+                        expert_bias_list.append(expert_bias)
     # For hybrid models with both MoE and Dense layers, this list can be empty.
     if len(expert_bias_list) == 0:
         return

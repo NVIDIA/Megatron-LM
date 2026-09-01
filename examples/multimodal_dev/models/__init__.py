@@ -33,6 +33,16 @@ Registry entry fields
     ``(train_val_test_num_samples) -> (train_ds, val_ds, test_ds)``.
 """
 
+from examples.multimodal_dev.models.deepseek_v4.configuration import get_deepseek_v4_vision_config
+from examples.multimodal_dev.models.deepseek_v4.factory import (
+    build_model as _build_deepseek_v4_model,
+)
+from examples.multimodal_dev.models.deepseek_v4.factory import (
+    post_language_config as _deepseek_v4_post_language_config,
+)
+from examples.multimodal_dev.models.deepseek_v4.factory import (
+    set_vision_flops_metadata as _deepseek_v4_vision_flops,
+)
 from examples.multimodal_dev.models.qwen35_vl.configuration import get_qwen35_vl_vision_config
 from examples.multimodal_dev.models.qwen35_vl.factory import build_model as _build_qwen35_vl_model
 from examples.multimodal_dev.models.qwen35_vl.factory import (
@@ -43,19 +53,27 @@ from examples.multimodal_dev.models.qwen35_vl.factory import (
 )
 
 MODEL_REGISTRY = {
+    "deepseek_v4_vision": {
+        "model_factory_fn": _build_deepseek_v4_model,
+        "vision_config_fn": get_deepseek_v4_vision_config,
+        "post_language_config_fn": _deepseek_v4_post_language_config,
+        "vision_flops_fn": _deepseek_v4_vision_flops,
+        "dataset_providers": {
+            "mock": (
+                "examples.multimodal_dev.data.deepseek_v4_mock"
+                ".train_valid_test_datasets_provider"
+            )
+        },
+    },
     "qwen35_vl": {
         "model_factory_fn": _build_qwen35_vl_model,
         "vision_config_fn": get_qwen35_vl_vision_config,
         "post_language_config_fn": _qwen35_vl_post_language_config,
         "vision_flops_fn": _qwen35_vl_vision_flops,
         "dataset_providers": {
-            "mock": (
-                "examples.multimodal_dev.data.mock"
-                ".train_valid_test_datasets_provider"
-            ),
+            "mock": ("examples.multimodal_dev.data.mock" ".train_valid_test_datasets_provider"),
             "cord_v2": (
-                "examples.multimodal_dev.data.cord_v2"
-                ".train_valid_test_datasets_provider"
+                "examples.multimodal_dev.data.cord_v2" ".train_valid_test_datasets_provider"
             ),
         },
     },

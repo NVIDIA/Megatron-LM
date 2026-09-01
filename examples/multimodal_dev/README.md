@@ -14,7 +14,8 @@ multimodal_dev/
 │   └── mock.py              # Mock dataset for end-to-end testing
 ├── models/
 │   ├── __init__.py          # MODEL_REGISTRY — central model registry
-│   ├── base.py              # MultimodalModel base class (vision encoder + GPTModel)
+│   ├── base.py              # Shared vision + language assembly
+│   ├── deepseek_v4/         # DeepSeek-V4-Flash-Vision + HybridModel
 │   └── qwen35_vl/           # Qwen3.5-VL architecture
 │       ├── factory.py       # Factory functions for pretrain entry point
 │       ├── model.py         # Qwen35VLModel (MRoPE, vision encoder wiring)
@@ -33,6 +34,41 @@ torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
     --dataset-provider mock \
     ... # other Megatron args (--num-layers, --hidden-size, etc.)
 ```
+
+## DeepSeek-V4-Flash-Vision
+
+The native `deepseek_v4_vision` path implements the public
+`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` architecture:
+
+- 32-layer, 1024-wide ViT with full per-image attention and 2D RoPE;
+- the 3x3 pad-and-unfold aligner and official N-layout permutation;
+- four decoder-side image boundary/padding embeddings;
+- the existing DSv4 `hybrid_dsv4_stack_spec` decoder with the 43-block
+  `W/W/C/(H/C)x20` attention layout;
+- bidirectional visibility inside each image span while preserving sparse
+  causal attention outside it; and
+- VL-aware routing for synthetic image IDs, including the first three
+  hash-routed MoE layers.
+
+MTP is intentionally out of scope for this first phase: the model rejects a
+`--hybrid-layer-pattern` containing `/` MTP segments. The model forward accepts
+precomputed `vision_embeddings` and optional `vision_token_indices`;
+constructing with `build_vision_encoder=False` (or passing
+`--use-external-vision-embeddings`) leaves the same decoder-side contract for a
+future MDP vision stage.
+
+This first phase implements the architecture and training path only; conversion
+from the published Hugging Face checkpoint is not included yet.
+
+Start with a dry run of the proxy recipe:
+
+```bash
+bash examples/multimodal_dev/scripts/run_deepseek_v4_vision.sh
+```
+
+Set `DRY_RUN=0` to execute it. `MODEL_VARIANT=flash` selects the full 43-layer
+decoder / 32-layer vision tower. The current image-span visibility path supports
+CP=1; context-parallel image spans require a later CSA/MDP transport extension.
 
 ## Checkpoint Conversion (HF → Megatron-FSDP DTensor)
 

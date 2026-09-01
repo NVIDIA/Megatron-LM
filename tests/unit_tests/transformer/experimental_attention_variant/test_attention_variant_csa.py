@@ -16,6 +16,7 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressorSubmodules,
     CSAIndexer,
     CSAIndexerSubmodules,
+    SparseAttentionVisibility,
     _apply_rope,
     _compute_unfused_csa_non_compressed_lse,
     build_cu_seqlens_kv_full,
@@ -24,6 +25,8 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     get_compress_topk_idxs_thd,
     get_window_topk_idxs,
     get_window_topk_idxs_thd,
+    get_window_topk_idxs_visible,
+    get_window_topk_idxs_visible_thd,
     unfused_compressed_sparse_attn,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
@@ -80,6 +83,37 @@ class _SingleRankTP:
 
 class _SingleRankPG:
     tp = _SingleRankTP()
+
+
+def test_visible_window_extends_bidirectionally_inside_image_span():
+    visibility = SparseAttentionVisibility(
+        left=torch.tensor([[0, 0, 0, 1, 2, 3, 0, 0]], dtype=torch.int32),
+        right=torch.tensor([[0, 0, 3, 2, 1, 0, 0, 0]], dtype=torch.int32),
+        max_span=4,
+    )
+
+    indices = get_window_topk_idxs_visible(3, 8, visibility, torch.device("cpu"))
+
+    assert indices.shape == (1, 8, 7)
+    assert torch.equal(indices[0, 2, :6], torch.arange(6, dtype=torch.int32))
+    assert torch.equal(indices[0, 5, :5], torch.arange(1, 6, dtype=torch.int32))
+    assert torch.equal(indices[0, 6, :3], torch.arange(4, 7, dtype=torch.int32))
+    assert torch.all(indices[0, 6, 3:] == -1)
+
+
+def test_visible_window_thd_keeps_indices_local_to_each_segment():
+    cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+    visibility = SparseAttentionVisibility(
+        left=torch.tensor([[0, 0, 0, 0, 0, 1, 2, 0]], dtype=torch.int32),
+        right=torch.tensor([[0, 0, 0, 0, 2, 1, 0, 0]], dtype=torch.int32),
+        max_span=3,
+    )
+
+    indices = get_window_topk_idxs_visible_thd(2, cu_seqlens, visibility, total_q=8)
+
+    # Global row 4 is local position 0 of segment 2 and sees its full local image span.
+    assert torch.equal(indices[4, :3], torch.tensor([0, 1, 2], dtype=torch.int32))
+    assert indices[4].max() < 4
 
 
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
