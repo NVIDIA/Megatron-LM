@@ -1168,6 +1168,7 @@ class TestMHCWithCudaGraph:
         cu_seqlens_kv = cu_seqlens_q.clone()
         cu_seqlens_q_padded = torch.tensor([0, 4, 8], dtype=torch.int32, device="cuda")
         cu_seqlens_kv_padded = cu_seqlens_q_padded.clone()
+        static_cp_group = object()
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens_q,
@@ -1177,6 +1178,7 @@ class TestMHCWithCudaGraph:
             max_seqlen_q=4,
             max_seqlen_kv=4,
             tokens_per_sample=8,
+            cp_group=static_cp_group,
         )
         padding_mask = torch.zeros((1, 8), dtype=torch.bool, device="cuda")
         input_ids = torch.arange(8, device="cuda").unsqueeze(0)
@@ -1210,6 +1212,32 @@ class TestMHCWithCudaGraph:
         assert recorded["mlp_kwargs"]["padding_mask"] is padding_mask
         assert recorded["mlp_kwargs"]["input_ids"] is input_ids
         assert recorded["mlp_kwargs"]["packed_seq_params"] is packed_seq_params
+        assert recorded["mlp_kwargs"]["packed_seq_params"].cp_group is static_cp_group
+
+    @pytest.mark.parametrize(
+        ("local_cp_size", "cp_group"),
+        [
+            pytest.param(1, None, id="cp1-without-group"),
+            pytest.param(2, object(), id="cp2-with-group"),
+        ],
+    )
+    def test_split_public_replay_rejects_runtime_dynamic_cp_metadata_before_decomposition(
+        self, local_cp_size, cp_group, monkeypatch
+    ):
+        """Runtime Dynamic-CP metadata must not replay against captured fixed groups."""
+        layer, config = self._create_split_layer()
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd", local_cp_size=local_cp_size, cp_group=cp_group
+        )
+        hidden = torch.randn(8, 2, config.num_residual_streams * config.hidden_size, device="cuda")
+        monkeypatch.setattr(
+            layer,
+            "_decompose_packed_seq_params_to_kwargs",
+            lambda _kwargs: pytest.fail("Dynamic-CP metadata was decomposed before validation"),
+        )
+
+        with pytest.raises(NotImplementedError, match="does not support Dynamic CP"):
+            layer._te_cuda_graph_replay(hidden, packed_seq_params=packed_seq_params)
 
     def test_split_capture_reconstructs_static_cp_packed_sequence(self, monkeypatch):
         """Capture rebuilds graph-static PackedSeqParams from flat THD tensors."""
@@ -1412,13 +1440,56 @@ class TestMHCWithCudaGraph:
             for packed_seq_params in packed_inputs:
                 layer.zero_grad(set_to_none=True)
                 hidden_states = base_hidden_states.clone().requires_grad_(True)
+                manager = MHCCheckpointManager()
+                manager.is_last_layer_in_recompute_block = True
                 output, context = layer(
-                    hidden_states, packed_seq_params=packed_seq_params, padding_mask=padding_mask
+                    hidden_states,
+                    packed_seq_params=packed_seq_params,
+                    padding_mask=padding_mask,
+                    mhc_recompute_manager=manager,
                 )
+
+                assert manager.checkpoints
+                arena_checkpoints = [
+                    checkpoint
+                    for checkpoint in manager.checkpoints
+                    if checkpoint.output_slot is not None
+                ]
+                assert len(arena_checkpoints) == 1
+                non_arena_outputs = [
+                    checkpoint_output
+                    for checkpoint in manager.checkpoints
+                    if checkpoint.output_slot is None
+                    for checkpoint_output in checkpoint.outputs
+                ]
+                assert non_arena_outputs
+                static_graph_input = layer.get_te_cuda_graph_static_hidden_input()
+                arena_checkpoint = arena_checkpoints[0]
+                assert len(manager.mhc_arena.slots) == 1
+                assert manager.mhc_arena.slots[0].consumer is static_graph_input
+                assert arena_checkpoint.outputs[0].data_ptr() == static_graph_input.data_ptr()
+
+                # Mirror TransformerBlock's group-finalization lifecycle. The
+                # static graph input keeps its address while eager checkpoint
+                # outputs are discarded, then the output hook replays the whole
+                # group before captured attention backward consumes that input.
+                manager.discard_all_outputs_and_register_unified_recompute(output)
+                assert manager._outputs_discarded
+                assert all(
+                    checkpoint_output.untyped_storage().nbytes() == 0
+                    for checkpoint_output in non_arena_outputs
+                )
+                assert arena_checkpoint.outputs[0].data_ptr() == static_graph_input.data_ptr()
+
                 loss = output.float().square().mean()
                 loss.backward()
 
                 assert context is None
+                assert manager._recomputed
+                assert all(
+                    checkpoint.ctx is None and checkpoint.outputs is None
+                    for checkpoint in manager.checkpoints
+                )
                 assert torch.isfinite(output).all()
                 assert hidden_states.grad is not None
                 assert torch.isfinite(hidden_states.grad).all()

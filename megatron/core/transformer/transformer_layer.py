@@ -2176,6 +2176,19 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
         return self._forward_mhc_attention_cuda_graph_consumer(*args, **kwargs)
 
+    def _te_cuda_graph_replay(self, *args, **kwargs):
+        """Reject runtime Dynamic-CP metadata before the split replay decomposes it."""
+        if self._uses_mhc_recompute_attn_cuda_graph_split():
+            packed_seq_params = kwargs.get("packed_seq_params")
+            if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+                raise NotImplementedError(
+                    "mhc_recompute_attn_cuda_graph_split does not support Dynamic CP: "
+                    "PackedSeqParams.local_cp_size selects per-batch CP geometry, which "
+                    "cannot be replayed by a Transformer Engine CUDA Graph with fixed "
+                    "tensor shapes and collective topology."
+                )
+        return super()._te_cuda_graph_replay(*args, **kwargs)
+
     def _forward_mhc_attention_post_cuda_graph(
         self,
         attention_output_with_bias,
