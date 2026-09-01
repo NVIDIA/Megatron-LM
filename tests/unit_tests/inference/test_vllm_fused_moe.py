@@ -1110,7 +1110,19 @@ def _ref_sequential_moe_clamped(
     """Sequential per-token reference with the tanh soft-clamped squared-ReLU activation.
 
     Mirrors _ref_sequential_moe with ``squared_relu(s * tanh(x / s))`` in place of
-    ``squared_relu(x)``.
+    ``squared_relu(x)``, but also models the two BF16 roundings the kernel performs inside
+    the activation. Unlike the unclamped reference — whose 0.01-scale weights keep every
+    intermediate small enough for atol to swallow the rounding — the clamp only bites when
+    the pre-activation is large, and at that scale the roundings move the result by more
+    than the tolerance:
+
+      1. the clamped pre-activation is rounded to BF16 before the square, matching
+         training's ``weighted_clamped_squared_relu`` (a 2x relative error once squared);
+      2. the squared activation is rounded to BF16 on its way into the FC1 output buffer,
+         which is what FC2 actually reads.
+
+    The FC2 output is likewise BF16 before ``_moe_sum`` applies the FP32 routing
+    probability, so that rounding is modelled too.
     """
     max_tokens, topk = routing_map.shape
     hidden_size = hidden_states.shape[1]
@@ -1121,9 +1133,10 @@ def _ref_sequential_moe_clamped(
             if not 0 <= lid < num_local_experts:
                 continue
             fc1_out = hidden_states[t].float() @ fc1_weight[lid].float().T
-            clamped = clamp_scale * torch.tanh(fc1_out / clamp_scale)
-            activated = torch.clamp(clamped, min=0.0) ** 2
-            out[t] += probs[t, k].item() * (activated @ fc2_weight[lid].float().T)
+            clamped = (clamp_scale * torch.tanh(fc1_out / clamp_scale)).to(torch.bfloat16)
+            activated = (torch.clamp(clamped.float(), min=0.0) ** 2).to(torch.bfloat16)
+            fc2_out = (activated.float() @ fc2_weight[lid].float().T).to(torch.bfloat16)
+            out[t] += probs[t, k].item() * fc2_out.float()
     return out
 
 
