@@ -8,7 +8,7 @@ import math
 import os
 import time
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
@@ -504,19 +504,18 @@ fwd_buffer_reuse_ref_count = 0
 bwd_buffer_reuse_ref_count = 0
 
 
-def _backup_grads_before_capture(runner):
-    """Snapshot main_grad so create_fwd_graph's eager warmup can't corrupt the finalized grads;
-    restore with '_restore_grads_after_capture'.
-    """
+def _backup_grads_before_capture(runner, parameters=None):
+    """Snapshot main_grad so CUDA-graph capture cannot corrupt finalized gradients."""
     backup = {}
-    for p in runner.base_module.parameters():
+    parameters = tuple(runner.base_module.parameters() if parameters is None else parameters)
+    for p in parameters:
         mg = getattr(p, "main_grad", None)
         if mg is not None:
             backup[id(p)] = (p, mg.clone())
 
     if runner.gtp_remat:
         # GTP only: also protect the cross-graph next_w the cascade accumulates into.
-        for p in runner.base_module.parameters():
+        for p in parameters:
             nw = getattr(p, "next_w", None) if getattr(p, "is_gtp_weight_remat", False) else None
             if nw is None:
                 continue
@@ -532,6 +531,38 @@ def _restore_grads_after_capture(backup):
     """Restore the main_grad snapshots taken by '_backup_grads_before_capture'."""
     for p, saved in backup.values():
         p.main_grad.copy_(saved)
+
+
+@contextmanager
+def _preserve_parameter_grads_during_backward_capture(runner):
+    """Give each backward runner fresh accumulation state without changing the training step."""
+
+    parameters = tuple(runner.params_to_backprop)
+    main_grad_backup = _backup_grads_before_capture(runner, parameters=parameters)
+    missing = object()
+    parameter_state = [
+        (param, param.grad, getattr(param, "grad_added_to_main_grad", missing))
+        for param in parameters
+    ]
+
+    # A module can back multiple runners, as with a repeated MTP layer. Each runner must capture
+    # its own contribution instead of inheriting another runner's accumulation flag or stale grad.
+    for param, _, _ in parameter_state:
+        param.grad = None
+        if hasattr(param, "grad_added_to_main_grad"):
+            param.grad_added_to_main_grad = False
+
+    try:
+        yield
+    finally:
+        _restore_grads_after_capture(main_grad_backup)
+        for param, grad, grad_added_to_main_grad in parameter_state:
+            param.grad = grad
+            if grad_added_to_main_grad is missing:
+                if hasattr(param, "grad_added_to_main_grad"):
+                    delattr(param, "grad_added_to_main_grad")
+            else:
+                param.grad_added_to_main_grad = grad_added_to_main_grad
 
 
 class _CudagraphGlobalRecord:
@@ -990,9 +1021,9 @@ class _CudaGraphRunner(torch.nn.Module):
         self.needs_recompute_param_discovery = False
         self.use_stream = False
         self.gtp_remat = False
-        # Populated by create_bwd_graph: GTP params whose main_grad.add_ was captured in THIS
-        # graph.  Used in Graphed.backward's post-replay hook loop to fire DDP hooks only in the
-        # graph whose replay populates main_grad.
+        # Populated by create_bwd_graph: one entry per captured GTP wgrad-finalization occurrence.
+        # Repeated parameters intentionally appear more than once so replay matches eager DDP
+        # grad-ready accounting.
         self.finalized_during_bwd_capture = []
         # (rs_stream, params) DDP grad-ready hook plan; built in create_bwd_graph.
         self._gtp_finalize_hook_plan = []
@@ -1059,31 +1090,26 @@ class _CudaGraphRunner(torch.nn.Module):
         for s in side_streams:
             torch.cuda.current_stream().wait_stream(s)
 
-    def _compute_finalized_during_bwd_capture(self):
-        """Return GTP params whose DDP grad-ready hook fires post-replay
-        of THIS bwd_graph.
+    def _set_gtp_finalize_hook_plan(self, finalized_params):
+        """Build the replay hook plan from captured GRAPHED finalization occurrences."""
+        self.finalized_during_bwd_capture = list(finalized_params) if self.gtp_remat else []
+        self._gtp_finalize_hook_plan = []
+        if not self.finalized_during_bwd_capture:
+            return
 
-        A param's hook must fire in the graph that physically populates its
-        main_grad. Rules, given the cascade walk in wgrad_reduce_scatter
-        finalizes p.next_w on behalf of p:
-          - p.prev_w is None → p is sync-finalized in p's own graph; add p.
-          - p.next_w is not None → p.next_w's main_grad.add_ is captured here
-            via p's cascade; add p.next_w. (For cross-graph chain tails the
-            wait was captured in the producer's Phase 2, but the add lives
-            here regardless, bridged by external rs_event.)
-        """
-        finalized = {}  # id → param
-        for p in self.params_to_backprop:
-            if not getattr(p, 'is_gtp_weight_remat', False):
-                continue
-            if getattr(p, "prev_w", None) is None:
-                for w in getattr(p, "_weights", [p]):
-                    finalized[id(w)] = w
-            next_w = getattr(p, "next_w", None)
-            if next_w is not None:
-                for w in getattr(next_w, "_weights", [next_w]):
-                    finalized[id(w)] = w
-        return list(finalized.values())
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["gtp_remat", "expt_gtp_remat"]
+        )
+        dense_group = pg_collection.gtp_remat
+        expert_group = pg_collection.expt_gtp_remat
+        params_by_group = defaultdict(list)
+        for param in self.finalized_during_bwd_capture:
+            is_expert = not getattr(param, 'allreduce', True)
+            params_by_group[expert_group if is_expert else dense_group].append(param)
+        self._gtp_finalize_hook_plan = [
+            (get_rs_stream(GTPChain.GRAPHED.value, group), params)
+            for group, params in params_by_group.items()
+        ]
 
     def __str__(self):
         return "%s; hid %s" % (
@@ -1517,6 +1543,7 @@ class _CudaGraphRunner(torch.nn.Module):
         capture_comm_context = track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
         with (
             capture_comm_context as capture_comms,
+            _preserve_parameter_grads_during_backward_capture(self),
             torch.cuda.graph(self.bwd_graph, pool=self.mempool),
         ):
 
@@ -1575,29 +1602,8 @@ class _CudaGraphRunner(torch.nn.Module):
         if FREEZE_GC:
             gc.unfreeze()
 
-        # See _compute_finalized_during_bwd_capture for what's in this set and why.
-        self.finalized_during_bwd_capture = (
-            self._compute_finalized_during_bwd_capture() if self.gtp_remat else []
-        )
         self._gtp_wgrad_ring_slots = list(capture_comms.wgrad_ring_slots) if self.gtp_remat else []
-
-        # Precompute the (rs_stream, params) DDP grad-ready hook plan once — it's
-        # replay-invariant — so Graphed.backward avoids per-replay group lookups.
-        self._gtp_finalize_hook_plan = []
-        if self.gtp_remat and self.finalized_during_bwd_capture:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=["gtp_remat", "expt_gtp_remat"]
-            )
-            dense_group = pg_collection.gtp_remat
-            expert_group = pg_collection.expt_gtp_remat
-            params_by_group = defaultdict(list)
-            for param in self.finalized_during_bwd_capture:
-                is_expert = not getattr(param, 'allreduce', True)
-                params_by_group[expert_group if is_expert else dense_group].append(param)
-            self._gtp_finalize_hook_plan = [
-                (get_rs_stream(GTPChain.GRAPHED.value, group), params)
-                for group, params in params_by_group.items()
-            ]
+        self._set_gtp_finalize_hook_plan(capture_comms.finalized_params if self.gtp_remat else ())
 
         for arg in args_to_clear_buffers:
             arg.cg_buffer_metadata.bwd_cudagraph_buffer = None
@@ -2707,6 +2713,10 @@ class TECudaGraphHelper:
                 # Starting from TE 2.7.0, make_graphed_callables() optimizes the graph memory usage
                 # by reusing input/output data buffers between graphs.
                 kwargs['_reuse_graph_input_output_buffers'] = True
+            if is_te_min_version("2.19.0"):
+                # MCore consumes parameter gradients through its accumulation hooks during each
+                # replay, before TE can overwrite the static buffers on a later replay.
+                kwargs['clone_param_grads_on_return'] = False
 
             if sample_kwargs:
                 kwargs['sample_kwargs'] = sample_kwargs

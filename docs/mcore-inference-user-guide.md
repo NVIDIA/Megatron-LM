@@ -110,7 +110,7 @@ and are expected to narrow this gap as they are merged.
 
 | Area | Features |
 |---|---|
-| **Batching** | Dynamic or in-flight batching with vectorized bookkeeping, dynamic suspend and resume, and request eviction for high input-rate regimes. Optional [async scheduling](#async-scheduling) moves the host-side bookkeeping off the critical path |
+| **Batching** | Dynamic or in-flight batching with vectorized bookkeeping, dynamic suspend and resume, and request eviction for high input-rate regimes. [Async scheduling](#async-scheduling), enabled by default, moves host-side bookkeeping off the critical path |
 | **Chunked prefill** | Chunked-prefill scheduling with decode piggybacking, so long prompts don't stall in-flight decodes |
 | **Attention and KV cache** | Optimized PagedAttention with prefix caching (LRU and ref-zero eviction, prefix-aware and load-aware coordinator routing, Mamba-state prefix caching for hybrid models). Sliding-window and sink attention are supported |
 | **CUDA graphs** | Full-model CUDA graphs for prefill, decode, and mixed batches. Prefill and mixed steps up to `cuda_graph_max_tokens` (512 by default) get a graph instead of falling back to eager |
@@ -415,7 +415,7 @@ used fields:
 | `prefix_caching_mamba_gb` | GPU budget for the Mamba-state prefix cache on hybrid models |
 | `num_speculative_tokens` | MTP-based speculative decoding |
 | `num_cuda_graphs`, `cuda_graph_max_tokens`, `cuda_graph_all_prefills`, `cuda_graph_sizing_distribution` | CUDA-graph capture controls. `cuda_graph_max_tokens` (512) bounds prefill and mixed graphs; `cuda_graph_all_prefills` extends capture to the full `max_tokens`; the sizing distribution is `exponential` (default) or `linear` |
-| `async_sched_mode` | `'legacy'` (default) or `'async'`. Refer to [Async Scheduling](#async-scheduling) |
+| `async_sched_mode` | `'async'` (default) or `'legacy'`. Refer to [Async Scheduling](#async-scheduling) |
 | `sampling_backend` | `'torch'` (default) or `'flashinfer'` |
 | `logprobs_mode` | `'raw_logprobs'` (default) or `'processed_logprobs'` |
 | `materialize_only_last_token_logits` | Set `False` when returning *prompt* log-probs |
@@ -485,23 +485,22 @@ refit call itself.
 
 ## Async Scheduling
 
-By default the engine resolves the previous step's requests before preparing the
-next forward pass, so host-side bookkeeping sits on the critical path. Async
-scheduling reorders those phases to prepare-before-resolve, overlapping the
-bookkeeping with GPU work.
-
-Turn it on with `InferenceConfig.async_sched_mode`, or
-`--inference-dynamic-batching-async-sched-mode async` on the command line. The
-default is `legacy`, so this is opt-in:
+Async scheduling reorders request processing to prepare the next forward pass
+before resolving the previous one, overlapping host-side bookkeeping with GPU
+work. It is enabled by default. Select legacy scheduling explicitly when a
+feature such as MoE router replay requires it:
 
 ```python
 from megatron.core.inference.config import AsyncScheduleMode, InferenceConfig
 
 inference_config = InferenceConfig(
     max_sequence_length=4096,
-    async_sched_mode=AsyncScheduleMode.ASYNC,   # or the string "async"
+    async_sched_mode=AsyncScheduleMode.LEGACY,   # or the string "legacy"
 )
 ```
+
+The equivalent command-line option is
+`--inference-dynamic-batching-async-sched-mode legacy`.
 
 The engine decides per step whether overlapping is profitable, so enabling the
 mode does not force overlap on every step. Restrictions to be aware of:
@@ -604,6 +603,10 @@ response/reasoning/tool parsers, named by their registry keys:
 (`False` — per-request logging), `frontend_replicas` (`4` — HTTP frontend
 processes on the primary rank), and `sock` (`None` — an already-bound listening
 socket to use instead of binding `host:port`).
+`default_temperature` (`1.0`), `default_top_p` (`1.0`), and `default_top_k`
+(`0`) provide sampling defaults for HTTP requests that omit those fields.
+`eval_mode` (`False`) switches the frontend to evaluation-oriented response
+defaults, avoiding prompt-token transmission unless a request opts in.
 
 The same call works from a synchronous launcher:
 
