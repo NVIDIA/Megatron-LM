@@ -1695,6 +1695,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 block_size_tokens=self.context.block_size_tokens,
                 enable_prefix_caching=self.context.enable_prefix_caching,
                 precomputed_block_hashes=precomputed_block_hashes or [],
+                # Text-only requests are the common case for a refit, so this is
+                # the path the weight scoping exists for. Note that hashes handed
+                # in by a caller are used as-is: __post_init__ only computes when
+                # none were supplied, so a disaggregated handoff carries the
+                # generation its sender hashed under.
+                block_hash_salt=_weight_scoped_salt(self._weight_epoch, None),
             )
 
         return self._add_request(request)

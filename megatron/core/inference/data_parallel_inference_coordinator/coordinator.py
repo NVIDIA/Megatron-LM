@@ -387,7 +387,7 @@ class DataParallelInferenceCoordinator:
                 chain for multimodal affinity.
 
         Returns:
-            List of integer routing hashes, or empty list if prefix caching is disabled.
+            List of integer routing hashes, one per complete block in the prompt.
         """
         if isinstance(prompt, str):
             tokens = self.tokenizer.tokenize(prompt)

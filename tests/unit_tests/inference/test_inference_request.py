@@ -488,3 +488,50 @@ def test_weight_scoped_salt_keeps_media_identity_distinct():
     )
     assert set(a).isdisjoint(b)
     assert set(a).isdisjoint(text)
+
+
+def test_text_request_hashes_are_scoped_to_the_weight_generation():
+    """A text-only request must not match blocks hashed under earlier weights.
+
+    The salt is only worth anything if it reaches the path that carries the
+    common case; testing the helper alone would pass with the engine never
+    applying it.
+    """
+    from megatron.core.inference.engines.dynamic_engine import _weight_scoped_salt
+
+    tokens = list(range(8))
+
+    def hashes_at(epoch):
+        request = DynamicInferenceRequest(
+            request_id=0,
+            prompt="",
+            prompt_tokens=torch.tensor(tokens, dtype=torch.int64),
+            block_size_tokens=4,
+            enable_prefix_caching=True,
+            block_hash_salt=_weight_scoped_salt(epoch, None),
+        )
+        return request.precomputed_block_hashes
+
+    before, after = hashes_at(1), hashes_at(2)
+    assert before and after
+    assert set(before).isdisjoint(after), "a refit must make earlier blocks unmatchable"
+    assert hashes_at(1) == before, "hashes must be stable within one generation"
+
+
+def test_supplied_block_hashes_are_not_re_salted():
+    """Hashes handed in by a caller are used as-is.
+
+    A disaggregated handoff carries hashes its sender already computed; the
+    receiver must adopt them rather than recompute under its own generation, or
+    the imported KV would be unreachable.
+    """
+    request = DynamicInferenceRequest(
+        request_id=0,
+        prompt="",
+        prompt_tokens=torch.tensor(list(range(8)), dtype=torch.int64),
+        block_size_tokens=4,
+        enable_prefix_caching=True,
+        precomputed_block_hashes=[11, 22],
+        block_hash_salt="w9",
+    )
+    assert request.precomputed_block_hashes == [11, 22]

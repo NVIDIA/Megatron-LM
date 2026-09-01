@@ -1022,3 +1022,32 @@ class TestRoutingPolicies:
         assert "removed engine" in caplog.text
         assert coord.router_socket.send_multipart.call_args[0][0][0] == b"client-A"
         assert 11 not in coord.request_id_to_client_id
+
+
+def test_engine_reply_defaults_to_detokenizing():
+    """A client that says nothing still gets its reply detokenized.
+
+    Coordinator-side detokenization was unconditional before reply bodies became
+    opaque frames. Keeping the default on means the frames change is invisible to
+    clients that relied on it; only a client that opts out pays nothing for it.
+    """
+    from megatron.core.inference.sampling_params import SamplingParams
+
+    metadata = msgpack.unpackb(
+        _engine_reply_frames([{"request_id": 3, "sampling_params": SamplingParams().serialize()}])[
+            0
+        ],
+        raw=False,
+    )
+    assert metadata[1] == [[3, True]]
+
+
+def test_engine_reply_honours_an_opt_out():
+    """A client that detokenizes for itself lets the coordinator skip the body."""
+    from megatron.core.inference.sampling_params import SamplingParams
+
+    params = SamplingParams(detokenize_generations=False).serialize()
+    metadata = msgpack.unpackb(
+        _engine_reply_frames([{"request_id": 4, "sampling_params": params}])[0], raw=False
+    )
+    assert metadata[1] == [[4, False]]

@@ -38,6 +38,12 @@ class SamplingParams:
     # drops prompt_tokens before serializing the finished request, saving the ZMQ
     # transmission cost for long prompts. Opt in when the client needs them.
     return_prompt_tokens: bool = False
+    # Whether the coordinator should detokenize the finished request before
+    # forwarding it. True keeps the behaviour every client had before the reply
+    # bodies became opaque frames. Clients that detokenize themselves -- the HTTP
+    # frontend does -- can turn this off, which lets the coordinator forward the
+    # body without decoding and re-encoding it.
+    detokenize_generations: bool = True
     streaming: bool = False  # Emit incremental ENGINE_REPLY_PARTIAL frames.
     streaming_interval: int = 1  # Minimum unsent tokens per ENGINE_REPLY_PARTIAL.
     do_kv_handoff: bool = False  # Pin KV blocks and expose metadata for peer transfer.

@@ -1099,10 +1099,7 @@ def test_streaming_partials_are_sent():
     assert msgpack.unpackb(frames[0], raw=False) == [Headers.ENGINE_REPLY_PARTIAL.value, [7]]
     assert msgpack.unpackb(frames[1], raw=False)["new_tokens"] == [11, 12, 13]
     assert engine._partial_emit_lengths == {7: 3}
-    payload = msgpack.unpackb(
-        engine.socket_for_receiving_requests.send.call_args.args[0], raw=False
-    )
-    partial = payload[1][0]
+    partial = msgpack.unpackb(frames[1], raw=False)
     assert partial["new_top_n_logprobs"] == request.generated_top_n_logprobs
     assert partial["prompt_log_probs"] == request.prompt_log_probs
     assert partial["prompt_top_n_logprobs"] == request.prompt_top_n_logprobs
