@@ -130,6 +130,108 @@ class TestLayerWiseOptimizer:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.parametrize(
+        ("source_offload", "destination_offload"), [(False, True), (True, False)]
+    )
+    def test_chunked_offload_distributed_checkpoint_compatibility(
+        self, tmp_path_dist_ckpt, source_offload, destination_offload
+    ):
+        """Compact Muon checkpoints remain compatible across the offload switch."""
+
+        Utils.initialize_model_parallel(1, 1)
+
+        def clone_to_cpu(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().clone()
+            if isinstance(value, dict):
+                return {key: clone_to_cpu(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [clone_to_cpu(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(clone_to_cpu(item) for item in value)
+            return deepcopy(value)
+
+        def snapshot_optimizer(optimizer):
+            children = getattr(optimizer, 'chained_optimizers', ())
+            if children:
+                return [snapshot_optimizer(child) for child in children]
+
+            snapshot = {'common': clone_to_cpu(optimizer.state_dict())}
+            if hasattr(optimizer, 'model_param_group_index_map'):
+                parameter_state = {}
+                for model_param in optimizer.model_param_group_index_map:
+                    tensors = optimizer._get_main_param_and_optimizer_states(model_param)
+                    parameter_state[optimizer._param_name(model_param)] = {
+                        key: tensor.detach().cpu().clone()
+                        for key, tensor in tensors.items()
+                        if key != 'step'
+                    }
+                snapshot['parameter_state'] = parameter_state
+            return snapshot
+
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / 'layerwise_offload_A', sync=True) as ckpt_dir_A,
+            TempNamedDir(tmp_path_dist_ckpt / 'layerwise_offload_B', sync=True) as ckpt_dir_B,
+        ):
+            metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
+            model_A, optimizer_A = setup_model_and_optimizer(
+                seed=2,
+                tp=1,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                optimizer='dist_muon',
+                use_param_layout=True,
+                chunked_optimizer_state_offload=source_offload,
+                optimizer_state_offload_chunk_size_mb=1,
+            )
+            model_sharded_sd_A = model_A[0].sharded_state_dict()
+            save(optimizer_A.sharded_state_dict(model_sharded_sd_A, metadata=metadata), ckpt_dir_A)
+            source_state = snapshot_optimizer(optimizer_A)
+
+            model_B, optimizer_B = setup_model_and_optimizer(
+                seed=3,
+                tp=1,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                optimizer='dist_muon',
+                use_param_layout=True,
+                chunked_optimizer_state_offload=destination_offload,
+                optimizer_state_offload_chunk_size_mb=1,
+                initialize_optimizer_state=False,
+            )
+            model_sharded_sd_B = model_B[0].sharded_state_dict()
+            load_template = optimizer_B.sharded_state_dict(
+                model_sharded_sd_B, is_loading=True, metadata=metadata
+            )
+            optimizer_B.load_state_dict(load(load_template, ckpt_dir_A))
+            check_equal(source_state, snapshot_optimizer(optimizer_B))
+
+            if destination_offload:
+
+                def collect_managers(optimizer):
+                    managers = []
+                    manager = getattr(optimizer, '_optimizer_state_offloader', None)
+                    if manager is not None:
+                        managers.append(manager)
+                    for child in getattr(optimizer, 'chained_optimizers', ()):
+                        managers.extend(collect_managers(child))
+                    return managers
+
+                managers = collect_managers(optimizer_B)
+                # Compact Muon state and its sibling DistributedOptimizer state must both
+                # preserve CPU canonical storage after the distributed load.
+                assert len(managers) >= 2
+                for manager in managers:
+                    for param in manager.selected_params:
+                        assert param.device.type == 'cpu'
+                        for key, value in manager.optimizer.state[param].items():
+                            if manager._is_offloadable_state(param, key, value):
+                                assert value.device.type == 'cpu'
+
+            save(optimizer_B.sharded_state_dict(model_sharded_sd_B, metadata=metadata), ckpt_dir_B)
+
     def test_parameter_sharding(self):
         """Test that parameters are correctly sharded across DP ranks."""
         Utils.initialize_model_parallel(1, 1)

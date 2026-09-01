@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import List, Optional, Set, Tuple, Union
+from typing import List, Optional, Sequence, Set, Tuple, Union
 
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 
@@ -22,8 +22,45 @@ ALLOWED_INFERENCE_SCOPES: dict[str, Set[InferenceCudaGraphScope]] = {
 }
 
 
+def is_whole_moe_cuda_graph_scope(cuda_graph_modules: Sequence[CudaGraphModule]) -> bool:
+    """Whether a per-layer CUDA graph scope captures the complete MoE module.
+
+    An empty normalized scope represents whole-layer capture, while an explicit
+    ``CudaGraphModule.moe`` captures the complete MoE submodule.
+    """
+
+    return not cuda_graph_modules or CudaGraphModule.moe in cuda_graph_modules
+
+
+def validate_moe_cuda_graph_support(config) -> None:
+    """Validate backend support when the capture includes a whole-MoE module."""
+
+    if (
+        config.num_moe_experts is None
+        or config.num_moe_experts <= 1
+        or not is_whole_moe_cuda_graph_scope(config.cuda_graph_modules)
+        or (
+            config.moe_expert_capacity_factor is not None
+            and config.moe_pad_expert_input_to_capacity
+        )
+    ):
+        return
+
+    assert (
+        config.cuda_graph_impl == "transformer_engine"
+        and config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "hybridep"
+        and config.moe_expert_rank_capacity_factor is not None
+        and config.moe_paged_stash
+        and config.use_transformer_engine_op_fuser
+    ), (
+        "moe cuda graph is only supported with drop-padding MoE or transformer_engine "
+        "sync-free HybridEP with rank capacity and paged stash."
+    )
+
+
 def normalize_cuda_graph_modules(
-    scopes: Optional[Union[str, CudaGraphModule, List[Union[str, CudaGraphModule]]]]
+    scopes: Optional[Union[str, CudaGraphModule, List[Union[str, CudaGraphModule]]]],
 ) -> Tuple[List[CudaGraphModule], List[Tuple[str, str, object]], bool]:
     """Normalize mixed CUDA graph scope inputs into enum values plus deprecation metadata."""
 

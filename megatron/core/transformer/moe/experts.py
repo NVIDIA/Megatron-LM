@@ -292,25 +292,74 @@ class TEGroupedMLP(MegatronModule):
                 self.config.moe_mlp_glu_interleave_size,
             )
 
-        if self.config.fp8 or self.config.fp4:
-            assert HAVE_TE, "FP8 and FP4 requires TE."
-            align_size = 256 if self._with_fused_impl else None
+        self._use_grouped_tensor = self.config.moe_use_grouped_tensor
+        if self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
+            assert HAVE_TE, "Quantized or TE grouped-tensor GroupedMLP execution requires TE."
+            align_size = (
+                get_align_size_for_quantization(self.config) if self._use_grouped_tensor else None
+            )
             self.quantization_padding = Fp8Padding(self.num_local_experts, align_size=align_size)
             self.quantization_unpadding = Fp8Unpadding(
                 self.num_local_experts, align_size=align_size
             )
 
     @staticmethod
+    def _apply_packed_bias(intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs):
+        """Apply a packed expert bias without reading token counts on the host."""
+        # TODO: get rid of the .float() by having fused kernel compute in FP32
+        shape = intermediate_parallel.shape
+        hidden_size = shape[-1]
+        output_dtype = intermediate_parallel.dtype
+        flat_output = intermediate_parallel.view(-1, hidden_size).float()
+        flat_probs = permuted_probs.reshape(-1, 1).float()
+
+        if tokens_per_expert.device != packed_bias.device:
+            raise ValueError("Packed MoE bias and tokens_per_expert must be on the same device.")
+
+        # Permutation stores tokens contiguously by expert. Repeat bias row e by that expert's
+        # token count to create one bias row per permuted token:
+        #
+        #   packed_bias        = [bias_e0, bias_e1]
+        #   tokens_per_expert  = [       2,       1]
+        #   bias_per_token     = [bias_e0, bias_e0, bias_e1]
+        #
+        # output_size avoids a stream synchronization to compute sum(tokens_per_expert).
+        # Cast before repeating so both forward arithmetic and repeat_interleave's backward
+        # reduction are computed in FP32. Autograd casts the final parameter gradient once.
+        bias_per_token = torch.repeat_interleave(
+            packed_bias.float(), tokens_per_expert, dim=0, output_size=flat_output.size(0)
+        )
+        return (flat_output + bias_per_token * flat_probs).view(shape).to(output_dtype)
+
+    @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
             return intermediate_parallel
+
+        # CUDA-graph-safe packed path. With single_grouped_bias=True, TE returns one packed
+        # GroupedTensor [num_experts, hidden_size]. The grouped-tensor backend also provides
+        # tokens_per_expert as a tensor on the same device.
+        if isinstance(bias_parallel, torch.Tensor) and isinstance(tokens_per_expert, torch.Tensor):
+            return TEGroupedMLP._apply_packed_bias(
+                intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs
+            )
+
+        # Eager-only CPU-metadata path. The legacy contract returns List[Tensor[hidden_size]],
+        # and torch.split plus the Python zip below require concrete host token counts. A packed
+        # bias paired with Python counts also uses this compatibility path. Converting a tensor
+        # with .tolist() synchronizes and copies device data to the host, so this path must never
+        # be included in a CUDA graph.
+        if isinstance(tokens_per_expert, torch.Tensor):
+            tokens_per_expert = tokens_per_expert.tolist()
+
         shape = intermediate_parallel.shape
+        flat_output = intermediate_parallel.view(-1, shape[-1])
         return (
             torch.cat(
                 [
                     t + b * p
                     for t, b, p in zip(
-                        torch.split(intermediate_parallel.view(-1, shape[-1]), tokens_per_expert),
+                        torch.split(flat_output, tokens_per_expert),
                         bias_parallel,
                         torch.split(permuted_probs, tokens_per_expert),
                     )
@@ -659,9 +708,21 @@ class TEGroupedMLP(MegatronModule):
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
+        # Some dispatchers have already padded each expert's token segment before the tokens
+        # reach this module:
+        #   * router padding changes the routing map before dispatch;
+        #   * HybridEP/NCCL-EP pad as part of their fused dispatch/permute operation;
+        #   * DeepEP can pad in the fused local permutation after communication.
+        # Padding those tensors again would insert a second set of dummy tokens and make
+        # tokens_per_expert disagree with the already-permuted token buffer, so skip the local
+        # Fp8Padding fallback in those cases.
         if skip_routed_expert_padding(self.config):
             pass
-        elif self.config.fp8 or self.config.fp4:
+        # Regular AllToAll normally reaches this branch because its permutation does not insert
+        # the padding needed by the fused grouped-MLP contract. FP8/FP4 require recipe-specific
+        # alignment, while the TE operation-fuser grouped-tensor path currently uses 256-token
+        # expert segments.
+        elif self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
             tokens_per_expert = tokens_per_expert.tolist()
             unpadded_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
@@ -672,7 +733,22 @@ class TEGroupedMLP(MegatronModule):
             )
             permuted_probs = permuted_probs.squeeze(-1)
             tokens_per_expert = torch.tensor(
-                tokens_per_expert, dtype=torch.int, device=permuted_probs.device
+                tokens_per_expert, dtype=torch.int64, device=permuted_probs.device
+            )
+
+        if self._use_grouped_tensor:
+            if not isinstance(tokens_per_expert, torch.Tensor):
+                tokens_per_expert = torch.tensor(
+                    tokens_per_expert, dtype=torch.int64, device=permuted_local_hidden_states.device
+                )
+            else:
+                tokens_per_expert = tokens_per_expert.to(
+                    device=permuted_local_hidden_states.device, dtype=torch.int64, non_blocking=True
+                )
+        else:
+            raise RuntimeError(
+                "The Transformer Engine operation-fuser MoE path requires "
+                "moe_use_grouped_tensor=True."
             )
         # if the number of tokens is 0, pad the hidden states to 256
 
@@ -761,11 +837,23 @@ class TEGroupedMLP(MegatronModule):
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
-        tokens_per_expert: list[int] = tokens_per_expert.tolist()
         permuted_probs = permuted_probs.unsqueeze(-1)
+        # The token buffer may already contain per-expert padding when padding was performed
+        # before expert compute:
+        #   * router padding modified the routing map before dispatch;
+        #   * HybridEP/NCCL-EP fused padding into dispatch/permute;
+        #   * DeepEP fused padding into its post-communication local permutation.
+        # In those cases tokens_per_expert already describes the padded expert segments. Running
+        # Fp8Padding again would change the segment lengths without matching the existing token
+        # layout, so this module must leave both tensors unchanged.
         if skip_routed_expert_padding(self.config):
             pass
-        elif self.config.fp8 or self.config.fp4:
+        # Regular AllToAll normally supplies unpadded expert segments and therefore uses this
+        # explicit fallback. FP8/FP4 need their recipe-specific alignment. MCore currently also
+        # applies its common aligned-segment contract to the GroupedTensor backend so quantized
+        # grouped execution receives supported shapes
+        elif self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
+            tokens_per_expert = tokens_per_expert.tolist()
             unpadded_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert
@@ -773,6 +861,18 @@ class TEGroupedMLP(MegatronModule):
             permuted_probs, _ = self.quantization_padding(
                 permuted_probs, unpadded_tokens_per_expert
             )
+
+        if self._use_grouped_tensor:
+            if not isinstance(tokens_per_expert, torch.Tensor):
+                tokens_per_expert = torch.tensor(
+                    tokens_per_expert, dtype=torch.int64, device=permuted_local_hidden_states.device
+                )
+            else:
+                tokens_per_expert = tokens_per_expert.to(
+                    device=permuted_local_hidden_states.device, dtype=torch.int64, non_blocking=True
+                )
+        elif isinstance(tokens_per_expert, torch.Tensor):
+            tokens_per_expert = tokens_per_expert.tolist()
 
         if self.config.moe_apply_probs_on_input:
             assert (

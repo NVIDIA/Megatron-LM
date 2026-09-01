@@ -66,8 +66,12 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
     output_tensors = []
     # get callables
     callables, dw = build_layer_callables(model)
-    attn, dispatch, moe, combine, post_process = callables
+    # Six slots: mHC post-processing is its own node. This model has no hyper
+    # connections, so that slot is None -- but unpack it explicitly so a future
+    # width change fails here rather than silently dropping the last callable.
+    attn, dispatch, moe, combine, post_process, mhc_post = callables
     assert post_process is None
+    assert mhc_post is None
     dummy_model = DummyState()
     dummy_model.decoder = DummyState()
     dummy_model.decoder.final_layernorm = None
@@ -133,9 +137,11 @@ class TestTransformerLayerSubmoduleCallables:
             expert_model_parallel_size=2,
             virtual_pipeline_model_parallel_size=2,
         )
+        qk_layernorm = True
         extra_kwargs = {
             "moe_token_dispatcher_type": dispatcher_type,
             "moe_permute_fusion": permute_fusion,
+            "qk_layernorm": qk_layernorm,
         }
         if dispatcher_type == "flex":
             extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
@@ -145,7 +151,7 @@ class TestTransformerLayerSubmoduleCallables:
             transformer_layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
                 num_experts=8,
                 moe_grouped_gemm=grouped_gemm,
-                qk_layernorm=True,
+                qk_layernorm=qk_layernorm,
                 multi_latent_attention=True,
             )
             model = TransformerLayer(config, transformer_layer_submodules)

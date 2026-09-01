@@ -218,7 +218,7 @@ class TokenDispatcher:
         self._deepep_event = None
 
         if self.ep_size > 1 and self.num_local_experts > 1:
-            chunk_idxs = torch.arange(self.ep_size * self.num_local_experts)
+            chunk_idxs = torch.arange(self.ep_size * self.num_local_experts, device="cpu")
             self._sort_by_experts = (
                 chunk_idxs.reshape(self.ep_size, self.num_local_experts).T.ravel().tolist()
             )
@@ -296,7 +296,7 @@ class TokenDispatcher:
         num_out = int(routing_map.sum().item())
 
         probs_2d = torch.zeros(t, e, dtype=topk_scores.dtype, device=hidden_states.device)
-        probs_2d.scatter_(1, topk_indices, topk_scores)
+        probs_2d.scatter_add_(1, topk_indices, topk_scores)
 
         permuted, permuted_probs, sorted_indices = permute(
             hidden_states,
@@ -338,7 +338,7 @@ class TokenDispatcher:
         num_out = int(routing_map.sum().item())
 
         probs_2d = torch.zeros(t, e, dtype=topk_scores.dtype, device=hidden_states.device)
-        probs_2d.scatter_(1, topk_indices, topk_scores)
+        probs_2d.scatter_add_(1, topk_indices, topk_scores)
 
         permuted, permuted_probs, sorted_indices = permute(
             hidden_states,
@@ -505,7 +505,7 @@ class TokenDispatcher:
         row_ids = row_ids.expand_as(recv_indices)[valid]
         expert_ids = recv_indices[valid]
         routing_map[row_ids, expert_ids] = True
-        probs_2d[row_ids, expert_ids] = recv_probs[valid]
+        probs_2d.index_put_((row_ids, expert_ids), recv_probs[valid], accumulate=True)
         num_out = sum(int(x) for x in recv_per_expert)
         dispatched, permuted_probs, sorted_indices = permute(
             recv_hidden,
