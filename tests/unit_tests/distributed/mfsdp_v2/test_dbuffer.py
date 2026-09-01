@@ -11,7 +11,12 @@ import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer, Flat
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import GlobalLayout
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
+    BlockAtomic,
+    Flat,
+)
 
 
 def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
@@ -27,8 +32,8 @@ def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torc
         torch.testing.assert_close(buffer.get_local_tensor(index), tensor)
 
 
-def test_dbuffer_layout_pads_to_lcm_times_dp_size_and_fills_gaps(distributed_setup):
-    """DBuffer layout returns element offsets and pads to LCM * DP size."""
+def test_dbuffer_layout_aligns_tensors_and_pads_to_lcm_times_dp_size(distributed_setup):
+    """DBuffer layout aligns tensor starts and pads to LCM * DP size."""
     if distributed_setup.world_size < 2:
         pytest.skip("DBuffer layout test requires at least 2 ranks.")
 
@@ -38,7 +43,7 @@ def test_dbuffer_layout_pads_to_lcm_times_dp_size_and_fills_gaps(distributed_set
     buffer = DBuffer(
         mesh=mesh,
         placements=[Replicate()],
-        tensor_shapes=shapes,
+        layout=GlobalLayout.build(shapes, dp_size=mesh.size()),
         dtype=torch.float32,
         device=distributed_setup.device,
     )
@@ -59,7 +64,7 @@ def test_dbuffer_layout_aligns_fragment_offsets_to_rows(distributed_setup):
     buffer = DBuffer(
         mesh=mesh,
         placements=[Replicate()],
-        tensor_shapes=shapes,
+        layout=GlobalLayout.build(shapes, dp_size=mesh.size()),
         dtype=torch.float32,
         device=distributed_setup.device,
     )
@@ -68,10 +73,32 @@ def test_dbuffer_layout_aligns_fragment_offsets_to_rows(distributed_setup):
     assert buffer.layout.size == 24
 
 
-def test_compute_layout_fills_lcm_padding_gaps(distributed_setup):
-    """LCM packing fills row-aligned padding gaps on a 5-rank flat-sharded mesh."""
+def test_block_atomic_layout_keeps_bf16_blocks_on_one_rank(distributed_setup):
+    """BlockAtomic avoids the odd local row counts permitted by Flat."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Requires at least 2 ranks.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (2,))
+    tensors = [
+        torch.arange(24, dtype=torch.bfloat16, device=distributed_setup.device).reshape(4, 6),
+        torch.arange(32, dtype=torch.bfloat16, device=distributed_setup.device).reshape(8, 4),
+    ]
+    flat = DBuffer.distribute_tensors(tensors, mesh, [Flat()])
+    block_atomic = DBuffer.distribute_tensors(tensors, mesh, [BlockAtomic(2)], block_size=2)
+
+    # P0=(4, 6) has 24 elements and P1=(8, 4) has 32. With two ranks, Flat
+    # uses 36-element shards: rank 0 owns P0 and 3 P1 rows, while rank 1 owns
+    # the remaining 5 P1 rows. BlockAtomic(2) uses 48-element shards instead,
+    # giving rank 0 6 P1 rows and rank 1 2 P1 rows—both whole row blocks.
+    assert flat.placements != block_atomic.placements
+    assert flat.get_local_tensor(1).shape[0] % 2 == 1
+    assert block_atomic.get_local_tensor(1).shape[0] % 2 == 0
+
+
+def test_compute_layout_preserves_rows_on_a_5_rank_flat_sharded_mesh(distributed_setup):
+    """Flat layout preserves rows while tensor-aligned padding crosses rank boundaries."""
     if distributed_setup.world_size < 5:
-        pytest.skip("LCM padding-gap layout test requires at least 5 ranks.")
+        pytest.skip("Flat layout test requires at least 5 ranks.")
 
     # P0-P4 are zero-based logical tensor names matching tensor indices.
     shapes = [
@@ -89,7 +116,7 @@ def test_compute_layout_fills_lcm_padding_gaps(distributed_setup):
     buffer = DBuffer(
         mesh=mesh,
         placements=[Flat()],
-        tensor_shapes=shapes,
+        layout=GlobalLayout.build(shapes, dp_size=mesh.size()),
         dtype=torch.float32,
         device=distributed_setup.device,
     )
@@ -120,14 +147,14 @@ def test_constructor_allocates_local_buffer(distributed_setup):
     replicated_buffer = DBuffer(
         mesh=mesh,
         placements=[Replicate()],
-        tensor_shapes=tensor_shapes,
+        layout=GlobalLayout.build(tensor_shapes, dp_size=mesh.size()),
         dtype=torch.float32,
         device=distributed_setup.device,
     )
     sharded_buffer = DBuffer(
         mesh=mesh,
         placements=[Flat()],
-        tensor_shapes=tensor_shapes,
+        layout=GlobalLayout.build(tensor_shapes, dp_size=mesh.size()),
         dtype=torch.float32,
         device=distributed_setup.device,
     )
@@ -183,7 +210,7 @@ def test_cast_with_out_reuses_destination_and_casts_values(distributed_setup):
     destination = DBuffer(
         mesh=mesh,
         placements=[Replicate()],
-        tensor_shapes=buffer.layout.tensor_shapes,
+        layout=buffer.layout,
         dtype=torch.bfloat16,
         device=distributed_setup.device,
     )
@@ -204,7 +231,7 @@ def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup
     buffer = DBuffer(
         mesh=mesh,
         placements=[Replicate()],
-        tensor_shapes=[torch.Size((4, 4))],
+        layout=GlobalLayout.build([torch.Size((4, 4))], dp_size=mesh.size()),
         dtype=torch.float32,
         device=distributed_setup.device,
     )
@@ -235,7 +262,7 @@ def test_from_local_reuses_required_local_buffer(distributed_setup):
         local_buffer,
         mesh,
         iter([Flat()]),
-        replicated_buffer.layout.tensor_shapes,
+        replicated_buffer.layout,
         allocation_stream=replicated_buffer.allocation_stream,
     )
 
@@ -314,7 +341,7 @@ def test_sharded_allgather_into_existing_buffer(distributed_setup):
     destination = DBuffer(
         mesh=mesh,
         placements=[Replicate()],
-        tensor_shapes=sharded_buffer.layout.tensor_shapes,
+        layout=sharded_buffer.layout,
         dtype=sharded_buffer.dtype,
         device=sharded_buffer.local_buffer.device,
     )
@@ -337,7 +364,7 @@ def test_replicate_scatter_round_trip(distributed_setup):
     redistribute_destination = DBuffer(
         mesh=mesh,
         placements=[Flat()],
-        tensor_shapes=replicated_buffer.layout.tensor_shapes,
+        layout=replicated_buffer.layout,
         dtype=replicated_buffer.dtype,
         device=replicated_buffer.local_buffer.device,
     )
@@ -393,7 +420,7 @@ def test_partial_allreduce_average(distributed_setup):
     destination = DBuffer(
         mesh=mesh,
         placements=[Replicate()],
-        tensor_shapes=partial_buffer.layout.tensor_shapes,
+        layout=partial_buffer.layout,
         dtype=partial_buffer.dtype,
         device=partial_buffer.local_buffer.device,
     )
@@ -422,7 +449,7 @@ def test_partial_reduce_scatter_to_flat(distributed_setup):
     destination = DBuffer(
         mesh=mesh,
         placements=[Flat()],
-        tensor_shapes=partial_buffer.layout.tensor_shapes,
+        layout=partial_buffer.layout,
         dtype=partial_buffer.dtype,
         device=partial_buffer.local_buffer.device,
     )
@@ -584,7 +611,7 @@ def test_2d_mesh_flat_before_replicate_is_rejected(distributed_setup):
         DBuffer(
             mesh=mesh,
             placements=[Flat(), Replicate()],
-            tensor_shapes=[torch.Size((6, 4))],
+            layout=GlobalLayout.build([torch.Size((6, 4))], dp_size=mesh.size()),
             dtype=torch.float32,
             device=distributed_setup.device,
         )

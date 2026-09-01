@@ -14,6 +14,7 @@
 
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
+import math
 from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -28,7 +29,8 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import changed_mesh_axis
+from .layout import GlobalLayout
+from .placement import BlockAtomic, changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -78,6 +80,7 @@ class FsdpParameterGroup:
     _owning_module: ReferenceType[nn.Module]
     fsdp_parameters: tuple[FsdpParameter, ...]
     mesh: DeviceMesh
+    layout: GlobalLayout
     dtype: torch.dtype
     requires_grad: bool
     main_weight: DBuffer
@@ -152,12 +155,17 @@ class FsdpParameterGroup:
                     f"got {parameter.requires_grad}."
                 )
 
-        tensor_shapes = tuple(parameter.shape for parameter in parameter_to_fqns)
+        block_size = 1
+        for placements in (model_weight_placements, main_grad_placements, main_weight_placements):
+            for placement in placements:
+                if isinstance(placement, BlockAtomic):
+                    block_size = math.lcm(block_size, placement.block_size)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
         self.main_weight = DBuffer.distribute_tensors(
             (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
             mesh=self.mesh,
             placements=main_weight_placements,
+            block_size=block_size,
         )
 
         if use_symmetric_memory:
@@ -175,7 +183,7 @@ class FsdpParameterGroup:
                 self.model_weight = DBuffer(
                     mesh=self.mesh,
                     placements=main_weight_placements,
-                    tensor_shapes=tensor_shapes,
+                    layout=self.main_weight.layout,
                     dtype=self.dtype,
                     device=self.main_weight.device,
                 )
@@ -187,7 +195,7 @@ class FsdpParameterGroup:
             self._unsharded_model_weight = DBuffer(
                 mesh=self.mesh,
                 placements=[Replicate()] * self.mesh.ndim,
-                tensor_shapes=tensor_shapes,
+                layout=self.main_weight.layout,
                 dtype=self.dtype,
                 device=self.main_weight.device,
             )
@@ -204,14 +212,10 @@ class FsdpParameterGroup:
                 self.main_grad = DBuffer(
                     mesh=self.mesh,
                     placements=main_grad_placements,
-                    tensor_shapes=self.main_weight.layout.tensor_shapes,
+                    layout=self.main_weight.layout,
                     dtype=grad_dtype,
                     device=self.main_weight.device,
                 )
-            assert self.main_grad.layout == self.main_weight.layout, (
-                "main_grad is built from main_weight tensor shapes on the same mesh, "
-                "and DBuffer layouts are deterministic from those shapes and mesh size."
-            )
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
@@ -338,7 +342,7 @@ class FsdpParameterGroup:
             return DBuffer(
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
-                tensor_shapes=tuple(grad.shape for grad in grads),
+                layout=self.main_weight.layout,
                 dtype=grads[0].dtype,
                 device=grads[0].device,
             )
@@ -407,7 +411,7 @@ class FsdpParameterGroup:
                 self.main_grad = DBuffer(
                     mesh=self.mesh,
                     placements=self._main_grad_placements,
-                    tensor_shapes=self.main_weight.layout.tensor_shapes,
+                    layout=self.main_weight.layout,
                     dtype=self.main_grad.dtype,
                     device=self.main_weight.device,
                 )
