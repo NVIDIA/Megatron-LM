@@ -89,8 +89,8 @@ class FsdpParameterGroup:
     main_grad: DBuffer | None
     # Optimizer-layout view into main_grad storage, avoiding a second allocation.
     pre_optimizer_main_grad: DBuffer | None
-    # HFSDP finalization writes only a smaller optimizer view. After
-    # zero_grad(set_to_none=False) clears that view, the remaining main_grad
+    # zero_grad(set_to_none=False) clears only the current optimizer view. If final
+    # reduction created a smaller view (e.g. ZeRO-1 or HFSDP), the remaining main_grad
     # storage is stale and must be cleared before the next accumulation begins.
     _main_grad_is_stale: bool
     _unsharded_model_weight: DBuffer
