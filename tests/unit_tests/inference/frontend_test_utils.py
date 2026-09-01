@@ -474,14 +474,16 @@ class FakeInferenceClient:
         reply["generated_text"] = self.tokenizer.detokenize(generated_tokens)
         return reply
 
-    def add_request(self, prompt, sampling_params):
+    def add_request(self, prompt, sampling_params, multi_modal_data=None):
         """Return an already-resolved future holding a canned reply."""
+        del multi_modal_data
         future = asyncio.get_running_loop().create_future()
         future.set_result(self._build_reply(prompt, sampling_params))
         return future
 
-    def add_request_streaming(self, prompt, sampling_params):
+    def add_request_streaming(self, prompt, sampling_params, multi_modal_data=None):
         """Return a stream that yields one partial per token, then the final reply."""
+        del multi_modal_data
         sampling_params.streaming = True
         reply = self._build_reply(prompt, sampling_params)
         request_id = reply["request_id"]

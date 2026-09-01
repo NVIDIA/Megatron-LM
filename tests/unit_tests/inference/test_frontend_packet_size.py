@@ -243,6 +243,7 @@ class TestWireMetricsAccounting:
                     request_id,
                     list(prompt),
                     SamplingParams(num_tokens_to_generate=num_output_tokens).serialize(),
+                    None,
                 ]
             )
             for request_id in range(num_requests)

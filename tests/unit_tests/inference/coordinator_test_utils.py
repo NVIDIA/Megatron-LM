@@ -14,6 +14,7 @@ from megatron.core.inference.config import (
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
+from megatron.core.inference.wire_metrics import WireMetrics
 
 
 def make_coordinator_direct(
@@ -89,5 +90,6 @@ def make_coordinator_direct(
 
     coordinator._pending_counts = np.zeros(n_ranks, dtype=np.int32)
     coordinator._identities_list = list(sorted_identities)
+    coordinator.wire_metrics = WireMetrics()
 
     return coordinator

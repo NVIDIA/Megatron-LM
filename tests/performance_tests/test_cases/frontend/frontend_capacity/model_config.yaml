@@ -41,12 +41,13 @@ METRICS:
   - reply_bytes_per_request
 
 # Past saturation, p99 stops describing the frontend and starts describing the
-# queue the load generator built in front of it: two back-to-back runs of this
-# exact config moved http_concurrency_128 p99 from 392 ms to 963 ms (+146%) while
-# every throughput number held within 13%. Below saturation p99 is stable to a
-# few percent and worth gating, so it stays gated there. Saturation is what
-# throughput_req_per_sec and peak_throughput_req_per_sec already measure.
+# queue the load generator built in front of it. HTTP saturates at concurrency
+# 8; on current main, three H100 nodes measured http_concurrency_32 p99 at
+# 42 ms, 42 ms and 293 ms while throughput remained within 8%. Saturation is
+# what throughput_req_per_sec and peak_throughput_req_per_sec already measure.
 METRICS_EXCLUDE:
+  - keys: "http_concurrency_32"
+    metrics: [p99_latency_ms]
   - keys: "*_concurrency_128"
     metrics: [p99_latency_ms]
   - keys: "*_concurrency_512"
