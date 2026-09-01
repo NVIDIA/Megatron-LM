@@ -3,6 +3,7 @@
 import asyncio
 import gc
 from collections import deque
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -26,10 +27,12 @@ from megatron.core.inference.inference_request import (
     compute_block_hashes_batched,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.inference.engines.ssm_test_helpers import (
+    skip_if_sequence_packing_not_available,
+)
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicEngineTestConfig,
     DynamicInferenceEngineTestBase,
@@ -2414,6 +2417,16 @@ PREFIX_CACHE_ENGINE_CASES = [
         ),
         id="hybrid-mamba-ref-zero",
     ),
+    pytest.param(
+        dict(
+            name="hybrid-gdp-lru",
+            feature="gdp",
+            model_provider="hybrid",
+            ssm_mixer="gdp",
+            policy=PrefixCachingEvictionPolicy.LRU,
+        ),
+        id="hybrid-gdp-lru",
+    ),
 ]
 
 
@@ -2426,6 +2439,11 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
     ):
         """Build the shared harness context with the row's cache eviction policy."""
         assert not requests
+        if test_config.ssm_mixer == "gdp":
+            assert mamba_inference_state_config is not None
+            mamba_inference_state_config = replace(
+                mamba_inference_state_config, ssm_states_dtype=torch.float32
+            )
         return DynamicInferenceContext(
             model_config=transformer_config,
             inference_config=InferenceConfig(
@@ -2474,6 +2492,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             pipeline_model_parallel_size=case.get("pp", 1),
             expert_model_parallel_size=case.get("ep", 1),
             model_provider=case.get("model_provider", "gpt"),
+            ssm_mixer=case.get("ssm_mixer", "mamba"),
             enable_prefix_caching=enable_prefix_caching,
             enable_chunked_prefill=feature == "chunked",
             num_speculative_tokens=2 if feature == "mtp" else 0,
@@ -2518,6 +2537,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             "moe_request_ids": set(),
             "fused_rope_calls": 0,
             "mamba_restores": 0,
+            "gdp_prefills": 0,
         }
         model = engine.controller.inference_wrapped_model.model
 
@@ -2578,7 +2598,28 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
             context.apply_fused_qk_rotary_emb = traced_fused_rope
 
-        if feature == "mamba" and engine.context.mamba_slot_allocator is not None:
+        if feature == "gdp":
+            context = engine.context
+            instrumented_mixers = 0
+            for module in model.modules():
+                if module.__class__.__name__ != "GatedDeltaProductMixer":
+                    continue
+                assert module.num_householder > 0
+                original = module.ssm_prefill
+
+                def traced_gdp_prefill(*args, _original=original, **kwargs):
+                    metadata = context.mamba_metadata
+                    assert metadata.gdp_chunk_indices is not None
+                    assert metadata.gdp_chunk_indices_dp is not None
+                    assert metadata.gdp_chunk_offsets is not None
+                    evidence["gdp_prefills"] += 1
+                    return _original(*args, **kwargs)
+
+                module.ssm_prefill = traced_gdp_prefill
+                instrumented_mixers += 1
+            assert instrumented_mixers > 0
+
+        if feature in {"mamba", "gdp"} and engine.context.mamba_slot_allocator is not None:
             allocator = engine.context.mamba_slot_allocator
             original = allocator.restore_to_live
 
@@ -2685,8 +2726,10 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     "pp": "pipeline_forwards",
                     "fused-rope": "fused_rope_calls",
                     "mamba": "mamba_restores",
+                    "gdp": "gdp_prefills",
                 }.get(case["feature"])
                 feature_before = evidence[feature_key] if feature_key is not None else None
+                mamba_restores_before = evidence["mamba_restores"]
                 mtp_before = int(engine._spec_tokens_proposed_per_pos.sum())
                 result = engine.step_modern()
                 step_count += 1
@@ -2700,6 +2743,8 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     cached_request_ids.update(newly_cached_ids)
                     if feature_key is not None:
                         assert evidence[feature_key] > feature_before
+                        if case["feature"] == "gdp":
+                            assert evidence["mamba_restores"] > mamba_restores_before
                         feature_seen_for_cached_request = True
                     elif case["feature"] == "chunked":
                         assert any(
@@ -2909,6 +2954,10 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             elif feature == "mamba":
                 assert stats["max_mamba_matched_blocks"] > 0
                 assert stats["mamba_restores"] > 0
+            elif feature == "gdp":
+                assert stats["max_mamba_matched_blocks"] > 0
+                assert stats["mamba_restores"] > 0
+                assert stats["gdp_prefills"] > 0
             else:
                 assert feature == "mtp"
                 assert stats["mtp_tokens_proposed"] > 0
@@ -2918,10 +2967,8 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
     @pytest.mark.internal
     @pytest.mark.parametrize("case", PREFIX_CACHE_ENGINE_CASES)
     def test_real_engine_stress_row(self, case):
-        if case["feature"] == "mamba":
-            available, reason = _check_mamba_sequence_packing_support()
-            if not available:
-                pytest.skip(reason)
+        if case["feature"] in {"mamba", "gdp"}:
+            skip_if_sequence_packing_not_available(case.get("ssm_mixer", "mamba"))
         if case["feature"] == "fused-rope":
             pytest.importorskip("flashinfer")
         Utils.initialize_model_parallel(
