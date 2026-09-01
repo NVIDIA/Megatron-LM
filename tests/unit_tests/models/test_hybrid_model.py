@@ -390,6 +390,43 @@ class TestHybridModel:
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == self.model.vocab_size
 
+    def test_output_processor_forward(self):
+        sequence_length = self.model.max_sequence_length
+        micro_batch_size = 2
+        self.model.cuda()
+
+        input_ids = torch.arange(sequence_length, device="cuda").repeat(micro_batch_size, 1)
+        position_ids = input_ids.clone()
+        labels = (input_ids + 1) % self.model.vocab_size
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=torch.bool, device="cuda"
+        )
+        context = {"selected_token_positions": torch.tensor([0, 2], device="cuda")}
+        result = {"payload": torch.ones(1, device="cuda")}
+        seen = {}
+
+        def output_processor(**kwargs):
+            seen.update(kwargs)
+            return result
+
+        output = self.model.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            output_processor=output_processor,
+            output_processor_context=context,
+        )
+
+        assert output is result
+        assert seen["context"] is context
+        assert seen["output_layer"] is self.model.output_layer
+        assert seen["output_weight"] is None
+        assert seen["labels"] is labels
+        assert seen["runtime_gather_output"] is None
+        assert seen["config"] is self.model.config
+        assert seen["compute_language_model_loss"].__self__ is self.model
+
     def test_forward_packed_sequence(self):
         os.environ.pop('NVTE_FUSED_ATTN', None)
         os.environ.pop('NVTE_FLASH_ATTN', None)
