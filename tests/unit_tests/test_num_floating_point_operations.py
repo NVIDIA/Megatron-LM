@@ -177,6 +177,26 @@ class TestBSHDBackwardCompat:
         assert default_flops == explicit_flops
 
 
+class TestMTPE2ETVFlops:
+    """E2E TV adds one frozen target-output projection to the FLOPs count."""
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_counts_one_forward_only_target_projection(self, hybrid):
+        args = _make_hybrid_args() if hybrid else _make_gpt_args()
+        args.mtp_num_layers = 3
+        args.mtp_loss_type = "cross_entropy"
+        batch_size = 2
+        cross_entropy_flops = num_floating_point_operations(args, batch_size)
+
+        args.mtp_loss_type = "e2e_tv"
+        e2e_tv_flops = num_floating_point_operations(args, batch_size)
+
+        expected_extra = (
+            2 * batch_size * args.seq_length * args.hidden_size * args.padded_vocab_size
+        )
+        assert e2e_tv_flops - cross_entropy_flops == expected_extra
+
+
 class TestTHDScaling:
     """Only the L^2 attention term should depend on ``seqlen_squared_sum_in_batch``."""
 

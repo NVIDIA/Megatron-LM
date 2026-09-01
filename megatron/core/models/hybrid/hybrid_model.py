@@ -622,6 +622,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     config=self.config,
                     cp_group=mtp_cp_group,
                     tp_group=self.tp_group,
+                    dp_cp_group=self.pg_collection.dp_cp,
                     packed_seq_params=packed_seq_params,
                     sequence_roll_context=sequence_roll_context,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
