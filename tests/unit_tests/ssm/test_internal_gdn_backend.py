@@ -63,6 +63,19 @@ def test_internal_backend_rejects_conflicting_state_layout_options():
             **_inputs(), state_v_first=True, transpose_state_layout=False
         )
 
+def test_cutedsl_cp_context_metadata_owns_global_offsets():
+    from megatron.core.ssm.gated_delta_net.gdn import _bind_cutedsl_cp_context_metadata
+
+    source = torch.tensor([0, 32768], dtype=torch.int64)
+    context = SimpleNamespace()
+    assert _bind_cutedsl_cp_context_metadata(context, source) is context
+    source[1] = 0
+
+    assert context.global_num_seqs == 1
+    assert torch.equal(context.global_cu_seqlens_cpu, torch.tensor([0, 32768]))
+    assert context.global_cu_seqlens_cpu.data_ptr() != source.data_ptr()
+
+
 
 def test_fused_forward_package_exports_wrapper():
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_fwd_cute
@@ -303,6 +316,89 @@ def test_cp_backward_preprocessing_produces_fused_dht_and_state(monkeypatch, use
     assert seen["cp_preprocess"]["dv"] is dv
     assert seen["cp_preprocess"]["initial_state"] is expanded_initial_state
     assert seen["cp_preprocess"]["context"] is cp_context
+
+
+@pytest.mark.parametrize("direction", ["forward", "backward"])
+def test_cp_preprocess_prefers_local_cutedsl_and_preserves_fla_fallback(monkeypatch, direction):
+    implementation = _implementation()
+    shape = (1, 64, 2, 4)
+    operands = {
+        "q": torch.empty(shape, dtype=torch.bfloat16),
+        "k": torch.empty(shape, dtype=torch.bfloat16),
+        "w": torch.empty(shape, dtype=torch.bfloat16),
+        "u": torch.empty(shape, dtype=torch.bfloat16),
+        "do": torch.empty(shape, dtype=torch.bfloat16),
+        "dv": torch.empty(shape, dtype=torch.bfloat16),
+        "g": torch.empty(shape[:-1], dtype=torch.float32),
+    }
+    cp_context = SimpleNamespace(group=object())
+    local_result = torch.empty((1, 2, 4, 4), dtype=torch.float32)
+    fallback_result = torch.empty_like(local_result)
+    calls = {"local": 0, "fla": 0}
+
+    if direction == "forward":
+        local_name = "try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl"
+        fla_name = "chunk_gated_delta_rule_fwd_h_pre_process"
+        wrapper = implementation._cp_forward_preprocess
+        kwargs = {
+            "k": operands["k"],
+            "w": operands["w"],
+            "u": operands["u"],
+            "g": operands["g"],
+            "cu_seqlens": None,
+            "initial_state": None,
+            "context": cp_context,
+            "use_exp2": True,
+            "transpose_state_layout": False,
+        }
+        expected_fallback = fallback_result
+    else:
+        local_name = "try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl"
+        fla_name = "chunk_gated_delta_rule_bwd_dhu_pre_process"
+        wrapper = implementation._cp_backward_preprocess
+        kwargs = {
+            "q": operands["q"],
+            "k": operands["k"],
+            "w": operands["w"],
+            "do": operands["do"],
+            "dv": operands["dv"],
+            "g": operands["g"],
+            "scale": 0.5,
+            "cu_seqlens": None,
+            "dht": None,
+            "initial_state": None,
+            "context": cp_context,
+            "use_exp2": True,
+            "transpose_state_layout": False,
+        }
+        expected_fallback = (fallback_result, None)
+
+    def local(**_kwargs):
+        calls["local"] += 1
+        return local_result
+
+    def fla(**_kwargs):
+        calls["fla"] += 1
+        return expected_fallback
+
+    monkeypatch.setattr(implementation, local_name, local)
+    monkeypatch.setattr(implementation, fla_name, fla)
+    actual_local = wrapper(**kwargs)
+    if direction == "forward":
+        assert actual_local is local_result
+    else:
+        assert actual_local[0] is local_result
+        assert actual_local[1] is None
+    assert calls == {"local": 1, "fla": 0}
+
+    monkeypatch.setattr(implementation, local_name, lambda **_kwargs: None)
+    actual_fallback = wrapper(**kwargs)
+    if direction == "forward":
+        assert actual_fallback is fallback_result
+    else:
+        assert actual_fallback[0] is fallback_result
+        assert actual_fallback[1] is None
+    assert calls == {"local": 1, "fla": 1}
 
 
 def test_cutedsl_cp_backward_feeds_preprocessed_dht_to_fused_kernel(monkeypatch):
