@@ -23,6 +23,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
     AsyncScheduleMode,
+    CudaGraphSizingDistribution,
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
@@ -348,6 +349,10 @@ class DynamicEngineTestConfig:
     num_cuda_graphs: int = None
     use_cuda_graphs_for_non_decode_steps: bool = True
     cuda_graph_all_prefills: bool = False
+    # Defaults to the production default (HYBRID: exponential prefill/mixed graphs,
+    # linear decode-only graphs). Tests that assert on exact token counts can pin a
+    # single distribution here.
+    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = CudaGraphSizingDistribution.HYBRID
     fp8: bool = False
     model_provider: str = "gpt"
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
@@ -528,6 +533,7 @@ class DynamicInferenceEngineTestBase:
                     test_config.use_cuda_graphs_for_non_decode_steps
                 ),
                 cuda_graph_all_prefills=test_config.cuda_graph_all_prefills,
+                cuda_graph_sizing_distribution=test_config.cuda_graph_sizing_distribution,
                 buffer_size_gb=test_config.context_buffer_size_gb,
                 paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
                 block_size_tokens=test_config.context_block_size_tokens,
@@ -1051,6 +1057,10 @@ def test_refresh_vlm_request_recomputes_embeddings_and_mask():
         expand_image_tokens=mock.Mock(return_value=([[99, 99, 5]], [[0, 1, None]])),
         _forward_vision_encoder=mock.Mock(return_value=torch.ones(2, 1, 4)),
     )
+    retained_imgs = mock.Mock()
+    device_imgs = torch.ones(1)
+    retained_imgs.to.return_value = device_imgs
+    request.imgs = retained_imgs
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper, tokenizer=object())
     engine.context = types.SimpleNamespace(add_vlm_request_data=mock.Mock())
@@ -1058,12 +1068,79 @@ def test_refresh_vlm_request_recomputes_embeddings_and_mask():
 
     engine._refresh_vlm_request_data(request)
 
+    retained_imgs.to.assert_called_once_with(device=request.prompt_tokens.device)
+    encoder_args, encoder_kwargs = wrapper._forward_vision_encoder.call_args
+    assert encoder_args[0] is device_imgs
+    assert encoder_kwargs["num_image_tiles"].device == request.prompt_tokens.device
+    assert encoder_kwargs["imgs_sizes"].device == request.prompt_tokens.device
     assert request.image_embeddings is wrapper._forward_vision_encoder.return_value
     assert request.image_token_mask.tolist() == [0, 1, -1, -1]
     engine.context.add_vlm_request_data.assert_called_once_with(
         request.request_id,
         image_embeddings=request.image_embeddings,
         image_token_mask=request.image_token_mask,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
+    device = torch.device("cuda", torch.cuda.current_device())
+    imgs = torch.ones(1)
+    imgs_sizes = torch.tensor([[1, 1]])
+    original_request = DynamicVLMInferenceRequest(
+        request_id=33,
+        prompt_tokens=torch.tensor([99, 99, 5], device=device),
+        compact_prompt_tokens=torch.tensor([99, 5], device=device),
+        sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+        block_hash_salt="media",
+        num_img_embeddings_per_tile=0,
+        imgs=imgs,
+        num_tiles=torch.tensor([1]),
+        imgs_sizes=imgs_sizes,
+        decoder_seq_length=0,
+        generated_tokens=[7, 8],
+        image_embeddings=torch.full((2, 1, 4), -1.0),
+        image_token_mask=torch.tensor([0, 1, -1]),
+    )
+    record = DynamicInferenceRequestRecord.from_request(original_request)
+    record.checkpoint()
+    checkpointed_request = record[-1]
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.allow_stale_multimodal_embeddings = False
+    engine._vision_embedding_cache = {"media": original_request.image_embeddings}
+    engine._vision_embedding_cache_bytes = original_request.image_embeddings.numel() * 4
+    engine.requests = {checkpointed_request.request_id: types.SimpleNamespace(record=record)}
+    refreshed_embeddings = torch.ones(2, 1, 4, device=device)
+    wrapper = types.SimpleNamespace(
+        resolve_media_token_id=mock.Mock(return_value=99),
+        expand_image_tokens=mock.Mock(return_value=([[99, 99, 5]], [[0, 1, None]])),
+        _forward_vision_encoder=mock.Mock(return_value=refreshed_embeddings),
+    )
+    engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper, tokenizer=object())
+    engine.context = types.SimpleNamespace(add_vlm_request_data=mock.Mock())
+    engine._cache_vision_embedding = mock.Mock()
+
+    engine._invalidate_vision_state()
+    engine._refresh_vlm_request_data(checkpointed_request)
+
+    assert checkpointed_request.prompt_tokens.tolist() == [99, 99, 5, 7, 8]
+    assert checkpointed_request.prompt_tokens.device == device
+    assert checkpointed_request.compact_prompt_tokens is original_request.compact_prompt_tokens
+    assert checkpointed_request.imgs is imgs
+    assert checkpointed_request.imgs_sizes is imgs_sizes
+    assert checkpointed_request.imgs.device.type == "cpu"
+    assert checkpointed_request.imgs_sizes.device.type == "cpu"
+    assert checkpointed_request.image_embeddings is refreshed_embeddings
+    assert checkpointed_request.image_token_mask.tolist() == [0, 1, -1, -1, -1]
+    encoder_args, encoder_kwargs = wrapper._forward_vision_encoder.call_args
+    assert encoder_args[0].device == checkpointed_request.prompt_tokens.device
+    assert encoder_kwargs["num_image_tiles"].device == checkpointed_request.prompt_tokens.device
+    assert encoder_kwargs["imgs_sizes"].device == checkpointed_request.prompt_tokens.device
+    engine.context.add_vlm_request_data.assert_called_once_with(
+        checkpointed_request.request_id,
+        image_embeddings=refreshed_embeddings,
+        image_token_mask=checkpointed_request.image_token_mask,
     )
 
 
@@ -1695,7 +1772,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     def test_cuda_graph_token_counts(self, use_non_decode: bool) -> None:
         """Test initialization of `cuda_graph_token_counts` in dynamic context."""
 
-        # Exponential-decay graph distribution (halve from max down to tp_size).
+        # Exponential-decay graph distribution (halve from max down to tp_size). Pinned
+        # explicitly below: the production default is HYBRID, which spaces the
+        # decode-only family linearly instead and so yields different token counts.
         # decode-only path: cuda_graph_max_tokens = max_requests * (spec+1) = 80.
         # non-decode path: cuda_graph_max_tokens = self.max_tokens (DEFAULT 16384);
         # most large prefill sizes are filtered by is_valid because
@@ -1729,6 +1808,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     num_cuda_graphs=num_cuda_graphs,
                     use_cuda_graphs_for_non_decode_steps=use_non_decode,
                     cuda_graph_all_prefills=use_non_decode,
+                    cuda_graph_sizing_distribution=CudaGraphSizingDistribution.EXPONENTIAL,
                 )
             )
             actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts

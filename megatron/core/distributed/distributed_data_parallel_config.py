@@ -104,6 +104,10 @@ class DistributedDataParallelConfig:
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
       'optim_grads', 'optim_grads_params'."""
 
+    expert_data_parallel_sharding_strategy: str | None = None
+    """Optional expert-parameter sharding strategy for MFSDP v2. When unset, experts use
+      ``data_parallel_sharding_strategy``."""
+
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
 
@@ -247,6 +251,13 @@ class DistributedDataParallelConfig:
     parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
     user buffer registration and CUDA graph replay for models with asymmetrical
     FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
+    """
+
+    hfsdp_param_gather_overlap: bool = False
+    """If true, pipeline HFSDP parameter gathers across the DP-Outer and DP-Inner
+    communication domains. DP-Inner retains its size-based prefetch policy, while
+    DP-Outer is prefetched one additional FSDP unit beyond the DP-Inner frontier.
+    Only effective with ``outer_dp_sharding_strategy='optim'``.
     """
 
     @property

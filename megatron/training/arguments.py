@@ -80,6 +80,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_varlen_dataset_args(parser)
 
     parser = _add_fault_injector_args(parser)
 
@@ -1693,7 +1694,36 @@ def validate_args(args, defaults={}):
     if args.ckpt_format == "fsdp_dtensor":
         assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
-    # Scheduler-name and max-seqlen validation live in
+    # --use-varlen-dataset: independent of --sft. Cannot be combined with --sft
+    # because they are mutually-exclusive top-level dataset selectors that both
+    # drive the packed-sequence (THD) path. These stay in validate_args: the
+    # selectors are CLI-level args, not core config fields.
+    if args.use_varlen_dataset:
+        assert not args.sft, (
+            "--use-varlen-dataset and --sft are mutually exclusive; both "
+            "select the packed-sequence dataset family. Pick one."
+        )
+        if args.varlen_sbhd_validation:
+            assert args.sequence_packing_scheduler is None, (
+                "--varlen-sbhd-validation does not use a sequence packing "
+                "scheduler; drop --sequence-packing-scheduler."
+            )
+            # SBHD validation is a real-data numerical-reference path only;
+            # MockVarlenDataset does not implement it.
+            assert not args.mock_data, (
+                "--varlen-sbhd-validation is not supported with --mock-data; "
+                "SBHD validation requires a real dataset."
+            )
+        else:
+            # VarlenDataset emits one unpacked sample per __getitem__; it
+            # relies on an upstream packing scheduler to group variable-length
+            # samples into THD batches. Auto-pick ``dp_balanced`` when the
+            # user did not request one explicitly.
+            if args.sequence_packing_scheduler is None:
+                args.sequence_packing_scheduler = 'dp_balanced'
+
+    # Runs after the varlen auto-select above so it sees the final resolved
+    # scheduler. Scheduler-name and max-seqlen validation live in
     # ModelParallelConfig.__post_init__; only the buffer-size check stays here
     # because seq_length is not a core config field. The None case for
     # max_seqlen_per_dp_cp_rank is rejected by the config check.
@@ -2282,12 +2312,15 @@ def _add_inference_args(parser):
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-sizing-distribution',
-                       type=str, default='exponential',
-                       choices=['exponential', 'linear'],
+                       type=str, default='hybrid',
+                       choices=['exponential', 'linear', 'hybrid'],
                        dest='inference_dynamic_batching_cuda_graph_sizing_distribution',
-                       help='Spacing of CUDA graph token counts. "exponential" (default) '
-                            'halves from cuda_graph_max_tokens down to tp_size, giving a '
-                            'log-spaced distribution with bounded relative padding. '
+                       help='Spacing of CUDA graph token counts. "hybrid" (default) uses '
+                            'exponential spacing for prefill/mixed graphs and linear spacing '
+                            'for decode-only graphs, whose token counts are capped at '
+                            'max_requests and are far too small for halving to cover well. '
+                            '"exponential" halves from cuda_graph_max_tokens down to tp_size, '
+                            'giving a log-spaced distribution with bounded relative padding. '
                             '"linear" uses varying linear strides across the range.')
     group.add_argument('--inference-dynamic-batching-sampling-backend',
                        type=str, default='torch',
@@ -3283,6 +3316,10 @@ def _add_distributed_args(parser):
     group.add_argument('--data-parallel-sharding-strategy', type=str, default='optim_grads_params',
                        choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
                        help='Sharding strategy of data parallelism.')
+    group.add_argument('--expert-data-parallel-sharding-strategy', type=str, default=None,
+                       choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
+                       help='Optional expert-parameter sharding strategy for MFSDP v2. '
+                            'Defaults to --data-parallel-sharding-strategy.')
     group.add_argument('--outer-dp-sharding-strategy', type=str, default='no_shard',
                        choices=['no_shard', 'optim'],
                        help='Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode. '
@@ -3290,6 +3327,11 @@ def _add_distributed_args(parser):
                             'The "optim" option is only supported when --data-parallel-sharding-strategy is "optim_grads_params". '
                             'This option is only effective when Hybrid FSDP is enabled (i.e., when dp_outer_dim is not None). '
                             'Default: "no_shard".')
+    group.add_argument('--hfsdp-param-gather-overlap', action='store_true',
+                       help='Pipeline HFSDP parameter all-gathers across DP-Outer and DP-Inner. '
+                            'DP-Outer is prefetched one FSDP unit beyond the existing '
+                            'DP-Inner prefetch frontier. '
+                            'Only effective with --outer-dp-sharding-strategy=optim.')
     group.add_argument('--no-gradient-reduce-div-fusion', action='store_false', dest='gradient_reduce_div_fusion',
                        help='If not set, fuse the division in gradient reduce.')
     group.add_argument('--fsdp-double-buffer', action='store_true',
@@ -3889,6 +3931,37 @@ def _add_sft_args(parser):
                        'defaults to a lognormal distribution with min_seq_len=seq_length//2, '
                        'max_seq_len=seq_length, mean_seq_len=seq_length*3//4, '
                        'lognormal_sigma=1.1.')
+    return parser
+
+
+def _add_varlen_dataset_args(parser):
+    group = parser.add_argument_group(title='varlen dataset')
+    group.add_argument('--use-varlen-dataset', action="store_true",
+                       help='Train with VarlenDataset, a variable-length packed (THD) dataset '
+                       'that consumes instruction-tuning data from a HuggingFace Hub repo id, '
+                       'a local parquet file, or a local jsonl file. Schema (alpaca / sharegpt '
+                       '/ openai-messages) is auto-detected from the dataset columns. '
+                       'Mutually exclusive with --sft. Auto-picks a sequence packing '
+                       'scheduler when none is given: dp_balanced. '
+                       'Combine with --mock-data for a synthetic lognormal sequence-length '
+                       'distribution; see --varlen-mock-dataset-config-json.')
+    group.add_argument('--varlen-sbhd-validation', action="store_true",
+                       help='Reference SBHD mode for THD numerical verification. When set, '
+                       'VarlenDataset emits SBHD-style samples right-padded to '
+                       '--seq-length (no cu_seqlens, no packing scheduler), so the run can '
+                       'be compared against the THD path to validate correctness. '
+                       'Incompatible with --sequence-packing-scheduler.')
+    group.add_argument('--varlen-mock-dataset-config-json', type=str, default=None,
+                       help='Mock-dataset config for --use-varlen-dataset --mock-data. '
+                       'Accepts either an inline JSON literal or a path to a JSON file '
+                       'containing the same schema as --sft-mock-dataset-config-json: either '
+                       '{"mode":"file","path":"/path/to/lengths.csv"}, '
+                       '{"mode":"distribution","type":"lognormal","min_seq_len":1024,'
+                       '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, or '
+                       '{"mode":"verification","data_path":"/prefix/of/IndexedDataset"}. '
+                       'If not specified, defaults to a lognormal distribution with '
+                       'min_seq_len=seq_length//2, max_seq_len=seq_length, '
+                       'mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.')
     return parser
 
 def _add_logits_distillation_args(parser):

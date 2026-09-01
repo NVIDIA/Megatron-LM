@@ -126,9 +126,9 @@ class InferenceSetupConfig:
     inference_dynamic_batching_cuda_graph_mixed_prefill_count: int = 16
     """Number of mixed prefill requests to capture in a cuda graph."""
 
-    inference_dynamic_batching_cuda_graph_sizing_distribution: Literal["exponential", "linear"] = (
-        "exponential"
-    )
+    inference_dynamic_batching_cuda_graph_sizing_distribution: Literal[
+        "exponential", "linear", "hybrid"
+    ] = "hybrid"
     """Spacing of CUDA graph token counts. "exponential" (default) halves from cuda_graph_max_tokens
     down to tp_size, giving a log-spaced distribution with bounded relative padding. "linear" uses
     varying linear strides across the range."""
