@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -58,7 +58,10 @@ def test_listener_failure_does_not_interrupt_block_deregistration():
 
     healthy_listener.side_effect = assert_allocator_committed
     allocator.register_kv_block_hashes(blocks.tolist(), [101, 202])
-    allocator.release_memory_blocks(blocks)
+    with patch(
+        "megatron.core.inference.contexts.dynamic_context.logging.exception"
+    ) as log_exception:
+        allocator.release_memory_blocks(blocks)
 
     assert not allocator.kv_hash_to_block_id
     assert torch.all(allocator.block_hashes[blocks.to(torch.int64)] == -1)
@@ -69,3 +72,4 @@ def test_listener_failure_does_not_interrupt_block_deregistration():
     assert healthy_listener.call_args.args[0] == "removed"
     assert set(failing_listener.call_args.args[1]["block_hashes"]) == {101, 202}
     assert set(healthy_listener.call_args.args[1]["block_hashes"]) == {101, 202}
+    log_exception.assert_called_once_with("KV-event listener failed while handling %r", "removed")

@@ -14,6 +14,7 @@ from megatron.core.models.common.embeddings.language_model_embedding import Lang
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -194,8 +195,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     config.num_layers, attn_ratio, mlp_ratio
                 )
 
-        # Parse unified pattern to extract main and MTP components, and
-        # determine the pipeline segment for this model instance.
+        # Parse unified pattern to extract main and MTP components.
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             parse_hybrid_pattern,
             select_pipeline_segment,
@@ -204,17 +204,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
-
-        logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
-
-        layer_type_list, layer_offset = select_pipeline_segment(
-            parsed.main_pattern or '',
-            self.pg_collection.pp,
-            vp_stage,
-            first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
-            last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
-            **logging_pg_kwargs,
-        )
 
         # Determine if MTP is needed (based on pattern parsing)
         self.mtp_process = (
@@ -229,7 +218,25 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_num_layers=self.config.mtp_num_layers,
                 ignore_virtual=False,
                 vp_stage=self.vp_stage,
+                pp_group=self.pg_collection.pp,
+                vp_size=self.config.virtual_pipeline_model_parallel_size,
             )
+        )
+
+        # Validate TP communication overlap after determining whether this rank builds MTP,
+        # before constructing the decoder or MTP modules.
+        layer_utils.validate_tp_comm_overlap(self.config, '', has_mtp=self.mtp_process)
+
+        logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
+
+        layer_config_list, layer_offset = select_pipeline_segment(
+            parsed.main_pattern or '',
+            self.config,
+            self.pg_collection.pp,
+            vp_stage,
+            first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
+            last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+            **logging_pg_kwargs,
         )
 
         # megatron core pipelining currently depends on model type
@@ -282,7 +289,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             hybrid_stack_spec,
             self.config,
             pre_process=self.pre_process,
-            layer_type_list=layer_type_list,
+            layer_config_list=layer_config_list,
             pp_layer_offset=layer_offset,
             post_process=self.post_process,
             dtype=config.params_dtype,
@@ -432,6 +439,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
+        mtp_input_mask: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
         compute_mtp_loss: bool = True,
@@ -570,6 +578,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
                 embedding=self.embedding,
+                mtp_input_mask=mtp_input_mask,
             )
 
         if not self.post_process:
@@ -609,6 +618,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
+                    mtp_input_mask=mtp_input_mask,
+                    metric_avg_group=(
+                        getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
+                        or self.pg_collection.dp_cp
+                    ),
                 )
         sequence_parallel_override = False
         if (

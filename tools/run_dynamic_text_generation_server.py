@@ -19,7 +19,10 @@ if _EXAMPLES_MULTIMODAL not in sys.path:
 import torch  # noqa: E402
 
 from examples.multimodal.multimodal_args import add_multimodal_extra_args  # noqa: E402
-from megatron.core.inference.config import ImageProcessingConfig  # noqa: E402
+from megatron.core.inference.config import (  # noqa: E402
+    ImageProcessingConfig,
+    VideoProcessingConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext  # noqa: E402
 from megatron.core.inference.engines import DynamicInferenceEngine  # noqa: E402
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (  # noqa: E402,E501
@@ -58,8 +61,10 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser = add_multimodal_extra_args(parser)
     parser.add_argument("--port", type=int, default=5000, help="Port for Flask server to run on")
     parser.add_argument(
-        "--host", type=str, default=None,
-        help="Hostname or IP address to bind the server to. Defaults to 0.0.0.0 (all interfaces)."
+        "--host",
+        type=str,
+        default=None,
+        help="Hostname or IP address to bind the server to. Defaults to 0.0.0.0 (all interfaces).",
     )
     parser.add_argument(
         "--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response"
@@ -68,6 +73,32 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     # (megatron/training/config/training_config.py); we don't re-register it.
     # The chat_completions endpoint reads it from args.chat_template via
     # _load_chat_template, which accepts either a file path or an inline string.
+    parser.add_argument(
+        "--default-temperature",
+        type=float,
+        default=1.0,
+        help="Default temperature sampling value when a request does not specify temperature.",
+    )
+    parser.add_argument(
+        "--default-top-p",
+        type=float,
+        default=1.0,
+        help="Default top-p sampling value when a request does not specify top_p.",
+    )
+    parser.add_argument(
+        "--default-top-k",
+        type=int,
+        default=0,
+        help="Default top-k sampling value when a request does not specify top_k.",
+    )
+    parser.add_argument(
+        "--eval-mode",
+        action="store_true",
+        help=(
+            "Optimize defaults for pure serving. In chat requests, prevent_retokenization "
+            "defaults to false so prompt token IDs are not returned."
+        ),
+    )
     return parser
 
 
@@ -147,6 +178,17 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
         use_thumbnail=getattr(args, 'use_thumbnail', False),
         num_img_embeddings_per_tile=args.num_img_embeddings_per_tile,
     )
+    inference_config.video_preprocessing_config = VideoProcessingConfig(
+        image_config=inference_config.image_preprocessing_config,
+        num_frames=int(getattr(args, "num_frames", 8)),
+        temporal_patch_size=int(
+            getattr(
+                model,
+                "temporal_patch_dim",
+                getattr(getattr(model, "vision_model", None), "temporal_patch_dim", 1),
+            )
+        ),
+    )
 
     context = DynamicInferenceContext(model.config, inference_config)
     wrapped_model = VLMInferenceWrapper(model, context)
@@ -161,6 +203,10 @@ async def run_text_generation_server(
     server_port: int,
     hostname: str | None = None,
     chat_template: str | None = None,
+    default_temperature: float = 1.0,
+    default_top_p: float = 1.0,
+    default_top_k: int = 0,
+    eval_mode: bool = False,
 ):
     """
     Runs the text generation server from rank 0 and initializes the
@@ -170,12 +216,19 @@ async def run_text_generation_server(
         engine (DynamicInferenceEngine): The dynamic inference engine.
         coordinator_port (int): The network port for the dynamic inference DP coordinator.
         server_port (int): The network for port the frontend text generation server.
+        hostname (str | None): Hostname or IP address for coordinator and HTTP traffic.
+        chat_template (str | None): Inline chat template or contents loaded from a file.
+        default_temperature (float): Sampling default when a request omits `temperature`.
+        default_top_p (float): Sampling default when a request omits `top_p`.
+        default_top_k (int): Sampling default when a request omits `top_k`.
+        eval_mode (bool): Whether to use evaluation response defaults.
     """
 
     rank = torch.distributed.get_rank()
 
     coordinator_addr = await engine.start_listening_to_data_parallel_coordinator(
-        inference_coordinator_port=coordinator_port, launch_inference_coordinator=True,
+        inference_coordinator_port=coordinator_port,
+        launch_inference_coordinator=True,
         hostname=hostname,
     )
 
@@ -190,6 +243,13 @@ async def run_text_generation_server(
                 verbose=args.inference_text_gen_server_logging,
                 hostname=hostname,
                 chat_template=chat_template,
+                multimodal_prompt_config=(
+                    engine.controller.inference_wrapped_model.multimodal_prompt_config
+                ),
+                default_temperature=default_temperature,
+                default_top_p=default_top_p,
+                default_top_k=default_top_k,
+                eval_mode=eval_mode,
             )
 
         # Await the engine loop directly since the server is running in a separate process
@@ -305,6 +365,10 @@ if __name__ == "__main__":
                     args.port,
                     args.host,
                     chat_template=chat_template,
+                    default_temperature=args.default_temperature,
+                    default_top_p=args.default_top_p,
+                    default_top_k=args.default_top_k,
+                    eval_mode=args.eval_mode,
                 )
             )
         except KeyboardInterrupt:
