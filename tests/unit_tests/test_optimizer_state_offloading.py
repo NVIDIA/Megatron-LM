@@ -974,6 +974,27 @@ def test_distributed_optimizer_plans_native_fp32_optimizer_owned_master():
     del model, optimizer
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.usefixtures("model_parallel_context")
+def test_distributed_optimizer_cpu_offload_accepts_native_fp32_shards():
+    """CPU offload receives leaf shards when a BF16 model keeps FP32 parameters."""
+
+    model, optimizer = create_model_and_optimizer(
+        chunked_optimizer_state_offload=False,
+        use_precision_aware_optimizer=True,
+        include_native_fp32_param=True,
+        optimizer_cpu_offload=True,
+        optimizer_offload_fraction=1.0,
+        decoupled_weight_decay=True,
+    )
+    dist_optimizer = optimizer.chained_optimizers[0]
+    native_fp32_shards = [param for group in dist_optimizer.shard_fp32_groups for param in group]
+
+    assert native_fp32_shards
+    assert all(param.is_leaf and param.grad_fn is None for param in native_fp32_shards)
+    del model, optimizer
+
+
 def test_group_metadata_comparison_accepts_bool_convertible_equality():
     """Non-bool scalar equality results are interpreted through their truth value."""
 
