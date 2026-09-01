@@ -1,17 +1,20 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_decoder_block_spec,
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-    get_gpt_layer_with_inference_spec,
-    get_gpt_mtp_block_spec,
-    get_gpt_decoder_layer_specs,
-)
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
     get_transformer_layer_with_experimental_attention_variant_spec,
+)
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_decoder_layer_specs,
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_inference_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+    get_gpt_wide_residual_layer_local_spec,
+    get_gpt_wide_residual_layer_with_inference_spec,
+    get_gpt_wide_residual_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
@@ -35,6 +38,11 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         use_te = args.transformer_impl == "transformer_engine"
 
         if args.experimental_attention_variant is not None:
+            if config.wide_residual is not None:
+                raise NotImplementedError(
+                    "wide_residual does not support experimental-attention GPT specs because "
+                    "they do not statically construct WideResidualTransformerLayer."
+                )
             transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
                 config=config, vp_stage=vp_stage
             )
@@ -48,6 +56,11 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 vp_stage=vp_stage,
             )
         elif args.heterogeneous_layers_config_path is not None:
+            if config.wide_residual is not None:
+                raise NotImplementedError(
+                    "wide_residual does not support heterogeneous GPT specs because they do not "
+                    "statically construct WideResidualTransformerLayer."
+                )
             assert not (config.transformer_impl == "inference_optimized")
             transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
         else:
@@ -116,8 +129,14 @@ def _get_transformer_layer_spec(use_te, config):
     Returns:
         transformer_layer_spec: The transformer layer specification
     """
+    use_wide_residual = config.wide_residual is not None
     if use_te:
-        return get_gpt_layer_with_transformer_engine_spec(
+        layer_spec = (
+            get_gpt_wide_residual_layer_with_transformer_engine_spec
+            if use_wide_residual
+            else get_gpt_layer_with_transformer_engine_spec
+        )
+        return layer_spec(
             config.num_moe_experts,
             config.moe_grouped_gemm,
             config.qk_layernorm,
@@ -132,11 +151,21 @@ def _get_transformer_layer_spec(use_te, config):
             use_grouped_gemm_for_dense_mlp=config.use_grouped_gemm_for_dense_mlp,
         )
     elif config.transformer_impl == "inference_optimized":
-        return get_gpt_layer_with_inference_spec(
+        layer_spec = (
+            get_gpt_wide_residual_layer_with_inference_spec
+            if use_wide_residual
+            else get_gpt_layer_with_inference_spec
+        )
+        return layer_spec(
             config.qk_layernorm, config.multi_latent_attention, qk_l2_norm=config.qk_l2_norm
         )
     else:
-        return get_gpt_layer_local_spec(
+        layer_spec = (
+            get_gpt_wide_residual_layer_local_spec
+            if use_wide_residual
+            else get_gpt_layer_local_spec
+        )
+        return layer_spec(
             config.num_moe_experts,
             config.moe_grouped_gemm,
             config.qk_layernorm,

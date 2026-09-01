@@ -6,12 +6,16 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_layer_specs
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
 )
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
 from megatron.training.models.gpt import (
     GPTModelBuilder,
     GPTModelConfig,
@@ -61,6 +65,8 @@ def _make_dispatch_config(**transformer_kwargs):
     transformer.kitchen_attention_backend = None
     transformer.use_te_activation_func = False
     transformer.mla_down_proj_fusion = False
+    transformer.use_grouped_gemm_for_dense_mlp = False
+    transformer.wide_residual = None
     for k, v in transformer_kwargs.items():
         setattr(transformer, k, v)
     config.transformer = transformer
@@ -166,6 +172,7 @@ class TestDefaultLayerSpecDispatch:
         transformer.transformer_impl = "transformer_engine"
         transformer.experimental_attention_variant = None
         transformer.num_moe_experts = None
+        transformer.wide_residual = None
         config = Mock()
         config.restore_modelopt_state = False
         config.transformer = transformer
@@ -240,6 +247,132 @@ class TestDefaultLayerSpecDispatch:
             kitchen_attention_backend=config.transformer.kitchen_attention_backend,
         )
         assert result is spec
+
+    @patch("megatron.training.models.gpt.get_gpt_wide_residual_layer_with_transformer_engine_spec")
+    def test_returns_explicit_wide_te_spec(self, mock_get_spec):
+        mock_get_spec.__signature__ = inspect.Signature()
+        spec = Mock(spec=ModuleSpec)
+        mock_get_spec.return_value = spec
+        config = _make_dispatch_config(wide_residual=WideResidualConfig(num_streams=2))
+        config.transformer.transformer_impl = "transformer_engine"
+
+        result = default_layer_spec(config, vp_stage=None)
+
+        mock_get_spec.assert_called_once()
+        assert result is spec
+
+    @patch("megatron.training.models.gpt.get_gpt_wide_residual_layer_with_inference_spec")
+    def test_returns_explicit_wide_inference_spec(self, mock_get_spec):
+        spec = Mock(spec=ModuleSpec)
+        mock_get_spec.return_value = spec
+        config = _make_dispatch_config(wide_residual=WideResidualConfig(num_streams=2))
+        config.transformer.transformer_impl = "inference_optimized"
+
+        result = default_layer_spec(config, vp_stage=None)
+
+        mock_get_spec.assert_called_once_with(
+            config.transformer.qk_layernorm,
+            config.transformer.multi_latent_attention,
+            qk_l2_norm=config.transformer.qk_l2_norm,
+        )
+        assert result is spec
+
+    @patch("megatron.training.models.gpt.get_gpt_wide_residual_layer_local_spec")
+    def test_returns_explicit_wide_local_spec(self, mock_get_spec):
+        spec = Mock(spec=ModuleSpec)
+        mock_get_spec.return_value = spec
+        config = _make_dispatch_config(wide_residual=WideResidualConfig(num_streams=2))
+
+        result = default_layer_spec(config, vp_stage=None)
+
+        mock_get_spec.assert_called_once()
+        assert result is spec
+
+    @pytest.mark.parametrize("unsupported_path", ["modelopt", "experimental_attention"])
+    def test_wide_residual_rejects_unsupported_default_spec_producers(self, unsupported_path):
+        config = _make_dispatch_config(wide_residual=WideResidualConfig(num_streams=2))
+        if unsupported_path == "modelopt":
+            config.restore_modelopt_state = True
+            expected_error = "ModelOpt"
+        else:
+            config.transformer.experimental_attention_variant = "variant_x"
+            expected_error = "experimental-attention"
+
+        with pytest.raises(NotImplementedError, match=expected_error):
+            default_layer_spec(config, vp_stage=None)
+
+
+class TestDefaultWideResidualLayerSpecs:
+    """Static class selection through the canonical GPT spec producers."""
+
+    @pytest.mark.parametrize(
+        ("wide_residual", "expected_module"),
+        [
+            (None, TransformerLayer),
+            (WideResidualConfig(num_streams=2), WideResidualTransformerLayer),
+        ],
+        ids=("disabled", "enabled"),
+    )
+    def test_local_dense_spec_selects_exact_layer_class(self, wide_residual, expected_module):
+        config = _make_gpt_config(
+            transformer=_make_transformer(transformer_impl="local", wide_residual=wide_residual)
+        )
+
+        spec = default_layer_spec(config, vp_stage=None)
+
+        assert spec.module is expected_module
+
+    @patch(
+        "megatron.core.models.gpt.gpt_layer_specs."
+        "get_gpt_layer_with_transformer_engine_submodules",
+        return_value=TransformerLayerSubmodules(),
+    )
+    @pytest.mark.parametrize(
+        ("wide_residual", "expected_module"),
+        [
+            (None, TransformerLayer),
+            (WideResidualConfig(num_streams=2), WideResidualTransformerLayer),
+        ],
+        ids=("disabled", "enabled"),
+    )
+    def test_te_dense_spec_selects_exact_layer_class(
+        self, _mock_submodules, wide_residual, expected_module
+    ):
+        config = _make_gpt_config(
+            transformer=_make_transformer(
+                transformer_impl="transformer_engine", wide_residual=wide_residual
+            )
+        )
+
+        spec = default_layer_spec(config, vp_stage=None)
+
+        assert spec.module is expected_module
+
+    @pytest.mark.parametrize(
+        ("wide_residual", "expected_module"),
+        [
+            (None, TransformerLayer),
+            (WideResidualConfig(num_streams=2), WideResidualTransformerLayer),
+        ],
+        ids=("disabled", "enabled"),
+    )
+    def test_mixed_dense_moe_specs_select_exact_layer_class(self, wide_residual, expected_module):
+        config = _make_transformer(
+            num_layers=4,
+            transformer_impl="local",
+            num_moe_experts=2,
+            moe_ffn_hidden_size=256,
+            moe_layer_freq=[0, 1, 0, 1],
+            wide_residual=wide_residual,
+        )
+
+        layer_specs = get_gpt_decoder_layer_specs(config, use_transformer_engine=False)
+
+        assert [layer_spec.module for layer_spec in layer_specs] == [expected_module] * 4
+        assert [
+            getattr(layer_spec.submodules.mlp, "func", None) is MoELayer
+            for layer_spec in layer_specs
+        ] == [False, True, False, True]
 
 
 # =============================================================================

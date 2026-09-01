@@ -1516,6 +1516,10 @@ class TransformerConfig(ModelParallelConfig):
         if self.wide_residual is not None:
             if self.enable_mhc_connections:
                 raise ValueError("wide_residual and enable_mhc_connections are mutually exclusive.")
+            if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
+                raise NotImplementedError(
+                    "wide_residual does not yet support CUDA graphs; use cuda_graph_impl='none'."
+                )
             if self.pipeline_model_parallel_size > 1:
                 raise NotImplementedError(
                     "wide_residual does not yet support pipeline_model_parallel_size > 1. "
@@ -1538,6 +1542,13 @@ class TransformerConfig(ModelParallelConfig):
                 raise NotImplementedError(
                     "wide_residual does not yet support heterogeneous_block_specs. "
                     "Residual-stream width is currently owned by the enclosing block."
+                )
+            if self.overlap_moe_expert_parallel_comm:
+                raise NotImplementedError(
+                    "wide_residual does not yet support overlap_moe_expert_parallel_comm. "
+                    "The fine-grained EP-overlap schedule invokes the pre-MLP norm and MLP BDA "
+                    "outside TransformerLayer._forward_mlp, bypassing the wide-residual MLP "
+                    "read and write connection."
                 )
 
         # Resolve deprecated attention variant spellings up front so that every consumer
