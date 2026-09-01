@@ -378,13 +378,15 @@ def test_gated_delta_net_dense_batch_cp4_matches_fla(monkeypatch, local_seqlen, 
     reference_output, reference_dinput, reference_grads = execute(capture_gdr_inputs=True)
 
     calls = {"pre": 0, "fwd": 0, "bwd": 0}
+    pre_batches = []
     original_pre = gdn._fused_streamed_pre_gated_delta_rule
     original_cp_forward = implementation._fla_forward_for_fused_bwd
     original_backward = implementation._call_fused_gdr_bwd_cute
 
-    def tracked_pre(*args, **kwargs):
+    def tracked_pre(qkvzba, *args, **kwargs):
         calls["pre"] += 1
-        return original_pre(*args, **kwargs)
+        pre_batches.append(qkvzba.shape[1])
+        return original_pre(qkvzba, *args, **kwargs)
 
     def tracked_cp_forward(**kwargs):
         calls["fwd"] += 1
@@ -401,6 +403,7 @@ def test_gated_delta_net_dense_batch_cp4_matches_fla(monkeypatch, local_seqlen, 
         path_guard.setattr(implementation, "_call_fused_gdr_bwd_cute", tracked_backward)
         actual_output, actual_dinput, actual_grads = execute(capture_gdr_inputs=True)
     assert calls == {"pre": 1, "fwd": 1, "bwd": 1}
+    assert pre_batches == [_BATCH_SIZE]
 
     def assert_distributed_close(name, actual, expected, *, tolerance):
         close = torch.isclose(actual, expected, atol=tolerance, rtol=tolerance)

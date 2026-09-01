@@ -287,7 +287,7 @@ def _call_fla_compat(function, **kwargs):
     return function(**kwargs)
 
 
-def _cp_forward_preprocess(**kwargs):
+def _cp_forward_preprocess(*, _allow_fla_fallback: bool = True, **kwargs):
     """Prefer the in-tree CuTeDSL CP boundary kernel, then fall back to FLA."""
     cutedsl_initial_state = try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl(
         k=kwargs["k"],
@@ -306,10 +306,12 @@ def _cp_forward_preprocess(**kwargs):
     )
     if cutedsl_initial_state is not None:
         return cutedsl_initial_state
+    if not _allow_fla_fallback:
+        return None
     return _call_fla_compat(chunk_gated_delta_rule_fwd_h_pre_process, **kwargs)
 
 
-def _cp_backward_preprocess(**kwargs):
+def _cp_backward_preprocess(*, _allow_fla_fallback: bool = True, **kwargs):
     """Prefer the in-tree CuTeDSL CP terminal-gradient kernel, then fall back to FLA."""
     cutedsl_dht = try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl(
         q=kwargs["q"],
@@ -331,6 +333,8 @@ def _cp_backward_preprocess(**kwargs):
     )
     if cutedsl_dht is not None:
         return cutedsl_dht, None
+    if not _allow_fla_fallback:
+        return None
     return _call_fla_compat(chunk_gated_delta_rule_bwd_dhu_pre_process, **kwargs)
 
 
@@ -395,21 +399,35 @@ def _fla_backward(
         chunk_bwd_dv_local, q=q, k=k, g=g, do=do, scale=scale, use_exp2=True, **common
     )
     if cp_context is not None:
-        dht, initial_state = _cp_backward_preprocess(
-            q=q,
-            k=k,
-            w=w,
-            do=do,
-            dv=dv,
-            g=g,
-            scale=scale,
-            cu_seqlens=cu_seqlens,
-            dht=dht,
-            initial_state=initial_state,
-            context=cp_context,
-            use_exp2=True,
-            transpose_state_layout=False,
-        )
+        if q.shape[0] > 1 and cu_seqlens is None:
+            dht = _fla_cp_backward_preprocess_dense_batch(
+                q=q,
+                k=k,
+                w=w,
+                do=do,
+                dv=dv,
+                g=g,
+                scale=scale,
+                initial_state=initial_state,
+                cp_context=cp_context,
+            )
+            initial_state = None
+        else:
+            dht, initial_state = _cp_backward_preprocess(
+                q=q,
+                k=k,
+                w=w,
+                do=do,
+                dv=dv,
+                g=g,
+                scale=scale,
+                cu_seqlens=cu_seqlens,
+                dht=dht,
+                initial_state=initial_state,
+                context=cp_context,
+                use_exp2=True,
+                transpose_state_layout=False,
+            )
     dh, _dh0, dv = _call_fla_compat(
         chunk_gated_delta_rule_bwd_dhu,
         q=q,
@@ -482,13 +500,29 @@ def _fla_cp_forward_preprocess_dense_batch(
     g: torch.Tensor,
     cp_context: object,
 ) -> torch.Tensor:
-    """Build one CP boundary state per dense batch element."""
+    """Use one native-B CuTeDSL call, or preserve FLA's B=1 contract."""
     cp_cu_seqlens = _dense_cp_cu_seqlens(cp_context)
+    native_state = _cp_forward_preprocess(
+        k=k,
+        w=w,
+        u=u,
+        g=g,
+        cu_seqlens=cp_cu_seqlens,
+        initial_state=None,
+        context=cp_context,
+        use_exp2=True,
+        transpose_state_layout=False,
+        _allow_fla_fallback=False,
+    )
+    if native_state is not None:
+        return native_state
+
     states = []
     for batch_index in range(k.shape[0]):
         batch_slice = slice(batch_index, batch_index + 1)
         states.append(
-            _cp_forward_preprocess(
+            _call_fla_compat(
+                chunk_gated_delta_rule_fwd_h_pre_process,
                 k=k[batch_slice],
                 w=w[batch_slice],
                 u=u[batch_slice],
@@ -515,12 +549,32 @@ def _fla_cp_backward_preprocess_dense_batch(
     initial_state: torch.Tensor,
     cp_context: object,
 ) -> torch.Tensor:
-    """Build one CP terminal gradient per dense batch element."""
+    """Use one native-B CuTeDSL call, or preserve FLA's B=1 contract."""
     cp_cu_seqlens = _dense_cp_cu_seqlens(cp_context)
+    native_result = _cp_backward_preprocess(
+        q=q,
+        k=k,
+        w=w,
+        do=do,
+        dv=dv,
+        g=g,
+        scale=scale,
+        cu_seqlens=cp_cu_seqlens,
+        dht=None,
+        initial_state=initial_state,
+        context=cp_context,
+        use_exp2=True,
+        transpose_state_layout=False,
+        _allow_fla_fallback=False,
+    )
+    if native_result is not None:
+        return native_result[0]
+
     terminal_gradients = []
     for batch_index in range(q.shape[0]):
         batch_slice = slice(batch_index, batch_index + 1)
-        batch_dht, _ = _cp_backward_preprocess(
+        batch_dht, _ = _call_fla_compat(
+            chunk_gated_delta_rule_bwd_dhu_pre_process,
             q=q[batch_slice],
             k=k[batch_slice],
             w=w[batch_slice],

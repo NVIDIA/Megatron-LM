@@ -59,6 +59,7 @@ class PreProcessBwdFused(PreProcessBwdMerged, PreProcessFwdFused):
         gate_mode: str,
         R: int,
         rank: int,
+        B: int = 1,
     ):
         # Call the protocol-bearing base explicitly.  A normal super() would
         # enter PreProcessBwdMerged.__init__, whose next MRO class is the fused
@@ -73,7 +74,7 @@ class PreProcessBwdFused(PreProcessBwdMerged, PreProcessFwdFused):
             R,
             rank,
             split=1,
-            B=1,
+            B=B,
         )
         assert K in (64, 128), "fused backward supports K in {64,128}"
         assert V % 64 == 0
@@ -958,6 +959,7 @@ class CuteDSLFusedCPBwdPreProcess:
         DV: int,
         gate_mode: str = "g",
         device=None,
+        B: int = 1,
     ):
         import torch.distributed as dist
 
@@ -966,9 +968,14 @@ class CuteDSLFusedCPBwdPreProcess:
         assert DK in (64, 128)
         assert DV % 64 == 0
         assert gate_mode in ("none", "g", "gk")
+        if B > 1 and type(self).OP_CLASS is None:
+            raise ValueError(
+                "dense B>1 requires the warp-specialized backward wrapper"
+            )
         self.group = group
         self.R = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
+        self.B = B
         assert self.R >= 2
         self.H, self.HV, self.DK, self.DV = H, HV, DK, DV
         self.gate_mode = gate_mode
@@ -976,7 +983,7 @@ class CuteDSLFusedCPBwdPreProcess:
             "cuda", torch.cuda.current_device()
         )
         self.bufs = CPSymmBuffers(
-            group, HV, DK, DV, self.device, smax=1, B=1
+            group, HV, DK, DV, self.device, smax=1, B=B
         )
         self.ptrs = torch.stack(
             [
@@ -1053,9 +1060,10 @@ class CuteDSLFusedCPBwdPreProcess:
 
         Backward twin of the forward wrapper's `launch_validated`; see there.
         The contract is the assertion block of ``__call__``: `q`/`k`/`w`/`do`/
-        `dv` contiguous bf16 with `B == 1`, `T >= 1`, the wrapper's own
+        `dv` contiguous bf16 with `B == self.B`, `T >= 1`, the wrapper's own
         `(H, HV, K, V)`, a gate matching `self.gate_mode`, and `dht_out` (when
-        given) a contiguous fp32 `[HV,K,V]` tensor.
+        given) a contiguous fp32 `[B,HV,K,V]` tensor (leading mode omitted
+        when ``B==1``).
 
         ``emit_h`` / ``emit_m`` are the mirror of the forward's: the reverse
         chain is always the full ``rank-1 .. 0`` push and ``rank+1 .. R-1``
@@ -1086,7 +1094,7 @@ class CuteDSLFusedCPBwdPreProcess:
     ) -> torch.Tensor:
         B, T, H, K = q.shape
         HV, V = do.shape[2], do.shape[-1]
-        assert B == 1 and T >= 1
+        assert B == self.B and T >= 1
         assert (H, HV, K, V) == (
             self.H,
             self.HV,
@@ -1147,24 +1155,26 @@ class CuteDSLFusedCPBwdPreProcess:
             # sources contribute nothing gets zeros through their emit masks.)
             if self.rank == self.R - 1:
                 if self._last_zero is None:
+                    out_shape = ((HV, K, V) if self.B == 1 else
+                                 (self.B, HV, K, V))
                     self._last_zero = torch.zeros(
-                        HV,
-                        K,
-                        V,
+                        *out_shape,
                         dtype=torch.float32,
                         device=self.device,
                     )
                 dht_out = self._last_zero
             else:
+                out_shape = ((HV, K, V) if self.B == 1 else
+                             (self.B, HV, K, V))
                 dht_out = torch.empty(
-                    HV,
-                    K,
-                    V,
+                    *out_shape,
                     dtype=torch.float32,
                     device=self.device,
                 )
         else:
-            assert dht_out.shape == (HV, K, V)
+            out_shape = ((HV, K, V) if self.B == 1 else
+                         (self.B, HV, K, V))
+            assert dht_out.shape == out_shape
             assert dht_out.dtype == torch.float32
             assert dht_out.is_contiguous()
 
