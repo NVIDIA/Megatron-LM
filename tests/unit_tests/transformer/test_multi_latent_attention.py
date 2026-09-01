@@ -1438,19 +1438,22 @@ class TestMLAClipQK:
     ],
 )
 @pytest.mark.parametrize(
-    ("tp", "sp", "cp"),
+    ("tp", "sp", "cp", "dynamic_cp"),
     [
-        (4, False, 1),  # TP w/o SP
-        (4, True, 1),  # TP w/ SP
-        (1, False, 4),  # CP
-        (2, False, 2),  # CP + TP w/o SP
-        (2, True, 2),  # CP + TP w/ SP
+        (4, False, 1, False),  # TP w/o SP
+        (4, True, 1, False),  # TP w/ SP
+        (1, False, 4, False),  # Static CP
+        (2, False, 2, False),  # Static CP + TP w/o SP
+        (2, True, 2, False),  # Static CP + TP w/ SP
+        (1, False, 2, True),  # Build-time CP1 + runtime Dynamic CP2
     ],
 )
 @pytest.mark.skipif(not is_te_min_version("1.10.0"), reason="Requires TransformerEngine >= 1.10.0")
 def test_parallel_multi_latent_attention_correctness(
-    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp
+    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp, dynamic_cp
 ):
+    if dynamic_cp and int(os.environ.get("WORLD_SIZE", "1")) < cp:
+        pytest.skip(f"Runtime CP={cp} parity requires at least {cp} distributed ranks")
     if cp > 1 and not is_te_min_version("2.5.0", check_equality=True):
         pytest.skip("MLA CP requires TransformerEngine >= 2.5.0")
     if rope_type == "yarn" and apply_rope_fusion and not is_torch_min_version("2.5.0"):
@@ -1554,6 +1557,11 @@ def test_parallel_multi_latent_attention_correctness(
             input_hidden_states, attention_mask=None
         )
         output_hidden_states_baseline.sum().backward()
+        parameter_grads_baseline = {
+            name: param.grad.detach().clone()
+            for name, param in attention.named_parameters()
+            if param.grad is not None
+        }
 
         # Save baseline output
         input_grad_baseline = input_hidden_states.grad.detach()
@@ -1562,16 +1570,21 @@ def test_parallel_multi_latent_attention_correctness(
 
         # Initialize parallel model
         Utils.destroy_model_parallel()
+        build_time_cp = 1 if dynamic_cp else cp
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tp, pipeline_model_parallel_size=1, context_parallel_size=cp
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=build_time_cp,
+            dynamic_context_parallel=dynamic_cp,
+            min_dynamic_context_parallel_size=1,
         )
         torch.manual_seed(seed)
         model_parallel_cuda_manual_seed(seed)
-        transformer_config.context_parallel_size = cp
+        transformer_config.context_parallel_size = build_time_cp
         transformer_config.tensor_model_parallel_size = tp
         transformer_config.sequence_parallel = sp
         init_basic_mock_args(mock_args, tp, 1, bf16=True)
-        mock_args.context_parallel_size = cp
+        mock_args.context_parallel_size = build_time_cp
         mock_args.sequence_parallel = sp
         gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
         with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
@@ -1579,12 +1592,18 @@ def test_parallel_multi_latent_attention_correctness(
                 load_checkpoint(gpt_model, None, None)
 
         # Function to get tensor on this tp and cp rank
-        cp_group = parallel_state.get_context_parallel_group()
+        cp_group = (
+            parallel_state.get_dynamic_data_context_parallel_groups(group_size=cp)
+            if dynamic_cp
+            else parallel_state.get_context_parallel_group()
+        )
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
         def get_tensor_on_this_rank(tensor):
             if cp > 1:
                 tensor = get_tensor_on_this_cp_rank(tensor, 0, cp_group)
+            if dynamic_cp:
+                tensor = tensor.transpose(0, 1).contiguous().view(-1, 1, *tensor.shape[2:])
             if tp > 1 and sp:
                 sp_seg = sequence_length // tp // cp
                 tensor = tensor[tp_rank * sp_seg : (tp_rank + 1) * sp_seg]
@@ -1594,11 +1613,35 @@ def test_parallel_multi_latent_attention_correctness(
         input_hidden_states = get_tensor_on_this_rank(input_hidden_states)
         input_hidden_states = input_hidden_states.detach().requires_grad_(True)
         parallel_attention = gpt_model[0].decoder.layers[0].self_attention
+        packed_seq_params = None
+        if dynamic_cp:
+            packed_seq_params = make_test_packed_seq_params(
+                cu_seqlens=[i * sequence_length for i in range(micro_batch_size + 1)]
+            )
+            packed_seq_params.local_cp_size = cp
+            packed_seq_params.cp_group = cp_group
         output_hidden_states_parallel, bias_hidden_states_parallel = parallel_attention(
-            input_hidden_states, attention_mask=None
+            input_hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
         )
         output_hidden_states_parallel.sum().backward()
         input_grad_parallel = input_hidden_states.grad.detach()
+
+        if dynamic_cp:
+            for name, param in parallel_attention.named_parameters():
+                if name not in parameter_grads_baseline:
+                    continue
+                assert param.grad is not None, f"Missing parallel gradient for {name}"
+                parallel_grad = param.grad.detach().clone()
+                torch.distributed.all_reduce(parallel_grad, group=cp_group)
+                torch.testing.assert_close(
+                    parameter_grads_baseline[name],
+                    parallel_grad,
+                    atol=5e-3,
+                    rtol=5e-3,
+                    msg=lambda msg, param_name=name: (
+                        f"Mismatch in MLA parameter gradient {param_name}: {msg}"
+                    ),
+                )
 
         # Check if the output is the same
         if cp:

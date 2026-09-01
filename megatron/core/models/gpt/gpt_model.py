@@ -21,7 +21,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     RotaryEmbedding,
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -749,6 +749,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     inference_context.mtp_decoder_hidden_states = hidden_states
             elif not in_inference_mode:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
+                mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
                     labels=labels,
@@ -759,7 +760,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=mtp_cp_group,
                     tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,

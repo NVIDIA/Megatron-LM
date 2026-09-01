@@ -24,17 +24,23 @@ from tests.unit_tests.transformer.test_attention import _test_parallel_attention
 
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
-    ("tp", "sp", "cp"),
+    ("tp", "sp", "cp", "dynamic_cp"),
     [
-        (4, False, 1),  # TP w/o SP
-        (4, True, 1),  # TP w/ SP
-        (1, False, 2),  # CP
-        (2, False, 2),  # TP w/o SP + CP
-        (2, True, 2),  # TP w/ SP + CP
+        (4, False, 1, False),  # TP w/o SP
+        (4, True, 1, False),  # TP w/ SP
+        (1, False, 2, False),  # Static CP
+        (2, False, 2, False),  # TP w/o SP + static CP
+        (2, True, 2, False),  # TP w/ SP + static CP
+        (1, False, 2, True),  # Build-time CP1 + runtime Dynamic CP2
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
+def test_parallel_gated_delta_net_correctness(
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, dynamic_cp
+):
+    if dynamic_cp and not sequence_packing:
+        pytest.skip("Runtime Dynamic CP requires packed THD input")
+
     transformer_config = TransformerConfig(
         hidden_size=128,
         linear_conv_kernel_dim=2,
@@ -76,6 +82,8 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         sequence_length=256,
         micro_batch_size=4,
         sequence_packing=sequence_packing,
+        dynamic_cp=dynamic_cp,
+        check_parameter_gradients=dynamic_cp,
     )
 
 

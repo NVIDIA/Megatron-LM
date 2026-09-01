@@ -18,7 +18,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
@@ -1442,13 +1442,15 @@ class MultiTokenPredictionLayer(MegatronModule):
             mtp_input_mask (torch.Tensor, optional): Mask of conditioning tokens backed by
                 regular token embeddings. Shape: [b, s].
         """
+        cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+
         # Calc logits for the current Multi-Token Prediction (MTP) layers.
         if mtp_input_mask is None:
             input_ids, _ = roll_tensor(
                 input_ids,
                 shifts=-1,
                 dims=-1,
-                cp_group=self.cp_group,
+                cp_group=cp_group,
                 packed_seq_params=packed_seq_params,
                 return_sum=False,
             )
@@ -1463,7 +1465,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 token_metadata,
                 shifts=-1,
                 dims=-1,
-                cp_group=self.cp_group,
+                cp_group=cp_group,
                 packed_seq_params=packed_seq_params,
                 return_sum=False,
             )
@@ -1473,7 +1475,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             position_ids,
             shifts=-1,
             dims=-1,
-            cp_group=self.cp_group,
+            cp_group=cp_group,
             packed_seq_params=packed_seq_params,
             return_sum=False,
         )
@@ -1482,7 +1484,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 padding_mask,
                 shifts=-1,
                 dims=-1,
-                cp_group=self.cp_group,
+                cp_group=cp_group,
                 packed_seq_params=packed_seq_params,
                 return_sum=False,
             )
@@ -2269,6 +2271,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         Returns:
             (Tensor): The mtp loss tensor of shape [b, s].
         """
+        cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
         # get hidden states from previous mtp stages
         offset = get_mtp_layer_offset(self.config, self.vp_stage, pp_rank=self.pp_rank)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
@@ -2324,7 +2327,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     shard_params = _packed_seq_params_for_local_hsm_roll(
                         packed_seq_params,
                         local_seq_length=sequence_length,
-                        cp_group=self.cp_group,
+                        cp_group=cp_group,
                         tp_group=self.tp_group if self.sequence_parallel else None,
                     )
                     if shard_params is not None:
@@ -2333,7 +2336,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     flattened,
                     shifts=-1,
                     dims=-1,
-                    cp_group=None if use_local_packed_roll else self.cp_group,
+                    cp_group=None if use_local_packed_roll else cp_group,
                     packed_seq_params=roll_packed_seq_params,
                     return_sum=False,
                 )
@@ -2345,7 +2348,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     newest_entry,
                     sequence_parallel=self.sequence_parallel,
                     tp_group=self.tp_group,
-                    cp_group=self.cp_group,
+                    cp_group=cp_group,
                     rng_tracker_name=self.hidden_state_mixing_rng_tracker_name,
                 )
                 hidden_state_history = list(rolled_older_hidden_states.unbind(0)) + [newest_entry]

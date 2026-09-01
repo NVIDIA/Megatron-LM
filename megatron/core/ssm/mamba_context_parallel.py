@@ -95,12 +95,18 @@ class MambaContextParallel:
         self.D_has_hdim = D_has_hdim
         self.sequence_is_contiguous = sequence_is_contiguous
 
-        self.cp_size = self.cp_group.size()
+        self._set_cp_params()
+
+    def _set_cp_params(self) -> None:
+        """Recompute local dimensions after changing the runtime CP group."""
+        self.cp_size = self.cp_group.size() if self.cp_group is not None else 1
 
         if self.cp_size == 1:
+            self.cp_rank = 0
             self.d_inner_local_tpcp = self.d_inner_local_tp
             self.nheads_local_tpcp = self.nheads_local_tp
             self.ngroups_local_tpcp = self.ngroups_local_tp
+            self.group_repeat_count = 1
             return
 
         self.cp_rank = self.cp_group.rank()
@@ -139,6 +145,13 @@ class MambaContextParallel:
         # because `nheads % ngroups == 0`, and therefore `nheads_local_tp % ngroups_local_tp == 0`,
         # and also `nheads_local_tpcp = nheads_local_tp // cp_size` whilst ngroups_local_tpcp is
         # either 1 or `ngroups_local_tp // cp_size`
+
+    def set_context_parallel_group(
+        self, cp_group: Optional[torch.distributed.ProcessGroup]
+    ) -> None:
+        """Set the per-microbatch context-parallel group."""
+        self.cp_group = cp_group
+        self._set_cp_params()
 
     def pre_conv_ssm(
         self, input_: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None

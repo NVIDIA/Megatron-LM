@@ -26,6 +26,7 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
+from megatron.core.packed_seq_params import resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
@@ -403,12 +404,6 @@ class AbsorbedMLASelfAttention(Attention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, h], got {hidden_states.ndim}D"
-        if packed_seq_params is not None:
-            assert (
-                packed_seq_params.local_cp_size is None
-            ), "dynamic context parallel is not supported with MLA yet and is planned for future. \
-            Please disable dynamic context parallel."
-
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # =========================================
@@ -829,6 +824,10 @@ class AbsorbedMLASelfAttention(Attention):
             inference_context is None and inference_params is None
         ), "Inference is not supported for AbsorbedMLA"
 
+        original_cp_group = self.pg_collection.cp
+        runtime_cp_group = resolve_cp_group(original_cp_group, packed_seq_params)
+        self.pg_collection.cp = runtime_cp_group
+
         # =====================
         # Query, Key, and Value
         # =====================
@@ -911,6 +910,7 @@ class AbsorbedMLASelfAttention(Attention):
         # =================
         output, bias = self.linear_proj(core_attn_out)
 
+        self.pg_collection.cp = original_cp_group
         return output, bias
 
     def backward_dw(self) -> NoReturn:
