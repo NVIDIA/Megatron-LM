@@ -286,6 +286,7 @@ ROLLOUT=(
   "actor_rollout_ref.rollout.name=vllm"
   "actor_rollout_ref.rollout.mode=async"
   "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}"
+  "actor_rollout_ref.rollout.expert_parallel_size=${ROLLOUT_EP}"
   "actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION}"
   "actor_rollout_ref.rollout.n=${ROLLOUT_N}"
   "actor_rollout_ref.rollout.calculate_log_probs=True"
