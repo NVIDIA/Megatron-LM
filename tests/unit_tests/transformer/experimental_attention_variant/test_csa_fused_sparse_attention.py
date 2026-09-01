@@ -1091,6 +1091,7 @@ class TestCPCommunicationOverlap:
             local_compressed_kv_rows = 2
             softmax_scale = 0.5
             q_padding_mask = None
+            out_rope = None
             num_forward_inputs = 25
 
         gradients = FusedCSAIndexerSparseAttnFromTopkFunc.backward(

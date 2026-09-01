@@ -834,8 +834,8 @@ def _unfused_indexer_sparse_attn_from_topk(
     _max_seqlen_q: int,
     indexer_layout: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     q_padding_mask: Optional[torch.Tensor] = None,
-    out_rope: Optional[OutputRopeParams] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    out_rope: Optional[OutputRopeParams] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """PyTorch sparse attention plus caller-supplied indexer loss for THD CP.
 
@@ -3071,7 +3071,6 @@ class CompressedSparseAttention(MegatronModule):
                 max_seqlen_q,
                 indexer_layout,
                 q_padding_mask,
-                fused_out_rope,
             )
             if overlap_cp_backward:
                 output, indexer_loss = FusedCSAIndexerSparseAttnFromTopkFunc.apply(
@@ -3083,10 +3082,13 @@ class CompressedSparseAttention(MegatronModule):
                     seq_to_rank_row if not sparse_indexer_loss else None,
                     indexer_k_rs_state,
                     compressed_kv_rs_state,
+                    fused_out_rope,
                 )
             else:
                 output, indexer_loss = _unfused_indexer_sparse_attn_from_topk(
-                    *indexer_loss_args, tp_group=indexer.pg_collection.tp
+                    *indexer_loss_args,
+                    out_rope=fused_out_rope,
+                    tp_group=indexer.pg_collection.tp,
                 )
             if fused_out_rope is None:
                 flat_shape = output.shape
