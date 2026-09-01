@@ -91,12 +91,17 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         where ``sampling_params`` is the serialized dict and ``multi_modal_data``
         carries the media identity the routing policy keys on. Both are
         constant-size, which is why they are decoded here on every request.
-    ``bodies``: ``[prompt, block_hashes]``. The prompt is a string or token id
-        list, forwarded to the engine untouched. ``block_hashes`` is the routing
-        hashes the client computed from the tokens it already held, salted with
-        the media key for multimodal requests. It is ``None`` when the client
-        could not hash -- a string prompt, which needs a tokenizer it does not
-        have -- and only then is the prompt decoded here.
+    ``bodies``: ``[prompt, block_hashes]``.
+
+        ``prompt`` is a string or token id list. It is forwarded to the engine
+        verbatim and never decoded here, which is the point of the split.
+
+        ``block_hashes`` is decoded here, used to pick a rank, and not forwarded:
+        the engine computes its own KV hashes. One int per block rather than per
+        token, which is why it is a body frame and not part of the constant-size
+        metadata. ``None`` means the client did not hash and this handler must,
+        paying the prompt decode; an empty list means it did hash and the prompt
+        was shorter than one block.
 
     Returns True (stopping the loop) if no engines are reachable.
     """
@@ -152,9 +157,11 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         request_hashes = msgpack.unpackb(bodies[1], raw=False)
         if request_hashes is None:
             # Nobody hashed this upstream, so it is hashed here and pays the prompt
-            # decode. Two cases reach this: a multimodal request, whose hashes are
-            # salted with a media key that is only derived further down the client,
-            # and a string prompt, which needs a tokenizer the caller may not have.
+            # decode. Two cases reach this: a client built directly rather than by
+            # the frontend, which is told neither the block size nor the policy,
+            # and a string prompt, which needs a tokenizer the client may not have.
+            # Multimodal no longer lands here -- the client salts it with the media
+            # key it derives while serializing.
             #
             # Distinct from an empty list, which means the caller did hash and the
             # prompt was shorter than one block. Re-hashing that would pay the

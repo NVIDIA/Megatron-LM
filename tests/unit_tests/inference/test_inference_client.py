@@ -74,7 +74,7 @@ async def test_inference_client_lifecycle():
 
     # add_request frames the submission as [metadata, prompt, block_hashes] so the
     # coordinator can route it without decoding the prompt.
-    fut = client.add_request("hello", SamplingParams(temperature=0.5), block_hashes=[7, 9])
+    fut = client.add_request("hello", SamplingParams(temperature=0.5))
     assert isinstance(fut, asyncio.Future)
     assert client.next_request_id == 1
     assert 0 in client.request_submission_times
@@ -84,9 +84,9 @@ async def test_inference_client_lifecycle():
     assert submit_payload[1] == 0
     assert submit_payload[2]["temperature"] == 0.5
     assert msgpack.unpackb(submit_prompt, raw=False) == "hello"
-    # Hashes ride in their own frame: the coordinator reads them without touching
-    # the prompt, which is the whole reason the frontend computes them.
-    assert msgpack.unpackb(submit_hashes, raw=False) == [7, 9]
+    # This client was told no block size, so it reports None -- "I did not hash" --
+    # and the coordinator hashes on its behalf.
+    assert msgpack.unpackb(submit_hashes, raw=False) is None
 
     # Listener delivers the reply: future resolves with payload + injected latency.
     # Submission-time entry is popped on completion.
@@ -155,3 +155,101 @@ async def test_add_request_with_kv_handoff_returns_future():
     assert msgpack.unpackb(prompt_frame, raw=False) == [1, 2, 3]
     assert msgpack.unpackb(blocks_frame, raw=False) == [10, 11]
     future.cancel()
+
+
+def _configured_client(policy=None, block_size=4):
+    from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+
+    fake_socket = MagicMock(name="zmq_socket")
+    fake_context = MagicMock(name="zmq_context")
+    fake_context.socket.return_value = fake_socket
+    with patch("megatron.core.inference.inference_client.zmq.Context", return_value=fake_context):
+        client = InferenceClient(
+            "tcp://127.0.0.1:5555",
+            block_size_tokens=block_size,
+            prefix_caching_coordinator_policy=policy
+            or PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        )
+    return client, fake_socket
+
+
+def _hash_frame(fake_socket):
+    return msgpack.unpackb(fake_socket.send_multipart.call_args.args[0][2], raw=False)
+
+
+async def test_unconfigured_client_says_it_did_not_hash():
+    """The regression that matters: None, never [].
+
+    Callers that build an InferenceClient directly -- MegatronAsyncLLM,
+    megatron.rl, the coordinator example -- configure neither the block size nor
+    the policy. Reporting an empty list for them reads as "hashed, nothing
+    matched", so the coordinator skips its own hashing and prefix-affinity
+    routing silently degrades to load balancing with nothing raising.
+    """
+    fake_socket = MagicMock(name="zmq_socket")
+    fake_context = MagicMock(name="zmq_context")
+    fake_context.socket.return_value = fake_socket
+    with patch("megatron.core.inference.inference_client.zmq.Context", return_value=fake_context):
+        client = InferenceClient("tcp://127.0.0.1:5555")
+    client.add_request(list(range(8)), SamplingParams()).cancel()
+    assert _hash_frame(fake_socket) is None
+
+
+async def test_configured_client_hashes_a_text_prompt():
+    import torch
+
+    from megatron.core.inference.inference_request import compute_block_hashes_batched
+
+    client, fake_socket = _configured_client()
+    tokens = list(range(8))
+    client.add_request(tokens, SamplingParams()).cancel()
+    assert _hash_frame(fake_socket) == compute_block_hashes_batched(
+        torch.tensor(tokens, dtype=torch.int64), block_size=4
+    )
+
+
+async def test_multimodal_hashes_are_salted_with_the_media_key():
+    """Same tokens, different media, disjoint hashes.
+
+    The client is the only place holding both the tokens and the media key, so
+    it is the only place that can salt them without deriving the key twice --
+    deriving it digests the media, hundreds of MB for video.
+    """
+    import torch
+
+    from megatron.core.inference.inference_request import (
+        compute_block_hashes_batched,
+        compute_media_cache_key,
+    )
+
+    client, fake_socket = _configured_client()
+    tokens = list(range(8))
+
+    client.add_request(tokens, SamplingParams()).cancel()
+    text_hashes = _hash_frame(fake_socket)
+
+    client.add_request(tokens, SamplingParams(), multi_modal_data={"image": b"jpeg"}).cancel()
+    media_hashes = _hash_frame(fake_socket)
+
+    assert set(text_hashes).isdisjoint(media_hashes)
+    assert media_hashes == compute_block_hashes_batched(
+        torch.tensor(tokens, dtype=torch.int64),
+        block_size=4,
+        cache_salt=compute_media_cache_key("image", [b"jpeg"]),
+    )
+
+
+async def test_load_balanced_policy_skips_hashing():
+    """Nobody reads them under LOAD_BALANCED, so computing them is pure overhead."""
+    from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+
+    client, fake_socket = _configured_client(PrefixCachingCoordinatorPolicy.LOAD_BALANCED)
+    client.add_request(list(range(8)), SamplingParams()).cancel()
+    assert _hash_frame(fake_socket) == []
+
+
+async def test_string_prompt_is_left_to_the_coordinator():
+    """Hashing needs token ids, and the client has no tokenizer."""
+    client, fake_socket = _configured_client()
+    client.add_request("some prompt text", SamplingParams()).cancel()
+    assert _hash_frame(fake_socket) is None

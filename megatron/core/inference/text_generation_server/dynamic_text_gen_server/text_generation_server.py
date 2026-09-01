@@ -67,7 +67,15 @@ async def _run_text_gen_server(
         raise RuntimeError(f"Web backend framework (Quart) not available")
 
     # Create and start the client locally inside this process
-    inference_client = InferenceClient(coordinator_addr, deserialize=False)
+    # The client hashes prompts for prefix-affinity routing so the coordinator
+    # does not have to on its single serial loop. It is the only place holding
+    # both the tokens and, for multimodal, the media key that salts them.
+    inference_client = InferenceClient(
+        coordinator_addr,
+        deserialize=False,
+        block_size_tokens=block_size_tokens,
+        prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
+    )
     inference_client.start()
     logger.info(f"Rank {rank}: InferenceClient connected.")
 
@@ -101,12 +109,6 @@ async def _run_text_gen_server(
         app.config['default_top_p'] = default_top_p
         app.config['default_top_k'] = default_top_k
         app.config['eval_mode'] = eval_mode
-        # The frontend hashes the prompt it already holds so the coordinator does
-        # not have to on its single serial loop. The policy decides whether anyone
-        # reads the hashes; the block size is only the granularity, and must match
-        # the engine's KV block size or the hashes name blocks it never cached.
-        app.config['block_size_tokens'] = block_size_tokens
-        app.config['prefix_caching_coordinator_policy'] = prefix_caching_coordinator_policy
 
         # Applying the chat template is synchronous and O(prompt); on the event loop it
         # stalls every other request this replica owns, including delivery of responses
