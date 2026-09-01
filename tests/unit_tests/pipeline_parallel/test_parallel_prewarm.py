@@ -49,6 +49,7 @@ def _build_inputs(layer, model_chunk, request_carrier_cache):
         micro_batch_size=1,
         rotary_pos_emb_cache={},
         request_carrier_cache=request_carrier_cache,
+        is_mtp=False,
     )
 
 

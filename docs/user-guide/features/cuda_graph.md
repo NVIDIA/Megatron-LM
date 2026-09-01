@@ -136,8 +136,8 @@ This implementation does not create inference CUDA graphs. For inference, use
 
 ### THD Sequence Packing (fixed schedule)
 
-Full-iteration capture is supported with the THD sequence packing scheduler
-(`--sequence-packing-scheduler dp_balanced`) under a fixed-schedule, static-shape contract:
+Full-iteration capture is supported with the THD sequence packing schedulers under a
+fixed-schedule, static-shape contract:
 
 - `num_microbatches` must stay constant across warmup, capture and replay. The packing scheduler
   and dataset must produce the same number of packed microbatches every step; a change after
@@ -153,8 +153,15 @@ Full-iteration capture is supported with the THD sequence packing scheduler
   exact boundaries and fails before capture/replay rather than reuse stale route metadata. At
   least one eager warmup step is required so consumers can materialize host-derived device layout
   caches before capture.
-- Dynamic context parallel (`--dynamic-context-parallel`) is not supported; the CP topology must
-  be static.
+- Dynamic context parallel remains disabled by default for full-iteration capture. A workload
+  whose realized schedule is deliberately invariant may opt in with
+  `--cuda-graph-static-dynamic-cp` together with `--dynamic-context-parallel` and
+  `--sequence-packing-scheduler default_dynamic_cp`. The flag does not make full-iteration
+  capture generally dynamic: every static microbatch slot must keep the same microbatch count,
+  effective CP size, process-group identity and ordered membership, partition mode, and (for
+  CP>1) exact packed boundaries and route-defining geometry. Layout changes are detected before
+  capture or replay and rejected by all ranks together. At effective CP1, tensor-backed
+  cu_seqlens and masks may change while the realized group remains fixed.
 - Pipeline parallel send/recv use the static CP-local token capacity instead of the per-step
   variable-shape handshake.
 - Validation/eval runs eager: a dedicated fixed-shape validation graph is not implemented yet.

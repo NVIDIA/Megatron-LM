@@ -41,7 +41,9 @@ class PackedSeqParams:
     # zigzag packed-CP MTP on its established roll path. Zero records that the
     # scheduler inspected the layout but could not certify one-hop addressing;
     # a positive value proves the minimum non-empty half-chunk size. The
-    # certificate is runtime transport metadata, not part of a graph signature.
+    # certificate is runtime transport metadata ignored by layerwise graph
+    # argument matching. Full-iteration static inputs may certify it separately
+    # because replay must preserve the transport plan for each fixed slot.
     zigzag_cp_min_chunk_size: Optional[int] = field(
         default=None, compare=False, metadata={"cuda_graph_ignore": True}
     )

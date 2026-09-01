@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from megatron.core import config
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -285,6 +286,25 @@ def test_te_whole_moe_paged_stash_requires_fixed_runtime_microbatch_count(cuda_g
     with pytest.raises(RuntimeError, match="expected 2, got 3"):
         runner._validate_te_whole_moe_graph_runtime(training=True, num_microbatches=3)
     runner._validate_te_whole_moe_graph_runtime(training=True, num_microbatches=2)
+
+
+def test_full_iteration_graph_replay_restores_paged_stash_enablement(monkeypatch):
+    runner = PagedStashRunner.__new__(PagedStashRunner)
+    runner.config = SimpleNamespace(moe_paged_stash=True)
+    runner.stash_manager = SimpleNamespace(enabled=False)
+    runner.forward_backward_func = object.__new__(FullCudaGraphWrapper)
+    monkeypatch.setitem(FullCudaGraphWrapper.cuda_graph, "training", object())
+    monkeypatch.setitem(FullCudaGraphWrapper.cuda_graph, "validation", object())
+
+    runner._restore_full_iteration_paged_stash_replay_state(training=True)
+    assert runner.stash_manager.enabled
+
+    runner._restore_full_iteration_paged_stash_replay_state(training=False)
+    assert not runner.stash_manager.enabled
+
+    runner.config.moe_paged_stash = False
+    runner._restore_full_iteration_paged_stash_replay_state(training=True)
+    assert not runner.stash_manager.enabled
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

@@ -19,12 +19,17 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.parallel_prewarm import _build_layer_inputs
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType, CudaGraphModule
 from megatron.core.transformer.experimental_attention_variant import dsa as dsa_module
+from megatron.core.transformer.mtp_sequence_roll import (
+    MTPSequenceRollField,
+    prepare_mtp_sequence_roll_context,
+)
 from megatron.core.transformer.multi_token_prediction import (
     MTPDSAIterationContext,
     MultiTokenPredictionBlock,
@@ -124,6 +129,40 @@ def test_iteration_sharing_accepts_full_iteration_cuda_graph_scope():
     config = _make_config(cuda_graph_impl="full_iteration", cuda_graph_modules=[])
 
     assert config.cuda_graph_impl == "full_iteration"
+
+
+@pytest.mark.parametrize(("is_mtp", "sharing"), [(True, True), (True, False), (False, True)])
+def test_pipeline_prewarm_builds_source_context_only_for_shared_mtp(is_mtp, sharing):
+    hidden_states = torch.zeros(2, 1, 4)
+
+    class StaticInputLayer:
+        def get_layer_static_inputs(
+            self, seq_length, micro_batch_size, *, for_pipeline_prewarm=False
+        ):
+            assert (seq_length, micro_batch_size) == (2, 1)
+            assert for_pipeline_prewarm
+            return {"hidden_states": hidden_states}
+
+    args, kwargs = _build_layer_inputs(
+        StaticInputLayer(),
+        SimpleNamespace(position_embedding_type=None),
+        SimpleNamespace(dsa_mtp_index_kv_share=sharing, multi_latent_attention=True),
+        2,
+        1,
+        {},
+        {},
+        is_mtp=is_mtp,
+    )
+
+    assert args[0] is hidden_states
+    context = kwargs.pop("mtp_dsa_context", None)
+    assert (context is not None) == (is_mtp and sharing)
+    if context is not None:
+        assert isinstance(context, MTPDSAIterationContext)
+        assert context.iteration == 0
+        assert context.is_source and not context.reuses_source
+        assert context.produced_tensors is None
+    assert kwargs == {}
 
 
 def test_iteration_sharing_accepts_selective_mla_up_projection_recompute():
@@ -961,6 +1000,7 @@ def test_recompute_path_threads_shared_kv_through_iteration_context(recompute_me
                 recompute_method=recompute_method,
                 recompute_num_layers=1,
             ),
+            mtp_layer_pattern=None,
             scale=scale,
         )
 
@@ -1033,7 +1073,19 @@ def test_recompute_path_threads_shared_kv_through_iteration_context(recompute_me
 
 def test_mtp_block_passes_one_source_state_through_all_repeated_iterations():
     observed = []
-    sequence_roll_context = object()
+    input_ids = torch.arange(4).view(1, 4)
+    position_ids = torch.arange(4).view(1, 4)
+    sequence_roll_context = prepare_mtp_sequence_roll_context(
+        tensor=input_ids, cp_group=None, packed_seq_params=None
+    )
+    assert sequence_roll_context is not None
+    sequence_roll_context = sequence_roll_context.prepare_fields(
+        (
+            MTPSequenceRollField("input_ids", input_ids, -1, 0, 0),
+            MTPSequenceRollField("position_ids", position_ids, -1, 0, 0),
+        ),
+        max_offset=7,
+    )
 
     class FakeRepeatedLayer:
         def __call__(
@@ -1075,8 +1127,8 @@ def test_mtp_block_passes_one_source_state_through_all_repeated_iterations():
     hidden_states = torch.randn(4, 1, 3)
     output = MultiTokenPredictionBlock.forward(
         block,
-        input_ids=torch.arange(4).view(1, 4),
-        position_ids=torch.arange(4).view(1, 4),
+        input_ids=input_ids,
+        position_ids=position_ids,
         hidden_states=hidden_states,
         attention_mask=None,
         sequence_roll_context=sequence_roll_context,

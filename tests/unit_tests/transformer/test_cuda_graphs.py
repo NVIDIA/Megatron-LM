@@ -366,6 +366,20 @@ class TestCudaGraphConfigAndArguments:
                 cuda_graph_modules=cuda_graph_modules, cuda_graph_warmup_steps=warmup_steps
             )
 
+    def test_full_iteration_paged_stash_requires_two_warmup_steps(self):
+        kwargs = dict(
+            cuda_graph_impl="full_iteration",
+            cuda_graph_modules=[],
+            moe_expert_capacity_factor=1.0,
+            moe_pad_expert_input_to_capacity=True,
+        )
+        for warmup_steps in (0, 1):
+            with pytest.raises(AssertionError, match="at least two eager warmup steps"):
+                _te_whole_moe_paged_stash_config(cuda_graph_warmup_steps=warmup_steps, **kwargs)
+
+        config = _te_whole_moe_paged_stash_config(cuda_graph_warmup_steps=2, **kwargs)
+        assert config.cuda_graph_warmup_steps == 2
+
     @pytest.mark.parametrize(
         "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
     )
@@ -447,6 +461,93 @@ class TestCudaGraphConfigAndArguments:
         )
 
         assert cfg.thd_static_pp_communication
+
+    def test_thd_full_iteration_dynamic_cp_requires_static_certificate_opt_in(self):
+        with pytest.raises(AssertionError, match="requires --cuda-graph-static-dynamic-cp"):
+            _base_cuda_graph_config(
+                cuda_graph_impl='full_iteration',
+                cuda_graph_modules=[],
+                cuda_graph_warmup_steps=1,
+                context_parallel_size=2,
+                dynamic_context_parallel=True,
+                sequence_packing_scheduler='default_dynamic_cp',
+                pad_packed_seq_alignment='max',
+                max_seqlen_per_dp_cp_rank=64,
+                thd_max_packed_sequences=8,
+            )
+
+    def test_thd_full_iteration_dynamic_cp_allows_static_certificate_path(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='full_iteration',
+            cuda_graph_modules=[],
+            cuda_graph_warmup_steps=1,
+            context_parallel_size=2,
+            dynamic_context_parallel=True,
+            sequence_packing_scheduler='default_dynamic_cp',
+            cuda_graph_static_dynamic_cp=True,
+            pad_packed_seq_alignment='max',
+            max_seqlen_per_dp_cp_rank=64,
+            thd_max_packed_sequences=8,
+        )
+
+        assert cfg.dynamic_context_parallel
+        assert cfg.cuda_graph_static_dynamic_cp
+        assert cfg.thd_static_pp_communication
+
+    def test_thd_full_iteration_static_dynamic_cp_flag_requires_dynamic_cp(self):
+        with pytest.raises(AssertionError, match="requires --dynamic-context-parallel"):
+            _base_cuda_graph_config(
+                cuda_graph_impl='full_iteration',
+                cuda_graph_modules=[],
+                cuda_graph_warmup_steps=1,
+                sequence_packing_scheduler='dp_balanced',
+                cuda_graph_static_dynamic_cp=True,
+                pad_packed_seq_alignment='max',
+                max_seqlen_per_dp_cp_rank=64,
+                thd_max_packed_sequences=8,
+            )
+
+    def test_static_dynamic_cp_flag_requires_default_dynamic_cp_scheduler(self):
+        # ModelParallelConfig owns the dynamic-CP scheduler contract and runs
+        # before the full-iteration-specific validation below.
+        with pytest.raises(
+            ValueError,
+            match="Dynamic context parallelism requires sequence_packing_scheduler=default_dynamic_cp",
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='full_iteration',
+                cuda_graph_modules=[],
+                cuda_graph_warmup_steps=1,
+                context_parallel_size=2,
+                dynamic_context_parallel=True,
+                sequence_packing_scheduler='dp_balanced',
+                cuda_graph_static_dynamic_cp=True,
+                pad_packed_seq_alignment='max',
+                max_seqlen_per_dp_cp_rank=64,
+                thd_max_packed_sequences=8,
+            )
+
+    @pytest.mark.parametrize('cuda_graph_impl', ['none', 'local'])
+    def test_static_dynamic_cp_flag_rejects_non_full_iteration_impl(self, cuda_graph_impl):
+        with pytest.raises(
+            AssertionError, match="only valid with cuda_graph_impl='full_iteration'"
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl=cuda_graph_impl,
+                cuda_graph_modules=[],
+                context_parallel_size=2,
+                dynamic_context_parallel=True,
+                sequence_packing_scheduler='default_dynamic_cp',
+                cuda_graph_static_dynamic_cp=True,
+                pad_packed_seq_alignment='max',
+                max_seqlen_per_dp_cp_rank=64,
+                thd_max_packed_sequences=8,
+            )
+
+    def test_static_dynamic_cp_cli_is_explicit_opt_in(self, monkeypatch):
+        monkeypatch.setattr(sys, 'argv', ['test_cuda_graphs.py', '--cuda-graph-static-dynamic-cp'])
+        args = parse_args()
+        assert args.cuda_graph_static_dynamic_cp
 
     def test_full_iteration_scope_string_in_config_migrated(self):
         with pytest.warns(DeprecationWarning, match="deprecated"):

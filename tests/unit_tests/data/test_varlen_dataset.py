@@ -855,6 +855,33 @@ def test_unpack_batch_slices_prepacked_cu_seqlens_samples():
 # ----------------------------------------------------------------------------
 
 
+def test_zero_length_dataset_does_not_build_dataloader(monkeypatch):
+    from megatron.training.datasets import data_samplers
+
+    def unexpected_get_args():
+        raise AssertionError("empty datasets must return before reading dataloader arguments")
+
+    monkeypatch.setattr(data_samplers, "get_args", unexpected_get_args)
+    dataset = torch.utils.data.TensorDataset(torch.empty(0))
+
+    assert data_samplers.build_pretraining_data_loader(dataset, consumed_samples=0) is None
+
+
+def test_external_iterable_without_length_is_passed_through(monkeypatch):
+    from megatron.training.datasets import data_samplers
+
+    class ExternalIterable:
+        def __iter__(self):
+            return iter(())
+
+    monkeypatch.setattr(
+        data_samplers, "get_args", lambda: SimpleNamespace(dataloader_type="external")
+    )
+    dataset = ExternalIterable()
+
+    assert data_samplers.build_pretraining_data_loader(dataset, consumed_samples=0) is dataset
+
+
 def _build_varlen_for_loader(items, config, num_samples):
     from megatron.core.datasets.utils import Split
 

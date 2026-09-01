@@ -113,6 +113,8 @@ def _build_layer_inputs(
     micro_batch_size,
     rotary_pos_emb_cache,
     request_carrier_cache,
+    *,
+    is_mtp,
 ):
     """Build one eager synthetic sample for a local transformer layer."""
     if not hasattr(layer, 'get_layer_static_inputs'):
@@ -127,6 +129,10 @@ def _build_layer_inputs(
     kwargs = static_inputs
     _build_packed_seq_params(config, kwargs)
     _reuse_model_chunk_request_carriers(model_chunk, kwargs, request_carrier_cache)
+    if is_mtp and config.dsa_mtp_index_kv_share:
+        from megatron.core.transformer.multi_token_prediction import MTPDSAIterationContext
+
+        kwargs['mtp_dsa_context'] = MTPDSAIterationContext(iteration=0)
 
     if (
         getattr(model_chunk, 'position_embedding_type', None) == 'rope'
@@ -278,6 +284,7 @@ def prewarm_pipeline_model_parallel(
                         micro_batch_size,
                         rotary_pos_emb_cache,
                         request_carrier_cache,
+                        is_mtp=is_mtp,
                     )
                     inner_quantization_context = (
                         nullcontext()

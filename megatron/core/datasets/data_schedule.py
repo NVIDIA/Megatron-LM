@@ -79,6 +79,94 @@ def _build_thd_full_iteration_cp_metadata(packed_seq_params: PackedSeqParams) ->
     }
 
 
+def _build_thd_full_iteration_dynamic_cp_signature(
+    packed_seq_params: PackedSeqParams, *, config
+) -> Dict[str, Any]:
+    """Describe the exact realized dynamic-CP topology for one static slot.
+
+    The process-group identity is intentional. CUDA Graph capture binds
+    collectives to a particular communicator, so another ProcessGroup with the
+    same rank membership is not interchangeable with the captured object.
+    """
+    # This helper must be called before ``finalize_packed_seq_params``.  The
+    # finalizer deliberately falls back to the model's static CP group when the
+    # per-microbatch group is absent; that fallback is useful on ordinary eager
+    # paths, but it must not certify a dynamic-CP schedule that failed to
+    # provide its realized group.
+    cp_group = packed_seq_params.cp_group
+    local_cp_size = packed_seq_params.local_cp_size
+    validation_error = None
+    if cp_group is None or local_cp_size is None:
+        validation_error = (
+            "Static dynamic-CP full-iteration batches require both local_cp_size "
+            "and the realized CP process group."
+        )
+    else:
+        local_cp_size = int(local_cp_size)
+
+    cp_group_size = -1
+    cp_group_rank = -1
+    cp_group_global_ranks = ()
+    if cp_group is not None:
+        try:
+            cp_group_size = int(cp_group.size())
+            cp_group_rank = int(cp_group.rank())
+            cp_group_global_ranks = tuple(torch.distributed.get_process_group_ranks(cp_group))
+        except (AttributeError, RuntimeError, ValueError, TypeError) as exc:
+            if validation_error is None:
+                validation_error = (
+                    "Static dynamic-CP full-iteration batch could not inspect its "
+                    f"realized CP process group: {exc}"
+                )
+    if validation_error is None and local_cp_size != cp_group_size:
+        validation_error = (
+            "Static dynamic-CP full-iteration batch has inconsistent topology: "
+            f"local_cp_size={local_cp_size}, process-group size={cp_group_size}."
+        )
+    if validation_error is None and len(cp_group_global_ranks) != cp_group_size:
+        validation_error = (
+            "Static dynamic-CP full-iteration batch has inconsistent process-group "
+            f"membership: size={cp_group_size}, ranks={cp_group_global_ranks}."
+        )
+    if validation_error is None and not 0 <= cp_group_rank < cp_group_size:
+        validation_error = (
+            "Static dynamic-CP full-iteration batch has invalid process-group rank: "
+            f"rank={cp_group_rank}, size={cp_group_size}."
+        )
+    mtp_num_layers = int(getattr(config, 'mtp_num_layers', 0) or 0)
+    if (
+        validation_error is None
+        and mtp_num_layers > 0
+        and packed_seq_params.cp_partition_mode == 'zigzag'
+        and cp_group_size > 1
+    ):
+        # This data-layer certificate is shared by forward, SFT, and RL consumers.
+        # Reserve one additional future row so no consumer can silently fall back
+        # to the legacy cumulative-roll path during graph capture.
+        required_max_offset = mtp_num_layers + 1
+        min_chunk_size = packed_seq_params.zigzag_cp_min_chunk_size
+        if min_chunk_size is None or min_chunk_size < required_max_offset:
+            validation_error = (
+                "THD full-iteration CUDA graph with MTP and zigzag dynamic CP>1 requires "
+                "the final zigzag_cp_min_chunk_size scheduler certificate to be at least "
+                f"mtp_num_layers + 1 ({required_max_offset}), got {min_chunk_size}; the "
+                "legacy cumulative-roll fallback is not CUDA-graph safe."
+            )
+
+    # Do not raise a rank-local exception here. StaticBufferLoader records this
+    # marker and the wrapper performs one world-wide consensus after every rank
+    # has completed batch preparation, so no peer can enter capture/replay alone.
+    return {
+        'version': 1,
+        'validation_error': validation_error,
+        'local_cp_size': -1 if local_cp_size is None else local_cp_size,
+        'cp_group_identity': None if cp_group is None else id(cp_group),
+        'cp_group_global_ranks': cp_group_global_ranks,
+        'cp_group_rank': cp_group_rank,
+        'cp_partition_mode': packed_seq_params.cp_partition_mode,
+    }
+
+
 def _build_thd_full_iteration_cp_layout_signature(
     packed_seq_params: PackedSeqParams,
 ) -> Optional[Dict[str, Any]]:
@@ -110,6 +198,7 @@ def _build_thd_full_iteration_cp_layout_signature(
         'contiguous_split_sizes': tuple(route.contiguous_split_sizes),
         'thd_cp_host_cu_seqlens_q': None if host_cu_q is None else tuple(host_cu_q),
         'thd_cp_host_cu_seqlens_kv': None if host_cu_kv is None else tuple(host_cu_kv),
+        'zigzag_cp_min_chunk_size': packed_seq_params.zigzag_cp_min_chunk_size,
     }
 
 
@@ -146,13 +235,13 @@ def _unpack_thd_full_iteration_static_batch(batch: Dict[str, Any]):
     # Only CP>1 geometry is immutable across a static-buffer slot.  At CP1,
     # packed boundaries may change between replays, so do not retain consumer
     # caches attached to a PackedSeqParams instance from an earlier batch.
+    cp_metadata = batch[_THD_FULL_ITERATION_CP_METADATA_KEY]
     packed_seq_params = (
-        batch.get(_THD_FULL_ITERATION_PACKED_SEQ_PARAMS_KEY)
+        cp_metadata.get(_THD_FULL_ITERATION_PACKED_SEQ_PARAMS_KEY)
         if layout_metadata is not None
         else None
     )
     if packed_seq_params is None:
-        cp_metadata = batch[_THD_FULL_ITERATION_CP_METADATA_KEY]
         packed_seq_params = PackedSeqParams(
             qkv_format='thd',
             cu_seqlens_q=batch['cu_seqlens'],
@@ -161,10 +250,13 @@ def _unpack_thd_full_iteration_static_batch(batch: Dict[str, Any]):
             cu_seqlens_kv_padded=batch['cu_seqlens_padded'],
             max_seqlen_q=batch['max_seqlen'],
             max_seqlen_kv=batch['max_seqlen'],
-            local_cp_size=None,
+            local_cp_size=batch['local_cp_size'],
             cp_group=cp_metadata['cp_group'],
             cp_partition_mode=batch['cp_partition_mode'],
             pad_between_seqs=batch['pad_between_seqs'],
+            zigzag_cp_min_chunk_size=(
+                None if layout_metadata is None else layout_metadata.get('zigzag_cp_min_chunk_size')
+            ),
             cp_partition_route=_restore_thd_full_iteration_cp_route(cp_metadata, layout_metadata),
         )
         for name in ('thd_cp_host_cu_seqlens_q', 'thd_cp_host_cu_seqlens_kv'):
@@ -180,7 +272,11 @@ def _unpack_thd_full_iteration_static_batch(batch: Dict[str, Any]):
             # graph. In addition to preserving route tensor addresses, this
             # lets consumers populate per-layout caches during eager warmup and
             # reuse them during capture without rebuilding host-derived tensors.
-            batch[_THD_FULL_ITERATION_PACKED_SEQ_PARAMS_KEY] = packed_seq_params
+            # StaticBufferLoader returns a shallow top-level copy, while this
+            # nested metadata dict is shared with the captured slot; cache here
+            # so the object survives the next replay without exposing a mutable
+            # top-level entry to pipeline-stage batch tailoring.
+            cp_metadata[_THD_FULL_ITERATION_PACKED_SEQ_PARAMS_KEY] = packed_seq_params
     return (
         batch['tokens'],
         batch['labels'],
@@ -215,8 +311,9 @@ def prepare_thd_static_batch_for_full_iteration_cuda_graph(
     ``THD_FULL_ITERATION_STATIC_BATCH_KEY`` and reads the static tensors
     without further shape discovery.
     """
-    # Static-shape requirements (max_seqlen_per_dp_cp_rank, thd_max_packed_sequences,
-    # no dynamic CP) are validated once at TransformerConfig construction time.
+    # Static-shape requirements are validated once at TransformerConfig
+    # construction time. Dynamic CP additionally requires an explicit opt-in to
+    # this per-slot certificate path; ordinary dynamic schedules remain rejected.
     assert config is not None, "THD full-iteration batch preparation requires a config."
     assert getattr(config, 'cuda_graph_impl', 'none') == 'full_iteration', (
         "prepare_thd_static_batch_for_full_iteration_cuda_graph requires "
@@ -224,6 +321,18 @@ def prepare_thd_static_batch_for_full_iteration_cuda_graph(
     )
     max_seqlen_per_dp_cp_rank = config.max_seqlen_per_dp_cp_rank
     thd_max_packed_sequences = config.thd_max_packed_sequences
+    dynamic_cp = bool(getattr(config, 'dynamic_context_parallel', False))
+    if dynamic_cp and not getattr(config, 'cuda_graph_static_dynamic_cp', False):
+        raise RuntimeError(
+            "THD full-iteration CUDA graph with dynamic context parallelism requires "
+            "cuda_graph_static_dynamic_cp=True so every realized schedule slot is "
+            "certified before replay."
+        )
+    if dynamic_cp and getattr(config, 'sequence_packing_scheduler', None) != 'default_dynamic_cp':
+        raise RuntimeError(
+            "Static-certified dynamic CP requires "
+            "sequence_packing_scheduler='default_dynamic_cp'."
+        )
 
     # Canonicalization mutates the batch dict in place (padding-mask insertion,
     # 2D views, sanitized values). Work on a shallow copy so callers that replay
@@ -241,20 +350,34 @@ def prepare_thd_static_batch_for_full_iteration_cuda_graph(
             vpp_size=vpp_size,
             mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
             vp_stage=vp_stage,
-            dynamic_cp=False,
+            dynamic_cp=dynamic_cp,
             pg_collection=pg_collection,
             config=config,
         )
     )
 
-    # CP route construction reads packed boundaries on the host and creates
-    # Python split metadata. Do it before StaticBufferLoader hands the batch to
-    # the captured forward, then preserve the resulting tensors and lists in
-    # the static slot. The exact CP>1 geometry is part of the graph contract;
-    # StaticBufferLoader rejects a later batch that would invalidate it.
-    finalize_packed_seq_params(packed_seq_params)
+    # Certify dynamic CP from the scheduler-produced metadata *before* the
+    # ordinary finalizer is allowed to resolve a missing group from the model's
+    # static CP group.  An invalid dynamic topology is kept as a deferred marker
+    # and deliberately not finalized; all ranks reject it together after batch
+    # preparation.
+    dynamic_cp_signature = (
+        _build_thd_full_iteration_dynamic_cp_signature(packed_seq_params, config=config)
+        if dynamic_cp
+        else None
+    )
+    if dynamic_cp_signature is None or dynamic_cp_signature['validation_error'] is None:
+        # CP route construction reads packed boundaries on the host and creates
+        # Python split metadata. Do it before StaticBufferLoader hands the batch
+        # to the captured forward, then preserve the resulting tensors and
+        # lists in the static slot.
+        finalize_packed_seq_params(packed_seq_params)
     cp_metadata = _build_thd_full_iteration_cp_metadata(packed_seq_params)
-    cp_layout_signature = _build_thd_full_iteration_cp_layout_signature(packed_seq_params)
+    cp_layout_signature = (
+        None
+        if dynamic_cp_signature is not None and dynamic_cp_signature['validation_error'] is not None
+        else _build_thd_full_iteration_cp_layout_signature(packed_seq_params)
+    )
 
     # Enforce the static-input contract before the tensors reach graph buffers.
     expected_entries = thd_max_packed_sequences + 1
@@ -298,12 +421,18 @@ def prepare_thd_static_batch_for_full_iteration_cuda_graph(
         'cu_seqlens': packed_seq_params.cu_seqlens_q,
         'cu_seqlens_padded': packed_seq_params.cu_seqlens_q_padded,
         'max_seqlen': packed_seq_params.max_seqlen_q,
+        'local_cp_size': packed_seq_params.local_cp_size,
         'cp_partition_mode': packed_seq_params.cp_partition_mode,
         'pad_between_seqs': packed_seq_params.pad_between_seqs,
         _THD_FULL_ITERATION_CP_METADATA_KEY: cp_metadata,
     }
+    static_metadata = {}
     if cp_layout_signature is not None:
-        static_batch[FULL_CUDA_GRAPH_STATIC_METADATA_KEY] = {'thd_cp_layout': cp_layout_signature}
+        static_metadata['thd_cp_layout'] = cp_layout_signature
+    if dynamic_cp_signature is not None:
+        static_metadata['thd_dynamic_cp'] = dynamic_cp_signature
+    if static_metadata:
+        static_batch[FULL_CUDA_GRAPH_STATIC_METADATA_KEY] = static_metadata
     return static_batch
 
 
@@ -1154,7 +1283,9 @@ def get_batch_on_this_rank_for_sequence_packing(
     max_seqlen = scalar_metadata_host[0]
     zigzag_cp_min_chunk_size = scalar_metadata_host[1]
     if zigzag_cp_min_chunk_size < 0 or (
-        config is not None and getattr(config, 'cuda_graph_impl', 'none') == 'full_iteration'
+        not dynamic_cp
+        and config is not None
+        and getattr(config, 'cuda_graph_impl', 'none') == 'full_iteration'
     ):
         zigzag_cp_min_chunk_size = None
     local_cp_size = scalar_metadata_host[2] if dynamic_cp else None

@@ -127,6 +127,39 @@ class StaticBufferLoader:
 
     def __init__(self):
         self.stream = torch.cuda.Stream()
+        self.defer_static_metadata_mismatch = False
+        self.static_metadata_mismatch = None
+        self.batch_stage = None
+        self.batch_start_length = None
+        self.batch_dynamic_cp_metadata = []
+
+    def begin_batch(self, stage, *, defer_static_metadata_mismatch=False):
+        """Reset per-call metadata state before loading all static-buffer slots."""
+        assert stage in ('training', 'validation')
+        self.defer_static_metadata_mismatch = defer_static_metadata_mismatch
+        self.static_metadata_mismatch = None
+        self.batch_stage = stage
+        self.batch_start_length = len(StaticBufferLoader.static_buffers[stage])
+        self.batch_dynamic_cp_metadata = []
+
+    def rollback_batch(self):
+        """Discard only slots appended since ``begin_batch``.
+
+        Existing slots may already be owned by a captured CUDA graph and must
+        never be replaced or truncated after a rejected replay batch.
+        """
+        if self.batch_stage is None:
+            return
+        assert self.batch_start_length is not None
+        del StaticBufferLoader.static_buffers[self.batch_stage][self.batch_start_length :]
+
+    def end_batch(self):
+        """Clear per-call bookkeeping after consensus succeeds or fails."""
+        self.defer_static_metadata_mismatch = False
+        self.static_metadata_mismatch = None
+        self.batch_stage = None
+        self.batch_start_length = None
+        self.batch_dynamic_cp_metadata = []
 
     @classmethod
     def reset(cls, stage=None):
@@ -146,23 +179,54 @@ class StaticBufferLoader:
             inputs = inputs[0]
 
         assert isinstance(inputs, dict)
+        incoming_static_metadata = inputs.get(FULL_CUDA_GRAPH_STATIC_METADATA_KEY)
+        dynamic_cp_metadata = (
+            incoming_static_metadata.get('thd_dynamic_cp')
+            if isinstance(incoming_static_metadata, dict)
+            else None
+        )
+        if self.batch_stage is not None:
+            assert stage == self.batch_stage
+            self.batch_dynamic_cp_metadata.append(dynamic_cp_metadata)
+        validation_error = (
+            dynamic_cp_metadata.get('validation_error')
+            if isinstance(dynamic_cp_metadata, dict)
+            else None
+        )
+        if validation_error is not None:
+            message = (
+                "Full-iteration CUDA graph static input metadata is invalid for "
+                f"{stage} microbatch slot {microbatch}: {validation_error}"
+            )
+            if not self.defer_static_metadata_mismatch:
+                raise RuntimeError(message)
+            if self.static_metadata_mismatch is None:
+                self.static_metadata_mismatch = message
+
         if microbatch == len(StaticBufferLoader.static_buffers[stage]):
             self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
                 StaticBufferLoader.static_buffers[stage].append(copy_tensors_in_struct(inputs))
         else:
-            incoming_static_metadata = inputs.get(FULL_CUDA_GRAPH_STATIC_METADATA_KEY)
             captured_static_metadata = StaticBufferLoader.static_buffers[stage][microbatch].get(
                 FULL_CUDA_GRAPH_STATIC_METADATA_KEY
             )
             if incoming_static_metadata != captured_static_metadata:
-                raise RuntimeError(
+                message = (
                     "Full-iteration CUDA graph static input metadata changed for "
                     f"{stage} microbatch slot {microbatch}. The captured graph contains "
                     "Python-derived layout values (such as packed-CP route/split metadata), "
                     "so replay with a different layout would be incorrect. Keep the packed "
                     "geometry fixed for each microbatch slot or reset and recapture the graph."
                 )
+                if not self.defer_static_metadata_mismatch:
+                    raise RuntimeError(message)
+                if self.static_metadata_mismatch is None:
+                    self.static_metadata_mismatch = message
+                # Do not mutate the captured slot. The wrapper performs one
+                # world-wide consensus after every rank has inspected all slots,
+                # then every rank fails together before capture or replay.
+                return StaticBufferLoader.static_buffers[stage][microbatch].copy()
 
             for k in inputs.keys():
                 if k not in StaticBufferLoader.static_buffers[stage][microbatch]:
@@ -256,6 +320,7 @@ class FullCudaGraphWrapper:
         cuda_graph_warmup_steps=1,
         use_single_mempool=False,
         batch_preparation_fn=None,
+        require_global_static_metadata_consensus=False,
     ):
         """
         Args:
@@ -267,12 +332,169 @@ class FullCudaGraphWrapper:
                 region (e.g. THD packed batches). It is called on every rank for every
                 (model chunk, microbatch) pair in the same order — even on ranks whose
                 data_iterator is None — so it may issue collectives such as TP broadcasts.
+            require_global_static_metadata_consensus: Defer local static-metadata mismatches
+                until all ranks perform one consensus outside capture. This guarantees that
+                a rank-local packed-layout change cannot leave peer ranks replaying a graph
+                whose collectives wait for the failed rank.
         """
         self.forward_backward_func = forward_backward_func
         self.static_loader = StaticBufferLoader()
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
         self.use_single_mempool = use_single_mempool
         self.batch_preparation_fn = batch_preparation_fn
+        self.require_global_static_metadata_consensus = require_global_static_metadata_consensus
+
+    @staticmethod
+    def _encode_new_dynamic_cp_group_state(
+        dynamic_cp_metadata, mismatch_found, appended_count, world_size
+    ):
+        """Encode all per-slot DCP groups into one fixed-shape WORLD payload."""
+        encoded = [int(mismatch_found), len(dynamic_cp_metadata), appended_count]
+        for metadata in dynamic_cp_metadata:
+            if metadata is None:
+                encoded.extend([0, 0, -1])
+                encoded.extend([-1] * world_size)
+                continue
+
+            members = [int(rank) for rank in metadata.get('cp_group_global_ranks', ())]
+            # Preserve the reported group size separately.  If it exceeds the
+            # WORLD-sized membership field, the validator below rejects it on
+            # every rank rather than changing the collective shape.
+            group_size = int(metadata.get('local_cp_size', -1))
+            group_rank = int(metadata.get('cp_group_rank', -1))
+            encoded.extend([1, group_size, group_rank])
+            encoded.extend((members + [-1] * world_size)[:world_size])
+        return encoded
+
+    @staticmethod
+    def _validate_new_dynamic_cp_group_state(
+        gathered_state, slot_count, appended_count, world_size
+    ):
+        """Validate that every DCP group is an ordered membership equivalence class."""
+        rows = gathered_state.to(device='cpu').tolist()
+        if any(row[1] != slot_count for row in rows):
+            return "ranks prepared different numbers of static DCP microbatch slots"
+        if any(row[2] != appended_count for row in rows):
+            return "ranks appended different numbers of static DCP microbatch slots"
+
+        block_width = world_size + 3
+        for slot in range(slot_count):
+            start = 3 + slot * block_width
+            present = [bool(row[start]) for row in rows]
+            if not any(present):
+                continue
+            if not all(present):
+                return f"slot {slot} has dynamic-CP metadata on only a subset of ranks"
+
+            for reporter_rank, row in enumerate(rows):
+                group_size = row[start + 1]
+                group_rank = row[start + 2]
+                members = tuple(row[start + 3 : start + 3 + world_size])
+                if not 1 <= group_size <= world_size:
+                    return (
+                        f"slot {slot} rank {reporter_rank} reported invalid dynamic-CP "
+                        f"group size {group_size} for WORLD size {world_size}"
+                    )
+                members = members[:group_size]
+                if len(set(members)) != group_size or any(
+                    member < 0 or member >= world_size for member in members
+                ):
+                    return (
+                        f"slot {slot} rank {reporter_rank} reported invalid dynamic-CP "
+                        f"members {members}"
+                    )
+                if not 0 <= group_rank < group_size or members[group_rank] != reporter_rank:
+                    return (
+                        f"slot {slot} rank {reporter_rank} reported group rank {group_rank} "
+                        f"for ordered members {members}"
+                    )
+
+                for expected_group_rank, member in enumerate(members):
+                    peer_row = rows[member]
+                    peer_start = start
+                    peer_size = peer_row[peer_start + 1]
+                    peer_group_rank = peer_row[peer_start + 2]
+                    peer_members = tuple(peer_row[peer_start + 3 : peer_start + 3 + group_size])
+                    if (
+                        not bool(peer_row[peer_start])
+                        or peer_size != group_size
+                        or peer_group_rank != expected_group_rank
+                        or peer_members != members
+                    ):
+                        return (
+                            f"slot {slot} dynamic-CP membership is not coherent: rank "
+                            f"{reporter_rank} reports {members}, but member {member} reports "
+                            f"members={peer_members}, group_rank={peer_group_rank}"
+                        )
+        return None
+
+    def _check_new_dynamic_cp_group_consensus(self, mismatch_found, appended_count):
+        """Run the exact DCP membership check whenever new slots are created."""
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        local_encoded = self._encode_new_dynamic_cp_group_state(
+            self.static_loader.batch_dynamic_cp_metadata, mismatch_found, appended_count, world_size
+        )
+        local_state = torch.tensor(
+            local_encoded, dtype=torch.int64, device=torch.cuda.current_device()
+        )
+        if world_size > 1:
+            gathered = torch.empty(
+                world_size * local_state.numel(), dtype=local_state.dtype, device=local_state.device
+            )
+            torch.distributed.all_gather_into_tensor(gathered, local_state)
+            gathered = gathered.view(world_size, local_state.numel())
+        else:
+            gathered = local_state.unsqueeze(0)
+
+        mismatch_found = bool(torch.any(gathered[:, 0] != 0).item())
+        group_error = self._validate_new_dynamic_cp_group_state(
+            gathered, len(self.static_loader.batch_dynamic_cp_metadata), appended_count, world_size
+        )
+        return mismatch_found or group_error is not None, group_error
+
+    def _check_global_static_metadata_consensus(self, stage):
+        """Make every rank fail together when any rank's static layout changes."""
+        assert self.static_loader.batch_stage == stage
+        assert self.static_loader.batch_start_length is not None
+        local_mismatch = self.static_loader.static_metadata_mismatch
+        mismatch_found = local_mismatch is not None
+        group_error = None
+        appended_count = (
+            len(StaticBufferLoader.static_buffers[stage]) - self.static_loader.batch_start_length
+        )
+        try:
+            if self.require_global_static_metadata_consensus:
+                if appended_count > 0:
+                    # Any batch that creates static slots validates all ordered
+                    # DCP memberships in the same fixed-shape WORLD all-gather
+                    # that propagates rank-local metadata failures.
+                    mismatch_found, group_error = self._check_new_dynamic_cp_group_consensus(
+                        mismatch_found, appended_count
+                    )
+                elif torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+                    mismatch_flag = torch.tensor(
+                        [int(mismatch_found)], dtype=torch.int32, device=torch.cuda.current_device()
+                    )
+                    torch.distributed.all_reduce(mismatch_flag, op=torch.distributed.ReduceOp.MAX)
+                    mismatch_found = bool(mismatch_flag.item())
+
+            if mismatch_found:
+                detail = (
+                    local_mismatch
+                    or group_error
+                    or ("Full-iteration CUDA graph static input metadata changed on another rank.")
+                )
+                raise RuntimeError(
+                    f"{detail} All ranks rejected the {stage} batch before capture or replay."
+                )
+        except Exception:
+            # Collective/runtime failures must not leave newly allocated slots
+            # behind either.  Existing graph-owned slots are preserved by the
+            # begin-batch boundary.
+            self.static_loader.rollback_batch()
+            raise
+        finally:
+            self.static_loader.end_batch()
 
     def _data_read_with_batch_preparation(self, data_iterator, model, stage, num_microbatches):
         """Canonicalize each microbatch outside the graph, then load static buffers.
@@ -366,7 +588,12 @@ class FullCudaGraphWrapper:
         }
         self._check_capture_signature(training_str, signature)
 
+        self.static_loader.begin_batch(
+            training_str,
+            defer_static_metadata_mismatch=self.require_global_static_metadata_consensus,
+        )
         data_list = self.data_read(data_iterator, model, training, num_microbatches)
+        self._check_global_static_metadata_consensus(training_str)
         kwargs['data_iterator'] = data_list
 
         curr_iteration = self.curr_iter(training_str)
@@ -457,17 +684,29 @@ class FullCudaGraphWrapper:
         return FullCudaGraphWrapper.result[training_str]
 
     def _check_capture_signature(self, stage, signature):
-        """Refuse to replay a captured graph whose call signature changed."""
+        """Refuse inconsistent or changed signatures before any rank reads data.
+
+        Static-certified dynamic CP may run different effective CP groups, but
+        full-iteration capture still requires one world-wide schedule signature.
+        Check that invariant collectively so one rank cannot fail locally while
+        its peers enter batch-preparation collectives or graph replay.
+        """
         captured = FullCudaGraphWrapper.capture_signature[stage]
-        if captured is None:
-            # No graph captured for this stage yet; nothing to enforce.
-            return
-        mismatches = {
-            key: (captured[key], signature[key])
-            for key in captured
-            if captured[key] != signature[key]
-        }
-        if mismatches:
+        mismatches = (
+            {}
+            if captured is None
+            else {
+                key: (captured[key], signature[key])
+                for key in captured
+                if captured[key] != signature[key]
+            }
+        )
+
+        if not self.require_global_static_metadata_consensus or not (
+            torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+        ):
+            if not mismatches:
+                return
             details = ', '.join(
                 f"{key}: captured={old} vs current={new}" for key, (old, new) in mismatches.items()
             )
@@ -477,6 +716,59 @@ class FullCudaGraphWrapper:
                 "num_microbatches), so these values must stay constant after capture. "
                 "Keep the schedule fixed or reset the graph via reset_cuda_graph()."
             )
+
+        signature_keys = (
+            'num_microbatches',
+            'num_model_chunks',
+            'seq_length',
+            'micro_batch_size',
+            'decoder_seq_length',
+        )
+        encoded_signature = [0 if stage == 'training' else 1]
+        encoded_signature.extend(
+            -1 if signature[key] is None else int(signature[key]) for key in signature_keys
+        )
+        # The buffer count decides whether the post-data path performs the
+        # one-time topology all-gather or the steady-state mismatch all-reduce.
+        # Certify it before data reads so all ranks select the same collective.
+        encoded_signature.append(len(StaticBufferLoader.static_buffers[stage]))
+        # Include graph-presence as well as the local captured-signature check.
+        # Otherwise one rank that lost/reset its graph could enter warmup while
+        # its peers replay, even if their current call signatures still match.
+        local_state = torch.tensor(
+            encoded_signature + [int(captured is not None), int(bool(mismatches))],
+            dtype=torch.int64,
+            device=torch.cuda.current_device(),
+        )
+        world_size = torch.distributed.get_world_size()
+        gathered = torch.empty(
+            world_size * local_state.numel(), dtype=local_state.dtype, device=local_state.device
+        )
+        torch.distributed.all_gather_into_tensor(gathered, local_state)
+        gathered = gathered.view(world_size, local_state.numel())
+
+        current_signature_differs = torch.any(gathered[:, :-2] != gathered[0, :-2])
+        graph_presence_differs = torch.any(gathered[:, -2] != gathered[0, -2])
+        captured_signature_mismatch = torch.any(gathered[:, -1] != 0)
+        if not bool(
+            (
+                current_signature_differs | graph_presence_differs | captured_signature_mismatch
+            ).item()
+        ):
+            return
+
+        details = (
+            ', '.join(
+                f"{key}: captured={old} vs current={new}" for key, (old, new) in mismatches.items()
+            )
+            if mismatches
+            else "the current signature, graph presence, or captured signature differs across ranks"
+        )
+        raise RuntimeError(
+            f"Full-iteration CUDA graph signature mismatch for {stage} ({details}). "
+            "All ranks rejected the call before reading data, capture, or replay. "
+            "Keep the schedule fixed across ranks or reset the graph via reset_cuda_graph()."
+        )
 
     def curr_iter(self, stage):
         """Return current training/validation iteration."""

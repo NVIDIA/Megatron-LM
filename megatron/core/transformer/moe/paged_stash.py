@@ -1354,6 +1354,15 @@ class PagedStashRunner:
                 f"{self._te_graph_runtime_num_microbatches}, got {num_microbatches}."
             )
 
+    def _restore_full_iteration_paged_stash_replay_state(self, training: bool) -> None:
+        """Restore stash enablement when full-iteration replay skips the Python schedule."""
+
+        if not isinstance(self.forward_backward_func, FullCudaGraphWrapper):
+            return
+        stage = "training" if training else "validation"
+        if FullCudaGraphWrapper.cuda_graph[stage] is not None:
+            self.stash_manager.enabled = training and self.config.moe_paged_stash
+
     def prepare_for_rerun(self, is_training=True):
         """Prepare for rerun"""
         log_single_rank(
@@ -1449,6 +1458,7 @@ class PagedStashRunner:
 
         training = not kwargs['forward_only']
         data_iterator = kwargs['data_iterator']
+        self._restore_full_iteration_paged_stash_replay_state(training)
         self._validate_te_whole_moe_graph_runtime(training, num_microbatches)
         saved_moe_paged_stash = self.config.moe_paged_stash
         num_tries = 0
