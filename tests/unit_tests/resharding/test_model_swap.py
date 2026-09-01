@@ -1061,12 +1061,19 @@ def test_swap_dsa_non_collocated(
     dst_tp: int,
     dst_pp: int,
     dsa_type: str,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """Refit real MLA and GQA DSA layers across disjoint rank windows."""
     if not has_mamba_deps:
         pytest.skip("Mamba dependencies (mamba_ssm, einops) not available")
     if Utils.world_size != src_world + dst_world:
         pytest.skip("Test requires a world containing exactly the source and destination ranks")
+    if refit_backend == "nccl_m2n":
+        if torch.cuda.get_device_properties(torch.cuda.current_device()).major < 10:
+            pytest.skip("Native NCCL M2N coverage runs on the GIN-enabled Blackwell CI lane")
+        # DIRECT is the native M2N transport for this single-node point-to-point topology.
+        # PACK uses hierarchical communicator splitting that this test neither needs nor covers.
+        monkeypatch.setenv("NCCL_RESHARD_COPY_ALGORITHM", "DIRECT")
 
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 
