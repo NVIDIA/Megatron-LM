@@ -140,6 +140,9 @@ async def test_legacy_runner_forwards_sampling_config_and_stops_frontend(monkeyp
             block_size_tokens=256,
             prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
         ),
+        # The runner sizes the frontend from the engine's DP group. A None group
+        # reads as size 1, so this exercises the floor on the replica count.
+        pg_collection=SimpleNamespace(dp=None),
     )
 
     monkeypatch.setattr(legacy_server.torch.distributed, "get_rank", lambda: 0)
@@ -178,6 +181,7 @@ async def test_legacy_runner_forwards_sampling_config_and_stops_frontend(monkeyp
         "rank": 0,
         "server_port": 4321,
         "verbose": True,
+        "num_replicas": 4,
         "hostname": "127.0.0.1",
         "chat_template": "template",
         "multimodal_prompt_config": multimodal_prompt_config,

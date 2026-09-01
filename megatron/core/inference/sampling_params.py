@@ -38,11 +38,10 @@ class SamplingParams:
     # drops prompt_tokens before serializing the finished request, saving the ZMQ
     # transmission cost for long prompts. Opt in when the client needs them.
     return_prompt_tokens: bool = False
-    # Whether the coordinator should detokenize the finished request before
-    # forwarding it. True keeps the behaviour every client had before the reply
-    # bodies became opaque frames. Clients that detokenize themselves -- the HTTP
-    # frontend does -- can turn this off, which lets the coordinator forward the
-    # body without decoding and re-encoding it.
+    # When False, the DP coordinator skips detokenizing this request's output. The
+    # coordinator is a single process serving every DP rank, so per-request work there
+    # is a throughput ceiling; callers that can detokenize themselves (e.g. the HTTP
+    # frontend, which is replicated) should set this to False.
     detokenize_generations: bool = True
     streaming: bool = False  # Emit incremental ENGINE_REPLY_PARTIAL frames.
     streaming_interval: int = 1  # Minimum unsent tokens per ENGINE_REPLY_PARTIAL.

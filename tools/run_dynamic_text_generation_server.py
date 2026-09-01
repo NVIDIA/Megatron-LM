@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 
@@ -44,7 +45,11 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_
     get_model as get_vlm_model,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer  # noqa: E402
-from megatron.core.utils import configure_nvtx_profiling, trace_async_exceptions  # noqa: E402
+from megatron.core.utils import (  # noqa: E402
+    configure_nvtx_profiling,
+    get_pg_size,
+    trace_async_exceptions,
+)
 from megatron.inference.utils import (  # noqa: E402
     get_dynamic_inference_engine,
     get_inference_config_from_model_and_args,
@@ -70,6 +75,26 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     )
     parser.add_argument(
         "--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response"
+    )
+    parser.add_argument(
+        "--frontend-replicas",
+        type=int,
+        default=-1,
+        help="Number of HTTP frontend processes spawned per hosting rank. "
+        "-1 (default) uses max(data parallel size, 4), or a flat 4 with "
+        "--frontend-on-all-ranks, where capacity already scales with the "
+        "number of ranks hosting a frontend.",
+    )
+    parser.add_argument(
+        "--frontend-on-all-ranks",
+        action="store_true",
+        help="Run HTTP frontends on every rank instead of only rank 0, and "
+        "return every rank's URL for the caller to spread requests over. "
+        "Frontend work (chat template, detokenize, parsers, JSON) is "
+        "CPU-bound and otherwise confined to the hosting rank's CPU "
+        "allocation, which leaves the rest of the job's cores unused. "
+        "Ranks still share one DP coordinator; only the HTTP tier is "
+        "replicated.",
     )
     # NOTE: --chat-template is already declared by upstream's TrainingConfig
     # (megatron/training/config/training_config.py); we don't re-register it.
@@ -230,15 +255,41 @@ async def run_text_generation_server(
         hostname=hostname,
     )
 
+    num_replicas = getattr(args, 'frontend_replicas', -1)
+    if num_replicas < 0:
+        if getattr(args, 'frontend_on_all_ranks', False):
+            # Capacity now scales with the number of ranks, so the per-rank
+            # replica count stays flat rather than tracking DP size on top of it.
+            num_replicas = 4
+        else:
+            # Each replica is a single event loop, so frontend capacity has to scale with
+            # the number of engines it feeds. The floor of 4 preserves the previous default
+            # for small deployments.
+            num_replicas = max(get_pg_size(engine.pg_collection.dp), 4)
+    if rank == 0:
+        logging.info("Starting %d HTTP frontend replica(s) per hosting rank.", num_replicas)
+
+    if getattr(args, 'frontend_on_all_ranks', False):
+        # Only the DP coordinator rank learns the coordinator's address: the
+        # engine broadcasts it over the DP group, which is a singleton when data
+        # parallel size is 1. Every rank needs it here, since every rank's
+        # frontend opens its own client.
+        address = [coordinator_addr]
+        torch.distributed.broadcast_object_list(address, src=0)
+        coordinator_addr = address[0]
+        assert coordinator_addr is not None, "no rank published a DP coordinator address"
+
     try:
-        if rank == 0:
-            start_text_gen_server(
+        url = None
+        if getattr(args, 'frontend_on_all_ranks', False) or rank == 0:
+            url = start_text_gen_server(
                 coordinator_addr=coordinator_addr,
                 tokenizer=engine.controller.tokenizer,
                 parsers=args.parsers,
                 rank=rank,
-                server_port=server_port,
+                server_port=0 if getattr(args, 'frontend_on_all_ranks', False) else server_port,
                 verbose=args.inference_text_gen_server_logging,
+                num_replicas=num_replicas,
                 hostname=hostname,
                 chat_template=chat_template,
                 multimodal_prompt_config=(
@@ -257,13 +308,24 @@ async def run_text_generation_server(
                 ),
             )
 
+        if getattr(args, 'frontend_on_all_ranks', False):
+            # Unlike callers that already collect a URL per worker, this entry
+            # point has to gather them itself before it can report the set.
+            urls = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(urls, url)
+            if rank == 0:
+                for entry in [u for u in urls if u]:
+                    logging.info("Frontend: %s", entry)
+        elif rank == 0:
+            logging.info("Frontend: %s", url)
+
         # Await the engine loop directly since the server is running in a separate process
         await engine.engine_loop_task
 
     finally:
-        # Guarantee that the separate process is terminated when the engine loop stops or is interrupted
-        if rank == 0:
-            stop_text_gen_server()
+        # Guarantee that the separate processes are terminated when the engine loop
+        # stops or is interrupted. Every rank may now own frontend processes.
+        stop_text_gen_server()
 
 
 def _load_chat_template(value):

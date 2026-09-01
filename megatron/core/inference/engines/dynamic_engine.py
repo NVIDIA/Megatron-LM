@@ -610,10 +610,22 @@ class DynamicInferenceEngine(AbstractEngine):
                 "tensors were not retained."
             )
 
+        # Move request tensors to local device for multimodal embedding recomputation.
+        # Prompt token tensors are persistently stored on the inference device.
+        device = request.prompt_tokens.device
+        imgs = request.imgs.to(device=device)
+        num_tiles = request.num_tiles.to(device=device) if request.num_tiles is not None else None
+        imgs_sizes = (
+            request.imgs_sizes.to(device=device) if request.imgs_sizes is not None else None
+        )
+        num_frames = (
+            request.num_frames.to(device=device) if request.num_frames is not None else None
+        )
+
         # Re-construct the input mask that provides multimodal embedding injection guidelines
         # for the inference wrapper decoder inputs.
         wrapper = self.controller.inference_wrapped_model
-        modality = "video" if request.num_frames is not None else "image"
+        modality = "video" if num_frames is not None else "image"
         if request.media_tokens_preexpanded:
             mask = wrapper.build_preexpanded_media_token_mask(request.prompt_tokens, modality)
         else:
@@ -623,9 +635,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     "multimodal prompt was not retained."
                 )
             media_token_id = wrapper.resolve_media_token_id(self.controller.tokenizer, modality)
-            expansion_kwargs = {"num_tiles": request.num_tiles, "imgs_sizes": request.imgs_sizes}
-            if request.num_frames is not None:
-                expansion_kwargs["num_frames"] = request.num_frames
+            expansion_kwargs = {"num_tiles": num_tiles, "imgs_sizes": imgs_sizes}
+            if num_frames is not None:
+                expansion_kwargs["num_frames"] = num_frames
             _, mask_list = wrapper.expand_image_tokens(
                 [request.compact_prompt_tokens.tolist()],
                 image_token_id=media_token_id,
@@ -644,11 +656,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 device=request.prompt_tokens.device,
             )
 
-        encoder_kwargs = {"num_image_tiles": request.num_tiles, "imgs_sizes": request.imgs_sizes}
-        if request.num_frames is not None:
-            encoder_kwargs["num_frames"] = request.num_frames
+        encoder_kwargs = {"num_image_tiles": num_tiles, "imgs_sizes": imgs_sizes}
+        if num_frames is not None:
+            encoder_kwargs["num_frames"] = num_frames
         with torch.inference_mode():
-            embeddings = wrapper._forward_vision_encoder(request.imgs, **encoder_kwargs)
+            embeddings = wrapper._forward_vision_encoder(imgs, **encoder_kwargs)
 
         expected_count = int((mask >= 0).sum().item())
         actual_count = embeddings.numel() // embeddings.shape[-1] if embeddings.ndim > 0 else 0
@@ -1628,7 +1640,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.controller.inference_wrapped_model.validate_input_modalities(*input_modalities)
 
         prompt_str = None
-        # Tokenize prompt if text.
+        # Tokenize prompt if text. Move prompt tokens to the CUDA device for inference.
         if isinstance(prompt, str):
             # Tokenize prompt if text. Support legacy single-arg mocks.
             prompt_str = prompt
