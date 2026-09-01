@@ -496,6 +496,31 @@ def _num_dsa_indexer_layers(num_layers, skip_topk_offset, topk_freq):
     )
 
 
+def _num_hybrid_dsa_indexer_layers(hybrid_layer_pattern, num_layers, skip_topk_offset, topk_freq):
+    """Count DSA indexers at their actual main and nested-MTP layer numbers."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
+
+    parsed = parse_hybrid_pattern(hybrid_layer_pattern)
+    main_pattern = (parsed.main_pattern or "").replace(Symbols.PIPE, "")
+
+    def is_indexer(layer_type, layer_number):
+        return layer_type == Symbols.DS_ATTENTION and not is_dsa_skip_topk_layer(
+            layer_number, skip_topk_offset or 0, topk_freq or 1
+        )
+
+    count = sum(
+        is_indexer(layer_type, layer_number)
+        for layer_number, layer_type in enumerate(main_pattern, start=1)
+    )
+    if parsed.mtp_pattern is not None:
+        indexers_per_mtp_depth = sum(
+            is_indexer(layer_type, num_layers + inner_layer_number)
+            for inner_layer_number, layer_type in enumerate(parsed.mtp_pattern, start=1)
+        )
+        count += indexers_per_mtp_depth * parsed.mtp_num_depths
+    return count
+
+
 def _dsv4_hybrid_self_attention_flops(
     *,
     hidden_size,
@@ -1486,8 +1511,7 @@ def num_floating_point_operations(
         # ``kw_args``, never back onto ``args``), so the attribute alone misses
         # exactly the runs this guard exists for.
         assert (
-            args.experimental_attention_variant != "dsa"
-            and layer_counts[Symbols.DS_ATTENTION] == 0
+            args.experimental_attention_variant != "dsa" and layer_counts[Symbols.DS_ATTENTION] == 0
         ), (
             "num_floating_point_operations does not support DSA "
             "('D' layers / experimental_attention_variant='dsa') on the "
@@ -3397,6 +3421,15 @@ def train_step(
     )
 
 
+def _resolve_dsa_metric_pg_collection(model_pg_collection, schedule_pg_collection):
+    """Resolve language-model metric groups and rank membership for DSA logging."""
+    if isinstance(schedule_pg_collection, MultiModuleProcessGroupCollection):
+        if not schedule_pg_collection.has_language_model():
+            return False, None
+        return True, schedule_pg_collection.get_language_model_collection()
+    return True, model_pg_collection
+
+
 def training_log(
     loss_dict,
     total_loss_dict,
@@ -3414,6 +3447,7 @@ def training_log(
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
     num_microbatches: int | None = None,
+    schedule_pg_collection=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -3658,28 +3692,57 @@ def training_log(
         )
 
     # Track sparse attention indexer loss.
-    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+    should_track_dsa, dsa_metric_pg_collection = _resolve_dsa_metric_pg_collection(
+        pg_collection, schedule_pg_collection
+    )
+    if (
+        args.dsa_indexer_loss_coeff is not None
+        and args.dsa_indexer_loss_coeff > 0
+        and should_track_dsa
+    ):
+        # Sequence packing may pass the physical packed microbatch count to training_log, but
+        # Dynamic-CP metric reduction reconstructs equal weighting over the nominal global-batch
+        # samples. Normalize by the calculator's nominal scheduled count deliberately.
         indexer_loss_scale = 1 / get_num_microbatches()
+        pp_group = None
+        dp_group = None
         dynamic_cp_parent_group = None
+        if dsa_metric_pg_collection is not None:
+            pp_group = dsa_metric_pg_collection.pp
+            dp_group = dsa_metric_pg_collection.dp
         if args.dynamic_context_parallel:
-            dynamic_cp_parent_group = getattr(pg_collection, "dp_cp", None)
-            if dynamic_cp_parent_group is None:
+            if dsa_metric_pg_collection is not None:
+                dynamic_cp_parent_group = dsa_metric_pg_collection.dp_cp
+            else:
+                # Legacy training entry points without a process-group collection.
                 dynamic_cp_parent_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        tracked_layers = args.num_layers + (args.mtp_num_layers or 0)
+        if args.csa_compress_ratios is not None:
+            num_indexer_layers = sum(ratio == 4 for ratio in args.csa_compress_ratios)
+        elif is_hybrid_model(args):
+            num_indexer_layers = _num_hybrid_dsa_indexer_layers(
+                args.hybrid_layer_pattern,
+                args.num_layers,
+                args.dsa_indexer_skip_topk_offset,
+                args.dsa_indexer_topk_freq,
+            )
+        else:
+            num_indexer_layers = _num_dsa_indexer_layers(
+                tracked_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
+            )
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
             iteration=iteration,
             writer=writer,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
-            num_layers=args.num_layers + (args.mtp_num_layers or 0),
-            num_indexer_layers=(
-                sum(ratio == 4 for ratio in args.csa_compress_ratios)
-                if args.csa_compress_ratios is not None
-                else None
-            ),
+            num_layers=tracked_layers,
+            num_indexer_layers=num_indexer_layers,
             preserve_groups=args.cuda_graph_impl != "none",
             dynamic_cp_parent_group=dynamic_cp_parent_group,
             configured_cp_size=args.context_parallel_size,
+            pp_group=pp_group,
+            dp_group=dp_group,
         )
 
     # Dump memory snapshot and print metrics to stdout.
@@ -4561,6 +4624,7 @@ def train(
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
+            pg_collection=model_pg_collection,
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
         )
 
@@ -4870,6 +4934,7 @@ def train(
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
             num_microbatches=num_microbatches,
+            schedule_pg_collection=pg_collection,
         )
         is_first_iteration = False
 
@@ -5113,7 +5178,7 @@ def evaluate(
             ft_integration.on_eval_step_start()
             if getattr(config, 'sequence_packing_scheduler', None) is not None:
                 try:
-                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                    packed_data_iterator, scheduled_eval_num_microbatches, _, _ = (
                         wrap_data_iterator(data_iterator, config, eval_num_microbatches)
                     )
                 except StopIteration:
@@ -5411,7 +5476,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
     args = get_args()
 
-    (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
+    train_dataloader, valid_dataloaders, test_dataloader = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
 

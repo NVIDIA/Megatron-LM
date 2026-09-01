@@ -23,7 +23,10 @@ from torch.utils._pytree import tree_map as tree_map_pyt
 from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.packed_seq_params import resolve_thd_tail_padding_policy
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
     get_all_rng_states,
@@ -178,13 +181,18 @@ def _get_local_dsa_metric_tracker_size(model=None):
         DSAIndexerLossLoggingHelper,
     )
 
-    values = DSAIndexerLossLoggingHelper.tracker.get("values")
-    required_size = values.shape[0] if values is not None else 0
     if model is None:
+        # Legacy callers without a model can only infer the potential writer range from
+        # storage populated by the eager step. Explicit models must not inherit storage from
+        # an unrelated model that previously ran in this process.
+        values = DSAIndexerLossLoggingHelper.tracker.get("values")
+        required_size = values.shape[0] if values is not None else 0
         model_chunks = ()
     elif isinstance(model, (list, tuple)):
+        required_size = 0
         model_chunks = model
     else:
+        required_size = 0
         model_chunks = (model,)
     for model_chunk in model_chunks:
         for module in model_chunk.modules():
@@ -199,16 +207,52 @@ def _get_local_dsa_metric_tracker_size(model=None):
     return required_size
 
 
-def _prepare_dsa_metric_tracker_for_capture(model=None, pp_group=None):
-    """PP-negotiate and allocate the final DSA tracker storage before recording graphs."""
+def _resolve_dsa_metric_pg_collection(pg_collection):
+    """Return whether this rank owns the language model and its process groups."""
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        if not pg_collection.has_language_model():
+            return False, None
+        return True, pg_collection.get_language_model_collection()
+    return True, pg_collection
+
+
+def _clear_dsa_metric_tracker_capture_state():
+    """Forget graph-capture size provenance after all recorded graphs are gone."""
     from megatron.core.transformer.experimental_attention_variant.dsa import (
         DSAIndexerLossLoggingHelper,
     )
 
     tracker = DSAIndexerLossLoggingHelper.tracker
+    tracker.pop("capture_prepared_size", None)
+    tracker.pop("capture_prepared_pp_group", None)
+    tracker.pop("capture_prepared_pp_ranks", None)
+
+
+def _prepare_dsa_metric_tracker_for_capture(model=None, pp_group=None):
+    """PP-negotiate and allocate the final DSA tracker storage before recording graphs."""
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossLoggingHelper,
+        _record_tracker_pp_group,
+        _tracker_pp_group_matches,
+    )
+
+    tracker = DSAIndexerLossLoggingHelper.tracker
     local_required_size = _get_local_dsa_metric_tracker_size(model)
+    if (
+        torch.distributed.is_initialized()
+        and pp_group is None
+        and parallel_state.model_parallel_is_initialized()
+    ):
+        # Legacy callers may omit the collection. Internal capture paths pass the owning
+        # language-model PP group explicitly.
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+
     capture_prepared_size = tracker.get("capture_prepared_size")
     if capture_prepared_size is not None:
+        if not _tracker_pp_group_matches(tracker, "capture_prepared", pp_group):
+            raise RuntimeError(
+                "DSA metric tracker CUDA Graph capture was prepared with a different PP group."
+            )
         if local_required_size > capture_prepared_size:
             raise RuntimeError(
                 "DSA metric tracker discovered a larger layer index after PP size agreement."
@@ -217,15 +261,37 @@ def _prepare_dsa_metric_tracker_for_capture(model=None, pp_group=None):
             DSAIndexerLossLoggingHelper.ensure_tracker_size(capture_prepared_size)
         return capture_prepared_size
 
+    size_was_negotiated_from_model = model is not None
+    if size_was_negotiated_from_model and torch.distributed.is_initialized():
+        size_tensor = torch.tensor(
+            [local_required_size], device=torch.cuda.current_device(), dtype=torch.long
+        )
+        torch.distributed.all_reduce(size_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group)
+        local_required_size = int(size_tensor.item())
+
+    if size_was_negotiated_from_model and local_required_size == 0:
+        # No rank in this model's PP group can write an indexer metric, so no tracker tensor is
+        # captured. Leave any tracker owned by another model untouched and do not bind this
+        # graph to its runtime/capture provenance.
+        return 0
+
     # ``agreed_size`` may have been cached by an earlier eager metric reduction. It reflects
     # only layers that wrote a loss in that step, whereas the model scan deliberately includes
     # every potential graph writer. Negotiate once more at capture time instead of treating the
     # eager value as final.
-    local_required_size = max(local_required_size, tracker.get("agreed_size") or 0)
+    agreed_size = tracker.get("agreed_size")
+    if agreed_size:
+        if not _tracker_pp_group_matches(tracker, "agreed_size", pp_group):
+            raise RuntimeError(
+                "DSA metric tracker reduction and CUDA Graph capture use different PP groups."
+            )
+        local_required_size = max(local_required_size, agreed_size)
+    elif agreed_size is not None:
+        tracker.pop("agreed_size", None)
+        tracker.pop("agreed_size_pp_group", None)
+        tracker.pop("agreed_size_pp_ranks", None)
     size = local_required_size
-    if torch.distributed.is_initialized():
-        if pp_group is None and parallel_state.model_parallel_is_initialized():
-            pp_group = parallel_state.get_pipeline_model_parallel_group()
+    if not size_was_negotiated_from_model and torch.distributed.is_initialized():
         size_tensor = torch.tensor(
             [local_required_size], device=torch.cuda.current_device(), dtype=torch.long
         )
@@ -234,8 +300,13 @@ def _prepare_dsa_metric_tracker_for_capture(model=None, pp_group=None):
 
     if size > 0:
         DSAIndexerLossLoggingHelper.ensure_tracker_size(size)
-    tracker["agreed_size"] = size
+        # The capture negotiation is also a valid runtime size agreement because both phases
+        # use the same explicitly tracked PP group. Never publish zero as a runtime agreement:
+        # a later writer must still be able to trigger size negotiation.
+        tracker["agreed_size"] = size
+        _record_tracker_pp_group(tracker, "agreed_size", pp_group)
     tracker["capture_prepared_size"] = size
+    _record_tracker_pp_group(tracker, "capture_prepared", pp_group)
     return size
 
 
@@ -464,7 +535,7 @@ class _CudagraphGlobalRecord:
         cls.cudagraph_record.append((runner, "bwd"))
 
     @classmethod
-    def create_cudagraphs(cls):
+    def create_cudagraphs(cls, model=None, pg_collection=None):
         """Iterate through 'cudagraph_record' creating graphs in the order in which
         they were recorded."""
         # Cudagraphs have already been created, check that no cudagraphed modules ran in eager mode
@@ -475,13 +546,35 @@ class _CudagraphGlobalRecord:
             )
             return
 
+        owns_language_model, metric_pg_collection = _resolve_dsa_metric_pg_collection(pg_collection)
+        pp_group = getattr(metric_pg_collection, "pp", None)
+        local_has_cudagraphs = bool(cls.cudagraph_record)
+        group_has_cudagraphs = local_has_cudagraphs
+        if owns_language_model and torch.distributed.is_initialized():
+            if pp_group is None and parallel_state.model_parallel_is_initialized():
+                pp_group = parallel_state.get_pipeline_model_parallel_group()
+            has_cudagraphs = torch.tensor(
+                [local_has_cudagraphs], device=torch.cuda.current_device(), dtype=torch.long
+            )
+            torch.distributed.all_reduce(
+                has_cudagraphs, op=torch.distributed.ReduceOp.MAX, group=pp_group
+            )
+            group_has_cudagraphs = bool(has_cudagraphs.item())
+
+        # Mark the capture phase complete on every rank. Otherwise an empty PP stage would
+        # re-enter these collectives after peer stages had already created their graphs.
+        if not group_has_cudagraphs:
+            cls.cudagraph_created = True
+            return
+
         # Local capture follows one complete eager step, so the local tracker already reflects
         # every local hybrid/MTP index. Negotiate its final size before any PP stage records a
         # graph; otherwise the first metric reduction could grow another stage's captured tensor.
-        _prepare_dsa_metric_tracker_for_capture()
+        if owns_language_model:
+            _prepare_dsa_metric_tracker_for_capture(model, pp_group)
 
-        # No cudagraphs have been created or recorded, so do nothing
-        if len(cls.cudagraph_record) == 0:
+        if not local_has_cudagraphs:
+            cls.cudagraph_created = True
             return
 
         # Otherwise, create all the recorded cudagraphs.
@@ -596,7 +689,7 @@ class _CudagraphGlobalRecord:
         return capture_stats
 
 
-def create_cudagraphs():
+def create_cudagraphs(model=None, pg_collection=None):
     """Should be called at the end of each schedule function,
     (e.g. forward_backward_pipelining_with_interleaving) in
     `megatron.core.pipeline_parallel.schedules.py`. During the first step, _CudaGraphRunners
@@ -606,7 +699,7 @@ def create_cudagraphs():
     to be created in execution order, which allows multiple cudagraphs to share a single
     memory pool, minimizing cudagraph memory usage."""
 
-    return _CudagraphGlobalRecord.create_cudagraphs()
+    return _CudagraphGlobalRecord.create_cudagraphs(model=model, pg_collection=pg_collection)
 
 
 def delete_cuda_graphs():
@@ -631,6 +724,7 @@ def delete_cuda_graphs():
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
+    _clear_dsa_metric_tracker_capture_state()
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
@@ -1873,6 +1967,11 @@ class TECudaGraphHelper:
     parameters that are covered by cudagraphs.
     """
 
+    # Subclasses that capture a disjoint module (for example, a vision encoder) must opt out:
+    # scanning their full parent model can discover language-model DSA writers whose tracker
+    # storage is not referenced by the subclass's graphs.
+    _captures_dsa_metric_tracker = True
+
     def __init__(
         self,
         model,
@@ -2833,7 +2932,8 @@ class TECudaGraphHelper:
         # TE supports capture without eager warmup. Scan the full local model (including
         # non-graphable hybrid/MTP internals), then PP-negotiate one final tracker storage before
         # any layer graph records a pointer to it.
-        _prepare_dsa_metric_tracker_for_capture(self.model, self.pp_group)
+        if self._captures_dsa_metric_tracker:
+            _prepare_dsa_metric_tracker_for_capture(self.model, self.pp_group)
         start_time = self._start_capturing()
 
         if not self.flattened_callables:
@@ -2902,6 +3002,10 @@ class TECudaGraphHelper:
             self._graphs_created = True
 
         self._finish_capturing(start_time)
+        if self._captures_dsa_metric_tracker and not self._graphs_created:
+            # No graph retains the prepared tracker storage on this rank, and train() only
+            # calls delete_cuda_graphs() when graphs_created() is true.
+            _clear_dsa_metric_tracker_capture_state()
 
     def cuda_graph_set_manual_hooks(self):
         """
@@ -2943,6 +3047,8 @@ class TECudaGraphHelper:
             f'{graphs_not_reset} graphs deleted without explicit reset.',
         )
         self._graphs_created = False
+        if self._captures_dsa_metric_tracker:
+            _clear_dsa_metric_tracker_capture_state()
 
 
 def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, schedule_table):
@@ -3215,6 +3321,10 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
             since the vision encoder always uses batch-dim = 1).
         num_microbatches: Number of microbatches per step.
     """
+
+    # Vision graphs do not execute language-model DSA/CSA writers even though ``model`` is the
+    # full multimodal model. Their lifecycle must not prepare or clear the language tracker.
+    _captures_dsa_metric_tracker = False
 
     def __init__(
         self,

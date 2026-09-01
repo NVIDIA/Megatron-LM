@@ -53,6 +53,54 @@ def reset_full_cuda_graph_state():
     gc.collect()
 
 
+def test_full_graph_reset_clears_capture_state_only_after_last_graph(monkeypatch):
+    """Training and validation graphs share tracker storage until both are released."""
+    from types import SimpleNamespace
+
+    from megatron.core.transformer.cuda_graphs import _prepare_dsa_metric_tracker_for_capture
+
+    class MetricModule(torch.nn.Module):
+        logs_dsa_indexer_loss = True
+
+        def __init__(self):
+            super().__init__()
+            self.layer_number = 5
+            self.config = SimpleNamespace(num_layers=5, mtp_num_layers=None)
+
+    pp_group = object()
+    values = torch.zeros(2)
+    reduce_group = object()
+    DSAIndexerLossLoggingHelper.tracker = {
+        "values": values,
+        "reduce_group": reduce_group,
+        "agreed_size": 2,
+        "agreed_size_pp_group": pp_group,
+        "capture_prepared_size": 2,
+        "capture_prepared_pp_group": pp_group,
+        "capture_prepared_pp_ranks": (0,),
+    }
+    FullCudaGraphWrapper.cuda_graph = {"training": object(), "validation": object()}
+    wrapper = object.__new__(FullCudaGraphWrapper)
+
+    wrapper.reset_cuda_graph("training")
+    assert DSAIndexerLossLoggingHelper.tracker["capture_prepared_size"] == 2
+
+    wrapper.reset_cuda_graph("validation")
+    tracker = DSAIndexerLossLoggingHelper.tracker
+    assert tracker["values"] is values
+    assert tracker["reduce_group"] is reduce_group
+    assert tracker["agreed_size"] == 2
+    assert "capture_prepared_size" not in tracker
+    assert "capture_prepared_pp_group" not in tracker
+    assert "capture_prepared_pp_ranks" not in tracker
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    model = torch.nn.Module()
+    model.add_module("metric", MetricModule())
+    assert _prepare_dsa_metric_tracker_for_capture(model, pp_group) == 5
+    assert tracker["values"].shape == (5,)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="StaticBufferLoader stages inputs on the GPU"
 )

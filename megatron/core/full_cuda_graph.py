@@ -218,6 +218,7 @@ class FullCudaGraphWrapper:
         if curr_iteration == self.cuda_graph_warmup_steps:
             from megatron.core.transformer.cuda_graphs import (
                 _prepare_dsa_metric_tracker_for_capture,
+                _resolve_dsa_metric_pg_collection,
                 _restore_metric_tracker,
                 _snapshot_metric_tracker,
             )
@@ -226,20 +227,13 @@ class FullCudaGraphWrapper:
             )
 
             pg_collection = kwargs.get('pg_collection')
-            prepare_dsa_tracker = True
-            if pg_collection is not None and hasattr(
-                pg_collection, "get_language_model_collection"
-            ):
-                prepare_dsa_tracker = pg_collection.has_language_model()
-                pp_group = (
-                    pg_collection.get_language_model_collection().pp
-                    if prepare_dsa_tracker
-                    else None
-                )
-            else:
-                pp_group = getattr(pg_collection, "pp", None)
+            prepare_dsa_tracker, metric_pg_collection = _resolve_dsa_metric_pg_collection(
+                pg_collection
+            )
             if prepare_dsa_tracker:
-                _prepare_dsa_metric_tracker_for_capture(model, pp_group)
+                _prepare_dsa_metric_tracker_for_capture(
+                    model, getattr(metric_pg_collection, "pp", None)
+                )
             dsa_metric_tracker = DSAIndexerLossLoggingHelper.tracker
             dsa_metric_snapshot = _snapshot_metric_tracker(dsa_metric_tracker)
             logger.info(f'Capture CUDA graph for {training_str}!!!')
@@ -321,4 +315,10 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph['validation'] = None
             FullCudaGraphWrapper.result['validation'] = None
             FullCudaGraphWrapper.curr_iteration['validation'] = 0
+        if all(graph is None for graph in FullCudaGraphWrapper.cuda_graph.values()):
+            from megatron.core.transformer.cuda_graphs import (
+                _clear_dsa_metric_tracker_capture_state,
+            )
+
+            _clear_dsa_metric_tracker_capture_state()
         gc.collect()

@@ -289,6 +289,37 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+def _get_process_group_ranks(group) -> Optional[Tuple[int, ...]]:
+    """Return stable rank provenance for a process group when distributed is initialized."""
+    if not torch.distributed.is_initialized():
+        return None
+    try:
+        if group is None:
+            return tuple(range(torch.distributed.get_world_size()))
+        return tuple(torch.distributed.get_process_group_ranks(group))
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _tracker_pp_group_matches(tracker, prefix: str, pp_group) -> bool:
+    """Return whether a cached group is the same object or spans the same ordered ranks."""
+    cached_group = tracker.get(f"{prefix}_pp_group")
+    if cached_group is pp_group:
+        return True
+    cached_ranks = tracker.get(f"{prefix}_pp_ranks")
+    return cached_ranks is not None and cached_ranks == _get_process_group_ranks(pp_group)
+
+
+def _record_tracker_pp_group(tracker, prefix: str, pp_group) -> None:
+    """Record both immediate and reinitialization-stable process-group provenance."""
+    tracker[f"{prefix}_pp_group"] = pp_group
+    ranks = _get_process_group_ranks(pp_group)
+    if ranks is None:
+        tracker.pop(f"{prefix}_pp_ranks", None)
+    else:
+        tracker[f"{prefix}_pp_ranks"] = ranks
+
+
 class DSAIndexerLossLoggingHelper:
     """Helper class for logging sparse attention indexer losses."""
 
@@ -355,6 +386,8 @@ class DSAIndexerLossLoggingHelper:
         num_layers: Optional[int] = None,
         dynamic_cp_parent_group: Optional[torch.distributed.ProcessGroup] = None,
         configured_cp_size: Optional[int] = None,
+        pp_group: Optional[torch.distributed.ProcessGroup] = None,
+        dp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Collect and reduce the indexer losses across ranks.
 
@@ -372,13 +405,42 @@ class DSAIndexerLossLoggingHelper:
             configured_cp_size: Configured/static CP width. Dynamic CP accumulates raw local
                 token sums, so multiplying by this value before the physical DP x CP average
                 preserves the nominal global-batch weighting of static CP-SUM then DP-AVG.
+            pp_group: Pipeline-parallel group that owns the language model. Defaults to the
+                legacy global process-group registry when not supplied.
+            dp_group: Data-parallel group that owns the language model. Used by static CP
+                logging and to validate the Dynamic-CP parent domain; defaults to the legacy
+                global process-group registry when omitted.
         """
         tracker = DSAIndexerLossLoggingHelper.tracker
-        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        if pp_group is None:
+            # Legacy callers may omit the collection. Training passes the owning language-model
+            # group explicitly so multi-module ranks never consult unrelated global groups.
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
         if dynamic_cp_parent_group is not None and (
             configured_cp_size is None or configured_cp_size < 1
         ):
             raise ValueError("configured_cp_size must be positive for Dynamic CP logging.")
+        if dynamic_cp_parent_group is not None and torch.distributed.is_initialized():
+            parent_size = get_pg_size(dynamic_cp_parent_group)
+            if parent_size % configured_cp_size != 0:
+                raise ValueError(
+                    "Dynamic CP metric parent group size must be divisible by configured_cp_size."
+                )
+            if dp_group is not None:
+                expected_parent_size = get_pg_size(dp_group) * configured_cp_size
+                if parent_size != expected_parent_size:
+                    raise ValueError(
+                        "Dynamic CP metric parent group must span the language-model DP x CP "
+                        f"domain (expected size {expected_parent_size}, got {parent_size})."
+                    )
+
+        capture_prepared_size = tracker.get("capture_prepared_size")
+        if capture_prepared_size is not None and not _tracker_pp_group_matches(
+            tracker, "capture_prepared", pp_group
+        ):
+            raise RuntimeError(
+                "DSA metric tracker CUDA Graph capture and reduction use different PP groups."
+            )
 
         # Agree on a consistent tracker size across the PP group BEFORE the collective.
         # Ranks owning indexer layers may have grown the tracker via save_loss_to_tracker
@@ -391,16 +453,26 @@ class DSAIndexerLossLoggingHelper:
         # per-iteration CPU-GPU sync (.item()); the size-negotiation all_reduce + .item() runs
         # only on the first call. Every PP rank caches on the same (first) call, so later steps
         # all skip it consistently.
-        if tracker.get("agreed_size") is not None:
-            size = tracker["agreed_size"]
+        agreed_size = tracker.get("agreed_size")
+        if agreed_size:
+            if not _tracker_pp_group_matches(tracker, "agreed_size", pp_group):
+                raise RuntimeError(
+                    "DSA metric tracker cached size belongs to a different PP group."
+                )
+            size = agreed_size
         else:
+            tracker.pop("agreed_size", None)
+            tracker.pop("agreed_size_pp_group", None)
+            tracker.pop("agreed_size_pp_ranks", None)
             local_size = tracker["values"].shape[0] if "values" in tracker else (num_layers or 0)
             size_t = torch.tensor(
                 [local_size], device=torch.cuda.current_device(), dtype=torch.long
             )
             torch.distributed.all_reduce(size_t, op=torch.distributed.ReduceOp.MAX, group=pp_group)
             size = int(size_t.item())
-            tracker["agreed_size"] = size
+            if size > 0:
+                tracker["agreed_size"] = size
+                _record_tracker_pp_group(tracker, "agreed_size", pp_group)
         if size == 0:
             return
         if "values" not in tracker:
@@ -413,25 +485,27 @@ class DSAIndexerLossLoggingHelper:
             tracker["values"] = grown
         values = tracker["values"]
 
-        torch.distributed.all_reduce(values, group=pp_group)
         if dynamic_cp_parent_group is not None:
+            torch.distributed.all_reduce(values, group=pp_group)
             values.mul_(configured_cp_size)
             torch.distributed.all_reduce(
                 values, group=dynamic_cp_parent_group, op=torch.distributed.ReduceOp.AVG
             )
         else:
-            # Reduce indexer losses across ranks.
+            # Apply static-CP normalization on the PP stage that owns each indexer before
+            # broadcasting its layer slots across PP. Empty PP stages have no local group
+            # metadata and can safely skip CP because their values are still zero here.
             if tracker.get('reduce_group') is not None:
                 torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
             if tracker.get('avg_group') is not None:
                 torch.distributed.all_reduce(
                     values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
                 )
-            torch.distributed.all_reduce(
-                values,
-                group=parallel_state.get_data_parallel_group(with_context_parallel=False),
-                op=torch.distributed.ReduceOp.AVG,
-            )
+            torch.distributed.all_reduce(values, group=pp_group)
+            if dp_group is None:
+                # Legacy fallback; explicit process-group collections are preferred.
+                dp_group = parallel_state.get_data_parallel_group(with_context_parallel=False)
+            torch.distributed.all_reduce(values, group=dp_group, op=torch.distributed.ReduceOp.AVG)
 
     @staticmethod
     def track_indexer_metrics(
@@ -446,6 +520,8 @@ class DSAIndexerLossLoggingHelper:
         preserve_groups: bool = False,
         dynamic_cp_parent_group: Optional[torch.distributed.ProcessGroup] = None,
         configured_cp_size: Optional[int] = None,
+        pp_group: Optional[torch.distributed.ProcessGroup] = None,
+        dp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """Track the sparse attention indexer metrics for logging.
 
@@ -464,11 +540,15 @@ class DSAIndexerLossLoggingHelper:
                 when Dynamic CP is enabled.
             configured_cp_size: Configured/static CP width used to normalize Dynamic-CP
                 raw local token sums.
+            pp_group: Pipeline-parallel group that owns the language model.
+            dp_group: Data-parallel group that owns the language model.
         """
         DSAIndexerLossLoggingHelper.reduce_loss_in_tracker(
             num_layers=num_layers,
             dynamic_cp_parent_group=dynamic_cp_parent_group,
             configured_cp_size=configured_cp_size,
+            pp_group=pp_group,
+            dp_group=dp_group,
         )
         tracker = DSAIndexerLossLoggingHelper.tracker
         if "values" not in tracker:
