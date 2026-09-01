@@ -457,12 +457,6 @@ class InferenceConfig:
     num_speculative_tokens: int = 0
     """The number of speculative tokens to generate for decode steps."""
 
-    enable_mtp_kv_cache: bool = False
-    """Whether to give the MTP (multi-token-prediction) draft attention its own KV cache during
-    dynamic inference. When enabled, one extra attention-layer plane is added to the shared KV
-    cache `memory_buffer` (v1 supports the repeated-layer MTP head only, attention-based, no
-    Mamba). Purely an acceptance-rate optimization; verified generated output is unaffected."""
-
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 
@@ -647,21 +641,6 @@ class InferenceConfig:
                 "logprobs_mode='processed_logprobs' is not yet supported with speculative decoding "
                 "(num_speculative_tokens > 0)."
             )
-
-        if self.enable_mtp_kv_cache:
-            if self.num_speculative_tokens <= 0:
-                raise ValueError(
-                    "enable_mtp_kv_cache requires speculative decoding "
-                    "(num_speculative_tokens > 0)."
-                )
-            if self.enable_prefix_caching:
-                # The MTP draft attention seeds its KV via a roll-by-one over the prompt hidden
-                # states; a prefix-cache hit forwards only the suffix, so the boundary hidden
-                # state needed to seed the shared prefix is unavailable. See mtp-kv-cache-v2
-                # design notes. TODO: child-prefix reuse + boundary-hidden storage.
-                raise ValueError(
-                    "enable_mtp_kv_cache is not yet supported together with enable_prefix_caching."
-                )
 
         if self.sampling_backend == 'flashinfer':
             try:

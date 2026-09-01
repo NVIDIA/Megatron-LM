@@ -493,13 +493,24 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
-        # MTP KV cache (v1): reserve one extra attention-layer plane in the shared KV `memory_buffer`
+        # MTP KV cache (v2): reserve one extra attention-layer plane in the shared KV `memory_buffer`
         # for the repeated MTP draft attention. Main KV position i and MTP KV position i are
         # position-aligned and MTP length <= main length, so the MTP layer reuses main's block
         # table; only its per-request length offset is tracked separately. The MTP forward routes
         # its append/read to this slot via the `_mtp_forward_active` flag (see
         # append_key_value_cache / key_value_cache), so no attention-layer renumbering is needed.
-        self.enable_mtp_kv_cache = inference_config.enable_mtp_kv_cache
+        #
+        # Always on wherever it is implementable -- there is no opt-in flag. The draft KV is an
+        # acceptance-rate optimization that cannot change verified output, so the only gate is
+        # whether this model/config can populate it: speculative decoding must be active, and v2
+        # covers the attention-based repeated-layer MTP head (a per-depth head has no single
+        # `mtp.layers[0]` to seed through, and a Mamba draft has no KV plane at all).
+        self.enable_mtp_kv_cache = bool(
+            self.num_speculative_tokens > 0
+            and getattr(model_config, "mtp_num_layers", None)
+            and getattr(model_config, "mtp_use_repeated_layer", False)
+            and not self.is_hybrid_model
+        )
         self._mtp_forward_active = False
         # Whether the current MTP draft loop is replaying captured CUDA graphs (True) or running
         # eager (False). Seeded by `_mtp_begin_decode` from the main decode step's graph decision;

@@ -2237,11 +2237,6 @@ def _add_inference_args(parser):
                        help="Enable chunked prefill (disabled by default)")
     group.add_argument('--num-speculative-tokens', type=int, default=0,
                        help='Number of speculative tokens generated during decode')
-    group.add_argument('--enable-mtp-kv-cache', dest='enable_mtp_kv_cache',
-                       action='store_true', default=False,
-                       help='Give the MTP draft attention its own KV cache (extra layer plane '
-                            'in the shared buffer) during dynamic inference. Requires '
-                            '--num-speculative-tokens > 0; incompatible with prefix caching.')
     group.add_argument('--inference-dynamic-batching-prefix-caching',
                        dest='inference_dynamic_batching_enable_prefix_caching',
                        action=argparse.BooleanOptionalAction,

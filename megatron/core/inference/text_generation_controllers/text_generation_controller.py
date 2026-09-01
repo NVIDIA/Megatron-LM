@@ -1080,13 +1080,18 @@ class TextGenerationController:
                 h_i = prefill_hidden[cum : cum + q]  # [q, 1, H] this chunk's hiddens
                 t_i = prefill_tokens[cum : cum + q]  # [q]     this chunk's tokens
                 cum += q
-                if off > 0:
+                # h_{off-1} is needed to seed the straddling entry at off-1, and is available only
+                # when this request computed position off-1 itself, i.e. off came from its own
+                # previous chunk. A prefix-cache hit also produces off > 0, but there the skipped
+                # prefix was computed by a DIFFERENT request whose activations are gone -- see the
+                # `else` branch.
+                own_prior_chunk = (
+                    self._mtp_chunk_boundary_hidden is not None
+                    and self._mtp_chunk_boundary_req_id == rid
+                )
+                if off > 0 and own_prior_chunk:
                     # Continuation chunk: boundary position off-1 = f(carried h_{off-1} + t_off),
                     # then this chunk's roll-by-one off..off+q-2. count = q, start = off-1.
-                    assert (
-                        self._mtp_chunk_boundary_hidden is not None
-                        and self._mtp_chunk_boundary_req_id == rid
-                    ), "chunked-prefill MTP boundary hidden missing or mismatched"
                     p_hidden_segs.append(self._mtp_chunk_boundary_hidden.to(device))
                     p_hidden_segs.append(h_i[:-1])
                     p_token_segs.append(t_i[:1])
@@ -1094,12 +1099,20 @@ class TextGenerationController:
                     p_counts.append(q)
                     p_starts.append(off - 1)
                 else:
-                    # First/only chunk: drop first token (no prior hidden) and last hidden (no next
-                    # token this chunk). count = q-1, start = 0.
+                    # off == 0 (nothing precedes), or a prefix-cache hit. On a hit this request
+                    # inherits the matched blocks' draft KV, which is already correct for every
+                    # position p <= off-2: that entry is f(h_p + emb(t_{p+1})) and t_{p+1} lies
+                    # inside the shared prefix, so it is the same token for every request sharing
+                    # the block. Only position off-1 differs, because its entry consumes t_off --
+                    # the first token where children diverge. That entry is NOT rewritten here: it
+                    # lives in a ref-counted block shared with the producer and every sibling, so
+                    # writing this request's value would corrupt theirs. One stale key/value at the
+                    # divergence point costs a little draft acceptance and cannot affect verified
+                    # output. count = q-1, start = off.
                     p_hidden_segs.append(h_i[:-1])
                     p_token_segs.append(t_i[1:])
                     p_counts.append(q - 1)
-                    p_starts.append(0)
+                    p_starts.append(off)
                 # Carry this step's in-flight chunk's last hidden for the next chunk's boundary.
                 if chunked_id != -1 and rid == chunked_id:
                     self._mtp_chunk_boundary_hidden = h_i[-1].detach().clone().view(1, 1, -1)

@@ -173,10 +173,6 @@ class InferenceSetupConfig:
     num_speculative_tokens: int = 0
     """Number of speculative tokens generated during decode."""
 
-    enable_mtp_kv_cache: bool = False
-    """Give the MTP draft attention its own KV cache (one extra attention-layer plane in the
-    shared KV buffer) during dynamic inference. Requires num_speculative_tokens > 0."""
-
     # ---------------- Prefix caching ----------------
 
     inference_dynamic_batching_enable_prefix_caching: bool = False
@@ -404,7 +400,6 @@ class InferenceSetupConfig:
             metrics_writer=metrics_writer,
             logging_step_interval=self.inference_logging_step_interval,
             num_speculative_tokens=self.num_speculative_tokens,
-            enable_mtp_kv_cache=self.enable_mtp_kv_cache,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
