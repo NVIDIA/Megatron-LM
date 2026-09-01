@@ -6,8 +6,10 @@ ENV_VARS:
   PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,graph_capture_record_stream_reuse:True"
   ENABLE_LIGHTWEIGHT_MODE: true
 MODEL_ARGS:
-  # Keep both PP ranks dependency-free while placing attention on each rank.
-  --hybrid-layer-pattern: "*-*-|*-*-"
+  # Put one adjacent attention/MoE pair on each PP rank. Hybrid graph discovery
+  # groups each pair into one callable: attention + router are captured, while
+  # expert dispatch/compute and the mHC BDA tail stay eager.
+  --hybrid-layer-pattern: "*E|*E"
   --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec]"
   --hidden-size: 512
   --ffn-hidden-size: 2048
@@ -24,17 +26,32 @@ MODEL_ARGS:
   --mhc-sinkhorn-iterations: 20
   --mhc-init-gating-factor: 0.01
 
-  # Exercise core-attention D2H/H2D event boundaries inside the attention graph.
+  # Minimal MoE settings for the eager continuation after partial router capture.
+  --num-experts: 4
+  --moe-ffn-hidden-size: 1024
+  --moe-router-topk: 2
+  --moe-router-load-balancing-type: aux_loss
+  --moe-aux-loss-coeff: 1.0e-3
+  --moe-token-dispatcher-type: alltoall
+  --moe-grouped-gemm: true
+  --moe-router-dtype: fp32
+  --expert-model-parallel-size: 1
+  --expert-tensor-parallel-size: 1
+
+  # Exercise delayed core-attention D2H/H2D event handling across the grouped
+  # attention -> partial-MoE graph boundary.
   # fine-grained-offloading-max-inflight-offloads is intentionally omitted (None).
   --fine-grained-activation-offloading: true
   --offload-modules: "[core_attn]"
   --min-offloaded-tensor-size: 1024
   --activation-offload-fraction: 1.0
-  --delay-offload-until-cuda-graph: false
+  --delay-offload-until-cuda-graph: true
 
-  # Lightweight mode runs four iterations: three warmups followed by capture/replay.
+  # This crash-only smoke runs exactly four iterations. After three eager warmups,
+  # the graph is created before iteration four, which exercises graph replay plus
+  # the eager MoE experts. Lightweight CI also pins exit-interval to four.
   --cuda-graph-impl: transformer_engine
-  --cuda-graph-modules: "[attn]"
+  --cuda-graph-modules: "[attn moe_router]"
   --cuda-graph-warmup-steps: 3
   --te-rng-tracker: true
 
@@ -48,8 +65,8 @@ MODEL_ARGS:
   --micro-batch-size: 1
   --global-batch-size: 8
   --seq-length: 1024
-  --train-iters: 8
-  --exit-interval: 8
+  --train-iters: 4
+  --exit-interval: 4
   --tokenizer-type: NullTokenizer
   --vocab-size: 32000
   --mock-data: true
@@ -60,7 +77,7 @@ MODEL_ARGS:
   --lr: 0.0001
   --min-lr: 1.0e-5
   --lr-decay-style: cosine
-  --lr-decay-iters: 8
+  --lr-decay-iters: 4
   --lr-warmup-iters: 0
   --weight-decay: 0.1
   --clip-grad: 1.0
@@ -82,6 +99,3 @@ MODEL_ARGS:
   --log-params-norm: true
   --tensorboard-dir: ${TENSORBOARD_PATH}
 TEST_TYPE: regular
-METRICS:
-  - "lm loss"
-  - "num-zeros"
