@@ -505,9 +505,22 @@ class InferenceConfig:
     """
 
     prefix_caching_routing_alpha: float = 0.5
-    """Weight for prefix-aware scoring: score = alpha * match + (1 - alpha) * normalized_load.
-    Higher alpha favors prefix cache hits; lower alpha favors load balance.
-    Must be in [0, 1]. Only applies when enable_prefix_caching is True and using a coordinator.
+    """How hard the coordinator penalises load when routing on prefix affinity:
+    score = cache_score - alpha * relative_load.
+
+    ``relative_load`` is a rank's in-flight count measured against the fleet mean, so it is
+    zero while ranks are even and grows only as they diverge. Both terms are normalized, which
+    makes alpha dimensionless: 0 is pure prefix affinity, and higher values divert to idle ranks
+    more readily as the fleet becomes lopsided. Must be non-negative; it is not a blend weight
+    and is not capped at 1.
+
+    At 1.0 a single request of imbalance across two ranks exactly cancels a full cache hit, so
+    affinity stops being decisive as soon as the fleet is uneven at all. The default keeps a hit
+    decisive against mild imbalance while still diverting to idle ranks once ranks genuinely
+    diverge. Larger fleets are less sensitive, since one request moves the mean less; the
+    16-engine runs this was tuned on ran at 1.0.
+
+    Only applies when enable_prefix_caching is True and using a coordinator.
     """
 
     media_cache_coordinator_policy: MediaCacheCoordinatorPolicy = (

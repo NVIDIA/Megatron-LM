@@ -127,16 +127,18 @@ class DataParallelInferenceCoordinator:
                 expected to connect.
             tokenizer: The tokenizer to use for prompt tokenization and detokenization.
             inference_coordinator_port (Optional[int]): The TCP port number to bind the server to.
-            prefix_caching_routing_alpha (float): Weight for prefix-aware routing score:
-                score = alpha * match + (1 - alpha) * normalized_load.
+            prefix_caching_routing_alpha (float): How hard to penalise load when
+                routing on prefix affinity: score = cache_score - alpha *
+                relative_load, measured against the fleet mean. Dimensionless and
+                not capped at 1.
             media_cache_coordinator_policy (MediaCacheCoordinatorPolicy):
                 Routing policy for media-cache affinity.
             media_cache_routing_weight (float): Estimated vision-encoder cost in
                 units of one cached prompt block, used for multimodal routing.
             vision_embedding_cache_enabled (bool): Whether engines retain
                 reusable projected media embeddings.
-            max_requests (int): Max concurrent requests per rank, used to
-                compute normalized_load for prefix-aware scoring.
+            max_requests (int): Max concurrent requests per rank, used to cap load
+                balancing and to gate media affinity on spare capacity.
         """
         assert HAVE_ZMQ, (
             "please install the pyzmq library to use DataParallelInferenceCoordinator\n"
@@ -399,9 +401,10 @@ class DataParallelInferenceCoordinator:
     def get_best_data_parallel_rank(self, request_hashes, media_cache_key: str | None = None):
         """Select the best DP rank based on media affinity, prefix affinity, and load.
 
-        Uses ``score = alpha * cache_score + (1 - alpha) * normalized_load``,
-        where ``cache_score`` combines matching prefix blocks with a weighted
-        media-cache hit, and ``normalized_load`` is the rank's free capacity.
+        Uses ``score = cache_score - alpha * relative_load``, where
+        ``cache_score`` combines reusable prefix blocks with a weighted media-cache
+        hit, and ``relative_load`` is the rank's in-flight count measured against
+        the fleet mean. Both terms are normalized, so ``alpha`` is dimensionless.
 
         Args:
             request_hashes: List of block hashes for the request.
@@ -428,10 +431,9 @@ class DataParallelInferenceCoordinator:
 
         # Compute text affinity.
         n_ranks = len(self._identities_list)
-        prefix_match = np.zeros(n_ranks, dtype=np.float64)
-        recency = np.zeros(n_ranks, dtype=np.float64)
+        prefix_blocks = np.zeros(n_ranks, dtype=np.float64)
         if use_prefix_affinity:
-            prefix_match, recency = self._match_vector(request_hashes)
+            prefix_blocks = self._prefix_depth_vector(request_hashes)
 
         # Compute multimodal affinity.
         media_hit = np.zeros(n_ranks, dtype=np.float64)
@@ -445,14 +447,15 @@ class DataParallelInferenceCoordinator:
                 media_hit[media_rank_idx] = 1.0
 
         # If there are no hits anywhere, just fall-back to load balancing.
-        if not prefix_match.any() and not media_hit.any():
+        if not prefix_blocks.any() and not media_hit.any():
             return self.get_least_loaded_data_parallel_rank()
 
-        # Compute the affinity / cache score based on matched prefix blocks
-        # and a hit on the multimodal media cache per DP rank.
+        # Fraction of this request's reusable work that each rank already holds,
+        # combining prompt blocks with a weighted media hit. Normalized by the most
+        # any rank could reuse, so it lands in [0, 1] and is comparable against the
+        # load term below.
         prefix_block_count = len(request_hashes) if use_prefix_affinity else 0
-        matched_prefix_blocks = prefix_match * prefix_block_count
-        reusable_work = matched_prefix_blocks + media_hit * self.media_cache_routing_weight
+        reusable_work = prefix_blocks + media_hit * self.media_cache_routing_weight
         maximum_reusable_work = prefix_block_count + (
             self.media_cache_routing_weight if use_media_affinity else 0.0
         )
@@ -460,16 +463,28 @@ class DataParallelInferenceCoordinator:
             reusable_work / maximum_reusable_work if maximum_reusable_work > 0 else reusable_work
         )
 
-        # Compute a coordinator score for every DP rank, weighting the cache score
-        # against the number of free request slots for each DP rank.
-        alpha = self.prefix_caching_routing_alpha
-        free_slots = np.maximum(0, self.max_requests - self._pending_counts).astype(np.float64)
-        scores = alpha * cache_score + (1.0 - alpha) * (free_slots / self.max_requests)
+        # Penalise a rank for the load it carries *relative to the fleet* rather
+        # than for its absolute occupancy. Measuring against max_requests scales
+        # the term by a configured ceiling instead of the actual operating point:
+        # with a large ceiling a sizeable imbalance stays a small fraction of it,
+        # so affinity wins however lopsided the fleet gets. Against the mean the
+        # term vanishes while ranks are even -- at saturation this is pure affinity
+        # -- and grows only as they diverge, which is the drain at the end of a
+        # batch, exactly when work should spread to idle ranks.
+        #
+        # Subtractive rather than a convex blend, so a full cache hit cannot cancel
+        # the load term and strand work on a saturated rank. Both terms are
+        # normalized, which is what makes alpha dimensionless.
+        #
+        # The mean is floored at 1 so a near-idle fleet does not turn a single
+        # in-flight request into a large relative load and thrash on noise.
+        mean_load = float(self._pending_counts.mean()) if n_ranks else 0.0
+        relative_load = (self._pending_counts - mean_load) / max(1.0, mean_load)
+        scores = cache_score - self.prefix_caching_routing_alpha * relative_load
 
-        # Tiebreak: highest score, then highest recency, then lowest rank index.
-        order = np.lexsort((np.arange(n_ranks), -recency, -scores))
-        best_idx = int(order[0])
-        return self._identities_list[best_idx]
+        # Tiebreak: highest score, then least loaded, then lowest rank index.
+        order = np.lexsort((np.arange(n_ranks), self._pending_counts, -scores))
+        return self._identities_list[int(order[0])]
 
     def _update_rank_hashes(self, rank_identity, request_hashes):
         """Record that a rank owns the given hashes.
@@ -484,33 +499,35 @@ class DataParallelInferenceCoordinator:
         for h in request_hashes:
             self._hash_table.setdefault(h, {})[rank_idx] = ts
 
-    def _match_vector(self, hashes):
-        """Return ``(match, recency)`` vectors of shape ``(n_ranks,)``.
+    def _prefix_depth_vector(self, hashes):
+        """Return each rank's contiguous prefix depth, in blocks.
 
-        *match* is binary depth: ``(depth + 1) / len(hashes)`` for ranks that
-        have the deepest cached block, 0 otherwise.  *recency* is the raw
-        assignment timestamp for each matching rank (0 for non-matching ranks).
+        Prefix cache
+        reuse requires an unbroken chain from the first block -- each block hash
+        chains the previous one's digest -- so a rank only benefits up to its
+        first miss. Walking forward and dropping ranks as they miss gives each
+        rank its true depth, and the loop exits as soon as no rank is left.
 
-        For ``FIRST_PREFIX_BLOCK`` the caller already truncates *hashes* to a
-        single element, so the same logic yields a binary 0/1 match score.
+        Counting forward also refuses to credit a rank for a deep block whose
+        prefix has been evicted: that KV cannot be reused, because reaching it
+        requires the blocks before it.
+
         """
         n_ranks = len(self._identities_list)
-        n = len(hashes)
-        zeros = np.zeros(n_ranks, dtype=np.float64)
-        if n == 0:
-            return zeros, zeros.copy()
-        for i in range(n - 1, -1, -1):
-            row = self._hash_table.get(hashes[i])
+        depth = np.zeros(n_ranks, dtype=np.int64)
+        alive = np.ones(n_ranks, dtype=bool)
+        for h in hashes:
+            row = self._hash_table.get(h)
             if row is None:
-                continue
-            rank_idxs = np.fromiter(row.keys(), dtype=np.intp)
+                break
             present = np.zeros(n_ranks, dtype=bool)
+            rank_idxs = np.fromiter(row.keys(), dtype=np.intp, count=len(row))
             present[rank_idxs] = True
-            recency = np.zeros(n_ranks, dtype=np.float64)
-            recency[rank_idxs] = np.fromiter(row.values(), dtype=np.float64)
-            if present.any():
-                return present.astype(np.float64) * ((i + 1.0) / n), recency
-        return zeros, zeros.copy()
+            alive &= present
+            if not alive.any():
+                break
+            depth += alive
+        return depth.astype(np.float64)
 
     def start(self):
         """

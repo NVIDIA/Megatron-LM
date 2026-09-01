@@ -950,20 +950,20 @@ class TestRoutingPolicies:
         assert chosen == b"rank-1"
 
     def test_free_capacity_wins_when_prefix_rank_is_full(self):
-        """A free rank wins when the prefix-matched rank is full and alpha is low."""
+        """A free rank wins when the prefix-matched rank is saturated."""
         coord = _make_routing_coordinator(
             num_ranks=2,
             enable_prefix_caching=True,
             policy=PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK,
         )
-        coord.prefix_caching_routing_alpha = 0.1
+        coord.prefix_caching_routing_alpha = 0.5
         coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 10
 
         fake_hash = 42
         _set_hash_rank(coord, fake_hash, b"rank-0", 1)
 
-        # score(rank-0) = 0.1*1 + 0.9*(0/10) = 0.1
-        # score(rank-1) = 0.1*0 + 0.9*(10/10) = 0.9
+        # mean 5 -> relative_load [+1, -1]; scores tie at 0.5 and the tiebreak
+        # goes to the least loaded rank.
         chosen = coord.get_best_data_parallel_rank([fake_hash])
         assert chosen == b"rank-1"
 

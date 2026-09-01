@@ -195,8 +195,10 @@ class InferenceSetupConfig:
     match exists."""
 
     inference_dynamic_batching_prefix_caching_routing_alpha: float = 0.5
-    """Weight for prefix-aware routing score: score = alpha * match + (1 - alpha) * normalized_load.
-    Higher alpha favors prefix cache hits; lower alpha favors load balance."""
+    """How hard to penalise load when routing on prefix affinity:
+    score = cache_score - alpha * relative_load, where relative_load is a rank's in-flight count
+    measured against the fleet mean. 0 is pure prefix affinity; higher values divert to idle ranks
+    more readily as the fleet becomes lopsided. Dimensionless and not capped at 1."""
 
     inference_dynamic_batching_media_cache_coordinator_policy: Literal[
         "affinity", "load_balanced"

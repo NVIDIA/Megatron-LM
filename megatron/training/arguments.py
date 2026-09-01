@@ -2238,10 +2238,12 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-prefix-caching-routing-alpha',
                        type=float, default=0.5,
                        dest='inference_dynamic_batching_prefix_caching_routing_alpha',
-                       help='Weight for prefix-aware routing score: '
-                       'score = alpha * match + (1 - alpha) * normalized_load. '
-                       'Higher alpha favors prefix cache hits; lower alpha '
-                       'favors load balance. Default: 0.5.')
+                       help='How hard to penalise load when routing on prefix '
+                       'affinity: score = cache_score - alpha * relative_load, where '
+                       'relative_load is a rank load measured against the fleet mean. '
+                       '0 is pure prefix affinity; higher values divert to idle ranks '
+                       'more readily as the fleet becomes lopsided. Dimensionless and '
+                       'not capped at 1. Default: 0.5.')
     group.add_argument('--inference-dynamic-batching-media-cache-coordinator-policy',
                        type=str, default='affinity',
                        choices=['affinity', 'load_balanced'],
