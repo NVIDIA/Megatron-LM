@@ -11,6 +11,7 @@ from packaging import version
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.tokenizers.text import MegatronTokenizerText
 from megatron.core.tokenizers.text.libraries.bytelevel_tokenizer import ByteLevelTokenizer
+from megatron.core.tokenizers.text.libraries.sft_tokenizer import IGNORE_INDEX
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 
 try:
@@ -537,6 +538,66 @@ def test_sft_tokenizer():
     assert len(conv_tokens) > 0 and len(conv_tokens) == len(
         target_tokens
     ), "failed to tokenize conversation and return target tokens"
+
+
+@pytest.mark.parametrize(
+    ("prompt_format", "expect_masked_tokens"),
+    [
+        pytest.param("default", False, id="default"),
+        pytest.param("nemotron-nano-v2", True, id="nemotron-nano-v2"),
+        pytest.param("nemotron-h-aligned", True, id="nemotron-h-aligned"),
+        pytest.param("identity", True, id="identity"),
+    ],
+)
+def test_sft_tokenizer_target_masking(prompt_format, expect_masked_tokens):
+    tokenizer = MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/multimodal",
+        metadata_path={"library": "sft"},
+        prompt_format=prompt_format,
+    )
+    conversation = [
+        {"role": "system", "content": "You are a helpful assistant.\n"},
+        {"role": "user", "content": "What is self-attention?\n"},
+        {
+            "role": "assistant",
+            "content": "Self-attention relates each token to other tokens in the sequence.\n",
+        },
+    ]
+
+    tokens, targets = tokenizer.tokenize_conversation(
+        conversation,
+        return_target=True,
+        add_generation_prompt=False,
+    )
+    sft_tokenizer = tokenizer._tokenizer
+    expected_targets = np.asarray(tokens).copy()
+
+    if expect_masked_tokens:
+        turn_start = 0
+        for turn_idx, turn in enumerate(conversation):
+            turn_tokens = sft_tokenizer._extract_token_ids(
+                sft_tokenizer._tokenizer.apply_chat_template(
+                    [turn],
+                    tokenize=True,
+                    chat_template=sft_tokenizer._prompt_config.custom_chat_template,
+                )
+            )
+            if sft_tokenizer._prompt_config.has_bos and turn_idx > 0:
+                turn_tokens = turn_tokens[1:]
+
+            turn_end = turn_start + len(turn_tokens)
+            if turn["role"] in ("system", "user", "tool"):
+                expected_targets[turn_start:turn_end] = IGNORE_INDEX
+            else:
+                assistant_content_start = (
+                    turn_start + sft_tokenizer._prompt_config.assistant_prefix_len
+                )
+                expected_targets[turn_start:assistant_content_start] = IGNORE_INDEX
+            turn_start = turn_end
+
+        assert turn_start == len(tokens)
+
+    np.testing.assert_array_equal(targets, expected_targets)
 
 
 # ------------------------------------------------------------------------
