@@ -1,11 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import sys
 from argparse import ArgumentParser
 from types import SimpleNamespace
 
 import pytest
 
 from megatron.training.argument_utils import ArgumentGroupFactory
+from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import ValidationConfig
 from megatron.training.global_vars import set_args
 from megatron.training.training import get_train_valid_test_num_samples
@@ -154,6 +156,61 @@ class TestEvalBatchSizeDivisibility:
         )
         assert args.eval_global_batch_size == 32
         assert args.eval_micro_batch_size == 2
+
+
+class TestEvalBatchSizeDivisibilityWithGTP:
+    """Test that the GTP weight-remat axis is factored into the eval divisibility check.
+
+    Unlike TestEvalBatchSizeDivisibility above, these call the real validate_args instead of
+    re-implementing its expression, so a future change to that expression is actually caught.
+    """
+
+    @staticmethod
+    def _build_args(
+        monkeypatch, num_weight_shards, eval_global_batch_size, eval_micro_batch_size=1
+    ):
+        """Build a minimal GTP config: world_size 8 = gtp_weight_remat_size x data_parallel_size."""
+        monkeypatch.setattr(sys, 'argv', ['test_eval_batch_size.py'])
+        args = parse_args()
+        # parse_args reads WORLD_SIZE from the environment. Pin it, since data_parallel_size is
+        # derived from it and the test must not depend on how the job was launched.
+        args.world_size = 8
+        args.num_layers = 2
+        args.hidden_size = 128
+        args.num_attention_heads = 4
+        args.max_position_embeddings = 1024
+        args.seq_length = 1024
+        args.micro_batch_size = 1
+        args.global_batch_size = 8
+        args.train_iters = 1
+        args.lr = 1e-4
+        args.tokenizer_type = 'NullTokenizer'
+        args.vocab_size = 1024
+        args.tensor_parallel_num_weight_shards = num_weight_shards
+        args.eval_global_batch_size = eval_global_batch_size
+        args.eval_micro_batch_size = eval_micro_batch_size
+        return args
+
+    def test_gtp_remat_factored_into_divisibility(self, monkeypatch):
+        """Divisible by eval_micro_batch_size * data_parallel_size, but not by the GTP axis."""
+        args = self._build_args(monkeypatch, num_weight_shards=8, eval_global_batch_size=4)
+        # 4 % (1 * 1) == 0 satisfies the two-factor check, but evaluate() divides by
+        # eval_micro_batch_size * data_parallel_size * gtp_weight_remat_size, which floors to
+        # 4 // 8 == 0 microbatches: evaluation would silently do nothing.
+        with pytest.raises(AssertionError, match="gtp_weight_remat_size"):
+            validate_args(args)
+
+    def test_gtp_remat_divisible_config_passes(self, monkeypatch):
+        """A config divisible by the full data-distribution breadth validates."""
+        args = self._build_args(monkeypatch, num_weight_shards=8, eval_global_batch_size=8)
+        validate_args(args)
+        assert args.gtp_weight_remat_size == 8
+        assert args.data_parallel_size == 1
+        # The division evaluate() performs; it must leave at least one microbatch.
+        num_microbatches = args.eval_global_batch_size // (
+            args.eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
+        )
+        assert num_microbatches == 1
 
 
 class TestGetTrainValidTestNumSamples:
