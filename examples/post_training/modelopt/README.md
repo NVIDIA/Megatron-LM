@@ -140,6 +140,14 @@ export the model with flag `--export-vllm-fq`:
 
 For KV cache quantization, add a flag like `MLM_EXTRA_ARGS="--export-kv-cache-quant fp8"` while specifying your desired KV cache precision (see `KV_QUANT_CFG_CHOICES` in `quantize.py`).
 
+For QAT exports, use:
+
+```ini
+MLM_EXTRA_ARGS=--no-clamp-kv-scales
+```
+
+to disable KV-cache scale clamping and preserve the learned scales.
+
 ### ⭐ Auto Quantize (Mixed-Precision Search)
 
 Auto Quantize uses `mtq.auto_quantize` to perform a per-layer mixed-precision search, assigning each
