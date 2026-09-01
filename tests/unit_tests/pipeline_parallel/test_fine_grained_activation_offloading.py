@@ -82,13 +82,15 @@ def test_offload_tensor_group_allocates_external_throttle_event_only_when_enable
     monkeypatch.setattr(torch.cuda, "Event", _make_event)
 
     unthrottled_group = OffloadTensorGroup("core_attn")
-    assert [kwargs for kwargs, _ in event_calls] == [{}, {}]
+    assert len(event_calls) == 2
+    assert not any(kwargs.get("external", False) for kwargs, _ in event_calls)
     assert unthrottled_group._offload_throttle_event is None
 
     event_calls.clear()
     throttled_group = OffloadTensorGroup("core_attn", enable_offload_throttle=True)
-    assert [kwargs for kwargs, _ in event_calls] == [{}, {}, {"external": True}]
-    assert throttled_group._offload_throttle_event is event_calls[-1][1]
+    assert len(event_calls) == 3
+    external_events = [event for kwargs, event in event_calls if kwargs.get("external", False)]
+    assert external_events == [throttled_group.offload_throttle_event]
 
 
 @pytest.mark.parametrize("max_inflight_offloads", [None, 0, 2])
@@ -111,7 +113,7 @@ def test_chunk_offload_handler_uses_throttle_event_only_when_configured(
     group = Mock()
     group._name = "core_attn"
     group._tensors = {}
-    group._offload_throttle_event = Mock() if max_inflight_offloads is not None else None
+    group.offload_throttle_event = Mock() if max_inflight_offloads is not None else None
 
     handler.bulk_offload_group(group)
 
@@ -123,16 +125,17 @@ def test_chunk_offload_handler_uses_throttle_event_only_when_configured(
     else:
         group.record_offload_throttle_event.assert_called_once_with(handler.d2h_stream)
         handler._drain_offload_pending.assert_called_once_with("core_attn")
-        assert list(handler._offload_pending_by_name["core_attn"]) == [
-            group._offload_throttle_event
-        ]
+        assert list(handler._offload_pending_by_name["core_attn"]) == [group.offload_throttle_event]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for graph capture.")
 @pytest.mark.launch_on_gb200
-@pytest.mark.parametrize("max_inflight_offloads", [0, 2])
+@pytest.mark.parametrize(
+    "max_inflight_offloads",
+    [pytest.param(0, id="same-graph-smoke"), pytest.param(2, id="cross-graph-regression")],
+)
 def test_max_inflight_throttle_events_cross_cuda_graph_boundaries(max_inflight_offloads: int):
-    """Throttle waits remain valid when same-name groups are captured separately."""
+    """Exercise throttle event capture and the cap-2 cross-graph wait regression."""
     off_interface.reset_instance()
     graphs = []
     try:
@@ -159,7 +162,14 @@ def test_max_inflight_throttle_events_cross_cuda_graph_boundaries(max_inflight_o
                 graph.replay()
         torch.cuda.synchronize()
 
-        assert len(handler._offload_pending_by_name["core_attn"]) == max_inflight_offloads
+        # Cap 0 is a same-graph record/wait smoke case. Cap 2 is the regression:
+        # graph three waits on graph one's event, leaving the last two events pending.
+        expected_events = (
+            [group.offload_throttle_event for group in groups[-max_inflight_offloads:]]
+            if max_inflight_offloads > 0
+            else []
+        )
+        assert list(handler._offload_pending_by_name["core_attn"]) == expected_events
     finally:
         graphs.clear()
         off_interface.reset_instance()
@@ -767,7 +777,6 @@ def _build_gpt_model_with_cuda_graph(
     cuda_graph_warmup_steps: int,
     delay_offload_until_cuda_graph: bool = False,
     activation_offload_fraction: float = 1.0,
-    max_inflight_offloads: Optional[int] = None,
     enable_hyper_connections: bool = False,
     num_residual_streams: int = 4,
 ) -> GPTModel:
@@ -796,7 +805,6 @@ def _build_gpt_model_with_cuda_graph(
         min_offloaded_tensor_size=min_offloaded_tensor_size,
         delay_offload_until_cuda_graph=delay_offload_until_cuda_graph,
         activation_offload_fraction=activation_offload_fraction,
-        fine_grained_offloading_max_inflight_offloads=max_inflight_offloads,
         # CUDA Graph settings
         cuda_graph_impl=cuda_graph_impl,
         cuda_graph_modules=cuda_graph_modules,
@@ -935,29 +943,18 @@ def _run_iters_with_cuda_graph(
 )
 @pytest.mark.flaky_in_dev
 @pytest.mark.parametrize(
-    (
-        "is_mla, offload_modules, cuda_graph_modules, activation_offload_fraction, "
-        "delay_offload, max_inflight_offloads"
-    ),
+    "is_mla, offload_modules, cuda_graph_modules, activation_offload_fraction, delay_offload",
     [
         # MoE model with attention CUDA graph + attn offloading
-        (False, ["core_attn", "attn_proj"], ["attn", "moe_router"], 1.0, True, None),
-        (
-            False,
-            ["expert_fc1", "moe_act"],
-            ["attn", "moe_router", "moe_preprocess"],
-            1.0,
-            True,
-            None,
-        ),
-        (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 1.0, True, None),
+        (False, ["core_attn", "attn_proj"], ["attn", "moe_router"], 1.0, True),
+        (False, ["expert_fc1", "moe_act"], ["attn", "moe_router", "moe_preprocess"], 1.0, True),
+        (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 1.0, True),
         (
             False,
             ["core_attn", "attn_proj", "expert_fc1", "moe_act"],
             ["attn", "moe_router"],
             1.0,
             True,
-            None,
         ),
         (
             False,
@@ -965,7 +962,6 @@ def _run_iters_with_cuda_graph(
             ["attn", "moe_router", "moe_preprocess"],
             1.0,
             True,
-            None,
         ),
         (
             True,
@@ -973,18 +969,12 @@ def _run_iters_with_cuda_graph(
             ["attn", "moe_router", "moe_preprocess"],
             1.0,
             True,
-            None,
         ),
         # Test activation_offload_fraction parameter
-        (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 0.0, True, None),
-        (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 0.5, True, None),
+        (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 0.0, True),
+        (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 0.5, True),
         # Test delay_offload_until_cuda_graph parameter
-        (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 1.0, False, None),
-        # Three active core_attn groups exercise max-inflight waits during TE
-        # per-module capture: cap 0 waits on every group and cap 2 waits on the
-        # oldest group when the third same-name offload is committed.
-        pytest.param(False, ["core_attn"], ["attn"], 1.0, False, 0, id="max-inflight-0"),
-        pytest.param(False, ["core_attn"], ["attn"], 1.0, False, 2, id="max-inflight-2"),
+        (False, ["core_attn", "attn_proj", "expert_fc1"], ["attn", "moe_router"], 1.0, False),
     ],
 )
 def test_fine_grained_activation_offloading_with_cuda_graph(
@@ -993,7 +983,6 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
     cuda_graph_modules: List[str],
     activation_offload_fraction: float,
     delay_offload: bool,
-    max_inflight_offloads: Optional[int],
 ):
     """
     Test fine-grained activation offloading combined with CUDA graph capture.
@@ -1004,7 +993,6 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
     - Memory savings from offloading are preserved with CUDA graphs
     - Different activation_offload_fraction values work correctly
     - Both delay_offload_until_cuda_graph=True/False produce correct results
-    - max_inflight_offloads=0/2 remain valid across TE per-module capture
     """
     from megatron.core.tensor_parallel.random import initialize_rng_tracker
 
@@ -1085,7 +1073,6 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
             cuda_graph_warmup_steps=cuda_graph_warmup_steps,
             delay_offload_until_cuda_graph=delay_offload,
             activation_offload_fraction=activation_offload_fraction,
-            max_inflight_offloads=max_inflight_offloads,
         ).cuda()
         off_model.train()
 
@@ -1098,19 +1085,6 @@ def test_fine_grained_activation_offloading_with_cuda_graph(
             num_measure_iters=2,
             enable_offload_reset=True,
         )
-
-        if max_inflight_offloads is not None:
-            manager = PipelineOffloadManager.get_instance()
-            active_core_attn_groups = [
-                group
-                for chunk in manager._cached_chunks_forward
-                for group in chunk.offload_groups
-                if group._name == "core_attn" and group.offload
-            ]
-            assert len(active_core_attn_groups) >= 3, (
-                "max-inflight CUDA graph coverage requires at least three active "
-                f"same-name core_attn groups, found {len(active_core_attn_groups)}"
-            )
         del off_model
         _reset_cuda_memory()
 

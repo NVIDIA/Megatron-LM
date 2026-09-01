@@ -359,6 +359,8 @@ class OffloadTensorGroup:
         # Keep throttling separate from the internal offload/reload handshake.
         # External events capture record/wait as explicit graph nodes, allowing
         # separate module graphs to synchronize through the same event.
+        # A stream wait binds to the event state at the wait call, so recording
+        # this cached event in a later iteration does not retarget earlier waits.
         self._offload_throttle_event: Optional[torch.cuda.Event] = (
             torch.cuda.Event(external=True) if enable_offload_throttle else None
         )
@@ -391,8 +393,13 @@ class OffloadTensorGroup:
 
     def record_offload_throttle_event(self, stream):
         """Record the external event used only for max-inflight throttling."""
+        self.offload_throttle_event.record(stream)
+
+    @property
+    def offload_throttle_event(self) -> torch.cuda.Event:
+        """Return the external event used only for max-inflight throttling."""
         assert self._offload_throttle_event is not None
-        self._offload_throttle_event.record(stream)
+        return self._offload_throttle_event
 
     def record_reload_event(self, stream):
         """Record the reload event."""
@@ -610,8 +617,10 @@ class PipelineOffloadManager:
         for chunk in self._cached_chunks_backward:
             for group in chunk.offload_groups:
                 if group.offload and keep_on_gpu_bytes > 0:
-                    debug_rank(f"group {group._name} offload {group.offload} \
-                        keep_on_gpu_bytes {keep_on_gpu_bytes}")
+                    debug_rank(
+                        f"group {group._name} offload {group.offload} "
+                        f"keep_on_gpu_bytes {keep_on_gpu_bytes}"
+                    )
                     keep_on_gpu_bytes -= group.total_offload_bytes
                     group.offload = False
         # Disable the later groups to meet the activation offload fraction.
@@ -1033,9 +1042,7 @@ class ChunkOffloadHandler:
         # reload dependency, whose capture-local semantics must remain unchanged.
         if self._max_inflight_offloads is not None:
             gname = group_to_offload._name
-            throttle_event = group_to_offload._offload_throttle_event
-            assert throttle_event is not None
-            self._offload_pending_by_name[gname].append(throttle_event)
+            self._offload_pending_by_name[gname].append(group_to_offload.offload_throttle_event)
             self._drain_offload_pending(gname)
 
     def get_max_deduplicated_groups(self):
