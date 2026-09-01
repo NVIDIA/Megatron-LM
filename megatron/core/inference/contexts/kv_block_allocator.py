@@ -503,6 +503,8 @@ class KVBlockAllocator:
                     torch.ones(int(has_parent.sum()), dtype=torch.int64),
                 )
 
+        return True
+
     def add_blocks_deregistered_observer(self, observer: BlocksDeregisteredObserver) -> None:
         """Register a callback invoked when cached blocks are deregistered.
 
