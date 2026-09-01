@@ -2120,9 +2120,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Per-token request row and within-request index (0..count-1); then shift each request's
         # write positions by its start offset (0 for prompt seed; committed offset for refresh).
-        rows = torch.repeat_interleave(
-            torch.arange(num_prefill, device=device), append_counts
-        )
+        rows = torch.repeat_interleave(torch.arange(num_prefill, device=device), append_counts)
         seg_start = torch.cumsum(append_counts, 0) - append_counts
         positions = torch.arange(total, device=device) - seg_start[rows]
         if request_start_positions is not None:
@@ -2135,7 +2133,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             gv.token_to_local_position_within_kv_block.dtype
         )
         gv.token_to_request_idx[:total] = rows.to(gv.token_to_request_idx.dtype)
-        gv.token_to_position_in_request[:total] = positions.to(gv.token_to_position_in_request.dtype)
+        gv.token_to_position_in_request[:total] = positions.to(
+            gv.token_to_position_in_request.dtype
+        )
         gv.token_to_pos_ids[:total] = positions.to(gv.token_to_pos_ids.dtype)
 
         # MHA metadata: fresh causal prefill, so per-request kv_length == query_length.
