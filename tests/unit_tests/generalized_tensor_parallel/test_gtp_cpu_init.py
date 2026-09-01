@@ -50,7 +50,11 @@ WORLD = 4
 GTP_SIZES = [2, 4]
 HIDDEN = 256
 NUM_HEADS = 8
-FFN_HIDDEN = 512
+# 320 is deliberately >= 64-aligned but NOT 128-aligned, so linear_fc1 is UNPADDED at
+# GTP_remat=2 and PADDED at GTP_remat=4. That asymmetry is what the real model hits (its GDP
+# in_proj is 61760: 61760 % 64 == 0 but 61760 % 128 == 64), and a uniformly-aligned size would
+# never exercise it.
+FFN_HIDDEN = 320
 # One stack holding every layer kind at once: GDP mixer, attention, MLP.
 LAYER_PATTERN = ["M", "*", "-"]
 NUM_LAYERS = len(LAYER_PATTERN)

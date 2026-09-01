@@ -43,7 +43,7 @@ from .mappings import (
     reduce_scatter_to_sequence_parallel_region,
     scatter_to_tensor_model_parallel_region,
 )
-from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
+from .random import expert_cpu_init_rng, get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility
 
 _grad_accum_fusion_available = True
@@ -263,9 +263,11 @@ def _initialize_affine_weight_cpu(
             tensor=weight, is_parallel=True, dim=partition_dim, stride=stride
         )
 
-    # Initialize master weight
+    # Initialize master weight. Under expert_cpu_init_index this draws from that global expert's
+    # own stream instead of the shared one.
     master_weight = torch.empty(output_size, input_size, dtype=torch.float, requires_grad=False)
-    init_method(master_weight)
+    with expert_cpu_init_rng():
+        init_method(master_weight)
     master_weight = master_weight.to(dtype=params_dtype)
     # Split and copy
     per_partition_per_stride_size = divide(per_partition_size, stride)

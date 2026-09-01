@@ -42,6 +42,8 @@ from megatron.core.tensor_parallel.layers import (
 )
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
 from megatron.core.tensor_parallel.random import (
+    expert_cpu_init_index,
+    expert_cpu_init_scope,
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
     get_expert_parallel_rng_tracker_name,
@@ -1248,6 +1250,11 @@ class TELinear(te.pytorch.Linear):
         if is_te_min_version("1.7.0"):
             extra_kwargs["rng_tracker_name"] = rng_tracker_name
 
+        # Only "duplicated" is initialized here; the column/row subclasses run their own
+        # _initialize_affine_weight_cpu afterwards. One flag for both the no-op and the init below,
+        # so a mode can never end up with TE's init suppressed and no replacement.
+        cpu_init_here = config.use_cpu_initialization and parallel_mode == "duplicated"
+
         te_parallel_mode = parallel_mode
         tp_group_for_te = tp_group
         if parallel_mode == "duplicated":
@@ -1275,6 +1282,9 @@ class TELinear(te.pytorch.Linear):
         init_quant_context = _get_fp8_model_init_for_quant_params(
             self.te_quant_params, torch.is_grad_enabled()
         )
+        # The GTP context rebinds output_size to this rank's shard and the binding outlives the
+        # with-block; CPU init needs the pre-GTP size because it re-applies the GTP slice itself.
+        cpu_init_output_size = output_size
         init_gtp_remat_context = _init_gtp_remat_context(
             self,
             output_size,
@@ -1297,11 +1307,35 @@ class TELinear(te.pytorch.Linear):
                 get_rng_state_tracker=(
                     get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
                 ),
-                init_method=condition_init_method(config, init_method),
+                init_method=(
+                    (lambda w: None)
+                    if cpu_init_here
+                    else condition_init_method(config, init_method)
+                ),
                 bias=bias,
                 return_bias=self.te_return_bias,
                 parallel_mode=te_parallel_mode,
                 **extra_kwargs,
+            )
+
+        if cpu_init_here:
+            # TE's init (no-op'd above) fills the LOCAL tensor, which under GTP_remat is only this
+            # rank's shard; drawing the full logical weight and slicing keeps every layout equal.
+            # "duplicated" implies tp_size == 1, so GTP_remat is the only split left to apply.
+            _initialize_affine_weight_cpu(
+                self.weight,
+                cpu_init_output_size,
+                input_size,
+                cpu_init_output_size,
+                0,
+                init_method=condition_init_method(config, init_method),
+                stride=1,
+                return_master_weight=False,
+                params_dtype=config.params_dtype,
+                rank=0,
+                world_size=1,
+                # TE (and the GTP attach) already stamped these on the parameter.
+                skip_set_tensor_parallel_attributes=True,
             )
 
         if is_expert:
@@ -2465,6 +2499,15 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             # so that refit/resharding can correctly identify which dimension is TP-partitioned.
             original_parallel_mode = parallel_mode
 
+            # Captured before explicit_expert_comm divides the sizes and sets tp_size = 1: CPU init
+            # must draw the full logical weight and slice it by the real ETP rank, or every ETP rank
+            # keeps the same draw and the global weight becomes a duplicated tile. The GTP context
+            # below rebinds output_size too, and _initialize_affine_weight_cpu re-applies that slice.
+            expt_tp_size = tp_size
+            expt_tp_rank = get_pg_rank(tp_group)
+            logical_output_size = output_size
+            logical_input_size = input_size
+
             if self.explicit_expert_comm:
                 if parallel_mode == "column":
                     output_size = divide(output_size, tp_size)
@@ -2530,7 +2573,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     get_rng_state_tracker=(
                         get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
                     ),
-                    init_method=condition_init_method(config, init_method),
+                    init_method=(
+                        condition_init_method(config, init_method)
+                        if not config.use_cpu_initialization
+                        else lambda w: None
+                    ),
                     bias=bias,
                     return_bias=self.te_return_bias,
                     parallel_mode=parallel_mode,
@@ -2538,6 +2585,53 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 )
 
             _set_expert_parameter_attributes(self, original_parallel_mode, use_expert_pgs)
+
+            if config.use_cpu_initialization:
+                # TE's own init is no-op'd above: it draws from the shared CPU generator in
+                # proportion to the LOCAL expert count, which desyncs every weight built afterwards
+                # once EP or GTP changes how many experts a rank owns.
+                if getattr(self, "single_grouped_weight", False):
+                    # TE packs the per-expert weights into one buffer and registers weight0..N-1 as
+                    # None, so there is nothing to initialize per expert here.
+                    raise NotImplementedError(
+                        "use_cpu_initialization is not supported together with "
+                        "moe_single_grouped_weight: the per-expert weights are packed into a "
+                        "single buffer, so they cannot be given per-expert init streams. Use "
+                        "GPU initialization, or set moe_single_grouped_weight=False."
+                    )
+                # get_pg_rank(None) silently returns 0, which would make every EP rank
+                # initialize the same experts. Fail loudly instead.
+                assert (
+                    pg_collection.ep is not None
+                ), "TEGroupedLinear cpu init requires pg_collection.ep to build global expert ids"
+                ep_rank = get_pg_rank(pg_collection.ep)
+                cpu_init_method = condition_init_method(config, init_method)
+                if original_parallel_mode == "column":
+                    partition_dim = 0
+                    per_partition_size = divide(logical_output_size, expt_tp_size)
+                else:
+                    partition_dim = 1
+                    per_partition_size = divide(logical_input_size, expt_tp_size)
+                # One scope per module: fc1 and fc2 are separate modules, so they draw different
+                # salts and their experts do not come out as copies of each other.
+                with expert_cpu_init_scope():
+                    for local_expert_idx in range(num_gemms):
+                        weight = getattr(self, f"weight{local_expert_idx}")
+                        with expert_cpu_init_index(ep_rank * num_gemms + local_expert_idx):
+                            _initialize_affine_weight_cpu(
+                                weight,
+                                logical_output_size,
+                                logical_input_size,
+                                per_partition_size,
+                                partition_dim,
+                                init_method=cpu_init_method,
+                                stride=1,
+                                return_master_weight=False,
+                                params_dtype=config.params_dtype,
+                                rank=expt_tp_rank,
+                                world_size=expt_tp_size,
+                                skip_set_tensor_parallel_attributes=True,
+                            )
 
             self._register_load_state_dict_pre_hook(
                 type(self)._normalize_grouped_parameter_keys, with_module=True

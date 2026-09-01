@@ -7,7 +7,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Callable
-from typing import Any, Optional, TypeVar, Union
+from typing import Any, List, Optional, Tuple, TypeVar, Union
 
 import torch
 from torch import _C
@@ -518,6 +518,81 @@ def model_parallel_cuda_manual_seed(
     if egtp_remat_world_size > 1:
         egtp_remat_seed = expert_parallel_seed + 32768 + 65536 * (1 + egtp_remat_rank)
         _CUDA_RNG_STATE_TRACKER.add(_EXPERT_GTP_REMAT_RNG_TRACKER_NAME, egtp_remat_seed)
+
+
+# CPU initialization draws from the plain CPU generator, which -- unlike the CUDA tracker -- has no
+# expert-parallel term. Without a per-expert stream every EP rank would initialize its local experts
+# from the same draws, leaving only ``num_experts // ep_size`` distinct experts: right shapes, right
+# dtypes, no crash, wrong model.
+_EXPERT_CPU_INIT_SALT: Optional[int] = None
+_EXPERT_CPU_INIT_INDEX: Optional[int] = None
+# Odd multiplier spreading adjacent expert indices across the seed space.
+_EXPERT_SEED_STRIDE = 7919
+
+
+@contextlib.contextmanager
+def expert_cpu_init_scope(enabled: bool = True):
+    """Open a per-module salt for CPU-initialized expert weights.
+
+    Enter **once per expert-weight module**, around the loop over local experts. The single draw it
+    takes from the shared stream is what keeps otherwise-identical weights apart: without it, layer
+    0's expert *k* and layer 1's expert *k* have the same shape and the same seed, so they come out
+    with identical values.
+
+    The draw must happen per module and **not** per expert: it advances the shared stream, so once
+    per module advances it equally on every rank, whereas once per *local* expert would advance it
+    by ``num_experts // ep_size`` -- a rank-dependent amount that breaks layout invariance.
+    """
+    global _EXPERT_CPU_INIT_SALT
+    if not enabled:
+        yield
+        return
+    previous = _EXPERT_CPU_INIT_SALT
+    _EXPERT_CPU_INIT_SALT = int(torch.randint(0, 2**62, (1,)).item())
+    try:
+        yield
+    finally:
+        _EXPERT_CPU_INIT_SALT = previous
+
+
+@contextlib.contextmanager
+def expert_cpu_init_index(global_expert_index: Optional[int]):
+    """Declare which GLOBAL expert the modules built inside this block belong to.
+
+    Paired with the enclosing :func:`expert_cpu_init_scope` salt by :func:`expert_cpu_init_rng`, so
+    the values an expert gets do not depend on which EP rank happens to own it. GPU initialization
+    ignores both: the CUDA tracker already folds in ``ep_rank``.
+    """
+    global _EXPERT_CPU_INIT_INDEX
+    previous = _EXPERT_CPU_INIT_INDEX
+    _EXPERT_CPU_INIT_INDEX = global_expert_index
+    try:
+        yield
+    finally:
+        _EXPERT_CPU_INIT_INDEX = previous
+
+
+@contextlib.contextmanager
+def expert_cpu_init_rng():
+    """Run one CPU weight init on the enclosing global expert's stream, if there is one.
+
+    A no-op unless both context managers above are active. Inside them the CPU generator is switched
+    to a per-(module, expert) stream and **restored afterwards**, so expert initialization consumes
+    none of the shared stream -- otherwise layouts with a different number of local experts would
+    desync every weight built after the MoE layer. Only the CPU generator is touched:
+    ``torch.manual_seed`` would also reseed every CUDA generator, which this cannot restore.
+    """
+    global_expert_index, salt = _EXPERT_CPU_INIT_INDEX, _EXPERT_CPU_INIT_SALT
+    if global_expert_index is None or salt is None:
+        yield
+        return
+    cpu_rng_state = torch.get_rng_state()
+    try:
+        seed = (salt + global_expert_index * _EXPERT_SEED_STRIDE) % (2**63 - 1)
+        torch.default_generator.manual_seed(seed)
+        yield
+    finally:
+        torch.set_rng_state(cpu_rng_state)
 
 
 def is_graph_safe_cuda_rng_tracker(cuda_rng_tracker):

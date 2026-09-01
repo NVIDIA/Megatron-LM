@@ -29,6 +29,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
+from megatron.core.tensor_parallel.random import expert_cpu_init_index, expert_cpu_init_scope
 from megatron.core.transformer.mlp import (
     MLP,
     MLPSubmodules,
@@ -56,7 +57,7 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.typed_torch import apply_module, not_none
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import get_pg_rank, is_te_min_version
 
 if HAVE_TE:
     import transformer_engine as te
@@ -1510,16 +1511,23 @@ class SequentialMLP(MegatronModule):
         # TODO (Hepteract): expt_dp wont be needed here once distributed checkpoint is refactored
         self.dp_group = pg_collection.expt_dp
 
-        for expert_idx in range(self.num_local_experts):
-            expert = MLP(
-                self.config,
-                submodules,
-                ffn_hidden_size=self.config.moe_ffn_hidden_size,
-                is_expert=True,
-                tp_group=pg_collection.expt_tp,
-                name=(name + f".local_experts.{expert_idx}") if name is not None else None,
-            )
-            self.local_experts.append(expert)
+        # Under CPU init each expert draws from a stream keyed by its GLOBAL index, so which
+        # expert an EP rank owns does not change the values it gets.
+        ep_rank = get_pg_rank(self.ep_group)
+        with expert_cpu_init_scope(self.config.use_cpu_initialization):
+            for expert_idx in range(self.num_local_experts):
+                with expert_cpu_init_index(ep_rank * self.num_local_experts + expert_idx):
+                    expert = MLP(
+                        self.config,
+                        submodules,
+                        ffn_hidden_size=self.config.moe_ffn_hidden_size,
+                        is_expert=True,
+                        tp_group=pg_collection.expt_tp,
+                        name=(
+                            (name + f".local_experts.{expert_idx}") if name is not None else None
+                        ),
+                    )
+                self.local_experts.append(expert)
 
     def _pad_tensor_for_quantization(self, hidden, probs):
         """Padding tensor shape to multiples of 16/32."""
