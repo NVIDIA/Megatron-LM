@@ -361,7 +361,12 @@ class DpBalancedScheduler(BasePackingScheduler):
 
             # Step 6: Build packed microbatches
             new_samples = build_packed_microbatches(
-                samples_this_rank_with_id, sample_id_groups, dcp_rank, dev, self.is_dynamic_cp
+                samples_this_rank_with_id,
+                sample_id_groups,
+                dcp_rank,
+                dev,
+                self.is_dynamic_cp,
+                global_id_seqlens,
             )
 
             # Step 7: Calculate FLOPs info
@@ -604,7 +609,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     dev = torch.cuda.current_device()
 
     # data_iterator should return a batch including the following keys.
-    batch_keys = ['cu_seqlens', 'cu_seqlens_padded', 'max_seqlen']
+    batch_keys = ['cu_seqlens', 'cu_seqlens_padded', 'max_seqlen', 'zigzag_cp_min_chunk_size']
     if dynamic_cp:
         batch_keys.append('local_cp_size')
     if is_first_stage or mtp_on_this_rank:
@@ -618,6 +623,10 @@ def get_batch_on_this_rank_for_sequence_packing(
     if is_tp_rank_0:
         assert data_iterator is not None
         batch = next(data_iterator)
+        # External iterators do not carry the optional scheduler certificate.
+        # Unknown geometry keeps MTP on its established zigzag packed-CP roll path.
+        if 'zigzag_cp_min_chunk_size' not in batch:
+            batch['zigzag_cp_min_chunk_size'] = torch.tensor(-1, dtype=torch.int32, device=dev)
         for key in batch_keys:
             assert key in batch, f"{key} is missing in current batch."
     else:
@@ -675,9 +684,10 @@ def get_batch_on_this_rank_for_sequence_packing(
         # sequence. Extend its global physical endpoint before CP slicing so
         # both zigzag indices and contiguous rank origins see the padded layout.
         if pad_alignment is not None and tail_padding_policy == 'extend_last':
+            original_cu_seqlens_padded = batch['cu_seqlens_padded']
             batch['cu_seqlens_padded'], batch['max_seqlen'], non_dummy_global_target_len = (
                 extend_thd_padding_before_cp_slice(
-                    batch['cu_seqlens_padded'],
+                    original_cu_seqlens_padded,
                     batch['max_seqlen'],
                     alignment=alignment,
                     target_len=(
@@ -687,6 +697,17 @@ def get_batch_on_this_rank_for_sequence_packing(
                     cp_partition_mode=cp_partition_mode,
                 )
             )
+            if batch['cu_seqlens_padded'] is not original_cu_seqlens_padded:
+                # Extending the final sequence can repair a previously
+                # non-divisible physical layout. The old zero certificate no
+                # longer describes it, so downgrade only that value to unknown.
+                certificate = batch['zigzag_cp_min_chunk_size']
+                if isinstance(certificate, torch.Tensor):
+                    batch['zigzag_cp_min_chunk_size'] = torch.where(
+                        certificate == 0, certificate.new_full(certificate.shape, -1), certificate
+                    )
+                elif certificate == 0:
+                    batch['zigzag_cp_min_chunk_size'] = -1
 
     # Partition sequence tensors for context parallelism. Padding mask is needed
     # on every PP stage, while data tensors are only needed on first/last/MTP stages.
@@ -789,6 +810,17 @@ def get_batch_on_this_rank_for_sequence_packing(
         batch['cu_seqlens_padded'] = torch.empty([cu_seqlen_size], dtype=torch.int32, device=dev)
         batch['max_seqlen'] = torch.empty(1, dtype=torch.int32, device=dev)
 
+    if is_tp_rank_0:
+        if type(batch['zigzag_cp_min_chunk_size']) == int:
+            batch['zigzag_cp_min_chunk_size'] = torch.tensor(
+                batch['zigzag_cp_min_chunk_size'], dtype=torch.int32, device=dev
+            )
+        else:
+            assert batch['zigzag_cp_min_chunk_size'].dtype == torch.int32
+            assert batch['zigzag_cp_min_chunk_size'].numel() == 1
+    else:
+        batch['zigzag_cp_min_chunk_size'] = torch.empty(1, dtype=torch.int32, device=dev)
+
     # Step5: Prepare "local_cp_size" if dynamic context parallel is enabled.
     if dynamic_cp:
         if is_tp_rank_0:
@@ -813,6 +845,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     broadcast_tensor(batch['cu_seqlens'], tp_src_rank, tp_group)
     broadcast_tensor(batch['cu_seqlens_padded'], tp_src_rank, tp_group)
     broadcast_tensor(batch['max_seqlen'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['zigzag_cp_min_chunk_size'], tp_src_rank, tp_group)
     broadcast_tensor(batch['local_cp_size'], tp_src_rank, tp_group)
 
     # Extract the data from batch after broadcasting.
@@ -823,8 +856,17 @@ def get_batch_on_this_rank_for_sequence_packing(
     padding_mask = batch['padding_mask']
     cu_seqlens = batch['cu_seqlens']
     cu_seqlens_padded = batch['cu_seqlens_padded']
-    max_seqlen = batch['max_seqlen'].item()
-    local_cp_size = batch['local_cp_size'].item() if dynamic_cp else None
+    scalar_metadata = [batch['max_seqlen'].reshape(1), batch['zigzag_cp_min_chunk_size'].reshape(1)]
+    if dynamic_cp:
+        scalar_metadata.append(batch['local_cp_size'].reshape(1))
+    scalar_metadata_host = torch.cat(scalar_metadata).cpu().tolist()
+    max_seqlen = scalar_metadata_host[0]
+    zigzag_cp_min_chunk_size = scalar_metadata_host[1]
+    if zigzag_cp_min_chunk_size < 0 or (
+        config is not None and getattr(config, 'cuda_graph_impl', 'none') == 'full_iteration'
+    ):
+        zigzag_cp_min_chunk_size = None
+    local_cp_size = scalar_metadata_host[2] if dynamic_cp else None
     cp_group = (
         parallel_state.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
         if dynamic_cp
@@ -847,6 +889,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         cp_group=cp_group,
         cp_partition_mode=cp_partition_mode,
         pad_between_seqs=True,
+        zigzag_cp_min_chunk_size=zigzag_cp_min_chunk_size,
     )
 
     # Dummy metadata is appended after CP slicing as an ordinary sequence.
