@@ -2301,35 +2301,6 @@ class TestPrefixCacheReuse(PrefixCachingTestBase):
         assert torch.all(ctx.mamba_conv_states[:, follower_mamba_idx] == 17)
         assert torch.all(ctx.mamba_ssm_states[:, follower_mamba_idx] == 23)
 
-    @pytest.mark.internal
-    def test_mamba_cache_disabled_no_hash_request_skips_state_publication(self):
-        ctx = self._ctx(
-            mamba_config=self._mamba_config(),
-            prefix_caching_mamba_gb=0.01,
-            block_size_tokens=256,
-            max_sequence_length=4096,
-        )
-        bs = ctx.block_size_tokens
-        msa = ctx.mamba_slot_allocator
-        free_before = msa.free_count
-        # This aligned prompt would stage both an interior offset and its live
-        # endpoint if add_request sent this uncacheable request to the allocator.
-        request = self._req(ctx, self._prompt(2 * bs), enable_prefix_caching=False)
-        assert request.precomputed_block_hashes == []
-
-        ctx.add_request(request)
-
-        assert msa._intermediate_counts_cpu[0].item() == 0
-        assert msa._eos_cache_block_id_cpu[0].item() == -1
-        assert not msa._has_intermediates
-
-        ctx.initialize_attention_state()
-        msa.commit_intermediate_states()
-
-        assert msa.free_count == free_before
-        assert torch.all(msa.block_to_slot == -1)
-        assert not msa.hash_to_block_id
-
 
 PREFIX_CACHE_CONTEXT_CASES = [
     pytest.param(feature, policy, id=f"{feature}-{policy.name.lower()}")

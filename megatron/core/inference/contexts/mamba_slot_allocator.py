@@ -443,7 +443,7 @@ class MambaSlotAllocator:
         matched_block_ids: list,
         overall_required_blocks: int,
     ) -> None:
-        """Compute intermediate state extraction offsets and store per-request.
+        """Stage reusable recurrent states at interior offsets and/or an aligned chunk endpoint.
 
         Args:
             req: The inference request.

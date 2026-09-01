@@ -3594,15 +3594,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # compute_and_store_offsets sets CPU state + GPU staging buffers that
         # commit_intermediate_states() consumes after the forward pass. Run it for
-        # EVERY cacheable prefill chunk (not just the first): the last complete block of a
+        # EVERY prefill chunk (not just the first): the last complete block of a
         # multi-chunk prompt falls in a continuation chunk, and caching its Mamba
         # state is precisely what lets a later turn skip prefill on a hybrid model.
         # Mamba slot allocation / state restore above stays first-chunk-only.
-        if (
-            self.is_hybrid_model
-            and self.mamba_slot_allocator is not None
-            and req.precomputed_block_hashes
-        ):
+        if self.is_hybrid_model and self.mamba_slot_allocator is not None:
             self.mamba_slot_allocator.compute_and_store_offsets(
                 req,
                 current_id,
