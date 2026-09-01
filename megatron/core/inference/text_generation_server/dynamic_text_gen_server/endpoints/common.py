@@ -2,9 +2,12 @@
 
 import logging
 import threading
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 import torch
+
+if TYPE_CHECKING:
+    from megatron.core.inference.inference_client import InferenceClient
 
 GENERATE_NUM = 0
 LOCK = threading.Lock()
@@ -12,7 +15,7 @@ LOCK = threading.Lock()
 logger = logging.getLogger(__name__)
 
 
-def abort_requests(client, request_ids: Iterable[int], reason: str) -> None:
+def abort_requests(client: "InferenceClient", request_ids: Iterable[int], reason: str) -> None:
     """Tell the coordinator to stop generating the given requests.
 
     Best-effort and never raises: it runs on paths that are already unwinding

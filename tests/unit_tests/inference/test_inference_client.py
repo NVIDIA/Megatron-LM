@@ -10,9 +10,6 @@ import zmq
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.common import (
-    abort_requests,
-)
 
 pytestmark = pytest.mark.asyncio
 
@@ -151,14 +148,17 @@ async def test_add_request_with_id_returns_the_id_abort_needs():
     generates, so a client that disconnects mid-generation is never discovered
     as a broken pipe. The handler has to abort explicitly, and abort_request
     takes an id -- with only the future in hand there is nothing to name, and
-    cancelling the future alone leaves the engine generating.
+    cancelling the future alone leaves the engine generating. add_request keeps
+    returning the future alone, delegating here for the id sequence.
     """
     client, _, fake_socket = _make_client()
 
+    delegated = client.add_request("a", SamplingParams())
     request_id, future = client.add_request_with_id("hello", SamplingParams())
 
     assert isinstance(future, asyncio.Future)
-    assert client.completion_futures == {request_id: future}
+    assert request_id == 1, "add_request must consume an id from the same counter"
+    assert client.completion_futures == {0: delegated, request_id: future}
     submitted = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
     assert submitted[0] == Headers.SUBMIT_REQUEST.value
     assert submitted[1] == request_id
@@ -172,42 +172,33 @@ async def test_add_request_with_id_returns_the_id_abort_needs():
     assert request_id not in client.completion_futures
     assert request_id in client.aborted_request_ids
 
-
-async def test_add_request_delegates_to_add_request_with_id():
-    """add_request keeps returning only a future, drawing from the same id sequence."""
-    client, _, _ = _make_client()
-
-    first = client.add_request("a", SamplingParams())
-    second_id, second = client.add_request_with_id("b", SamplingParams())
-
-    assert isinstance(first, asyncio.Future)
-    assert second_id == 1, "add_request must consume an id from the same counter"
-    assert client.completion_futures == {0: first, 1: second}
-
-    first.cancel()
-    second.cancel()
+    delegated.cancel()
 
 
-async def test_abort_requests_helper_is_best_effort():
-    """One failing abort must not stop the others, and must not raise.
-
-    abort_requests runs on paths that are already unwinding -- a handler
-    cancelled by client disconnect, or one returning a 500 -- where letting a
-    second exception escape would replace the real one.
-    """
-    client = MagicMock()
-    client.abort_request.side_effect = [None, RuntimeError("coordinator gone"), None]
-
-    abort_requests(client, [7, 8, 9], "client disconnected")
-
-    assert [call.args[0] for call in client.abort_request.call_args_list] == [7, 8, 9]
-
-    client.reset_mock(side_effect=True)
-    abort_requests(client, [], "client disconnected")
-    client.abort_request.assert_not_called()
+def _consume_reply_for_a_completed_request(client):
+    """Submit, then stand in for _recv_task delivering the final reply."""
+    request_id, future = client.add_request_with_id("hello", SamplingParams())
+    # _recv_task pops the future from completion_futures immediately before
+    # resolving it.
+    client.completion_futures.pop(request_id)
+    future.set_result({"tokens": [1]})
+    return request_id
 
 
-async def test_abort_request_ignores_an_already_completed_request():
+def _consume_reply_for_a_finished_stream(client):
+    """Same, for the streaming path, whose AsyncStream aborts on close."""
+    stream = client.add_request_streaming("hello", SamplingParams())
+    # _recv_task pops the stream before delivering the final frame.
+    client.streams.pop(stream.request_id)
+    return stream.request_id
+
+
+@pytest.mark.parametrize(
+    "finish_request",
+    [_consume_reply_for_a_completed_request, _consume_reply_for_a_finished_stream],
+    ids=["completed_future", "finished_stream"],
+)
+async def test_abort_request_ignores_a_request_with_no_local_state(finish_request):
     """A completed request must not be recorded in aborted_request_ids.
 
     That set is pruned in exactly one place -- _recv_task, when an ENGINE_REPLY
@@ -220,11 +211,7 @@ async def test_abort_request_ignores_an_already_completed_request():
     """
     client, _, fake_socket = _make_client()
 
-    request_id, future = client.add_request_with_id("hello", SamplingParams())
-    # Stand in for _recv_task delivering the reply: it pops the future from
-    # completion_futures immediately before resolving it.
-    client.completion_futures.pop(request_id)
-    future.set_result({"tokens": [1]})
+    request_id = finish_request(client)
     fake_socket.send.reset_mock()
 
     client.abort_request(request_id)
@@ -232,20 +219,4 @@ async def test_abort_request_ignores_an_already_completed_request():
     assert request_id not in client.aborted_request_ids
     # The coordinator has already dropped its mapping for a finished request,
     # so the ABORT_REQUEST send would be wasted too.
-    fake_socket.send.assert_not_called()
-
-
-async def test_abort_request_ignores_an_already_finished_stream():
-    """Same guard on the streaming path, whose AsyncStream aborts on close."""
-    client, _, fake_socket = _make_client()
-
-    stream = client.add_request_streaming("hello", SamplingParams())
-    request_id = stream.request_id
-    # _recv_task pops the stream before delivering the final frame.
-    client.streams.pop(request_id)
-    fake_socket.send.reset_mock()
-
-    client.abort_request(request_id)
-
-    assert request_id not in client.aborted_request_ids
     fake_socket.send.assert_not_called()

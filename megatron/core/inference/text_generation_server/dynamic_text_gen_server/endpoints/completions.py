@@ -246,9 +246,6 @@ try:
             abort_requests(client, request_ids, "client disconnected")
             raise
         except Exception as e:
-            # gather leaves siblings running when one child raises, so the
-            # others would leak the same way while we return a 500.
-            abort_requests(client, request_ids, f"inference error: {e}")
             return f"Error during inference: {e}", 500
 
         if current_app.config['verbose']:
