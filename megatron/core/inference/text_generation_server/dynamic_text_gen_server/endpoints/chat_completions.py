@@ -2,7 +2,6 @@
 
 import asyncio
 import base64
-import functools
 import ipaddress
 import json
 import logging

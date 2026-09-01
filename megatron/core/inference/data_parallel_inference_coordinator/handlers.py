@@ -28,6 +28,7 @@ import logging
 from megatron.core.inference.config import (
     MediaCacheCoordinatorPolicy,
     PrefixCachingCoordinatorPolicy,
+    routes_on_prefix,
 )
 from megatron.core.inference.headers import Headers
 
@@ -148,11 +149,13 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     # Only prefix-affinity routing consults the block hashes. When nothing will
     # look at them, skip hashing *and* the prompt decode it needs -- avoiding
     # that decode is the reason the prompt travels in its own frame.
+    # Same predicate the client uses to decide whether hashing was worth doing,
+    # rather than a second spelling of it: a policy added to one and not the
+    # other would have the client skip hashes this handler still expects.
     if (
         coordinator.enable_prefix_caching
         and coordinator.block_size_tokens is not None
-        and coordinator.prefix_caching_coordinator_policy
-        != PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+        and routes_on_prefix(coordinator.prefix_caching_coordinator_policy)
     ):
         request_hashes = msgpack.unpackb(bodies[1], raw=False)
         if request_hashes is None:
