@@ -357,6 +357,8 @@ class OffloadTensorGroup:
         self._offload_event = torch.cuda.Event()
         self._reload_event = torch.cuda.Event()
         # Keep throttling separate from the internal offload/reload handshake.
+        # ``_offload_event`` must remain capture-local because ``bulk_reload_group``
+        # uses it for the reload dependency; sharing it would change that graph edge.
         # External events make record/wait explicit graph nodes, so separate
         # module graphs can synchronize through the same event object. A captured
         # wait node resolves against the event's live state at each replay, which
@@ -920,7 +922,9 @@ class ChunkOffloadHandler:
         self._tensor_count_current_group = 0
         self._reloading_group = []
         # Clear the pending-event FIFO at iter boundary so we never wait on
-        # an event recorded in a previous (non-captured) iteration.
+        # an event recorded in a previous (non-captured) iteration. Groups and
+        # their event objects persist, but a reused event is only waited on in
+        # the iteration that re-recorded it.
         self._offload_pending_by_name.clear()
 
     def find_group_with_name(

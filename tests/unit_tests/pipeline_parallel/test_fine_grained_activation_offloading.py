@@ -94,6 +94,28 @@ def test_offload_tensor_group_allocates_external_throttle_event_only_when_enable
 
 
 @pytest.mark.parametrize("max_inflight_offloads", [None, 0, 2])
+def test_chunk_offload_handler_wires_throttle_event_to_max_inflight(
+    monkeypatch, max_inflight_offloads: Optional[int]
+):
+    monkeypatch.setattr(torch.cuda, "Event", lambda **_: Mock())
+
+    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
+    handler.do_offload = True
+    handler.is_warmup = True
+    handler.offload_groups = []
+    handler._offloaded_group_index = 0
+    handler._max_group_size = 0
+    handler._groups_to_offload = []
+    handler._max_inflight_offloads = max_inflight_offloads
+
+    handler.on_group_start_forward("core_attn")
+
+    group = handler.offload_groups[0]
+    assert (group._offload_throttle_event is not None) == (max_inflight_offloads is not None)
+    assert handler._groups_to_offload == [group]
+
+
+@pytest.mark.parametrize("max_inflight_offloads", [None, 0, 2])
 def test_chunk_offload_handler_uses_throttle_event_only_when_configured(
     monkeypatch, max_inflight_offloads: Optional[int]
 ):
@@ -135,7 +157,10 @@ def test_chunk_offload_handler_uses_throttle_event_only_when_configured(
     [pytest.param(0, id="same-graph-smoke"), pytest.param(2, id="cross-graph-regression")],
 )
 def test_max_inflight_throttle_events_cross_cuda_graph_boundaries(max_inflight_offloads: int):
-    """Exercise throttle event capture and the cap-2 cross-graph wait regression."""
+    """Exercise the exact throttle-event record/wait regression across graphs.
+
+    The GB200 marker also selects this file into the GB200 unit-test bucket.
+    """
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank % torch.cuda.device_count())
     off_interface.reset_instance()
