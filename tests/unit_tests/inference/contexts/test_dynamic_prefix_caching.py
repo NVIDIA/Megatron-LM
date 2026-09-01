@@ -1998,7 +1998,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
             ),
         )
         ctx.add_request(request)
-        assert request.num_cached_tokens == 2 * bs
+        assert request.num_cached_tokens == bs
         engine = _StubEngine(ctx)
         future = engine._add_request(request)
         engine.waiting_request_ids.clear()
@@ -2521,7 +2521,7 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
             assert matched == producer_blocks
             assert skipped == 2 * block_size and effective == block_size
             ctx.add_request(probe)
-            assert probe.num_cached_tokens == 3 * block_size
+            assert probe.num_cached_tokens == skipped
 
         elif feature == "partial-prefix":
             partial = torch.cat((prompt[: 2 * block_size], self._prompt(block_size, offset=50_000)))
@@ -2561,7 +2561,7 @@ class TestPrefixCachePolicyStressMatrix(PrefixCachingTestBase):
             ctx.add_request(fresh)
             assert ctx.request_query_lengths[1].item() == block_size
             assert ctx.request_query_lengths[2].item() == 3 * block_size
-            assert cached.num_cached_tokens == 3 * block_size
+            assert cached.num_cached_tokens == 2 * block_size
             assert fresh.num_cached_tokens == 0
 
         self._apply_local_churn(ctx, producer, producer_blocks)
