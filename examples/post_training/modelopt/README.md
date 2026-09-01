@@ -165,11 +165,7 @@ before running inference with it.
 ## ⭐ Quantization Aware Training & Distillation
 
 Quantization-aware training (QAT) fine-tunes the PTQ checkpoint with the
-supervised cross-entropy loss to adapt it to a target task. Quantization-aware
-distillation (QAD) instead trains the quantized student against a frozen BF16
-teacher to recover quantization accuracy. Both workflows use `finetune.sh`
-with the PTQ checkpoint in `${MLM_MODEL_CKPT}`; configure the training data and
-the QAD teacher according to your training recipe.
+supervised cross-entropy loss to adapt it to a target task.
 
 ```sh
 \
@@ -178,6 +174,26 @@ the QAD teacher according to your training recipe.
     MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Instruct-qat \
     ./finetune.sh meta-llama/Llama-3.2-1B-Instruct
 ```
+
+Quantization-aware distillation (QAD) instead distills the quantized student from a frozen BF16
+teacher to recover quantization accuracy. Both workflows use `finetune.sh`
+with the PTQ checkpoint in `${MLM_MODEL_CKPT}`.  For QAD, add the BF16 teacher checkpoint through `--export-kd-teacher-load`. The teacher checkpoint must include `model_config.yaml`, or provide its path
+with `--export-kd-teacher-model-config`:
+
+```sh
+\
+    TP=1 \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
+    MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Instruct-qad \
+    MLM_EXTRA_ARGS="--export-kd-teacher-load /path/to/Llama-3.2-1B-Instruct-bf16 \
+        --export-kd-teacher-model-config /path/to/Llama-3.2-1B-Instruct-bf16/model_config.yaml" \
+    ./finetune.sh meta-llama/Llama-3.2-1B-Instruct
+```
+
+See the [distillation documentation](./distillation.md) for teacher checkpoint
+requirements and optional distillation-loss configuration.
+
+For both QAT and QAD, configure the training data, hyper parameters, and the PTQ student and/or BF16 teacher according to your desired training recipe.
 
 Export the QAT or QAD checkpoint with [`export.sh`](#-megatron-checkpoint-export)
 before running inference with it.
