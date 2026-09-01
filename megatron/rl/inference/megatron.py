@@ -17,9 +17,11 @@ except ImportError:
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import get_pg_size, log_single_rank
 from megatron.training.global_vars import get_args, get_tokenizer
+from megatron.training.utils import print_rank_0
 
 from ..inference.inference_interface import (
     InferenceRequest,
@@ -28,11 +30,11 @@ from ..inference.inference_interface import (
     ReturnsRaw,
     ReturnsTokens,
 )
-from ..rollout_granularity import get_rl_parallel_generation_tasks
 from ..server.api import InferenceServer
 
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
     """Interface to use MCoreEngine directly as an inference engine."""
@@ -85,9 +87,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
             logprobs=choice.message.generation_log_probs,
             finish_reason=choice.finish_reason,
             prompt_length=len(choice.message.prompt_token_ids),
-            policy_epoch=choice.message.policy_epoch,
-            kv_cache_epoch=choice.message.kv_cache_epoch,
-            num_evictions=choice.message.num_evictions,
+            completion_id=response.id,
         )
 
     @classmethod
@@ -110,6 +110,38 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         args.skip_prompt_log_probs = True
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
+        inference_engine.local_metadata_ledger_enabled = True
+        if args.rl_partial_rollouts:
+            # Resolve args.rl_generation_lag against the engine's request capacity:
+            # autotune it when unset, or report how the requested lag compares.
+            dp_size = get_pg_size(inference_engine.pg_collection.dp)
+            max_requests = inference_engine.context.max_requests
+            G = args.grpo_group_size
+            P = args.grpo_prompts_per_step
+            max_effective_groups = dp_size * max_requests // G
+            max_effective_lag = max_effective_groups / P - 1
+            if args.rl_generation_lag is None:
+                args.rl_generation_lag = max_effective_lag
+                print_rank_0(
+                    f"Autotuned rl-generation-lag={max_effective_lag:.2f} "
+                    f"(DP={dp_size}, max_requests={max_requests}, G={G}, P={P}).")
+            else:
+                print_rank_0(
+                    f"Using rl-generation-lag={args.rl_generation_lag} "
+                    f"(max effective lag={max_effective_lag:.2f}; "
+                    f"DP={dp_size}, max_requests={max_requests}, G={G}, P={P}).")
+            groups_in_flight = (args.rl_generation_lag + 1) * P
+            if groups_in_flight > max_effective_groups + 1e-6:
+                print_rank_0(
+                    f"WARNING: {groups_in_flight:.1f} groups in flight oversubscribes the "
+                    f"inference engine (max effective lag is {max_effective_lag:.2f}). "
+                    f"Additional run-ahead beyond that point has no benefit.")
+            if max_effective_lag < 0:
+                print_rank_0(
+                    f"WARNING: max effective lag is {max_effective_lag:.2f} (negative) — the "
+                    f"inference engine cannot hold even one training step's worth of rollouts "
+                    f"({max_effective_groups} groups < P={P}). Even fully-synchronous GRPO would "
+                    f"oversubscribe. Consider scaling up inference resources.")
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=41521, launch_inference_coordinator=True,
         )
@@ -127,6 +159,9 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
                 server_port=kwargs.get('port', 8294),
                 parsers=args.rl_inference_parsers,
                 verbose=kwargs.get('verbose', False),
+                multimodal_prompt_config=(
+                    inference_engine.controller.inference_wrapped_model.multimodal_prompt_config
+                ),
             )
         else:
             client = None
@@ -139,9 +174,7 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         )
 
         concurrency_limit = (
-            args.grpo_prompts_per_step
-            * args.grpo_group_size
-            * get_rl_parallel_generation_tasks(args)
+            get_pg_size(inference_engine.pg_collection.dp) * inference_engine.context.max_requests
         )
         custom_limits = httpx.Limits(
             max_connections=concurrency_limit,
@@ -194,6 +227,20 @@ class MegatronLocal(InferenceServer, ReturnsTokens, ReturnsRaw):
         if dist.get_rank() == 0:
             self._client.suspend_engines()
         await self._inference_engine.wait_until(EngineState.SUSPENDED)
+
+    def merge_global_request_ledgers(self) -> dict[str, FinishedRequestRecord]:
+        """Union every engine's local-metadata ledger and clear them."""
+        engine = self._inference_engine
+        local, engine.local_metadata_ledger = engine.local_metadata_ledger, {}
+        shards = [None] * dist.get_world_size()
+        dist.all_gather_object(shards, local)
+        merged: dict[str, FinishedRequestRecord] = {}
+        for shard in shards:
+            merged.update(shard)
+        assert len(merged) == sum(len(shard) for shard in shards), (
+            "finished-request ledger: duplicate uids across engine ledgers"
+        )
+        return merged
 
     async def resume(self):
         if self._inference_engine._state_events[EngineState.RUNNING].is_set():

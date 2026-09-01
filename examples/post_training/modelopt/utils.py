@@ -39,16 +39,38 @@ def get_eos_token_id(hf_tokenizer=None):
     if hf_tokenizer is None:
         hf_tokenizer = get_hf_tokenizer()
 
-    if hf_tokenizer.eos_token == "<|eot_id|>":
-        return 128001
-    if hf_tokenizer.eos_token == "<|eot|>":
-        return 200001
-    if hf_tokenizer.eos_token == "<|im_end|>":
-        return 151643
-    if hf_tokenizer.eos_token == "<|return|>":
-        return 199999
+    tokenizer_size = None
+    try:
+        tokenizer_size = len(hf_tokenizer)
+    except TypeError:
+        tokenizer_size = getattr(hf_tokenizer, "vocab_size", None)
 
-    return hf_tokenizer.eos_token_id
+    def _valid_token_id(token_id):
+        return token_id is not None and token_id >= 0 and (
+            tokenizer_size is None or token_id < tokenizer_size
+        )
+
+    known_chat_eos_ids = {
+        "<|eot_id|>": 128001,
+        "<|eot|>": 200001,
+        "<|im_end|>": 151643,
+        "<|return|>": 199999,
+    }
+    if hf_tokenizer.eos_token in known_chat_eos_ids:
+        converted_id = hf_tokenizer.convert_tokens_to_ids(hf_tokenizer.eos_token)
+        if _valid_token_id(converted_id):
+            return converted_id
+        mapped_id = known_chat_eos_ids[hf_tokenizer.eos_token]
+        if _valid_token_id(mapped_id):
+            return mapped_id
+
+    if _valid_token_id(hf_tokenizer.eos_token_id):
+        return hf_tokenizer.eos_token_id
+    raise ValueError(
+        "Tokenizer EOS token id {} is outside the tokenizer vocabulary.".format(
+            hf_tokenizer.eos_token_id
+        )
+    )
 
 
 def build_lm_batch(
