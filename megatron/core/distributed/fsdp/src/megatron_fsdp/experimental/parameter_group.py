@@ -88,6 +88,7 @@ class FsdpParameterGroup:
     _model_weight_is_stale: bool
     main_grad: DBuffer | None
     # Optimizer-layout view into main_grad storage, avoiding a second allocation.
+    # This is None exactly when main_grad is None.
     pre_optimizer_main_grad: DBuffer | None
     # zero_grad(set_to_none=False) clears only the current optimizer view. If final
     # reduction created a smaller view (e.g. ZeRO-1 or HFSDP), the remaining main_grad
@@ -209,17 +210,13 @@ class FsdpParameterGroup:
             # eagerly deallocated right after optimizer.step(), avoiding main_grad
             # storage during forward. That requires a separate lifetime contract with
             # the optimizer, so this version keeps the simpler persistent buffer.
-            # This persistent buffer is allocated on the default stream rather than the
-            # reduce-scatter stream. The latter is reserved for transient communication
-            # buffers and CUDA graph replay can otherwise observe a stream-local allocation.
-            with torch.cuda.stream(torch.cuda.default_stream(self.main_weight.device)):
-                self.main_grad = DBuffer(
-                    mesh=self.mesh,
-                    placements=main_grad_placements,
-                    tensor_shapes=self.main_weight.layout.tensor_shapes,
-                    dtype=grad_dtype,
-                    device=self.main_weight.device,
-                )
+            self.main_grad = DBuffer(
+                mesh=self.mesh,
+                placements=main_grad_placements,
+                tensor_shapes=self.main_weight.layout.tensor_shapes,
+                dtype=grad_dtype,
+                device=self.main_weight.device,
+            )
             self.pre_optimizer_main_grad = self.main_grad.view(main_weight_placements)
             assert self.main_grad.layout == self.main_weight.layout, (
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
@@ -387,9 +384,9 @@ class FsdpParameterGroup:
         # leaves sharded grads installed, so this backward accumulates into main_grad.
         has_sharded_grads = self._has_sharded_grads()
         if self._main_grad_is_stale:
-            # In HFSDP, zero_grad(set_to_none=False) only zeros the smaller optimizer
-            # view. Clear the persistent full accumulation buffer before this new step;
-            # set_to_none=True needs no clear because out= below overwrites it.
+            # In ZeRO-1 and HFSDP, zero_grad(set_to_none=False) only zeros the smaller
+            # optimizer view. Clear the persistent full accumulation buffer before this
+            # new step; set_to_none=True needs no clear because out= below overwrites it.
             if has_sharded_grads:
                 self.main_grad.local_buffer.zero_()
             self._main_grad_is_stale = False
@@ -422,9 +419,7 @@ class FsdpParameterGroup:
             optimizer_main_grad = self.main_grad.redistribute(
                 self.main_weight.placements, out=self.pre_optimizer_main_grad
             )
-            self._main_grad_is_stale = (
-                optimizer_main_grad.local_buffer.numel() < self.main_grad.local_buffer.numel()
-            )
+            self._main_grad_is_stale = True
 
         # Make each sharded parameter's .grad consistent with the final main_grad.
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):

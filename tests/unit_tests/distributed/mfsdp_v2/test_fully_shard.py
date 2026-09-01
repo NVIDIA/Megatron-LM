@@ -249,7 +249,7 @@ def test_fully_shard_sgd_losses_match_baseline(
     )
 
 
-def test_zero1_main_grad_reuses_default_stream_storage(distributed_setup):
+def test_zero1_main_grad_reuses_storage(distributed_setup):
     """ZeRO-1 keeps its main-gradient allocation and optimizer view across backwards."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -258,18 +258,15 @@ def test_zero1_main_grad_reuses_default_stream_storage(distributed_setup):
 
     mesh = init_device_mesh(device.type, (world_size,))
     model = TinyModel().to(device)
-    construction_stream = torch.cuda.Stream(device)
-    with torch.cuda.stream(construction_stream):
-        with fully_shard_context(device=device):
-            fully_shard(model.fc1, mesh=mesh, placements=_zero1_placements())
-            fully_shard(model.fc2, mesh=mesh, placements=_zero1_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.fc1, mesh=mesh, placements=_zero1_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_zero1_placements())
 
     (parameter_group,) = model.fc1.parameter_groups
     main_grad = parameter_group.main_grad
     pre_optimizer_main_grad = parameter_group.pre_optimizer_main_grad
     assert main_grad is not None
     assert pre_optimizer_main_grad is not None
-    assert main_grad.allocation_stream == torch.cuda.default_stream(device)
     assert pre_optimizer_main_grad.placements == (Flat(),)
     assert (
         pre_optimizer_main_grad.local_buffer.untyped_storage()
