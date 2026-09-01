@@ -761,6 +761,61 @@ class TestHashRouting:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_hash_routing_uses_learned_selection_for_synthetic_vl_ids(self):
+        """Synthetic image IDs bypass tid2eid and select experts with the VL bias."""
+        config = _hash_routing_config(
+            moe_router_enable_expert_bias=True,
+            moe_router_enable_vl_bias=True,
+            moe_router_score_function="sqrtsoftplus",
+        )
+        router = TopKRouter(
+            config=config, pg_collection=get_default_pg_collection(), layer_number=1
+        )
+        router.expert_bias_vl.copy_(torch.tensor([0.0, 0.0, 9.0, 10.0], device="cuda"))
+        logits = torch.zeros(4, 4, device="cuda")
+        input_ids = torch.tensor([[1, 128], [2, 129]], device="cuda")
+
+        _, routing_map = router._hash_routing(logits, input_ids)
+
+        flat_ids = input_ids.T.reshape(-1)
+        for row, token_id in enumerate(flat_ids.tolist()):
+            selected = routing_map[row].nonzero(as_tuple=True)[0].sort().values
+            if token_id >= config.actual_vocab_size:
+                assert torch.equal(selected, torch.tensor([2, 3], device="cuda"))
+            else:
+                expected = router.tid2eid[token_id].long().sort().values
+                assert torch.equal(selected, expected)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_non_hash_routing_separates_text_and_vl_bias_counts(self):
+        """Normal MoE layers select and balance text and synthetic IDs independently."""
+        config = _hash_routing_config(
+            moe_router_enable_expert_bias=True,
+            moe_router_enable_vl_bias=True,
+            moe_router_score_function="sqrtsoftplus",
+        )
+        router = TopKRouter(
+            config=config, pg_collection=get_default_pg_collection(), layer_number=2
+        )
+        router.expert_bias.copy_(torch.tensor([10.0, 9.0, 0.0, 0.0], device="cuda"))
+        router.expert_bias_vl.copy_(torch.tensor([0.0, 0.0, 9.0, 10.0], device="cuda"))
+        logits = torch.zeros(2, 2, 4, device="cuda")
+        input_ids = torch.tensor([[1, 128], [2, 129]], device="cuda")
+
+        _, routing_map = router.routing(logits, input_ids=input_ids)
+
+        assert torch.equal(
+            routing_map[0].nonzero(as_tuple=True)[0], torch.tensor([0, 1], device="cuda")
+        )
+        assert torch.equal(
+            routing_map[2].nonzero(as_tuple=True)[0], torch.tensor([2, 3], device="cuda")
+        )
+        assert router.local_tokens_per_expert.sum() == 4
+        assert router.local_tokens_per_expert_vl.sum() == 4
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_moe_layer_hash_routing_integration(self):
         """End-to-end MoELayer forward/backward with hash routing; raises without input_ids."""
         config = _hash_routing_config(moe_n_hash_layers=1)

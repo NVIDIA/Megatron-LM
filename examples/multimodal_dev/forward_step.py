@@ -418,6 +418,8 @@ def forward_step(data_iterator, model):
         padding_mask=batch.get("padding_mask", None),
         pixel_values=pixel_values,
         image_grid_thw=batch.get("image_grid_thw", None),
+        vision_embeddings=batch.get("vision_embeddings", None),
+        vision_token_indices=batch.get("vision_token_indices", None),
         packed_seq_params=batch.get("packed_seq_params", None),
     )
 

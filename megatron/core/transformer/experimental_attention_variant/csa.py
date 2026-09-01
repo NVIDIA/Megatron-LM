@@ -56,6 +56,20 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class SparseAttentionVisibility:
+    """Compact per-token extension of a causal sliding-attention window.
+
+    ``left`` and ``right`` contain the additional visible-token counts around each query.
+    A zero pair preserves ordinary causal sliding-window attention. This representation avoids
+    materializing an ``[B, S, S]`` mask and is used by DeepSeek-V4-Vision image spans.
+    """
+
+    left: torch.Tensor
+    right: torch.Tensor
+    max_span: int
+
+
 @lru_cache(maxsize=8)
 def _get_window_topk_idxs_cached(window_size: int, seqlen: int, device_str: str) -> torch.Tensor:
     """Compute sliding-window indices for a single sequence (cached).
@@ -76,6 +90,28 @@ def get_window_topk_idxs(
     """Sliding-window indices [batch, seqlen, window_size]."""
     matrix = _get_window_topk_idxs_cached(window_size, seqlen, str(device))
     return matrix.unsqueeze(0).expand(batch_size, -1, -1)
+
+
+def get_window_topk_idxs_visible(
+    window_size: int, seqlen: int, visibility: SparseAttentionVisibility, device: torch.device
+) -> torch.Tensor:
+    """Sliding-window indices extended by compact left/right visibility counts."""
+    left = visibility.left.to(device=device)
+    right = visibility.right.to(device=device)
+    if left.shape != right.shape or left.ndim != 2 or left.shape[1] != seqlen:
+        raise ValueError(
+            "Sparse attention visibility must provide matching [batch, sequence] tensors; "
+            f"got left={tuple(left.shape)}, right={tuple(right.shape)}, seqlen={seqlen}."
+        )
+
+    width = min(seqlen, window_size + visibility.max_span)
+    positions = torch.arange(seqlen, device=device, dtype=left.dtype).unsqueeze(0)
+    left_add = (left - (window_size - 1)).clamp(min=0)
+    starts = (positions - (window_size - 1) - left_add).clamp(min=0)
+    matrix = starts.unsqueeze(-1) + torch.arange(width, device=device, dtype=left.dtype)
+    max_visible = (positions + right).clamp(max=seqlen - 1)
+    matrix = torch.where(matrix > max_visible.unsqueeze(-1), -1, matrix)
+    return matrix.int().contiguous()
 
 
 @lru_cache(maxsize=8)
@@ -257,6 +293,48 @@ def get_window_topk_idxs_thd(
     matrix = torch.where(matrix > pos_in_seq.unsqueeze(1), torch.full_like(matrix, -1), matrix)
     matrix = torch.where(valid.unsqueeze(1), matrix, torch.full_like(matrix, -1))
     return matrix.int()
+
+
+def get_window_topk_idxs_visible_thd(
+    window_size: int,
+    cu_seqlens_q: torch.Tensor,
+    visibility: SparseAttentionVisibility,
+    total_q: Optional[int] = None,
+) -> torch.Tensor:
+    """Packed-THD counterpart of :func:`get_window_topk_idxs_visible`.
+
+    Returned indices remain local to each packed segment, matching
+    :func:`get_window_topk_idxs_thd` and the CSA full-KV layout.
+    """
+    if total_q is None:
+        total_q = int(cu_seqlens_q[-1].item())
+    device = cu_seqlens_q.device
+    left = visibility.left.reshape(-1).to(device=device, dtype=cu_seqlens_q.dtype)
+    right = visibility.right.reshape(-1).to(device=device, dtype=cu_seqlens_q.dtype)
+    if left.numel() != total_q or right.numel() != total_q:
+        raise ValueError(
+            "Packed sparse attention visibility must have one entry per query token; "
+            f"got left={left.numel()}, right={right.numel()}, total_q={total_q}."
+        )
+
+    batch_of_token = batch_of_row(cu_seqlens_q, total_q=total_q)
+    token_idx = torch.arange(total_q, device=device, dtype=cu_seqlens_q.dtype)
+    valid = token_idx < cu_seqlens_q[-1]
+    segment_starts = cu_seqlens_q[batch_of_token]
+    segment_lengths = cu_seqlens_q[batch_of_token + 1] - segment_starts
+    positions = token_idx - segment_starts
+    positions = torch.where(valid, positions, torch.zeros_like(positions))
+
+    width = min(total_q, window_size + visibility.max_span)
+    left_add = (left - (window_size - 1)).clamp(min=0)
+    starts = (positions - (window_size - 1) - left_add).clamp(min=0)
+    matrix = starts.unsqueeze(1) + torch.arange(
+        width, device=device, dtype=cu_seqlens_q.dtype
+    ).unsqueeze(0)
+    max_visible = torch.minimum(positions + right, segment_lengths - 1)
+    matrix = torch.where(matrix > max_visible.unsqueeze(1), -1, matrix)
+    matrix = torch.where(valid.unsqueeze(1), matrix, torch.full_like(matrix, -1))
+    return matrix.int().contiguous()
 
 
 def get_compress_topk_idxs_thd(
@@ -2100,6 +2178,13 @@ class CompressedSparseAttention(MegatronModule):
 
         cp_size = self.pg_collection.cp.size() if self.pg_collection.cp is not None else 1
         qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None
+        sparse_visibility = (
+            attention_mask if isinstance(attention_mask, SparseAttentionVisibility) else None
+        )
+        if sparse_visibility is not None and cp_size > 1:
+            raise ValueError(
+                "Sparse image-span visibility is not yet supported with context parallelism."
+            )
         if cp_size > 1 and qkv_format != 'thd':
             raise ValueError("CompressedSparseAttention with CP requires qkv_format='thd'.")
         if cp_size > 1 and packed_seq_params.cp_partition_mode != "contiguous":
@@ -2114,7 +2199,9 @@ class CompressedSparseAttention(MegatronModule):
                     query, key, x, qr, boundary_hidden, boundary_kv, packed_seq_params
                 )
             else:
-                output = self._forward_thd(query, key, x, qr, packed_seq_params)
+                output = self._forward_thd(
+                    query, key, x, qr, packed_seq_params, sparse_visibility=sparse_visibility
+                )
             self.pg_collection.cp = _orig_cp_group
             nvtx_range_pop("compressed_sparse_attn")
             return output
@@ -2124,7 +2211,12 @@ class CompressedSparseAttention(MegatronModule):
         kv = key.squeeze(-2)  # [sq, b, 1, v_head_dim] -> [sq, b, v_head_dim]
         kv_full, compressed_kv, n_compressed = self._build_kv_full(kv, x)
         offset = sq  # compressed indices start after original positions
-        window_idxs = get_window_topk_idxs(self.window_size, b, sq, query.device)
+        if sparse_visibility is None:
+            window_idxs = get_window_topk_idxs(self.window_size, b, sq, query.device)
+        else:
+            window_idxs = get_window_topk_idxs_visible(
+                self.window_size, sq, sparse_visibility, query.device
+            )
 
         has_indexer_compressed = (
             self.compress_ratio > 1 and n_compressed > 0 and self.indexer is not None
@@ -2902,6 +2994,7 @@ class CompressedSparseAttention(MegatronModule):
         x: torch.Tensor,  # (total_q, 1, hidden_size)
         qr: torch.Tensor,  # (total_q, 1, q_lora_rank)
         packed_seq_params: PackedSeqParams,
+        sparse_visibility: Optional[SparseAttentionVisibility] = None,
     ) -> torch.Tensor:
         """THD-packed branch of :meth:`forward`. See class docstring for layout.
 
@@ -2965,9 +3058,14 @@ class CompressedSparseAttention(MegatronModule):
         )
 
         # ---- Step 3: window indices (per-segment local) ---------------------
-        window_idxs = get_window_topk_idxs_thd(
-            self.window_size, cu_seqlens_q, total_q=total_q
-        )  # (total_q, win_topk) local-to-segment
+        if sparse_visibility is None:
+            window_idxs = get_window_topk_idxs_thd(
+                self.window_size, cu_seqlens_q, total_q=total_q
+            )  # (total_q, win_topk) local-to-segment
+        else:
+            window_idxs = get_window_topk_idxs_visible_thd(
+                self.window_size, cu_seqlens_q, sparse_visibility, total_q=total_q
+            )
 
         # Upper bound on the max compressed-KV length per segment.  Not exact
         # when segment lengths aren't divisible by compress_ratio, but
