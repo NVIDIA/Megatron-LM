@@ -14,6 +14,10 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import Chun
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedOffloadingBackwardRecordFunction,
+    PipelineOffloadManager,
+)
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     is_checkpoint_without_output_tensor,
@@ -67,6 +71,47 @@ def test_chunk_offload_handler_skips_non_offloadable_tensor_types():
     assert not handler.tensor_need_offloading_checker(fake_tensor)
     assert handler.tensor_push(fake_tensor) is fake_tensor
     assert handler.tensor_pop(fake_tensor) is fake_tensor
+
+
+def test_cuda_graph_backward_completion_event_follows_accumulate_grad(monkeypatch):
+    """The TE sync-back event must be the true GraphTask tail, not just input dgrad-ready."""
+    calls = []
+
+    class RecordingStream:
+        def record_event(self, event):
+            calls.append(("record_event", event))
+
+        def wait_stream(self, stream):
+            calls.append(("wait_stream", stream))
+
+    graph_event = object()
+    h2d_stream = object()
+    recording_stream = RecordingStream()
+
+    def current_stream():
+        calls.append(("callback_boundary", recording_stream))
+        return recording_stream
+
+    monkeypatch.setattr(
+        PipelineOffloadManager,
+        "OFFLOAD_MGR",
+        type("Manager", (), {"cuda_graph_event": graph_event, "h2d_stream": h2d_stream})(),
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+
+    hidden_states = torch.tensor(2.0, requires_grad=True)
+    weight = torch.nn.Parameter(torch.tensor(3.0))
+    weight.register_post_accumulate_grad_hook(lambda _param: calls.append(("param_grad", weight)))
+
+    recorded_input = FineGrainedOffloadingBackwardRecordFunction.apply(hidden_states)
+    (recorded_input * weight).backward()
+
+    assert calls == [
+        ("param_grad", weight),
+        ("callback_boundary", recording_stream),
+        ("record_event", graph_event),
+        ("wait_stream", h2d_stream),
+    ]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")

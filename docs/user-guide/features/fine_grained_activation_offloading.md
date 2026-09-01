@@ -197,5 +197,6 @@ A 'OffloadTensorPool` (on CPU with pinned memory) caches allocated tensors by `(
 When offloading interacts with CUDA graphs:
 
 - A dedicated `cuda_graph_stream` runs the captured computation, while `d2h_stream` overlaps D2H transfers for regions that are **inside** the graph capture.
+- The backward completion event is queued at the end of the autograd GraphTask, after all requested input and parameter gradients have been produced. TE can therefore synchronize the main stream without exposing partially written graph gradients; the subsequent `h2d_stream` join still prefetches the next offload group asynchronously.
 - During CUDA graph **warmup**, offloading is disabled (`pre_warmup_hook` / `post_warmup_hook`).
 - The `delay_offload_until_cuda_graph` option defers D2H launches until graph replay, utilizing the CPU idle time during `cudaGraphLaunch` to issue offload commands with near-zero CPU overhead.
