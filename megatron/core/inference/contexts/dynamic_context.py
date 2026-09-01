@@ -23,6 +23,8 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling.base import Sampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.unified_memory import (
@@ -337,6 +339,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Hyperparameter for choosing to prioritize prefix hit matches vs minimizing idle load
         self.prefix_caching_routing_alpha = inference_config.prefix_caching_routing_alpha
+        self.media_cache_coordinator_policy = inference_config.media_cache_coordinator_policy
+        self.media_cache_routing_weight = inference_config.media_cache_routing_weight
 
         # Monotonic clock for prefix caching LRU eviction ordering.
         # Incremented each engine step but kept independent so the engine step
@@ -435,11 +439,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.gdp_num_householder = mamba_inference_state_config.gdp_num_householder
 
             if self.batch_invariant_mode:
-                # Gated Delta Product does not implement batch-invariant mode yet.
-                assert self.gdp_num_householder == 0, (
-                    "batch_invariant_mode does not support Gated Delta Product layers; "
-                    "set batch_invariant_mode=False."
-                )
                 assert not self.enable_prefix_caching, (
                     "batch_invariant_mode does not support Mamba prefix caching; "
                     "set enable_prefix_caching=False."
@@ -819,6 +818,30 @@ class DynamicInferenceContext(BaseInferenceContext):
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
                 ep_group=self.expert_model_parallel_group,
+            )
+
+        # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
+        # inside CUDA graph capture; one buffer set is shared by all MoE layers
+        # and graphs. Like the dispatcher buffers above, these persist across
+        # engine suspend/resume.
+        if (
+            model_config.num_moe_experts
+            and model_config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
+        ):
+            ep_size = get_pg_size(self.expert_model_parallel_group)
+            moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
+            # Worst-case rows entering the MoE: the fixed NVLS AGV buffer height
+            # (per-rank worst case * ep_size); max_tokens covers the EP=1 / NCCL paths.
+            moe_max_rows = max(
+                self.max_tokens, self.round_up_tokens(self.max_tokens) // tp_size * ep_size
+            )
+            VllmFusedMoeBuffers.allocate_buffers(
+                max_tokens=moe_max_rows,
+                topk=model_config.moe_router_topk,
+                fc1_output_size=model_config.moe_ffn_hidden_size
+                * (2 if model_config.gated_linear_unit else 1),
+                hidden_size=moe_hidden_size,
+                num_local_experts=model_config.num_moe_experts // ep_size,
             )
 
         # Deal with chunked prefill
@@ -3065,10 +3088,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         mamba_map = self.mamba_slot_allocator.hash_to_block_id
         hashes = req.precomputed_block_hashes[start_block:end_block]
-        for i in range(len(hashes) - 1, -1, -1):
-            if hashes[i] in mamba_map:
-                return i + 1
-        return 0
+
+        # Mark the blocks in range whose hash the allocator still holds state
+        # for; the farthest such block is the match count. Intersecting against
+        # the range's hashes first keeps this bounded by the range rather than
+        # the size of the whole cache.
+        block_hashes = torch.tensor(hashes, dtype=torch.int64)
+        cached = mamba_map.keys() & set(hashes)
+        cached_hashes = torch.tensor(list(cached), dtype=torch.int64)
+        is_cached = torch.isin(block_hashes, cached_hashes)
+        return int(is_cached.nonzero()[-1].item()) + 1 if is_cached.any() else 0
 
     def _compute_prefix_match(
         self,
@@ -3125,7 +3154,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # already had Mamba state restored during the first chunk.
         if self.is_hybrid_model and self.mamba_slot_allocator is not None and finished == 0:
             num_mamba_matched = self._find_mamba_match_count(
-                req, already_allocated_blocks, already_allocated_blocks + num_matched
+                req=req,
+                start_block=already_allocated_blocks,
+                end_block=already_allocated_blocks + num_matched,
             )
             if record_mamba_match:
                 req._mamba_num_matched_blocks = num_mamba_matched
@@ -3136,12 +3167,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 raw_skip = num_mamba_matched * self.block_size_tokens
                 if raw_skip >= prefill_chunk_length:
                     # Back off to previous block with cached Mamba state
-                    mamba_map = self.mamba_slot_allocator.hash_to_block_id
-                    backed_off_blocks = 0
-                    for j in range(num_mamba_matched - 2, -1, -1):
-                        if req.precomputed_block_hashes[j] in mamba_map:
-                            backed_off_blocks = j + 1
-                            break
+                    backed_off_blocks = self._find_mamba_match_count(
+                        req=req, start_block=0, end_block=num_mamba_matched - 1
+                    )
                     prefix_skip_tokens = backed_off_blocks * self.block_size_tokens
                 else:
                     prefix_skip_tokens = raw_skip
@@ -3159,6 +3187,32 @@ class DynamicInferenceContext(BaseInferenceContext):
         if prefill_chunk_length - prefix_skip_tokens < 2 and prefill_chunk_length >= 2:
             max_skip = prefill_chunk_length - 2
             prefix_skip_tokens = (max_skip // self.block_size_tokens) * self.block_size_tokens
+
+            # Rounding down can land on a block that has no cached Mamba state.
+            # add_request() restores from `prefix_skip_tokens // block_size - 1`
+            # unconditionally and, when `restore_to_live` misses, ZEROES the SSM
+            # state while still skipping the tokens -- the request then resumes
+            # mid-prompt from a zero state and produces a wrong (but internally
+            # coherent) distribution for its first generated token.
+            #
+            # Mamba boundaries are sparse: only the few positions selected in
+            # `compute_and_store_offsets` are cached, so the clamped boundary is
+            # frequently not one of them. A 5889-token prompt caches state only at
+            # block 22 (offset 5888), the clamp moves the skip to 5632, and the
+            # restore then targets block 21, which has none.
+            #
+            # Walk back to the nearest block that actually has cached state, the
+            # same way the `raw_skip >= prefill_chunk_length` branch above does.
+            if (
+                self.is_hybrid_model
+                and self.mamba_slot_allocator is not None
+                and finished == 0
+                and prefix_skip_tokens > 0
+            ):
+                usable = self._find_mamba_match_count(
+                    req=req, start_block=0, end_block=prefix_skip_tokens // self.block_size_tokens
+                )
+                prefix_skip_tokens = usable * self.block_size_tokens
 
         effective_prefill_chunk_length = prefill_chunk_length - prefix_skip_tokens
         num_blocks_from_pool = max(
