@@ -4,6 +4,7 @@ import gc
 import os
 import sys
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -1029,6 +1030,61 @@ class TestParallelHybridBlockCudagraphs:
 
 
 class TestHybridTECudaGraphDiscovery:
+    @staticmethod
+    def _bare_hybrid_wrapper(*, offload_in_graph=False, delay_offload=False):
+        wrapper = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(wrapper)
+        wrapper.config = SimpleNamespace(
+            cuda_graph_modules=[CudaGraphModule.attn],
+            delay_offload_until_cuda_graph=delay_offload,
+            fine_grained_activation_offloading=True,
+        )
+        object.__setattr__(wrapper, '_has_offload_module_in_cuda_graph', lambda: offload_in_graph)
+        return wrapper
+
+    @staticmethod
+    def _bare_transformer_inner(*, has_attention, offload_core_attn, is_moe=False):
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        inner = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(inner)
+        inner.self_attention = torch.nn.Linear(2, 2) if has_attention else IdentityOp()
+        inner.cross_attention = IdentityOp()
+        inner.mlp = IdentityOp()
+        inner.offload_attn_norm = False
+        inner.offload_qkv_linear = False
+        inner.offload_core_attn = offload_core_attn
+        inner.offload_attn_proj = False
+        inner.offload_mlp_norm = False
+        inner.is_moe_layer = is_moe
+        return inner
+
+    @staticmethod
+    def _recording_offload_interface(calls):
+        class RecordingOffloadInterface:
+            @staticmethod
+            def backward_record(hidden_states):
+                calls.append('backward_record')
+                return hidden_states + 1
+
+            @staticmethod
+            def forward_record():
+                calls.append('forward_record')
+
+            @staticmethod
+            def enter_replay():
+                calls.append('enter_replay')
+
+            @staticmethod
+            def flush_delayed_groups():
+                calls.append('flush_delayed_groups')
+
+            @staticmethod
+            def exit_replay():
+                calls.append('exit_replay')
+
+        return RecordingOffloadInterface
+
     def test_hybrid_mtp_layers_are_flattened_and_adjacent_layers_are_grouped(self, monkeypatch):
         from megatron.core.transformer import cuda_graphs
 
@@ -1155,6 +1211,163 @@ class TestHybridTECudaGraphDiscovery:
         inner.is_mtp_layer = True
         head.layer_number, tail.layer_number = 1, 2
         assert head._can_group_te_cuda_graph_with(tail)
+
+    @pytest.mark.parametrize('offload_in_graph', [False, True])
+    def test_hybrid_offload_graph_replay_args_include_te_stream_and_event(
+        self, monkeypatch, offload_in_graph
+    ):
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface,
+        )
+
+        wrapper = self._bare_hybrid_wrapper(offload_in_graph=offload_in_graph)
+        graph_stream = object()
+        graph_event = object()
+        monkeypatch.setattr(
+            FineGrainedActivationOffloadingInterface, 'cuda_graph_stream', lambda: graph_stream
+        )
+        monkeypatch.setattr(
+            FineGrainedActivationOffloadingInterface, 'cuda_graph_event', lambda: graph_event
+        )
+
+        cudagraph_args, cudagraph_kwargs = wrapper._get_te_cuda_graph_replay_args(
+            torch.ones(2, 1, 4)
+        )
+
+        assert len(cudagraph_args) == 1
+        if offload_in_graph:
+            assert cudagraph_kwargs['cuda_graph_stream'] is graph_stream
+            assert cudagraph_kwargs['cuda_graph_event'] is graph_event
+        else:
+            assert 'cuda_graph_stream' not in cudagraph_kwargs
+            assert 'cuda_graph_event' not in cudagraph_kwargs
+
+    def test_hybrid_capture_records_offload_boundary_exactly_once(self):
+        calls = []
+        wrapper = self._bare_hybrid_wrapper(offload_in_graph=True)
+        object.__setattr__(wrapper, 'off_interface', self._recording_offload_interface(calls))
+        object.__setattr__(wrapper, '_get_te_cuda_graph_group_tail', lambda: None)
+        object.__setattr__(wrapper, '_inner_is_partial_moe_capture', lambda: False)
+
+        def forward(hidden_states, **_kwargs):
+            calls.append('body')
+            assert torch.equal(hidden_states, torch.full_like(hidden_states, 2))
+            return hidden_states * 2, None
+
+        object.__setattr__(wrapper, 'forward', forward)
+        output = wrapper._te_cuda_graph_capture(torch.ones(2, 1, 4))
+
+        assert calls == ['backward_record', 'body', 'forward_record']
+        assert torch.equal(output[0], torch.full((2, 1, 4), 4.0))
+
+    def test_grouped_hybrid_capture_has_one_outer_offload_boundary(self):
+        calls = []
+        head = self._bare_hybrid_wrapper(offload_in_graph=True)
+        tail = self._bare_hybrid_wrapper(offload_in_graph=True)
+        off_interface = self._recording_offload_interface(calls)
+        object.__setattr__(head, 'off_interface', off_interface)
+        object.__setattr__(tail, 'off_interface', off_interface)
+        object.__setattr__(head, '_get_te_cuda_graph_group_tail', lambda: tail)
+
+        def head_forward(hidden_states, **_kwargs):
+            calls.append('attention_body')
+            return hidden_states + 1, None
+
+        def tail_capture_impl(hidden_states, **_kwargs):
+            calls.append('moe_prefix_body')
+            return (hidden_states + 1,)
+
+        object.__setattr__(head, 'forward', head_forward)
+        object.__setattr__(tail, '_te_cuda_graph_capture_impl', tail_capture_impl)
+
+        output = head._te_cuda_graph_capture(torch.ones(2, 1, 4))
+
+        assert calls == ['backward_record', 'attention_body', 'moe_prefix_body', 'forward_record']
+        assert torch.equal(output[0], torch.full((2, 1, 4), 4.0))
+
+    def test_moe_only_tail_does_not_claim_attention_offload(self):
+        # Reproduce the stale inner-layer flag: cuda_graph_modules contains ``attn``
+        # globally even though this split Hybrid layer has no attention body.
+        inner = self._bare_transformer_inner(
+            has_attention=False, offload_core_attn=True, is_moe=True
+        )
+
+        tail = self._bare_hybrid_wrapper()
+        tail.inner_layer = inner
+        # Exercise the real predicate instead of the test helper override.
+        object.__delattr__(tail, '_has_offload_module_in_cuda_graph')
+
+        assert not tail._has_offload_module_in_cuda_graph()
+        assert not tail.offload_module_in_cuda_graph
+
+    def test_hybrid_offload_predicate_reads_real_inner_flags_and_group_tail(self):
+        attention_inner = self._bare_transformer_inner(has_attention=True, offload_core_attn=True)
+
+        attention_wrapper = self._bare_hybrid_wrapper()
+        attention_wrapper.inner_layer = attention_inner
+        object.__delattr__(attention_wrapper, '_has_offload_module_in_cuda_graph')
+        assert attention_wrapper.offload_module_in_cuda_graph
+
+        no_attention_inner = self._bare_transformer_inner(
+            has_attention=False, offload_core_attn=True, is_moe=True
+        )
+
+        group_head = self._bare_hybrid_wrapper()
+        group_head.inner_layer = no_attention_inner
+        object.__delattr__(group_head, '_has_offload_module_in_cuda_graph')
+        object.__setattr__(group_head, '_get_te_cuda_graph_group_tail', lambda: attention_wrapper)
+        assert group_head.offload_module_in_cuda_graph
+
+    @pytest.mark.parametrize(
+        ('delay_offload', 'tail_raises'), [(False, False), (True, False), (True, True)]
+    )
+    @pytest.mark.parametrize('grouped', [False, True])
+    def test_hybrid_partial_replay_preserves_delayed_offload_lifecycle(
+        self, monkeypatch, delay_offload, tail_raises, grouped
+    ):
+        calls = []
+        head = self._bare_hybrid_wrapper(delay_offload=delay_offload)
+
+        class Tail:
+            @staticmethod
+            def _resume_partial_moe_cuda_graph(_outputs):
+                calls.append('eager_tail')
+                if tail_raises:
+                    raise RuntimeError('eager tail failed')
+                return torch.full((2, 1, 4), 3.0), None
+
+        object.__setattr__(head, 'off_interface', self._recording_offload_interface(calls))
+        object.__setattr__(
+            head, '_get_te_cuda_graph_group_tail', lambda: Tail() if grouped else None
+        )
+        object.__setattr__(head, '_inner_is_partial_moe_capture', lambda: not grouped)
+        object.__setattr__(
+            head, '_resume_partial_moe_cuda_graph', Tail._resume_partial_moe_cuda_graph
+        )
+
+        def graph_replay(_self, *_args, **_kwargs):
+            calls.append('graph_replay')
+            return (torch.ones(2, 1, 4),)
+
+        monkeypatch.setattr(GraphableMegatronModule, '_te_cuda_graph_replay', graph_replay)
+
+        if tail_raises:
+            with pytest.raises(RuntimeError, match='eager tail failed'):
+                head._te_cuda_graph_replay(torch.ones(2, 1, 4))
+        else:
+            output = head._te_cuda_graph_replay(torch.ones(2, 1, 4))
+            assert torch.equal(output[0], torch.full((2, 1, 4), 3.0))
+
+        expected_calls = ['graph_replay', 'eager_tail']
+        if delay_offload:
+            expected_calls = [
+                'enter_replay',
+                'graph_replay',
+                'flush_delayed_groups',
+                'eager_tail',
+                'exit_replay',
+            ]
+        assert calls == expected_calls
 
 
 # Global storage for comparing unique buffer counts across different num_microbatches,
