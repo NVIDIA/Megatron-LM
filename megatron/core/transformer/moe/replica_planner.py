@@ -48,7 +48,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.fp8_utils import is_mxfp8tensor
-from megatron.core.transformer.moe.replica_weight_cutedsl import (
+from megatron.core.transformer.moe.replica_weight_triton import (
     MAX_REPLICA_WEIGHT_SMS,
     compile_replica_weight_kernels,
     launch_replica_grad_reduce,
