@@ -63,6 +63,7 @@ __all__ = [
     "EXPERT_CLASSIFIER",
     "ImplConfig",
     "PLACEMENT_FN",
+    "SUPPORTS_LOCAL_EXPERT_SHARD",
     "build_model",
     "build_model_config",
     "export_hf_weights",
@@ -70,6 +71,8 @@ __all__ = [
     "save_hf_weights",
     "vocab_size",
 ]
+
+SUPPORTS_LOCAL_EXPERT_SHARD = True
 
 # ---------------------------------------------------------------------------
 # ImplConfig

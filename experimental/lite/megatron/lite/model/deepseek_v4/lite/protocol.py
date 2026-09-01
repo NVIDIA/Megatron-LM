@@ -44,6 +44,9 @@ from megatron.lite.primitive.quantization import (
 from megatron.lite.runtime.contracts import OptimizerConfig, PackedBatch, ParallelConfig
 
 
+SUPPORTS_LOCAL_EXPERT_SHARD = True
+
+
 def is_expert_param(name: str) -> bool:
     return EXPERT_CLASSIFIER(name)
 

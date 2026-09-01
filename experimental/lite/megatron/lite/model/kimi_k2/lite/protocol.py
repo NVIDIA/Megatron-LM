@@ -30,6 +30,9 @@ from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
 
 
+SUPPORTS_LOCAL_EXPERT_SHARD = True
+
+
 def EXPERT_CLASSIFIER(name: str) -> bool:
     return "experts" in name and "router" not in name and "shared" not in name
 
@@ -302,6 +305,7 @@ __all__ = [
     "EXPERT_CLASSIFIER",
     "ImplConfig",
     "PLACEMENT_FN",
+    "SUPPORTS_LOCAL_EXPERT_SHARD",
     "build_model",
     "build_model_config",
     "export_hf_weights",

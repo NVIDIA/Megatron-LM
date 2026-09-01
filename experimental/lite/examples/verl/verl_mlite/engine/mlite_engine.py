@@ -505,8 +505,9 @@ class MegatronLiteEngine(BaseEngine):
         ep_size = int(getattr(ps, "ep_size", 1) or 1)
         rollout_ep = int(getattr(self.engine_config, "rollout_ep", 1) or 1)
         rollout_tp = int(getattr(self.engine_config, "rollout_tp", 1) or 1)
+        proto = self.handle._extras.get("protocol")
         if (
-            self._resolve_model_name() != "deepseek_v4"
+            not getattr(proto, "SUPPORTS_LOCAL_EXPERT_SHARD", False)
             or ep_size <= 1
             or rollout_ep != ep_size
             or rollout_tp != 1
