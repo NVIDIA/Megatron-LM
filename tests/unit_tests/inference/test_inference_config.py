@@ -167,6 +167,8 @@ class TestInferenceConfig:
         assert all(layer_config is not root_config for layer_config in layer_config_list)
         assert len({id(layer_config) for layer_config in layer_config_list}) == 2
         assert state_config.layer_config_list is layer_config_list
+        assert state_config.layer_type_list is None
+        assert dataclasses.replace(state_config).layer_config_list is layer_config_list
 
     def test_layer_config_list_is_preserved_without_deprecation_warning(self):
         """The config-list path preserves the supplied config objects."""

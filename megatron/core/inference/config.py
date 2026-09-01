@@ -104,8 +104,10 @@ class MambaInferenceStateConfig:
             raise ValueError("layer_type_list must be provided for conversion")
         if self.layer_config_list is not None:
             raise ValueError("layer_config_list is already populated")
-        self.layer_config_list = validate_segment_layers(''.join(self.layer_type_list), config)
-        return self.layer_config_list
+        layer_config_list = validate_segment_layers(''.join(self.layer_type_list), config)
+        self.layer_config_list = layer_config_list
+        self.layer_type_list = None
+        return layer_config_list
 
     @classmethod
     def from_model(
