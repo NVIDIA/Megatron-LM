@@ -341,8 +341,10 @@ def test_bytelevel_tokenizer():
     assert tokenizer.detokenize([72, 101, 108, 108, 111]) == "Hello"
 
 
-def test_write_metadata_hf():
-    tokenizer_path = "/opt/data/tokenizers/huggingface"
+def test_write_metadata_hf(tmp_path):
+    tokenizer_dir = tmp_path / "huggingface"
+    tokenizer_dir.mkdir()
+    tokenizer_path = str(tokenizer_dir)
     metadata_path = f"{tokenizer_path}/tokenizer_metadata.json"
     chat_template = "test chat template"
     tokenizer_library = "huggingface"
@@ -376,7 +378,7 @@ def test_write_metadata_hf():
     assert metadata['class_name'] == "CustomTokenizerClass"
 
     # Save metadata to specific path
-    metadata_path = f"{tokenizer_path}/test_metadata.json"
+    metadata_path = str(tmp_path / "test_metadata.json")
     MegatronTokenizer.write_metadata(
         tokenizer_path=tokenizer_path,
         metadata_path=metadata_path,
@@ -389,10 +391,10 @@ def test_write_metadata_hf():
     assert metadata['class_name'] == "MegatronTokenizerText"
 
 
-def test_write_metadata_sp():
+def test_write_metadata_sp(tmp_path):
     path = "/opt/data/tokenizers/sentencepiece"
     tokenizer_path = f"{path}/tokenizer.model"
-    metadata_path = f"{path}/test_metadata.json"
+    metadata_path = str(tmp_path / "test_metadata.json")
     tokenizer_library = "sentencepiece"
     MegatronTokenizer.write_metadata(
         tokenizer_path=tokenizer_path,
@@ -407,9 +409,9 @@ def test_write_metadata_sp():
     assert metadata['class_name'] == "MegatronTokenizerText"
 
 
-def test_write_metadata_vision():
+def test_write_metadata_vision(tmp_path):
     tokenizer_path = "/opt/data/tokenizers/multimodal"
-    metadata_path = f"{tokenizer_path}/test_metadata.json"
+    metadata_path = str(tmp_path / "test_metadata.json")
     MegatronTokenizer.write_metadata(
         tokenizer_path=tokenizer_path,
         metadata_path=metadata_path,
@@ -420,12 +422,12 @@ def test_write_metadata_vision():
         assert json.load(f)["class_name"] == "MegatronTokenizerVision"
 
 
-def test_own_metadata_class():
+def test_own_metadata_class(tmp_path):
     tokenizer_path = "/opt/data/tokenizers/huggingface"
     chat_template = "test chat template"
     tokenizer_library = "huggingface"
 
-    metadata_path = f"{tokenizer_path}/test_metadata.json"
+    metadata_path = str(tmp_path / "test_metadata.json")
     MegatronTokenizer.write_metadata(
         tokenizer_path=tokenizer_path,
         metadata_path=metadata_path,
@@ -601,6 +603,53 @@ class TestBuildTokenizer:
         assert tokenizer.chat_template == chat_template
         assert tokenizer._tokenizer.include_special_tokens == True
 
+    def test_build_hf_tokenizer_fast(self):
+        tokenizer_model = "/opt/data/tokenizers/huggingface"
+        tokenizer_type = "HuggingFaceTokenizer"
+        chat_template = get_chat_template()
+
+        config = TokenizerConfig(
+            tokenizer_model=tokenizer_model,
+            tokenizer_type=tokenizer_type,
+            pad_vocab_size=False,
+            chat_template=chat_template,
+            use_gigatoken=True,
+        )
+
+        tokenizer = build_tokenizer(config)
+
+        assert tokenizer.library == "huggingface"
+        assert tokenizer.chat_template == chat_template
+        assert tokenizer._tokenizer.include_special_tokens == True
+
+        config = TokenizerConfig(
+            tokenizer_model=tokenizer_model,
+            tokenizer_type=tokenizer_type,
+            pad_vocab_size=False,
+            chat_template=chat_template,
+            use_gigatoken=False,
+        )
+
+        tokenizer_default = build_tokenizer(config)
+
+        # Verify gigatoken matches with default implementation
+        text = "Hi how are you? How was your day? :)"
+        ids = [128000, 13347, 1268, 527, 499, 30, 2650, 574, 701, 1938, 30, 27046]
+        assert tokenizer.tokenize(text) == tokenizer_default.tokenize(text)
+        assert (
+            tokenizer.detokenize(ids)
+            == tokenizer_default.detokenize(ids)
+            == f"<|begin_of_text|>{text}"
+        )
+        assert (
+            tokenizer.additional_special_tokens_ids
+            == tokenizer_default.additional_special_tokens_ids
+        )
+        assert tokenizer.eod == tokenizer_default.eod
+        assert tokenizer.sep_id == tokenizer_default.sep_id
+        assert tokenizer.vocab_size == tokenizer_default.vocab_size
+        assert tokenizer.vocab == tokenizer_default.vocab
+
     def test_build_megatron_tokenizer(self):
         special_tokens = [f'<extra_id_{i}>' for i in range(100)]
         vocab_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
@@ -618,6 +667,50 @@ class TestBuildTokenizer:
 
         assert tokenizer.library == "megatron"
         assert tokenizer.chat_template == None
+
+    def test_build_megatron_tokenizer_fast(self):
+        special_tokens = [f'<extra_id_{i}>' for i in range(100)]
+        vocab_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
+        merges_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
+
+        config = TokenizerConfig(
+            tokenizer_type="GPT2BPETokenizer",
+            vocab_file=vocab_file,
+            merge_file=merges_file,
+            special_tokens=special_tokens,
+            pad_vocab_size=False,
+            use_gigatoken=True,
+        )
+
+        tokenizer = build_tokenizer(config)
+
+        assert tokenizer.library == "megatron"
+        assert tokenizer.chat_template == None
+
+        config = TokenizerConfig(
+            tokenizer_type="GPT2BPETokenizer",
+            vocab_file=vocab_file,
+            merge_file=merges_file,
+            special_tokens=special_tokens,
+            pad_vocab_size=False,
+            use_gigatoken=False,
+        )
+
+        tokenizer_default = build_tokenizer(config)
+
+        # Verify gigatoken matches with default implemetation
+        text = "Hi how are you? How was your day? :)"
+        ids = [17250, 703, 389, 345, 30, 1374, 373, 534, 1110, 30, 14373]
+        assert tokenizer.tokenize(text) == tokenizer_default.tokenize(text)
+        assert tokenizer.detokenize(ids) == tokenizer_default.detokenize(ids) == f"{text}"
+        assert (
+            tokenizer.additional_special_tokens_ids
+            == tokenizer_default.additional_special_tokens_ids
+        )
+        assert tokenizer.eod == tokenizer_default.eod
+        assert tokenizer.sep_id == tokenizer_default.sep_id
+        assert tokenizer.vocab_size == tokenizer_default.vocab_size
+        assert tokenizer.vocab == tokenizer_default.vocab
 
     def test_build_sp_tokenizer(self):
         tokenizer_model = "/opt/data/tokenizers/sentencepiece/tokenizer.model"

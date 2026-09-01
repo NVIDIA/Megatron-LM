@@ -9,16 +9,15 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    Flat,
-    Partial,
     Placements,
-    Replicate,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import Flat
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
 logger = logging.getLogger(__name__)
@@ -53,20 +52,19 @@ class ElementwiseModel(nn.Module):
 
 
 def _flat_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+    return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
 def _zero1_placements() -> Placements:
     return Placements(
-        dp_axes=[0],
-        parameter=[Replicate()],
-        gradient=[Partial(dist.ReduceOp.AVG)],
-        optimizer=[Flat()],
+        dp_axes=[0], parameter=[Replicate()], gradient=[Partial("avg")], optimizer=[Shard(0)]
     )
 
 
 def _zero2_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Replicate()], gradient=[Flat()], optimizer=[Flat()])
+    return Placements(
+        dp_axes=[0], parameter=[Replicate()], gradient=[Shard(0)], optimizer=[Shard(0)]
+    )
 
 
 def _mb(num_bytes: int) -> str:
@@ -156,7 +154,10 @@ def test_training_step_peak_memory_bounds_full_size_buffers(
         model(x).float().sum().backward()
         optimizer.step()
 
-    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
+    # Warm up so cuBLAS's workspaces land in resting_allocated rather than in peak_delta,
+    # which would otherwise depend on whether an earlier test already allocated them.
+    train_step()
+
     resting_allocated = torch.cuda.memory_allocated(device)
     torch.cuda.reset_peak_memory_stats(device)
     train_step()
@@ -166,15 +167,16 @@ def test_training_step_peak_memory_bounds_full_size_buffers(
     # child also has a full wgrad until it is copied into a full reduce-scatter input.
     # With separate streams, their allocation cannot reuse the released full-weight
     # storage, for a four-buffer peak. With a unified stream, the release precedes the
-    # allocation on that stream, reducing the peak to three. Allow one additional buffer
-    # for cuBLAS workspace, allocator granularity, and small temporaries.
-    full_buffer_bound = 4 if unify_communication_stream else 5
-    bound_nbytes = full_buffer_bound * child_weight_nbytes
+    # allocation on that stream, reducing the peak to three. The slack on top covers
+    # allocator granularity and small temporaries, measured at ~169 KiB.
+    child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
+    full_buffer_bound = 3 if unify_communication_stream else 4
+    bound_nbytes = full_buffer_bound * child_weight_nbytes + 1024**2
 
     assert peak_delta < bound_nbytes, (
         "FSDP training-step peak memory exceeded the full-size-buffer bound: "
         f"rank={rank}, peak_delta={_mb(peak_delta)}, "
-        f"{full_buffer_bound}_full_child_buffers={_mb(bound_nbytes)}"
+        f"bound={_mb(bound_nbytes)} ({full_buffer_bound} full child buffers + 1.00 MB)"
     )
 
 
