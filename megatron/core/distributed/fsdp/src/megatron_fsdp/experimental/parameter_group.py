@@ -380,10 +380,6 @@ class FsdpParameterGroup:
         assert self.main_grad is not None
         assert self.pre_optimizer_main_grad is not None
 
-        def install_sharded_grads(grad: DBuffer) -> None:
-            for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-                fsdp_parameter.sharded.grad = grad.get_dtensor(index)
-
         # zero_grad(set_to_none=True) clears sharded parameter grads, so this
         # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
         # leaves sharded grads installed, so this backward accumulates into main_grad.
@@ -414,6 +410,10 @@ class FsdpParameterGroup:
                 self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
             else:
                 self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
+
+        def install_sharded_grads(main_grad: DBuffer) -> None:
+            for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+                fsdp_parameter.sharded.grad = main_grad.get_dtensor(index)
 
         if is_last_microbatch and self.pre_optimizer_main_grad is not self.main_grad:
             # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
