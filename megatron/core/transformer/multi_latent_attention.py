@@ -62,7 +62,10 @@ if HAVE_TE:
     import transformer_engine_torch as tex
 
     try:
-        from transformer_engine.pytorch.attention import FusedMLAQUpProjFunction, FusedMLAQUpProjRopeQuant
+        from transformer_engine.pytorch.attention import (
+            FusedMLAQUpProjFunction,
+            FusedMLAQUpProjRopeQuant,
+        )
     except ImportError:
         FusedMLAQUpProjFunction = None
         FusedMLAQUpProjRopeQuant = None
@@ -215,7 +218,8 @@ class MultiLatentAttention(Attention):
         # Fused MLA Q up-proj+rope+quant via cuDNN gemm_proj_rope_mxfp8.
         # The q_layernorm is absorbed into the fusion so that MXFP8 is produced in one step
         # from the norm's FP32 accumulator, as TELayerNormColumnParallelLinear does; that
-        # requires the norm to exist and to be an RMSNorm (because currently it is only tested with DSv3 which uses RMSNorm)
+        # requires the norm to exist and to be an RMSNorm (because currently it is only
+        # tested with DSv3 which uses RMSNorm)
         self._use_fused_q_uproj = (
             getattr(self.config, "use_fused_mla_q_uproj", False)
             and FusedMLAQUpProjRopeQuant is not None
@@ -796,8 +800,16 @@ class MLASelfAttention(MultiLatentAttention):
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
             else:
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+            rope_max_seqlen_q = packed_seq_params.max_seqlen_q
+            rope_max_seqlen_kv = packed_seq_params.max_seqlen_kv
+            rope_freqs_max_seqlen = (
+                max(rope_max_seqlen_q, rope_max_seqlen_kv)
+                if rope_max_seqlen_q is not None and rope_max_seqlen_kv is not None
+                else None
+            )
         else:
             cu_seqlens_q = cu_seqlens_kv = None
+            rope_freqs_max_seqlen = None
 
         # =========================================
         # QKV down projection and layernorm
@@ -1054,6 +1066,7 @@ class MLASelfAttention(MultiLatentAttention):
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
+                    max_seqlen=rope_freqs_max_seqlen,
                 )
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
                 k_pos_emb = apply_rotary_pos_emb(
@@ -1064,6 +1077,7 @@ class MLASelfAttention(MultiLatentAttention):
                     mscale=mscale,
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
+                    max_seqlen=rope_freqs_max_seqlen,
                 )
 
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]

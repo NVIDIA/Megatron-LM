@@ -1532,6 +1532,7 @@ def test_parallel_multi_latent_attention_correctness(
     with TempNamedDir(tmp_path_dist_ckpt / 'test_parallel_mla', sync=True) as ckpt_dir:
         # Set argument
         mock_args = parse_args(ignore_unknown_args=True)
+        mock_args.save_tokenizer_assets = False
         set_args(mock_args)
 
         # Initialize baseline model
@@ -2078,7 +2079,10 @@ class TestFusedMLAQUpProjIntegration:
         from transformer_engine.pytorch.cpp_extensions import general_gemm as _te_general_gemm
         from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
 
-        if mla_module.FusedMLAQUpProjRopeQuant is None or not FusedMLAQUpProjRopeQuant.is_supported():
+        if (
+            mla_module.FusedMLAQUpProjRopeQuant is None
+            or not FusedMLAQUpProjRopeQuant.is_supported()
+        ):
             pytest.skip("Fused MLA Q up-projection requires SM100+ and cuDNN frontend 1.27+")
         if mla_module.fused_apply_mla_rope_for_q is None:
             pytest.skip("fused_apply_mla_rope_for_q not available")
@@ -2088,11 +2092,11 @@ class TestFusedMLAQUpProjIntegration:
         # DSv3 671B dims
         S, B = 256, 1
         NH = 128
-        QK_HEAD_DIM = 128   # NOPE head dim
-        QK_ROPE_DIM = 64    # ROPE head dim
-        Q_HEAD_DIM = QK_HEAD_DIM + QK_ROPE_DIM   # 192
+        QK_HEAD_DIM = 128  # NOPE head dim
+        QK_ROPE_DIM = 64  # ROPE head dim
+        Q_HEAD_DIM = QK_HEAD_DIM + QK_ROPE_DIM  # 192
         Q_LORA_RANK = 1536
-        PROJ_DIM = NH * Q_HEAD_DIM               # 24576
+        PROJ_DIM = NH * Q_HEAD_DIM  # 24576
         BLOCK = 32
         E8M0_BIAS = 127
         device = torch.device("cuda")
@@ -2135,7 +2139,9 @@ class TestFusedMLAQUpProjIntegration:
             x_mxfp8,  # B = input  (S*B,       Q_LORA_RANK), not transposed
             layout="TN",
             out_dtype=torch.bfloat16,
-        )[0].view(S, B, NH, Q_HEAD_DIM)  # → (S*B, PROJ_DIM) then reshape
+        )[0].view(
+            S, B, NH, Q_HEAD_DIM
+        )  # → (S*B, PROJ_DIM) then reshape
 
         # Step 2: RoPE.  fused_apply_mla_rope_for_q expects (S, B, NH, Q_HEAD_DIM) when
         # cu_seqlens_q=None, and cos/sin as (tokens, QK_ROPE_DIM).
@@ -2146,17 +2152,13 @@ class TestFusedMLAQUpProjIntegration:
             QK_HEAD_DIM,
             QK_ROPE_DIM,
             None,  # cu_seqlens_q
-            0,     # cp_rank
-            1,     # cp_size
+            0,  # cp_rank
+            1,  # cp_size
         )  # → (S, B, NH, Q_HEAD_DIM) bf16
 
         # Step 3: Quantize.  Same quantizer + format as _QuantizeKVForFusedAttn uses for K/V.
-        q_quantizer = MXFP8Quantizer(
-            fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True
-        )
-        (query_unfused,) = mxfp8_quantize_only(
-            [(query_bf16.contiguous(), q_quantizer)], "sbhd"
-        )
+        q_quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+        (query_unfused,) = mxfp8_quantize_only([(query_bf16.contiguous(), q_quantizer)], "sbhd")
 
         # ── Compare ───────────────────────────────────────────────────────────────────
         # Compare MXFP8 Q from both paths directly.  Each path applies E4M3 quantization
