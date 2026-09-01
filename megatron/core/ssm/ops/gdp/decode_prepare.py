@@ -16,6 +16,12 @@ tensors the recurrent kernel consumes in exactly the layouts it wants. It is
 CUDA-graph safe for the same reasons as the rest of this package: static
 shapes, no host synchronization, and padding handled by the conv kernel
 upstream (a `-1` slot zeroes its conv output, which propagates here).
+
+It is deterministic: a pure elementwise map where each program owns a disjoint
+slice of every output, with no atomics, no reductions and no autotuning, so
+nothing depends on scheduling order. That is reproducibility against itself,
+not bitwise agreement with the eager path -- `beta` and `g` use libdevice
+`exp`/`log1p` rather than torch's `sigmoid`/`softplus` and may land a ulp apart.
 """
 
 import torch
