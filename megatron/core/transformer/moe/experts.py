@@ -1022,7 +1022,10 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
-        if self.activation_recompute:
+        use_activation_recompute = (
+                self.activation_recompute and torch.is_grad_enabled()
+            )
+        if use_activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             with moe_act_manager as fc1_output:
                 bias_act_output = self.activation_checkpoint.checkpoint(
@@ -1032,7 +1035,8 @@ class TEGroupedMLP(MegatronModule):
             with moe_act_manager as fc1_output:
                 bias_act_output = bias_act_func(fc1_output, bias_parallel, permuted_probs)
         output, output_bias = apply_module(self.linear_fc2)(bias_act_output, tokens_per_expert)
-        if self.activation_recompute:
+
+        if use_activation_recompute:
             self.activation_checkpoint.discard_output_and_register_recompute(output)
 
         # Delay the offload of the moe act until after the linear_fc2 has been computed
