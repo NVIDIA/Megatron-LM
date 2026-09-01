@@ -4,6 +4,7 @@ import copy
 
 import pytest
 import torch
+import torch._dynamo
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
@@ -90,6 +91,9 @@ def gdn_process_group_collection():
     cp_group = parallel_state.get_context_parallel_group()
     yield ProcessGroupCollection(tp=tp_group, cp=cp_group)
     Utils.destroy_model_parallel()
+    # These standalone tests compile GDNs before the parametrized TP/CP matrix.
+    # Do not let their process-global Dynamo cache change later tests' execution mode.
+    torch._dynamo.reset()
 
 
 def _build_gdn_for_l2norm_test(pg_collection, gdn_use_qk_l2norm_in_kernel, use_qk_l2norm=True):
@@ -375,8 +379,6 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
         )
 
     def test_jit_compiled_helpers(self):
-        import torch._dynamo
-
         gdn = self.gdn
         batch = 2
         seq_len = 16
