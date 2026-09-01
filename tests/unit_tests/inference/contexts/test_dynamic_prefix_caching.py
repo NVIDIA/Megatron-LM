@@ -9,7 +9,10 @@ import pytest
 import torch
 
 from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictionPolicy
-from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.contexts.dynamic_context import (
+    BlockOverflowError,
+    DynamicInferenceContext,
+)
 from megatron.core.inference.contexts.mamba_slot_allocator import (
     MambaSlotAllocator,
     MambaSlotCapacityError,
@@ -540,6 +543,53 @@ class TestPrefixCachingCore(PrefixCachingTestBase):
         assert alloc.kv_hash_to_block_id[h1] == s1
 
     @pytest.mark.internal
+    def test_failed_partial_hit_admission_rolls_back_and_retries(self):
+        """A failed allocation must not pin or double-count a matched prefix."""
+        ctx = self._ctx()
+        alloc = ctx.kv_block_allocator
+        bs = ctx.block_size_tokens
+
+        producer = self._req(ctx, self._prompt(2 * bs))
+        ctx.add_request(producer)
+        matched_blocks = self._block_ids(ctx, 0, 2)
+        matched_hashes = list(producer.precomputed_block_hashes)
+        ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
+        ctx.total_request_count = 0
+
+        # Keep every raw pool block in use. The only allocatable blocks are the
+        # two cached matches, which the follower pins before requesting its tail.
+        drained = alloc.allocate_memory_blocks(alloc.pool_avail)
+        assert drained is not None
+        assert alloc.pool_avail == 0
+        assert int(alloc.get_evictable_block_count()) == 2
+
+        follower = self._req(ctx, self._prompt(3 * bs), request_id=2)
+        hits_before = ctx.prefix_cache_hits
+        blocks_before = ctx.prefix_cache_blocks_matched
+        with pytest.raises(BlockOverflowError):
+            ctx.add_request(follower)
+
+        assert ctx.total_request_count == 0
+        assert follower.num_cached_tokens == 0
+        assert ctx.prefix_cache_hits == hits_before
+        assert ctx.prefix_cache_blocks_matched == blocks_before
+        assert [alloc.block_ref_counts[block].item() for block in matched_blocks] == [0, 0]
+        assert all(
+            alloc.kv_hash_to_block_id[hash_] == block
+            for hash_, block in zip(matched_hashes, matched_blocks)
+        )
+
+        # Releasing one unregistered block makes the retry succeed. The prefix
+        # is counted once, and the cached blocks stay shared rather than evicted.
+        alloc.release_memory_blocks(drained[:1])
+        ctx.add_request(follower)
+        assert follower.num_cached_tokens == 2 * bs
+        assert ctx.prefix_cache_hits == hits_before + 1
+        assert ctx.prefix_cache_blocks_matched == blocks_before + 2
+        assert self._block_ids(ctx, 0, 2) == matched_blocks
+        assert len(set(self._block_ids(ctx, 0, 3))) == 3
+
+    @pytest.mark.internal
     def test_check_availability_excludes_already_pinned_matches(self):
         """check_availability reserves only matched blocks that are currently
         evictable (ref_count == 0). A matched prefix already pinned by an
@@ -826,6 +876,9 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         for bid in first_blocks:
             assert alloc.block_ref_counts[bid].item() == 2
         # all tokens processed (none skipped)
+        assert req2.num_cached_tokens == 0
+        assert ctx.prefix_cache_hits == 1
+        assert ctx.prefix_cache_blocks_matched == 3
         assert ctx.active_token_count - tokens_after == len(prompt)
         assert ctx.request_kv_length_offsets[1].item() == 0
 
@@ -1000,6 +1053,10 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req2._mamba_num_matched_blocks = 1
         matched, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3 and prefix_skip == bs and eff_chunk == len(prompt) - bs
+        ctx.add_request(req2)
+        assert req2.num_cached_tokens == prefix_skip
+        assert ctx.prefix_cache_hits == 1
+        assert ctx.prefix_cache_blocks_matched == 3
 
         # no mamba match means no skip
         ctx2 = self._mctx()
@@ -1010,7 +1067,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         m2, _, _, _, ps2, ec2 = ctx2._compute_prefix_match(req2b, len(p2))
         assert len(m2) == 3 and ps2 == 0 and ec2 == len(p2)
 
-        # zero prefill for hybrid (mamba-cached, block-aligned)
+        # a full hybrid match backs off to one prefill block
         ctx3 = self._mctx()
         p3 = self._prompt(bs * 3)
         ctx3.add_request(self._req(ctx3, p3.clone()))
@@ -1019,6 +1076,10 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         req3._mamba_num_matched_blocks = 3
         m3, _, _, _, ps3, ec3 = ctx3._compute_prefix_match(req3, len(p3))
         assert len(m3) == 3 and ps3 == 2 * bs and ec3 == bs
+        ctx3.add_request(req3)
+        assert req3.num_cached_tokens == ps3
+        assert ctx3.prefix_cache_hits == 1
+        assert ctx3.prefix_cache_blocks_matched == 3
 
         # KV-only prefix skip with non-block-aligned prompt: all 3 full blocks
         # are skipped and only the trailing tokens remain for prefill.

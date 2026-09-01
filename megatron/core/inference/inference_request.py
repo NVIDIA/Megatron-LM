@@ -671,7 +671,8 @@ class DynamicInferenceRequest(InferenceRequest):
     # Prefix caching fields
     block_size_tokens: Optional[int] = None  # Block size for hash computation
     enable_prefix_caching: bool = False  # Whether prefix caching is enabled
-    num_cached_tokens: int = 0  # Tokens served from prefix cache (set by context on first match)
+    # Prompt tokens whose prefill was skipped via prefix caching; accumulated across chunks.
+    num_cached_tokens: int = 0
     # Length of the leading run of this request's blocks that was obtained by hash
     # match rather than computed. Accumulated across prefill chunks by the context,
     # which uses it to avoid rewriting KV into blocks that already hold it.
