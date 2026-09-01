@@ -81,9 +81,7 @@ def weighted_clamped_squared_relu(
         torch.Tensor: The weighted activation with original ``dtype`` preserved.
     """
     out_dtype = x.dtype
-    t = _tanh_relu_over_scale(x, clamp_scale)
-
-    c = (clamp_scale * t).to(out_dtype)
+    c = clamp_scale * _tanh_relu_over_scale(x, clamp_scale)
     res = torch.pow(c, 2) * weights
     return res.to(out_dtype)
 
@@ -100,12 +98,12 @@ def weighted_clamped_squared_relu_back(
     w_dtype = weights.dtype
 
     t = _tanh_relu_over_scale(x, clamp_scale)
-    c = (clamp_scale * t).to(input_dtype)
+    c = clamp_scale * t
     act = torch.pow(c, 2)
 
     input_grad = (1 - torch.pow(t, 2)) * (2 * c) * g * weights
 
-    weights_grad = act.float() * g.float()
+    weights_grad = act * g.float()
 
     weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
 

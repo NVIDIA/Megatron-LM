@@ -406,6 +406,9 @@ class TEGroupedMLP(MegatronModule):
             return False  # Selective expert_fc1/moe_act offload is only supported unfused.
         if self.config.moe_apply_probs_on_input:
             return False  # Pre-multiplying probs is not supported
+        if self.config.activation_func_tanh_clamp_scale is not None:
+            # TanH clamp is not supported.
+            return False
 
         # Check grouped linear modules
         if not isinstance(self.linear_fc1, te.pytorch.GroupedLinear):

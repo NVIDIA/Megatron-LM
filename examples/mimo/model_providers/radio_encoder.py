@@ -72,8 +72,6 @@ def _base_config(args: argparse.Namespace) -> TransformerConfig:
 
 def _make_dense_non_hybrid(config: TransformerConfig) -> None:
     """Strip language-only MoE/Mamba/hybrid and activation-clamp settings from the base config."""
-    # The decoder's activation soft clamp (tanh clamp, or SiTU-GLU for a gated activation) would
-    # otherwise replace the activation a pretrained vision tower or projector was trained with.
     config.activation_func_tanh_clamp_scale = None
     config.activation_func_tanh_clamp_scale_linear = None
     config.num_moe_experts = None

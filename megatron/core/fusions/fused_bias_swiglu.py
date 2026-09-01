@@ -77,9 +77,9 @@ def clamped_weighted_swiglu(y, weights, clamp_value):
 
 @jit_fuser
 def _tanh_clamp_and_deriv(y: torch.Tensor, clamp_scale: float):
-    """Soft-clamps ``y`` and returns the clamp derivative alongside it."""
+    """Soft-clamps ``y`` and returns the clamp derivative alongside it, both in fp32."""
     t = torch.tanh(y.float() / clamp_scale)
-    return (clamp_scale * t).to(y.dtype), 1 - t * t
+    return clamp_scale * t, 1 - t * t
 
 
 @jit_fuser
@@ -88,10 +88,10 @@ def situ_glu(y, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
     dtype = y.dtype
     y_1, y_2 = torch.chunk(y, 2, -1)
     c, _ = _tanh_clamp_and_deriv(y_1, gate_clamp_scale)
-    gate = (c * torch.sigmoid(y_1)).to(dtype)
+    gate = c * torch.sigmoid(y_1)
     if linear_clamp_scale is not None:
         y_2, _ = _tanh_clamp_and_deriv(y_2, linear_clamp_scale)
-    return gate * y_2
+    return (gate * y_2).to(dtype)
 
 
 @jit_fuser
@@ -197,17 +197,16 @@ def clamped_weighted_swiglu_back(g, y, weights, clamp_value):
 @jit_fuser
 def _situ_glu_grads(g, y, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
     """Gradients of SiTU-GLU w.r.t. the two halves of ``y``, kept in fp32."""
-    dtype = y.dtype
     y_1, y_2 = torch.chunk(y, 2, -1)
     c, sech2 = _tanh_clamp_and_deriv(y_1, gate_clamp_scale)
     sig = torch.sigmoid(y_1)
-    gate = (c * sig).to(dtype)
+    gate = c * sig
     if linear_clamp_scale is not None:
         lin, lin_sech2 = _tanh_clamp_and_deriv(y_2, linear_clamp_scale)
         dy_2 = lin_sech2 * gate * g
     else:
         lin = y_2
-        dy_2 = gate.float() * g
+        dy_2 = gate * g
     dy_1 = (sech2 + c * (1 - sig)) * sig * lin * g
     return dy_1, dy_2
 
