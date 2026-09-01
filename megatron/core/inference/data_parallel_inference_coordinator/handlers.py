@@ -151,10 +151,14 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     ):
         request_hashes = msgpack.unpackb(bodies[1], raw=False)
         if request_hashes is None:
-            # The client could not hash: it was handed a string prompt and has no
-            # tokenizer. This one has, so it hashes here and pays the decode.
-            # Distinct from an empty list, which means the client hashed and the
-            # prompt was shorter than a block.
+            # Nobody hashed this upstream, so it is hashed here and pays the prompt
+            # decode. Two cases reach this: a multimodal request, whose hashes are
+            # salted with a media key that is only derived further down the client,
+            # and a string prompt, which needs a tokenizer the caller may not have.
+            #
+            # Distinct from an empty list, which means the caller did hash and the
+            # prompt was shorter than one block. Re-hashing that would pay the
+            # decode for every short request.
             request_hashes = coordinator.compute_request_hashes(
                 msgpack.unpackb(prompt_frame, raw=False), cache_salt=media_cache_key
             )
