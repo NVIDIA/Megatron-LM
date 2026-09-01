@@ -88,21 +88,29 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
 
     Sent by ``InferenceClient.add_request`` / ``add_request_streaming``.
 
-    ``metadata``: ``[header, client_request_id, sampling_params, multi_modal_data]``,
-        where ``sampling_params`` is the serialized dict and ``multi_modal_data``
-        carries the media identity the routing policy keys on. Both are
-        constant-size, which is why they are decoded here on every request.
-    ``bodies``: ``[prompt, block_hashes]``.
+    ``metadata``: ``[header, client_request_id, sampling_params, media_meta]``,
+        where ``sampling_params`` is the serialized dict and ``media_meta`` is the
+        bounded media descriptor -- a content key plus modality and token-expansion
+        flags -- carrying the identity the routing policy keys on. Both are small
+        by construction, which is why they are decoded and repacked here on every
+        request.
+    ``bodies``: ``[prompt, block_hashes, media]``.
 
         ``prompt`` is a string or token id list. It is forwarded to the engine
         verbatim and never decoded here, which is the point of the split.
 
         ``block_hashes`` is decoded here, used to pick a rank, and not forwarded:
         the engine computes its own KV hashes. One int per block rather than per
-        token, which is why it is a body frame and not part of the constant-size
-        metadata. ``None`` means the client did not hash and this handler must,
-        paying the prompt decode; an empty list means it did hash and the prompt
-        was shorter than one block.
+        token, which is why it is a body frame and not part of the metadata.
+        ``None`` means the client did not hash and this handler must, paying the
+        prompt decode; an empty list means it did hash and the prompt was shorter
+        than one block.
+
+        ``media`` is the raw image or video bytes, or serialized preprocessed
+        tensors, and is None for a text-only request. Like the prompt it is
+        forwarded verbatim and never decoded here: it is the largest thing on the
+        wire, and decoding it per request would cost this one serial loop far more
+        than the prompt decode the split already removed.
 
     Returns True (stopping the loop) if no engines are reachable.
     """
@@ -115,7 +123,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     # rank and every client, so an IndexError raised out of it takes the whole
     # coordinator down; a client that framed its request wrongly should only cost
     # itself that request.
-    if len(metadata) != 4 or len(bodies) != 2:
+    if len(metadata) != 4 or len(bodies) != 3:
         logging.error(
             "Coordinator: malformed SUBMIT_REQUEST with %d metadata fields, %d bodies",
             len(metadata) - 1,
@@ -123,8 +131,9 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         )
         return
 
-    _, client_request_id, sampling_params, multi_modal_data = metadata
+    _, client_request_id, sampling_params, media_meta = metadata
     prompt_frame = bodies[0]
+    media_frame = bodies[2]
 
     # map client request_id to server request_id
     # necessary because multiple clients might have the same request_id.
@@ -134,17 +143,16 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
-    # Rebuilding the metadata frame is cheap: it holds no prompt tokens.
+    # Rebuilding the metadata frame is cheap: it holds neither prompt tokens nor
+    # media bytes, only the bounded media descriptor.
     engine_metadata = msgpack.packb(
-        [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, multi_modal_data],
-        use_bin_type=True,
+        [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, media_meta], use_bin_type=True
     )
 
     # Media identity is read straight from the metadata frame; it salts the
-    # routing hashes and is passed to rank selection for media affinity.
-    media_cache_key = (
-        multi_modal_data.get("media_cache_key") if isinstance(multi_modal_data, dict) else None
-    )
+    # routing hashes and is passed to rank selection for media affinity. The
+    # media itself rides in its own body frame, forwarded without being decoded.
+    media_cache_key = media_meta.get("media_cache_key") if isinstance(media_meta, dict) else None
 
     # Only prefix-affinity routing consults the block hashes. When nothing will
     # look at them, skip hashing *and* the prompt decode it needs -- avoiding
@@ -163,8 +171,10 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
             # decode. Two cases reach this: a client built directly rather than by
             # the frontend, which is told neither the block size nor the policy,
             # and a string prompt, which needs a tokenizer the client may not have.
-            # Multimodal no longer lands here -- the client salts it with the media
-            # key it derives while serializing.
+            # Either can carry media, which is why the media key is still passed as
+            # the salt: a client always derives that key while serializing, even
+            # when it cannot hash. A client that *is* configured salts its own
+            # hashes and never lands here.
             #
             # Distinct from an empty list, which means the caller did hash and the
             # prompt was shorter than one block. Re-hashing that would pay the
@@ -186,7 +196,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         next_identity = coordinator.get_best_data_parallel_rank(
             request_hashes, media_cache_key=media_cache_key
         )
-        if coordinator._send_to_engine(next_identity, [engine_metadata, prompt_frame]):
+        if coordinator._send_to_engine(next_identity, [engine_metadata, prompt_frame, media_frame]):
             break
     else:
         # If all engines have died, we are in an abnormal state, and must exit cleanly.

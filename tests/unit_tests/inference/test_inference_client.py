@@ -72,13 +72,15 @@ async def test_inference_client_lifecycle():
     sent_connect = fake_socket.send.call_args.args[0]
     assert msgpack.unpackb(sent_connect, raw=False)[0] == Headers.CONNECT.value
 
-    # add_request frames the submission as [metadata, prompt, block_hashes] so the
-    # coordinator can route it without decoding the prompt.
+    # add_request frames the submission as [metadata, prompt, block_hashes, media]
+    # so the coordinator can route it without decoding the prompt or the media.
     fut = client.add_request("hello", SamplingParams(temperature=0.5))
     assert isinstance(fut, asyncio.Future)
     assert client.next_request_id == 1
     assert 0 in client.request_submission_times
-    submit_meta, submit_prompt, submit_hashes = fake_socket.send_multipart.call_args.args[0]
+    submit_meta, submit_prompt, submit_hashes, submit_media = (
+        fake_socket.send_multipart.call_args.args[0]
+    )
     submit_payload = msgpack.unpackb(submit_meta, raw=False)
     assert submit_payload[0] == Headers.SUBMIT_REQUEST.value
     assert submit_payload[1] == 0
@@ -87,6 +89,9 @@ async def test_inference_client_lifecycle():
     # This client was told no block size, so it reports None -- "I did not hash" --
     # and the coordinator hashes on its behalf.
     assert msgpack.unpackb(submit_hashes, raw=False) is None
+    # Text-only, so the media frame is present but empty: the frame count is fixed
+    # so the coordinator can reject a malformed submission on arity alone.
+    assert msgpack.unpackb(submit_media, raw=False) is None
 
     # Listener delivers the reply: future resolves with payload + injected latency.
     # Submission-time entry is popped on completion.
@@ -237,6 +242,51 @@ async def test_multimodal_hashes_are_salted_with_the_media_key():
         block_size=4,
         cache_salt=compute_media_cache_key("image", [b"jpeg"]),
     )
+
+
+async def test_media_bytes_travel_in_their_own_frame():
+    """Media rides in a body frame; only its bounded descriptor is metadata.
+
+    The coordinator decodes and repacks the metadata frame for every request, so
+    anything unbounded in it is paid for on a loop shared by every rank. Raw
+    video reaches hundreds of megabytes, which is three orders of magnitude more
+    than the prompt decode the earlier split removed.
+    """
+    from megatron.core.inference.inference_request import compute_media_cache_key
+
+    client, fake_socket = _configured_client()
+    image = b"jpeg-payload"
+
+    client.add_request(list(range(8)), SamplingParams(), multi_modal_data={"image": image}).cancel()
+    meta_frame, _prompt, _hashes, media_frame = fake_socket.send_multipart.call_args.args[0]
+
+    media_meta = msgpack.unpackb(meta_frame, raw=False)[3]
+    assert media_meta == {
+        "media_cache_key": compute_media_cache_key("image", [image]),
+        "modality": "image",
+    }
+    # The bytes are in the body frame, and nowhere in the metadata frame.
+    assert msgpack.unpackb(media_frame, raw=False) == [image]
+    assert image not in meta_frame
+
+
+async def test_media_frames_round_trip_back_to_serialized_form():
+    """What the engine reassembles from the two frames is what was serialized."""
+    from megatron.core.inference.inference_request import (
+        merge_multimodal_data,
+        serialize_multimodal_data,
+    )
+
+    client, fake_socket = _configured_client()
+    multi_modal_data = {"image": [b"a", b"bb"], "media_tokens_preexpanded": True}
+
+    client.add_request(list(range(8)), SamplingParams(), multi_modal_data=multi_modal_data).cancel()
+    meta_frame, _prompt, _hashes, media_frame = fake_socket.send_multipart.call_args.args[0]
+
+    reassembled = merge_multimodal_data(
+        msgpack.unpackb(meta_frame, raw=False)[3], msgpack.unpackb(media_frame, raw=False)
+    )
+    assert reassembled == serialize_multimodal_data(multi_modal_data)
 
 
 async def test_load_balanced_policy_skips_hashing():

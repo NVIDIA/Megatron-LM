@@ -48,6 +48,7 @@ from megatron.core.inference.inference_request import (
     FinishedRequestRecord,
     Status,
     compute_media_cache_key,
+    merge_multimodal_data,
     resolve_multimodal_data_for_engine,
 )
 from megatron.core.inference.sampling_params import SamplingParams
@@ -3472,10 +3473,15 @@ class DynamicInferenceEngine(AbstractEngine):
             data = msgpack.unpackb(message[0], raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
-                request_id, sampling_params, multi_modal_data = data[1:]
-                # The prompt rides in its own frame; the engine is its first
-                # consumer, so this is where it finally gets decoded.
+                request_id, sampling_params, media_meta = data[1:]
+                # The prompt and the media each ride in their own frame; the
+                # engine is their first consumer, so this is where they finally
+                # get decoded. The coordinator forwarded both untouched, and
+                # only the bounded media descriptor travelled in the metadata.
                 prompt = msgpack.unpackb(message[1], raw=False)
+                multi_modal_data = merge_multimodal_data(
+                    media_meta, msgpack.unpackb(message[2], raw=False)
+                )
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request")
                 # TODO(perf): media preprocessing (decode / resize / normalize /
