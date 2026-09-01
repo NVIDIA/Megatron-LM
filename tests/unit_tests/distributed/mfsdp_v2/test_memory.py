@@ -104,8 +104,8 @@ def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
                     "model and main weights."
                 )
                 assert group.post_optimizer_model_weight is group.model_weight, (
-                    f"Layer {layer_index}, parameter group {group_index} should alias "
-                    "post-optimizer and model weights."
+                    f"ZeRO-3 layer {layer_index}, parameter group {group_index} should use "
+                    "model_weight itself as its post-optimizer model weight."
                 )
         expected_per_child_nbytes = 2 * child_weight_nbytes
     else:
