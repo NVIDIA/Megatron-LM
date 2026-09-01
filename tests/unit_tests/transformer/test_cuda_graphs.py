@@ -1274,6 +1274,15 @@ class TestHybridTECudaGraphDiscovery:
                 torch.ones(2, 1, 4), cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32)
             )
 
+    def test_transformer_capture_impl_rejects_raw_packed_sequence_kwargs(self):
+        layer = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(layer)
+
+        with pytest.raises(AssertionError):
+            layer._te_cuda_graph_capture_impl(
+                torch.ones(2, 1, 4), cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32)
+            )
+
     def test_grouped_hybrid_capture_has_one_outer_offload_boundary(self):
         calls = []
         head = self._bare_hybrid_wrapper(offload_in_graph=True)

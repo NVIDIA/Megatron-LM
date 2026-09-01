@@ -1465,6 +1465,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         part of a larger callable, avoiding nested events in the middle of that graph.
         ``packed_seq_params`` must already be reconstructed by the boundary owner.
         """
+        assert 'cu_seqlens_q' not in kwargs, (
+            "TransformerLayer CUDA graph capture body received raw THD sequence tensors. "
+            "The outer capture boundary must reconstruct PackedSeqParams first."
+        )
+
         context = None
         if (
             not self.config.cuda_graph_modules
@@ -2153,7 +2158,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         return attention_output, output_bias
 
     def _te_cuda_graph_capture(self, *args, **kwargs):
-        """Capture only the attention consumer for the split mHC path."""
+        """Capture only the attention consumer for the split mHC path.
+
+        This GPT layer is itself the top-level TE graph callable. HybridStack instead wraps
+        plain ``TransformerLayer`` instances in ``HyperConnectionHybridLayer``, so no outer
+        wrapper calls this subclass's ``_te_cuda_graph_capture_impl``. If that topology changes,
+        this subclass must override the implementation entry point as well.
+        """
         if not self._uses_mhc_recompute_attn_cuda_graph_split():
             return super()._te_cuda_graph_capture(*args, **kwargs)
 

@@ -4,6 +4,7 @@ ENV_VARS:
   NVTE_CPU_OFFLOAD_V1: 1
   NVTE_FUSED_ATTN: 1
   PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,graph_capture_record_stream_reuse:True"
+  NCCL_GRAPH_REGISTER: "0"
   ENABLE_LIGHTWEIGHT_MODE: true
 MODEL_ARGS:
   # Put one adjacent attention/MoE pair on each PP rank. Hybrid graph discovery
@@ -38,8 +39,9 @@ MODEL_ARGS:
   --expert-model-parallel-size: 1
   --expert-tensor-parallel-size: 1
 
-  # Exercise delayed core-attention D2H/H2D event handling across the grouped
-  # attention -> partial-MoE graph boundary.
+  # Exercise core-attention D2H/H2D event handling across the grouped attention ->
+  # partial-MoE graph boundary. Keep the delayed replay lifecycle enabled on GPU;
+  # core-attention commits immediately, while delayed-queue flush ordering is unit-tested.
   # fine-grained-offloading-max-inflight-offloads is intentionally omitted (None).
   --fine-grained-activation-offloading: true
   --offload-modules: "[core_attn]"
