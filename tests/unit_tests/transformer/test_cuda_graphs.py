@@ -1075,21 +1075,21 @@ class TestParallelHybridBlockCudagraphs:
             return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
         def get_mamba_block(hybrid_layer_pattern):
-            layer_type_list = validate_segment_layers(hybrid_layer_pattern)
             transformer_config = TransformerConfig(
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 # Need to specify num_attention_heads and num_layers or TransformerConfig
                 # will generate errors.
-                num_layers=len(layer_type_list),
+                num_layers=len(hybrid_layer_pattern),
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 cuda_graph_impl="local",
             )
+            layer_config_list = validate_segment_layers(hybrid_layer_pattern, transformer_config)
             modules = hybrid_stack_spec.submodules
             return HybridStack(
                 transformer_config,
                 modules,
-                layer_type_list=layer_type_list,
+                layer_config_list=layer_config_list,
                 pp_layer_offset=0,
                 pg_collection=get_pg_collection(),
             )
@@ -1230,6 +1230,10 @@ class TestTECudaGraphHelper:
         assert (
             'sample_kwargs' in make_graphed_callables_kwargs
         ), "sample_kwargs should be present in make_graphed_callables_kwargs for TE >= 1.10.0"
+        if is_te_min_version("2.19.0"):
+            assert make_graphed_callables_kwargs['clone_param_grads_on_return'] is False
+        else:
+            assert 'clone_param_grads_on_return' not in make_graphed_callables_kwargs
         sample_kwargs = make_graphed_callables_kwargs['sample_kwargs']
 
         # Basic checks
@@ -1766,6 +1770,20 @@ class _CheckpointDependencyModule(MegatronModule):
         return output
 
 
+class _RepeatedParameterModule(MegatronModule):
+    """Invoke one graphed operation twice so two runners share its parameter."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.weight = torch.nn.Parameter(torch.randn(config.hidden_size))
+
+    def forward(self, x):
+        return self.project(x) + self.project(0.5 * x)
+
+    def project(self, x):
+        return x + self.weight
+
+
 class _SimpleNonModule:
     """non-nn.Module base_module for testing the function_name= form of `CudaGraphManager`."""
 
@@ -1870,6 +1888,96 @@ class TestCheckpointParameterDiscovery:
             for name, param in module.named_parameters():
                 assert param.grad is None
                 torch.testing.assert_close(param.main_grad, reference_wgrads[name])
+
+
+class TestRepeatedParameterCapture:
+    """Local-CG capture preserves every use of a parameter shared by multiple runners."""
+
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        if _CudagraphGlobalRecord.cudagraph_created:
+            delete_cuda_graphs()
+        else:
+            _CudagraphGlobalRecord.cudagraph_record = []
+            _CudagraphGlobalRecord.cudagraph_inference_record = []
+            CudaGraphManager.global_mempool = None
+        torch.cuda.set_stream(torch.cuda.default_stream())
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    def test_two_runners_accumulate_shared_parameter_and_preserve_record_grad(self):
+        if not torch.distributed.is_initialized() or torch.distributed.get_world_size() < 2:
+            pytest.skip("test requires at least two data-parallel ranks")
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            cuda_graph_warmup_steps=0,
+        )
+        torch.manual_seed(123)
+        reference = _RepeatedParameterModule(config).cuda()
+        module = _RepeatedParameterModule(config).cuda()
+        module.load_state_dict(reference.state_dict())
+
+        manager = CudaGraphManager(
+            config, base_module=module, function_name="project", need_backward=True
+        )
+        ddp_model = DistributedDataParallel(
+            config,
+            DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=1_000_000),
+            module,
+        )
+
+        torch.manual_seed(1000 + ddp_model.dp_group.rank())
+        test_input = torch.randn(4, config.hidden_size, device="cuda", requires_grad=True)
+        reference_output = reference(test_input.detach().clone().requires_grad_(True))
+        reference_output_value = reference_output.detach().clone()
+        reference_output.sum().backward()
+        reference_local_wgrad = reference.weight.grad.detach().clone()
+        reference_wgrad = reference_local_wgrad.clone()
+        torch.distributed.all_reduce(reference_wgrad, group=ddp_model.dp_group)
+        reference_wgrad.div_(ddp_model.dp_group.size())
+
+        ddp_model.zero_grad_buffer()
+        record_output = ddp_model(test_input.detach().clone().requires_grad_(True))
+        record_output.sum().backward()
+        ddp_model.finish_grad_sync()
+        record_wgrad = module.weight.main_grad.detach().clone()
+        torch.testing.assert_close(record_wgrad, reference_wgrad)
+
+        create_cudagraphs()
+
+        assert len(manager.cudagraph_runners) == 2
+        torch.testing.assert_close(module.weight.main_grad, record_wgrad)
+
+        ddp_model.zero_grad_buffer()
+        with ddp_model.no_sync():
+            replay_output = ddp_model(test_input.detach().clone().requires_grad_(True))
+            replay_output.sum().backward()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(replay_output, reference_output_value)
+        torch.testing.assert_close(module.weight.main_grad, reference_local_wgrad)
+
+        for _ in range(2):
+            ddp_model.zero_grad_buffer()
+            replay_output = ddp_model(test_input.detach().clone().requires_grad_(True))
+            replay_output.sum().backward()
+            ddp_model.finish_grad_sync()
+            torch.cuda.synchronize()
+
+            torch.testing.assert_close(replay_output, reference_output_value)
+            torch.testing.assert_close(module.weight.main_grad, reference_wgrad)
 
 
 class TestInlineCaptureManager:
