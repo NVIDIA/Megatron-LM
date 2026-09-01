@@ -28,6 +28,7 @@ Index storage optimization:
 import io
 import json
 import logging
+import multiprocessing as mp
 import os
 import tarfile
 from collections import OrderedDict
@@ -80,6 +81,29 @@ _ACTIVE_LOGITS_SAVER: Optional["LogitsSaverHooks"] = None
 def get_logits_saver() -> Optional["LogitsSaverHooks"]:
     """Return the active :class:`LogitsSaverHooks` instance, or *None*."""
     return _ACTIVE_LOGITS_SAVER
+
+
+def check_logits_saver_failure() -> None:
+    """Raise if the async logits-saver background write has failed.
+
+    ``_write_batched_tar`` runs in a persistent async worker process whose
+    completion queue only ever reports "done", never "failed" -- an
+    uncaught exception there silently kills the worker with no signal back
+    to the main training process (see ``_failure_event`` on
+    :class:`LogitsSaverHooks`).  Call this once per iteration from the main
+    training loop so a dead/broken logits-saver worker surfaces promptly as
+    a training crash instead of an unnoticed stall that only manifests much
+    later (e.g. a hang at the next blocking checkpoint finalize).
+    """
+    saver = get_logits_saver()
+    if saver is not None and saver._failure_event.is_set():
+        raise RuntimeError(
+            "Cached-logits saver background write failed (async worker for "
+            f"save_dir='{saver.save_dir}' hit an unrecoverable error and "
+            "exited). Check the worker process log for the original "
+            "traceback. Aborting training rather than silently continuing "
+            "with a stalled logits-saver worker."
+        )
 
 
 _MAX_VOCAB_SIZE = 2 ** 17  # 131072 - maximum supported vocab size
@@ -245,6 +269,13 @@ class LogitsSaverHooks:
 
         # Top-P logging: per-microbatch kept counts (populated by _apply_topp_truncation)
         self._topp_kept_counts: List[float] = []
+
+        # Set by the async worker process (via _write_batched_tar's failure_event
+        # arg) if a background write hits an unrecoverable error; the worker's
+        # completion queue only reports "done", never "failed", so this is the
+        # only channel by which a dead/broken worker becomes visible to the main
+        # process. Checked once per iteration by check_logits_saver_failure().
+        self._failure_event: "mp.synchronize.Event" = mp.Event()
 
         # Create save directory if needed
         storage_makedirs(self.save_dir, exist_ok=True)
@@ -660,7 +691,9 @@ class LogitsSaverHooks:
 
     def take_pending_data(
         self,
-    ) -> Tuple[str, "OrderedDict[Tuple[int, int], bytes]", bytes, bool, List[str]]:
+    ) -> Tuple[
+        str, "OrderedDict[Tuple[int, int], bytes]", bytes, bool, List[str], "mp.synchronize.Event"
+    ]:
         """Take ownership of buffered data for async flush at checkpoint time.
 
         Also lists this rank's own DP shards here, on the main training
@@ -680,10 +713,14 @@ class LogitsSaverHooks:
         collective and the active ones would hang waiting for them.
 
         Returns:
-            Tuple of (tar_path, writes, meta_bytes, msc_enabled, existing_tars).
-            If there is no pending data (e.g. non-TP-rank-0 or
+            Tuple of (tar_path, writes, meta_bytes, msc_enabled, existing_tars,
+            failure_event). If there is no pending data (e.g. non-TP-rank-0 or
             non-CP-rank-0), ``writes`` will be an empty OrderedDict and
-            ``tar_path`` will be an empty string.
+            ``tar_path`` will be an empty string. ``failure_event`` is set by
+            the worker (see :func:`_write_batched_tar`) if the write hits an
+            unrecoverable error, so the main process can detect a dead/broken
+            worker instead of silently stalling (see
+            :func:`check_logits_saver_failure`).
         """
         # NOTE: We need to re-enabled MSC in the async saving process, so we pass this flag.
         msc_enabled = MultiStorageClientFeature.is_enabled()
@@ -695,7 +732,10 @@ class LogitsSaverHooks:
         existing_tars = storage_glob_with_caching(self.save_dir, f"*{prefix}*.tar", cached=False)
 
         if not self._pending_writes:
-            return ("", OrderedDict(), self._meta_bytes, msc_enabled, existing_tars)
+            return (
+                "", OrderedDict(), self._meta_bytes, msc_enabled, existing_tars,
+                self._failure_event,
+            )
 
         writes = self._pending_writes
         self._pending_writes = OrderedDict()
@@ -705,7 +745,9 @@ class LogitsSaverHooks:
         tar_filename = v2_batched_tar_filename(self.dp_rank, bundle_start, bundle_end)
         tar_path = os.path.join(self.save_dir, tar_filename)
         print_rank_last(f"Handing off {len(writes)} logit iterations for async flush")
-        return (tar_path, writes, self._meta_bytes, msc_enabled, existing_tars)
+        return (
+            tar_path, writes, self._meta_bytes, msc_enabled, existing_tars, self._failure_event,
+        )
 
     @staticmethod
     def _write_batched_tar(
@@ -714,6 +756,7 @@ class LogitsSaverHooks:
         meta_bytes: bytes,
         msc_enabled: bool = False,
         existing_tars: Optional[List[str]] = None,
+        failure_event: Optional["mp.synchronize.Event"] = None,
     ) -> None:
         """Write a tar archive containing multiple iterations.
 
@@ -749,37 +792,58 @@ class LogitsSaverHooks:
         process, so every DP rank's worker independently calling
         ``storage_glob`` on every flush is what actually triggers
         object-store rate limiting.
+
+        *failure_event*, when provided, is set before any exception here
+        is re-raised. The persistent async worker's own completion queue
+        only ever reports "done", never "failed" (see ``async_loop`` in
+        ``megatron.core.dist_checkpointing.strategies.async_utils``), so an
+        uncaught exception here silently kills this worker process with no
+        signal back to the main training process -- future writes (both
+        logits *and* regular checkpoints, which share this same per-rank
+        worker) would then silently never complete. Setting the event lets
+        the main process detect this promptly via
+        :func:`check_logits_saver_failure` instead of only noticing much
+        later, e.g. as a hang at the next blocking checkpoint finalize.
         """
         if not writes:
             return
-        if msc_enabled:
-            # NOTE: MSC is not enabled in the async saving process by default.
-            MultiStorageClientFeature.enable()
+        try:
+            if msc_enabled:
+                # NOTE: MSC is not enabled in the async saving process by default.
+                MultiStorageClientFeature.enable()
 
-        if not HAVE_ZSTANDARD:
-            raise ImportError(
-                "zstandard is required to write batched logit tars. "
-                "Install via `pip install zstandard`."
-            )
+            if not HAVE_ZSTANDARD:
+                raise ImportError(
+                    "zstandard is required to write batched logit tars. "
+                    "Install via `pip install zstandard`."
+                )
 
-        storage_makedirs(os.path.dirname(tar_path), exist_ok=True)
-        for old_path, quarantined in quarantine_contained_tars(tar_path, known_tars=existing_tars):
-            print_rank_last(f"Quarantined superseded cached-logits shard {old_path} -> {quarantined}")
+            storage_makedirs(os.path.dirname(tar_path), exist_ok=True)
+            for old_path, quarantined in quarantine_contained_tars(
+                tar_path, known_tars=existing_tars
+            ):
+                print_rank_last(
+                    f"Quarantined superseded cached-logits shard {old_path} -> {quarantined}"
+                )
 
-        write_path = tar_path if is_remote_storage_path(tar_path) else f"{tar_path}.tmp"
-        compressor = zstandard.ZstdCompressor(level=3)
+            write_path = tar_path if is_remote_storage_path(tar_path) else f"{tar_path}.tmp"
+            compressor = zstandard.ZstdCompressor(level=3)
 
-        with open_logit_file(write_path, "wb") as stream:
-            with tarfile.open(fileobj=stream, mode="w") as tar:
-                info = tarfile.TarInfo(name=META_TAR_MEMBER)
-                info.size = len(meta_bytes)
-                tar.addfile(info, io.BytesIO(meta_bytes))
+            with open_logit_file(write_path, "wb") as stream:
+                with tarfile.open(fileobj=stream, mode="w") as tar:
+                    info = tarfile.TarInfo(name=META_TAR_MEMBER)
+                    info.size = len(meta_bytes)
+                    tar.addfile(info, io.BytesIO(meta_bytes))
 
-                for (start_sample, end_sample), data in writes.items():
-                    data = compressor.compress(data)
-                    member_name = f"{start_sample}-{end_sample}{LOGPROBS_TAR_MEMBER_SUFFIX}"
-                    info = tarfile.TarInfo(name=member_name)
-                    info.size = len(data)
-                    tar.addfile(info, io.BytesIO(data))
-        if write_path != tar_path:
-            storage_move(write_path, tar_path)
+                    for (start_sample, end_sample), data in writes.items():
+                        data = compressor.compress(data)
+                        member_name = f"{start_sample}-{end_sample}{LOGPROBS_TAR_MEMBER_SUFFIX}"
+                        info = tarfile.TarInfo(name=member_name)
+                        info.size = len(data)
+                        tar.addfile(info, io.BytesIO(data))
+            if write_path != tar_path:
+                storage_move(write_path, tar_path)
+        except Exception:
+            if failure_event is not None:
+                failure_event.set()
+            raise
