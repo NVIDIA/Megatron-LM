@@ -14,10 +14,14 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
+from megatron.lite.primitive.ckpt import local_pipeline_stage_state
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
+from megatron.lite.runtime.contracts.data import (
+    ForwardResult,
+    ModelOutputs,
+    PackedBatch,
+)
 from megatron.lite.runtime.contracts.handle import ModelHandle
 from megatron.lite.runtime.contracts.loss import (
     get_loss_context,
@@ -31,10 +35,7 @@ def _step_nvtx_range(name: str):
     if os.environ.get("MLITE_STEP_NVTX") != "1" or not torch.cuda.is_available():
         yield
         return
-    synchronize = (
-        os.environ.get("MLITE_PROFILE_SYNC_PHASES") == "1"
-        and name == "optimizer/step"
-    )
+    synchronize = os.environ.get("MLITE_PROFILE_SYNC_PHASES") == "1" and name == "optimizer/step"
     if synchronize:
         torch.cuda.synchronize()
     with torch.cuda.nvtx.range(name):
@@ -50,10 +51,7 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     # may pass knobs (e.g. cross_entropy_fusion) that some models don't model.
     impl_cfg_kwargs = {key: value for key, value in rt_cfg.impl_cfg.items() if key in init_fields}
     impl_cfg_kwargs["parallel"] = rt_cfg.parallel
-    if (
-        "attention_backend_override" in init_fields
-        and impl_cfg_kwargs.get("attention_backend_override") is None
-    ):
+    if "attention_backend_override" in init_fields and impl_cfg_kwargs.get("attention_backend_override") is None:
         impl_cfg_kwargs["attention_backend_override"] = rt_cfg.attention_backend_override
     if (
         "router_aux_loss_coef" in init_fields
@@ -76,35 +74,8 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
 
 def _reset_parameters(module: torch.nn.Module) -> None:
     reset = getattr(module, "reset_parameters", None)
-    if not callable(reset):
-        return
-
-    original_parameters = dict(module.named_parameters(recurse=False))
-    reset()
-    with torch.no_grad():
-        for name, original in original_parameters.items():
-            replacement = module._parameters.get(name)
-            if replacement is None:
-                raise RuntimeError(f"{type(module).__name__}.reset_parameters() removed {name!r}.")
-            if replacement is original:
-                continue
-            original_local = original.to_local() if isinstance(original, DTensor) else original
-            replacement_local = (
-                replacement.to_local() if isinstance(replacement, DTensor) else replacement
-            )
-            if original_local.shape != replacement_local.shape:
-                raise RuntimeError(
-                    f"{type(module).__name__}.reset_parameters() changed {name!r} shape "
-                    f"from {tuple(original_local.shape)} to {tuple(replacement_local.shape)}."
-                )
-            if original_local.data_ptr() != replacement_local.data_ptr():
-                original_local.copy_(
-                    replacement_local.to(
-                        device=original_local.device,
-                        dtype=original_local.dtype,
-                    )
-                )
-            module._parameters[name] = original
+    if callable(reset):
+        reset()
 
 
 def _apply_attention_backend_env(backend: str | None, *, tag: str) -> None:
@@ -117,16 +88,12 @@ def _apply_attention_backend_env(backend: str | None, *, tag: str) -> None:
         "fused": ("0", "1", "0"),
         "unfused": ("0", "0", "1"),
         "local": ("0", "0", "0"),
-        # Magi owns core attention and ignores these TE selectors. Keep TE's
-        # auto-selection available so a built model can hot-swap back to TE.
-        "magi": ("1", "1", "1"),
     }
     try:
         flash, fused, unfused = env_overrides[backend]
     except KeyError as exc:
         raise ValueError(
-            "attention_backend_override must be one of "
-            "{'auto', 'flash', 'fused', 'unfused', 'local', 'magi'}"
+            "attention_backend_override must be one of {'auto', 'flash', 'fused', 'unfused', 'local'}"
         ) from exc
 
     os.environ["NVTE_FLASH_ATTN"] = flash
@@ -170,9 +137,7 @@ def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tupl
         local_seq_len = total_padded // (cp_size * tp_size)
     elif tp_size > 1:
         if local_seq_len % tp_size != 0:
-            raise ValueError(
-                f"Pipeline tensor sequence length {local_seq_len} is not divisible by TP={tp_size}."
-            )
+            raise ValueError(f"Pipeline tensor sequence length {local_seq_len} is not divisible by TP={tp_size}.")
         local_seq_len //= tp_size
 
     # Models with multi-head hyper-connections (e.g. DeepSeek V4) carry hc_mult
@@ -195,9 +160,7 @@ def _checkpoint_module(model: Any) -> torch.nn.Module:
         return model
     if isinstance(model, list | tuple):
         return torch.nn.ModuleList(model)
-    raise TypeError(
-        f"Checkpoint model must be an nn.Module or sequence of modules, got {type(model).__name__}."
-    )
+    raise TypeError(f"Checkpoint model must be an nn.Module or sequence of modules, got {type(model).__name__}.")
 
 
 def _pipeline_callbacks(forward_step: Callable, loss_fn: Callable | None):
@@ -226,11 +189,7 @@ class MegatronLiteRuntime(RuntimeBase):
 
     def __init__(self, hf_path: str, cfg: MegatronLiteConfig | dict[str, Any]):
         self._hf_path = hf_path
-        self._cfg = (
-            cfg
-            if isinstance(cfg, MegatronLiteConfig)
-            else MegatronLiteConfig.from_dict(hf_path, cfg)
-        )
+        self._cfg = cfg if isinstance(cfg, MegatronLiteConfig) else MegatronLiteConfig.from_dict(hf_path, cfg)
         plugins = self._cfg.impl_cfg.get("runtime_plugins", {})
         if not isinstance(plugins, Mapping):
             raise TypeError("impl_cfg.runtime_plugins must be a mapping.")
@@ -264,9 +223,7 @@ class MegatronLiteRuntime(RuntimeBase):
         # ── load model protocol module ──
         proto = self._load_protocol(rt_cfg)
 
-        _apply_attention_backend_env(
-            rt_cfg.attention_backend_override, tag=f"{rt_cfg.model_name}:{rt_cfg.impl}"
-        )
+        _apply_attention_backend_env(rt_cfg.attention_backend_override, tag=f"{rt_cfg.model_name}:{rt_cfg.impl}")
 
         # ── escape hatch: model takes over ──
         if hasattr(proto, "create_runtime"):
@@ -282,9 +239,7 @@ class MegatronLiteRuntime(RuntimeBase):
 
         # ── build model (model owns ps + optimizer + everything) ──
         bundle = proto.build_model(model_cfg, impl_cfg=impl_cfg)
-        meta_initialized = any(
-            param.is_meta for chunk in bundle.chunks for param in chunk.parameters()
-        )
+        meta_initialized = any(param.is_meta for chunk in bundle.chunks for param in chunk.parameters())
         if meta_initialized:
             bundle.optimizer = bundle.extras.pop("post_model_load_hook")()["optimizer"]
             if not rt_cfg.load_hf_weights:
@@ -344,7 +299,10 @@ class MegatronLiteRuntime(RuntimeBase):
 
     def _load_protocol(self, rt_cfg: MegatronLiteConfig):
         """Load and return the model protocol module."""
-        from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES, resolve_runtime_model_name
+        from megatron.lite.model.registry import (
+            TRAIN_RUNTIME_MODULES,
+            resolve_runtime_model_name,
+        )
 
         try:
             runtime_key = resolve_runtime_model_name(rt_cfg.model_name, rt_cfg.impl)
@@ -432,6 +390,8 @@ class MegatronLiteRuntime(RuntimeBase):
         proto = handle._extras.get("protocol")
         model_cfg = handle._extras.get("model_cfg")
         ps = handle._parallel_state
+        if kwargs.pop("local_pipeline_stage", False):
+            ps = local_pipeline_stage_state(ps)
 
         if proto and hasattr(proto, "export_hf_weights"):
             yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
@@ -523,7 +483,9 @@ class MegatronLiteRuntime(RuntimeBase):
         router_replay: Any = None,
     ) -> ForwardResult:
         from megatron.lite.primitive.train_step import run_microbatch_loop
-        from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+        from megatron.lite.runtime.backends.mlite.router_replay import (
+            RouterReplayDriver,
+        )
 
         forward_step = handle._extras["forward_step"]
         if num_microbatches < 1:
@@ -546,7 +508,9 @@ class MegatronLiteRuntime(RuntimeBase):
             from types import SimpleNamespace
 
             from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
-            from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
+            from megatron.lite.primitive.parallel.pipeline import (
+                forward_backward_pipelining,
+            )
 
             first_item = next(data_iter)
             first_batch, _loss_context = split_loss_context(first_item)
@@ -715,7 +679,10 @@ def _checkpoint_model(handle: ModelHandle, *, use_dcp: bool):
 
 
 def _checkpoint_hooks(handle: ModelHandle):
-    from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
+    from megatron.lite.primitive.protocols import (
+        default_expert_classifier,
+        default_placement_fn,
+    )
 
     proto = handle._extras.get("protocol")
     return (

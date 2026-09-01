@@ -71,9 +71,9 @@ def test_ds4_default_export_preserves_fp32_coefficient_bits() -> None:
         pp_global_ranks=[0],
     )
 
-    exported = dict(
-        ckpt._export_unquantized_weights(model, config, parallel_state)
-    )["norm.weight"]
+    exported = dict(ckpt._export_unquantized_weights(model, config, parallel_state))[
+        "norm.weight"
+    ]
 
     assert exported.dtype == torch.float32
     assert torch.equal(exported, model.norm.weight)
@@ -230,9 +230,7 @@ def test_ds4_shared_checkpoint_preserves_reversible_fp8_source_scale(tmp_path):
         scale,
     )
     assert torch.equal(
-        model._fp8_source_scales_by_name[
-            "layers.0.self_attn.self_attn.wq_a.weight"
-        ],
+        model._fp8_source_scales_by_name["layers.0.self_attn.self_attn.wq_a.weight"],
         scale,
     )
 
@@ -264,8 +262,7 @@ def test_ds4_fused_expert_preserves_w1_w3_bytes_and_scale_order():
     spec = ckpt.DeepseekV4WeightSpec(cfg, source_block_fp8=True)
     native_name = "layers.0.mlp.experts.fc1.weight0"
     qweights = [
-        torch.randn(128, 128).clamp(-4, 4).to(torch.float8_e4m3fn)
-        for _ in range(2)
+        torch.randn(128, 128).clamp(-4, 4).to(torch.float8_e4m3fn) for _ in range(2)
     ]
     scales = [
         torch.tensor([[0.125]], dtype=torch.float32),
@@ -420,6 +417,32 @@ def test_ds4_source_scales_bind_global_expert_to_ep_local_parameter():
         layer.mlp.experts.fc1._fp8_source_scales_by_parameter["weight0"], scale
     )
     assert "layers.2.mlp.experts.fc1.weight128" in model._fp8_source_scales_by_name
+
+
+def test_ds4_source_scale_export_keeps_bound_global_layer_names():
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+
+    ckpt = _checkpoint_module()
+    model = nn.Module()
+    model.layer_indices = [2]
+    model._fp8_source_scales_valid = True
+    model._fp8_source_scales_by_name = {
+        "layers.0.self_attn.self_attn.wq_a.weight": torch.ones(1, 1),
+        "layers.2.self_attn.self_attn.wq_a.weight": torch.full((1, 1), 2.0),
+    }
+    ps = SimpleNamespace(
+        ep_size=1,
+        ep_group=None,
+        pp_size=1,
+        pp_group=None,
+    )
+
+    scales = ckpt._export_source_scales(
+        model, DeepseekV4Config(num_hidden_layers=4), ps
+    )
+
+    assert torch.equal(scales["layers.0.attn.wq_a.weight"], torch.ones(1, 1))
+    assert torch.equal(scales["layers.2.attn.wq_a.weight"], torch.full((1, 1), 2.0))
 
 
 def test_ds4_source_scale_export_gathers_remote_ep_experts(monkeypatch):

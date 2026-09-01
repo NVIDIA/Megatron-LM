@@ -2,12 +2,13 @@
 """Checkpoint helpers."""
 
 from megatron.lite.primitive.ckpt.dcp import load_training_checkpoint, save_training_checkpoint
-from megatron.lite.primitive.ckpt.hf_weights import HFWeights
+from megatron.lite.primitive.ckpt.hf_weights import HFWeights, local_pipeline_stage_state
 
 __all__ = [
     "HFWeights",
     "attach_model_sharded_state_dict",
     "load_training_checkpoint",
+    "local_pipeline_stage_state",
     "save_training_checkpoint",
 ]
 

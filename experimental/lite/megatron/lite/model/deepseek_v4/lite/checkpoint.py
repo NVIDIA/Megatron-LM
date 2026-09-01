@@ -583,15 +583,14 @@ def _export_source_scales(
     for chunk in chunks:
         if not bool(getattr(chunk, "_fp8_source_scales_valid", False)):
             continue
-        layer_map = {
-            local_idx: chunk.layer_indices[local_idx]
-            for local_idx in range(len(getattr(chunk, "layer_indices", ())))
-        }
         for native_name, scale in getattr(
             chunk, "_fp8_source_scales_by_name", {}
         ).items():
-            global_name = to_global_layer_name(native_name, layer_map)
-            names = _hf_names_for_state_key(global_name, config)
+            # ``bind_source_scales`` stores this registry under global layer
+            # names.  Remapping it a second time aliases global layer 0 with
+            # the first local layer on nonzero PP stages (for example both
+            # become layer 2 on PP rank 2), producing a false scale conflict.
+            names = _hf_names_for_state_key(native_name, config)
             values = scale.chunk(2, dim=0) if len(names) == 2 else (scale,)
             for name, value in zip(names, values, strict=True):
                 value = value.detach().cpu().float().contiguous()
