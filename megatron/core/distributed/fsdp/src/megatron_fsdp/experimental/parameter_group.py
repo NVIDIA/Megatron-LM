@@ -425,9 +425,9 @@ class FsdpParameterGroup:
             self._main_grad_is_stale = True
             install_sharded_grads(self.pre_optimizer_main_grad)
         else:
-            # We could install pre_optimizer_main_grad unconditionally, but before
-            # finalization it lacks the deferred DP-outer reduction and is not a valid
-            # optimizer gradient.
+            # We could install pre_optimizer_main_grad unconditionally because
+            # sharded.grad is only read by the optimizer. However, for consistency and
+            # debugging, keep sharded.grad valid even between microbatches.
             install_sharded_grads(self.main_grad)
 
 
