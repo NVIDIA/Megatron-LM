@@ -140,6 +140,8 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
             max_tokens=8,
             is_hybrid_model=hybrid,
             kv_block_allocator=_KvAllocator(),
+            # Every registered block is dated by the context's generation epoch.
+            prefix_cache_epoch=0,
             mamba_slot_allocator=None,
             mamba_metadata=_MambaMetadata(available) if hybrid else None,
             memory_buffer=torch.empty(1),
