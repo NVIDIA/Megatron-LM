@@ -11,6 +11,7 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
 )
+from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.models.gpt import (
     GPTModelBuilder,
@@ -60,6 +61,7 @@ def _make_dispatch_config(**transformer_kwargs):
     transformer.use_kitchen_attention = False
     transformer.kitchen_attention_backend = None
     transformer.use_te_activation_func = False
+    transformer.enable_hyper_connections = False
     transformer.mla_down_proj_fusion = False
     for k, v in transformer_kwargs.items():
         setattr(transformer, k, v)
@@ -238,6 +240,7 @@ class TestDefaultLayerSpecDispatch:
             use_kitchen=config.transformer.use_kitchen,
             use_kitchen_attention=config.transformer.use_kitchen_attention,
             kitchen_attention_backend=config.transformer.kitchen_attention_backend,
+            enable_hyper_connection=config.transformer.enable_hyper_connections,
         )
         assert result is spec
 
@@ -845,21 +848,16 @@ class TestMtpBlockSpec:
         assert result is None
 
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
-    def test_uses_explicit_spec_when_layer_specs_nonempty(self, mock_get_mtp):
+    def test_uses_resolved_block_layer_spec(self, mock_get_mtp):
         config = self._make_config(mtp_num_layers=1)
-        spec = Mock(spec=ModuleSpec)
-        spec.layer_specs = [Mock()]  # Non-empty
+        decoder_layer = ModuleSpec(module=object)
+        spec = TransformerBlockSubmodules(layer_specs=[decoder_layer])
         mock_get_mtp.return_value = Mock(spec=ModuleSpec)
 
-        with patch(
-            "megatron.training.models.gpt.get_gpt_decoder_layer_specs"
-        ) as mock_decoder_specs:
-            mock_decoder_specs.return_value = [Mock(), Mock()]
-            mtp_block_spec(config, spec)
+        mtp_block_spec(config, spec)
 
-        # When layer_specs is non-empty, use the last decoder spec (not the explicit spec arg)
         passed_spec = mock_get_mtp.call_args.args[1]
-        assert passed_spec is mock_decoder_specs.return_value[-1]
+        assert passed_spec is decoder_layer
 
     @patch("megatron.training.models.gpt._te_or_local_layer_spec")
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
@@ -867,8 +865,7 @@ class TestMtpBlockSpec:
         self, mock_get_mtp, mock_te_or_local
     ):
         config = self._make_config(mtp_num_layers=1)
-        spec = Mock(spec=ModuleSpec)
-        spec.layer_specs = []  # Empty → falls back to _te_or_local_layer_spec
+        spec = TransformerBlockSubmodules(layer_specs=[])
         fallback_spec = Mock(spec=ModuleSpec)
         mock_te_or_local.return_value = fallback_spec
         mock_get_mtp.return_value = Mock(spec=ModuleSpec)
@@ -885,11 +882,7 @@ class TestMtpBlockSpec:
         spec = ModuleSpec(module=object)
         mock_get_mtp.return_value = Mock(spec=ModuleSpec)
 
-        with patch(
-            "megatron.training.models.gpt.get_gpt_decoder_layer_specs"
-        ) as mock_decoder_specs:
-            mock_decoder_specs.return_value = [Mock(), Mock()]
-            mtp_block_spec(config, spec, vp_stage=3)
+        mtp_block_spec(config, spec, vp_stage=3)
 
         call_kwargs = mock_get_mtp.call_args.kwargs
         assert call_kwargs["use_transformer_engine"] is True
@@ -901,10 +894,38 @@ class TestMtpBlockSpec:
         spec = ModuleSpec(module=object)
         mock_get_mtp.return_value = Mock(spec=ModuleSpec)
 
-        with patch(
-            "megatron.training.models.gpt.get_gpt_decoder_layer_specs"
-        ) as mock_decoder_specs:
-            mock_decoder_specs.return_value = [Mock(), Mock()]
-            mtp_block_spec(config, spec)
+        mtp_block_spec(config, spec)
 
         assert mock_get_mtp.call_args.kwargs["use_transformer_engine"] is False
+
+
+@pytest.mark.parametrize(
+    "transformer_impl,factory_name",
+    [
+        ("transformer_engine", "get_gpt_layer_with_transformer_engine_spec"),
+        ("local", "get_gpt_layer_local_spec"),
+    ],
+)
+def test_te_or_local_layer_spec_preserves_hyper_connections(transformer_impl, factory_name):
+    config = _make_dispatch_config(enable_hyper_connections=True)
+    config.transformer.transformer_impl = transformer_impl
+
+    with patch(f"megatron.training.models.gpt.{factory_name}") as get_spec:
+        get_spec.__signature__ = inspect.Signature()
+        get_spec.return_value = Mock(spec=ModuleSpec)
+        default_layer_spec(config, vp_stage=None)
+
+    assert get_spec.call_args.kwargs["enable_hyper_connection"] is True
+
+
+@patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
+def test_mtp_block_spec_reuses_experimental_decoder_layer(mock_get_mtp):
+    config = TestMtpBlockSpec()._make_config(mtp_num_layers=1)
+    config.transformer.experimental_attention_variant = "dsv4_hybrid"
+    decoder_layer = ModuleSpec(module=object)
+    decoder_block = TransformerBlockSubmodules(layer_specs=[decoder_layer])
+    mock_get_mtp.return_value = Mock(spec=ModuleSpec)
+
+    mtp_block_spec(config, decoder_block)
+
+    assert mock_get_mtp.call_args.args[1] is decoder_layer
