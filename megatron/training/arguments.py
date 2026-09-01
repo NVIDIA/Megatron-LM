@@ -893,6 +893,14 @@ def validate_args(args, defaults={}):
             + f"The supported position embedding types are rope and none."
         )
 
+    if args.freeze_base_model_for_mtp:
+        assert args.mtp_num_layers, (
+            "--freeze-base-model-for-mtp requires --mtp-num-layers to be set."
+        )
+        assert not args.freeze_all_layers, (
+            "--freeze-base-model-for-mtp cannot be combined with --freeze-all-layers."
+        )
+
     if args.mtp_hsm and not (args.mtp_num_layers and args.mtp_num_layers >= 2):
         warn_rank_0(
             "--mtp-hsm needs at least two MTP layers to mix anything, but "
