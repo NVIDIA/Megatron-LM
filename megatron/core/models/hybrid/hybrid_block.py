@@ -294,10 +294,10 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
     @property
     def offload_module_in_cuda_graph(self) -> bool:
         """Whether TE must join the wrapper graph with offload streams."""
-        cached = getattr(self, '_offload_module_in_cuda_graph_cached', None)
+        cached = self._offload_module_in_cuda_graph_cached
         if cached is None:
             cached = self._compute_offload_module_in_cuda_graph()
-            object.__setattr__(self, '_offload_module_in_cuda_graph_cached', cached)
+            self._offload_module_in_cuda_graph_cached = cached
         return cached
 
     def _can_group_te_cuda_graph_with(self, next_layer: MegatronModule) -> bool:
@@ -337,7 +337,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         # Bypass nn.Module.__setattr__: next_layer remains registered exactly once in
         # HybridStack.layers, so this capture-only reference cannot alter state_dict keys.
         object.__setattr__(self, '_te_cuda_graph_group_tail', next_layer)
-        object.__setattr__(self, '_offload_module_in_cuda_graph_cached', None)
+        self._offload_module_in_cuda_graph_cached = None
 
     def _get_te_cuda_graph_group_tail(self) -> Optional['HyperConnectionHybridLayer']:
         """Return the capture-only MoE tail, if discovery grouped this layer."""
