@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
-from dataclasses import InitVar, dataclass
+from dataclasses import InitVar, dataclass, field
 from enum import Enum
 from typing import List, Literal, Optional, Tuple
 
@@ -43,10 +43,29 @@ class MambaInferenceStateConfig:
     mamba_chunk_size: int = 128
     """The chunk size used by the Mamba SSM Triton kernels."""
 
+    ssm_chunk_alignment: Optional[int] = None
+    """Token quantum that a prefill chunk boundary must land on for the model's
+    SSM mixers to see a clean chunk boundary. Defaults to `mamba_chunk_size`,
+    which is correct for any Mamba-only model.
+
+    This is the mixers' shared `ssm_inference_chunk_size`, which is not always
+    their `chunk_size`: the forked Gated Delta Product prefill kernels run at a
+    fixed 64 whatever `chunk_size` says. `from_model` asserts every SSM layer
+    agrees rather than reconciling a mixed stack. Only the paths that genuinely
+    require an aligned boundary consult it -- batch-invariant chunked prefill,
+    which replays the partial tail at decode, and recurrent-state extraction for
+    prefix caching, which can only snapshot at a chunk boundary. Ordinary
+    chunked prefill splits anywhere, because each step re-chunks from its own
+    slice start."""
+
     gdp_num_householder: int = 0
     """Number of Householder copies of the Gated Delta Product layers, or 0 if the
     model has none. Sizes the GDP chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
+
+    def __post_init__(self):
+        if self.ssm_chunk_alignment is None:
+            self.ssm_chunk_alignment = self.mamba_chunk_size
 
     @classmethod
     def from_model(
@@ -57,6 +76,7 @@ class MambaInferenceStateConfig:
     ) -> Optional["MambaInferenceStateConfig"]:
         """Return recurrent inference state config for a Mamba or GDN hybrid model."""
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+        from megatron.core.ssm.ssm_inference import ssm_chunking
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
@@ -94,28 +114,22 @@ class MambaInferenceStateConfig:
                 ssm_states_dtype = torch.float32
             elif ssm_states_dtype is None:
                 ssm_states_dtype = model.config.params_dtype
-            mamba_chunk_size = 128
-            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
-                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
-                    mamba_chunk_size = layer.mixer.chunk_size
-                    break
-                if layer_type == Symbols.GDN and hasattr(layer, 'self_attention'):
-                    mamba_chunk_size = layer.self_attention.chunk_size
-                    break
-            # Gated Delta Product layers register as Mamba layers but carry a
-            # Householder count, which sizes their (separate) chunk descriptors.
-            gdp_num_householder = 0
-            for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
-                if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
-                    num_householder = getattr(layer.mixer, 'num_householder', None)
-                    if num_householder is not None:
-                        # The descriptors are shared across layers, so one count
-                        # has to cover every GDP layer.
-                        assert gdp_num_householder in (0, num_householder), (
-                            "every GDP layer must use the same num_householder; got "
-                            f"{gdp_num_householder} and {num_householder}"
-                        )
-                        gdp_num_householder = num_householder
+            # `decoder.layers` is pipeline-local, so a stage holding no SSM
+            # layer falls back to the Mamba defaults while a stage holding GDP
+            # layers reports 64. Safe today because every consumer of a
+            # disagreeing value is stage-local (bookkeeping-buffer sizing) or
+            # gated off for GDP (batch-invariant chunk lengths, prefix-cache
+            # extraction offsets). A future cross-rank consumer must reconcile
+            # these across the PP group.
+            chunking = ssm_chunking(decoder.layer_type_list, decoder.layers)
+            if chunking is None:
+                mamba_chunk_size = 128
+                ssm_chunk_alignment = mamba_chunk_size
+                gdp_num_householder = 0
+            else:
+                mamba_chunk_size = chunking.chunk_size
+                ssm_chunk_alignment = chunking.inference_chunk_size
+                gdp_num_householder = chunking.num_householder
             return cls(
                 layer_type_list=layer_type_list,
                 conv_states_shape=mamba_conv_states_shape,
@@ -123,6 +137,7 @@ class MambaInferenceStateConfig:
                 conv_states_dtype=conv_states_dtype,
                 ssm_states_dtype=ssm_states_dtype,
                 mamba_chunk_size=mamba_chunk_size,
+                ssm_chunk_alignment=ssm_chunk_alignment,
                 gdp_num_householder=gdp_num_householder,
             )
         return None
@@ -154,6 +169,16 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
     """Route to the rank with the fewest in-flight requests. Ignores prefix affinity."""
 
 
+class MediaCacheCoordinatorPolicy(str, Enum):
+    """Routing policy for the DP inference coordinator with media caching."""
+
+    AFFINITY = "affinity"
+    """Prefer ranks assigned the same media key when vision embeddings are cached."""
+
+    LOAD_BALANCED = "load_balanced"
+    """Ignore media affinity and route using prefix affinity and load."""
+
+
 class KVCacheManagementMode(str, Enum):
     """Mode for handling large tensors (KV cache, Mamba states) during suspend/resume."""
 
@@ -170,17 +195,26 @@ class KVCacheManagementMode(str, Enum):
 class CudaGraphSizingDistribution(str, Enum):
     """How CUDA graph token-count sizes are spaced when generating the captured graphs.
 
-    EXPONENTIAL (default) — token counts halve from `cuda_graph_max_tokens` down to `tp_size`,
+    EXPONENTIAL — token counts halve from `cuda_graph_max_tokens` down to `tp_size`,
     giving a log-spaced distribution. Bounded relative padding (~2x worst case) at every scale and
     `log2(max_tokens)` total graphs.
 
     LINEAR — Include size-1 and size-2 graphs where applicable, linear spacing up until 256, and
     sparser linear spacing past 256. e.g. `[1, 2, 4] + range(8, 256, 8) + range(256, max+1, 16)`.
     Higher graph density at the top end.
+
+    HYBRID (default) — EXPONENTIAL for prefill and mixed graphs, LINEAR for decode-only graphs.
+    The two
+    serve different ranges: prefill token counts span the whole `cuda_graph_max_tokens` (thousands),
+    where log spacing keeps padding bounded at ~2x for a handful of graphs, while decode-only counts
+    are capped at `max_requests * (num_speculative_tokens + 1)` (tens), where halving is far too
+    coarse -- a 33-request step would pad up to a 64-request graph. Linear spacing there covers
+    every small request count densely for little extra capture cost.
     """
 
     EXPONENTIAL = "exponential"
     LINEAR = "linear"
+    HYBRID = "hybrid"
 
 
 class AsyncScheduleMode(str, Enum):
@@ -212,6 +246,54 @@ class ImageProcessingConfig:
     max_num_tiles: int = 1
     use_thumbnail: bool = False
     num_img_embeddings_per_tile: int = 0
+
+
+@dataclass
+class VideoProcessingConfig:
+    """Configuration for decoding raw video bytes into model input tensors."""
+
+    image_config: ImageProcessingConfig
+    num_frames: int = 8
+    temporal_patch_size: int = 1
+    frame_manifest_magic: Optional[bytes] = None
+    """Prefix for payloads encoded as ``magic + UTF-8 {"frame_paths": [...]}``."""
+    video_maintain_aspect_ratio: bool = True
+
+
+@dataclass(frozen=True)
+class MediaPromptSpec:
+    """Map one API media type to the model's prompt-token contract."""
+
+    model_token: str = "<image>"
+    prefix: str = ""
+    suffix: str = ""
+    input_marker: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class MultimodalPromptConfig:
+    """Prompt contracts used to lower structured image/video blocks."""
+
+    image_spec: MediaPromptSpec = field(default_factory=MediaPromptSpec)
+    video_spec: MediaPromptSpec = field(default_factory=MediaPromptSpec)
+
+    def get_spec(self, modality: str) -> MediaPromptSpec:
+        """Return the prompt specification for ``image`` or ``video``."""
+        if modality == "image":
+            return self.image_spec
+        if modality == "video":
+            return self.video_spec
+        raise ValueError(f"Unsupported media modality: {modality!r}")
+
+    @classmethod
+    def from_dict(cls, value):
+        """Build from image and video specs."""
+        if not value:
+            return cls()
+        return cls(
+            image_spec=MediaPromptSpec(**value.get("image_spec", {})),
+            video_spec=MediaPromptSpec(**value.get("video_spec", {})),
+        )
 
 
 @dataclass
@@ -300,14 +382,14 @@ class InferenceConfig:
     The number of mixed prefill graphs to capture if mixed prefill/decode graphs are enabled.
     """
 
-    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = (
-        CudaGraphSizingDistribution.EXPONENTIAL
-    )
+    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = CudaGraphSizingDistribution.HYBRID
     """
-    How CUDA graph token counts are spaced. EXPONENTIAL (default) halves from
-    `cuda_graph_max_tokens` down to `tp_size` (log-spaced, ~log2(max_tokens) graphs).
-    LINEAR uses a range of linear strides (includes small graphs + mid-range linearity + 
-    a bigger step size at the top end).
+    How CUDA graph token counts are spaced. HYBRID (default) applies EXPONENTIAL to prefill and
+    mixed graphs and LINEAR to decode-only graphs, since the two cover ranges that differ by
+    orders of magnitude. EXPONENTIAL halves from `cuda_graph_max_tokens` down to `tp_size`
+    (log-spaced, ~log2(max_tokens) graphs). LINEAR uses a range of linear strides (includes small
+    graphs + mid-range linearity + a bigger step size at the top end). Set EXPONENTIAL or LINEAR
+    explicitly to apply one distribution to both families.
     """
 
     use_cuda_graphs_for_non_decode_steps: bool = True
@@ -351,6 +433,9 @@ class InferenceConfig:
     image_preprocessing_config: Optional[ImageProcessingConfig] = None
     """Configuration for preprocessing raw image payloads."""
 
+    video_preprocessing_config: Optional[VideoProcessingConfig] = None
+    """Configuration for decoding and preprocessing raw video payloads."""
+
     use_flashinfer_fused_rope: Optional[bool] = False
     """
     If True, use flashinfer's fused rope implementation.
@@ -375,6 +460,15 @@ class InferenceConfig:
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 
+    vision_embedding_cache_max_bytes: int = 0
+    """Maximum GPU bytes retained for reusable vision embeddings.
+
+    A value of zero disables the cache. Cache entries use an automatically
+    generated media-content key and, unless ``allow_stale_multimodal_embeddings``
+    is enabled, are discarded whenever the inference engine is suspended or its
+    generation epoch changes.
+    """
+
     prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
         PrefixCachingEvictionPolicy.REF_ZERO
     )
@@ -396,6 +490,25 @@ class InferenceConfig:
     """Weight for prefix-aware scoring: score = alpha * match + (1 - alpha) * normalized_load.
     Higher alpha favors prefix cache hits; lower alpha favors load balance.
     Must be in [0, 1]. Only applies when enable_prefix_caching is True and using a coordinator.
+    """
+
+    media_cache_coordinator_policy: MediaCacheCoordinatorPolicy = (
+        MediaCacheCoordinatorPolicy.AFFINITY
+    )
+    """Media-cache routing policy for the DP inference coordinator.
+
+    Media affinity is active only when ``vision_embedding_cache_max_bytes`` is
+    greater than zero. Media-salted prefix affinity is controlled separately by
+    ``prefix_caching_coordinator_policy``.
+    """
+
+    media_cache_routing_weight: float = 1.0
+    """Estimated vision-encoder reuse cost in compact-prompt block units.
+
+    Multimodal coordinator routing combines this media-hit value with the number
+    of matching routing-prefix blocks before blending cache affinity with load
+    using ``prefix_caching_routing_alpha``. The engine independently uses
+    post-expansion hashes for authoritative KV lookup. Must be non-negative.
     """
 
     prefix_caching_mamba_gb: Optional[float] = None
@@ -452,8 +565,9 @@ class InferenceConfig:
     enabled), then all DP ranks share the same sampling / generation seed.
     """
 
-    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
-    """Mode used to schedule dynamic batching inference work."""
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.ASYNC
+    """Mode used to schedule dynamic batching inference work. Defaults to async scheduling; use
+    ``AsyncScheduleMode.LEGACY`` to disable it."""
 
     logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
     """Whether returned log-probs are modified by the sampling parameters or not."""
@@ -493,6 +607,14 @@ class InferenceConfig:
     """Whether to log detailed context configuration at initialization.
     This is an InitVar and is not stored as a field on the config."""
 
+    allow_stale_multimodal_embeddings: bool = False
+    """Allow projected-media embeddings to survive weight-change boundaries.
+
+    By default, suspend/resume and generation-epoch changes invalidate both the
+    shared vision-embedding cache and request-local vision state. Enable this
+    only when model weights are guaranteed not to change across those boundaries.
+    """
+
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
         self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)
@@ -500,6 +622,11 @@ class InferenceConfig:
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
+            )
+        if self.media_cache_routing_weight < 0:
+            raise ValueError(
+                "media_cache_routing_weight must be non-negative, "
+                f"got {self.media_cache_routing_weight}"
             )
 
         if self.logprobs_mode not in ("raw_logprobs", "processed_logprobs"):
