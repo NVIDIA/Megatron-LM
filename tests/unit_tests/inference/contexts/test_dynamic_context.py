@@ -4262,3 +4262,73 @@ def test_flashinfer_no_op_filter_rows_get_exact_log_softmax(top_k, top_p, finite
             assert torch.equal(log_probs[row], expected[row])
         else:
             assert int(torch.isfinite(log_probs[row]).sum()) == finite_count
+
+
+@pytest.mark.parametrize(
+    "no_top_k,no_top_p,top_k,top_p,expected_kernel",
+    [
+        (True, True, [0, 0], [0.0, 0.0], "sampling_from_logits"),
+        (True, False, [0, 0], [0.9, 0.0], "top_p_sampling_from_probs"),
+        (False, True, [5, 0], [0.0, 0.0], "top_k_sampling_from_probs"),
+        (False, False, [5, 0], [0.0, 0.9], "top_k_top_p_sampling_from_logits"),
+    ],
+)
+def test_flashinfer_sample_kernel_dispatch(
+    monkeypatch, no_top_k, no_top_p, top_k, top_p, expected_kernel
+):
+    """Filter flags pick the right kernel; an unfiltered batch avoids the CDF kernels.
+
+    The probability-CDF kernels' fp32 fallback can emit the last positive-probability
+    vocab id (~1e-6 of draws), so the unfiltered batch must use `sampling_from_logits`.
+    """
+    kernels = (
+        "sampling_from_logits",
+        "sampling_from_probs",
+        "top_p_sampling_from_probs",
+        "top_k_sampling_from_probs",
+        "top_k_top_p_sampling_from_logits",
+    )
+    vocab_size = 16
+    n = len(top_k)
+    fake = mock.MagicMock()
+    for name in kernels:
+        getattr(fake.sampling, name).return_value = torch.zeros(n, dtype=torch.int32)
+    monkeypatch.setattr("megatron.core.inference.sampling.flashinfer_sampling.flashinfer", fake)
+
+    context = SimpleNamespace(
+        gpu_view=SimpleNamespace(
+            temperature=torch.ones(n),
+            top_k=torch.tensor(top_k, dtype=torch.int32),
+            top_p=torch.tensor(top_p),
+        )
+    )
+    rng = torch.Generator()
+    backend = FlashInferSampling(vocab_size, rng)
+    logits = torch.randn(n, vocab_size, dtype=torch.float32)
+    sampled = backend.sample_kernel(logits, n, context, no_top_k=no_top_k, no_top_p=no_top_p)
+
+    assert sampled.dtype == torch.int64
+    for name in kernels:
+        assert getattr(fake.sampling, name).call_count == (1 if name == expected_kernel else 0)
+
+    args, kwargs = getattr(fake.sampling, expected_kernel).call_args
+    assert kwargs["generator"] is rng
+    assert kwargs["deterministic"] is True
+    if expected_kernel.endswith("from_logits"):
+        # Logits kernels receive the temperature-scaled logits, never a softmax.
+        assert torch.equal(args[0], logits)
+    else:
+        # Probability kernels receive normalized rows.
+        assert torch.allclose(args[0].sum(dim=-1), torch.ones(n))
+
+    # Per-row no-op sentinels map to the kernels' keep-everything values.
+    expected_safe = {
+        "top_p_sampling_from_probs": [torch.tensor([0.9, 1.0])],
+        "top_k_sampling_from_probs": [torch.tensor([5, vocab_size], dtype=torch.int32)],
+        "top_k_top_p_sampling_from_logits": [
+            torch.tensor([5, vocab_size], dtype=torch.int32),
+            torch.tensor([1.0, 0.9]),
+        ],
+    }
+    for safe_arg, expected in zip(args[1:], expected_safe.get(expected_kernel, [])):
+        assert torch.equal(safe_arg, expected)

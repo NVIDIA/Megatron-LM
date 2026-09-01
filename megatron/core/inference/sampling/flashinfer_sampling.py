@@ -19,12 +19,12 @@ from megatron.core.inference.sampling_params import (
 
 
 class FlashInferSampling(Sampling):
-    """FlashInfer sampling with per-step top-p-only / top-k-only / joint dispatch.
+    """FlashInfer sampling with per-step unfiltered / top-p-only / top-k-only / joint dispatch.
 
-    Each step selects a kernel from the batch's active filters: the dedicated exact
-    top-p or top-k kernel when only one filter is in use, and the joint kernel only
-    for genuinely mixed batches. The dispatch flags are read from the pinned CPU
-    sampling metadata, so evaluating them costs no GPU sync.
+    Each step selects a kernel from the batch's active filters: the logits kernel
+    when nothing filters, the dedicated exact top-p or top-k kernel when only one filter is in use,
+    and the joint kernel only for genuinely mixed batches.
+    The dispatch flags are read from the pinned CPU sampling metadata.
 
     The sampler runs eagerly. Its kernel choice is data-dependent (it varies with
     which filters the batch uses), so it cannot be captured in a CUDA graph; running
@@ -108,13 +108,9 @@ class FlashInferSampling(Sampling):
         # the full mass). Every kernel gets `self._rng` so sampling is seeded and its
         # philox offset advances per launch.
         if no_top_k and no_top_p:
-            # No nucleus / top-k filtering: sample the full temperature-scaled
-            # distribution. Use FlashInfer's kernel rather than torch.multinomial:
-            # multinomial forces a device-to-host sync, whereas sampling_from_probs
-            # stays on-device and keeps the RNG's philox offset advancing per launch.
-            probs = torch.softmax(scaled, dim=-1)
-            sampled_tokens = flashinfer.sampling.sampling_from_probs(
-                probs, deterministic=True, generator=self._rng
+            # No filtering: sample the temperature-scaled dist with the Gumbel-race logits kernel.
+            sampled_tokens = flashinfer.sampling.sampling_from_logits(
+                scaled, deterministic=True, generator=self._rng
             ).long()
         elif no_top_k:
             # Top-p only -> dedicated exact nucleus kernel.
