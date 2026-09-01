@@ -1071,9 +1071,10 @@ def test_swap_dsa_non_collocated(
     if refit_backend == "nccl_m2n":
         if torch.cuda.get_device_properties(torch.cuda.current_device()).major < 10:
             pytest.skip("Native NCCL M2N coverage runs on the GIN-enabled Blackwell CI lane")
-        # DIRECT is the native M2N transport for this single-node point-to-point topology.
-        # PACK uses hierarchical communicator splitting that this test neither needs nor covers.
-        monkeypatch.setenv("NCCL_RESHARD_COPY_ALGORITHM", "DIRECT")
+        # PACK is M2N's default, supported copy transport. Keep submissions to one
+        # complete parameter so this model test does not depend on the extension's
+        # cross-tensor fusion path; grouped fusion has its own focused unit coverage.
+        monkeypatch.setenv("NCCL_RESHARD_COPY_ALGORITHM", "PACK")
 
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 
@@ -1158,6 +1159,7 @@ def test_swap_dsa_non_collocated(
         [src_model] if src_model is not None else None,
         [dst_model] if dst_model is not None else None,
         refit_method=refit_backend,
+        execution_batch_bytes=1 if refit_backend == "nccl_m2n" else None,
     )
     torch.cuda.synchronize()
 
