@@ -76,6 +76,7 @@ def test_mtp_forward_signatures_preserve_positional_compatibility():
         "roll_depth",
         "sequence_len_offset",
         "embedding",
+        "mtp_dsa_context",
         "_inputs_pre_aligned",
     )
 
@@ -1399,7 +1400,10 @@ class TestMultiTokenPrediction:
                 return hidden_states, input_ids, position_ids, padding_mask
 
         config = types.SimpleNamespace(
-            pipeline_model_parallel_size=1, mtp_num_layers=2, mtp_detach_heads=False
+            pipeline_model_parallel_size=1,
+            mtp_num_layers=2,
+            mtp_detach_heads=False,
+            dsa_mtp_index_kv_share=False,
         )
         block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
         torch.nn.Module.__init__(block)
@@ -1492,7 +1496,10 @@ class TestMultiTokenPrediction:
                 return hidden_states, input_ids, position_ids, padding_mask
 
         config = types.SimpleNamespace(
-            pipeline_model_parallel_size=1, mtp_num_layers=1, mtp_detach_heads=False
+            pipeline_model_parallel_size=1,
+            mtp_num_layers=1,
+            mtp_detach_heads=False,
+            dsa_mtp_index_kv_share=False,
         )
         block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
         torch.nn.Module.__init__(block)
@@ -1540,6 +1547,88 @@ class TestMultiTokenPrediction:
                 sequence_roll_context=context,
                 embedding=embedding,
             )
+
+    def test_prepared_rows_and_repeated_dsa_context_share_are_composable(self):
+        """Absolute row alignment and iteration-scoped DSA sharing use independent carriers."""
+
+        shared_key = torch.tensor([101.0])
+        shared_topk = torch.tensor([[2]], dtype=torch.int32)
+        shared_topk_length = torch.tensor([1], dtype=torch.int32)
+
+        class SharingLayer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+
+            def forward(
+                self,
+                hidden_states,
+                input_ids,
+                position_ids,
+                padding_mask,
+                mtp_dsa_context,
+                **kwargs,
+            ):
+                self.calls.append(
+                    (
+                        input_ids.clone(),
+                        position_ids.clone(),
+                        kwargs["_inputs_pre_aligned"],
+                        mtp_dsa_context,
+                    )
+                )
+                if mtp_dsa_context.is_source:
+                    mtp_dsa_context.capture(shared_key, shared_topk, shared_topk_length)
+                else:
+                    assert mtp_dsa_context.reuses_source
+                    assert mtp_dsa_context.shared_tensors.key is shared_key
+                    assert mtp_dsa_context.shared_tensors.topk_indices is shared_topk
+                    assert mtp_dsa_context.shared_tensors.topk_length is shared_topk_length
+                return hidden_states, input_ids, position_ids, padding_mask
+
+        config = types.SimpleNamespace(
+            pipeline_model_parallel_size=1,
+            mtp_num_layers=2,
+            mtp_detach_heads=False,
+            dsa_mtp_index_kv_share=True,
+        )
+        block = MultiTokenPredictionBlock.__new__(MultiTokenPredictionBlock)
+        torch.nn.Module.__init__(block)
+        block.config = config
+        block.vp_stage = None
+        block.mtp_use_repeated_layer = True
+        layer = SharingLayer()
+        block.layers = torch.nn.ModuleList((layer,))
+
+        input_ids = torch.tensor([[10, 20, 30, 40]], dtype=torch.long)
+        position_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+        sequence_roll_context = prepare_mtp_sequence_roll_context(input_ids, None, None)
+        sequence_roll_context = sequence_roll_context.prepare_fields(
+            (
+                MTPSequenceRollField("input_ids", input_ids, -1, 0, 0),
+                MTPSequenceRollField("position_ids", position_ids, -1, 0, 0),
+            ),
+            max_offset=2,
+        )
+
+        block.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=torch.zeros(4, 1, 2),
+            attention_mask=None,
+            sequence_roll_context=sequence_roll_context,
+            embedding=types.SimpleNamespace(add_position_embedding=True),
+        )
+
+        assert len(layer.calls) == 2
+        assert torch.equal(layer.calls[0][0], torch.tensor([[20, 30, 40, 0]]))
+        assert torch.equal(layer.calls[1][0], torch.tensor([[30, 40, 0, 0]]))
+        assert torch.equal(layer.calls[0][1], torch.tensor([[1, 2, 3, 0]]))
+        assert torch.equal(layer.calls[1][1], torch.tensor([[2, 3, 0, 0]]))
+        assert all(call[2] for call in layer.calls)
+        assert layer.calls[0][3].is_source
+        assert layer.calls[1][3].reuses_source
+        assert layer.calls[1][3].shared_tensors is layer.calls[0][3].produced_tensors
 
     @pytest.mark.parametrize(
         (

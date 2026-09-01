@@ -100,8 +100,8 @@ from megatron.core.parallel_state import (
     update_pg_timeout,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.pipeline_parallel.parallel_prewarm import prewarm_pipeline_model_parallel
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.pipeline_parallel.parallel_prewarm import prewarm_pipeline_model_parallel
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -5121,6 +5121,7 @@ def train(
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
             batch_preparation_fn=thd_batch_preparation_fn,
+            require_global_static_metadata_consensus=config.cuda_graph_static_dynamic_cp,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
