@@ -770,12 +770,20 @@ class TestMcoreAdapterHybrid:
         torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
 
     @pytest.mark.parametrize(
-        "dense_instances,expert_instances,outer_strategy",
-        [(2, 1, "optim"), (1, 2, "no_shard")],
-        ids=["dense-hybrid", "expert-hsdp"],
+        "dense_instances,expert_instances,dense_outer_strategy,expert_outer_strategy",
+        [
+            (2, 1, "optim", "no_shard"),
+            (1, 2, "no_shard", "no_shard"),
+            (2, 2, "no_shard", "optim"),
+        ],
+        ids=["dense-hybrid", "expert-hsdp", "independent-outer-strategies"],
     )
     def test_moe_with_independent_hybrid_meshes(
-        self, dense_instances, expert_instances, outer_strategy
+        self,
+        dense_instances,
+        expert_instances,
+        dense_outer_strategy,
+        expert_outer_strategy,
     ):
         """Dense and expert parameters independently select their hybrid DP meshes."""
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -820,7 +828,8 @@ class TestMcoreAdapterHybrid:
                 data_parallel_sharding_strategy="optim_grads_params",
                 num_distributed_optimizer_instances=dense_instances,
                 expert_num_distributed_optimizer_instances=expert_instances,
-                outer_dp_sharding_strategy=outer_strategy,
+                outer_dp_sharding_strategy=dense_outer_strategy,
+                expert_outer_dp_sharding_strategy=expert_outer_strategy,
             ),
             module=HybridModel(
                 config=config,
@@ -863,3 +872,15 @@ class TestMcoreAdapterHybrid:
             ("dp_outer", "dp_shard") if expert_instances > 1 else ("expert_dp",),
         }
         assert meshes == expected_meshes, meshes
+        placements = {
+            parameter.grad.placements
+            for parameter in model.parameters()
+            if parameter.grad is not None
+        }
+        dense_outer = Replicate() if dense_outer_strategy == "no_shard" else Shard(0)
+        expert_outer = Replicate() if expert_outer_strategy == "no_shard" else Shard(0)
+        expected_placements = {
+            (dense_outer, Shard(0)) if dense_instances > 1 else (Shard(0),),
+            (expert_outer, Shard(0)) if expert_instances > 1 else (Shard(0),),
+        }
+        assert placements == expected_placements, placements

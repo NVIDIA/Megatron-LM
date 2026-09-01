@@ -177,6 +177,11 @@ class DistributedDataParallelConfig:
     Valid values are 'no_shard', 'optim'. This option is only effective when Hybrid FSDP is enabled.
     """
 
+    expert_outer_dp_sharding_strategy: str = 'no_shard'
+    """Sharding strategy for the outer expert data-parallel group in MFSDP v2.
+    Valid values are ``'no_shard'`` and ``'optim'``.
+    """
+
     disable_symmetric_registration: bool = False
     """If true, disable symmetric (window) registration for NCCL userbuffer registration.
       This option will force to use conventional (local) userbuffer registration 

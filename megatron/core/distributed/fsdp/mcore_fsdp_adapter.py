@@ -630,7 +630,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     pg_collection.expert_intra_dist_opt,
                     device_type,
                 )
-                expert_outer = _DATA_PARALLEL_PLACEMENTS[ddp_config.outer_dp_sharding_strategy]
+                expert_outer = _DATA_PARALLEL_PLACEMENTS[
+                    ddp_config.expert_outer_dp_sharding_strategy
+                ]
                 expert_placements = Placements(
                     dp_axes=[0, 1],
                     parameter=[expert_outer.parameter, expert_inner.parameter],
@@ -779,14 +781,22 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if (
             ddp_config.outer_dp_sharding_strategy != "no_shard"
             and ddp_config.num_distributed_optimizer_instances <= 1
-            and (config.expert_model_parallel_size <= 1 or expert_num_instances <= 1)
         ):
             # Without a second instance there is no outer axis for the strategy to apply
             # to, so honouring it is impossible and ignoring it would be silent.
             raise ValueError(
                 "MFSDP v2 outer_dp_sharding_strategy="
                 f"{ddp_config.outer_dp_sharding_strategy!r} requires an outer DP axis, "
-                "i.e. a dense or expert optimizer instance count greater than one."
+                "i.e. num_distributed_optimizer_instances > 1."
+            )
+        if ddp_config.expert_outer_dp_sharding_strategy != "no_shard" and (
+            config.expert_model_parallel_size <= 1 or expert_num_instances <= 1
+        ):
+            raise ValueError(
+                "MFSDP v2 expert_outer_dp_sharding_strategy="
+                f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires an outer expert-DP "
+                "axis, i.e. expert parallelism and "
+                "expert_num_distributed_optimizer_instances > 1."
             )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
