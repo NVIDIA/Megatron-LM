@@ -105,6 +105,18 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         logging.info(f"Received message from unknown client {sender_identity}. Ignoring.")
         return
 
+    # Drop a malformed submission rather than unpacking it. This loop serves every
+    # rank and every client, so an IndexError raised out of it takes the whole
+    # coordinator down; a client that framed its request wrongly should only cost
+    # itself that request.
+    if len(metadata) != 4 or len(bodies) != 2:
+        logging.error(
+            "Coordinator: malformed SUBMIT_REQUEST with %d metadata fields, %d bodies",
+            len(metadata) - 1,
+            len(bodies),
+        )
+        return
+
     _, client_request_id, sampling_params, multi_modal_data = metadata
     prompt_frame = bodies[0]
 

@@ -27,6 +27,7 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.data_parallel_inference_coordinator.handlers import (
+    handle_engine_reply,
     handle_submit_request,
 )
 from megatron.core.inference.engines.dynamic_engine import (
@@ -1149,3 +1150,73 @@ class TestPrefixCacheTTL:
         monkeypatch.setattr(time, "monotonic", lambda: 1350.0)
         coordinator._update_rank_hashes(rank_1, coordinator.compute_request_hashes([6, 6, 6, 6]))
         assert kept[0] in coordinator._hash_table
+
+
+class TestMalformedSubmissionsAreDropped:
+    """A badly framed submission must cost its sender, not the coordinator.
+
+    The event loop serves every rank and every client, so an exception raised out
+    of a handler takes the whole coordinator down with it.
+    """
+
+    def _coordinator(self):
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.known_clients = {b"client-A"}
+        coordinator.next_request_id = 0
+        coordinator.request_id_to_client_id = {}
+        coordinator.request_id_to_client_request_id = {}
+        coordinator.client_request_to_request_id = {}
+        coordinator.request_id_to_rank = {}
+        coordinator.schedule_records = None
+        coordinator.router_socket = MagicMock()
+        return coordinator
+
+    def test_submission_missing_the_hash_frame_is_dropped(self):
+        """Two frames was the old wire format; it must not raise IndexError."""
+        coordinator = self._coordinator()
+        metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}, None]
+        handle_submit_request(coordinator, b"client-A", metadata, [b"\xc0"])
+        coordinator.router_socket.send_multipart.assert_not_called()
+        assert coordinator.next_request_id == 0
+
+    def test_submission_with_short_metadata_is_dropped(self):
+        """Too few metadata fields must not raise a ValueError on unpack."""
+        coordinator = self._coordinator()
+        metadata = [Headers.SUBMIT_REQUEST.value, 7, {"temperature": 1.0}]
+        handle_submit_request(coordinator, b"client-A", metadata, [b"\xc0", b"\xc0"])
+        coordinator.router_socket.send_multipart.assert_not_called()
+        assert coordinator.next_request_id == 0
+
+
+class TestEngineReplyDetokenization:
+    """The coordinator detokenizes a reply only when its client asked it to."""
+
+    def _coordinator(self):
+        coordinator = make_coordinator_direct(data_parallel_size=2)
+        coordinator.request_id_to_client_id = {5: b"client-A"}
+        coordinator.request_id_to_client_request_id = {5: 55}
+        coordinator.client_request_to_request_id = {(b"client-A", 55): 5}
+        coordinator.request_id_to_rank = {}
+        coordinator.identities_of_data_parallel_ranks = deque([b"rank_0"])
+        coordinator._pending_counts = np.zeros(1, dtype=np.int32)
+        coordinator.identity_to_rank_index = {b"rank_0": 0}
+        coordinator.router_socket = MagicMock()
+        coordinator.detokenize = MagicMock()
+        return coordinator
+
+    def test_detokenizes_when_the_client_asked(self):
+        coordinator = self._coordinator()
+        metadata = [Headers.ENGINE_REPLY.value, [[5, True]]]
+        body = msgpack.packb({"request_id": 5}, use_bin_type=True)
+        handle_engine_reply(coordinator, b"rank_0", metadata, [body])
+        coordinator.detokenize.assert_called_once()
+
+    def test_forwards_the_body_untouched_when_it_did_not(self):
+        """The opt-out is the whole point: the body is never decoded."""
+        coordinator = self._coordinator()
+        metadata = [Headers.ENGINE_REPLY.value, [[5, False]]]
+        body = msgpack.packb({"request_id": 5}, use_bin_type=True)
+        handle_engine_reply(coordinator, b"rank_0", metadata, [body])
+        coordinator.detokenize.assert_not_called()
+        sent = coordinator.router_socket.send_multipart.call_args.args[0]
+        assert body in sent, "an un-detokenized body must be forwarded verbatim"
