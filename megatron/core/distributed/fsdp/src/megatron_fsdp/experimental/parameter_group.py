@@ -378,6 +378,11 @@ class FsdpParameterGroup:
         rests finalized.
         """
         assert self.main_grad is not None
+        assert self.pre_optimizer_main_grad is not None
+
+        def install_sharded_grads(grad: DBuffer) -> None:
+            for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+                fsdp_parameter.sharded.grad = grad.get_dtensor(index)
 
         # zero_grad(set_to_none=True) clears sharded parameter grads, so this
         # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
@@ -410,20 +415,20 @@ class FsdpParameterGroup:
             else:
                 self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
 
-        optimizer_main_grad = self.main_grad
         if is_last_microbatch and self.pre_optimizer_main_grad is not self.main_grad:
             # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
             # reduce-scatter for HFSDP) into the persistent buffer's optimizer-layout
             # view before binding the sharded parameter grads.
-            assert self.pre_optimizer_main_grad is not None
-            optimizer_main_grad = self.main_grad.redistribute(
+            self.main_grad.redistribute(
                 self.main_weight.placements, out=self.pre_optimizer_main_grad
             )
             self._main_grad_is_stale = True
-
-        # Make each sharded parameter's .grad consistent with the final main_grad.
-        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.sharded.grad = optimizer_main_grad.get_dtensor(index)
+            install_sharded_grads(self.pre_optimizer_main_grad)
+        else:
+            # We could install pre_optimizer_main_grad unconditionally, but before
+            # finalization it lacks the deferred DP-outer reduction and is not a valid
+            # optimizer gradient.
+            install_sharded_grads(self.main_grad)
 
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
