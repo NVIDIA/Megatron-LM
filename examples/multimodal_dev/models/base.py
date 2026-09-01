@@ -132,8 +132,11 @@ class MultimodalModel(MegatronModule):
 
         self.image_token_id = image_token_id
         self.pre_process = pre_process
-        self.post_process = post_process
         self.vp_stage = vp_stage
+        # ``post_process`` is deliberately not stored: nothing reads it off this
+        # wrapper, and ``get_attr_wrapped_model(model, 'post_process', ...)``
+        # (schedules.clear_embedding_activation_buffer) must keep resolving to
+        # the GPTModel that owns ``embedding_activation_buffer``.
         # Surfaced for ``finalize_model_grads._allreduce_word_embedding_grads``
         # which inspects the outer module (not the wrapped GPTModel) when
         # PP > 1 and either tied embeddings or MTP layers are in use.
@@ -165,10 +168,8 @@ class MultimodalModel(MegatronModule):
         return self.language_model.shared_embedding_or_output_weight()
 
     def set_input_tensor(self, input_tensor):
-        """Forward the activation from the previous PP stage into
-        ``GPTModel``.  No PP-specific routing is needed here:
-        ``GPTModel.set_input_tensor`` already handles the case based on
-        its own ``pre_process`` flag.
+        """Forward the previous PP stage's activation into ``GPTModel``,
+        which routes it according to its own ``pre_process`` flag.
         """
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
@@ -398,10 +399,8 @@ class MultimodalModel(MegatronModule):
                 else:
                     decoder_input = text_embeddings
         else:
-            # Non-first PP stage: the activation arrives via
-            # set_input_tensor on GPTModel.  Don't run vision encoder,
-            # don't run embedding, and don't pass a decoder_input here
-            # so the CP-split helper leaves it as None.
+            # Non-first PP stage: no vision encoder, no embedding; the
+            # activation arrives via GPTModel.set_input_tensor.
             assert decoder_input is None, (
                 "decoder_input is only honored on the first pipeline stage; "
                 "later stages take their activation from set_input_tensor."

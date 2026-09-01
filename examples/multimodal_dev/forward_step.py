@@ -304,12 +304,14 @@ def pack_or_pad_batch(
         assert batch is not None, "source TP rank must provide a batch"
         max_seqlens = max(x["input_ids"].shape[0] for x in batch)
         if get_pipeline_model_parallel_world_size() > 1:
-            # The PP scheduler sizes its P2P recv buffers from
-            # ``args.seq_length`` unless ``config.variable_seq_lengths`` is
-            # set, which this BSHD path deliberately does not do — only the
-            # packed/THD path sets it, in ``model_provider``.  Padding to the
-            # per-microbatch max would make the activation length vary between
-            # microbatches and mismatch those buffers, so keep it static.
+            # The PP scheduler sizes its P2P recv buffers from --seq-length
+            # (this BSHD path leaves ``variable_seq_lengths`` unset), so the
+            # padded length must be static rather than the per-microbatch max.
+            assert max_seqlens <= seq_length, (
+                f"sample length {max_seqlens} exceeds --seq-length {seq_length}; "
+                "under PP>1 the batch is padded to a static --seq-length and "
+                "longer samples cannot be represented"
+            )
             target_seqlens = seq_length
         else:
             target_seqlens = min(max_seqlens, seq_length)
@@ -440,11 +442,7 @@ def forward_step(data_iterator, model):
     if batch is None:
         return None, None
 
-    # ``pixel_values`` was omitted from the batch before TP broadcast on
-    # non-first logical pipeline stages. ``input_ids`` and ``image_grid_thw``
-    # remain available on every stage for MRoPE position construction.
-    is_last_pipeline_stage = is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
-
+    # ``pixel_values`` is absent here on non-first stages (see pack_or_pad_batch).
     pixel_values = batch.get("pixel_values", None)
     if (
         pixel_values is not None
@@ -472,10 +470,9 @@ def forward_step(data_iterator, model):
 
     # Slice loss_mask the same way the model sliced its inputs, so the
     # mask aligns with the CP-shard output.  Delegated to MultimodalModel
-    # so the slicing rule lives in one place.  The PP scheduler only
-    # invokes the loss closure on the last PP stage, so on non-last
-    # stages the mask is left untouched.
-    if is_last_pipeline_stage:
+    # so the slicing rule lives in one place.  Only the last PP stage runs
+    # the loss closure, so other stages leave the mask untouched.
+    if is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
         from examples.multimodal_dev.models.base import MultimodalModel
 
         loss_mask = MultimodalModel.cp_split_loss_mask(

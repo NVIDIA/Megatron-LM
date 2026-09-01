@@ -179,8 +179,10 @@ def test_pp_flags_reach_language_model(stage_flags):
     model = _build_model(pre_process=is_first, post_process=is_last, vp_stage=0)
 
     assert model.pre_process is is_first
-    assert model.post_process is is_last
     assert model.vp_stage == 0
+    # post_process is intentionally not stored on the wrapper (see base.py),
+    # so it is only observable on the wrapped GPTModel below.
+    assert not hasattr(model, "post_process")
 
     assert model.language_model.pre_process is is_first
     assert model.language_model.post_process is is_last
