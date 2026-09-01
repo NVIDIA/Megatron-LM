@@ -310,7 +310,7 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
     def _smem_bytes(self) -> int:
         stages = self.STAGES * self.CHUNK_ELEMENTS * self.element_bytes
         barriers = self.STAGES * 2 * 8
-        plan = (self.num_local_experts * (self.world_size + 1) + 1) * 4
+        plan = (self.num_local_experts * (self.world_size + 3) + 2) * 4
         return stages + barriers + plan + 256
 
     def _chunk_boundaries(self) -> list[int]:
@@ -431,7 +431,14 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
         active_slots = smem.allocate_tensor(
             Int32, cute.make_layout((self.num_local_experts,)), byte_alignment=16
         )
+        sourced_experts = smem.allocate_tensor(
+            Int32, cute.make_layout((self.num_local_experts,)), byte_alignment=16
+        )
+        sourced_counts = smem.allocate_tensor(
+            Int32, cute.make_layout((self.num_local_experts,)), byte_alignment=16
+        )
         active_count = smem.allocate_tensor(Int32, cute.make_layout((1,)), byte_alignment=4)
+        sourced_count = smem.allocate_tensor(Int32, cute.make_layout((1,)), byte_alignment=4)
 
         for index in cutlass.range(tid, self.num_local_experts * self.world_size, self.num_threads):
             matches[index] = Int32(-1)
@@ -443,6 +450,7 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                 destination = index // self.num_local_experts
                 slot = index - destination * self.num_local_experts
                 matches[owner_expert * self.world_size + destination] = slot
+        cute.arch.sync_threads()
         if tid == 0:
             count = Int32(0)
             for slot in cutlass.range_constexpr(self.num_local_experts):
@@ -450,6 +458,22 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                     active_slots[count] = Int32(slot)
                     count += Int32(1)
             active_count[0] = count
+            # Compact the local experts some peer actually replicated. The
+            # planner only fills a replica slot for an expert whose load it has
+            # to migrate, so a balanced iteration leaves most slots empty, and
+            # the sweep below is indexed by this count rather than by the
+            # nominal expert count so that no block draws an empty expert.
+            sourced = Int32(0)
+            for local_expert in cutlass.range_constexpr(self.num_local_experts):
+                sources = Int32(0)
+                for destination in cutlass.range_constexpr(self.world_size):
+                    if matches[local_expert * self.world_size + destination] >= Int32(0):
+                        sources += Int32(1)
+                if sources > Int32(0):
+                    sourced_experts[sourced] = Int32(local_expert)
+                    sourced_counts[sourced] = sources
+                    sourced += Int32(1)
+            sourced_count[0] = sourced
         cute.arch.sync_threads()
 
         _cross_rank_barrier(
@@ -492,19 +516,25 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                 first_chunk * bulks_per_chunk - retired_first_bulk if transport_pass else 0
             )
             retired_work = active_count[0] * retired_bulks
+            experts_with_sources = sourced_count[0]
             if warp <= self.consumer_warps:
-                # Sweep the local experts fastest. Consecutive experts come from
-                # different peers, so this keeps the blocks running at any
+                # Sweep the sourced experts fastest. Consecutive experts come
+                # from different peers, so this keeps the blocks running at any
                 # instant spread over the peers instead of pointing all of them
                 # at the one peer that hosts the expert currently being swept.
+                # Sweeping the nominal experts instead would alias every block
+                # onto one of them whenever the expert count divides the grid,
+                # leaving all but a few blocks idle on the sparse plans the
+                # planner emits for a balanced iteration.
                 for work in cutlass.range(
-                    first_chunk * self.num_local_experts + block,
-                    cutlass.const_expr(boundaries[transport_pass + 1] * self.num_local_experts),
+                    first_chunk * experts_with_sources + block,
+                    boundaries[transport_pass + 1] * experts_with_sources,
                     self.num_sms,
                     unroll=1,
                 ):
-                    expert_chunk = work // self.num_local_experts
-                    local_expert = work - expert_chunk * self.num_local_experts
+                    expert_chunk = work // experts_with_sources
+                    sourced_index = work - expert_chunk * experts_with_sources
+                    local_expert = sourced_experts[sourced_index]
                     member_chunk = expert_chunk
                     member_numel = cutlass.const_expr(self.fc1_member_numel)
                     virtual_projection_base = Int64(0)
@@ -544,59 +574,54 @@ class _ReplicaGradReduceKernel(_ReplicaBulkKernel):
                                 load_pipe.producer_commit(load_state)
                                 load_state.advance()
                     else:
-                        source_count = Int32(0)
-                        for destination in cutlass.range_constexpr(self.world_size):
-                            if matches[local_expert * self.world_size + destination] >= Int32(0):
-                                source_count += Int32(1)
-                        if source_count > Int32(0):
-                            native_destination = cute.make_ptr(
-                                self.grad_type,
-                                native_grad_bases[local_expert],
-                                cute.AddressSpace.gmem,
-                                assumed_align=16,
+                        source_count = sourced_counts[sourced_index]
+                        native_destination = cute.make_ptr(
+                            self.grad_type,
+                            native_grad_bases[local_expert],
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        )
+                        native_destination = _tensor_1d(
+                            native_destination + member_offset, self.CHUNK_ELEMENTS
+                        )
+                        if cutlass.const_expr(self.is_bf16):
+                            consumer_thread = tid - Int32(32)
+                            consumer_threads = cutlass.const_expr(32 * self.consumer_warps)
+                            thread_elements = cutlass.const_expr(
+                                self.CHUNK_ELEMENTS // consumer_threads
                             )
-                            native_destination = _tensor_1d(
-                                native_destination + member_offset, self.CHUNK_ELEMENTS
-                            )
-                            if cutlass.const_expr(self.is_bf16):
-                                consumer_thread = tid - Int32(32)
-                                consumer_threads = cutlass.const_expr(32 * self.consumer_warps)
-                                thread_elements = cutlass.const_expr(
-                                    self.CHUNK_ELEMENTS // consumer_threads
-                                )
-                                accumulator = cute.make_rmem_tensor((thread_elements,), Float32)
+                            accumulator = cute.make_rmem_tensor((thread_elements,), Float32)
+                            for register in cutlass.range_constexpr(thread_elements):
+                                element = consumer_thread + register * consumer_threads
+                                accumulator[register] = Float32(native_destination[element])
+                            for _source_index in cutlass.range(source_count, unroll=1):
+                                load_pipe.consumer_wait(consume_state)
+                                stage = stage_smem[(None, consume_state.index)]
                                 for register in cutlass.range_constexpr(thread_elements):
                                     element = consumer_thread + register * consumer_threads
-                                    accumulator[register] = Float32(native_destination[element])
-                                for _source_index in cutlass.range(source_count, unroll=1):
-                                    load_pipe.consumer_wait(consume_state)
-                                    stage = stage_smem[(None, consume_state.index)]
-                                    for register in cutlass.range_constexpr(thread_elements):
-                                        element = consumer_thread + register * consumer_threads
-                                        accumulator[register] += Float32(stage[element])
-                                    load_pipe.consumer_release(consume_state)
-                                    consume_state.advance()
-                                # Round only on the final store; peer traffic and persistent
-                                # storage remain BF16 while local additions use FP32.
-                                for register in cutlass.range_constexpr(thread_elements):
-                                    element = consumer_thread + register * consumer_threads
-                                    native_destination[element] = BFloat16(accumulator[register])
-                            else:
-                                for _source_index in cutlass.range(source_count, unroll=1):
-                                    load_pipe.consumer_wait(consume_state)
-                                    with cute.arch.elect_one():
-                                        for bulk in cutlass.range_constexpr(self.BULKS_PER_CHUNK):
-                                            stage = stage_smem[(None, consume_state.index)]
-                                            _cp_reduce_async_bulk_add_f32(
-                                                stage.iterator + bulk * self.BULK_ELEMENTS,
-                                                native_destination.iterator
-                                                + bulk * self.BULK_ELEMENTS,
-                                                self.BULK_ELEMENTS * 4,
-                                            )
-                                        cute.arch.cp_async_bulk_commit_group()
-                                        cute.arch.cp_async_bulk_wait_group(0, read=True)
-                                    load_pipe.consumer_release(consume_state)
-                                    consume_state.advance()
+                                    accumulator[register] += Float32(stage[element])
+                                load_pipe.consumer_release(consume_state)
+                                consume_state.advance()
+                            # Round only on the final store; peer traffic and persistent
+                            # storage remain BF16 while local additions use FP32.
+                            for register in cutlass.range_constexpr(thread_elements):
+                                element = consumer_thread + register * consumer_threads
+                                native_destination[element] = BFloat16(accumulator[register])
+                        else:
+                            for _source_index in cutlass.range(source_count, unroll=1):
+                                load_pipe.consumer_wait(consume_state)
+                                with cute.arch.elect_one():
+                                    for bulk in cutlass.range_constexpr(self.BULKS_PER_CHUNK):
+                                        stage = stage_smem[(None, consume_state.index)]
+                                        _cp_reduce_async_bulk_add_f32(
+                                            stage.iterator + bulk * self.BULK_ELEMENTS,
+                                            native_destination.iterator + bulk * self.BULK_ELEMENTS,
+                                            self.BULK_ELEMENTS * 4,
+                                        )
+                                    cute.arch.cp_async_bulk_commit_group()
+                                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                                load_pipe.consumer_release(consume_state)
+                                consume_state.advance()
             else:
                 if cutlass.const_expr(retired_bulks > 0):
                     # The barrier that closed the previous pass proved every owner
