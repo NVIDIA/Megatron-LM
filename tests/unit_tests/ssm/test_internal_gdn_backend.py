@@ -552,7 +552,7 @@ def test_cp_fla_fallback_uses_exp2_gate_semantics(monkeypatch):
     assert all(calls[function]["use_exp2"] is True for function in gate_primitives)
 
 
-def test_dense_batch_cp_forward_batches_local_compute_and_slices_boundaries(monkeypatch):
+def test_dense_batch_cp_forward_batches_local_and_boundary_compute(monkeypatch):
     implementation = _implementation()
     shape = (2, 64, 2, 4)
     q = torch.empty(shape, dtype=torch.bfloat16)
@@ -576,7 +576,7 @@ def test_dense_batch_cp_forward_batches_local_compute_and_slices_boundaries(monk
 
     def cp_boundary(**kwargs):
         calls["cp_boundary"].append(kwargs["k"].shape)
-        return torch.empty((1, 2, 4, 4), dtype=torch.float32)
+        return torch.empty((2, 2, 4, 4), dtype=torch.float32)
 
     def fwd_h(**kwargs):
         calls["fwd_h"].append((kwargs["k"].shape, kwargs["initial_state"].shape))
@@ -587,7 +587,11 @@ def test_dense_batch_cp_forward_batches_local_compute_and_slices_boundaries(monk
         return output
 
     monkeypatch.setattr(implementation, "chunk_gated_delta_rule_fwd_intra", intra)
-    monkeypatch.setattr(implementation, "chunk_gated_delta_rule_fwd_h_pre_process", cp_boundary)
+    monkeypatch.setattr(
+        implementation,
+        "try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl",
+        cp_boundary,
+    )
     monkeypatch.setattr(implementation, "chunk_gated_delta_rule_fwd_h", fwd_h)
     monkeypatch.setattr(implementation, "chunk_fwd_o", fwd_o)
     monkeypatch.setattr(implementation, "compress_h0", lambda state, *, context: state)
@@ -614,7 +618,7 @@ def test_dense_batch_cp_forward_batches_local_compute_and_slices_boundaries(monk
     assert initial_state.shape == (2, 2, 4, 4)
     assert calls == {
         "intra": [torch.Size([2, 64, 2, 4])],
-        "cp_boundary": [torch.Size([1, 64, 2, 4])] * 2,
+        "cp_boundary": [torch.Size([2, 64, 2, 4])],
         "fwd_h": [(torch.Size([2, 64, 2, 4]), torch.Size([2, 2, 4, 4]))],
         "output": [torch.Size([2, 64, 2, 4])],
     }
@@ -699,6 +703,46 @@ def test_single_sequence_cp_forward_uses_dense_local_compute(monkeypatch):
     assert seen["output"]["chunk_indices"] is None
 
 
+def test_dense_batch_cp_forward_fallback_slices_fla_per_batch(monkeypatch):
+    implementation = _implementation()
+    shape = (2, 64, 2, 4)
+    k = torch.empty(shape, dtype=torch.bfloat16)
+    w = torch.empty_like(k)
+    u = torch.empty_like(k)
+    g = torch.empty(shape[:-1], dtype=torch.float32)
+    cp_context = SimpleNamespace(cu_seqlens=torch.tensor([0, 64], dtype=torch.int32))
+    calls = []
+
+    cutedsl_calls = []
+
+    def cutedsl_boundary(**kwargs):
+        cutedsl_calls.append(kwargs["k"].shape)
+        if kwargs["k"].shape[0] == 1:
+            pytest.fail("dense fallback must call FLA directly")
+        return None
+
+    monkeypatch.setattr(
+        implementation,
+        "try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl",
+        cutedsl_boundary,
+    )
+
+    def fla_boundary(**kwargs):
+        calls.append(kwargs["k"].shape)
+        return torch.empty((1, 2, 4, 4), dtype=torch.float32)
+
+    monkeypatch.setattr(
+        implementation, "chunk_gated_delta_rule_fwd_h_pre_process", fla_boundary
+    )
+    result = implementation._fla_cp_forward_preprocess_dense_batch(
+        k=k, w=w, u=u, g=g, cp_context=cp_context
+    )
+
+    assert result.shape == (2, 2, 4, 4)
+    assert cutedsl_calls == [torch.Size([2, 64, 2, 4])]
+    assert calls == [torch.Size([1, 64, 2, 4])] * 2
+
+
 def test_single_sequence_cp_backward_preprocess_uses_dense_local_compute(monkeypatch):
     implementation = _implementation()
     shape = (1, 128, 2, 4)
@@ -767,7 +811,7 @@ def test_single_sequence_cp_backward_preprocess_uses_dense_local_compute(monkeyp
     assert seen["cp_boundary"]["initial_state"] is expanded_initial_state
 
 
-def test_dense_batch_cp_backward_batches_local_compute_and_slices_boundaries(monkeypatch):
+def test_dense_batch_cp_backward_batches_local_and_boundary_compute(monkeypatch):
     implementation = _implementation()
     shape = (2, 64, 2, 4)
     q = torch.zeros(shape, dtype=torch.bfloat16)
@@ -796,14 +840,18 @@ def test_dense_batch_cp_backward_batches_local_compute_and_slices_boundaries(mon
 
     def cp_boundary(**kwargs):
         calls["cp_boundary"].append(kwargs["q"].shape)
-        batch_value = int(kwargs["q"][0, 0, 0, 0].item())
-        dht = torch.full((1, 2, 4, 4), batch_value, dtype=torch.float32)
-        return dht, None
+        batch_values = kwargs["q"][:, 0, 0, 0].float().reshape(2, 1, 1, 1)
+        dht = batch_values.expand(2, 2, 4, 4).contiguous()
+        return dht
 
     monkeypatch.setattr(implementation, "recompute_w_u_fwd", recompute)
     monkeypatch.setattr(implementation, "expand_h0", lambda state, *, context: state)
     monkeypatch.setattr(implementation, "chunk_bwd_dv_local", dv_local)
-    monkeypatch.setattr(implementation, "chunk_gated_delta_rule_bwd_dhu_pre_process", cp_boundary)
+    monkeypatch.setattr(
+        implementation,
+        "try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl",
+        cp_boundary,
+    )
 
     actual_dht, actual_h = implementation._fla_cp_backward_preprocess(
         q=q,
@@ -828,8 +876,165 @@ def test_dense_batch_cp_backward_batches_local_compute_and_slices_boundaries(mon
     assert calls == {
         "recompute": [torch.Size([2, 64, 2, 4])],
         "dv": [torch.Size([2, 64, 2, 4])],
-        "cp_boundary": [torch.Size([1, 64, 2, 4])] * 2,
+        "cp_boundary": [torch.Size([2, 64, 2, 4])],
     }
+
+
+def test_dense_batch_cp_backward_fallback_slices_fla_per_batch(monkeypatch):
+    implementation = _implementation()
+    shape = (2, 64, 2, 4)
+    q = torch.zeros(shape, dtype=torch.bfloat16)
+    q[1].fill_(1)
+    k = torch.empty_like(q)
+    w = torch.empty_like(q)
+    do = torch.empty_like(q)
+    dv = torch.empty_like(q)
+    g = torch.empty(shape[:-1], dtype=torch.float32)
+    initial_state = torch.empty((2, 2, 4, 4), dtype=torch.float32)
+    cp_context = SimpleNamespace(cu_seqlens=torch.tensor([0, 64], dtype=torch.int32))
+    calls = []
+
+    cutedsl_calls = []
+
+    def cutedsl_boundary(**kwargs):
+        cutedsl_calls.append(kwargs["q"].shape)
+        if kwargs["q"].shape[0] == 1:
+            pytest.fail("dense fallback must call FLA directly")
+        return None
+
+    monkeypatch.setattr(
+        implementation,
+        "try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl",
+        cutedsl_boundary,
+    )
+
+    def fla_boundary(**kwargs):
+        calls.append(kwargs["q"].shape)
+        value = kwargs["q"][:, 0, 0, 0].float().reshape(1, 1, 1, 1)
+        return value.expand(1, 2, 4, 4).contiguous(), None
+
+    monkeypatch.setattr(
+        implementation, "chunk_gated_delta_rule_bwd_dhu_pre_process", fla_boundary
+    )
+    result = implementation._fla_cp_backward_preprocess_dense_batch(
+        q=q,
+        k=k,
+        w=w,
+        do=do,
+        dv=dv,
+        g=g,
+        scale=0.5,
+        initial_state=initial_state,
+        cp_context=cp_context,
+    )
+
+    assert result.shape == (2, 2, 4, 4)
+    assert torch.equal(result[:, 0, 0, 0], torch.tensor([0.0, 1.0]))
+    assert cutedsl_calls == [torch.Size([2, 64, 2, 4])]
+    assert calls == [torch.Size([1, 64, 2, 4])] * 2
+
+
+def test_dense_batch_cp_backward_rejects_subchunk_local_length(monkeypatch):
+    pytest.importorskip("fla")
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_cp_cute import (
+        backend as cp_backend,
+    )
+
+    B, T, H, HV, K = 2, 63, 2, 4, 128
+    q = torch.empty((B, T, H, K), dtype=torch.bfloat16)
+    k = torch.empty_like(q)
+    w = torch.empty((B, T, HV, K), dtype=torch.bfloat16)
+    do = torch.empty_like(w)
+    dv = torch.empty_like(w)
+    g = torch.empty((B, T, HV), dtype=torch.float32)
+    context = SimpleNamespace(group=object())
+
+    monkeypatch.setenv("MCORE_GDN_CP_CUTEDSL", "1")
+    monkeypatch.setattr(cp_backend, "_group_topology", lambda _group: (4, 0))
+    monkeypatch.setattr(cp_backend, "_chain_mode", lambda **_kwargs: "fused")
+    cp_backend.reset_cutedsl_fallback_reasons()
+
+    assert (
+        cp_backend._is_supported_bwd(
+            q=q,
+            k=k,
+            w=w,
+            do=do,
+            dv=dv,
+            g=g,
+            gk=None,
+            bg=None,
+            dht=None,
+            chunk_size=64,
+            cu_seqlens=torch.tensor([0, T * 4], dtype=torch.int32),
+            context=context,
+        )
+        is None
+    )
+    assert cp_backend.get_cutedsl_fallback_reasons() == {
+        "bwd: dense B=2 requires local T>=64": 1
+    }
+
+
+def test_fla_backward_dense_batch_cp_uses_batched_boundary_helper(monkeypatch):
+    implementation = _implementation()
+    tensor = torch.zeros((2, 1, 1, 1), dtype=torch.float32)
+    expanded_initial_state = torch.ones_like(tensor)
+    expected_dht = torch.full_like(tensor, 2.0)
+    seen = {}
+
+    def call_fla_compat(function, **kwargs):
+        if function is implementation.recompute_w_u_fwd:
+            return tensor, tensor
+        if function is implementation.chunk_gated_delta_rule_fwd_h:
+            return tensor, tensor, None
+        if function is implementation.chunk_bwd_dv_local:
+            return tensor
+        if function is implementation.chunk_gated_delta_rule_bwd_dhu:
+            seen["dht"] = kwargs["dht"]
+            seen["h0"] = kwargs["h0"]
+            return tensor, tensor, tensor
+        if function is implementation.chunk_bwd_dqkwg:
+            return tensor, tensor.clone(), tensor, tensor.clone()
+        if function is implementation.prepare_wy_repr_bwd:
+            return tensor, tensor, tensor, tensor
+        raise AssertionError(f"unexpected FLA primitive: {function}")
+
+    def dense_boundary(**kwargs):
+        seen["dense_boundary"] = kwargs
+        return expected_dht
+
+    monkeypatch.setattr(implementation, "_call_fla_compat", call_fla_compat)
+    monkeypatch.setattr(
+        implementation, "expand_h0", lambda _state, *, context: expanded_initial_state
+    )
+    monkeypatch.setattr(implementation, "_fla_cp_backward_preprocess_dense_batch", dense_boundary)
+    monkeypatch.setattr(
+        implementation,
+        "_cp_backward_preprocess",
+        lambda **_kwargs: pytest.fail("dense CP must use the batched boundary helper"),
+    )
+    monkeypatch.setattr(implementation, "chunk_local_cumsum", lambda value, **_kwargs: value)
+
+    implementation._fla_backward(
+        q=tensor,
+        k=tensor,
+        v=tensor,
+        g=tensor,
+        beta=tensor,
+        A=tensor,
+        scale=1.0,
+        do=tensor,
+        cu_seqlens=None,
+        chunk_indices=None,
+        initial_state=tensor,
+        cp_context=SimpleNamespace(group=object()),
+    )
+
+    assert seen["dense_boundary"]["q"] is tensor
+    assert seen["dense_boundary"]["initial_state"] is expanded_initial_state
+    assert seen["dht"] is expected_dht
+    assert seen["h0"] is None
 
 
 def test_dense_cu_seqlens_reuses_cached_tensor():
