@@ -31,6 +31,10 @@ from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphS
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.residual_connection import (
+    ResidualConnectionSpec,
+    build_residual_connection,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -273,6 +277,9 @@ class TransformerLayerSubmodules:
             after the MLP.
         sharded_state_dict_keys_map (Dict[str, str]): Mapping for sharded tensor keys to be applied
             in the `sharded_state_dict` method.
+        residual_connection_self_attn: Optional residual connection around self-attention.
+        residual_connection_cross_attn: Optional residual connection around cross-attention.
+        residual_connection_mlp: Optional residual connection around the MLP or MoE branch.
     """
 
     input_layernorm: LayerNormBuilder = IdentityOp
@@ -292,6 +299,12 @@ class TransformerLayerSubmodules:
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
+
+    # Keep optional architecture seams after existing fields so positional construction
+    # of TransformerLayerSubmodules remains backward compatible.
+    residual_connection_self_attn: ResidualConnectionSpec = None
+    residual_connection_cross_attn: ResidualConnectionSpec = None
+    residual_connection_mlp: ResidualConnectionSpec = None
 
 
 class BaseTransformerLayer(ABC):
@@ -470,6 +483,124 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.mlp_bda = build_module(submodules.mlp_bda)
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
+
+        # Residual connections are ordinary child modules. Constructing them after the
+        # existing branches preserves the base layer's parameter initialization order.
+        self.residual_connection_self_attn = build_residual_connection(
+            submodules.residual_connection_self_attn,
+            config=self.config,
+            layer_number=self.layer_number,
+            branch_name="self_attention",
+            pg_collection=pg_collection,
+            name=(name + ".residual_connection_self_attn") if name is not None else None,
+        )
+        self.residual_connection_cross_attn = build_residual_connection(
+            submodules.residual_connection_cross_attn,
+            config=self.config,
+            layer_number=self.layer_number,
+            branch_name="cross_attention",
+            pg_collection=pg_collection,
+            name=(name + ".residual_connection_cross_attn") if name is not None else None,
+        )
+        self.residual_connection_mlp = build_residual_connection(
+            submodules.residual_connection_mlp,
+            config=self.config,
+            layer_number=self.layer_number,
+            branch_name="mlp",
+            pg_collection=pg_collection,
+            name=(name + ".residual_connection_mlp") if name is not None else None,
+        )
+
+        residual_connections = [
+            connection
+            for connection in (
+                self.residual_connection_self_attn,
+                self.residual_connection_cross_attn,
+                self.residual_connection_mlp,
+            )
+            if connection is not None
+        ]
+        if self.residual_connection_cross_attn is not None:
+            raise NotImplementedError(
+                "Residual connections around cross-attention are not yet supported."
+            )
+        if (
+            self.residual_connection_self_attn is not None
+            and self._input_layernorm_returns_residual
+        ):
+            raise ValueError(
+                "A self-attention residual connection cannot be combined with a layer norm "
+                "that returns its own residual."
+            )
+        if self.residual_connection_mlp is not None and self._pre_mlp_layernorm_returns_residual:
+            raise ValueError(
+                "An MLP residual connection cannot be combined with a layer norm that returns "
+                "its own residual."
+            )
+        if residual_connections and self.config.inference_fuse_tp_communication:
+            raise NotImplementedError(
+                "Residual connections do not support fused tensor-parallel inference."
+            )
+        residual_stream_hidden_sizes = {
+            connection.residual_stream_hidden_size for connection in residual_connections
+        }
+        if len(residual_stream_hidden_sizes) > 1:
+            raise ValueError(
+                "All residual paths in a TransformerLayer must use the same residual-stream "
+                f"hidden size, got {sorted(residual_stream_hidden_sizes)}."
+            )
+        self.residual_stream_hidden_size = (
+            residual_stream_hidden_sizes.pop()
+            if residual_stream_hidden_sizes
+            else self.config.hidden_size
+        )
+
+        if self.config.wide_residual is not None:
+            expected_stream_hidden_size = (
+                self.config.wide_residual.num_streams * self.config.hidden_size
+            )
+            if self.residual_stream_hidden_size != expected_stream_hidden_size:
+                raise ValueError(
+                    "wide_residual connections must carry num_streams * hidden_size features, "
+                    f"expected {expected_stream_hidden_size}, got "
+                    f"{self.residual_stream_hidden_size}."
+                )
+            branches = (
+                ("self-attention", self.self_attention, self.residual_connection_self_attn),
+                ("cross-attention", self.cross_attention, self.residual_connection_cross_attn),
+                ("MLP", self.mlp, self.residual_connection_mlp),
+            )
+            missing_connections = [
+                branch_name
+                for branch_name, branch, connection in branches
+                if not isinstance(branch, IdentityOp) and connection is None
+            ]
+            if missing_connections:
+                raise ValueError(
+                    "Every active branch needs a wide-residual connection; missing "
+                    f"{', '.join(missing_connections)}."
+                )
+
+        for connection in residual_connections:
+            if connection.branch_hidden_size != self.config.hidden_size:
+                raise ValueError(
+                    "Residual connections around TransformerLayer branches must produce "
+                    f"hidden_size={self.config.hidden_size}, got "
+                    f"{connection.branch_hidden_size}."
+                )
+
+        if (
+            self.is_moe_layer
+            and self.residual_connection_mlp is not None
+            and any(
+                module in (self.config.cuda_graph_modules or [])
+                for module in (CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess)
+            )
+        ):
+            raise NotImplementedError(
+                "Outer MoE residual connections do not support partial MoE CUDA graphs "
+                "because those graph boundaries do not carry residual-connection state."
+            )
 
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
@@ -768,8 +899,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             Tuple ``(input_layernorm_output, residual, attn_state)`` where
             ``attn_state`` is an opaque payload subclasses can use to thread
             extra intermediates (e.g. mHC ``h_res``/``h_post``) through to
-            ``_apply_self_attn_bda_step``. Base returns ``()``.
+            ``_apply_self_attn_bda_step``. A configured residual connection uses
+            it for the corresponding write state; otherwise base returns ``()``.
         """
+        residual_connection = self.residual_connection_self_attn
+        connection_state = ()
+        if residual_connection is not None:
+            hidden_states, connection_state = apply_module(residual_connection)(
+                hidden_states,
+                operation="read",
+                fp32_residual_connection=self.config.fp32_residual_connection,
+            )
+
         self.attn_norm_manager = self.off_interface(
             self.offload_attn_norm, hidden_states, "attn_norm"
         )
@@ -789,22 +930,27 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self._input_layernorm_returns_residual:
             input_layernorm_output, residual = input_layernorm_output
         else:
-            residual = hidden_states
+            residual = (
+                hidden_states
+                if residual_connection is None
+                else residual_connection.residual_stream(connection_state)
+            )
 
-        if self.config.fp32_residual_connection:
+        if residual_connection is None and self.config.fp32_residual_connection:
             residual = residual.float()
-        return input_layernorm_output, residual, ()
+        return input_layernorm_output, residual, connection_state
 
     def _apply_self_attn_bda_step(self, attention_output_with_bias, residual, attn_state=()):
         """bias-dropout-add for self-attention output + post-step offload commit.
 
-        Subclasses override this to swap in a fused kernel that consumes extra
-        intermediates threaded via ``attn_state`` (the third element returned
-        by ``_run_input_layernorm``). Base ignores ``attn_state``.
+        Subclasses may override this to consume custom intermediates threaded via
+        ``attn_state``. Base uses that state for an optional residual connection and
+        otherwise performs the ordinary bias-dropout-add.
         """
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
+        residual_connection = self.residual_connection_self_attn
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
@@ -813,6 +959,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # self attention module.
             hidden_states = attention_output_with_bias[0]
+        elif residual_connection is not None:
+            if not attn_state:
+                raise RuntimeError("Missing state for the self-attention residual connection.")
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = apply_module(residual_connection)(
+                    attention_output_with_bias,
+                    operation="write",
+                    state=attn_state,
+                    dropout_probability=self.hidden_dropout,
+                    training=self.training,
+                )
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
@@ -822,8 +979,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Delay the offload of the attention norm until after the self_attn_bda has been computed
         # because the residual is needed in the self_attn_bda.
+        forced_released_tensors = [residual] if residual_connection is None else []
         hidden_states = self.attn_norm_manager.group_offload(
-            hidden_states, forced_released_tensors=[residual]
+            hidden_states, forced_released_tensors=forced_released_tensors
         )
         self.attn_norm_manager = None
         return hidden_states
@@ -942,19 +1100,33 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             Tuple ``(pre_mlp_layernorm_output, residual, mlp_state)`` where
             ``mlp_state`` is an opaque payload subclasses can use to thread
             extra intermediates (e.g. mHC ``mlp_h_res`` / ``mlp_hc_h_post``)
-            through to ``_apply_mlp_bda_step``. Base returns ``()``.
+            through to ``_apply_mlp_bda_step``. A configured residual connection
+            uses it for the corresponding write state; otherwise base returns ``()``.
         """
+        residual_connection = self.residual_connection_mlp
+        connection_state = ()
+        if residual_connection is not None:
+            hidden_states, connection_state = apply_module(residual_connection)(
+                hidden_states,
+                operation="read",
+                fp32_residual_connection=self.config.fp32_residual_connection,
+            )
+
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
 
         if self._pre_mlp_layernorm_returns_residual:
             pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
         else:
-            residual = hidden_states
+            residual = (
+                hidden_states
+                if residual_connection is None
+                else residual_connection.residual_stream(connection_state)
+            )
 
-        if self.config.fp32_residual_connection:
+        if residual_connection is None and self.config.fp32_residual_connection:
             residual = residual.float()
 
-        return pre_mlp_layernorm_output, residual, ()
+        return pre_mlp_layernorm_output, residual, connection_state
 
     def _forward_mlp_output_with_bias(
         self,
@@ -1086,7 +1258,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
-
         if self.recompute_mlp:
             if self.config.fp8 or self.config.fp4:
                 # import here to avoid circular import
@@ -1150,9 +1321,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Perform operations after the MLP computation: bias-dropout-add for
         the MLP output + post-step offload commit + viewless-tensor wrap.
 
-        Subclasses override this to swap in a fused kernel that consumes extra
-        intermediates threaded via ``mlp_state`` (the third element returned
-        by ``_pre_mlp_layernorm_and_residual``). Base ignores ``mlp_state``.
+        Subclasses may override this to consume custom intermediates threaded via
+        ``mlp_state``. Base uses that state for an optional residual connection and
+        otherwise performs the ordinary bias-dropout-add.
 
         Args:
             mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
@@ -1182,7 +1353,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
-
+        residual_connection = self.residual_connection_mlp
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of mlp_output_with_bias[0]
@@ -1198,6 +1369,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # The remaining residual add is already handled inside the
             # MLP module.
             hidden_states = mlp_output_with_bias[0]
+        elif residual_connection is not None:
+            if not mlp_state:
+                raise RuntimeError("Missing state for the MLP residual connection.")
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = apply_module(residual_connection)(
+                    mlp_output_with_bias,
+                    operation="write",
+                    state=mlp_state,
+                    dropout_probability=self.hidden_dropout,
+                    training=self.training,
+                )
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
@@ -1207,8 +1389,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
         # because the residual is needed in the mlp_bda.
         if self.mlp_norm_manager is not None:
+            forced_released_tensors = [residual] if residual_connection is None else []
             hidden_states = self.mlp_norm_manager.group_offload(
-                hidden_states, forced_released_tensors=[residual]
+                hidden_states, forced_released_tensors=forced_released_tensors
             )
             self.mlp_norm_manager = None
 
@@ -1317,6 +1500,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
 
+        if self.config.wide_residual is not None:
+            hidden_states = static_inputs["hidden_states"]
+            static_inputs["hidden_states"] = torch.ones(
+                (hidden_states.shape[0], hidden_states.shape[1], self.residual_stream_hidden_size),
+                dtype=hidden_states.dtype,
+                requires_grad=hidden_states.requires_grad,
+                device=hidden_states.device,
+            )
+
         if not isinstance(self.self_attention, IdentityOp) and (
             not self.config.cuda_graph_modules
             or CudaGraphModule.attn in self.config.cuda_graph_modules
@@ -1345,10 +1537,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 self.pre_cross_attn_layernorm,
                 self.cross_attention,
             ]
+            if self.residual_connection_self_attn is not None:
+                submodules.append(self.residual_connection_self_attn)
         if (not self.is_moe_layer and CudaGraphModule.mlp in self.config.cuda_graph_modules) or (
             self.is_moe_layer and CudaGraphModule.moe in self.config.cuda_graph_modules
         ):
             submodules += [self.pre_mlp_layernorm, self.mlp]
+            if self.residual_connection_mlp is not None:
+                submodules.append(self.residual_connection_mlp)
         elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
             submodules += [self.pre_mlp_layernorm, self.mlp.router]
             if (
