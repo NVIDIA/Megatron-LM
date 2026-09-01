@@ -89,9 +89,10 @@ class FsdpParameterGroup:
     main_grad: DBuffer | None
     # Optimizer-layout view into main_grad storage, avoiding a second allocation.
     pre_optimizer_main_grad: DBuffer | None
-    # HFSDP finalization writes a smaller optimizer view, leaving the rest of
-    # main_grad untouched until the next accumulation begins.
-    _main_grad_has_smaller_optimizer_view: bool
+    # HFSDP finalization writes only a smaller optimizer view. After
+    # zero_grad(set_to_none=False) clears that view, the remaining main_grad
+    # storage is stale and must be cleared before the next accumulation begins.
+    _main_grad_is_stale: bool
     _unsharded_model_weight: DBuffer
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
@@ -200,7 +201,7 @@ class FsdpParameterGroup:
 
         self.main_grad = None
         self.pre_optimizer_main_grad = None
-        self._main_grad_has_smaller_optimizer_view = False
+        self._main_grad_is_stale = False
         if self.requires_grad:
             grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
             # Keep main_grad persistent for the initial implementation. For micro-batch
@@ -385,13 +386,13 @@ class FsdpParameterGroup:
         # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
         # leaves sharded grads installed, so this backward accumulates into main_grad.
         has_sharded_grads = self._has_sharded_grads()
-        if self._main_grad_has_smaller_optimizer_view:
+        if self._main_grad_is_stale:
             # In HFSDP, zero_grad(set_to_none=False) only zeros the smaller optimizer
             # view. Clear the persistent full accumulation buffer before this new step;
             # set_to_none=True needs no clear because out= below overwrites it.
             if has_sharded_grads:
                 self.main_grad.local_buffer.zero_()
-            self._main_grad_has_smaller_optimizer_view = False
+            self._main_grad_is_stale = False
 
         if can_reduce_into_main_grad := (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
@@ -421,7 +422,7 @@ class FsdpParameterGroup:
             optimizer_main_grad = self.main_grad.redistribute(
                 self.main_weight.placements, out=self.pre_optimizer_main_grad
             )
-            self._main_grad_has_smaller_optimizer_view = (
+            self._main_grad_is_stale = (
                 optimizer_main_grad.local_buffer.numel() < self.main_grad.local_buffer.numel()
             )
 
