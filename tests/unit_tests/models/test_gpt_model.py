@@ -21,6 +21,7 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
     get_mlp_module_spec,
 )
@@ -28,8 +29,12 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import Float16Module
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
 from megatron.core.utils import is_fa_min_version, is_te_min_version
+from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -77,6 +82,92 @@ class TestGPTModel:
 
         num_weights = sum([p.numel() for p in self.gpt_model.parameters()])
         assert num_weights == 6240
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        ("wide_residual", "expected_layer_type"),
+        [
+            (None, TransformerLayer),
+            (WideResidualConfig(num_streams=2), WideResidualTransformerLayer),
+        ],
+        ids=("disabled", "enabled"),
+    )
+    def test_public_builder_default_spec_constructs_exact_layer_class(
+        self, wide_residual, expected_layer_type
+    ):
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            transformer_impl="local",
+            use_cpu_initialization=True,
+            wide_residual=wide_residual,
+        )
+        model_config = GPTModelConfig(
+            transformer=transformer_config,
+            transformer_layer_spec=None,
+            vocab_size=100,
+            seq_length=4,
+        )
+
+        model = GPTModelBuilder(model_config).build_model(
+            ProcessGroupCollection.use_mpu_process_groups(), pre_process=True, post_process=True
+        )
+
+        assert type(model.decoder.layers[0]) is expected_layer_type
+
+    @pytest.mark.internal
+    def test_public_builder_does_not_rewrite_explicit_ordinary_spec(self):
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            transformer_impl="local",
+            use_cpu_initialization=True,
+            wide_residual=WideResidualConfig(num_streams=2),
+        )
+        model_config = GPTModelConfig(
+            transformer=transformer_config,
+            transformer_layer_spec=get_gpt_layer_local_spec(),
+            vocab_size=100,
+            seq_length=4,
+        )
+
+        with pytest.raises(ValueError, match="WideResidualTransformerLayer"):
+            GPTModelBuilder(model_config).build_model(
+                ProcessGroupCollection.use_mpu_process_groups(), pre_process=True, post_process=True
+            )
+
+    @pytest.mark.internal
+    def test_public_builder_default_spec_constructs_wide_moe_layers(self):
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            transformer_impl="local",
+            num_moe_experts=2,
+            moe_ffn_hidden_size=24,
+            moe_layer_freq=[0, 1],
+            add_bias_linear=False,
+            use_cpu_initialization=True,
+            wide_residual=WideResidualConfig(num_streams=2),
+        )
+        model_config = GPTModelConfig(
+            transformer=transformer_config,
+            transformer_layer_spec=None,
+            vocab_size=100,
+            seq_length=4,
+        )
+
+        model = GPTModelBuilder(model_config).build_model(
+            ProcessGroupCollection.use_mpu_process_groups(), pre_process=True, post_process=True
+        )
+
+        assert [type(layer) for layer in model.decoder.layers] == [
+            WideResidualTransformerLayer,
+            WideResidualTransformerLayer,
+        ]
+        assert isinstance(model.decoder.layers[1].mlp, MoELayer)
 
     @pytest.mark.internal
     def test_set_input_tensor(self):
@@ -604,6 +695,7 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
     mock_config.use_kitchen = False
     mock_config.use_kitchen_attention = False
     mock_config.kitchen_attention_backend = "sdpa"
+    mock_config.wide_residual = None
 
     mock_args = MagicMock()
     mock_args.num_experts = None
@@ -627,3 +719,28 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
         assert (
             call_kwargs.get('use_te_activation_func') is True
         ), "use_te_activation_func must be forwarded from config"
+
+
+@pytest.mark.parametrize(
+    ("use_te", "transformer_impl", "factory_name"),
+    [
+        (True, "transformer_engine", "get_gpt_wide_residual_layer_with_transformer_engine_spec"),
+        (False, "inference_optimized", "get_gpt_wide_residual_layer_with_inference_spec"),
+        (False, "local", "get_gpt_wide_residual_layer_local_spec"),
+    ],
+    ids=("transformer_engine", "inference", "local"),
+)
+def test_legacy_builder_selects_explicit_wide_residual_factory(
+    use_te, transformer_impl, factory_name
+):
+    from gpt_builders import _get_transformer_layer_spec
+
+    config = MagicMock()
+    config.transformer_impl = transformer_impl
+    config.wide_residual = WideResidualConfig(num_streams=2)
+
+    with patch(f"gpt_builders.{factory_name}") as factory:
+        result = _get_transformer_layer_spec(use_te=use_te, config=config)
+
+    factory.assert_called_once()
+    assert result is factory.return_value

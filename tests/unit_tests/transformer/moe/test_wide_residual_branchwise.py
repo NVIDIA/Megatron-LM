@@ -13,10 +13,9 @@ from megatron.core.tensor_parallel.random import initialize_rng_tracker
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
-from megatron.core.transformer.transformer_layer import MoETransformerLayer
 from megatron.core.transformer.wide_residual_layer import (
     StreamwiseSigmoidWideResidualConnection,
-    specialize_wide_residual_layer_spec,
+    WideResidualTransformerLayer,
 )
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
@@ -58,16 +57,14 @@ def _config(
     )
 
 
-def _build_layer(config: TransformerConfig) -> MoETransformerLayer:
+def _build_layer(config: TransformerConfig) -> WideResidualTransformerLayer:
     submodules = copy.deepcopy(
         get_gpt_layer_local_submodules(num_experts=config.num_moe_experts, moe_grouped_gemm=False)
     )
     submodules.input_layernorm = IdentityOp
     submodules.self_attention = IdentityOp
     submodules.self_attn_bda = IdentityFuncOp
-    layer_spec = specialize_wide_residual_layer_spec(
-        ModuleSpec(module=MoETransformerLayer, submodules=submodules), config
-    )
+    layer_spec = ModuleSpec(module=WideResidualTransformerLayer, submodules=submodules)
     return build_module(
         layer_spec,
         config=config,
@@ -78,7 +75,9 @@ def _build_layer(config: TransformerConfig) -> MoETransformerLayer:
     ).cuda()
 
 
-def _assert_branchwise_geometry(layer: MoETransformerLayer, config: TransformerConfig) -> None:
+def _assert_branchwise_geometry(
+    layer: WideResidualTransformerLayer, config: TransformerConfig
+) -> None:
     wide_hidden_size = config.wide_residual.num_streams * config.hidden_size
     connection = layer.residual_connection_mlp
     assert isinstance(connection, StreamwiseSigmoidWideResidualConnection)
