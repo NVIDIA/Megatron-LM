@@ -209,8 +209,6 @@ def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup
         device=distributed_setup.device,
     )
     tensor_view = buffer.get_local_tensor(0)
-    buffer_data_ptr = buffer.local_buffer.data_ptr()
-    tensor_view_data_ptr = tensor_view.data_ptr()
 
     buffer.release_storage()
     assert buffer.local_buffer.untyped_storage().nbytes() == 0
@@ -220,8 +218,6 @@ def test_release_and_reallocate_storage_preserves_buffer_views(distributed_setup
         buffer.local_buffer.untyped_storage().nbytes()
         == buffer.local_buffer.numel() * buffer.local_buffer.element_size()
     )
-    assert buffer.local_buffer.data_ptr() == buffer_data_ptr
-    assert tensor_view.data_ptr() == tensor_view_data_ptr
     buffer.local_buffer.fill_(7.0)
     torch.testing.assert_close(tensor_view, torch.full_like(tensor_view, 7.0))
 

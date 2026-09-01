@@ -135,6 +135,9 @@ class DBuffer:
 
     def reallocate_storage(self) -> None:
         """Restore the local buffer's backing storage to its logical size."""
+        # The allocator may hand back a different address than release_storage() freed.
+        # Tensors sharing this Storage read its pointer on each access, so views into the
+        # buffer -- including ones autograd saved -- follow it to the new allocation.
         self._resize_storage(self.local_buffer.numel())
 
     def release_storage(self) -> None:
