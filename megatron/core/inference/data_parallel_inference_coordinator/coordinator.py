@@ -104,9 +104,9 @@ class DataParallelInferenceCoordinator:
         block_size_tokens: int | None = None,
         enable_prefix_caching: bool = False,
         prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-            PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         ),
-        prefix_caching_routing_alpha: float = 0.5,
+        prefix_caching_routing_alpha: float = 1.0,
         prefix_cache_ttl_seconds: float = 300.0,
         media_cache_coordinator_policy: MediaCacheCoordinatorPolicy = (
             MediaCacheCoordinatorPolicy.AFFINITY
@@ -650,9 +650,9 @@ class DataParallelInferenceCoordinator:
         block_size_tokens: int | None = None,
         enable_prefix_caching: bool = False,
         prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-            PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         ),
-        prefix_caching_routing_alpha: float = 0.5,
+        prefix_caching_routing_alpha: float = 1.0,
         prefix_cache_ttl_seconds: float = 300.0,
         media_cache_coordinator_policy: MediaCacheCoordinatorPolicy = (
             MediaCacheCoordinatorPolicy.AFFINITY

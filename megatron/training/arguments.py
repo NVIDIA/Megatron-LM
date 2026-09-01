@@ -2245,28 +2245,28 @@ def _add_inference_args(parser):
                        'When disabled, KV cache blocks cannot be shared between '
                        'requests with identical prompt prefixes.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-eviction-policy',
-                       type=str, default='ref_zero',
+                       type=str, default='lru',
                        choices=['ref_zero', 'lru'],
                        dest='inference_dynamic_batching_prefix_caching_eviction_policy',
                        help='Eviction policy for prefix caching blocks. '
-                       '"ref_zero" (default) immediately returns blocks to the '
-                       'free pool when ref_count hits 0. "lru" keeps blocks '
-                       'cached and evicts via LRU only when space is needed.')
+                       '"ref_zero" immediately returns blocks to the '
+                       'free pool when ref_count hits 0. "lru" (default) keeps '
+                       'blocks cached and evicts via LRU only when space is needed.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-coordinator-policy',
-                       type=str, default='load_balanced',
+                       type=str, default='longest_prefix',
                        choices=['longest_prefix', 'first_prefix_block', 'load_balanced'],
                        dest='inference_dynamic_batching_prefix_caching_coordinator_policy',
                        help='Coordinator routing policy for prefix caching. '
-                       '"load_balanced" (default) routes to the rank with the fewest '
+                       '"load_balanced" routes to the rank with the fewest '
                        'in-flight requests, ignoring prefix affinity. '
                        '"first_prefix_block" routes based on the first block hash only. '
-                       '"longest_prefix" routes to the rank with the longest matching '
-                       'prefix. "first_prefix_block" and "longest_prefix" both combine '
+                       '"longest_prefix" (default) routes to the rank with the longest '
+                       'matching prefix. "first_prefix_block" and "longest_prefix" both combine '
                        'prefix affinity with load balancing and fall back to '
                        'load-balanced routing when prefix caching is disabled or no '
                        'prefix match exists.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-routing-alpha',
-                       type=float, default=0.5,
+                       type=float, default=1.0,
                        dest='inference_dynamic_batching_prefix_caching_routing_alpha',
                        help='How hard to penalise load when routing on prefix '
                        'affinity: score = cache_score - alpha * relative_load, where '

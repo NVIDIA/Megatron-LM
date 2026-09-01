@@ -487,16 +487,14 @@ class InferenceConfig:
     generation epoch changes.
     """
 
-    prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
-        PrefixCachingEvictionPolicy.REF_ZERO
-    )
+    prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = PrefixCachingEvictionPolicy.LRU
     """Eviction policy for prefix caching blocks. See `PrefixCachingEvictionPolicy` for options.
 
     Only applies when enable_prefix_caching is True.
     """
 
     prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-        PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+        PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
     )
     """Routing policy for the DP inference coordinator. See
     `PrefixCachingCoordinatorPolicy` for options.
@@ -504,7 +502,7 @@ class InferenceConfig:
     Only applies when enable_prefix_caching is True and using a coordinator.
     """
 
-    prefix_caching_routing_alpha: float = 0.5
+    prefix_caching_routing_alpha: float = 1.0
     """How hard the coordinator penalises load when routing on prefix affinity:
     score = cache_score - alpha * relative_load.
 
