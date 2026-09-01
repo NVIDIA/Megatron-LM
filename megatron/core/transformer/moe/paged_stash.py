@@ -612,7 +612,10 @@ class PagedStashManager:
                 else 0
             )
             buf_dtype = (
-                torch.uint8 if dtype in [torch.float8_e4m3fn, torch.float8_e8m0fnu] else dtype
+                torch.uint8
+                if dtype in [torch.float8_e4m3fn, torch.float8_e8m0fnu]
+                or dtype is getattr(torch, "float4_e2m1fn_x2", None)
+                else dtype
             )
             self.stash_buffers[dtype][hidden_size] = PagedStashBuffer(
                 num_tokens,
