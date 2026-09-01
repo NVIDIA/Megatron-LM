@@ -658,9 +658,12 @@ class InferenceConfig:
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
         self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)
-        if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
+        # Not capped at 1: alpha stopped being a blend weight when the score became
+        # cache_score - alpha * relative_load, and values above 1 are meaningful --
+        # they let load outweigh a full cache hit once ranks diverge.
+        if self.prefix_caching_routing_alpha < 0.0:
             raise ValueError(
-                f"prefix_caching_routing_alpha must be in [0, 1], "
+                f"prefix_caching_routing_alpha must be non-negative, "
                 f"got {self.prefix_caching_routing_alpha}"
             )
         if self.media_cache_routing_weight < 0:
