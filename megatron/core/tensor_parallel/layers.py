@@ -1271,22 +1271,13 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             # Check the weight passed in is the correct shape
             expected_shape = (self.output_size_per_partition, self.input_size)
-            # A GTP weight-remat shard legitimately arrives at its *local* shape: with tied
-            # embeddings, shared_embedding_or_output_weight() hands this layer the embedding's
-            # GTP-sharded parameter, and _forward_impl all-gathers it to the logical shape
-            # before the matmul (see the gtp_remat_size kwarg). Compare the logical shape so
-            # the guard still rejects a genuinely wrong weight.
             # Deferred to break the tensor_parallel package import cycle (gtp_api ->
             # generalized_tensor_parallelism -> tensor_parallel/__init__ -> layers).
             from megatron.core.tensor_parallel.gtp_api import is_gtp_param
 
-            if is_gtp_param(weight):
-                supplied_shape = weight._unsharded_shape
-            else:
-                supplied_shape = tuple(weight.shape)
-            if supplied_shape != expected_shape:
+            if weight.shape != expected_shape and not is_gtp_param(weight):
                 raise RuntimeError(
-                    f"supplied weight's shape is {supplied_shape}, "
+                    f"supplied weight's shape is {tuple(weight.shape)}, "
                     f"not {expected_shape} as expected"
                 )
 

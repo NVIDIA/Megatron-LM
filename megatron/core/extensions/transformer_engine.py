@@ -38,7 +38,6 @@ from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
-    copy_tensor_model_parallel_attributes,
     set_tensor_model_parallel_attributes,
 )
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
@@ -87,9 +86,6 @@ except ImportError:
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
-# GEMM bias parameters ("bias", or "bias0".."biasN" on a grouped linear). Deliberately excludes
-# names like "layer_norm_bias", which are not sized off out_features.
-_BIAS_NAME_PATTERN = re.compile(r"bias\d*")
 
 
 def _set_expert_parameter_attributes(
@@ -448,7 +444,7 @@ def _gtp_pre_init(
     ), f"_gtp_pre_init: output_size={output_size} not divisible by out_split_size={out_split_size}"
     per_rank, pad_length = gtp_remat_shard_dim0(output_size // out_split_size, gtp_remat_group)
     shard_out = per_rank * out_split_size
-    gtp_ctx = (gtp_remat_group, pad_length, output_size, out_split_size)
+    gtp_ctx = (gtp_remat_group, pad_length, output_size)
 
     tracker_name = get_gtp_remat_rng_tracker_name(is_expert=is_expert)
     if rng_via_kwarg:
@@ -456,54 +452,6 @@ def _gtp_pre_init(
     else:
         module.rng_tracker_name = tracker_name
     return shard_out, gtp_ctx
-
-
-def _gtp_restore_presharded_bias(module, gtp_ctx, is_grouped=False):
-    """Re-allocate biases that the pre-sharded ``out_features`` of :func:`_gtp_pre_init` shrank.
-
-    GTP shards the WEIGHT along dim 0; a bias is GTP-REPLICATED (mcore's own
-    ``ColumnParallelLinear`` allocates it at the full per-TP size,
-    ``attach_gtp_to_presharded_module`` never wraps it, and
-    ``make_sharded_tensors_for_checkpoint_with_gtp_remat`` treats a non-GTP param under a GTP
-    module as replicated). TE, however, sizes its bias from the ``out_features``
-    it is constructed with, and :func:`_gtp_pre_init` deliberately passes the pre-sharded value —
-    so the bias silently comes out 1/gtp_remat too small. That breaks two things: the all-gathered
-    weight produces a full-width GEMM output the shard-sized bias cannot be added to, and
-    distributed checkpointing declares a global shape 1/gtp_remat of the real one (a plain
-    checkpoint then fails to load with "Global shape mismatch ... linear_qkv.bias").
-
-    Biases are zero-initialized by both TE and mcore, so re-allocating loses no state.
-    """
-    gtp_remat_group, pad_length, logical_out_features, out_split_size = gtp_ctx
-    gtp_remat_size = gtp_remat_group.size()
-    # Size TE gave the bias (its shard) vs. the logical size it should have had.
-    logical_numel = logical_out_features // out_split_size
-    shard_numel = (logical_numel + pad_length) // gtp_remat_size
-    if shard_numel == logical_numel:
-        return
-
-    bias_names = getattr(module, "bias_names", None)
-    if not bias_names:
-        bias_names = [f"bias{idx}" for idx in range(module.num_gemms)] if is_grouped else ["bias"]
-    # Only the GEMM biases; never a norm bias (``layer_norm_bias``), which is sized off
-    # in_features and is not affected by the out_features pre-shard.
-    bias_names = [name for name in bias_names if _BIAS_NAME_PATTERN.fullmatch(name)]
-    for name in bias_names:
-        bias = getattr(module, name, None)
-        # Only touch a bias TE actually sized off the pre-sharded out_features. Anything else
-        # (a zero-length placeholder for bias=False) is left alone.
-        if not isinstance(bias, Parameter) or bias.dim() != 1 or bias.numel() != shard_numel:
-            continue
-        restored = Parameter(
-            torch.zeros(logical_numel, dtype=bias.dtype, device=bias.device),
-            requires_grad=bias.requires_grad,
-        )
-        copy_tensor_model_parallel_attributes(restored, bias)
-        for attr in ("allreduce", "sequence_parallel", "partition_stride"):
-            if hasattr(bias, attr):
-                setattr(restored, attr, getattr(bias, attr))
-        delattr(module, name)
-        module._parameters[name] = restored
 
 
 def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False, replica_group=None):
@@ -515,14 +463,11 @@ def _gtp_attach_post_init(module, gtp_ctx, is_grouped=False, replica_group=None)
     """
     from megatron.core.tensor_parallel.gtp_api import attach_gtp_to_presharded_module
 
-    gtp_remat_group, pad_length, logical_out_features, _ = gtp_ctx
+    gtp_remat_group, pad_length, logical_out_features = gtp_ctx
     # Restore the LOGICAL out_features (the sharded value was only needed to size the weight in
     # super().__init__): downstream code reads it, e.g. the grouped-MLP fusion gate checks
     # fc1.out_features == 2 * fc2.in_features (a shard-sized fc1 would silently disable fusion).
     module.out_features = logical_out_features
-    # Biases are replicated, not GTP-sharded: undo the pre-shard for them before the weights are
-    # wrapped (which is what makes the weights, and only the weights, GTP params).
-    _gtp_restore_presharded_bias(module, gtp_ctx, is_grouped=is_grouped)
     attach_gtp_to_presharded_module(
         module, gtp_remat_group, pad_length, is_grouped=is_grouped, replica_group=replica_group
     )
