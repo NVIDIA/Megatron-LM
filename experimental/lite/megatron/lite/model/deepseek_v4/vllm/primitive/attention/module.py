@@ -755,6 +755,9 @@ class VLLMAttention(CompressedSparseAttention):
                 ):
                     owned_start = max(global_start, seq_start)
                     owned_end = min(local_end, seq_end)
+                    if owned_start >= owned_end:
+                        local_boundaries.append(local_boundaries[-1])
+                        continue
                     first_group = max(
                         0,
                         (owned_start - seq_start - d_comp + ratio - 1) // ratio,

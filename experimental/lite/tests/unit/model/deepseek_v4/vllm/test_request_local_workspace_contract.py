@@ -39,6 +39,18 @@ def test_attention_gathers_workspace_inside_request_loop() -> None:
     assert ".item()" not in source
 
 
+def test_attention_skips_requests_outside_the_local_cp_rank() -> None:
+    source = _function_source(
+        ATTENTION_ROOT / "module.py", "_forward_training_attention"
+    )
+    guard = "if owned_start >= owned_end:"
+    assert source.index("owned_end = min(local_end, seq_end)") < source.index(guard)
+    assert source.index(guard) < source.index("first_group = max(")
+    guard_body = source[source.index(guard) : source.index("first_group = max(")]
+    assert "local_boundaries.append(local_boundaries[-1])" in guard_body
+    assert "continue" in guard_body
+
+
 def test_official_request_loops_consume_host_boundaries() -> None:
     for function_name in (
         "official_compact_compressed_visible",
