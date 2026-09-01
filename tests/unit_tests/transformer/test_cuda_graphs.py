@@ -1031,15 +1031,20 @@ class TestParallelHybridBlockCudagraphs:
 
 class TestHybridTECudaGraphDiscovery:
     @staticmethod
-    def _bare_hybrid_wrapper(*, offload_in_graph=False, delay_offload=False):
+    def _bare_hybrid_wrapper(*, offload_in_graph=None, delay_offload=False):
         wrapper = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
         torch.nn.Module.__init__(wrapper)
+        # Intentionally minimal: individual CPU mocks provide only the state they exercise.
         wrapper.config = SimpleNamespace(
             cuda_graph_modules=[CudaGraphModule.attn],
             delay_offload_until_cuda_graph=delay_offload,
             fine_grained_activation_offloading=True,
         )
-        object.__setattr__(wrapper, '_has_offload_module_in_cuda_graph', lambda: offload_in_graph)
+        object.__setattr__(wrapper, '_offload_module_in_cuda_graph_cached', None)
+        if offload_in_graph is not None:
+            object.__setattr__(
+                wrapper, '_compute_offload_module_in_cuda_graph', lambda: offload_in_graph
+            )
         return wrapper
 
     @staticmethod
@@ -1057,6 +1062,7 @@ class TestHybridTECudaGraphDiscovery:
         inner.offload_attn_proj = False
         inner.offload_mlp_norm = False
         inner.is_moe_layer = is_moe
+        inner.offload_module_in_cuda_graph = offload_core_attn
         return inner
 
     @staticmethod
@@ -1260,6 +1266,14 @@ class TestHybridTECudaGraphDiscovery:
         assert calls == ['backward_record', 'body', 'forward_record']
         assert torch.equal(output[0], torch.full((2, 1, 4), 4.0))
 
+    def test_hybrid_capture_impl_rejects_raw_packed_sequence_kwargs(self):
+        wrapper = self._bare_hybrid_wrapper(offload_in_graph=False)
+
+        with pytest.raises(AssertionError):
+            wrapper._te_cuda_graph_capture_impl(
+                torch.ones(2, 1, 4), cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32)
+            )
+
     def test_grouped_hybrid_capture_has_one_outer_offload_boundary(self):
         calls = []
         head = self._bare_hybrid_wrapper(offload_in_graph=True)
@@ -1294,29 +1308,63 @@ class TestHybridTECudaGraphDiscovery:
 
         tail = self._bare_hybrid_wrapper()
         tail.inner_layer = inner
-        # Exercise the real predicate instead of the test helper override.
-        object.__delattr__(tail, '_has_offload_module_in_cuda_graph')
 
-        assert not tail._has_offload_module_in_cuda_graph()
+        assert not tail._compute_offload_module_in_cuda_graph()
         assert not tail.offload_module_in_cuda_graph
 
-    def test_hybrid_offload_predicate_reads_real_inner_flags_and_group_tail(self):
+    def test_hybrid_empty_cuda_graph_scope_does_not_claim_inner_offload(self):
+        calls = []
+        wrapper = self._bare_hybrid_wrapper()
+        wrapper.config.cuda_graph_modules = []
+        wrapper.inner_layer = self._bare_transformer_inner(
+            has_attention=True, offload_core_attn=True
+        )
+        object.__setattr__(wrapper, 'off_interface', self._recording_offload_interface(calls))
+        object.__setattr__(wrapper, '_get_te_cuda_graph_group_tail', lambda: None)
+        object.__setattr__(wrapper, '_inner_is_partial_moe_capture', lambda: False)
+        object.__setattr__(
+            wrapper,
+            'forward',
+            lambda hidden_states, **_kwargs: (calls.append('body') or hidden_states, None),
+        )
+
+        assert not wrapper.offload_module_in_cuda_graph
+        wrapper._te_cuda_graph_capture(torch.ones(2, 1, 4))
+        assert calls == ['body']
+
+    def test_hybrid_explicit_attn_scope_claims_inner_offload(self):
         attention_inner = self._bare_transformer_inner(has_attention=True, offload_core_attn=True)
 
         attention_wrapper = self._bare_hybrid_wrapper()
         attention_wrapper.inner_layer = attention_inner
-        object.__delattr__(attention_wrapper, '_has_offload_module_in_cuda_graph')
         assert attention_wrapper.offload_module_in_cuda_graph
 
-        no_attention_inner = self._bare_transformer_inner(
-            has_attention=False, offload_core_attn=True, is_moe=True
+    def test_hybrid_offload_property_caches_and_grouping_invalidates(self):
+        calls = []
+        head = self._bare_hybrid_wrapper()
+        tail = self._bare_hybrid_wrapper()
+        object.__setattr__(
+            head,
+            '_compute_inner_offload_module_in_cuda_graph',
+            lambda: calls.append('head') or False,
         )
+        object.__setattr__(
+            tail,
+            '_compute_inner_offload_module_in_cuda_graph',
+            lambda: calls.append('tail') or True,
+        )
+        object.__setattr__(head, '_can_group_te_cuda_graph_with', lambda _tail: True)
 
-        group_head = self._bare_hybrid_wrapper()
-        group_head.inner_layer = no_attention_inner
-        object.__delattr__(group_head, '_has_offload_module_in_cuda_graph')
-        object.__setattr__(group_head, '_get_te_cuda_graph_group_tail', lambda: attention_wrapper)
-        assert group_head.offload_module_in_cuda_graph
+        assert not head.offload_module_in_cuda_graph
+        assert not head.offload_module_in_cuda_graph
+        assert calls == ['head']
+
+        head._set_te_cuda_graph_group_tail(tail)
+        assert head._offload_module_in_cuda_graph_cached is None
+        assert head.offload_module_in_cuda_graph
+        assert head.offload_module_in_cuda_graph
+        assert calls == ['head', 'head', 'tail']
+        assert head._offload_module_in_cuda_graph_cached is True
 
     @pytest.mark.parametrize(
         ('delay_offload', 'tail_raises'), [(False, False), (True, False), (True, True)]
