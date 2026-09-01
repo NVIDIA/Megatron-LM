@@ -91,18 +91,7 @@ pip install -e /workspace/Model-Optimizer
 All examples require a Megatron-Core distributed checkpoint. To import a
 Hugging Face model, run the [Megatron-Bridge stable checkpoint conversion
 CLI](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/conversion#2-stable-checkpoint-conversion-cli)
-inside the NeMo container started above:
-
-```sh
-HF_MODEL_PATH=/workspace/modelopt-workspace/hf/Llama-3.2-1B-Instruct
-MEGATRON_MODEL_PATH=/workspace/modelopt-workspace/megatron/Llama-3.2-1B-Instruct
-
-cd /opt/Megatron-Bridge
-./scripts/conversion/convert.sh import \
-        --executor local --device cpu \
-        --hf-model "${HF_MODEL_PATH}" \
-        --megatron-path "${MEGATRON_MODEL_PATH}"
-```
+inside the NeMo container started above.
 
 Use `--device cpu` when the conversion fits in host memory; otherwise use
 `--device gpu` with the intended `--tp`, `--pp`, and `--ep` layout. See the
@@ -112,8 +101,7 @@ architectures. To quantize directly from Hugging Face, use the
 
 ### Megatron Model Configs
 
-> **❗ IMPORTANT:** The first positional argument (e.g. `meta-llama/Llama-3.2-1B-Instruct`) of each script
-> is the config name used to match the supported model config in `conf/`. Make sure the model you are running is supported by a config in `conf/`.
+**❗ IMPORTANT:** The first positional argument (e.g. `meta-llama/Llama-3.2-1B-Instruct`) of each script is the config name used to match the supported model config in `conf/`. Make sure the model you are running is supported by a config in `conf/`.
 
 ## ⭐ Post-Training Quantization
 
