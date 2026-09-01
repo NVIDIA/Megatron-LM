@@ -1,6 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Tests for streamwise wide-residual branch connections."""
 
+from dataclasses import fields
+from unittest.mock import Mock
+
 import pytest
 import torch
 from torch import nn
@@ -8,23 +11,17 @@ from torch import nn
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
-from megatron.core.transformer.transformer_layer import (
-    MoETransformerLayer,
-    TransformerLayer,
-    TransformerLayerSubmodules,
-)
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual_layer import (
     LearnedWideResidualRetention,
     StreamwiseSigmoidResidualReadout,
     StreamwiseSigmoidWideResidualConnection,
+    WideResidualTransformerLayer,
     expand_wide_residual_stream,
-    specialize_wide_residual_layer_spec,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -56,6 +53,10 @@ def _process_groups() -> ProcessGroupCollection:
 
 
 class _ActiveBranch(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        del args, kwargs
+
     def forward(self, hidden_states, *args, **kwargs):
         del args, kwargs
         return hidden_states
@@ -148,6 +149,7 @@ def test_wide_residual_config_validates_bounded_retention(retention_init, max_fo
         ({"inference_fuse_tp_communication": True}, "fuse_tp_communication"),
         ({"fp32_residual_connection": True}, "fp32_residual_connection"),
         ({"heterogeneous_block_specs": True}, "heterogeneous_block_specs"),
+        ({"overlap_moe_expert_parallel_comm": True}, "overlap_moe_expert_parallel_comm"),
         (
             {"num_layers": 2, "pipeline_model_parallel_size": 2, "pipeline_dtype": torch.bfloat16},
             "pipeline_model_parallel_size",
@@ -270,69 +272,137 @@ class TestStreamwiseSigmoidWideResidualConnection:
         assert torch.allclose(retention(), torch.full((3,), 0.999), atol=1.0e-7)
 
 
-class TestWideResidualSpecSpecialization:
-    def test_disabled_config_returns_original_spec(self):
-        config = TransformerConfig(
-            num_layers=1, hidden_size=8, num_attention_heads=2, use_cpu_initialization=True
+class TestWideResidualStaticConstruction:
+    def test_transformer_layer_submodules_has_no_wide_residual_fields(self):
+        field_names = {field.name for field in fields(TransformerLayerSubmodules)}
+
+        assert field_names.isdisjoint(
+            {
+                "residual_connection_self_attn",
+                "residual_connection_cross_attn",
+                "residual_connection_mlp",
+            }
         )
-        original = ModuleSpec(module=TransformerLayer, submodules=TransformerLayerSubmodules())
 
-        assert specialize_wide_residual_layer_spec(original, config) is original
-
-    def test_active_branches_receive_independent_connections(self):
-        original = ModuleSpec(
-            module=TransformerLayer,
+    @pytest.mark.parametrize(
+        ("self_attention", "mlp", "expected_connections"),
+        [
+            (_ActiveBranch, IdentityOp, {"self_attention"}),
+            (IdentityOp, _ActiveBranch, {"mlp"}),
+            (_ActiveBranch, _ActiveBranch, {"self_attention", "mlp"}),
+        ],
+        ids=("attention_only", "mlp_only", "attention_and_mlp"),
+    )
+    def test_static_subclass_constructs_connections_for_active_branches(
+        self, self_attention, mlp, expected_connections
+    ):
+        layer_spec = ModuleSpec(
+            module=WideResidualTransformerLayer,
             submodules=TransformerLayerSubmodules(
-                self_attention=_ActiveBranch, cross_attention=IdentityOp, mlp=_ActiveBranch
+                self_attention=self_attention,
+                self_attn_bda=get_bias_dropout_add,
+                mlp=mlp,
+                mlp_bda=get_bias_dropout_add,
             ),
         )
-        specialized = specialize_wide_residual_layer_spec(original, _wide_config())
 
-        assert original.submodules.residual_connection_self_attn is None
-        assert original.submodules.residual_connection_mlp is None
-        assert (
-            specialized.submodules.residual_connection_self_attn.module
-            is StreamwiseSigmoidWideResidualConnection
+        layer = build_module(
+            layer_spec,
+            config=_wide_config(),
+            layer_number=1,
+            add_layer_offset=False,
+            pg_collection=_process_groups(),
         )
-        assert (
-            specialized.submodules.residual_connection_mlp.module
-            is StreamwiseSigmoidWideResidualConnection
-        )
-        assert (
-            specialized.submodules.residual_connection_self_attn
-            is not specialized.submodules.residual_connection_mlp
-        )
+
+        assert layer_spec.module is WideResidualTransformerLayer
+        assert type(layer) is WideResidualTransformerLayer
+        connections = {
+            "self_attention": layer.residual_connection_self_attn,
+            "mlp": layer.residual_connection_mlp,
+        }
+        for branch_name, connection in connections.items():
+            if branch_name in expected_connections:
+                assert isinstance(connection, StreamwiseSigmoidWideResidualConnection)
+            else:
+                assert connection is None
+        if len(expected_connections) == 2:
+            assert layer.residual_connection_self_attn is not layer.residual_connection_mlp
 
     def test_cross_attention_is_rejected_explicitly(self):
-        original = ModuleSpec(
-            module=TransformerLayer,
+        layer_spec = ModuleSpec(
+            module=WideResidualTransformerLayer,
             submodules=TransformerLayerSubmodules(
                 self_attention=_ActiveBranch, cross_attention=_ActiveBranch, mlp=_ActiveBranch
             ),
         )
 
         with pytest.raises(NotImplementedError, match="cross-attention"):
-            specialize_wide_residual_layer_spec(original, _wide_config())
+            build_module(
+                layer_spec,
+                config=_wide_config(),
+                layer_number=1,
+                add_layer_offset=False,
+                pg_collection=_process_groups(),
+            )
 
-    def test_moe_uses_one_outer_branch_connection(self):
-        original = ModuleSpec(
-            module=MoETransformerLayer,
-            submodules=TransformerLayerSubmodules(self_attention=IdentityOp, mlp=MoELayer),
+    def test_ordinary_spec_with_wide_config_fails_without_mutation(self):
+        submodules = TransformerLayerSubmodules(
+            self_attention=_ActiveBranch,
+            self_attn_bda=get_bias_dropout_add,
+            mlp=_ActiveBranch,
+            mlp_bda=get_bias_dropout_add,
         )
-        specialized = specialize_wide_residual_layer_spec(original, _wide_config())
+        layer_spec = ModuleSpec(module=TransformerLayer, submodules=submodules)
+        original_submodules = dict(vars(submodules))
 
-        assert specialized.submodules.residual_connection_self_attn is None
-        assert (
-            specialized.submodules.residual_connection_mlp.module
-            is StreamwiseSigmoidWideResidualConnection
+        with pytest.raises(ValueError, match="WideResidualTransformerLayer"):
+            TransformerBlock(
+                _wide_config(), layer_spec, post_layer_norm=False, pg_collection=_process_groups()
+            )
+
+        assert layer_spec.module is TransformerLayer
+        assert layer_spec.submodules is submodules
+        assert vars(submodules) == original_submodules
+
+    def test_static_subclass_requires_wide_residual_config(self):
+        config = TransformerConfig(
+            num_layers=1, hidden_size=8, num_attention_heads=2, use_cpu_initialization=True
         )
+        layer_spec = ModuleSpec(
+            module=WideResidualTransformerLayer,
+            submodules=TransformerLayerSubmodules(self_attention=_ActiveBranch),
+        )
+
+        with pytest.raises(ValueError, match="requires wide_residual"):
+            build_module(
+                layer_spec,
+                config=config,
+                layer_number=1,
+                add_layer_offset=False,
+                pg_collection=_process_groups(),
+            )
+
+    @pytest.mark.parametrize(
+        "config_overrides",
+        [
+            {"cuda_graph_impl": "local"},
+            {"cuda_graph_impl": "transformer_engine"},
+            {"cuda_graph_impl": "full_iteration"},
+            {"enable_cuda_graph": True},
+            {"external_cuda_graph": True},
+        ],
+        ids=("local", "transformer_engine", "full_iteration", "legacy_local", "legacy_te"),
+    )
+    def test_wide_residual_rejects_cuda_graphs(self, config_overrides):
+        with pytest.raises(NotImplementedError, match="does not yet support CUDA graphs"):
+            _wide_config(**config_overrides)
 
 
 class TestWideResidualLayerIntegration:
     @staticmethod
-    def _layer_spec() -> ModuleSpec:
+    def _layer_spec(*, module=WideResidualTransformerLayer) -> ModuleSpec:
         return ModuleSpec(
-            module=TransformerLayer,
+            module=module,
             submodules=TransformerLayerSubmodules(
                 self_attention=_AdditiveAttention,
                 self_attn_bda=get_bias_dropout_add,
@@ -351,7 +421,7 @@ class TestWideResidualLayerIntegration:
             use_cpu_initialization=True,
         )
         layer = build_module(
-            self._layer_spec(),
+            self._layer_spec(module=TransformerLayer),
             config=config,
             layer_number=1,
             add_layer_offset=False,
@@ -362,9 +432,31 @@ class TestWideResidualLayerIntegration:
         output, context = layer(hidden_states=hidden_states, attention_mask=None)
 
         assert context is None
-        assert layer.residual_connection_self_attn is None
-        assert layer.residual_connection_mlp is None
+        assert type(layer) is TransformerLayer
+        assert not hasattr(layer, "residual_connection_self_attn")
+        assert not hasattr(layer, "residual_connection_mlp")
         assert torch.allclose(output, 12.0 * hidden_states + 4.0)
+
+    def test_disabled_block_keeps_optional_readout_defined_when_layer_build_is_overridden(
+        self, monkeypatch
+    ):
+        config = TransformerConfig(
+            num_layers=1, hidden_size=8, num_attention_heads=2, use_cpu_initialization=True
+        )
+
+        def build_layers_without_wide_residual(block):
+            block.layers = torch.nn.ModuleList()
+            block.final_layernorm = None
+
+        monkeypatch.setattr(TransformerBlock, "_build_layers", build_layers_without_wide_residual)
+        block = TransformerBlock(
+            config,
+            self._layer_spec(module=TransformerLayer),
+            post_layer_norm=False,
+            pg_collection=_process_groups(),
+        )
+
+        assert block.residual_stream_readout is None
 
     @pytest.mark.parametrize(
         ("norm_field", "expected_error"),
@@ -380,7 +472,7 @@ class TestWideResidualLayerIntegration:
 
         with pytest.raises(ValueError, match=expected_error):
             build_module(
-                specialize_wide_residual_layer_spec(layer_spec, config),
+                layer_spec,
                 config=config,
                 layer_number=1,
                 add_layer_offset=False,
@@ -396,8 +488,15 @@ class TestWideResidualLayerIntegration:
             use_cpu_initialization=True,
         )
         wide_config = _wide_config()
-        layer_spec = ModuleSpec(
-            module=TransformerLayer,
+        submodules = TransformerLayerSubmodules(
+            self_attention=_ParameterizedAttention,
+            self_attn_bda=get_bias_dropout_add,
+            mlp=_ParameterizedMLP,
+            mlp_bda=get_bias_dropout_add,
+        )
+        baseline_spec = ModuleSpec(module=TransformerLayer, submodules=submodules)
+        wide_spec = ModuleSpec(
+            module=WideResidualTransformerLayer,
             submodules=TransformerLayerSubmodules(
                 self_attention=_ParameterizedAttention,
                 self_attn_bda=get_bias_dropout_add,
@@ -408,7 +507,7 @@ class TestWideResidualLayerIntegration:
 
         torch.manual_seed(1234)
         baseline = build_module(
-            layer_spec,
+            baseline_spec,
             config=base_config,
             layer_number=1,
             add_layer_offset=False,
@@ -416,7 +515,7 @@ class TestWideResidualLayerIntegration:
         )
         torch.manual_seed(1234)
         wide = build_module(
-            specialize_wide_residual_layer_spec(layer_spec, wide_config),
+            wide_spec,
             config=wide_config,
             layer_number=1,
             add_layer_offset=False,
@@ -429,7 +528,7 @@ class TestWideResidualLayerIntegration:
     def test_layer_carries_wide_stream_while_branches_remain_ordinary_width(self):
         config = _wide_config(init_scale=0.0)
         layer = build_module(
-            specialize_wide_residual_layer_spec(self._layer_spec(), config),
+            self._layer_spec(),
             config=config,
             layer_number=1,
             add_layer_offset=False,
@@ -456,10 +555,68 @@ class TestWideResidualLayerIntegration:
         assert connection_parameters
         assert all(parameter.grad is not None for parameter in connection_parameters.values())
 
-        config.cuda_graph_modules = [CudaGraphModule.attn, CudaGraphModule.mlp]
-        graph_submodules = layer._get_submodules_under_cudagraphs()
-        assert layer.residual_connection_self_attn in graph_submodules
-        assert layer.residual_connection_mlp in graph_submodules
+    def test_layer_checkpoint_surface_and_strict_round_trip(self):
+        config = _wide_config(learned_retention=True)
+        source = build_module(
+            self._layer_spec(),
+            config=config,
+            layer_number=1,
+            add_layer_offset=False,
+            pg_collection=_process_groups(),
+        )
+        destination = build_module(
+            self._layer_spec(),
+            config=config,
+            layer_number=1,
+            add_layer_offset=False,
+            pg_collection=_process_groups(),
+        )
+        with torch.no_grad():
+            source.residual_connection_self_attn.read_map.logit[0].add_(0.25)
+            source.residual_connection_mlp.write_map.logit[1].sub_(0.125)
+
+        state = source.state_dict()
+        expected_connection_keys = {
+            f"residual_connection_{branch}.{parameter}"
+            for branch in ("self_attn", "mlp")
+            for parameter in ("read_map.logit", "write_map.logit", "retention.retention_logit")
+        }
+        connection_keys = {key for key in state if key.startswith("residual_connection_")}
+
+        assert connection_keys == expected_connection_keys
+        destination.load_state_dict(state, strict=True)
+        for key in state:
+            assert torch.equal(destination.state_dict()[key], state[key])
+
+    def test_layer_forward_invokes_connection_module_hooks(self):
+        config = _wide_config()
+        layer = build_module(
+            self._layer_spec(),
+            config=config,
+            layer_number=1,
+            add_layer_offset=False,
+            pg_collection=_process_groups(),
+        )
+        operations = []
+
+        def record_operation(module, args, kwargs):
+            del args
+            operations.append((module.branch_name, kwargs["operation"]))
+
+        layer.residual_connection_self_attn.register_forward_pre_hook(
+            record_operation, with_kwargs=True
+        )
+        layer.residual_connection_mlp.register_forward_pre_hook(record_operation, with_kwargs=True)
+        base = torch.randn(2, 3, config.hidden_size)
+
+        layer(hidden_states=expand_wide_residual_stream(base, 3), attention_mask=None)
+
+        assert operations == [
+            ("self_attention", "read"),
+            ("self_attention", "write"),
+            ("mlp", "read"),
+            ("mlp", "write"),
+        ]
 
     def test_transformer_block_expands_and_reads_out_the_wide_stream(self):
         config = _wide_config(init_scale=0.01)

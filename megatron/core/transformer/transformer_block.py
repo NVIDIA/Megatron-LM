@@ -30,7 +30,7 @@ from megatron.core.transformer.hyper_connection import (
     finalize_mhc_recompute_layer,
 )
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module, get_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -39,9 +39,9 @@ from megatron.core.transformer.transformer_layer import (
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.transformer.wide_residual_layer import (
+    WideResidualTransformerLayer,
     build_wide_residual_readout,
     expand_wide_residual_stream,
-    specialize_wide_residual_layer_spec,
 )
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
@@ -335,6 +335,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             and config.recompute_granularity == 'selective'
             and 'mhc' in config.recompute_modules
         )
+        self.residual_stream_readout = None
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
 
@@ -366,15 +367,26 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             else:
                 quantization_context = nullcontext()
 
-            configured_layer_spec = (
-                specialize_wide_residual_layer_spec(layer_spec, layer_config)
-                if layer_config.wide_residual is not None
-                else layer_spec
-            )
+            if layer_config.wide_residual is not None:
+                if not isinstance(layer_spec, ModuleSpec):
+                    raise ValueError(
+                        "wide_residual requires every TransformerBlock layer to use an "
+                        "explicit ModuleSpec naming WideResidualTransformerLayer."
+                    )
+                layer_module = get_module(layer_spec)
+                if not (
+                    isinstance(layer_module, type)
+                    and issubclass(layer_module, WideResidualTransformerLayer)
+                ):
+                    raise ValueError(
+                        "wide_residual requires every TransformerBlock layer spec to name "
+                        "WideResidualTransformerLayer explicitly; got "
+                        f"{layer_module!r}."
+                    )
 
             with quantization_context:
                 module = build_module(
-                    configured_layer_spec,
+                    layer_spec,
                     config=layer_config,
                     layer_number=layer_number,
                     pg_collection=self.pg_collection,

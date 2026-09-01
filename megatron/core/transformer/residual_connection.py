@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Construction-time seam for architecture-specific residual connections."""
+"""Runtime protocol for architecture-specific residual connections."""
 
 from __future__ import annotations
 
@@ -9,14 +9,9 @@ from typing import Literal, Optional, TypeAlias, overload
 import torch
 from torch import Tensor, nn
 
-from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_config import TransformerConfig
-
 ResidualBranchOutput: TypeAlias = Tensor | tuple[Tensor, Optional[Tensor]]
 ResidualConnectionState: TypeAlias = tuple[Tensor, ...]
 ResidualConnectionWriteState: TypeAlias = tuple[Tensor, ...]
-ResidualConnectionSpec: TypeAlias = ModuleSpec | type["ResidualConnection"] | None
 ResidualConnectionOperation: TypeAlias = Literal["read", "write"]
 
 
@@ -213,32 +208,3 @@ class ResidualConnection(nn.Module, ABC):
         training: bool,
     ) -> Tensor:
         """Implement the architecture-specific residual-stream update."""
-
-
-def build_residual_connection(
-    spec: ResidualConnectionSpec,
-    *,
-    config: TransformerConfig,
-    layer_number: int,
-    branch_name: str,
-    pg_collection: ProcessGroupCollection,
-    name: str | None,
-) -> ResidualConnection | None:
-    """Build and validate an optional residual connection from a module spec."""
-
-    if spec is None:
-        return None
-    connection = build_module(
-        spec,
-        config=config,
-        layer_number=layer_number,
-        branch_name=branch_name,
-        pg_collection=pg_collection,
-        name=name,
-    )
-    if not isinstance(connection, ResidualConnection):
-        raise TypeError(
-            f"Residual connection spec built {type(connection).__name__}; expected "
-            f"{ResidualConnection.__name__}."
-        )
-    return connection
