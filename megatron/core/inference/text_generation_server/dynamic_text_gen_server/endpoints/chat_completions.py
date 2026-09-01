@@ -344,7 +344,7 @@ def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptC
         """Preserve a media block's position while the chat template renders text.
 
         The actual bytes travel separately. After rendering,
-        _tokenize_with_media_slots replaces this sentinel with the
+        _tokenize_with_media_slots_sync replaces this sentinel with the
         model-specific MediaPromptSpec tokens.
         """
         sentinel = f"__MCORE_MEDIA_SLOT_{len(media_slots)}__"
@@ -619,7 +619,7 @@ def _coerce_to_token_id_list(result):
     return list(result)
 
 
-async def _tokenize_with_media_slots(
+def _tokenize_with_media_slots_sync(
     chat_tok,
     messages,
     media_slots,
@@ -629,16 +629,24 @@ async def _tokenize_with_media_slots(
     chat_template_kwargs,
     add_generation_prompt=True,
 ):
-    """Render a chat template and lower internal media slots to model tokens."""
-    rendered = await asyncio.to_thread(
-        functools.partial(
-            chat_tok.apply_chat_template,
-            messages,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-            tools=tools,
-            **chat_template_kwargs,
-        )
+    """Render a chat template and lower internal media slots to model tokens.
+
+    Synchronous, and run whole on the frontend's tokenize executor rather than
+    piecewise. Rendering is only the first of 3N+1 tokenizer calls for N media
+    slots -- each slot encodes the text before it, then the model token's prefix
+    and suffix -- and awaiting just the render left the rest on the event loop,
+    where they stall every other request this replica owns.
+
+    One hop to the executor also means one thread touches the tokenizer for the
+    whole request. HF tokenizers are not thread-safe, and this runs on the
+    executor's private copy.
+    """
+    rendered = chat_tok.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+        tools=tools,
+        **chat_template_kwargs,
     )
     if not isinstance(rendered, str):
         raise TypeError("Multimodal chat template rendering must return a string.")
@@ -825,17 +833,19 @@ try:
                 # Jinja renders that contend for the GIL with the very loop this
                 # offload protects. The executor also owns a private tokenizer
                 # copy, since HF tokenizers are not thread-safe.
-                # The multimodal path is left as-is: it is owned by the multimodal
-                # work and its slot lowering is being looked at separately.
                 if media_slots:
-                    prompt_tokens = await _tokenize_with_media_slots(
-                        chat_tok,
-                        template_messages,
-                        media_slots,
-                        prompt_config,
-                        tools=template_tools,
-                        chat_template_kwargs=chat_template_kwargs,
-                        add_generation_prompt=True,
+                    prompt_tokens = await asyncio.get_running_loop().run_in_executor(
+                        current_app.config.get('tokenize_executor'),
+                        partial(
+                            _tokenize_with_media_slots_sync,
+                            tokenize_chat_tok,
+                            template_messages,
+                            media_slots,
+                            prompt_config,
+                            tools=template_tools,
+                            chat_template_kwargs=chat_template_kwargs,
+                            add_generation_prompt=True,
+                        ),
                     )
                 else:
                     prompt_tokens = await asyncio.get_running_loop().run_in_executor(
@@ -898,14 +908,20 @@ try:
 
                         # Get the templated tokenization of just the previous generation.
                         if previous_media_slots:
-                            retokenized_previous_turn_token_ids = await _tokenize_with_media_slots(
-                                chat_tok,
-                                messages_to_last_assistant_message,
-                                previous_media_slots,
-                                prompt_config,
-                                tools=template_tools,
-                                chat_template_kwargs=chat_template_kwargs,
-                                add_generation_prompt=False,
+                            retokenized_previous_turn_token_ids = (
+                                await asyncio.get_running_loop().run_in_executor(
+                                    current_app.config.get('tokenize_executor'),
+                                    partial(
+                                        _tokenize_with_media_slots_sync,
+                                        tokenize_chat_tok,
+                                        messages_to_last_assistant_message,
+                                        previous_media_slots,
+                                        prompt_config,
+                                        tools=template_tools,
+                                        chat_template_kwargs=chat_template_kwargs,
+                                        add_generation_prompt=False,
+                                    ),
+                                )
                             )
                         else:
                             retokenized_previous_turn_token_ids = (
