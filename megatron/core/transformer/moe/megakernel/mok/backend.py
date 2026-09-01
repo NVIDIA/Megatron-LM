@@ -45,6 +45,9 @@ class MoKMegakernel(MegakernelBackend):
     ) -> None:
         super().__init__()
         try:
+            # This adapter targets our MCore-integration version of MOK rather than the
+            # upstream package API:
+            # https://github.com/QiZhangNV/mixture-of-kittens/tree/qizhang/mcore-integration
             from mok.functional import MoKConfig
         except ImportError as exc:
             raise ImportError(
