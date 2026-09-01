@@ -32,6 +32,7 @@ torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
     --model-arch qwen35_vl \
     --dataset-provider mock \
     --hybrid-layer-pattern GEGEGE*E/*E \
+    --position-embedding-type mrope --mrope-section 11 11 10 \
     ... # other Megatron args (--hidden-size, etc.)
 ```
 
@@ -40,9 +41,27 @@ torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
 `multimodal_dev` uses `HybridModel` for the Qwen3.5-VL language decoder.
 The unified `--hybrid-layer-pattern` is required. It replaces `--num-layers`
 and the GPTModel-specific implicit in-layer attention/MLP ordering. The Qwen
-launcher still declares `--experimental-attention-variant gated_delta_net`
-and `--linear-attention-freq 4` so `TransformerConfig` validates the GDN
-dimensions and related runtime constraints.
+launcher still declares `--experimental-attention-variant gated_delta_net` so
+`TransformerConfig` validates the GDN dimensions (`--linear-key-head-dim`,
+`--linear-num-value-heads`, ...) and related runtime constraints.
+
+`--linear-attention-freq` is *not* passed. `TransformerConfig` skips its
+assertion for hybrid models, and the only consumers are the GPTModel spec
+builder, `TransformerBlock`, and the non-hybrid FLOPs branch — none of which
+the HybridModel path reaches. The pattern is the single source of truth for
+GDN / full-attention placement, and it is strictly more expressive than the
+integer frequency (it matches the per-layer list form).
+
+### Position embeddings
+
+The decoder applies 3D MRoPE, so the recipe must say so: pass
+`--position-embedding-type mrope` together with `--mrope-section 11 11 10`.
+The sections are the temporal / height / width channel split and must sum to
+half the rotary dimension (`kv_channels * rotary_percent / 2 = 32`); they must
+also match `MROPE_SECTION` in `models/qwen35_vl/configuration.py`.
+`Qwen35VLModel` rejects any other `--position-embedding-type`, so the parsed
+args, the constructed decoder, and the checkpoint metadata can no longer
+disagree.
 
 Each historical Qwen transformer block becomes two HybridModel layers:
 

@@ -6,10 +6,7 @@ Encapsulates all Qwen3.5-VL-specific logic needed by ``pretrain_multimodal.py``
 so that the training entry point remains model-agnostic.
 """
 
-from examples.multimodal_dev.models.qwen35_vl.configuration import (
-    MROPE_SECTION,
-    VISION_KWARGS,
-)
+from examples.multimodal_dev.models.qwen35_vl.configuration import VISION_KWARGS
 
 
 def post_language_config(language_config, args):
@@ -17,8 +14,19 @@ def post_language_config(language_config, args):
 
     Called after ``core_transformer_config_from_args`` to inject model-specific
     fields that cannot be expressed via CLI args alone.
+
+    ``mrope_section`` is deliberately not set here: it is a ``TransformerConfig``
+    field fed by ``--mrope-section``, so overriding it would let the recipe and
+    the constructed model disagree.
+
+    ``mrope_interleaved`` goes the other way. ``--mrope-interleaved`` also exists
+    as a generated flag, but it is ``store_true`` with a ``False`` default, so a
+    recipe that forgot it would silently build a non-interleaved decoder.
+    Qwen3.5 always interleaves the T/H/W sections, so it is pinned here as an
+    architectural constant, alongside ``ROTARY_PERCENT`` / ``ROTARY_BASE`` in
+    ``model.py``. ``mrope_section`` cannot get the same treatment because
+    ``validate_args`` requires it on the CLI before the model is built.
     """
-    language_config.mrope_section = list(MROPE_SECTION)
     language_config.mrope_interleaved = True
 
 
@@ -62,9 +70,8 @@ def build_model(args, language_config, vision_config, **kwargs):
             "and append /*E or /*- for each MTP depth."
         )
 
-    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-
     from examples.multimodal_dev.models.qwen35_vl.model import Qwen35VLModel
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 
     # When --untie-embeddings-and-output-weights is NOT passed, Megatron
     # defaults to tied embeddings (share_embeddings_and_output_weights=True).
@@ -81,6 +88,7 @@ def build_model(args, language_config, vision_config, **kwargs):
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         image_token_id=getattr(args, "image_token_id", 248056),
+        position_embedding_type=args.position_embedding_type,
         parallel_output=True,
         share_embeddings_and_output_weights=share_embeddings,
     )

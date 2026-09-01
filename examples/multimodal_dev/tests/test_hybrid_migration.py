@@ -8,6 +8,8 @@ import pytest
 
 from examples.multimodal_dev.models.qwen35_vl import factory
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
+    MROPE_SECTION,
+    ROTARY_PERCENT,
     get_qwen35_vl_language_config,
 )
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -36,6 +38,7 @@ def _args(**overrides):
         "padded_vocab_size": 1024,
         "max_position_embeddings": 4096,
         "image_token_id": 42,
+        "position_embedding_type": "mrope",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -69,6 +72,31 @@ def test_factory_passes_hybrid_pattern(monkeypatch):
     assert result == "model"
     assert captured["hybrid_layer_pattern"] == "GEGEGE*E/*E"
     assert captured["share_embeddings_and_output_weights"] is False
+    # The model must be told which position embedding the CLI asked for, so the
+    # constructed decoder and the saved args cannot describe different models.
+    assert captured["position_embedding_type"] == "mrope"
+
+
+def test_model_rejects_non_mrope_position_embedding():
+    """A recipe declaring plain rope must fail loudly, not build an MRoPE decoder."""
+    from examples.multimodal_dev.models.qwen35_vl.model import Qwen35VLModel
+
+    with pytest.raises(ValueError, match="requires --position-embedding-type mrope"):
+        Qwen35VLModel(
+            language_config=SimpleNamespace(hidden_size=128),
+            hybrid_stack_spec=SimpleNamespace(),
+            hybrid_layer_pattern=MOE_PATTERN_4_BLOCKS,
+            vision_config=SimpleNamespace(),
+            position_embedding_type="rope",
+        )
+
+
+def test_mrope_section_matches_rotary_dimension():
+    """--mrope-section must sum to half the rotary dimension of the decoder."""
+    kv_channels = 256  # every language variant in configuration.py
+    rotary_dim = int(kv_channels * ROTARY_PERCENT)
+
+    assert sum(MROPE_SECTION) == rotary_dim // 2
 
 
 @pytest.mark.parametrize("pattern", [MOE_PATTERN_4_BLOCKS, DENSE_PATTERN_4_BLOCKS])
