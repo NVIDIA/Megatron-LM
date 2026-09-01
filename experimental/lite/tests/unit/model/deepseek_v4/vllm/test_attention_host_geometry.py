@@ -4,6 +4,7 @@ import pytest
 
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.host_geometry import (
     compressed_sequence_boundaries,
+    local_compressed_sequence_boundaries,
     padded_sequence_boundaries,
 )
 
@@ -36,8 +37,58 @@ def test_compressed_geometry_floors_each_request(
     assert compressed_sequence_boundaries(boundaries, ratio=ratio) == expected
 
 
+@pytest.mark.parametrize("distance", range(1, 8))
+def test_local_compressed_geometry_ignores_left_boundary_only_sequences(
+    distance: int,
+) -> None:
+    global_start = 16
+    boundaries = (0, 5, global_start - distance, 48)
+
+    local = local_compressed_sequence_boundaries(
+        boundaries,
+        global_start=global_start,
+        local_rows=16,
+        ratio=4,
+    )
+
+    # CompressorInputCompact requires range_start < local_seq_end. Both packed
+    # sequences ending before this rank therefore emit zero groups, including
+    # the C4 danger window 0 < global_start - seq_end < d_comp (8).
+    assert local[:3] == (0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    ("boundaries", "global_start", "local_rows", "ratio", "expected"),
+    [
+        ((0, 12, 32), 8, 8, 4, (0, 3, 4)),
+        ((0, 8, 24, 40), 16, 8, 4, (0, 0, 4, 4)),
+        ((0, 256, 512), 256, 128, 128, (0, 0, 1)),
+    ],
+)
+def test_local_compressed_geometry_matches_compactor_visible_groups(
+    boundaries: tuple[int, ...],
+    global_start: int,
+    local_rows: int,
+    ratio: int,
+    expected: tuple[int, ...],
+) -> None:
+    assert (
+        local_compressed_sequence_boundaries(
+            boundaries,
+            global_start=global_start,
+            local_rows=local_rows,
+            ratio=ratio,
+        )
+        == expected
+    )
+
+
 def test_invalid_host_geometry_fails_closed() -> None:
     with pytest.raises(ValueError, match="positive integers"):
         padded_sequence_boundaries((4, 0), cp_size=2)
     with pytest.raises(ValueError, match="strictly increasing"):
         compressed_sequence_boundaries((0, 8, 8), ratio=4)
+    with pytest.raises(ValueError, match="local_rows positive"):
+        local_compressed_sequence_boundaries(
+            (0, 8), global_start=0, local_rows=0, ratio=4
+        )

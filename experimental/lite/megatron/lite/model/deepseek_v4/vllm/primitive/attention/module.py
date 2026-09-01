@@ -34,6 +34,9 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import (
     compressed_compact_graph,
     visible_sparse_attention,
 )
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.host_geometry import (
+    local_compressed_sequence_boundaries,
+)
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.runtime import (
     AttentionKernelMetadata,
     c128_all_visible_topk,
@@ -747,23 +750,12 @@ class VLLMAttention(CompressedSparseAttention):
                 # request-local compressed boundaries in this path.
                 local_compressed_boundaries = compressed_boundaries
             else:
-                local_boundaries = [0]
-                local_end = global_start + l_local
-                d_comp = 8 if ratio == 4 else ratio
-                for seq_start, seq_end in zip(
-                    sequence_boundaries, sequence_boundaries[1:]
-                ):
-                    owned_start = max(global_start, seq_start)
-                    owned_end = min(local_end, seq_end)
-                    first_group = max(
-                        0,
-                        (owned_start - seq_start - d_comp + ratio - 1) // ratio,
-                    )
-                    last_group = max(0, (owned_end - seq_start) // ratio)
-                    local_boundaries.append(
-                        local_boundaries[-1] + max(0, last_group - first_group)
-                    )
-                local_compressed_boundaries = tuple(local_boundaries)
+                local_compressed_boundaries = local_compressed_sequence_boundaries(
+                    sequence_boundaries,
+                    global_start=global_start,
+                    local_rows=l_local,
+                    ratio=ratio,
+                )
             if cu_seqlens_compressed.numel() != len(compressed_boundaries):
                 raise RuntimeError(
                     "DS4 host compressed boundaries do not match GPU metadata shape"
