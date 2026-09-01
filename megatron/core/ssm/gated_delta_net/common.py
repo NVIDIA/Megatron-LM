@@ -184,7 +184,8 @@ class _GDNBase(MegatronModule):
         # Attributes from config
         self.config = config
         self.hidden_size = config.hidden_size
-        self.act_fn = config.activation_func
+        # GDN-family convolution and output gates use SiLU independently of the FFN activation.
+        self.act_fn = nn.functional.silu
         self.activation = self.act_fn.__name__
         self.conv_kernel_dim = config.linear_conv_kernel_dim
         self.key_head_dim = config.linear_key_head_dim

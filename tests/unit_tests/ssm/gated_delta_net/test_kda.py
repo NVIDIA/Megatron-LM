@@ -186,8 +186,14 @@ def test_kda_forward_backward(f_lora_rank, gate_lora_rank):
     )
     try:
         model_parallel_cuda_manual_seed(123)
-        config = _make_config(f_lora_rank=f_lora_rank, gate_lora_rank=gate_lora_rank)
+        config = replace(
+            _make_config(f_lora_rank=f_lora_rank, gate_lora_rank=gate_lora_rank),
+            activation_func=F.gelu,
+            gated_linear_unit=True,
+        )
         kda = _build_kda(config)
+        assert kda.act_fn is F.silu
+        assert kda.activation == "silu"
         legacy_fused = f_lora_rank is None and gate_lora_rank is None
         assert kda.use_legacy_fused_projections == legacy_fused
         if legacy_fused:
