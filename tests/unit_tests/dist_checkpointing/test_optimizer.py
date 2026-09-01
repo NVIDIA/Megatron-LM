@@ -79,6 +79,27 @@ class Model(torch.nn.Module):
         return sharded_state_dict
 
 
+class NativeFp32Model(torch.nn.Module):
+    """Parameters for an interleaved trainable/frozen BF16 and FP32 group."""
+
+    def __init__(self):
+        super().__init__()
+        self.pre = torch.nn.Linear(8, 8, bias=False)
+        self.frozen = torch.nn.Linear(8, 8, bias=False)
+        self.frozen.weight.requires_grad_(False)
+        self.gate = torch.nn.Parameter(torch.zeros(24, dtype=torch.float32))
+        self.post = torch.nn.Linear(8, 8, bias=False)
+        self.config = TransformerConfig(
+            hidden_size=8, num_attention_heads=1, num_layers=1, bf16=True
+        )
+
+    def sharded_state_dict(self):
+        return {
+            key: ShardedTensor.from_rank_offsets(key, value)
+            for key, value in self.state_dict(keep_vars=True).items()
+        }
+
+
 class SwigluFactoryModel(torch.nn.Module):
     def __init__(self, pp_separate_model: bool = False):
         super().__init__()
@@ -152,6 +173,41 @@ class SwigluFactoryModel(torch.nn.Module):
         )
         if self.pp_separate_model:
             add_prefix_for_sharding(sharded_state_dict, f'pp_rank_{pp_rank}.')
+        return sharded_state_dict
+
+
+class MultiBucketModel(torch.nn.Module):
+    """Model with enough separate params for the grad buffer to split into several buckets.
+
+    Param sizes are deliberately not multiples of the bucket-end divisor, so every bucket
+    but the last picks up nonzero DP-divisibility padding. That padding is what the
+    reshardable-checkpoint index math has to compensate for: `param_index_map` offsets
+    include it, the coalesced world tensors do not.
+    """
+
+    def __init__(self, num_layers: int = 6):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(
+            torch.nn.Linear(70, 130, bias=True) for _ in range(num_layers)
+        )
+        self.config = TransformerConfig(
+            hidden_size=8, num_attention_heads=1, num_layers=1, bf16=True
+        )
+
+    def sharded_state_dict(self):
+        # The model is replicated rather than sharded; every rank holds the same tensor,
+        # which keeps this test focused on bucket index math instead of TP/PP resharding.
+        sharded_state_dict = self.state_dict(keep_vars=True)
+        for key, tensor in sharded_state_dict.items():
+            sharded_state_dict[key] = ShardedTensor.from_rank_offsets(
+                key,
+                tensor,
+                replica_id=(
+                    parallel_state.get_pipeline_model_parallel_rank(),
+                    parallel_state.get_tensor_model_parallel_rank(),
+                    parallel_state.get_data_parallel_rank(with_context_parallel=True),
+                ),
+            )
         return sharded_state_dict
 
 
@@ -238,6 +294,65 @@ class TestOptimizer:
             ]
         )
 
+    def test_float16_optimizer_with_native_fp32_and_frozen_params(self):
+        """Native FP32 and frozen param ids must not shift BF16 checkpoint state."""
+        from megatron.core.optimizer import OptimizerConfig
+        from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
+        from megatron.core.transformer.module import (
+            convert_module_to_dtype_except_fp32_marked,
+            mark_keep_in_fp32,
+        )
+
+        Utils.initialize_model_parallel(1, 1)
+        model = NativeFp32Model().cuda()
+        model.gate = mark_keep_in_fp32(model.gate)
+        convert_module_to_dtype_except_fp32_marked(model, torch.bfloat16)
+        assert model.pre.weight.dtype == torch.bfloat16
+        assert model.frozen.weight.dtype == torch.bfloat16
+        assert not model.frozen.weight.requires_grad
+        assert model.gate.dtype == torch.float32
+        assert model.post.weight.dtype == torch.bfloat16
+
+        # Use an explicit trainable BF16/frozen BF16/FP32/trainable BF16 order.
+        # Module.parameters() would yield the root gate before child parameters.
+        ordered_params = [model.pre.weight, model.frozen.weight, model.gate, model.post.weight]
+        for param in ordered_params:
+            if param.requires_grad:
+                param.grad = torch.zeros_like(param)
+        inner_optim = Adam(ordered_params)
+        inner_optim.step()
+
+        optim = Float16OptimizerWithFloat16Params(
+            inner_optim,
+            OptimizerConfig(optimizer='adam', lr=1e-4, bf16=True),
+            None,
+            lambda opt, cfg: None,
+        )
+        sharded_state_dict = optim.sharded_state_dict(model.sharded_state_dict())
+
+        # FP32 main copies pair with the BF16 params only, in optimizer order.
+        fp32_params = sharded_state_dict['fp32_from_fp16_params'][0]
+        assert [(sharded.key, tuple(sharded.data.shape)) for sharded in fp32_params] == [
+            ('optimizer.state.fp32_param.pre.weight', (8, 8)),
+            ('optimizer.state.fp32_param.post.weight', (8, 8)),
+        ]
+
+        # The frozen parameter has neither optimizer state nor an fp32 main copy.
+        state = sharded_state_dict['optimizer']['state']
+        assert 1 not in state
+
+        # Per-param state maps every trainable param, including native FP32, to the right key.
+        expected = {0: ('pre.weight', (8, 8)), 2: ('gate', (24,)), 3: ('post.weight', (8, 8))}
+        for param_id, (model_key, shape) in expected.items():
+            for state_key in ('exp_avg', 'exp_avg_sq'):
+                sharded = state[param_id][state_key]
+                assert sharded.key == f'optimizer.state.{state_key}.{model_key}', sharded.key
+                assert tuple(sharded.data.shape) == shape, (
+                    param_id,
+                    sharded.key,
+                    sharded.data.shape,
+                )
+
 
 def initialize_pp_agnostic_model(pre_process=True, post_process=True, seed=0, **config_kwargs):
     torch.manual_seed(seed)
@@ -248,6 +363,13 @@ def initialize_pp_agnostic_model(pre_process=True, post_process=True, seed=0, **
 
 def initialize_pp_agnostic_gpt_model(pre_process=True, post_process=True, seed=0, **config_kwargs):
     return initialize_gpt_model(False, False, seed=seed, **config_kwargs)
+
+
+def initialize_multi_bucket_model(pre_process=True, post_process=True, seed=0, **config_kwargs):
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+
+    return MultiBucketModel()
 
 
 def initialize_small_model(pre_process=True, post_process=True, seed=0, **config_kwargs):
@@ -397,6 +519,7 @@ class TestDistributedOptimizer:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_dp_sharding', sync=True) as ckpt_dir:
             mock_args = parse_args(ignore_unknown_args=True)
             mock_args.use_distributed_optimizer = True
+            mock_args.save_tokenizer_assets = False
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 # Initialize model and optimizer A
                 if is_moe:
@@ -472,6 +595,7 @@ class TestDistributedOptimizer:
             tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer', sync=True
         ) as ckpt_dir:
             mock_args = parse_args(ignore_unknown_args=True)
+            mock_args.save_tokenizer_assets = False
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 init_basic_mock_args(mock_args, tp=src_tp_pp[0], pp=src_tp_pp[1])
                 init_checkpointing_mock_args(mock_args, ckpt_dir, False)
@@ -800,6 +924,144 @@ class TestDistributedOptimizer:
             assert self.check_equal_dp_zero_state(
                 dp_zero_optim_A, dp_zero_optim_B, same_dp_group, raise_if_different=True
             )
+
+    @staticmethod
+    def _unwrap_distributed_optimizer(optimizer):
+        if isinstance(optimizer, ChainedOptimizer):
+            assert len(optimizer.chained_optimizers) == 1
+            return optimizer.chained_optimizers[0]
+        return optimizer
+
+    @staticmethod
+    def _bucket_end_paddings(buffer):
+        """Bucket-end padding stripped from the coalesced world tensors, per bucket."""
+        return [bucket.grad_data.numel() - bucket.numel_unpadded for bucket in buffer.buckets[:-1]]
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"),
+        reason="fully_reshardable requires PyTorch 2.6a0 or later",
+    )
+    @pytest.mark.parametrize(('num_buckets', 'pad_buckets'), [(2, False), (3, False), (3, True)])
+    def test_fully_reshardable_multi_bucket_save_load(
+        self, tmp_path_dist_ckpt, num_buckets, pad_buckets
+    ):
+        """Round-trip fully-reshardable optimizer state across a multi-bucket grad buffer.
+
+        `sharded_param_state_fully_reshardable` slices the coalesced world tensors using
+        `param_index_map` offsets, which include each bucket's end padding, while the world
+        tensors are packed with that padding stripped. Without the per-bucket adjustment,
+        every param past the first bucket is saved from the wrong offset. Existing coverage
+        misses this because the default bucket size puts the whole buffer in one bucket,
+        where the adjustment is always zero.
+        """
+        Utils.initialize_model_parallel(1, 1)
+        metadata = {
+            'distrib_optim_sharding_type': 'fully_reshardable',
+            'distrib_optim_fully_reshardable_mem_efficient': False,
+        }
+        setup_kwargs = dict(
+            tp=1,
+            pp=1,
+            bf16=True,
+            dist_opt=True,
+            initialize_fn=initialize_multi_bucket_model,
+            ddp_num_buckets=num_buckets,
+            ddp_pad_buckets_for_high_nccl_busbw=pad_buckets,
+        )
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_fully_reshardable_multi_bucket_save_load', sync=True
+        ) as ckpt_dir:
+            model_A, optimizer_A = setup_model_and_optimizer(seed=2, **setup_kwargs)
+
+            # Guard against the test silently degenerating into the single-bucket case that
+            # already passes, or into buckets that happen to need no padding.
+            for buffer in self._unwrap_distributed_optimizer(optimizer_A).buffers:
+                assert len(buffer.buckets) == num_buckets, (
+                    f"expected {num_buckets} buckets, got {len(buffer.buckets)}; "
+                    f"the bucket-padding adjustment is a no-op with a single bucket"
+                )
+                paddings = self._bucket_end_paddings(buffer)
+                assert any(padding > 0 for padding in paddings), (
+                    f"no bucket-end padding to strip ({paddings}); this test cannot "
+                    f"distinguish adjusted from unadjusted indices"
+                )
+
+            optim_sd = optimizer_A.sharded_state_dict(
+                model_A[0].sharded_state_dict(), metadata=metadata
+            )
+            save(optim_sd, ckpt_dir)
+            dp_zero_optim_A = get_param_state_dp_zero(optimizer_A)
+
+            # A different seed, so an unloaded optimizer B is guaranteed to differ from A.
+            model_B, optimizer_B = setup_model_and_optimizer(seed=3, **setup_kwargs)
+            dp_zero_optim_B = get_param_state_dp_zero(optimizer_B)
+            assert not self.check_equal_dp_zero_state(
+                dp_zero_optim_A, dp_zero_optim_B, same_dp_group=True
+            )
+
+            load_sharded_state_dict = optimizer_B.sharded_state_dict(
+                model_B[0].sharded_state_dict(), metadata=metadata, is_loading=True
+            )
+            state_dict, _, unexpected_keys = load(
+                load_sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL
+            )
+            assert not unexpected_keys
+            optimizer_B.load_state_dict(state_dict)
+
+            dp_zero_optim_B = get_param_state_dp_zero(optimizer_B)
+            assert self.check_equal_dp_zero_state(
+                dp_zero_optim_A, dp_zero_optim_B, same_dp_group=True, raise_if_different=True
+            )
+
+    @pytest.mark.parametrize('pad_buckets', [False, True])
+    def test_coalesced_world_tensors_are_compact(self, pad_buckets):
+        """The coalesced world tensors are sized to exactly what the fill and read paths use.
+
+        `get_parameter_state_dp_zero` packs bucket-by-bucket with bucket-end padding stripped,
+        so `numel_unpadded` is both the last element written and the last element read once
+        `param_index_map` offsets are rebased. Oversizing them would append a zero tail to
+        every dp_zero_gather_scatter and legacy checkpoint, and would let an out-of-range
+        slice still satisfy the length assert in the reshardable save path.
+        """
+        Utils.initialize_model_parallel(1, 1)
+        _, optimizer = setup_model_and_optimizer(
+            seed=2,
+            tp=1,
+            pp=1,
+            bf16=True,
+            dist_opt=True,
+            initialize_fn=initialize_multi_bucket_model,
+            ddp_num_buckets=3,
+            ddp_pad_buckets_for_high_nccl_busbw=pad_buckets,
+        )
+        distributed_optimizer = self._unwrap_distributed_optimizer(optimizer)
+        state = distributed_optimizer.get_parameter_state_dp_zero(use_gloo_comm=False)
+        if parallel_state.get_data_parallel_rank(with_context_parallel=True) != 0:
+            return
+
+        for gbuf_idx, buffer in enumerate(distributed_optimizer.buffers):
+            assert any(padding > 0 for padding in self._bucket_end_paddings(buffer))
+
+            for world_tensors in state[gbuf_idx].values():
+                for key, tensor in world_tensors.items():
+                    if not isinstance(tensor, torch.Tensor):
+                        continue
+                    assert tensor.numel() == buffer.numel_unpadded, (
+                        f"world tensor '{key}' is {tensor.numel()} elements, expected the "
+                        f"compact {buffer.numel_unpadded}"
+                    )
+
+            # The rebased ranges must end exactly at numel_unpadded: any less and the
+            # compact allocation would be wasteful, any more and it would truncate.
+            cumulative_padding_stripped = [0]
+            for padding in self._bucket_end_paddings(buffer):
+                cumulative_padding_stripped.append(cumulative_padding_stripped[-1] + padding)
+            adjusted_ends = [
+                param_world_end - cumulative_padding_stripped[bucket_id]
+                for _, param_world_end, bucket_id in buffer.param_index_map.values()
+            ]
+            assert max(adjusted_ends) == buffer.numel_unpadded
 
     def check_equal_dp_zero_state(
         self, dp_zero_state_A, dp_zero_state_B, same_dp_group, raise_if_different=False
