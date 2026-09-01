@@ -136,6 +136,8 @@ def test_chunk_offload_handler_uses_throttle_event_only_when_configured(
 )
 def test_max_inflight_throttle_events_cross_cuda_graph_boundaries(max_inflight_offloads: int):
     """Exercise throttle event capture and the cap-2 cross-graph wait regression."""
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank % torch.cuda.device_count())
     off_interface.reset_instance()
     graphs = []
     try:

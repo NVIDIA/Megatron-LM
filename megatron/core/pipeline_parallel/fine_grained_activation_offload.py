@@ -357,10 +357,11 @@ class OffloadTensorGroup:
         self._offload_event = torch.cuda.Event()
         self._reload_event = torch.cuda.Event()
         # Keep throttling separate from the internal offload/reload handshake.
-        # External events capture record/wait as explicit graph nodes, allowing
-        # separate module graphs to synchronize through the same event.
-        # A stream wait binds to the event state at the wait call, so recording
-        # this cached event in a later iteration does not retarget earlier waits.
+        # External events make record/wait explicit graph nodes, so separate
+        # module graphs can synchronize through the same event object. A captured
+        # wait node resolves against the event's live state at each replay, which
+        # lets a later graph wait on an earlier graph's re-recorded event; reuse the
+        # event across iterations rather than reallocating it per offload.
         self._offload_throttle_event: Optional[torch.cuda.Event] = (
             torch.cuda.Event(external=True) if enable_offload_throttle else None
         )
