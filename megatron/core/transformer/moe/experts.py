@@ -1185,6 +1185,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
 
         self._mcore_activation_type = self._resolve_mcore_activation_type()
+        self._activation_clamp_scale = config.activation_func_tanh_clamp_scale
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
@@ -1366,6 +1367,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
         assert HAVE_FLASHINFER, "flashinfer-python is required for FlashInfer forward path."
+        assert self._activation_clamp_scale is None, (
+            "activation_func_tanh_clamp_scale is not supported by the FlashInfer MoE kernels, "
+            "whose activations are fixed enum variants with no clamp. Use "
+            "inference_grouped_gemm_backend=vllm or torch."
+        )
         assert probs.dtype == torch.float32, "FlashInfer forward path requires fp32 probabilities."
         if isinstance(self._fc1_weight, FlashInferRoutedMXFP8Weight):
             if not isinstance(self._fc2_weight, FlashInferRoutedMXFP8Weight):
@@ -1417,6 +1423,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             routing_map=routing_map,
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
+            activation_clamp_scale=self._activation_clamp_scale,
         )
         return output, None
 
@@ -1435,6 +1442,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             routing_map=routing_map,
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
+            activation_clamp_scale=self._activation_clamp_scale,
         )
         return output, None
 

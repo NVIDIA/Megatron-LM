@@ -1084,3 +1084,159 @@ class TestVllmVsMcoreFusedMoe:
         )
 
         torch.testing.assert_close(vllm_out, mcore_out, atol=5e-2, rtol=5e-2)
+
+
+CLAMP_SCALE = 16.0
+
+
+def _make_saturating_moe_inputs(max_tokens, hidden_size, ffn_hidden, topk, num_experts, seed=42):
+    """Like _make_moe_inputs, but with FC1 weights large enough to saturate the tanh clamp.
+
+    The default 0.01 weight scale keeps the FC1 pre-activation well inside the clamp's
+    linear region, where a dropped clamp would still pass.
+    """
+    hidden, probs, routing_map, _, fc2_weight = _make_moe_inputs(
+        max_tokens, hidden_size, ffn_hidden, topk, num_experts, seed=seed
+    )
+    fc1_weight = (
+        torch.randn(num_experts, ffn_hidden, hidden_size, device="cuda", dtype=torch.bfloat16) * 0.5
+    )
+    return hidden, probs, routing_map, fc1_weight, fc2_weight
+
+
+def _ref_sequential_moe_clamped(
+    hidden_states, probs, fc1_weight, fc2_weight, routing_map, num_local_experts, clamp_scale
+):
+    """Sequential per-token reference with the tanh soft-clamped squared-ReLU activation.
+
+    Mirrors _ref_sequential_moe with ``squared_relu(s * tanh(x / s))`` in place of
+    ``squared_relu(x)``.
+    """
+    max_tokens, topk = routing_map.shape
+    hidden_size = hidden_states.shape[1]
+    out = torch.zeros(max_tokens, hidden_size, device="cuda", dtype=torch.float32)
+    for t in range(max_tokens):
+        for k in range(topk):
+            lid = routing_map[t, k].item()
+            if not 0 <= lid < num_local_experts:
+                continue
+            fc1_out = hidden_states[t].float() @ fc1_weight[lid].float().T
+            clamped = clamp_scale * torch.tanh(fc1_out / clamp_scale)
+            activated = torch.clamp(clamped, min=0.0) ** 2
+            out[t] += probs[t, k].item() * (activated @ fc2_weight[lid].float().T)
+    return out
+
+
+@pytest.mark.internal
+class TestFusedMoeActivationClamp:
+    """config.activation_func_tanh_clamp_scale fused into the squared-ReLU activation.
+
+    The clamp preconditions the FC1 output with ``s * tanh(x / s)`` before the square,
+    bounding the activation by ``s ** 2``. It rides the vLLM grouped-GEMM epilogue and the
+    torch-backend activation kernels; these pin all of them to one PyTorch reference.
+    """
+
+    @pytest.mark.parametrize(
+        "max_tokens,hidden_size,ffn_hidden,topk,num_experts",
+        [(4, 64, 64, 2, 4), (16, 128, 128, 4, 8), (64, 128, 256, 4, 8)],
+    )
+    def test_vllm_matches_reference(self, max_tokens, hidden_size, ffn_hidden, topk, num_experts):
+        from megatron.core.inference.moe.fused_moe import ActivationType
+        from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+
+        hidden, probs, routing_map, fc1_weight, fc2_weight = _make_saturating_moe_inputs(
+            max_tokens, hidden_size, ffn_hidden, topk, num_experts
+        )
+
+        result = vllm_fused_moe(
+            hidden,
+            probs,
+            fc1_weight,
+            fc2_weight,
+            ActivationType.SQUARED_RELU,
+            num_experts,
+            0,
+            _vt(max_tokens),
+            routing_map,
+            activation_clamp_scale=CLAMP_SCALE,
+        )
+        expected = _ref_sequential_moe_clamped(
+            hidden, probs, fc1_weight, fc2_weight, routing_map, num_experts, CLAMP_SCALE
+        )
+
+        assert result.shape == (max_tokens, hidden_size)
+        torch.testing.assert_close(result, expected, atol=5e-2, rtol=5e-2)
+
+    def test_clamp_changes_the_result(self):
+        """Guard against the clamp being silently dropped: it must alter the output."""
+        from megatron.core.inference.moe.fused_moe import ActivationType
+        from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+
+        max_tokens, hidden_size, ffn_hidden, topk, num_experts = 16, 128, 128, 4, 8
+        hidden, probs, routing_map, fc1_weight, fc2_weight = _make_saturating_moe_inputs(
+            max_tokens, hidden_size, ffn_hidden, topk, num_experts
+        )
+        args = (
+            hidden,
+            probs,
+            fc1_weight,
+            fc2_weight,
+            ActivationType.SQUARED_RELU,
+            num_experts,
+            0,
+            _vt(max_tokens),
+            routing_map,
+        )
+        unclamped = vllm_fused_moe(*args).clone()
+        clamped = vllm_fused_moe(*args, activation_clamp_scale=CLAMP_SCALE).clone()
+        assert not torch.allclose(unclamped, clamped, atol=1e-2, rtol=1e-2)
+
+    def test_swiglu_with_clamp_is_rejected(self):
+        """The gated (SiTU-GLU) form of the clamp has no inference kernel yet."""
+        from megatron.core.inference.moe.fused_moe import ActivationType
+        from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+
+        max_tokens, hidden_size, ffn_hidden, topk, num_experts = 4, 64, 64, 2, 4
+        hidden, probs, routing_map, fc1_weight, fc2_weight = _make_swiglu_inputs(
+            max_tokens, hidden_size, ffn_hidden, topk, num_experts
+        )
+        with pytest.raises(AssertionError, match="only implemented for squared ReLU"):
+            vllm_fused_moe(
+                hidden,
+                probs,
+                fc1_weight,
+                fc2_weight,
+                ActivationType.SWIGLU,
+                num_experts,
+                0,
+                _vt(max_tokens),
+                routing_map,
+                activation_clamp_scale=CLAMP_SCALE,
+            )
+
+    @requires_torch_grouped_mm
+    def test_mcore_matches_reference(self):
+        """The torch grouped_mm backend applies the same clamp as the vLLM backend."""
+        from megatron.core.inference.moe.fused_moe import ActivationType, mcore_fused_moe
+
+        max_tokens, hidden_size, ffn_hidden, topk, num_experts = 16, 128, 128, 4, 8
+        hidden, probs, routing_map, fc1_weight, fc2_weight = _make_saturating_moe_inputs(
+            max_tokens, hidden_size, ffn_hidden, topk, num_experts
+        )
+
+        result = mcore_fused_moe(
+            hidden,
+            probs,
+            fc1_weight,
+            fc2_weight,
+            ActivationType.SQUARED_RELU,
+            num_experts,
+            0,
+            _vt(max_tokens),
+            routing_map,
+            activation_clamp_scale=CLAMP_SCALE,
+        )
+        expected = _ref_sequential_moe_clamped(
+            hidden, probs, fc1_weight, fc2_weight, routing_map, num_experts, CLAMP_SCALE
+        )
+        torch.testing.assert_close(result.float(), expected, atol=5e-2, rtol=5e-2)

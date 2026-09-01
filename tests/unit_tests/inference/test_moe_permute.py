@@ -80,6 +80,46 @@ def test_batch_invariant_squared_relu_applies_probs_before_fc2():
     assert not torch.equal(old_inference_output, training_output)
 
 
+def test_padded_squared_relu_applies_tanh_soft_clamp():
+    """config.activation_func_tanh_clamp_scale bounds the activation by ``s ** 2``."""
+    from megatron.core.activations import squared_relu, tanh_soft_clamp
+    from megatron.core.inference.moe.activations import padded_squared_relu
+
+    torch.manual_seed(23)
+    rows, hidden, clamp_scale = 37, 512, 16.0
+    # Scaled past the clamp so the tanh saturates; inside the linear region a dropped
+    # clamp would be indistinguishable.
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16) * 50.0
+    permutation_map = torch.arange(rows, device="cuda", dtype=torch.int32)
+
+    clamped = padded_squared_relu(x, permutation_map, _vt(rows), clamp_scale=clamp_scale)
+    expected = squared_relu(tanh_soft_clamp(x, clamp_scale))
+
+    torch.testing.assert_close(clamped, expected, rtol=1e-2, atol=1e-2)
+    assert clamped.max().item() <= clamp_scale**2
+    # clamp_scale=None must leave the existing unclamped path bit-identical.
+    assert torch.equal(padded_squared_relu(x, permutation_map, _vt(rows)), squared_relu(x))
+
+
+def test_batch_invariant_clamped_squared_relu_matches_training_rounding():
+    """The clamped batch-invariant kernel reproduces training's rounding sequence exactly."""
+    from megatron.core.inference.moe.batch_invariant import squared_relu_with_probs
+
+    torch.manual_seed(29)
+    rows, hidden, clamp_scale = 37, 512, 16.0
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.bfloat16) * 50.0
+    probs = torch.rand(rows, device="cuda", dtype=torch.float32)
+    permutation_map = torch.arange(rows, device="cuda", dtype=torch.int32)
+
+    actual = squared_relu_with_probs(x, permutation_map, _vt(rows), probs, clamp_scale)
+
+    # Training's weighted_clamped_squared_relu: round the clamped pre-activation to BF16,
+    # square it, then apply the FP32 probability and round again.
+    c = (clamp_scale * torch.tanh(torch.clamp(x.float(), min=0.0) / clamp_scale)).to(torch.bfloat16)
+    expected = ((c.float() ** 2).to(torch.bfloat16).float() * probs.unsqueeze(1)).to(torch.bfloat16)
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.internal
 class TestComputeLocalTokensPerExpert:
 

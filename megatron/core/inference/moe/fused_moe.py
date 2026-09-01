@@ -6,7 +6,8 @@ All permutation logic is handled internally — callers invoke a single function
 """
 
 from enum import Enum
-from typing import Callable
+from functools import partial
+from typing import Callable, Optional
 
 import torch
 
@@ -73,16 +74,25 @@ def _mxfp8_grouped_mm(act: MXFP8Tensor, weight: MXFP8Tensor, offs: torch.Tensor)
     )
 
 
-def _get_activation_func(activation_type: ActivationType, fused_quant: bool = False) -> Callable:
+def _get_activation_func(
+    activation_type: ActivationType, fused_quant: bool = False, clamp_scale: Optional[float] = None
+) -> Callable:
     """Resolve ActivationType enum to a concrete kernel.
 
     If fused_quant=True, returns the fused activation + MXFP8 quantize kernel.
+    If clamp_scale is set, the squared-ReLU kernels soft-clamp the pre-activation first.
     """
     if activation_type == ActivationType.SQUARED_RELU:
-        return squared_relu_and_quantize_mxfp8 if fused_quant else padded_squared_relu
+        func = squared_relu_and_quantize_mxfp8 if fused_quant else padded_squared_relu
+        return func if clamp_scale is None else partial(func, clamp_scale=clamp_scale)
     elif activation_type == ActivationType.SWIGLU:
         if fused_quant:
             raise NotImplementedError("SWIGLU + MXFP8 fused-quant not implemented (bf16 only)")
+        if clamp_scale is not None:
+            raise NotImplementedError(
+                "activation_func_tanh_clamp_scale is only implemented for squared ReLU here; "
+                "the gated form (SiTU-GLU) has no inference kernel yet."
+            )
         return padded_swiglu
     else:
         raise ValueError(f"Unsupported activation type: {activation_type}")
@@ -100,6 +110,7 @@ def mcore_fused_moe(
     routing_map: torch.Tensor,
     disable_fused_quant_kernels: bool = False,
     out: torch.Tensor = None,
+    activation_clamp_scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
@@ -126,6 +137,9 @@ def mcore_fused_moe(
         out: optional pre-allocated output buffer. If provided, unpermute writes
             directly into this tensor (e.g. the RSV symmetric buffer), avoiding a
             separate copy before reduce-scatter.
+        activation_clamp_scale: config.activation_func_tanh_clamp_scale. When set, the
+            squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before the
+            square, bounding the activation output by ``s ** 2``.
 
     Returns:
         [max_tokens, hidden_size] BF16 output. Only the first valid_tokens rows are
@@ -165,7 +179,9 @@ def mcore_fused_moe(
         mm_fn = _bf16_grouped_mm
         expert_alignment = 16
 
-    activation_func = _get_activation_func(activation_type, fused_quant=use_fused_quant)
+    activation_func = _get_activation_func(
+        activation_type, fused_quant=use_fused_quant, clamp_scale=activation_clamp_scale
+    )
 
     # --- Pre-processing: permute ---
     if use_fused_quant:
@@ -211,12 +227,16 @@ def mcore_fused_moe(
     if batch_invariant_mode:
         # Match training: BF16 activation, FP32 probability multiply, then BF16 before FC2.
         if activation_type == ActivationType.SWIGLU:
+            assert activation_clamp_scale is None, (
+                "activation_func_tanh_clamp_scale is only implemented for squared ReLU here; "
+                "the gated form (SiTU-GLU) has no inference kernel yet."
+            )
             activation_out = batch_invariant.swiglu_with_probs(
                 fc1_output, permutation_map, n_used, permuted_probs
             )
         else:
             activation_out = batch_invariant.squared_relu_with_probs(
-                fc1_output, permutation_map, n_used, permuted_probs
+                fc1_output, permutation_map, n_used, permuted_probs, activation_clamp_scale
             )
     else:
         activation_out = activation_func(fc1_output, permutation_map, n_used)
