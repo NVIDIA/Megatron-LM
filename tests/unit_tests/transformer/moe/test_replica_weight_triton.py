@@ -3,12 +3,12 @@
 """Correctness and profiling coverage for the replica weight-transfer kernels.
 
 The production-shape benchmark is opt-in because it allocates large symmetric
-arenas and compiles two fixed-shape CuTeDSL kernels on every rank. Run it on one
+arenas and compiles two fixed-shape transport kernels on every rank. Run it on one
 four-GPU Blackwell node with::
 
     MCORE_RUN_REPLICA_WEIGHT_PROFILE=1 uv run python -m torch.distributed.run \
       --nproc-per-node 4 -m pytest -q \
-      tests/unit_tests/transformer/moe/test_replica_weight_cutedsl.py
+      tests/unit_tests/transformer/moe/test_replica_weight_triton.py
 
 The test emits ``replica_weight_owner_push_profile`` and
 ``replica_grad_reduce_profile`` NVTX ranges, so the same command can be placed
@@ -24,10 +24,10 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.transformer.moe.replica_weight_cutedsl import (
-    HAVE_CUTEDSL,
+from megatron.core.transformer.moe.replica_weight_triton import (
     MAX_REPLICA_WEIGHT_SMS,
-    _validate_compile_shape,
+    _grad_tile_elements,
+    _validate_transport_shape,
     compile_replica_weight_kernels,
     launch_replica_grad_reduce,
     launch_replica_weight_prefetch,
@@ -37,30 +37,18 @@ from tests.unit_tests.test_utilities import Utils
 _PROFILE_ENABLED = os.environ.get("MCORE_RUN_REPLICA_WEIGHT_PROFILE", "0") == "1"
 
 
-@pytest.mark.skipif(not HAVE_CUTEDSL, reason="CuTeDSL is required")
 def test_replica_weight_kernel_rejects_more_than_32_sms():
     """Keep replica-weight launches within their reserved SM budget."""
     with pytest.raises(ValueError, match="limited to 32 SMs"):
-        _validate_compile_shape(
-            world_size=4,
-            num_local_experts=32,
-            fc1_member_numel=8,
-            fc2_member_numel=8,
-            num_sms=MAX_REPLICA_WEIGHT_SMS + 1,
+        _validate_transport_shape(
+            world_size=4, num_local_experts=32, num_sms=MAX_REPLICA_WEIGHT_SMS + 1
         )
 
 
-@pytest.mark.skipif(not HAVE_CUTEDSL, reason="CuTeDSL is required")
 def test_replica_weight_kernel_rejects_nondivisible_projections():
-    """Require full transport tiles for both unequal projection shapes."""
-    with pytest.raises(ValueError, match="multiple of 16384 elements"):
-        _validate_compile_shape(
-            world_size=4,
-            num_local_experts=8,
-            fc1_member_numel=16384,
-            fc2_member_numel=16385,
-            num_sms=4,
-        )
+    """Require a row-aligned transport tile shared by both projection shapes."""
+    with pytest.raises(ValueError, match="256-element aligned"):
+        _grad_tile_elements((16384, 16385), torch.bfloat16.itemsize)
 
 
 def _allocate_symmetric(
@@ -102,7 +90,7 @@ def _summarize(samples: list[float]) -> dict[str, float]:
 
 @pytest.mark.internal
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not HAVE_CUTEDSL,
+    not torch.cuda.is_available(),
     reason="CUDA and CuTeDSL are required",
 )
 @pytest.mark.parametrize(
@@ -315,7 +303,7 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
 
 @pytest.mark.internal
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not HAVE_CUTEDSL,
+    not torch.cuda.is_available(),
     reason="CUDA and CuTeDSL are required",
 )
 def test_replica_mxfp8_weight_kernel_copies_data_and_scales_by_orientation():
@@ -483,7 +471,7 @@ def test_replica_mxfp8_weight_kernel_copies_data_and_scales_by_orientation():
 
 @pytest.mark.internal
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not HAVE_CUTEDSL,
+    not torch.cuda.is_available(),
     reason="CUDA and CuTeDSL are required",
 )
 @pytest.mark.skipif(
@@ -691,7 +679,7 @@ def test_replica_mxfp8_weight_kernel_production_bandwidth():
 
 @pytest.mark.internal
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or not HAVE_CUTEDSL,
+    not torch.cuda.is_available(),
     reason="CUDA and CuTeDSL are required",
 )
 @pytest.mark.skipif(
