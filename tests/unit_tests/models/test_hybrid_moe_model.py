@@ -236,6 +236,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_padding_for_fp8": False,
     "moe_router_padding_for_quantization": False,
     "moe_router_pre_softmax": False,
+    "moe_router_qb_num_bins": 1000,
+    "moe_router_quantile_balancing_estimation_scope": "global_batch",
     "moe_router_score_function": "sigmoid",
     "moe_router_topk": 6,
     "moe_router_topk_limited_devices": None,
