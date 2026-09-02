@@ -250,6 +250,9 @@ class TestMegatronFSDPE2EMxfp8:
                     "model_config": {
                         "data_parallel_sharding_strategy": "optim_grads_params",
                         "megatron_fsdp_main_grads_dtype": torch.float32,
+                        # Keep the hybrid Mamba projection dimensions divisible by
+                        # the MXFP8 block size (32).
+                        "mamba_num_heads": 32,
                         "moe_token_dispatcher_type": "alltoall",
                     },
                     "loss_tolerance": {"atol": 0, "rtol": 0.05},
