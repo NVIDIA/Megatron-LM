@@ -227,7 +227,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         self.pg_collection = pg_collection
         if self.config.linear_cp_mode == "chunkwise" and self.pg_collection.cp.size() > 1:
             raise NotImplementedError(
-                "This branch supports linear_cp_mode='chunkwise' only for FLA GDP mixers."
+                "linear_cp_mode='chunkwise' is supported only by GatedDeltaProductMixer."
             )
         self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
         self.mamba_training_ssm_states_dtype = (
