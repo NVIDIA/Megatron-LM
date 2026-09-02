@@ -563,7 +563,6 @@ class TEGroupedMLP(MegatronModule):
 
         if replica_bridge is not None:
             register_replica_weights(op, replica_bridge.runtime_fc1_weights)
-            self._install_fused_fc1_prefetch_wait(op, replica_bridge)
         else:
             register_grouped_linear_params(
                 op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
@@ -693,17 +692,6 @@ class TEGroupedMLP(MegatronModule):
 
         return ops
 
-    @staticmethod
-    def _install_fused_fc1_prefetch_wait(fc1_op: torch.nn.Module, bridge) -> None:
-        """Wait for replica weights at FC1's execution boundary."""
-        original_pre_fuser_forward = fc1_op.pre_fuser_forward
-
-        def pre_fuser_forward(*, requires_grad: bool) -> None:
-            original_pre_fuser_forward(requires_grad=requires_grad)
-            bridge.wait_prefetch(bridge.last_plan)
-
-        fc1_op.pre_fuser_forward = pre_fuser_forward
-
     def _make_fused_impl_pre_forward_hook(self) -> Callable:
         """Make function that calls submodule pre-forward callback hooks.
 
@@ -721,8 +709,6 @@ class TEGroupedMLP(MegatronModule):
             self._fused_impl_parameters_prepared = False
             bridge = getattr(self, "_replica_weight_bridge", None)
             if bridge is not None:
-                bridge.prepare_runtime_parameters()
-                bridge.prepare_forward()
                 bridge.wait_prefetch(bridge.last_plan)
 
         return forward_pre_hook
