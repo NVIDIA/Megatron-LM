@@ -412,8 +412,8 @@ def _is_supported(
 
     B, T, H, K = k.shape
     HV, V = u.shape[2], u.shape[-1]
-    if B < 1:
-        return _reject("empty batch")
+    if B != 1:
+        return _reject(f"B={B} (only 1)")
     if T < 1:
         return _reject("empty local shard")
     if K != V or K not in {64, 128}:
@@ -515,26 +515,21 @@ def try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl(
     if mode is None:
         return None
 
-    B, T, H, K = k.shape
+    _, T, H, K = k.shape
     HV, V = u.shape[2], u.shape[-1]
     world_size, rank = _group_topology(context.group)
     # One state per local sequence, matching the Triton wrapper. Only slot 0
     # can be a continuation from an earlier rank; the rest start fresh and stay
     # zero.
-    N = B if B > 1 else len(context.cu_seqlens_cpu) - 1
-    if B > 1 and mode == "fused" and rank > 0:
-        initial_state = torch.empty(
-            N, HV, K, V, dtype=torch.float32, device=k.device
-        )
-    else:
-        initial_state = _out_state(
-            N, HV, K, V, k.device,
-            # `_merge_role` writes every element of slot 0 on a merging rank
-            # (every `hv`, every V-subtile `b`, rows 0..K), so pre-zeroing it there
-            # is an 8 MB memset the kernel immediately overwrites. Rank 0 folds
-            # nothing and never writes it, so it does need the zeros.
-            live_slot=0 if (mode == "fused" and rank > 0) else None,
-        )
+    N = len(context.cu_seqlens_cpu) - 1
+    initial_state = _out_state(
+        N, HV, K, V, k.device,
+        # `_merge_role` writes every element of slot 0 on a merging rank
+        # (every `hv`, every V-subtile `b`, rows 0..K), so pre-zeroing it there
+        # is an 8 MB memset the kernel immediately overwrites. Rank 0 folds
+        # nothing and never writes it, so it does need the zeros.
+        live_slot=0 if (mode == "fused" and rank > 0) else None,
+    )
 
     if mode == "noop":
         # No rank has cross-rank state to exchange: every sequence is complete
@@ -555,7 +550,6 @@ def try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl(
         HV,
         K,
         V,
-        B,
         "g",
     )
     fused = _WRAPPER_CACHE.get(key)
@@ -574,7 +568,6 @@ def try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl(
             gate_mode="g",
             device=k.device,
             split=1,
-            B=B,
         )
         _WRAPPER_CACHE[key] = fused
 
@@ -599,7 +592,7 @@ def try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl(
         _window(u, bos, eos),
         _window(w, bos, eos),
         g=_window(g, bos, eos),
-        h0_out=initial_state if B > 1 else initial_state[0],
+        h0_out=initial_state[0],
         emit_h=emit_h,
         emit_m=emit_m,
     )
@@ -655,16 +648,12 @@ def _is_supported_bwd(
 
     B, T, H, K = q.shape
     HV, V = do.shape[2], do.shape[-1]
-    if B < 1:
-        return _reject("bwd: empty batch")
+    if B != 1:
+        return _reject(f"bwd: B={B} (only 1)")
     if T < 1:
         return _reject("bwd: empty local shard")
-    if B > 1 and T < 64:
-        return _reject(f"bwd: dense B={B} requires local T>=64")
     if K != V or K not in {64, 128}:
         return _reject(f"bwd: K={K},V={V} (need K==V in 64,128)")
-    if B > 1 and K != 128:
-        return _reject(f"bwd: dense B={B} requires WS K=V=128")
     if H < 1 or HV % H != 0 or HV % 4 != 0:
         return _reject(f"bwd: head geometry H={H},HV={HV}")
     if k.shape != (B, T, H, K) or w.shape != (B, T, HV, K):
@@ -742,24 +731,19 @@ def try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl(
     if mode is None:
         return None
 
-    B, T, H, K = q.shape
+    _, T, H, K = q.shape
     HV, V = do.shape[2], do.shape[-1]
     world_size, rank = _group_topology(context.group)
     # One gradient state per local sequence, matching the Triton wrapper. Only
     # the LAST slot can carry gradient back from a later rank; the rest stay
     # zero. (Mirror image of the forward, which writes slot 0.)
-    N = B if B > 1 else len(context.cu_seqlens_cpu) - 1
-    if B > 1 and mode == "fused" and rank < world_size - 1:
-        dht_out = torch.empty(
-            N, HV, K, V, dtype=torch.float32, device=q.device
-        )
-    else:
-        dht_out = _out_state(
-            N, HV, K, V, q.device,
-            # Mirror of the forward: a merging rank's `_merge_role` fills the last
-            # slot completely; the last rank folds nothing and needs the zeros.
-            live_slot=N - 1 if (mode == "fused" and rank < world_size - 1) else None,
-        )
+    N = len(context.cu_seqlens_cpu) - 1
+    dht_out = _out_state(
+        N, HV, K, V, q.device,
+        # Mirror of the forward: a merging rank's `_merge_role` fills the last
+        # slot completely; the last rank folds nothing and needs the zeros.
+        live_slot=N - 1 if (mode == "fused" and rank < world_size - 1) else None,
+    )
 
     if mode == "noop":
         global _CP_NOOP_COUNT
@@ -777,16 +761,12 @@ def try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl(
         HV,
         K,
         V,
-        B,
         "g",
     )
     fused = _BWD_WRAPPER_CACHE.get(key)
     if fused is None:
         from .bwd_fused import CuteDSLFusedCPBwdPreProcess
-        from .bwd_ws import (
-            CuteDSLFusedCPBwdPreProcessWS,
-            ws_supported,
-        )
+        from .bwd_ws import CuteDSLFusedCPBwdPreProcessWS, ws_supported
 
         # The warp-specialized Blackwell engine is 2.7x exact FLA at the
         # canonical shape versus 0.99x for the SM80 engine it replaces; it is
@@ -804,7 +784,6 @@ def try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl(
             V,
             gate_mode="g",
             device=q.device,
-            B=B,
         )
         _BWD_WRAPPER_CACHE[key] = fused
 
@@ -827,7 +806,7 @@ def try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl(
         _window(dv, bos, eos),
         g=_window(g, bos, eos),
         scale=K ** -0.5 if scale is None else float(scale),
-        dht_out=dht_out if B > 1 else dht_out[-1],
+        dht_out=dht_out[-1],
         emit_h=emit_h,
         emit_m=emit_m,
     )

@@ -21,22 +21,18 @@ variable is unset.
 ## Supported fast path
 
 - NVIDIA SM100 B200/GB200 with an NCCL CP group of size 2 through 8.
+- Packed THD input with validated CPU sequence offsets attached to the CP
+  context.
 - BF16 operands, scalar `g` gate, chunk size 64.
 - Equal key/value dimensions of 64 or 128.
-- Dense BTHD forward preprocessing treats `(batch, value head)` as one native
-  work-item space, so all batch elements run in one kernel launch. The
-  warp-specialized backward does the same for `K = V = 128`.
-- When a dense shape is not supported by the native-batch specialization, the
-  dispatcher preserves the installed FLA kernel's `B = 1` contract by slicing
-  the boundary preprocessing per batch element and concatenating the states.
-- Packed THD uses the validated CPU sequence offsets attached to the CP context.
 - A local sequence length of at least 64 that is not divisible by 64 is handled
-  inside the kernels; inputs are not padded or copied. Dense backward shards
-  shorter than one chunk use the FLA fallback.
+  inside the kernels; inputs are not padded or copied.
 
-Calls outside this contract fall back to the installed FLA implementation. The
-dispatcher exposes launch counters and fallback reasons so benchmarks can prove
-which path executed.
+The production `GatedDeltaNet.forward` path preserves MCore's established
+chunkwise-CP contract: dense SBHD input with `B > 1` is rejected. Use packed THD
+input, or use dense input with `B = 1`. Calls outside the fast-path contract
+fall back to the installed FLA implementation. The dispatcher exposes launch
+counters and fallback reasons so benchmarks can prove which path executed.
 
 ## Notes
 
@@ -47,24 +43,28 @@ rank chain from immutable global CPU sequence offsets before launching.
 The Python modules carry their upstream MIT copyright and license notice in
 their source headers. No separate runtime checkout of an FLA fork is required.
 
-## Verified CP4 case
+## Verified CP4 cases
 
-On four GB200 GPUs, the production `GatedDeltaNet.forward` path was checked at
-`B=2`, local `T=8192`, global `T=32768`, `H=64`, and `K=V=128`. Correctness
-covered the output, input gradient, and the `q`, `k`, `v`, `g`, and `beta`
-gradients. The non-64-aligned local `T=8190` case was checked separately.
+The production packed-THD `GatedDeltaNet.forward` path was checked on four
+GB200 GPUs for two logical sequences. Each sequence has global length 32768 and
+local length 8192, with `H=64` and `K=V=128`. Each rank receives a local tensor
+of shape `[16384, H, D]` and validated global CPU metadata
+`cu_seqlens=[0, 32768, 65536]`; the normal MCore packed CP layout conversion is
+enabled. Correctness covered the output, input gradient, and the `q`, `k`, `v`,
+`g`, and `beta` gradients. For the non-64-aligned case, the two local
+sequence lengths were 8190 and 8194; the combined path measured 11.114 ms
+versus 15.117 ms for pure FLA (1.36x).
 
-For the aligned case, CUDA Event timing with 10 warmups and 20 samples, taking
-the maximum time across CP ranks, measured:
+The aligned timings below use CUDA Events with 10 warmups and 20 samples. Each
+sample is the maximum time across CP ranks, and the table reports the median.
 
 | Path | Median | Speedup vs. pure FLA |
 | --- | ---: | ---: |
-| Pure FLA | 14.926 ms | 1.00x |
-| FLA CP + fused GDR backward | 10.931 ms | 1.37x |
-| CuTeDSL CP + FLA backward | 11.138 ms | 1.34x |
-| CuTeDSL CP + fused GDR backward | 8.604 ms | 1.73x |
+| Pure FLA | 14.794 ms | 1.00x |
+| FLA CP + fused GDR backward | 13.035 ms | 1.13x |
+| CuTeDSL CP + FLA backward | 12.907 ms | 1.15x |
+| CuTeDSL CP + fused GDR backward | 11.197 ms | 1.32x |
 
-The final path executed one CuTeDSL forward boundary launch, one CuTeDSL
+The combined path executed one CuTeDSL forward boundary launch, one CuTeDSL
 backward boundary launch, and one fused GDR backward launch per iteration,
-with no CuTeDSL fallback. A separate post-review rerun of the final path
-measured 8.603 ms median (P10 8.593 ms, P90 8.646 ms, CV 0.353%).
+with no CuTeDSL fallback.
