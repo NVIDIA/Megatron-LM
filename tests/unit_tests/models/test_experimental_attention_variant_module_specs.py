@@ -489,8 +489,10 @@ class TestGetDSv4HybridModuleSpec:
         )
 
     def test_uses_te_batched_linear_when_available(self):
-        """The canonical DSv4 spec should select TE's BatchedLinear module."""
-        fake_te = SimpleNamespace(pytorch=SimpleNamespace(BatchedLinear=_FakeBatchedLinear))
+        """The canonical DSv4 spec should select TE's BatchedLinear operation."""
+        fake_te = SimpleNamespace(
+            pytorch=SimpleNamespace(ops=SimpleNamespace(BatchedLinear=_FakeBatchedLinear))
+        )
         with (
             patch(f"{self.MODULE}.HAVE_TE", True),
             patch(f"{self.MODULE}.te", fake_te, create=True),
@@ -499,9 +501,14 @@ class TestGetDSv4HybridModuleSpec:
 
         assert spec.submodules.linear_o_group_proj is _FakeBatchedLinear
 
-    def test_sets_none_when_te_batched_linear_is_unavailable(self):
+    @pytest.mark.parametrize(
+        "fake_pytorch",
+        [SimpleNamespace(), SimpleNamespace(ops=SimpleNamespace())],
+        ids=["ops_unavailable", "batched_linear_unavailable"],
+    )
+    def test_sets_none_when_te_batched_linear_is_unavailable(self, fake_pytorch):
         """Old TE installations should leave construction to the einsum fallback."""
-        fake_te = SimpleNamespace(pytorch=SimpleNamespace())
+        fake_te = SimpleNamespace(pytorch=fake_pytorch)
         with (
             patch(f"{self.MODULE}.HAVE_TE", True),
             patch(f"{self.MODULE}.te", fake_te, create=True),

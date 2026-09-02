@@ -194,7 +194,7 @@ class DSv4HybridAttention(Attention):
         self._uses_te_batched_linear = submodules.linear_o_group_proj is not None
         if not self._uses_te_batched_linear:
             warnings.warn(
-                "transformer_engine.pytorch.BatchedLinear is unavailable. Please upgrade "
+                "transformer_engine.pytorch.ops.BatchedLinear is unavailable. Please upgrade "
                 "Transformer Engine to avoid a performance regression; "
                 "DSv4HybridAttention.linear_o_group_proj is falling back to torch.einsum.",
                 stacklevel=2,
@@ -216,7 +216,7 @@ class DSv4HybridAttention(Attention):
                 self.config.o_lora_rank,
                 batch_dim=-2,
                 device=device,
-                params_dtype=self.config.params_dtype,
+                dtype=self.config.params_dtype,
                 bias=False,
                 accumulate_into_main_grad=self.config.gradient_accumulation_fusion,
                 init_method=partial(
@@ -224,6 +224,7 @@ class DSv4HybridAttention(Attention):
                 ),
                 name=(name + ".linear_o_group_proj") if name is not None else None,
             )
+            set_save_original_input(self.linear_o_group_proj)
             self._register_state_dict_hook(self._linear_o_group_proj_state_dict_hook)
 
         linear_proj_in_size = self.config.o_groups * self.config.o_lora_rank

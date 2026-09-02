@@ -215,7 +215,8 @@ def get_dsv4_hybrid_module_spec_for_backend(
 
     linear_o_group_proj = None
     if HAVE_TE:
-        linear_o_group_proj = getattr(te.pytorch, "BatchedLinear", None)
+        te_ops = getattr(te.pytorch, "ops", None)
+        linear_o_group_proj = getattr(te_ops, "BatchedLinear", None)
 
     attention = ModuleSpec(
         module=DSv4HybridSelfAttention,

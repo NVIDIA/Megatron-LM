@@ -37,6 +37,12 @@ except ImportError:
 _SEED = 42
 
 
+def _get_te_batched_linear():
+    """Return TE's batched-linear operation when supported by the installed version."""
+    te_ops = getattr(te_pytorch, "ops", None)
+    return getattr(te_ops, "BatchedLinear", None)
+
+
 def _mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     return x * scale
 
@@ -434,13 +440,15 @@ class TestDSv4HybridGroupedOutput:
         )
         assert weight.shape == expected_shape
         assert weight.requires_grad
+        if attn._uses_te_batched_linear:
+            assert attn.linear_o_group_proj.save_original_input
 
     @pytest.mark.parametrize(
         "quantized_weight", [False, True], ids=["bf16", "mxfp8_quantized_weight"]
     )
     def test_o_group_proj_legacy_checkpoint_compatibility(self, quantized_weight):
         """Legacy 2D checkpoints should load into BF16 and quantized weights."""
-        if not hasattr(te_pytorch, "BatchedLinear"):
+        if _get_te_batched_linear() is None:
             pytest.skip("Transformer Engine BatchedLinear is not available")
 
         recipe = None
@@ -519,7 +527,8 @@ class TestDSv4HybridGroupedOutput:
     )
     def test_o_group_proj_numerics_and_gradients(self, use_mxfp8, quantized_weight):
         """TE BatchedLinear should match einsum with BF16 and MXFP8 weights."""
-        if not hasattr(te_pytorch, "BatchedLinear"):
+        te_batched_linear = _get_te_batched_linear()
+        if te_batched_linear is None:
             pytest.skip("Transformer Engine BatchedLinear is not available")
         if use_mxfp8:
             available, reason = te_pytorch.is_mxfp8_available(return_reason=True)
@@ -545,7 +554,7 @@ class TestDSv4HybridGroupedOutput:
             attn = _build_attention(config, layer_number=1, pg_collection=pg)
         module = attn.linear_o_group_proj
         weight = module.weight
-        assert isinstance(module, te_pytorch.BatchedLinear)
+        assert isinstance(module, te_batched_linear)
         assert (isinstance(weight, TEQuantizedTensor)) == quantized_weight
         group_proj_param_names = [
             name for name, param in attn.named_parameters(remove_duplicate=False) if param is weight
@@ -589,33 +598,39 @@ class TestDSv4HybridGroupedOutput:
         torch.testing.assert_close(input_test.grad, input_ref.grad, **tolerances)
         torch.testing.assert_close(weight.grad, weight_ref.grad, **tolerances)
 
-    def test_o_group_proj_preserves_high_precision_init_val(self):
-        """TE BatchedLinear should retain the pre-quantization initialized weight."""
-        if not hasattr(te_pytorch, "BatchedLinear"):
+    @pytest.mark.parametrize(
+        "quantized_weight", [False, True], ids=["bf16", "mxfp8_quantized_weight"]
+    )
+    def test_o_group_proj_uses_config_init_method(self, quantized_weight):
+        """TE BatchedLinear should initialize BF16 and quantized weights from the config."""
+        if _get_te_batched_linear() is None:
             pytest.skip("Transformer Engine BatchedLinear is not available")
-        available, reason = te_pytorch.is_mxfp8_available(return_reason=True)
-        if not available:
-            pytest.skip(reason)
 
-        recipe = te_recipe.MXFP8BlockScaling(
-            fp8_format=te_recipe.Format.E4M3, backward_override=None
-        )
+        recipe = None
+        if quantized_weight:
+            available, reason = te_pytorch.is_mxfp8_available(return_reason=True)
+            if not available:
+                pytest.skip(reason)
+            recipe = te_recipe.MXFP8BlockScaling(
+                fp8_format=te_recipe.Format.E4M3, backward_override=None
+            )
+
         config = _make_config(o_groups=8, o_lora_rank=64)
         config.init_method = lambda weight: torch.nn.init.constant_(weight, 0.25)
         pg = ProcessGroupCollection.use_mpu_process_groups()
-        with te_pytorch.quantized_model_init(
-            enabled=True, recipe=recipe, preserve_high_precision_init_val=True
-        ):
+        init_context = (
+            te_pytorch.quantized_model_init(enabled=True, recipe=recipe)
+            if quantized_weight
+            else nullcontext()
+        )
+        with init_context:
             attn = _build_attention(config, layer_number=1, pg_collection=pg)
 
         weight = attn.linear_o_group_proj.weight
-        assert isinstance(weight, TEQuantizedTensor)
-        high_precision_weight = weight.get_high_precision_init_val()
-        assert high_precision_weight.device.type == "cpu"
-        assert high_precision_weight.shape == weight.shape
-        torch.testing.assert_close(
-            high_precision_weight, torch.full_like(high_precision_weight, 0.25), rtol=0, atol=0
-        )
+        assert (isinstance(weight, TEQuantizedTensor)) == quantized_weight
+        expected = torch.full(weight.shape, 0.25, device=weight.device, dtype=torch.bfloat16)
+        tolerances = {"rtol": 0.125, "atol": 0.0675} if quantized_weight else {}
+        torch.testing.assert_close(weight, expected, **tolerances)
 
     @pytest.mark.parametrize("use_quantized_model_init", [False, True], ids=["bf16", "qmi"])
     def test_o_group_proj_falls_back_to_einsum(self, monkeypatch, use_quantized_model_init):
@@ -632,7 +647,9 @@ class TestDSv4HybridGroupedOutput:
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
 
-        monkeypatch.delattr(te_pytorch, "BatchedLinear", raising=False)
+        te_ops = getattr(te_pytorch, "ops", None)
+        if te_ops is not None:
+            monkeypatch.delattr(te_ops, "BatchedLinear", raising=False)
         config = _make_config(o_groups=8, o_lora_rank=64)
         pg = ProcessGroupCollection.use_mpu_process_groups()
         init_context = (
