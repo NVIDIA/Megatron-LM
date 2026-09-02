@@ -323,9 +323,15 @@ def _alloc_symmetric_wgrad_buffer(weight, dtype, device) -> torch.Tensor:
     return buf
 
 
-def _wgrad_pool_get(shape: tuple, dtype: torch.dtype, device) -> torch.Tensor:
+def _wgrad_pool_get(
+    shape: tuple, dtype: torch.dtype, device, *, graph_capture_safe: bool = False
+) -> torch.Tensor:
     """Get a pool buffer or allocate fresh, tagged so _wgrad_pool_put accepts only
     pool-owned buffers (other callers fall through to the caching allocator on release)."""
+    if graph_capture_safe and torch.cuda.is_current_stream_capturing():
+        # An eager-pool tensor may be recycled after capture while the graph retains its address.
+        # Allocate transient capture storage from the graph's private pool instead.
+        return torch.empty(shape, dtype=dtype, device=device, requires_grad=False)
     key = (shape, dtype)
     pool = _wgrad_buf_pool.get(key)
     if pool:
@@ -1818,7 +1824,12 @@ class GTPShardedParam(torch.nn.Parameter):
             buf = _alloc_symmetric_wgrad_buffer(self, self.main_grad.dtype, self.device)
             self._wgrad_symm_slot = buf
             return buf[: self._unsharded_shape[0]]
-        return _wgrad_pool_get(self._unsharded_shape, self.main_grad.dtype, self.device)
+        return _wgrad_pool_get(
+            self._unsharded_shape,
+            self.main_grad.dtype,
+            self.device,
+            graph_capture_safe=_chain_is_graphed(self.chain_id),
+        )
 
     def register_grad_accum_hook(
         self, grad_accum_node: torch.autograd.graph.Node | None, hook: Callable[..., None] | None
@@ -1969,7 +1980,12 @@ class GTPShardedParam(torch.nn.Parameter):
             out_shape = [tensor.shape[0] // self.group.size(), *tensor.shape[1:]]
             out_buffer = torch.empty(out_shape, dtype=tensor.dtype, device=tensor.device)
 
-        a2a_buf = _wgrad_pool_get(tuple(tensor.shape), tensor.dtype, tensor.device)
+        a2a_buf = _wgrad_pool_get(
+            tuple(tensor.shape),
+            tensor.dtype,
+            tensor.device,
+            graph_capture_safe=_chain_is_graphed(self.chain_id),
+        )
         handle = reduce_scatter_with_fp32_accumulation(
             out_buffer,
             tensor,

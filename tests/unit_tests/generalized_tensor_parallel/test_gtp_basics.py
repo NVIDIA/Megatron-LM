@@ -1555,6 +1555,21 @@ class TestGTPGraphWgradRing:
         assert torch.count_nonzero(rs_input[4:]) == 0
 
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA allocator test")
+    def test_capture_does_not_borrow_eager_wgrad_pool(self, monkeypatch):
+        monkeypatch.setattr(gtp_module, "_wgrad_buf_pool", {})
+        eager_buffer = gtp_module._wgrad_pool_get((8,), torch.bfloat16, "cuda")
+        gtp_module._wgrad_pool_put(eager_buffer)
+
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        capture_buffer = gtp_module._wgrad_pool_get(
+            (8,), torch.bfloat16, "cuda", graph_capture_safe=True
+        )
+
+        assert capture_buffer.data_ptr() != eager_buffer.data_ptr()
+        assert gtp_module._wgrad_buf_pool[((8,), torch.bfloat16)] == [eager_buffer]
+
+
 class TestActivationRecomputePhaseFlag:
     """GTP's forward-only readiness gate rests on TE's recompute flag being dtype-agnostic."""
 
