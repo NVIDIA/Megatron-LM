@@ -21,12 +21,14 @@ from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
+from megatron.core.activations import squared_relu
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     CudaGraphSizingDistribution,
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
+    PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
@@ -353,6 +355,8 @@ class DynamicEngineTestConfig:
     # linear decode-only graphs). Tests that assert on exact token counts can pin a
     # single distribution here.
     cuda_graph_sizing_distribution: CudaGraphSizingDistribution = CudaGraphSizingDistribution.HYBRID
+    cuda_graph_mixed_prefill_count: Optional[int] = 16
+    cuda_graph_max_tokens: int = 512
     fp8: bool = False
     model_provider: str = "gpt"
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
@@ -366,6 +370,9 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     enable_prefix_caching: bool = False
+    prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
+        PrefixCachingEvictionPolicy.REF_ZERO
+    )
     cuda_graph_modules: List[CudaGraphModule] = field(default_factory=list)
     inference_cuda_graph_scope: InferenceCudaGraphScope = InferenceCudaGraphScope.block
     cuda_graph_impl: Optional[str] = None
@@ -388,6 +395,7 @@ class DynamicEngineTestConfig:
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 0.0
+    offset_sampling_seed_by_dp_rank: bool = True
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.ASYNC
     # Sliding-window attention config. When `window_size` is None, SWA is
     # disabled and all layers do full causal attention. When set to a
@@ -529,11 +537,13 @@ class DynamicInferenceEngineTestBase:
             inference_config=InferenceConfig(
                 max_sequence_length=test_config.max_sequence_length,
                 num_cuda_graphs=test_config.num_cuda_graphs,
+                cuda_graph_mixed_prefill_count=test_config.cuda_graph_mixed_prefill_count,
+                cuda_graph_sizing_distribution=test_config.cuda_graph_sizing_distribution,
+                cuda_graph_max_tokens=test_config.cuda_graph_max_tokens,
                 use_cuda_graphs_for_non_decode_steps=(
                     test_config.use_cuda_graphs_for_non_decode_steps
                 ),
                 cuda_graph_all_prefills=test_config.cuda_graph_all_prefills,
-                cuda_graph_sizing_distribution=test_config.cuda_graph_sizing_distribution,
                 buffer_size_gb=test_config.context_buffer_size_gb,
                 paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
                 block_size_tokens=test_config.context_block_size_tokens,
@@ -547,12 +557,14 @@ class DynamicInferenceEngineTestBase:
                 static_kv_memory_pointers=test_config.static_kv_memory_pointers,
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
+                prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 sampling_backend=test_config.sampling_backend,
+                offset_sampling_seed_by_dp_rank=test_config.offset_sampling_seed_by_dp_rank,
                 async_sched_mode=test_config.async_sched_mode,
                 logprobs_mode=test_config.logprobs_mode,
             ),
@@ -620,6 +632,18 @@ class DynamicInferenceEngineTestBase:
                     else InferenceCudaGraphScope.none
                 ),
                 transformer_impl=test_config.transformer_impl,
+                activation_func=(
+                    squared_relu
+                    if test_config.transformer_impl == "inference_optimized"
+                    and test_config.expert_model_parallel_size > 1
+                    else torch.nn.functional.gelu
+                ),
+                moe_router_dtype=(
+                    "fp32"
+                    if test_config.transformer_impl == "inference_optimized"
+                    and test_config.expert_model_parallel_size > 1
+                    else None
+                ),
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
                 ),
@@ -634,11 +658,17 @@ class DynamicInferenceEngineTestBase:
                 window_attn_skip_freq=test_config.window_attn_skip_freq,
             )
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
-                layer_spec = get_gpt_layer_with_transformer_engine_spec()
+                layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    num_experts=transformer_config.num_moe_experts
+                )
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec()
+                layer_spec = get_gpt_layer_local_spec(
+                    num_experts=transformer_config.num_moe_experts
+                )
             elif test_config.transformer_impl == "inference_optimized":
-                layer_spec = get_gpt_layer_with_inference_spec()
+                layer_spec = get_gpt_layer_with_inference_spec(
+                    num_experts=transformer_config.num_moe_experts
+                )
 
             # MTP block spec (needed for speculative decoding).
             mtp_block_spec = None
