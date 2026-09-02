@@ -53,9 +53,11 @@ Operationally, this path is tightly integrated into MCore training and inference
 - users select the mode through config flags only; there is no separate helper API to
   wire into a custom training loop or a separate need to handle static input buffers
 
-A graph captured during training is not replayed by standard evaluation under `model.eval()`
-with autograd disabled. Evaluation runs eagerly so capture-time Python branches and mutable-buffer
-updates retain their evaluation semantics. Explicit inference CUDA graphs remain unaffected.
+A graph captured during training can also be replayed by standard evaluation. CUDA graph replay
+preserves capture-time side effects, so the graph manager clears temporary model accumulators when
+the model returns to training; for example, validation token counts cannot affect the next
+expert-bias update. The captured computation must otherwise have compatible training and
+evaluation semantics.
 
 ### Usage
 
