@@ -37,10 +37,15 @@ Selected by `torch.are_deterministic_algorithms_enabled()` or
 | MoE routing map and probabilities | `megatron/core/transformer/moe/moe_utils.py` | `index_put_(accumulate=False)` row-wise writes | out-of-place `scatter` |
 | Vocab-parallel embedding | `megatron/core/tensor_parallel/layers.py` | direct indexing `weight[idx]` (deterministic backward) | `F.embedding` (non-deterministic atomic backward) |
 | Gated-delta-net kernel | `megatron/core/ssm/gated_delta_net.py` | torch `chunk_gated_delta_rule` | FLA fused kernel |
-| Gated-delta-net causal conv1d | `megatron/core/ssm/gated_delta_net.py` | `F.conv1d` (plus transposes) | FLA `causal_conv1d` |
-| Mamba/SSM Triton ops | `megatron/core/ssm/ops/determinism.py` | one fixed autotune config plus a zero-initialized tiled workspace reduced with an ordered `sum` | timing-based autotune, uninitialized workspace |
+| Gated-delta-net causal conv1d | `megatron/core/ssm/gated_delta_net/` | `F.conv1d` (plus transposes) | FLA `causal_conv1d` |
+| Mamba/SSM Triton ops | `megatron/core/ssm/ops/common/determinism.py` | one fixed autotune config plus a zero-initialized tiled workspace reduced with an ordered `sum` | timing-based autotune, uninitialized workspace |
+| Mamba/GDP causal conv1d | `megatron/core/ssm/causal_conv1d.py` | causal_conv1d >= 1.6.0 — per-block workspace for the weight and bias gradients, reduced with an ordered `sum` | `atomicAdd` accumulation (order varies per launch) |
 | Transformer Engine attention | `megatron/core/extensions/transformer_engine.py` | requires `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`, under which TE selects only backends that support deterministic execution (including deterministic FlashAttention backward) | TE picks freely, including atomic-accumulation attention backward |
 | Inference DP scheduling and RL rollout order | `megatron/core/inference/engines/dynamic_engine.py`, `megatron/rl/rl_utils.py` | sort by stable key | completion order |
+
+The two conv rows are different kernels. Mamba and GDP call Dao-AILab's
+`causal_conv1d`, which has its own deterministic reduction; gated-delta-net binds
+FLA's, which does not, so it falls back to `F.conv1d`.
 
 The following environment controls make the rest of the step deterministic.
 The flag `--deterministic-mode` validates and defaults these settings. For
@@ -51,6 +56,7 @@ details, refer to `megatron/training/determinism.py`.
 - `CUBLAS_WORKSPACE_CONFIG=:4096:8` (or `:16:8`).
 - `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`.
 - `MAMBA_DETERMINISTIC` must not be disabled.
+- `CAUSAL_CONV1D_DETERMINISTIC` must not be disabled. Needs causal_conv1d >= 1.6.0.
 
 ## Operations Without Determinism Support
 

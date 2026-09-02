@@ -24,7 +24,7 @@ from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy
 import torch
@@ -893,6 +893,8 @@ def mup_scaled_init_method_normal(sigma, num_layers, width_mult, multiplier=2.0)
 
 def log_on_each_pipeline_stage(
     logger: logging.Logger,
+    level: int,
+    msg: object,
     *args: Any,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -903,23 +905,32 @@ def log_on_each_pipeline_stage(
     Args:
         logger (logging.Logger): The logger to write the logs
 
-        args (Tuple[Any]): All logging.Logger.log positional arguments
+        level (int): Logging level for the message.
+
+        msg (object): Message format string.
+
+        args (Tuple[Any]): Message format arguments.
 
         kwargs (Dict[str, Any]): All logging.Logger.log keyword arguments
     """
     assert torch.distributed.is_initialized()
 
+    if (tp_group is None) != (dp_cp_group is None):
+        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
+
+    if not logger.isEnabledFor(level):
+        return
+
     if tp_group is None and dp_cp_group is None:
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         dp_cp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
-    elif tp_group is not None and dp_cp_group is not None:
+    else:
+        assert tp_group is not None and dp_cp_group is not None
         tp_rank = tp_group.rank()
         dp_cp_rank = dp_cp_group.rank()
-    else:
-        raise ValueError("tp_group and dp_cp_group must be provided or not provided together")
 
     if tp_rank == 0 and dp_cp_rank == 0:
-        logger.log(*args, **kwargs)
+        logger.log(level, msg, *args, **kwargs)
 
 
 def check_param_hashes_across_dp_replicas(
@@ -1070,7 +1081,11 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     if HAVE_GTP:
         from megatron.core.fp8_utils import is_float8tensor
-        from megatron.core.tensor_parallel.gtp_api import dequantize_gtp_native_fp8, is_gtp_param
+        from megatron.core.tensor_parallel.gtp_api import (
+            dequantize_gtp_native_fp8,
+            gtp_replica_rank,
+            is_gtp_param,
+        )
 
         if is_gtp_param(tensor):
             gtp_rank = get_pg_rank(tensor.group)
@@ -1085,10 +1100,9 @@ def make_tp_sharded_tensor_for_checkpoint(
             else:
                 # GTP shards axis 0, TP shards a different axis → add a separate axis-0 offset
                 new_offsets.append((prepend_axis_num, gtp_rank, gtp_remat_size))
-            # Elect the writer over the gtp_remat-EXCLUDED DP group (its true replicas).
-            dp_replica_id = parallel_state.get_data_parallel_rank(
-                with_context_parallel=True, with_gtp_remat=False
-            )
+            # Elect the writer over the gtp_remat-EXCLUDED DP group (its true replicas): the
+            # group stamped on the param by the caller's pg_collection, else the MPU globals.
+            dp_replica_id = gtp_replica_rank(tensor)
             # Saved global is the padded shape when GTP padded out_features for alignment.
             if getattr(tensor, "pad_length", 0):
                 kwargs.setdefault("allow_shape_mismatch", True)
@@ -2649,6 +2663,7 @@ def get_batch_on_this_cp_rank(
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
     use_per_sequence_balancing: bool = False,
+    use_contiguous_cp: bool = False,
 ):
     """Dispatch batch partitioning across context-parallel ranks.
 
@@ -2663,6 +2678,7 @@ def get_batch_on_this_cp_rank(
       - **Hybrid CP**: When ``cu_seqlens`` is present and ``is_hybrid_cp`` is
         True, creates a local hybrid CP group (via ``hybrid_cp_group_func``)
         and delegates to ``_get_batch_on_this_cp_rank_per_sequence_balancing``.
+      - **Contiguous CP**: Keeps the hybrid residual stream in causal rank order.
 
     Args:
         batch (Dict[str, Any]): Input batch tensors. Must contain a
@@ -2677,13 +2693,18 @@ def get_batch_on_this_cp_rank(
             even when ``cu_seqlens`` is present (e.g., for inter-document
             masking where document lengths are not divisible by
             ``2 * cp_size``).
+        use_contiguous_cp (bool): Use contiguous sequence shards for the linear CP layout.
 
     Returns:
         Dict[str, Any]: The batch with sequence-dimension tensors partitioned
         to this CP rank.
     """
 
-    if use_per_sequence_balancing or batch.get("cu_seqlens") is None:
+    if use_contiguous_cp:
+        from megatron.core.context_parallel.utils import _get_batch_on_this_cp_rank_contiguous
+
+        batch = _get_batch_on_this_cp_rank_contiguous(batch, cp_group=cp_group)
+    elif use_per_sequence_balancing or batch.get("cu_seqlens") is None:
         batch = _get_batch_on_this_cp_rank_per_sequence_balancing(batch, cp_group=cp_group)
     elif is_hybrid_cp:
         assert (
@@ -3152,3 +3173,28 @@ def deprecate_inference_params(inference_context, inference_params):
         )
         return inference_params
     return inference_context
+
+
+#: Attribute a parameter-sharding backend sets on each parameter it publishes asynchronously.
+#: See :func:`ensure_params_ready`.
+PARAM_READY_CALLBACK_ATTR = "_ensure_param_ready_callback"
+
+
+def ensure_params_ready(params: Iterable[Any]) -> None:
+    """Make ``params`` readable now, finishing any outstanding backend publication.
+
+    A parameter-sharding backend (DDP with ``overlap_param_gather``, FSDP, ...) publishes values
+    asynchronously, so only the owning module's forward pre-hook makes ``param.data`` valid. Any
+    consumer reading it earlier -- ahead of that module, or from another stream -- calls this
+    first. Backends mark their params with :data:`PARAM_READY_CALLBACK_ATTR`; unmarked params
+    no-op, so neither side needs to know about the other.
+
+    Callbacks are shared per communication bucket, so each fires once, not once per parameter.
+    """
+    fired = set()
+    for param in params:
+        callback = getattr(param, PARAM_READY_CALLBACK_ATTR, None)
+        if callback is None or id(callback) in fired:
+            continue
+        fired.add(id(callback))
+        callback()
