@@ -1495,6 +1495,14 @@ class TransformerConfig(ModelParallelConfig):
                 "hybrid_context_parallel is not supported with linear_cp_layout='contiguous'."
             )
         if (
+            self.sequence_packing_scheduler is not None
+            and self.context_parallel_size > 1
+            and self.linear_cp_layout != self.attention_cp_layout
+        ):
+            raise ValueError(
+                "The sequence-packing scheduler does not support CP layout conversion."
+            )
+        if (
             self.context_parallel_size > 1
             and self.linear_cp_layout != self.attention_cp_layout
             and self.sequence_parallel
@@ -1504,14 +1512,6 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "Sequence-parallel CP layout conversion requires an even "
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
-            )
-        if (
-            self.linear_cp_layout == "contiguous"
-            and self.context_parallel_size > 1
-            and (self.mtp_num_layers or 0) > 0
-        ):
-            raise ValueError(
-                "linear_cp_layout='contiguous' with context parallelism does not yet support MTP."
             )
 
     def __post_init__(self):
