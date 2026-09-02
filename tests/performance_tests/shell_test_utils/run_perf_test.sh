@@ -88,6 +88,10 @@ NUM_TIMED_ITERS=$("$YQ" '.NUM_TIMED_ITERS // 5' "$CONFIG_PATH")
 # hybrid models should use 'gsm8k' — synthetic input gives misleading
 # perf because every token is identical (uniform expert routing, hot KV).
 DATASET=$("$YQ" '.DATASET // "synthetic"' "$CONFIG_PATH")
+# Scheduler selection for the performance A/B baselines. True pins the async
+# scheduler; false (and a missing value) pins the legacy scheduler so changes to
+# the application default do not silently change an existing benchmark case.
+ASYNC_SCHED=$("$YQ" '.ASYNC_SCHED // false' "$CONFIG_PATH")
 mapfile -t BATCH_SIZES < <("$YQ" '.BATCH_SIZES[]' "$CONFIG_PATH")
 
 # For MoE configs, expert-parallelism is orthogonal to DP and reshapes the
@@ -95,6 +99,9 @@ mapfile -t BATCH_SIZES < <("$YQ" '.BATCH_SIZES[]' "$CONFIG_PATH")
 # and MoE-with-DP=1 picks up EP correctly.
 GROUP_SIZE=$((DP > EP ? DP : EP))
 WORLD_SIZE=$((TP * PP * GROUP_SIZE))
+# The inference coordinator uses the dense-model DP group. EP-only configs
+# therefore expose GROUP_SIZE workers even when the YAML DP value is one.
+COORDINATOR_WORKERS=$GROUP_SIZE
 ARGS_FILE="$PERF_DIR/server/model_args/${MODEL}.args"
 if [[ ! -f "$ARGS_FILE" ]]; then
     echo "[run_perf_test] error: model args file $ARGS_FILE not found" >&2
@@ -102,6 +109,7 @@ if [[ ! -f "$ARGS_FILE" ]]; then
 fi
 
 echo "[run_perf_test] MODEL=$MODEL  TP=$TP PP=$PP DP=$DP EP=$EP  world_size=$WORLD_SIZE  dataset=$DATASET"
+echo "[run_perf_test] coordinator workers: $COORDINATOR_WORKERS"
 echo "[run_perf_test] ISL=$NUM_INPUT_TOKENS  OSL=$NUM_OUTPUT_TOKENS"
 echo "[run_perf_test] batch sizes: ${BATCH_SIZES[*]}"
 
@@ -190,6 +198,29 @@ SERVER_COMMON_ARGS=(
     --host 0.0.0.0
 )
 
+# Pin both sides of the scheduler A/B comparison instead of inheriting the
+# application default. Async cases retain their established prompt-log-prob
+# setting so the benchmark invocation remains stable.
+case "$ASYNC_SCHED" in
+    true)
+        echo "[run_perf_test] pinning async scheduling (--inference-dynamic-batching-async-sched-mode async --skip-prompt-log-probs)"
+        SERVER_COMMON_ARGS+=(
+            --inference-dynamic-batching-async-sched-mode async
+            --skip-prompt-log-probs
+        )
+        ;;
+    false)
+        echo "[run_perf_test] pinning legacy scheduling (--inference-dynamic-batching-async-sched-mode legacy)"
+        SERVER_COMMON_ARGS+=(
+            --inference-dynamic-batching-async-sched-mode legacy
+        )
+        ;;
+    *)
+        echo "[run_perf_test] error: ASYNC_SCHED must be true or false; got '$ASYNC_SCHED' from $CONFIG_PATH" >&2
+        exit 2
+        ;;
+esac
+
 (
     cd "$ROOT_DIR"
     uv run --no-sync python -m torch.distributed.run \
@@ -257,6 +288,7 @@ for BS in "${BATCH_SIZES[@]}"; do
         --num-input-tokens "$NUM_INPUT_TOKENS" \
         --num-output-tokens "$NUM_OUTPUT_TOKENS" \
         --num-warmup-iters "$NUM_WARMUP_ITERS" \
+        --data-parallel-size "$COORDINATOR_WORKERS" \
         --num-iters "$NUM_TIMED_ITERS" \
         --output-json "$RESULTS_JSON" \
         2>&1 | tee -a "$RESULTS_ROOT/benchmark.log"

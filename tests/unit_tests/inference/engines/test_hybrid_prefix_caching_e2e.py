@@ -31,6 +31,7 @@ registration, skip counts) and output correctness (generated
 tokens match between pc=off and pc=on).
 """
 
+import math
 import os
 import random
 import types
@@ -40,6 +41,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
+    AsyncScheduleMode,
     InferenceConfig,
     MambaInferenceStateConfig,
     PrefixCachingEvictionPolicy,
@@ -54,13 +56,21 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    _CudagraphGlobalRecord,
+    delete_cuda_graphs,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
+from tests.unit_tests.inference.engines.ssm_test_helpers import (
+    hybrid_mixer_kwargs,
+    hybrid_stack_spec_for,
+    skip_if_sequence_packing_not_available,
+    ssm_state_config,
+)
 from tests.unit_tests.test_utilities import Utils
 
 BLOCK_SIZE = 256
@@ -75,10 +85,24 @@ NUM_GROUPS = 4
 GROUP_TOKEN_STRIDE = 2000
 
 
-def skip_if_mamba_sequence_packing_not_available():
-    sequence_packing_available, reason = _check_mamba_sequence_packing_support()
-    if not sequence_packing_available:
-        pytest.skip(reason)
+def buffer_gb_for_kv_blocks(context, num_blocks):
+    """Buffer size that yields exactly `num_blocks` KV blocks for this context.
+
+    Without a `mamba_memory_ratio` the context sizes its block pool as
+    `buffer_bytes // (block_size_bytes + mamba_states_memory_per_request)`, so
+    the block count depends on how large a mixer's recurrent state is. A budget
+    tuned against Mamba2 gives a GDP model, whose state is several times
+    smaller, a correspondingly larger pool. Tests whose scenario depends on an
+    exact pool size therefore have to ask for blocks, not bytes.
+
+    The returned size lands mid-band so floor division cannot tip either way.
+    """
+    mamba_bytes_per_request = (
+        math.prod(context.mamba_conv_states_shape) * context.mamba_conv_states_dtype.itemsize
+        + math.prod(context.mamba_ssm_states_shape) * context.mamba_ssm_states_dtype.itemsize
+    ) * context.num_mamba_layers
+    bytes_per_block = context.block_size_bytes + mamba_bytes_per_request
+    return (bytes_per_block * num_blocks + bytes_per_block // 2) / 1024**3
 
 
 def set_rounder(value):
@@ -113,14 +137,33 @@ class TestMambaPrefixCachingE2E:
 
     @classmethod
     def teardown_class(cls):
+        delete_cuda_graphs()
         Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        # Free captured CUDA graphs and their private mempools between tests;
+        # otherwise graph memory accumulates across a --count/whole-file run and OOMs.
+        delete_cuda_graphs()
+
+    @pytest.fixture(params=["mamba", "gdp"], autouse=True)
+    def ssm_mixer(self, request):
+        """Run every test in this class against both SSM mixers.
+
+        Prefix caching itself is mixer-agnostic -- the durable cache stores and
+        restores whole per-layer state slabs -- but the mid-sequence snapshot it
+        depends on is not: each mixer has to hand back the state at a token
+        offset from its own chunk scan. That is the part these tests cover twice.
+        """
+        skip_if_sequence_packing_not_available(request.param)
+        self._ssm_mixer = request.param
+        return request.param
 
     def _create_model(self, num_cuda_graphs=None):
         transformer_config = TransformerConfig(
             params_dtype=torch.bfloat16,
             num_layers=3,
             hidden_size=256,
-            mamba_num_heads=16,
+            **hybrid_mixer_kwargs(self._ssm_mixer),
             num_attention_heads=16,
             use_cpu_initialization=True,
             cuda_graph_impl="local" if num_cuda_graphs else "none",
@@ -133,7 +176,7 @@ class TestMambaPrefixCachingE2E:
         )
         model = HybridModel(
             config=transformer_config,
-            hybrid_stack_spec=hybrid_stack_spec,
+            hybrid_stack_spec=hybrid_stack_spec_for(self._ssm_mixer),
             vocab_size=VOCAB_SIZE,
             max_sequence_length=MAX_SEQ_LEN,
             parallel_output=True,
@@ -192,6 +235,10 @@ class TestMambaPrefixCachingE2E:
         prefix_caching_mamba_gb=2.0,
         request_rounder=4,
         num_cuda_graphs=None,
+        enable_chunked_prefill=False,
+        max_tokens=None,
+        max_requests=None,
+        async_sched_mode=AsyncScheduleMode.LEGACY,
     ):
         set_rounder(request_rounder)
         inference_config_kwargs = dict(
@@ -199,12 +246,18 @@ class TestMambaPrefixCachingE2E:
             buffer_size_gb=buffer_size_gb,
             block_size_tokens=BLOCK_SIZE,
             mamba_inference_state_config=mamba_config,
-            materialize_only_last_token_logits=False,
+            materialize_only_last_token_logits=async_sched_mode == AsyncScheduleMode.ASYNC,
             enable_prefix_caching=enable_prefix_caching,
+            enable_chunked_prefill=enable_chunked_prefill,
             unified_memory_level=0,
             num_cuda_graphs=num_cuda_graphs,
             sampling_backend='torch',
+            async_sched_mode=async_sched_mode,
         )
+        if max_tokens is not None:
+            inference_config_kwargs["max_tokens"] = max_tokens
+        if max_requests is not None:
+            inference_config_kwargs["max_requests"] = max_requests
         if enable_prefix_caching:
             inference_config_kwargs.update(
                 prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
@@ -416,9 +469,8 @@ class TestMambaPrefixCachingE2E:
     @torch.inference_mode()
     def test_mamba_prefix_caching_e2e(self):
         """Verify output tokens match between pc=off and pc=on."""
-        skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        mamba_config = ssm_state_config(model)
         prompts = self._create_prompts()
 
         off_outputs, off_prefill = self._run_simple(model, mamba_config, prompts, False)
@@ -430,12 +482,46 @@ class TestMambaPrefixCachingE2E:
             ), f"req {req_id}: pc=off {off_outputs[req_id]} != pc=on {on_outputs[req_id]}"
         assert off_prefill == 3800 and on_prefill == 2008 and on_prefill < off_prefill
 
+    @torch.inference_mode()
+    def test_async_sched_mamba_prefix_caching_with_chunked_prefill_e2e(self):
+        """Async combined chunking and Mamba prefix caching matches legacy output."""
+        model = self._create_model()
+        mamba_config = ssm_state_config(model)
+        prompts = self._create_prompts()[:3]
+
+        legacy_outputs, legacy_prefill = self._run_simple(
+            model, mamba_config, prompts, enable_pc=False
+        )
+        async_outputs, async_prefill = self._run_simple(
+            model,
+            mamba_config,
+            prompts,
+            enable_pc=True,
+            enable_chunked_prefill=True,
+            max_tokens=400,
+            max_requests=4,
+            async_sched_mode=AsyncScheduleMode.ASYNC,
+        )
+
+        assert async_outputs == legacy_outputs
+        assert async_prefill < legacy_prefill
+
+    # Comparing 20 requests against 5 is a batch-composition change, so this
+    # needs batch invariant mode, which is not implemented for GDP.
+    # TODO(ksanthanam): add GDP coverage once GDP supports batch invariant mode.
+    @pytest.mark.parametrize("ssm_mixer", ["mamba"], indirect=True)
     @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
     @torch.inference_mode()
     def test_mamba_prefix_caching_multi_group_e2e(self, num_cuda_graphs):
         """Verify multi-group prefix caching with 4 independent groups."""
-        skip_if_mamba_sequence_packing_not_available()
         model = self._create_model(num_cuda_graphs=num_cuda_graphs)
+        # This test only compares pc=on runs against each other (multi-group vs
+        # per-group), so the state round-trip precision cancels -- unlike the
+        # pc=off vs pc=on tests that need ssm_state_config's FP32. Use the model
+        # dtype, as this test did before GDP prefix caching landed. FP32 here
+        # buys nothing and instead shifts the generated tokens into a region
+        # where the unavoidable bf16 batch-composition noise (20 vs 5 requests,
+        # no batch_invariant_mode) crosses the token-equality margin.
         mamba_config = MambaInferenceStateConfig.from_model(model)
         all_prompts = [self._create_prompts(g * GROUP_TOKEN_STRIDE) for g in range(NUM_GROUPS)]
 
@@ -544,9 +630,8 @@ class TestMambaPrefixCachingE2E:
     @torch.inference_mode()
     def test_mamba_block_aligned_eos_e2e(self):
         """Verify block-aligned EOS caching and recompute-based back-off."""
-        skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        mamba_config = ssm_state_config(model)
         prompts = self._create_block_aligned_prompts()
 
         off_outputs, off_prefill = self._run_simple(model, mamba_config, prompts, False)
@@ -569,23 +654,30 @@ class TestMambaPrefixCachingE2E:
     @torch.inference_mode()
     def test_mamba_lru_eviction_e2e(self):
         """Verify KV eviction invalidates mamba state via invalidate_mamba_state_for_block."""
-        skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
+        # Deliberately on the model dtype: this test asserts eviction behaviour,
+        # not token equality, and an FP32 state would shrink the pool it is tuned to.
         mamba_config = MambaInferenceStateConfig.from_model(model)
         prompts = self._create_eviction_prompts()
 
+        # The scenario below is written against a 3-block pool: E takes two
+        # blocks, leaving exactly one, so F has to evict E's cached block. Ask
+        # for that pool size rather than hardcoding a byte budget, which would
+        # buy a different number of blocks for every mixer.
+        engine_kwargs = dict(
+            enable_prefix_caching=True, prefix_caching_mamba_gb=0.05, request_rounder=1
+        )
+        probe = self._build_engine(model, mamba_config, buffer_size_gb=0.002, **engine_kwargs)
+        buffer_size_gb = buffer_gb_for_kv_blocks(probe.context, 3)
+        del probe
+
         engine = self._build_engine(
-            model,
-            mamba_config,
-            enable_prefix_caching=True,
-            buffer_size_gb=0.002,
-            prefix_caching_mamba_gb=0.05,
-            request_rounder=1,
+            model, mamba_config, buffer_size_gb=buffer_size_gb, **engine_kwargs
         )
         alloc = engine.context.kv_block_allocator
         ctx = engine.context
 
-        assert alloc.total_count == 3, f"expected 3 total blocks, got {alloc.total_count}"
+        assert alloc.pool_size == 3, f"expected 3 total blocks, got {alloc.pool_size}"
         assert ctx.max_requests >= 1
 
         finished = {}
@@ -608,7 +700,7 @@ class TestMambaPrefixCachingE2E:
         assert (
             h_E0 in ctx.mamba_slot_allocator.hash_to_block_id and h_E0 in alloc.kv_hash_to_block_id
         )
-        assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1 and alloc.total_avail == 1
+        assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1 and alloc.pool_avail == 1
 
         # F: disjoint prefix, forces eviction of E's cached block
         req_F = _run_one(1, prompts[1])
@@ -624,3 +716,74 @@ class TestMambaPrefixCachingE2E:
         assert req_G._mamba_num_matched_blocks == 0
         assert h_E0 in ctx.mamba_slot_allocator.hash_to_block_id
         assert finished[0] == finished[2]
+
+    @torch.inference_mode()
+    def test_mamba_chunked_prefill_unaligned_boundary_snapshot(self):
+        """Chunked prefill snapshots Mamba state at the last block boundary.
+
+        ``compute_and_store_offsets`` records a Mamba state snapshot at a KV-block
+        boundary only when that boundary is a whole multiple of the SSM chunk size
+        measured from the start of the current prefill chunk. Because the chunk
+        start equals ``finished_chunk_token_count`` on continuation chunks, this
+        holds exactly when every chunk boundary is block-aligned.
+
+        Here ``max_tokens`` (300) is intentionally not a multiple of the block size
+        (256), so the request spans several chunks and its last full-block boundary
+        (token 768) lands in a continuation chunk. The scheduler keeps each chunk
+        boundary block-aligned, so the final chunk begins at token 512 and the
+        token-768 snapshot is extracted and committed. A second request sharing the
+        768-token prefix then restores that state and skips those blocks.
+        """
+        model = self._create_model()
+        mamba_config = ssm_state_config(model)
+
+        device = torch.cuda.current_device()
+        # 800-token prompt -> 3 full blocks (256/512/768) + a 32-token tail.
+        # The last full-block boundary (768) falls in the final continuation chunk.
+        prompt = torch.arange(9000, 9800, dtype=torch.int64, device=device)
+        assert len(prompt) == 800
+
+        engine = self._build_engine(
+            model,
+            mamba_config,
+            enable_prefix_caching=True,
+            enable_chunked_prefill=True,
+            max_tokens=300,  # not a multiple of BLOCK_SIZE (256) -> forces unaligned cuts
+            max_requests=4,
+            request_rounder=4,
+        )
+        ctx = engine.context
+        # Sanity: the prompt genuinely spans multiple prefill chunks.
+        assert ctx.max_tokens < len(prompt)
+
+        # --- Seed request: fills the cache, no prior matches. ---
+        seed = self._make_request(0, prompt, enable_pc=True, num_tokens=4)
+        engine._add_request(seed)
+        while engine.has_unfinished_requests():
+            engine.step_modern()
+        # Seed has no prior cache, so no Mamba blocks are matched during its prefill.
+        assert seed._mamba_num_matched_blocks == 0
+
+        # block index 2 == the boundary at token 768 (768 // 256 - 1). The final
+        # chunk begins block-aligned at token 512, so (768 - 512) % 128 == 0 and
+        # the state at this boundary is extracted and committed.
+        assert len(seed.precomputed_block_hashes) == 3
+        last_block_hash = seed.precomputed_block_hashes[2]
+        assert (
+            last_block_hash in ctx.mamba_slot_allocator.hash_to_block_id
+        ), "Mamba snapshot at the last block boundary (token 768) was not recorded."
+
+        # --- Reuse request: shares the full 768-token prefix, should restore the
+        # cached Mamba state and skip those blocks entirely. ---
+        reuse_prompt = torch.cat(
+            [prompt[:768], torch.arange(9800, 9900, dtype=torch.int64, device=device)]
+        )
+        reuse = self._make_request(1, reuse_prompt, enable_pc=True, num_tokens=4)
+        engine._add_request(reuse)
+        while engine.has_unfinished_requests():
+            engine.step_modern()
+
+        assert reuse._mamba_num_matched_blocks == 3, (
+            "Reuse request should restore Mamba state from the token-768 snapshot "
+            f"(3 matched blocks), got {reuse._mamba_num_matched_blocks}."
+        )

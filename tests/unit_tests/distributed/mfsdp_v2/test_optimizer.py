@@ -6,12 +6,14 @@ import pytest
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard
 from transformer_engine.pytorch.optimizers import FusedAdam
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    Flat,
     Placements,
     fully_shard,
+    fully_shard_context,
+    fully_shard_optimizer,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
@@ -31,7 +33,7 @@ class TinyModel(nn.Module):
 
 
 def _flat_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+    return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
 def test_adam_without_adapter_raises_precision_error(distributed_setup):
@@ -41,8 +43,9 @@ def test_adam_without_adapter_raises_precision_error(distributed_setup):
     mesh = init_device_mesh(device.type, (world_size,))
     torch.manual_seed(2026)
     model = TinyModel().to(device=device, dtype=torch.bfloat16)
-    fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
-    fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(device=device):
+        fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
+        fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
     x = torch.randn(6, 8, device=device, dtype=torch.bfloat16)
@@ -54,8 +57,8 @@ def test_adam_without_adapter_raises_precision_error(distributed_setup):
         optimizer.step()
 
 
-def test_fused_adam_without_adapter_accepts_mismatched_grads(distributed_setup):
-    """TE FusedAdam should handle mixed-precision FSDP grads without the adapter."""
+def test_fused_adam_adapter_accepts_mismatched_grads(distributed_setup):
+    """TE FusedAdam should handle mixed-precision FSDP grads through the adapter."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
 
@@ -67,19 +70,21 @@ def test_fused_adam_without_adapter_accepts_mismatched_grads(distributed_setup):
     mixed_precision_policy = MixedPrecisionPolicy(
         main_params_dtype=torch.float32, main_grads_dtype=torch.bfloat16
     )
-    fully_shard(
-        model.fc1,
-        mesh=mesh,
-        placements=_flat_placements(),
-        mixed_precision_policy=mixed_precision_policy,
-    )
-    fully_shard(
-        model.fc2,
-        mesh=mesh,
-        placements=_flat_placements(),
-        mixed_precision_policy=mixed_precision_policy,
-    )
+    with fully_shard_context(device=device):
+        fully_shard(
+            model.fc1,
+            mesh=mesh,
+            placements=_flat_placements(),
+            mixed_precision_policy=mixed_precision_policy,
+        )
+        fully_shard(
+            model.fc2,
+            mesh=mesh,
+            placements=_flat_placements(),
+            mixed_precision_policy=mixed_precision_policy,
+        )
     optimizer = FusedAdam(model.parameters(), lr=0.01)
+    fully_shard_optimizer(optimizer, precision_aware=True)
 
     x = torch.randn(6, 8, device=device, dtype=torch.bfloat16)
     optimizer.zero_grad(set_to_none=True)

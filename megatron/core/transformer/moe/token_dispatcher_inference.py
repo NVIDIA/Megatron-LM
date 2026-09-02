@@ -32,13 +32,16 @@ from megatron.core.inference.communication.torch_symm_triton import (
     multimem_all_gatherv_3tensor,
     multimem_reduce_scatter_v,
 )
-from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.moe import InferenceGroupedGemmBackend, batch_invariant
 from megatron.core.inference.moe.metadata import fused_metadata_update
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
+)
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    get_batch_invariant_collective,
 )
 from megatron.core.transformer.moe.inference_routing_mask_kernel import mask_routing_padding
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
@@ -617,9 +620,13 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     def token_combine(self, hidden_states):
         """ReduceScatter-V: sum expert outputs across EP ranks, scatter to local tokens.
 
+        In batch-invariant mode, the symmetric RSV buffer is still used for data
+        visibility, but the rank reduction is an explicit fp32 rank-order loop
+        rather than a hardware multimem reduction.
+
         Args:
-            hidden_states: [global_max, hidden_size] expert outputs (fp32 when
-                written directly to the RSV buffer, bf16 otherwise).
+            hidden_states: [global_max, hidden_size] expert outputs (fp32
+                when written directly to the RSV buffer, bf16 otherwise).
 
         Returns:
             [local_tokens, hidden_size] bf16 local token outputs.
@@ -637,7 +644,16 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             dtype=rsv["tensor"].dtype,
             device=hidden_states.device,
         )
-        multimem_reduce_scatter_v(
+        use_ordered = batch_invariant.enabled() and get_batch_invariant_collective() == "ordered"
+        # Under batch-invariant mode the "multimem" option keeps the native
+        # NVLS in-switch reduce: measured correctly-rounded (exact fp32 sum,
+        # bitwise-equal to an fp64 reference), deterministic and
+        # batch-invariant; "ordered" (default) uses the explicit fixed
+        # rank-order fp32 kernel, deterministic by construction anywhere.
+        reduce_scatter_v = (
+            batch_invariant.ordered_reduce_scatter_v if use_ordered else multimem_reduce_scatter_v
+        )
+        reduce_scatter_v(
             output,
             rsv["tensor"],
             rsv["handle"],

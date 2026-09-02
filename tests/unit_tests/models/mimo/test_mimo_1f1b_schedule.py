@@ -7,7 +7,6 @@ Run with:
 """
 
 import logging
-from contextlib import ExitStack, contextmanager
 from functools import partial
 from types import SimpleNamespace
 
@@ -18,6 +17,7 @@ from packaging import version
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from examples.mimo.training.grad_sync import configure_grad_sync
+from examples.mimo.training.runtime import wrap_active_modules_with_ddp
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -28,6 +28,7 @@ from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.pipeline_parallel.bridge_communicator import BridgeCommunicator
 from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
@@ -59,27 +60,6 @@ logger = logging.getLogger(__name__)
 
 _active_grids: list = []
 _embedding_pg_cache: dict = {}
-
-
-def build_no_sync_func(mimo_model):
-    """Build a no_sync_func that stacks DDP no_sync over each sub-module.
-
-    Shared by 1F1B pipeline tests and colocated-correctness tests — both need
-    DDP's gradient sync disabled during microbatches and resumed via the
-    schedule's finalize_grads_func.
-    """
-
-    @contextmanager
-    def no_sync_func():
-        with ExitStack() as stack:
-            if mimo_model.language_model is not None:
-                stack.enter_context(mimo_model.language_model.no_sync())
-            for submodule in mimo_model.modality_submodules.values():
-                if submodule is not None:
-                    stack.enter_context(submodule.no_sync())
-            yield
-
-    return no_sync_func
 
 
 def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
@@ -137,6 +117,9 @@ def get_pg_collection(grid):
     pg_collection.dp = grid.get_pg("dp")
     pg_collection.dp_cp = grid.get_pg(["dp", "cp"])
     pg_collection.expt_dp = grid.get_pg("expt_dp", view="expert")
+    pg_collection.expt_tp = pg_collection.tp
+    pg_collection.gtp_remat = None
+    pg_collection.expt_gtp_remat = None
     # Expert groups from the expert view (dense here, so tp_ep_pp resolves to tp x pp).
     pg_collection.mp = grid.get_pg(["tp", "pp"])
     pg_collection.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view="expert")
@@ -148,29 +131,28 @@ def create_all_embedding_groups(grids):
     """Create embedding PGs for all grids upfront.
 
     dist.new_group is a collective — ALL ranks must call it, even non-members.
-    We create all embedding groups in a consistent order across all ranks to
-    avoid hangs from asymmetric new_group calls.
+    Enumerate every PP subgroup from each grid so all ranks create the same
+    deduplicated sequence of embedding groups. Looking only at ``grid.get_pg("pp")``
+    would expose the caller's local subgroup and make different ranks issue
+    different ``new_group`` calls.
 
     Args:
         grids: List of all HyperCommGrids that need embedding groups.
     """
     for grid in grids:
-        pp_group = grid.get_pg("pp")
-        if not pp_group:
-            continue
+        for pp_ranks in grid.get_rank_enum("pp"):
+            pp_ranks = sorted(pp_ranks)
+            cache_key = tuple(pp_ranks)
 
-        pp_ranks = sorted(dist.get_process_group_ranks(pp_group))
-        cache_key = tuple(pp_ranks)
-
-        if cache_key not in _embedding_pg_cache:
-            pos_embd_ranks = [pp_ranks[0]]
-            embd_ranks = [pp_ranks[0]]
-            if pp_ranks[-1] != pp_ranks[0]:
-                embd_ranks.append(pp_ranks[-1])
-            _embedding_pg_cache[cache_key] = (
-                dist.new_group(ranks=pos_embd_ranks),
-                dist.new_group(ranks=embd_ranks),
-            )
+            if cache_key not in _embedding_pg_cache:
+                pos_embd_ranks = [pp_ranks[0]]
+                embd_ranks = [pp_ranks[0]]
+                if pp_ranks[-1] != pp_ranks[0]:
+                    embd_ranks.append(pp_ranks[-1])
+                _embedding_pg_cache[cache_key] = (
+                    dist.new_group(ranks=pos_embd_ranks),
+                    dist.new_group(ranks=embd_ranks),
+                )
 
 
 def add_embedding_groups(pg_collection, is_language_model=False):
@@ -246,6 +228,7 @@ def get_language_model_spec(
     pp_rank = dist.get_rank(pg_collection.pp)
     pp_size = dist.get_world_size(pg_collection.pp)
     tp_size = pg_collection.tp.size() if pg_collection.tp is not None else 1
+    cp_size = pg_collection.cp.size() if pg_collection.cp is not None else 1
 
     pipeline_dtype = torch.bfloat16 if bf16 else torch.float32
     extra_kwargs = {}
@@ -269,6 +252,7 @@ def get_language_model_spec(
         cross_entropy_loss_fusion=True,
         cross_entropy_fusion_impl='native',
         calculate_per_token_loss=per_token_loss,
+        context_parallel_size=cp_size,
         **extra_kwargs,
     )
     return ModuleSpec(
@@ -397,6 +381,7 @@ def get_mimo_model(
     bias=True,
     dropout=True,
     per_token_loss=False,
+    use_layer_wise_distributed_optimizer=False,
 ):
     """Create MIMO model with TransformerBlock encoder and GPTModel LLM.
 
@@ -416,6 +401,8 @@ def get_mimo_model(
             divides grads by the correct global divisor on both sides;
             hetero-DP callers use this to land ``1/B_full`` on both encoder
             and LLM without relying on the per-DDP built-in scaling.
+        use_layer_wise_distributed_optimizer: Whether to wrap active modules through the
+            production MIMO LayerWise parameter-layout path.
     """
     language_pg = get_pg_collection_with_embedding_groups(llm_grid, is_language_model=True)
     vision_pg = get_pg_collection_with_embedding_groups(encoder_grid, is_language_model=False)
@@ -454,7 +441,7 @@ def get_mimo_model(
         module_to_grid_map=module_to_grid_map,
     )
 
-    mimo_model = MimoModel(mimo_config)
+    mimo_model = MimoModel(mimo_config, cp_group=language_pg.cp, tp_group=language_pg.tp)
     mimo_model.to(torch.device("cuda"))
     if bf16:
         mimo_model.to(torch.bfloat16)
@@ -462,27 +449,47 @@ def get_mimo_model(
     # Wrap with DDP (caller may override e.g. for heterogeneous-DP scaling).
     if ddp_config is None:
         ddp_config = DistributedDataParallelConfig(
-            overlap_grad_reduce=True, bucket_size=10000, use_distributed_optimizer=True
+            overlap_grad_reduce=True,
+            overlap_param_gather=use_layer_wise_distributed_optimizer,
+            bucket_size=10000,
+            use_distributed_optimizer=True,
         )
 
-    if mimo_model.language_model is not None:
-        mimo_model.language_model = DistributedDataParallel(
-            config=mimo_model.language_model.config,
-            ddp_config=ddp_config,
-            module=mimo_model.language_model,
-            pg_collection=language_pg,
+    if use_layer_wise_distributed_optimizer:
+        wrap_active_modules_with_ddp(
+            SimpleNamespace(
+                mimo_encoder_ddp_overlap=False,
+                freeze_lm=False,
+                freeze_vit=False,
+                freeze_projection=False,
+            ),
+            mimo_model,
+            SimpleNamespace(
+                module_pgs={MIMO_LANGUAGE_MODULE_KEY: language_pg, encoder_name: vision_pg}
+            ),
+            ddp_config,
+            use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_param_layout=True,
         )
-
-    if encoder_name in mimo_model.modality_submodules:
-        submodule = mimo_model.modality_submodules[encoder_name]
-        if submodule is not None:
-            submodule = DistributedDataParallel(
-                config=submodule.encoders['clip_encoder'].config,
+    else:
+        if mimo_model.language_model is not None:
+            mimo_model.language_model = DistributedDataParallel(
+                config=mimo_model.language_model.config,
                 ddp_config=ddp_config,
-                module=submodule,
-                pg_collection=vision_pg,
+                module=mimo_model.language_model,
+                pg_collection=language_pg,
             )
-            mimo_model.modality_submodules[encoder_name] = submodule
+
+        if encoder_name in mimo_model.modality_submodules:
+            submodule = mimo_model.modality_submodules[encoder_name]
+            if submodule is not None:
+                submodule = DistributedDataParallel(
+                    config=submodule.encoders['clip_encoder'].config,
+                    ddp_config=ddp_config,
+                    module=submodule,
+                    pg_collection=vision_pg,
+                )
+                mimo_model.modality_submodules[encoder_name] = submodule
 
     return mimo_model, module_to_grid_map, topology, language_pg, vision_pg
 
@@ -547,6 +554,13 @@ class DataIterator:
         )
         loss_mask[input_ids == self.image_token_id] = 0.0
 
+        flat_input_ids = input_ids.reshape(-1)
+        image_mask = flat_input_ids == self.image_token_id
+        modality_token_indices = {
+            self.encoder_name: image_mask.nonzero(as_tuple=False).flatten(),
+            "text": (~image_mask).nonzero(as_tuple=False).flatten(),
+        }
+
         return {
             "input_ids": input_ids,
             "labels": labels,
@@ -560,6 +574,7 @@ class DataIterator:
                     "clip_encoder": {'hidden_states': encoder_hidden_states, 'attention_mask': None}
                 }
             },
+            "modality_token_indices": modality_token_indices,
         }
 
 
@@ -577,18 +592,21 @@ def run_mimo_1f1b_test(
     llm_pp,
     llm_dp,
     llm_offset,
+    llm_cp=1,
     hidden_size=256,
     num_layers=2,
     vocab_size=1000,
     seq_length=64,
     micro_batch_size=2,
     num_microbatches=4,
+    use_layer_wise_distributed_optimizer=False,
 ):
     """Run MIMO model through 1F1B schedule and verify.
 
     Uses the production examples/mimo configure_grad_sync (calculate_per_token_loss=True)
     as the grad-finalization hook, exercising its cross-grid token sourcing + N_global
-    broadcast on this non-colocated topology.
+    broadcast on this non-colocated topology. The LayerWise variant also uses the production
+    MIMO DDP wrapper and performs a real Muon optimizer step with the default parameter layout.
     """
     # Clear NVTE env vars that the conftest set_env fixture sets to '0'.
     # GPTModel (LanguageModule) asserts these are unset or match the attention backend.
@@ -603,7 +621,7 @@ def run_mimo_1f1b_test(
     encoder_grid = create_hypercomm_grid(
         offset=encoder_offset, tp=encoder_tp, cp=1, pp=encoder_pp, dp=encoder_dp
     )
-    llm_grid = create_hypercomm_grid(offset=llm_offset, tp=llm_tp, cp=1, pp=llm_pp, dp=llm_dp)
+    llm_grid = create_hypercomm_grid(offset=llm_offset, tp=llm_tp, cp=llm_cp, pp=llm_pp, dp=llm_dp)
 
     # Create all embedding PGs upfront — dist.new_group is a collective that
     # requires ALL ranks to participate, so we must create them before any
@@ -621,9 +639,8 @@ def run_mimo_1f1b_test(
         vocab_size=vocab_size,
         seq_len=seq_length,
         per_token_loss=True,
+        use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
     )
-
-    mimo_model.config.no_sync_func = build_no_sync_func(mimo_model)
 
     # Use the production grad-sync hook (finalize per module over its own groups +
     # cross-grid N_global per-token mean) for every config.
@@ -634,18 +651,30 @@ def run_mimo_1f1b_test(
             **{name: vision_pg for name in mimo_model.modality_submodules},
         },
     )
-    configure_grad_sync(SimpleNamespace(), mimo_model, grad_sync_topology)
+    configure_grad_sync(
+        SimpleNamespace(overlap_grad_reduce=True, align_grad_reduce=False),
+        mimo_model,
+        grad_sync_topology,
+    )
 
     # Create optimizer
     opt_config = OptimizerConfig(
-        optimizer='adam',
+        optimizer='muon' if use_layer_wise_distributed_optimizer else 'adam',
         lr=1e-4,
         weight_decay=0.01,
         clip_grad=1.0,
         bf16=True,
-        use_distributed_optimizer=True,
+        use_distributed_optimizer=not use_layer_wise_distributed_optimizer,
+        use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
     )
     optimizer = get_mimo_optimizer(mimo_model, opt_config)
+    assert (
+        any(
+            isinstance(inner_optimizer, LayerWiseDistributedOptimizer)
+            for inner_optimizer in optimizer.chained_optimizers
+        )
+        == use_layer_wise_distributed_optimizer
+    )
 
     communicator = MultiModulePipelineCommunicator(
         module_to_grid_map,
@@ -749,12 +778,17 @@ def run_mimo_1f1b_test(
         assert (
             grad_norm is not None and grad_norm > 0
         ), f"Expected positive grad norm, got {grad_norm}"
+        assert torch.isfinite(
+            torch.as_tensor(grad_norm)
+        ).all(), f"Expected finite grad norm, got {grad_norm}"
 
         # Verify results on last LLM stage
         if is_rank_in_grid(llm_grid) and is_pp_last_stage(llm_grid.get_pg("pp")):
             assert len(losses) > 0, "Expected losses on last LLM stage"
             for loss_dict in losses:
                 assert 'loss_reduced' in loss_dict
+                loss = torch.as_tensor(loss_dict['loss_reduced'])
+                assert torch.isfinite(loss).all(), f"Expected finite loss, got {loss}"
 
         return losses
     finally:
@@ -873,11 +907,15 @@ class TestMimo1F1BSchedule:
             num_microbatches=4,
         )
 
-    def test_fan_in_dp4_to_dp1_llm_tp2_pp2_8gpu(self):
-        """Fan-in 4→1: Encoder DP=4 → LLM TP=2 PP=2 DP=1, on 8 GPUs.
+    @pytest.mark.parametrize(
+        "llm_tp,llm_cp,hidden_size", [(2, 1, 256), (1, 2, 128)], ids=["tp2-cp1", "tp1-cp2"]
+    )
+    def test_fan_in_dp4_to_dp1_llm_pp2_8gpu(self, llm_tp, llm_cp, hidden_size):
+        """Fan-in 4→1: Encoder DP=4 → LLM PP=2 DP=1 with TP or CP.
 
         High fan-in ratio. Each encoder rank processes MBS=1, bridge concatenates
-        4 × [img_seq, H] → [4*img_seq, H]. LLM has both TP and PP.
+        4 × [img_seq, H] → [4*img_seq, H]. The CP2 case exercises destination
+        CP gradient reconstruction in steady-state and cooldown backward paths.
         """
         if self.world_size != 8:
             pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
@@ -887,11 +925,12 @@ class TestMimo1F1BSchedule:
             encoder_pp=1,
             encoder_dp=4,
             encoder_offset=0,
-            llm_tp=2,
+            llm_tp=llm_tp,
+            llm_cp=llm_cp,
             llm_pp=2,
             llm_dp=1,
             llm_offset=4,
-            hidden_size=256,
+            hidden_size=hidden_size,
             num_layers=2,
             vocab_size=1000,
             seq_length=64,
@@ -925,11 +964,13 @@ class TestMimo1F1BSchedule:
             num_microbatches=4,
         )
 
-    def test_fan_in_dp2_to_dp1_llm_pp3_8gpu(self):
+    @pytest.mark.parametrize("use_layer_wise_distributed_optimizer", [False, True])
+    def test_fan_in_dp2_to_dp1_llm_pp3_8gpu(self, use_layer_wise_distributed_optimizer):
         """Fan-in 2→1: Encoder DP=2 → LLM TP=2 PP=3, on 8 GPUs.
 
         Tests fan-in with deep LLM pipeline (PP=3). The 2D tensor goes through
-        bridge fan-in then P2P across 3 LLM PP stages.
+        bridge fan-in then P2P across 3 LLM PP stages. Runs both the standard
+        distributed optimizer and the LayerWise optimizer path.
         """
         if self.world_size != 8:
             pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
@@ -949,4 +990,5 @@ class TestMimo1F1BSchedule:
             seq_length=64,
             micro_batch_size=2,
             num_microbatches=4,
+            use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
         )

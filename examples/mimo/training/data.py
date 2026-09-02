@@ -227,7 +227,12 @@ def _build_mock_vlm_dataloader(
         num_image_tiles=num_image_tiles,
     )
     return DataLoader(
-        dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=_collate_mock_batch
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=_collate_mock_batch,
+        pin_memory=True,
     )
 
 
@@ -286,8 +291,14 @@ def build_train_valid_test_data_loaders(
         raise ValueError(f"unsupported dataset provider: {args.dataset_provider}")
 
     encoder_name = _encoder_name(topology)
-    if encoder_name is not None and (args.micro_batch_size * args.llm_dp) % args.encoder_dp:
-        raise ValueError("micro_batch_size * llm_dp must be divisible by encoder_dp")
+    llm_data_parallel_size = args.mimo_llm_dp * args.gtp_weight_remat_size
+    if (
+        encoder_name is not None
+        and (args.micro_batch_size * llm_data_parallel_size) % args.mimo_encoder_dp
+    ):
+        raise ValueError(
+            "micro_batch_size * mimo_llm_dp * GTP must be divisible by mimo_encoder_dp"
+        )
 
     language_grid = topology.grids[MIMO_LANGUAGE_MODULE_KEY]
     language_pgc = topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY]
@@ -307,7 +318,7 @@ def build_train_valid_test_data_loaders(
     if encoder_needs_data and language_needs_data:
         raise ValueError("the external DataLoader adapter requires non-colocated module grids")
     if encoder_needs_data:
-        encoder_mbs = args.micro_batch_size * args.llm_dp // args.encoder_dp
+        encoder_mbs = args.micro_batch_size * llm_data_parallel_size // args.mimo_encoder_dp
         return _build_split_loaders(
             args,
             batch_size=encoder_mbs,
@@ -335,7 +346,8 @@ def _build_split_loaders(
     encoder_name: Optional[str],
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build split-local datasets with deterministic module/DP/split seeds."""
-    base_seed = args.seed + module_seed_offset + get_pg_rank(pg_collection.dp)
+    data_group = pg_collection.dp_cp_gtp_remat or pg_collection.dp
+    base_seed = args.seed + module_seed_offset + get_pg_rank(data_group)
     common = _mock_loader_kwargs(args, encoder_name)
     return tuple(
         _build_mock_vlm_dataloader(
