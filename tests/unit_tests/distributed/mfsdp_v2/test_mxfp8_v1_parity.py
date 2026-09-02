@@ -164,6 +164,23 @@ class TestMegatronFSDPE2EMxfp8:
                 **case["model_config"],
                 **fsdp_args,
             )
+            if use_mfsdp_v2:
+                fp8_groups = [
+                    group
+                    for model_chunk in model
+                    for module in model_chunk.modules()
+                    for group in getattr(module, "_parameter_groups", [])
+                    if isinstance(group, Fp8ParameterGroup)
+                ]
+                assert fp8_groups
+                for group in fp8_groups:
+                    # Replicated payloads are transient and must not remain
+                    # allocated between construction and the first unshard.
+                    assert group._unsharded_rowwise.local_buffer.untyped_storage().nbytes() == 0
+                    assert group._unsharded_colwise.local_buffer.untyped_storage().nbytes() == 0
+                    for fsdp_parameter in group.fsdp_parameters:
+                        assert fsdp_parameter.unsharded._rowwise_data is None
+                        assert fsdp_parameter.unsharded._columnwise_data is None
             if initial_parameters is not None:
                 cls._load_parameters(model, initial_parameters)
                 for sub_optimizer in getattr(optimizer, "chained_optimizers", [optimizer]):

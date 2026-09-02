@@ -602,6 +602,12 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         # Compute weights must be initialized before the first forward;
         # subsequent refreshes happen from the optimizer's post-step hook.
         self.sync_model_weight_from_main_weight()
+        # The base constructor releases its replicated compute-weight buffer,
+        # but FP8 groups replace that buffer with separate row-wise and
+        # column-wise payload buffers. Keep only the sharded payloads at rest;
+        # otherwise every FP8 group retains both full gathers until its first
+        # reshard, inflating the construction peak and allocator cache.
+        self.release_unsharded_storage()
 
     def _init_compute_weight_storage(
         self,
