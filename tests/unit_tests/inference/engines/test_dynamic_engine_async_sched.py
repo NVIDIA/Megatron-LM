@@ -519,9 +519,7 @@ _ASYNC_PAIR_SCENARIOS = (
             "max_sequence_length": 544,
             "context_block_size_tokens": 256,
             "context_max_tokens": 384,
-            "inference_config_overrides": {
-                "prefix_caching_eviction_policy": PrefixCachingEvictionPolicy.LRU
-            },
+            "prefix_caching_eviction_policy": PrefixCachingEvictionPolicy.LRU,
         },
         request_profile="prefix",
         signals=("chunked", "prefix-hit"),
@@ -536,10 +534,8 @@ _ASYNC_PAIR_SCENARIOS = (
             "force_build_cuda_graphs": True,
             "use_cuda_graphs_for_non_decode_steps": False,
             "inference_cuda_graph_scope": InferenceCudaGraphScope.block,
-            "inference_config_overrides": {
-                "cuda_graph_sizing_distribution": CudaGraphSizingDistribution.EXPONENTIAL,
-                "cuda_graph_max_tokens": 16,
-            },
+            "cuda_graph_sizing_distribution": CudaGraphSizingDistribution.EXPONENTIAL,
+            "cuda_graph_max_tokens": 16,
         },
         signals=("cuda-graph", "graph-decode-config"),
     ),
@@ -550,10 +546,8 @@ _ASYNC_PAIR_SCENARIOS = (
         config={
             "num_cuda_graphs": 4,
             "force_build_cuda_graphs": True,
-            "inference_config_overrides": {
-                "cuda_graph_max_tokens": 16,
-                "cuda_graph_mixed_prefill_count": 2,
-            },
+            "cuda_graph_max_tokens": 16,
+            "cuda_graph_mixed_prefill_count": 2,
         },
         signals=("cuda-graph", "graph-bounded-config"),
     ),
@@ -568,11 +562,9 @@ _ASYNC_PAIR_SCENARIOS = (
             "force_build_cuda_graphs": True,
             "cuda_graph_all_prefills": True,
             "inference_cuda_graph_scope": InferenceCudaGraphScope.layer,
-            "inference_config_overrides": {
-                "cuda_graph_mixed_prefill_count": 2,
-                "cuda_graph_sizing_distribution": CudaGraphSizingDistribution.LINEAR,
-                "cuda_graph_max_tokens": 24,
-            },
+            "cuda_graph_mixed_prefill_count": 2,
+            "cuda_graph_sizing_distribution": CudaGraphSizingDistribution.LINEAR,
+            "cuda_graph_max_tokens": 24,
         },
         signals=("cuda-graph", "graph-mixed-config"),
     ),
@@ -776,7 +768,7 @@ _ASYNC_PARALLEL_SCENARIOS = (
             "tensor_model_parallel_size": 2,
             "sequence_parallel": True,
             "transformer_impl": "inference_optimized",
-            "inference_config_overrides": {"offset_sampling_seed_by_dp_rank": False},
+            "offset_sampling_seed_by_dp_rank": False,
         },
         sampling=({"temperature": 0.8, "top_k": 8},),
         signals=(
