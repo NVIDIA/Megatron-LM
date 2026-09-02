@@ -1554,7 +1554,6 @@ class TestGTPGraphWgradRing:
         torch.testing.assert_close(rs_input[:4], wgrad)
         assert torch.count_nonzero(rs_input[4:]) == 0
 
-
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA allocator test")
     def test_capture_does_not_borrow_eager_wgrad_pool(self, monkeypatch):
         monkeypatch.setattr(gtp_module, "_wgrad_buf_pool", {})
@@ -1568,6 +1567,71 @@ class TestGTPGraphWgradRing:
 
         assert capture_buffer.data_ptr() != eager_buffer.data_ptr()
         assert gtp_module._wgrad_buf_pool[((8,), torch.bfloat16)] == [eager_buffer]
+
+    def test_ungraphed_wgrad_pool_fences_cross_stream_reuse(self, monkeypatch):
+        class FakeBuffer:
+            shape = (8,)
+            dtype = torch.bfloat16
+            _from_gtp_wgrad_pool = True
+
+        class FakeEvent:
+            def __init__(self):
+                self.recorded_stream = None
+
+            def record(self, stream=None):
+                self.recorded_stream = stream
+
+        class FakeStream:
+            def __init__(self):
+                self.waited_events = []
+
+            def wait_event(self, event):
+                self.waited_events.append(event)
+
+        producer_stream = object()
+        consumer_stream = FakeStream()
+        event = FakeEvent()
+        buffer = FakeBuffer()
+        monkeypatch.setattr(gtp_module, "_wgrad_buf_pool", {})
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: consumer_stream)
+
+        event.record(producer_stream)
+        gtp_module._wgrad_pool_put(buffer, ready_event=event)
+        reused = gtp_module._wgrad_pool_get(buffer.shape, buffer.dtype, "cuda")
+
+        assert reused is buffer
+        assert event.recorded_stream is producer_stream
+        assert consumer_stream.waited_events == [event]
+
+        gtp_module._wgrad_pool_put(reused)
+        assert gtp_module._wgrad_pool_get(buffer.shape, buffer.dtype, "cuda") is buffer
+        assert consumer_stream.waited_events == [event]
+
+    def test_eager_recording_releases_scratch_on_rs_stream(self, monkeypatch):
+        class Scratch:
+            def __init__(self):
+                self.recorded_streams = []
+
+            def record_stream(self, stream):
+                self.recorded_streams.append(stream)
+
+        scratch = Scratch()
+        param = type(
+            "FakeGTPParam",
+            (),
+            {
+                "chain_id": GTPChain.GRAPHED.value,
+                "_wgrad_input_bufs": [scratch],
+                "_rs_a2a_bufs": None,
+            },
+        )()
+        stream = object()
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+        GTPShardedParam._release_wgrad_scratch(param, stream=stream)
+
+        assert scratch.recorded_streams == [stream]
+        assert param._wgrad_input_bufs is None
 
 
 class TestActivationRecomputePhaseFlag:

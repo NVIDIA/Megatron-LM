@@ -336,17 +336,21 @@ def _wgrad_pool_get(
     pool = _wgrad_buf_pool.get(key)
     if pool:
         buf = pool.pop()
+        reuse_event = getattr(buf, "_gtp_wgrad_reuse_event", None)
+        if reuse_event is not None:
+            torch.cuda.current_stream(device=device).wait_event(reuse_event)
     else:
         buf = torch.empty(shape, dtype=dtype, device=device, requires_grad=False)
     buf._from_gtp_wgrad_pool = True
     return buf
 
 
-def _wgrad_pool_put(buf: torch.Tensor):
+def _wgrad_pool_put(buf: torch.Tensor, ready_event=None):
     """Return a pool-owned buffer for reuse (no-op for untagged buffers; see
-    _wgrad_pool_get)."""
+    _wgrad_pool_get). The caller supplies a recorded event when reuse needs a stream fence."""
     if not getattr(buf, "_from_gtp_wgrad_pool", False):
         return
+    buf._gtp_wgrad_reuse_event = ready_event
     key = (tuple(buf.shape), buf.dtype)
     if key not in _wgrad_buf_pool:
         _wgrad_buf_pool[key] = []
@@ -1913,15 +1917,18 @@ class GTPShardedParam(torch.nn.Parameter):
                     for w in self._weights:
                         self._handle_megatron_grad_accum(w)
                     self._already_finalized = True
-        self._release_wgrad_scratch()
+        self._release_wgrad_scratch(stream=rs_stream, ready_event=self.rs_event)
         return waited
 
-    def _release_wgrad_scratch(self, attrs=("_wgrad_input_bufs", "_rs_a2a_bufs")):
+    def _release_wgrad_scratch(
+        self, attrs=("_wgrad_input_bufs", "_rs_a2a_bufs"), stream=None, ready_event=None
+    ):
         """Release the buffers a finished RS was reading.
 
         Its wgrad inputs, and the fp32-accum all-to-all scratch (input to the deferred FP32 sum,
-        so only free once the handle has been waited on). UNGRAPHED buffers go back to the pool;
-        GRAPHED just drops Python refs (addresses must stay stable for CG).
+        so only release once the handle has been waited on). Plain UNGRAPHED buffers return to the
+        manual pool, graph-pool buffers drop their Python references, and symmetric buffers return
+        to their registered pool. Reusable buffers carry the RS completion event to their next use.
         """
         for attr in attrs:
             bufs = getattr(self, attr, None)
@@ -1929,12 +1936,15 @@ class GTPShardedParam(torch.nn.Parameter):
                 continue
             if not _chain_is_graphed(self.chain_id):
                 for buf in bufs:
-                    _wgrad_pool_put(buf)
+                    _wgrad_pool_put(buf, ready_event=ready_event)
+            elif stream is not None and not torch.cuda.is_current_stream_capturing():
+                # The FP32 handle enqueues its local sum before returning. Keep eager-recording
+                # scratch alive until that sum has consumed it on the RS stream.
+                for buf in bufs:
+                    buf.record_stream(stream)
             for buf in bufs:
-                # Return symm pool buffers (tag-gated no-op for plain and ring buffers).
-                # Unconditional on chain kind: free() is captured, so replayed reuse keeps
-                # the eager wait edges, and replays serialize on the launch stream.
-                symmetric_wgrad_pool.free(buf)
+                # Return symmetric-pool buffers; this is a tag-gated no-op for other storage.
+                symmetric_wgrad_pool.free(buf, ready_event=ready_event)
             setattr(self, attr, None)
 
     def _record_graph_wgrad_ring_slots_ready(self) -> None:
@@ -2081,7 +2091,8 @@ class GTPShardedParam(torch.nn.Parameter):
                 # Only the a2a scratch is ours to release — the wgrad inputs belong to the
                 # caller on this path (recycled in wgrad_reduce_scatter).
                 handle.wait()
-                self._release_wgrad_scratch(("_rs_a2a_bufs",))
+                self.rs_event.record()
+                self._release_wgrad_scratch(("_rs_a2a_bufs",), ready_event=self.rs_event)
                 return outputs, None, release_bufs
 
             if len(wgrads) == 1:
@@ -2134,7 +2145,9 @@ class GTPShardedParam(torch.nn.Parameter):
                     if wgrad.data_ptr() != symm_slot.data_ptr():
                         symm_slot[: weight._unsharded_shape[0]].copy_(wgrad)
                         if not _chain_is_graphed(self.chain_id):
-                            _wgrad_pool_put(wgrad)
+                            copy_complete_event = torch.cuda.Event()
+                            copy_complete_event.record()
+                            _wgrad_pool_put(wgrad, ready_event=copy_complete_event)
 
                     send_bufs.append(symm_slot)
                     release_bufs.append(symm_slot)
@@ -2206,7 +2219,8 @@ class GTPShardedParam(torch.nn.Parameter):
             result = [self._handle_megatron_grad_accum(p) for p in weights]
             # The sync RS is complete: hand the inputs to the shared release path.
             self._wgrad_input_bufs = release_bufs
-            self._release_wgrad_scratch()
+            self.rs_event.record()
+            self._release_wgrad_scratch(ready_event=self.rs_event)
             ret = result if batched else result[0]
 
         # Wait for last reduce scatter if it was async
