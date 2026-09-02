@@ -49,7 +49,9 @@ def test_fp8_backward_scope_covers_schedule_and_wgrad(monkeypatch, fp8_recipe):
         backward_update_context,
     )
     monkeypatch.setattr(combined_1f1b, "get_fp8_context", lambda _config: nullcontext())
-    monkeypatch.setattr(torch.autograd, "backward", lambda *_args, **_kwargs: events.append("loss_backward"))
+    monkeypatch.setattr(
+        torch.autograd, "backward", lambda *_args, **_kwargs: events.append("loss_backward")
+    )
 
     config = SimpleNamespace(
         enable_autocast=False,
