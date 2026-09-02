@@ -181,6 +181,31 @@ class GroupedMLPSubmodules:
     """
 
 
+class _ReplicaFC2WgradStore:
+    """Start the FC2 replica gradient reduction the moment TE enqueues FC2's wgrad GEMM.
+
+    Installed as the FC2 GroupedLinear op's ``wgrad_store``. TE's delayed-wgrad protocol
+    hands the wgrad GEMM to ``put`` instead of launching it, from the basic op's backward
+    and from the fused grouped-MLP backward alike; this store runs the GEMM at once and
+    starts the reduction right behind it, so it hides under FC1's dgrad and wgrad GEMMs
+    instead of the dispatch-backward all-to-all. The queue stays empty, so TE's
+    ``backward_dw`` has nothing to run.
+    """
+
+    context = None
+
+    def __init__(self, bridge) -> None:
+        self._bridge = bridge
+
+    @staticmethod
+    def delay_wgrad_compute() -> bool:
+        return True
+
+    def put(self, tensors, wgrad_gemm) -> None:
+        wgrad_gemm(*tensors)
+        self._bridge.start_fc2_grad_reduce()
+
+
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
 
@@ -674,6 +699,7 @@ class TEGroupedMLP(MegatronModule):
 
         if replica_bridge is not None:
             register_replica_weights(op, replica_bridge.runtime_fc2_weights)
+            op.wgrad_store = _ReplicaFC2WgradStore(replica_bridge)
         else:
             register_grouped_linear_params(
                 op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias

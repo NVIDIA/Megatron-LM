@@ -674,7 +674,10 @@ class MoELayer(BaseMoELayer):
             shared_expert_output = None
             try:
                 if "route" in self.fwd_execution_map:
-                    layer_input = hidden_states
+                    # Backend hooks on the layer input run their backward only after
+                    # every consumer of the input (router, shared experts, latent
+                    # projection) has run its own.
+                    layer_input = self.token_dispatcher.wrap_layer_input(hidden_states)
                     probs, routing_map = self.route(layer_input, padding_mask)
                     hidden_states, probs = self.preprocess(layer_input, probs, routing_map)
                     # The shared experts follow preprocessing so that asynchronous
