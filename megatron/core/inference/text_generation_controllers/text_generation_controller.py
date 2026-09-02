@@ -2107,7 +2107,7 @@ class TextGenerationController:
             raise RuntimeError("Async scheduling overlap does not support paused requests.")
 
     def _compact_async_sched_logits(self, survivor_idxs: Tensor) -> None:
-        """Compact pending logits and sampling metadata into survivor order.
+        """Compact pending logits and all active-request metadata into survivor order.
 
         Args:
             survivor_idxs (Tensor): Active-row indices for requests that remain
@@ -2154,9 +2154,9 @@ class TextGenerationController:
         survivor_count = survivor_idxs.numel()
         survivor_idxs_cpu = survivor_idxs.to("cpu")
         survivor_idxs_cuda = survivor_idxs.to(gpu_view.temperature.device)
-        for label in ("temperature", "top_k", "top_p"):
-            compacted_metadata = context.active_request_metadata[label][survivor_idxs_cpu]
-            context.active_request_metadata[label][:survivor_count].copy_(compacted_metadata)
+        for metadata in context.active_request_metadata.values():
+            compacted_metadata = metadata[survivor_idxs_cpu]
+            metadata[:survivor_count].copy_(compacted_metadata)
         compacted_temperature = gpu_view.temperature[survivor_idxs_cuda].contiguous()
         compacted_top_k = gpu_view.top_k[survivor_idxs_cuda].contiguous()
         compacted_top_p = gpu_view.top_p[survivor_idxs_cuda].contiguous()
