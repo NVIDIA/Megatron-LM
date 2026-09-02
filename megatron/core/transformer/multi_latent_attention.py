@@ -24,6 +24,7 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
+from megatron.core.packed_seq_params import resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -334,6 +335,10 @@ class MultiLatentAttention(Attention):
         if self.config.cache_mla_latents:
             self.prepare_for_absorption()
 
+        original_cp_group = self.pg_collection.cp
+        runtime_cp_group = resolve_cp_group(original_cp_group, packed_seq_params)
+        self.pg_collection.cp = runtime_cp_group
+
         # =====================
         # Query, Key, and Value
         # =====================
@@ -465,6 +470,7 @@ class MultiLatentAttention(Attention):
             output, bias = apply_module(self.linear_proj)(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
+        self.pg_collection.cp = original_cp_group
         return output, bias
 
 
@@ -681,12 +687,6 @@ class MLASelfAttention(MultiLatentAttention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
-        if packed_seq_params is not None:
-            assert (
-                packed_seq_params.local_cp_size is None
-            ), "hybrid_context_parallel is not supported with MLA yet and is planned for future. \
-            Please disable hybrid_context_parallel."
-
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # =========================================

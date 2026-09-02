@@ -8,6 +8,7 @@ import json
 import os
 import re
 import types
+import warnings
 from pathlib import Path
 
 import torch
@@ -1444,11 +1445,41 @@ def validate_args(args, defaults={}):
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
     if args.hybrid_context_parallel:
-        assert not args.pipeline_model_parallel_size > 1, 'Hybrid context parallelism not supported with pipeline parallelism'
-        assert not args.enable_cuda_graph, 'Hybrid context parallelism not supported with CUDA Graph'
-        assert not args.use_megatron_fsdp, 'Hybrid context parallelism not supported with Megatron FSDP'
-        assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
-        assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
+        warnings.warn(
+            "--hybrid-context-parallel is deprecated; use --dynamic-context-parallel.",
+            DeprecationWarning,
+        )
+        if args.dynamic_context_parallel:
+            raise ValueError(
+                "Cannot set both --hybrid-context-parallel and --dynamic-context-parallel"
+            )
+        args.dynamic_context_parallel = True
+        args.hybrid_context_parallel = False
+
+    if args.dynamic_context_parallel:
+        assert not args.enable_cuda_graph, 'Dynamic context parallelism not supported with CUDA Graph'
+        assert not args.use_megatron_fsdp, 'Dynamic context parallelism not supported with Megatron FSDP'
+        assert args.dataloader_type == 'single', 'Dynamic context parallelism only supported with single dataloader type'
+        assert args.calculate_per_token_loss, 'Dynamic context parallelism must be used with --calculate-per-token-loss'
+        if args.sequence_packing_scheduler is None:
+            args.sequence_packing_scheduler = 'default_dynamic_cp'
+        if args.sequence_packing_scheduler != 'default_dynamic_cp':
+            raise ValueError(
+                "Dynamic context parallelism requires "
+                "--sequence-packing-scheduler default_dynamic_cp"
+            )
+        dp_cp_size = args.data_parallel_size * args.context_parallel_size
+        from megatron.core.parallel_state import (
+            get_valid_dynamic_context_parallel_group_sizes,
+        )
+
+        valid_group_sizes = get_valid_dynamic_context_parallel_group_sizes(dp_cp_size)
+        if args.min_dynamic_context_parallel_size not in valid_group_sizes:
+            raise ValueError(
+                "--min-dynamic-context-parallel-size="
+                f"{args.min_dynamic_context_parallel_size} is invalid for DPxCP size "
+                f"{dp_cp_size}; expected one of {valid_group_sizes}"
+            )
 
     # Support for variable sequence lengths across batches/microbatches.
     # set it if the dataloader supports generation of variable sequence lengths
@@ -1720,13 +1751,24 @@ def validate_args(args, defaults={}):
             # samples into THD batches. Auto-pick ``dp_balanced`` when the
             # user did not request one explicitly.
             if args.sequence_packing_scheduler is None:
-                args.sequence_packing_scheduler = 'dp_balanced'
+                args.sequence_packing_scheduler = (
+                    'default_dynamic_cp' if args.dynamic_context_parallel else 'dp_balanced'
+                )
 
     # Runs after the varlen auto-select above so it sees the final resolved
     # scheduler. Scheduler-name and max-seqlen validation live in
     # ModelParallelConfig.__post_init__; only the buffer-size check stays here
     # because seq_length is not a core config field. The None case for
     # max_seqlen_per_dp_cp_rank is rejected by the config check.
+    if (
+        args.sequence_packing_scheduler == 'default_dynamic_cp'
+        and not args.dynamic_context_parallel
+    ):
+        raise ValueError(
+            "--sequence-packing-scheduler default_dynamic_cp requires "
+            "--dynamic-context-parallel"
+        )
+
     if args.sequence_packing_scheduler is not None:
         args.variable_seq_lengths = True
         # Packed microbatches carry different numbers of valid tokens, so the
@@ -1738,6 +1780,8 @@ def validate_args(args, defaults={}):
         )
         if args.max_seqlen_per_dp_cp_rank is not None:
             total_cp_ranks = args.context_parallel_size
+            if args.sequence_packing_scheduler == 'default_dynamic_cp':
+                total_cp_ranks *= args.data_parallel_size
             assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
                 f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
                 f'must be >= single sequence max length ({args.seq_length})'
@@ -2472,14 +2516,13 @@ def _add_network_size_args(parser):
         "mamba_training_ssm_states_dtype",
         "max_seqlen_per_dp_cp_rank",
         "hybrid_context_parallel",
+        "dynamic_context_parallel",
+        "min_dynamic_context_parallel_size",
         "sequence_packing_scheduler",
         # internal/derived: controlled only via --tensor-parallel-num-weight-shards
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
         "expert_gtp_weight_remat_size",
-        "max_seqlen_per_dp_cp_rank",
-        "hybrid_context_parallel",
-        "sequence_packing_scheduler",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -3363,10 +3406,13 @@ def _add_distributed_args(parser):
                        help='Maximum sequence length per CP rank. This is used to calculate the '
                        'number of sub-samples assigned to each CP rank when using heterogeneous context parallel.')
     group.add_argument('--hybrid-context-parallel', action='store_true', default=False,
-                       help='Enables hybrid context parallel. This is used to balance the workload '
-                       'of each CP rank when we use packed samples with variable sequence lengths. '
-                       'Requires --max-seqlen-per-dp-cp-rank to be set.')
-    group.add_argument('--sequence-packing-scheduler', type=str, default=None, choices=['dp_balanced'])
+                       help='Deprecated alias for --dynamic-context-parallel.')
+    group.add_argument('--dynamic-context-parallel', action='store_true', default=False,
+                       help='Enable variable-sized CP groups selected per packed microbatch.')
+    group.add_argument('--min-dynamic-context-parallel-size', type=int, default=1,
+                       help='Minimum runtime CP group size used by dynamic CP.')
+    group.add_argument('--sequence-packing-scheduler', type=str, default=None,
+                       choices=['dp_balanced', 'default_dynamic_cp'])
     group.add_argument('--fake-process-group', action='store_true', default=False,
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \

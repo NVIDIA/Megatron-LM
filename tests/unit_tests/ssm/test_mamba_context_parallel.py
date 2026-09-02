@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import os
+
 import pytest
 import torch
 import torch.nn as nn
@@ -124,6 +126,114 @@ class TestMambaContextParallel:
         assert list(cp.get_D().shape) == [d_inner_local_tpcp if D_has_hdim else nheads_local_tpcp]
 
         Utils.destroy_model_parallel()
+
+    def test_runtime_cp_group_forward_backward_matches_static_group(self):
+        """A CP1-built helper must match one built directly with the runtime CP group."""
+        runtime_cp_size = 2
+        if int(os.environ.get("WORLD_SIZE", "1")) < runtime_cp_size:
+            pytest.skip("Runtime Mamba CP parity requires at least two distributed ranks")
+
+        Utils.initialize_model_parallel(
+            context_parallel_size=1,
+            dynamic_context_parallel=True,
+            min_dynamic_context_parallel_size=1,
+        )
+        try:
+            runtime_group = parallel_state.get_dynamic_data_context_parallel_groups(
+                group_size=runtime_cp_size
+            )
+            device = torch.device("cuda")
+            dtype = torch.float32
+            d_inner = 128
+            nheads = 2
+            ngroups = 2
+            d_state = 16
+            d_conv = 4
+            conv_dim = d_inner + 2 * ngroups * d_state
+
+            torch.manual_seed(17)
+            base_tensors = {
+                "conv_weight": torch.randn(conv_dim, 1, d_conv, device=device, dtype=dtype),
+                "conv_bias": torch.randn(conv_dim, device=device, dtype=dtype),
+                "dt_bias": torch.randn(nheads, device=device, dtype=dtype),
+                "A_log": torch.randn(nheads, device=device, dtype=dtype),
+                "D": torch.randn(nheads, device=device, dtype=dtype),
+            }
+
+            def build(cp_group):
+                tensors = {
+                    name: value.detach().clone().requires_grad_(True)
+                    for name, value in base_tensors.items()
+                }
+                helper = MambaContextParallel(
+                    cp_group=cp_group,
+                    d_inner_local_tp=d_inner,
+                    nheads_local_tp=nheads,
+                    ngroups_local_tp=ngroups,
+                    d_state=d_state,
+                    conv1d_weight_cp1=tensors["conv_weight"],
+                    conv1d_bias_cp1=tensors["conv_bias"],
+                    conv1d_padding=d_conv - 1,
+                    dt_bias_cp1=tensors["dt_bias"],
+                    A_log_cp1=tensors["A_log"],
+                    D_cp1=tensors["D"],
+                    D_has_hdim=False,
+                )
+                return helper, tensors
+
+            reference, reference_tensors = build(runtime_group)
+            dynamic, dynamic_tensors = build(None)
+            dynamic.set_context_parallel_group(runtime_group)
+
+            rank = torch.distributed.get_rank(group=runtime_group)
+            torch.manual_seed(100 + rank)
+            local_seq_len = 4
+            global_seq_len = local_seq_len * runtime_cp_size
+            in_hidden = 2 * d_inner + 2 * ngroups * d_state + nheads
+            pre_input = torch.randn(local_seq_len, 1, in_hidden, device=device, dtype=dtype)
+            post_input = torch.randn(
+                global_seq_len, 1, d_inner // runtime_cp_size, device=device, dtype=dtype
+            )
+            conv_input = torch.randn(
+                1, conv_dim // runtime_cp_size, global_seq_len, device=device, dtype=dtype
+            )
+
+            def run(helper, tensors):
+                pre = pre_input.detach().clone().requires_grad_(True)
+                post = post_input.detach().clone().requires_grad_(True)
+                conv = conv_input.detach().clone().requires_grad_(True)
+                outputs = (
+                    helper.pre_conv_ssm(pre),
+                    helper.post_conv_ssm(post),
+                    helper.conv1d(conv),
+                )
+                loss = sum(output.square().sum() for output in outputs)
+                loss = loss + helper.get_dt_bias().square().sum()
+                loss = loss + helper.get_A_log().square().sum() + helper.get_D().square().sum()
+                loss.backward()
+                return outputs, (pre.grad, post.grad, conv.grad), tensors
+
+            reference_result = run(reference, reference_tensors)
+            dynamic_result = run(dynamic, dynamic_tensors)
+
+            for reference_value, dynamic_value in zip(
+                reference_result[0], dynamic_result[0], strict=True
+            ):
+                torch.testing.assert_close(reference_value, dynamic_value)
+            for reference_grad, dynamic_grad in zip(
+                reference_result[1], dynamic_result[1], strict=True
+            ):
+                torch.testing.assert_close(reference_grad, dynamic_grad)
+            for name in reference_tensors:
+                torch.testing.assert_close(
+                    reference_tensors[name].grad,
+                    dynamic_tensors[name].grad,
+                    msg=lambda msg, tensor_name=name: (
+                        f"Mismatch in Mamba runtime-CP gradient {tensor_name}: {msg}"
+                    ),
+                )
+        finally:
+            Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
         "nheads_tp, ngroups_tp, cp_size, expected_error_message",

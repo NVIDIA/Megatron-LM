@@ -248,7 +248,7 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
         # which are normally wrapped by @jit_fuser (torch.compile).
         with torch._dynamo.config.patch(disable=True):
             kernel_inputs = gdn._prepare_input_for_gated_delta_rule(
-                qkv, gate, A_log_mock, dt_bias_mock, batch, seq_len, *gate_feats
+                qkv, gate, A_log_mock, dt_bias_mock, batch, seq_len, gdn.cp_size, *gate_feats
             )
 
         # The output gate (z) rides along under "gate" and is popped by forward before

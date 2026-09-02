@@ -21,7 +21,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_masked_update,
 )
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
@@ -512,6 +512,11 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                     out, out_bias = self._static_decode(hidden_states, conv_state, ssm_state)
                     return out, out_bias
 
+        original_cp_group = self.cp.cp_group
+        runtime_cp_group = resolve_cp_group(original_cp_group, packed_seq_params)
+        if runtime_cp_group is not original_cp_group:
+            self.cp.set_context_parallel_group(runtime_cp_group)
+
         zxBCdt, _ = self.in_proj(hidden_states)
 
         zxBCdt = self.cp.pre_conv_ssm(zxBCdt, packed_seq_params)
@@ -528,6 +533,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             y = self._ssm_training(zxBCdt, packed_seq_params)
 
         out, out_bias = self.out_proj(y)
+
+        if runtime_cp_group is not original_cp_group:
+            self.cp.set_context_parallel_group(original_cp_group)
 
         return out, out_bias
 

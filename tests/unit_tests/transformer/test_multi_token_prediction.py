@@ -24,6 +24,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_data_parallel_group,
+    get_dynamic_data_context_parallel_groups,
     get_tensor_and_context_parallel_group,
     get_tensor_model_parallel_group,
 )
@@ -100,8 +101,14 @@ class TestMultiTokenPredictionLayer:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
 
-    def _create_config_and_mtp_block_spec(self, tp, cp, use_te=False):
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+    def _create_config_and_mtp_block_spec(self, tp, cp, use_te=False, dynamic_cp=False):
+        build_time_cp = 1 if dynamic_cp else cp
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp,
+            context_parallel_size=build_time_cp,
+            dynamic_context_parallel=dynamic_cp,
+            min_dynamic_context_parallel_size=1,
+        )
         config = TransformerConfig(
             mtp_num_layers=2,
             num_layers=4,
@@ -110,7 +117,7 @@ class TestMultiTokenPredictionLayer:
             use_cpu_initialization=True,
             tensor_model_parallel_size=tp,
             sequence_parallel=True if tp > 1 else False,
-            context_parallel_size=cp,  # Enable CP for MTP testing
+            context_parallel_size=build_time_cp,
         )
         if use_te:
             transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
@@ -757,6 +764,106 @@ class TestMultiTokenPredictionLayer:
         expected_mask = (expected_ids != 0) & (expected_ids != 3) & (expected_ids != 14)
         torch.testing.assert_close(rolled_ids, expected_ids)
         torch.testing.assert_close(rolled_mask, expected_mask)
+
+    def test_runtime_cp_packed_preprocess_forward_backward_parity(self):
+        """Runtime CP metadata matches an MTP layer bound directly to the same real group."""
+        runtime_cp_size = 2
+        if int(os.environ.get("WORLD_SIZE", "1")) < runtime_cp_size:
+            pytest.skip("Runtime MTP CP parity requires at least two distributed ranks")
+
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(
+            tp=1, cp=runtime_cp_size, dynamic_cp=True
+        )
+        runtime_group = get_dynamic_data_context_parallel_groups(group_size=runtime_cp_size)
+
+        reference_block = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).cuda()
+        dynamic_block = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).cuda()
+        dynamic_block.load_state_dict(reference_block.state_dict())
+        reference_layer = reference_block.layers[0]
+        dynamic_layer = dynamic_block.layers[0]
+        reference_layer.cp_group = runtime_group
+
+        cp_rank = torch.distributed.get_rank(group=runtime_group)
+        if cp_rank == 0:
+            input_ids = torch.tensor(
+                [[1, 2, 7, 8, 11, 12, 13, 20, 21, 22]], dtype=torch.int64, device="cuda"
+            )
+        else:
+            input_ids = torch.tensor(
+                [[3, 4, 5, 6, 14, 15, 16, 17, 18, 19]], dtype=torch.int64, device="cuda"
+            )
+        position_ids = torch.arange(input_ids.size(1), device="cuda").unsqueeze(0)
+        mtp_input_mask = (input_ids != 3) & (input_ids != 14)
+        cu_seqlens = torch.tensor([0, 8, 20], dtype=torch.int32, device="cuda")
+
+        reference_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=6,
+            max_seqlen_kv=6,
+            qkv_format="thd",
+        )
+        dynamic_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=6,
+            max_seqlen_kv=6,
+            qkv_format="thd",
+            local_cp_size=runtime_cp_size,
+            cp_group=runtime_group,
+        )
+
+        torch.manual_seed(99 + cp_rank)
+        hidden = torch.randn(
+            input_ids.size(1), 1, config.hidden_size, device="cuda", dtype=torch.float32
+        )
+
+        def embedding(input_ids, position_ids):
+            del position_ids
+            return (
+                input_ids.transpose(0, 1)
+                .unsqueeze(-1)
+                .expand(-1, -1, config.hidden_size)
+                .to(dtype=torch.float32)
+                / 100.0
+            )
+
+        def run(layer, packed_seq_params, hidden_states):
+            rolled_ids, _, _, rolled_mask, decoder_input, rolled_hidden = layer._get_embeddings(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                embedding=embedding,
+                hidden_states=hidden_states,
+                packed_seq_params=packed_seq_params,
+                mtp_input_mask=mtp_input_mask,
+            )
+            output = layer._concat_embeddings(rolled_hidden, decoder_input)
+            output.square().sum().backward()
+            return rolled_ids, rolled_mask, output.detach(), hidden_states.grad.detach()
+
+        reference_hidden = hidden.detach().clone().requires_grad_(True)
+        dynamic_hidden = hidden.detach().clone().requires_grad_(True)
+        reference_result = run(reference_layer, reference_params, reference_hidden)
+        dynamic_result = run(dynamic_layer, dynamic_params, dynamic_hidden)
+
+        for reference_value, dynamic_value in zip(reference_result, dynamic_result, strict=True):
+            torch.testing.assert_close(reference_value, dynamic_value)
+        for (reference_name, reference_param), (dynamic_name, dynamic_param) in zip(
+            reference_layer.named_parameters(), dynamic_layer.named_parameters(), strict=True
+        ):
+            assert reference_name == dynamic_name
+            assert (
+                reference_param.grad is not None
+            ), f"Missing reference gradient for {reference_name}"
+            assert dynamic_param.grad is not None, f"Missing dynamic gradient for {dynamic_name}"
+            torch.testing.assert_close(
+                reference_param.grad,
+                dynamic_param.grad,
+                msg=lambda msg, param_name=reference_name: (
+                    f"Mismatch in MTP runtime-CP gradient {param_name}: {msg}"
+                ),
+            )
 
     def test_forward_propagates_rolled_padding_mask(self, monkeypatch):
         """Test forward passes rolled padding_mask to transformer path."""
