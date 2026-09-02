@@ -589,9 +589,7 @@ def test_fused_wgrad_zero_token_expert_overwrites_staging_buffer(distributed_set
 @pytest.mark.parametrize(
     "use_symmetric_memory", [False, True], ids=["default_memory", "symmetric_memory"]
 )
-def test_trace_pool_losses_match_baseline_after_planning(
-    distributed_setup, use_symmetric_memory
-):
+def test_trace_pool_losses_match_baseline_after_planning(distributed_setup, use_symmetric_memory):
     """Trace-planned storage must preserve saved weight views and optimizer parity."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -609,9 +607,7 @@ def test_trace_pool_losses_match_baseline_after_planning(
     model.load_state_dict(baseline.state_dict())
 
     with fully_shard_context(
-        device=device,
-        use_symmetric_memory=use_symmetric_memory,
-        enable_trace_pool=True,
+        device=device, use_symmetric_memory=use_symmetric_memory, enable_trace_pool=True
     ) as context:
         fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
         fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
@@ -645,8 +641,7 @@ def test_trace_pool_losses_match_baseline_after_planning(
     if use_symmetric_memory:
         assert context.trace_pool_allocator._slots
         assert all(
-            symm_mem.is_symm_mem_tensor(slot.tensor)
-            for slot in context.trace_pool_allocator._slots
+            symm_mem.is_symm_mem_tensor(slot.tensor) for slot in context.trace_pool_allocator._slots
         )
     torch.testing.assert_close(torch.stack(pooled_losses), torch.stack(baseline_losses))
 
@@ -902,7 +897,11 @@ def test_sharded_grad_dtensor_reuse_across_microbatches(distributed_setup):
                     (loss / num_microbatches).backward()
                 losses.append(loss.detach())
                 step_identities.append(
-                    [id(parameter.grad) for parameter in sharded_params if parameter.grad is not None]
+                    [
+                        id(parameter.grad)
+                        for parameter in sharded_params
+                        if parameter.grad is not None
+                    ]
                 )
             grad_identities.append(step_identities)
             optimizer.step()
@@ -1161,6 +1160,198 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
     torch.testing.assert_close(local_grad, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("set_to_none", [True, False], ids=["set-to-none", "zero-in-place"])
+@pytest.mark.parametrize("grad_divisor", [1, 4], ids=["no-extra-divisor", "expert-divisor"])
+@pytest.mark.parametrize(
+    "manual_finalize", [False, True], ids=["parameter-hooks", "delayed-wgrad-manual"]
+)
+def test_singleton_dp_accumulates_without_partial_grad_buffer(
+    distributed_setup, monkeypatch, set_to_none, grad_divisor, manual_finalize
+):
+    """Unfused DP1 gradients accumulate directly into persistent main-grad storage."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    parent_mesh = init_device_mesh(
+        device.type, (world_size, 1), mesh_dim_names=("replica", "singleton_dp")
+    )
+    mesh = parent_mesh["singleton_dp"]
+
+    torch.manual_seed(1234)
+    baseline = nn.Linear(4, 3, bias=True, device=device)
+    model = nn.Linear(4, 3, bias=True, device=device)
+    model.load_state_dict(baseline.state_dict())
+
+    with fully_shard_context(device=device, enable_trace_pool=True) as context:
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=_flat_placements(),
+            grad_divisor=grad_divisor,
+            skip_backward_callback=manual_finalize,
+        )
+
+    (group,) = model.parameter_groups
+    assert group.uses_local_grad_accumulation
+    assert group.main_grad is not None
+    main_grad = group.main_grad
+    main_grad_data_ptr = main_grad.local_buffer.data_ptr()
+
+    def fail_partial_grad_allocation():
+        pytest.fail("singleton DP must not allocate a partial-gradient staging buffer")
+
+    monkeypatch.setattr(group, "allocate_partial_grad_buffer", fail_partial_grad_allocation)
+
+    def assert_grad_matches_baseline():
+        for index, fsdp_parameter in enumerate(group.fsdp_parameters):
+            parameter_name = fsdp_parameter.fqns[0]
+            sharded_parameter = getattr(model, parameter_name)
+            baseline_parameter = getattr(baseline, parameter_name)
+            assert isinstance(sharded_parameter.grad, DTensor)
+            local_grad = sharded_parameter.grad.to_local()
+            torch.testing.assert_close(local_grad, baseline_parameter.grad, rtol=0, atol=0)
+            assert local_grad.data_ptr() == main_grad.get_local_tensor(index).data_ptr()
+            assert fsdp_parameter.unsharded.grad is None
+        assert group.main_grad is main_grad
+        assert group.main_grad.local_buffer.data_ptr() == main_grad_data_ptr
+
+    inputs = (
+        torch.arange(8, device=device, dtype=model.weight.dtype).reshape(2, 4),
+        torch.arange(8, 16, device=device, dtype=model.weight.dtype).reshape(2, 4),
+        torch.arange(16, 24, device=device, dtype=model.weight.dtype).reshape(2, 4),
+    )
+
+    for backward_index, inputs_for_backward in enumerate(inputs[:2]):
+        with microbatch(context, is_last=backward_index == 1):
+            (baseline(inputs_for_backward).square().sum() / grad_divisor).backward()
+            model(inputs_for_backward).square().sum().backward()
+            if manual_finalize:
+                model.post_backward()
+        assert_grad_matches_baseline()
+
+    baseline.zero_grad(set_to_none=set_to_none)
+    model.zero_grad(set_to_none=set_to_none)
+    if set_to_none:
+        assert all(parameter.grad is None for parameter in baseline.parameters())
+        assert all(parameter.grad is None for parameter in model.parameters())
+    else:
+        for model_parameter, baseline_parameter in zip(model.parameters(), baseline.parameters()):
+            assert model_parameter.grad is not None
+            assert baseline_parameter.grad is not None
+            torch.testing.assert_close(
+                model_parameter.grad.to_local(), baseline_parameter.grad, rtol=0, atol=0
+            )
+
+    (baseline(inputs[2]).square().sum() / grad_divisor).backward()
+    model(inputs[2]).square().sum().backward()
+    if manual_finalize:
+        model.post_backward()
+    assert_grad_matches_baseline()
+
+    assert context.trace_pool_allocator is not None
+    assert group._partial_grad_allocation_key not in context.trace_pool_allocator._metadata
+
+
+@pytest.mark.parametrize(
+    ("model_dtype", "main_grad_dtype", "grad_comm_dtype"),
+    [
+        (torch.bfloat16, torch.float32, torch.bfloat16),
+        (torch.float32, torch.bfloat16, torch.bfloat16),
+    ],
+    ids=["communication-main-mismatch", "lossy-source-main-cast"],
+)
+def test_singleton_dp_keeps_staging_when_gradient_dtypes_differ(
+    distributed_setup, monkeypatch, model_dtype, main_grad_dtype, grad_comm_dtype
+):
+    """DP=1 retains the communication-dtype cast when main-grad uses another dtype."""
+    device = distributed_setup.device
+    parent_mesh = init_device_mesh(
+        device.type, (distributed_setup.world_size, 1), mesh_dim_names=("replica", "singleton_dp")
+    )
+    model = nn.Linear(8, 8, bias=False, device=device, dtype=model_dtype)
+    policy = MixedPrecisionPolicy(
+        main_params_dtype=torch.float32,
+        main_grads_dtype=main_grad_dtype,
+        grad_comm_dtype=grad_comm_dtype,
+    )
+    with fully_shard_context(device=device):
+        fully_shard(
+            model,
+            mesh=parent_mesh["singleton_dp"],
+            placements=_flat_placements(),
+            mixed_precision_policy=policy,
+        )
+
+    (group,) = model.parameter_groups
+    assert not group.uses_local_grad_accumulation
+    observed_dtypes = []
+    original_allocate = group.allocate_partial_grad_buffer
+
+    def record_partial_grad_dtype():
+        partial_grad = original_allocate()
+        observed_dtypes.append(partial_grad.dtype)
+        return partial_grad
+
+    monkeypatch.setattr(group, "allocate_partial_grad_buffer", record_partial_grad_dtype)
+    inputs = torch.randn(4, 8, device=device, dtype=model_dtype)
+    model(inputs).float().sum().backward()
+
+    assert observed_dtypes == [grad_comm_dtype]
+    assert model.weight.grad.dtype == main_grad_dtype
+
+
+@pytest.mark.parametrize("grad_divisor", [1, 4, 3], ids=["one", "power-of-two", "non-power-of-two"])
+def test_singleton_dp_bf16_to_fp32_matches_staged_accumulation(distributed_setup, grad_divisor):
+    """Lossless BF16 widening uses the fast path without changing accumulated values."""
+    device = distributed_setup.device
+    parent_mesh = init_device_mesh(
+        device.type, (distributed_setup.world_size, 1), mesh_dim_names=("replica", "singleton_dp")
+    )
+    mesh = parent_mesh["singleton_dp"]
+    torch.manual_seed(1234)
+    staged_model = nn.Linear(8, 8, bias=True, device=device, dtype=torch.bfloat16)
+    local_model = nn.Linear(8, 8, bias=True, device=device, dtype=torch.bfloat16)
+    local_model.load_state_dict(staged_model.state_dict())
+    policy = MixedPrecisionPolicy(
+        main_params_dtype=torch.float32,
+        main_grads_dtype=torch.float32,
+        grad_comm_dtype=torch.float32,
+    )
+    with fully_shard_context(device=device):
+        fully_shard(
+            staged_model,
+            mesh=mesh,
+            placements=_flat_placements(),
+            mixed_precision_policy=policy,
+            grad_divisor=grad_divisor,
+        )
+    with fully_shard_context(device=device):
+        fully_shard(
+            local_model,
+            mesh=mesh,
+            placements=_flat_placements(),
+            mixed_precision_policy=policy,
+            grad_divisor=grad_divisor,
+        )
+
+    (staged_group,) = staged_model.parameter_groups
+    (local_group,) = local_model.parameter_groups
+    assert staged_group.uses_local_grad_accumulation
+    assert local_group.uses_local_grad_accumulation
+    staged_group.uses_local_grad_accumulation = False
+
+    for _ in range(2):
+        inputs = torch.randn(4, 8, device=device, dtype=torch.bfloat16)
+        staged_model(inputs).float().square().sum().backward()
+        local_model(inputs).float().square().sum().backward()
+
+    for staged_parameter, local_parameter in zip(
+        staged_model.parameters(), local_model.parameters()
+    ):
+        torch.testing.assert_close(
+            local_parameter.grad.to_local(), staged_parameter.grad.to_local(), rtol=0, atol=0
+        )
+
+
 @pytest.mark.parametrize("enable_trace_pool", [False, True], ids=["allocator", "trace-pool"])
 @pytest.mark.parametrize(
     "grad_comm_dtype", [torch.float32, None], ids=["explicit", "inherit-main-grad"]
@@ -1182,12 +1373,7 @@ def test_unfused_partial_grad_uses_grad_comm_dtype(
         grad_comm_dtype=grad_comm_dtype,
     )
     with fully_shard_context(device=device, enable_trace_pool=enable_trace_pool):
-        fully_shard(
-            model,
-            mesh=mesh,
-            placements=_flat_placements(),
-            mixed_precision_policy=policy,
-        )
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), mixed_precision_policy=policy)
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-3, foreach=False)
     fully_shard_optimizer(optimizer)
 

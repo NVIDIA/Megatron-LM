@@ -355,6 +355,14 @@ class FsdpModule:
             )
             return
 
+        for group in self._parameter_groups:
+            if group.requires_grad and group.supports_local_grad_accumulation():
+                # A singleton mesh has nothing to reduce. Write gradients into
+                # persistent main_grad instead of allocating a full Partial
+                # staging buffer. Manual delayed-wgrad schedules use the same
+                # mode but pack in _reduce_gradient_groups after backward_dw().
+                group.enable_local_grad_accumulation()
+
         if skip_backward_callback:
             return
 
@@ -364,7 +372,7 @@ class FsdpModule:
         # before that when module inputs do not require grad.
         module_ref = ref(self)
 
-        def grad_hook(_: nn.Parameter) -> None:
+        def grad_hook(_parameter: nn.Parameter) -> None:
             module = module_ref()
             if module is None:
                 return
@@ -589,6 +597,11 @@ class FsdpModule:
             for group_index, group in enumerate(self._parameter_groups):
                 if not group.requires_grad:
                     continue
+                if group.uses_local_grad_accumulation:
+                    group.accumulate_local_gradients()
+                    if group.uses_local_grad_accumulation:
+                        group.finalize_local_gradients(self.context.is_last_microbatch)
+                        continue
                 is_fused = group.fuse_wgrad_accumulation
                 if is_fused:
                     partial_grad = group.take_fused_wgrad_buffer()
@@ -702,6 +715,7 @@ def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.
         )
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
+
 
 def _specialize_placements(
     placements: tuple[Placement, ...], dtype: torch.dtype, is_fp8_group: bool = False

@@ -11,13 +11,16 @@ matching the v1 `fp8_param_gather` semantics:
    column-wise quantized weight for the backward pass, each with its own
    per-block scales. This mirrors TE's `cast_master_weights_to_fp8` and the
    v1 buffer's `weight_buffer` / `transpose_weight_buffer` pair.
-2. **The parameter all-gather moves both fp8 payloads.** The unsharded
-   parameters are TE `MXFP8Tensor` weights that Transformer Engine layers
-   consume directly — fp8 GEMMs in forward and backward, with the transpose
-   cache created at unshard and discarded at reshard (v1 parity).
-3. **Main gradients stay fp32/bf16 — never fp8.** The existing v2 gradient
-   path (bf16 partial grads -> reduce-scatter -> fp32/bf16 `main_grad`) is
-   unchanged.
+2. **The parameter all-gather moves both fp8 payloads when communication is
+   required.** The unsharded parameters are TE `MXFP8Tensor` weights that
+   Transformer Engine layers consume directly — fp8 GEMMs in forward and
+   backward, with the transpose cache created at unshard and discarded at
+   reshard (v1 parity). Replicated and singleton-DP payloads bind their
+   persistent storage directly without an all-gather.
+3. **Main gradients stay fp32/bf16 — never fp8.** Multi-rank and
+   dtype-incompatible paths pack partial gradients and reduce them into
+   `main_grad`; eligible unfused singleton-DP groups accumulate directly into
+   persistent `main_grad` without a Partial staging buffer or collective.
 4. **Optimizer states stay fp32.** Standard master-weight fp8 training; the
    optimizer adapter and `main_weight` (fp32) are untouched.
 
@@ -48,12 +51,14 @@ From `experimental/parameter_group.py`:
   placements (sharded). Owned by the optimizer.
 - `model_weight`: flat DBuffer in the compute dtype (bf16), parameter
   placements (sharded). Source for the all-gather.
-- `_unsharded_model_weight`: replicated bf16 buffer, filled by
-  `unshard_parameters()` (all-gather + redistribute) and consumed by compute;
-  storage released after forward/backward.
-- `main_grad`: flat DBuffer in `main_grads_dtype` (fp32/bf16), lazily allocated
-  on the reduce-scatter stream, filled by `reduce_partial_gradients` from bf16
-  partial grads. **fp32/bf16 only — fp8 is never used for gradients.**
+- `_unsharded_model_weight`: a separate replicated bf16 gather destination
+  only when a non-singleton mesh axis requires communication. Otherwise it
+  aliases persistent `model_weight`; temporary gather storage is released
+  after forward/backward, while aliased persistent storage is retained.
+- `main_grad`: persistent flat DBuffer in `main_grads_dtype` (fp32/bf16), eagerly
+  allocated on the reduce-scatter stream. The general path fills it through
+  `reduce_partial_gradients`; eligible singleton-DP groups fill it directly
+  from parameter gradients. **fp32/bf16 only — fp8 is never used for gradients.**
 - `sync_model_weight_from_main_weight()`: after `optimizer.step()`, cast +
   redistribute `main_weight` -> `model_weight`. This is the single refresh
   touch point.
@@ -109,7 +114,8 @@ Flow changes:
   (raw fp8 data + block scales), creating the transpose cache per the v1
   lifecycle. TE layers compute directly on the fp8 weights — no explicit
   dequantization in the FSDP layer.
-- The optimizer post-step hook and `main_grad` path are unchanged.
+- The optimizer post-step refresh hook and gradient precision contract are
+  unchanged. Eligible singleton-DP groups elide gradient staging and reduction.
 
 Benefits: fp8 GEMM compute with memory/comm parity vs bf16 (2x fp8 payload =
 1x bf16), matching v1 `fp8_param_gather`. No change to gradient or optimizer
@@ -118,7 +124,8 @@ state precision.
 ### Non-goals (explicit)
 
 - **No fp8 main gradients.** `main_grad` stays fp32/bf16 (the `main_grads_dtype`
-  policy); grads are reduced in bf16 and stored in fp32/bf16.
+  policy); multi-rank gradients are reduced in bf16/fp32, and eligible
+  singleton-DP gradients accumulate locally in fp32/bf16.
 - **No fp8 optimizer states.** Adam moments stay fp32 in `main_weight`'s
   optimizer buffers.
 - No fp8 for activations (that is `--fp8` autocast, still rejected for v2).
@@ -154,13 +161,13 @@ state precision.
   tensors' grids), `cast_master_weights_to_fp8` with fragments = flat slices
   of the temp raw data at the shard offsets, then the shard slices are copied
   into the two payload DBuffers and the temps are released.
-- **Oriented unshard**: `unshard_parameters(orientation)` — forward
-  (`"rowwise"`) gathers and binds only the rowwise payload; backward
-  (`"colwise"`) only the column-wise payload — one byte per element per pass,
-  mirroring v1's per-pass transpose gather and TE's `fsdp_pre_all_gather`
-  usage. The orientation threads through `pre_forward` / `pre_backward`, the
-  prefetches, the public API, and the fine-grained hooks (1F1B path).
-  Reshard detaches the payloads (`clear_payloads`).
+- **Both-orientation unshard**: `unshard_parameters(orientation)` binds both
+  row-wise and column-wise payloads because TE primary-weight layers require
+  both during forward. Sharded payloads on non-singleton axes gather into
+  temporary targets; replicated and singleton-DP payloads alias their
+  persistent row/column buffers. Construction clears the original TE payload
+  ownership and releases distinct bootstrap gather targets. Reshard detaches
+  the payloads (`clear_payloads`).
 - Both payloads are `(rows, cols)` row-major uint8 (TE's `_columnwise_data`
   has the same shape as `_rowwise_data`; only the block direction and scale
   grid differ). The reference kernels/tests in `quantization.py` follow that

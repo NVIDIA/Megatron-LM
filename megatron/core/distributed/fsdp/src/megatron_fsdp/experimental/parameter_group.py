@@ -104,7 +104,7 @@ class FsdpParameterGroup:
     requires_grad: bool
     main_weight: DBuffer
     model_weight: DBuffer | None
-    _main_grad: DBuffer | None
+    main_grad: DBuffer | None
     _unsharded_model_weight: DBuffer | None
     _symm_mem_pool: torch.cuda.MemPool | None
     _persistent_model_weight: bool
@@ -118,10 +118,13 @@ class FsdpParameterGroup:
     # Rebuilding DTensors every backward costs O(params) ``_FromTorchTensor``
     # calls on the host; when main_grad storage is reused we rebind the cached
     # DTensor's local storage in place instead. Invalidation: cleared whenever
-    # ``_main_grad`` is replaced (redistribute) or ``main_grad`` changes dtype.
+    # ``main_grad`` is replaced (redistribute) or changes dtype.
     _grad_dtensor_cache: list[dist_tensor.DTensor | None]
     _grad_dtensor_cache_main_grad_id: int | None
     _trace_pool_allocator: TracePoolAllocator | None
+    _main_grad_allocation_event: torch.cuda.Event | None
+    uses_local_grad_accumulation: bool
+    _local_grad_accumulates_existing: bool | None
 
     def __init__(
         self,
@@ -193,6 +196,8 @@ class FsdpParameterGroup:
         self.fuse_wgrad_accumulation = fuse_wgrad_accumulation
         self.fused_wgrad_is_complete = fused_wgrad_is_complete
         self._trace_pool_allocator = trace_pool_allocator
+        self.uses_local_grad_accumulation = False
+        self._local_grad_accumulates_existing = None
         self._unsharded_allocation_key = (id(self), "unsharded_model_weight")
         self._partial_grad_allocation_key = (id(self), "partial_grad")
         first_parameter = next(iter(parameter_to_fqns))
@@ -216,9 +221,7 @@ class FsdpParameterGroup:
         parameters_with_high_precision_init = []
         for parameter in parameter_to_fqns:
             source = parameter
-            get_high_precision_init_val = getattr(
-                parameter, "get_high_precision_init_val", None
-            )
+            get_high_precision_init_val = getattr(parameter, "get_high_precision_init_val", None)
             if get_high_precision_init_val is not None:
                 high_precision_init_val = get_high_precision_init_val()
                 if high_precision_init_val is not None:
@@ -226,9 +229,7 @@ class FsdpParameterGroup:
                     parameters_with_high_precision_init.append(parameter)
             main_weight_sources.append(source.to(dtype=main_weight_dtype))
         self.main_weight = DBuffer.distribute_tensors(
-            main_weight_sources,
-            mesh=self.mesh,
-            placements=main_weight_placements,
+            main_weight_sources, mesh=self.mesh, placements=main_weight_placements
         )
         for parameter in parameters_with_high_precision_init:
             parameter.clear_high_precision_init_val()
@@ -254,15 +255,14 @@ class FsdpParameterGroup:
             use_symmetric_memory,
         )
 
-        self._main_grad = None
+        self.main_grad = None
+        self._main_grad_allocation_event = None
         self._fused_wgrad_buffer = None
         self._main_grad_dtype = None
         self._partial_grad_dtype = None
         self._grad_dtensor_cache = []
         self._grad_dtensor_cache_main_grad_id = None
         if self.requires_grad:
-            # main_grad itself is materialized lazily by the property below; only its
-            # dtype and placement metadata are recorded here. See that property for why.
             self._main_grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
             # By contract, an unspecified communication dtype inherits the
             # persistent main-gradient dtype, not the lower-precision model dtype.
@@ -307,8 +307,19 @@ class FsdpParameterGroup:
         # Compute weights must be initialized before the first forward; subsequent
         # refreshes happen from the FSDP optimizer's post-step hook.
         self.sync_model_weight_from_main_weight()
+        if self.requires_grad:
+            # Match the upstream M-FSDP v2 ownership contract: main_grad is
+            # persistent optimizer-visible state, allocated explicitly on the
+            # reduction stream. Allocate after the initial MXFP8 quantization so
+            # its full-size temporary payloads do not overlap this buffer.
+            with torch.cuda.stream(reduce_scatter_stream):
+                self.main_grad = self._allocate_main_grad(self._main_grad_placements)
+                self._main_grad_allocation_event = reduce_scatter_stream.record_event()
         self._switch_to_sharded_parameters()
-        if self._unsharded_model_weight is not None:
+        if (
+            self._unsharded_model_weight is not None
+            and self._unsharded_model_weight is not self.model_weight
+        ):
             self._unsharded_model_weight.release_storage()
 
     def _init_compute_weight_storage(
@@ -323,23 +334,13 @@ class FsdpParameterGroup:
         """Create the resting and materialized compute-weight storage."""
         del use_symmetric_memory
         self._persistent_model_weight = model_weight_placements != main_weight_placements
-        with self._symmetric_memory_context():
-            self._unsharded_model_weight = DBuffer(
-                mesh=self.mesh,
-                placements=[Replicate()] * self.mesh.ndim,
-                tensor_shapes=tensor_shapes,
-                dtype=self.dtype,
-                device=self.main_weight.device,
-            )
         if main_weight_dtype == self.dtype and not self._persistent_model_weight:
             self.model_weight = self.main_weight
         else:
             # When optimizer and compute placements differ, keep a persistent
             # compute-weight buffer so forward does not issue parameter all-gathers.
             resting_placements = (
-                model_weight_placements
-                if self._persistent_model_weight
-                else main_weight_placements
+                model_weight_placements if self._persistent_model_weight else main_weight_placements
             )
             with torch.cuda.stream(allgather_stream):
                 self.model_weight = DBuffer(
@@ -349,6 +350,25 @@ class FsdpParameterGroup:
                     dtype=self.dtype,
                     device=self.main_weight.device,
                 )
+        assert self.model_weight is not None
+        requires_model_weight_gather = any(
+            not isinstance(placement, Replicate) and self.mesh.size(axis) > 1
+            for axis, placement in enumerate(self.model_weight.placements)
+        )
+        if requires_model_weight_gather:
+            with self._symmetric_memory_context():
+                self._unsharded_model_weight = DBuffer(
+                    mesh=self.mesh,
+                    placements=[Replicate()] * self.mesh.ndim,
+                    tensor_shapes=tensor_shapes,
+                    dtype=self.dtype,
+                    device=self.main_weight.device,
+                )
+        else:
+            # A Flat placement on a singleton axis already contains the complete
+            # local weight. Reuse it as the compute parameter instead of creating
+            # an all-gather destination that cannot receive peer data.
+            self._unsharded_model_weight = self.model_weight
 
     def _materialize_unsharded_parameter(
         self, parameter: nn.Parameter, unsharded_tensor: torch.Tensor | None
@@ -404,8 +424,12 @@ class FsdpParameterGroup:
         allgather_stream.wait_stream(current_stream)
         with torch.cuda.stream(allgather_stream):
             if not self._persistent_model_weight:
-                # Preserve the established same-placement ZeRO-3 lifecycle.
-                self.model_weight = self.main_weight.cast(self.model_weight.dtype)
+                if self._unsharded_model_weight is self.model_weight:
+                    # DP=1 compute parameters alias this persistent destination.
+                    self.main_weight.cast(self.model_weight.dtype, out=self.model_weight)
+                else:
+                    # Preserve the established same-placement ZeRO-3 lifecycle.
+                    self.model_weight = self.main_weight.cast(self.model_weight.dtype)
             else:
                 source = self.main_weight
                 if source.dtype == self.model_weight.dtype:
@@ -521,45 +545,12 @@ class FsdpParameterGroup:
         # post-backward reshard behavior would make the caller code less clean,
         # so keep the shared storage-release path.
         if self._unsharded_model_weight is not None:
-            if self._persistent_model_weight:
-                # The persistent model_weight materializes the configured compute
-                # placement directly; the temporary destination was never allocated.
+            if self._unsharded_model_weight is self.model_weight:
                 return
             if self._trace_pool_allocator is None:
                 self._unsharded_model_weight.release_storage()
             else:
                 self._trace_pool_allocator.free(self._unsharded_allocation_key)
-
-    @property
-    def main_grad(self) -> DBuffer | None:
-        """Sharded gradient buffer, materialized on first access.
-
-        Allocation is deferred to the first backward so that the buffer is created on
-        ``reduce_scatter_stream`` -- the same stream that later frees it when
-        ``reduce_partial_gradients`` rebinds it. Allocating during ``fully_shard()``
-        would bind the block to the caller's stream, typically the default stream. The
-        caching allocator binds a block to its allocation stream, so that buffer would
-        become reusable by default-stream allocations the moment it is dropped here,
-        while the reduce-scatter is still reading it as its input.
-        ``FsdpModule._reshard_parameter_groups`` keeps the same
-        allocate-and-release-on-one-stream invariant for unsharded parameter storage.
-
-        Returns ``None`` for parameter groups that do not require gradients.
-        """
-        if self._main_grad is not None:
-            return self._main_grad
-        if not self.requires_grad:
-            return None
-
-        owning_module = self._owning_module()
-        if owning_module is None:
-            raise RuntimeError("FSDP parameter group outlived its owning module.")
-        assert (
-            torch.cuda.current_stream(self.main_weight.device)
-            == owning_module.context.reduce_scatter_stream
-        ), "main_grad must be allocated on the reduce-scatter stream."
-        self._main_grad = self._allocate_main_grad(self._main_grad_placements)
-        return self._main_grad
 
     def _allocate_main_grad(self, placements: tuple[Placement, ...]) -> DBuffer:
         """Allocate a gradient buffer with ``placements`` on the reduction stream."""
@@ -581,6 +572,170 @@ class FsdpParameterGroup:
             "and DBuffer layouts are deterministic from those shapes and mesh size."
         )
         return main_grad
+
+    @staticmethod
+    def _can_accumulate_gradient_dtype(
+        source_dtype: torch.dtype, target_dtype: torch.dtype
+    ) -> bool:
+        """Whether casting ``source_dtype`` to ``target_dtype`` is value preserving."""
+        return source_dtype == target_dtype or (
+            target_dtype == torch.float32 and source_dtype in (torch.bfloat16, torch.float16)
+        )
+
+    def supports_local_grad_accumulation(self) -> bool:
+        """Whether DP=1 can bypass gradient staging without changing precision semantics."""
+        main_grad = self.main_grad
+        return (
+            self.mesh.size() == 1
+            and not self.fuse_wgrad_accumulation
+            and main_grad is not None
+            and self._partial_grad_dtype == main_grad.dtype
+            and self._can_accumulate_gradient_dtype(self.dtype, main_grad.dtype)
+        )
+
+    def enable_local_grad_accumulation(self) -> None:
+        """Accumulate gradients directly when the complete data-parallel mesh is local."""
+        if not self.supports_local_grad_accumulation():
+            raise RuntimeError(
+                "Local accumulation requires a singleton mesh, unfused wgrad, and "
+                "matching gradient communication and main-gradient dtypes."
+            )
+        self.uses_local_grad_accumulation = True
+
+    def _relabel_main_grad(self, placements: tuple[Placement, ...]) -> None:
+        """Relabel singleton-mesh gradient storage without allocation or communication."""
+        main_grad = self.main_grad
+        assert main_grad is not None
+        if main_grad.placements == placements:
+            return
+        if self.mesh.size() != 1:
+            raise RuntimeError("Only singleton meshes may relabel main_grad locally.")
+        self.main_grad = DBuffer.from_local(
+            main_grad.local_buffer,
+            self.mesh,
+            placements,
+            main_grad.layout.tensor_shapes,
+            allocation_stream=main_grad.allocation_stream,
+        )
+
+    def _begin_local_gradient_accumulation(self) -> DBuffer:
+        """Prepare persistent DP=1 gradient storage for writes on the active stream."""
+        main_grad = self.main_grad
+        assert main_grad is not None
+        if self._local_grad_accumulates_existing is not None:
+            return main_grad
+
+        if main_grad.local_buffer.is_cuda:
+            current_stream = torch.cuda.current_stream(main_grad.local_buffer.device)
+            if self._main_grad_allocation_event is not None:
+                # Wait only for main_grad's construction, not later work queued
+                # on the shared reduction stream by another parameter group.
+                current_stream.wait_event(self._main_grad_allocation_event)
+            main_grad.local_buffer.record_stream(current_stream)
+        self._local_grad_accumulates_existing = self._has_sharded_grads()
+        self._relabel_main_grad(self._main_grad_placements)
+        main_grad = self.main_grad
+        assert main_grad is not None
+        return main_grad
+
+    def _accumulate_local_contribution(
+        self, destination: torch.Tensor, source: torch.Tensor
+    ) -> None:
+        """Accumulate one contribution with the regular staging path's operation order."""
+        if not self._local_grad_accumulates_existing:
+            destination.copy_(source)
+            if self.grad_divisor != 1:
+                destination.div_(self.grad_divisor)
+            return
+
+        if self.grad_divisor == 1:
+            destination.add_(source)
+            return
+
+        if source.dtype == destination.dtype:
+            # parameter.grad is cleared immediately below, so it can serve as
+            # the per-parameter staging value and preserve divide-then-add.
+            source.div_(self.grad_divisor)
+            destination.add_(source)
+            return
+
+        # Scaling by a positive power of two is exact in the supported binary
+        # floating-point dtypes, so add_(alpha=...) matches divide-then-add
+        # without allocating a per-parameter cast buffer.
+        divisor = self.grad_divisor
+        if divisor > 0 and divisor & (divisor - 1) == 0:
+            destination.add_(source, alpha=1.0 / divisor)
+            return
+
+        contribution = source.to(dtype=destination.dtype, copy=True)
+        contribution.div_(divisor)
+        destination.add_(contribution)
+
+    def accumulate_local_gradients(self) -> None:
+        """Pack a complete manually scheduled DP=1 backward into ``main_grad``.
+
+        Normal autograd schedules call this when the module's last parameter
+        hook reports completion. Delayed-wgrad 1F1B schedules skip those hooks
+        and call it explicitly after ``backward_dw()``. Both paths batch all
+        completed gradients before publishing them.
+        """
+        if not self.uses_local_grad_accumulation:
+            return
+        if self._local_grad_accumulates_existing is not None:
+            return
+
+        parameters = [fsdp_parameter.unsharded for fsdp_parameter in self.fsdp_parameters]
+        sources = []
+        for fsdp_parameter, parameter in zip(self.fsdp_parameters, parameters):
+            source = parameter.grad
+            if source is None:
+                raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
+            sources.append(source)
+
+        main_grad = self.main_grad
+        assert main_grad is not None
+        if any(
+            not self._can_accumulate_gradient_dtype(source.dtype, main_grad.dtype)
+            for source in sources
+        ):
+            self.uses_local_grad_accumulation = False
+            return
+
+        main_grad = self._begin_local_gradient_accumulation()
+        destinations = [main_grad.get_local_tensor(index) for index in range(len(parameters))]
+        if self._local_grad_accumulates_existing:
+            divisor = self.grad_divisor
+            if divisor == 1:
+                torch._foreach_add_(destinations, sources)
+            elif all(
+                source.dtype == destination.dtype
+                for source, destination in zip(sources, destinations)
+            ):
+                torch._foreach_div_(sources, divisor)
+                torch._foreach_add_(destinations, sources)
+            elif divisor > 0 and divisor & (divisor - 1) == 0:
+                torch._foreach_add_(destinations, sources, alpha=1.0 / divisor)
+            else:
+                for destination, source in zip(destinations, sources):
+                    self._accumulate_local_contribution(destination, source)
+        else:
+            torch._foreach_copy_(destinations, sources)
+            if self.grad_divisor != 1:
+                torch._foreach_div_(destinations, self.grad_divisor)
+        for parameter in parameters:
+            parameter.grad = None
+
+    def finalize_local_gradients(self, is_last_microbatch: bool = True) -> None:
+        """Publish directly accumulated DP=1 gradients to the sharded parameters."""
+        if not self.uses_local_grad_accumulation:
+            return
+        if self._local_grad_accumulates_existing is None:
+            raise RuntimeError("No local FSDP gradients were accumulated before finalization.")
+        if is_last_microbatch:
+            self._relabel_main_grad(self.main_weight.placements)
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            fsdp_parameter.sharded.grad = self._get_sharded_grad_dtensor(index)
+        self._local_grad_accumulates_existing = None
 
     def prepare_fused_wgrad_buffer(self) -> None:
         """Allocate the full gradient target before layer backward.
@@ -687,9 +842,7 @@ class FsdpParameterGroup:
                 placements=partial_placements,
                 tensor_shapes=tensor_shapes,
                 allocation_stream=(
-                    torch.cuda.current_stream(local_buffer.device)
-                    if local_buffer.is_cuda
-                    else None
+                    torch.cuda.current_stream(local_buffer.device) if local_buffer.is_cuda else None
                 ),
             )
 
@@ -786,19 +939,17 @@ class FsdpParameterGroup:
             assert self.main_grad.allocation_stream == (
                 torch.cuda.current_stream(self.main_grad.device)
             )
-            changed_axis = changed_mesh_axis(
-                self.main_grad.placements, self._main_grad_placements
-            )
+            changed_axis = changed_mesh_axis(self.main_grad.placements, self._main_grad_placements)
             if changed_axis is None:
                 raise RuntimeError("FSDP gradient accumulation requires a changed placement axis.")
             if isinstance(self.main_grad.placements[changed_axis], Replicate):
                 # HSDP can restore its Partial accumulation placement as a metadata-only
                 # relabel, preserving retained gradients without allocating new storage.
-                self._main_grad = self.main_grad.redistribute(self._main_grad_placements)
+                self.main_grad = self.main_grad.redistribute(self._main_grad_placements)
             elif not has_sharded_grads:
                 # HFSDP's finalized Flat buffer is smaller than the Partial accumulation
                 # buffer; allocate fresh storage for the first reduction to overwrite.
-                self._main_grad = self._allocate_main_grad(self._main_grad_placements)
+                self.main_grad = self._allocate_main_grad(self._main_grad_placements)
             else:
                 # With set_to_none=False, preserve HFSDP's retained optimizer shard by
                 # all-gathering Flat -> Replicate before relabeling it as Partial.
@@ -807,7 +958,7 @@ class FsdpParameterGroup:
                 restored_grad = self.main_grad
                 if restored_grad.placements != tuple(replicated_placements):
                     restored_grad = restored_grad.redistribute(replicated_placements)
-                self._main_grad = restored_grad.redistribute(self._main_grad_placements)
+                self.main_grad = restored_grad.redistribute(self._main_grad_placements)
 
         grad_divisor = self.grad_divisor
 
@@ -836,7 +987,7 @@ class FsdpParameterGroup:
             assert self.main_grad.allocation_stream == (
                 torch.cuda.current_stream(self.main_grad.device)
             )
-            self._main_grad = self.main_grad.redistribute(self.main_weight.placements)
+            self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
 
         # Make each sharded parameter's .grad consistent with the final main_grad.
         # Reuse cached DTensors where possible: rebinding storage in place avoids
@@ -945,6 +1096,16 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         )
         self._unsharded_rowwise_allocation_key = (id(self), "unsharded_rowwise")
         self._unsharded_colwise_allocation_key = (id(self), "unsharded_colwise")
+        # Construction has copied the original TE payloads into the persistent
+        # sharded DBuffers. Enter the normal resting state immediately instead
+        # of retaining both payload owners (and initial gather targets) until
+        # the first post-forward reshard. These targets predate TracePool use,
+        # so release their DBuffer storage directly rather than freeing a key.
+        for fsdp_parameter in self.fsdp_parameters:
+            clear_payloads(fsdp_parameter.unsharded)
+        if self._unsharded_rowwise is not self._rowwise_buffer:
+            self._unsharded_rowwise.release_storage()
+            self._unsharded_colwise.release_storage()
 
     def _init_compute_weight_storage(
         self,
@@ -976,26 +1137,31 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             dtype=torch.uint8,
             device=device,
         )
-        self._unsharded_rowwise = DBuffer(
-            mesh=self.mesh,
-            placements=[Replicate()] * self.mesh.ndim,
-            tensor_shapes=tensor_shapes,
-            dtype=torch.uint8,
-            device=device,
+        requires_payload_gather = any(
+            not isinstance(placement, Replicate) and self.mesh.size(axis) > 1
+            for axis, placement in enumerate(model_weight_placements)
         )
-        self._unsharded_colwise = DBuffer(
-            mesh=self.mesh,
-            placements=[Replicate()] * self.mesh.ndim,
-            tensor_shapes=tensor_shapes,
-            dtype=torch.uint8,
-            device=device,
-        )
-        if model_weight_placements == self._unsharded_rowwise.placements:
-            # ZeRO-1 payloads are already replicated and bind directly during
-            # unshard, so these all-gather destinations are never used. Preserve
-            # the existing first-allocation lifecycle for sharded compute weights.
-            self._unsharded_rowwise.release_storage()
-            self._unsharded_colwise.release_storage()
+        if requires_payload_gather:
+            self._unsharded_rowwise = DBuffer(
+                mesh=self.mesh,
+                placements=[Replicate()] * self.mesh.ndim,
+                tensor_shapes=tensor_shapes,
+                dtype=torch.uint8,
+                device=device,
+            )
+            self._unsharded_colwise = DBuffer(
+                mesh=self.mesh,
+                placements=[Replicate()] * self.mesh.ndim,
+                tensor_shapes=tensor_shapes,
+                dtype=torch.uint8,
+                device=device,
+            )
+        else:
+            # Flat and Replicate have the same local payload on singleton axes.
+            # Alias the persistent sources instead of creating full-size gather
+            # destinations (and TracePool slots) that no peer can contribute to.
+            self._unsharded_rowwise = self._rowwise_buffer
+            self._unsharded_colwise = self._colwise_buffer
         for index, shape in enumerate(tensor_shapes):
             if (
                 len(shape) != 2

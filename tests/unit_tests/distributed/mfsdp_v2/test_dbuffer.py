@@ -27,6 +27,19 @@ def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torc
         torch.testing.assert_close(buffer.get_local_tensor(index), tensor)
 
 
+def _singleton_axis_mesh(distributed_setup):
+    parent_mesh = init_device_mesh(
+        distributed_setup.device.type,
+        (distributed_setup.world_size, 1),
+        mesh_dim_names=("replica", "singleton"),
+    )
+    return parent_mesh["singleton"]
+
+
+def _forbid_all_gather(*_args, **_kwargs) -> None:
+    raise AssertionError("A singleton mesh axis must not launch an all-gather.")
+
+
 def test_dbuffer_layout_pads_to_lcm_times_dp_size_and_fills_gaps(distributed_setup):
     """DBuffer layout returns element offsets and pads to LCM * DP size."""
     if distributed_setup.world_size < 2:
@@ -351,6 +364,51 @@ def test_sharded_allgather_into_existing_buffer(distributed_setup):
 
     assert result is destination
     assert destination.local_buffer.data_ptr() == destination_data_ptr
+    _assert_dbuffer_local_tensors_close(destination, tensors)
+
+
+def test_singleton_axis_redistribute_without_out_aliases_storage_without_collective(
+    distributed_setup, monkeypatch
+):
+    """Singleton Flat -> Replicate relabels the source storage without communication."""
+    mesh = _singleton_axis_mesh(distributed_setup)
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    source = DBuffer.distribute_tensors(tensors, mesh, [Flat()])
+    monkeypatch.setattr(dist, "all_gather_into_tensor", _forbid_all_gather)
+
+    result = source.redistribute([Replicate()])
+
+    assert result is not source
+    assert result.placements == (Replicate(),)
+    assert result.layout == source.layout
+    assert result.local_buffer is source.local_buffer
+    assert result.local_buffer.data_ptr() == source.local_buffer.data_ptr()
+    _assert_dbuffer_local_tensors_close(result, tensors)
+
+
+def test_singleton_axis_redistribute_with_out_copies_without_collective(
+    distributed_setup, monkeypatch
+):
+    """Singleton redistribution honors an explicit destination without communication."""
+    mesh = _singleton_axis_mesh(distributed_setup)
+    tensors = _same_tensors_on_all_ranks(distributed_setup.device)
+    source = DBuffer.distribute_tensors(tensors, mesh, [Flat()])
+    destination = DBuffer(
+        mesh=mesh,
+        placements=[Replicate()],
+        tensor_shapes=source.layout.tensor_shapes,
+        dtype=source.dtype,
+        device=source.device,
+    )
+    destination.local_buffer.fill_(-1)
+    destination_data_ptr = destination.local_buffer.data_ptr()
+    monkeypatch.setattr(dist, "all_gather_into_tensor", _forbid_all_gather)
+
+    result = source.redistribute([Replicate()], out=destination)
+
+    assert result is destination
+    assert destination.local_buffer.data_ptr() == destination_data_ptr
+    assert destination.local_buffer.data_ptr() != source.local_buffer.data_ptr()
     _assert_dbuffer_local_tensors_close(destination, tensors)
 
 

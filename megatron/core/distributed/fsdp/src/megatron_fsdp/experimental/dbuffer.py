@@ -373,6 +373,21 @@ class DBuffer:
         axis = changed_axis
         old_placement = self.placements[axis]
         new_placement = new_placements[axis]
+        if self.mesh.size(axis) == 1:
+            # Every supported placement has the same local range on a singleton
+            # axis. Preserve caller-provided destination ownership, or otherwise
+            # return a metadata-only alias without launching a one-rank collective.
+            if out is None:
+                return DBuffer.from_local(
+                    self.local_buffer,
+                    self.mesh,
+                    new_placements,
+                    self.layout.tensor_shapes,
+                    allocation_stream=self.allocation_stream,
+                )
+            out = self._create_or_validate_out(out, placements=new_placements)
+            out.local_buffer.copy_(self.local_buffer)
+            return out
         if isinstance(old_placement, Flat) and isinstance(new_placement, Replicate):
             return self.allgather(axis, out=out)
         if isinstance(old_placement, Partial) and isinstance(new_placement, Replicate):
