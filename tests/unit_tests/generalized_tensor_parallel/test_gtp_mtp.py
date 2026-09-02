@@ -511,6 +511,100 @@ def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False):
     )
 
 
+# Value written into the shared dummy-wgrad buffer to make the leak observable. Any non-zero
+# value works; a large one keeps it far outside the range of a real gradient.
+DUMMY_POISON = 12345.0
+
+
+def _worker_dummy_wgrad_not_leaked(rank, world_size, port, repeated_layer=False):
+    """A GTP weight's gradient must not depend on the shared dummy-wgrad buffer's contents.
+
+    GTP returns a PLACEHOLDER from backward, not a gradient -- the real wgrad already went into
+    main_grad via reduce-scatter. But it becomes ``param.grad``, and DDP adds ``param.grad`` into
+    main_grad when ``zero_out_wgrad`` is set (``_make_backward_post_hook``), which MTP does to the
+    shared embedding weight. ``get_dummy_wgrad`` hands back ONE reused buffer, and the shared
+    weight gets N = (1 main pass + mtp_num_layers) x gradient-accumulation steps backward passes
+    per iteration, so::
+
+        want:  S1 + S2 + ... + SN            Si = call i's reduce-scattered gradient
+        got:   S1 + S2 + ... + SN  +  N*D    D  = whatever that shared buffer last held
+
+    D is near-zero while the buffer is fresh and real data once traffic has passed through it --
+    hence the original failure needing both MTP and gradient accumulation, and vanishing whenever
+    an extra allocation shifted the buffer. This test POISONS it with a known value instead, and
+    requires the gradients to come out bit-identical. It runs a single step, so N = 1 + 2 = 3 and
+    reverting the fix shifts the gradient by ~3x the poison.
+    """
+    from transformer_engine.pytorch.module.base import get_dummy_wgrad
+
+    from megatron.core import parallel_state as ps
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        GTP_CONFIG,
+        reset_gtp_state,
+    )
+    from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    def _train_one_step_with_poison(poison):
+        """Build a fresh MTP model, poison the shared dummy, run fwd+bwd, return {name: grad}."""
+        reset_gtp_state()  # reset_gtp_globals is an autouse FIXTURE; this is what it defers to
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=world_size
+        )
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+
+        model = _build_mtp_gpt_model(repeated_layer, moe=False)
+        classify_gtp_remat_chains([model])
+        for p in model.parameters():
+            p.main_grad = torch.zeros(p.shape, dtype=torch.float32, device='cuda')
+
+        tagged = [n for n, p in model.named_parameters() if getattr(p, "zero_out_wgrad", False)]
+        # Fail loudly rather than pass vacuously: with nothing tagged, DDP never reads the
+        # placeholder and this test would be green no matter what GTP returns.
+        assert tagged, (
+            "no parameter has zero_out_wgrad set -- MTP should tag the shared embedding weight. "
+            "Without it this test cannot observe the placeholder at all."
+        )
+        # get_dummy_wgrad keys on main_grad's shape, so this dirties the exact buffer GTP will
+        # hand back from _handle_megatron_grad_accum.
+        for _, p in model.named_parameters():
+            if getattr(p, "zero_out_wgrad", False):
+                get_dummy_wgrad(list(p.main_grad.shape), p.dtype).fill_(poison)
+
+        _forward_backward(model)
+
+        # The model here is unwrapped, so replay DDP's accumulation rule explicitly -- see
+        # DistributedDataParallel._make_backward_post_hook. This is what makes the test able to
+        # observe the placeholder at all: drop it and the test passes even with the bug present.
+        for p in model.parameters():
+            if p.grad is not None and (
+                not getattr(p, "grad_added_to_main_grad", False)
+                or getattr(p, "zero_out_wgrad", False)
+            ):
+                p.main_grad.add_(p.grad.to(p.main_grad.dtype))
+
+        return _gathered_main_grads(model), tagged
+
+    saved_pad = GTP_CONFIG.pad_for_alignment
+    try:
+        # Shards stay exactly 1/gtp of the weight so _gathered_main_grads reconstructs it.
+        GTP_CONFIG.pad_for_alignment = 0
+        clean, tagged = _train_one_step_with_poison(0.0)
+        dirty, _ = _train_one_step_with_poison(DUMMY_POISON)
+    finally:
+        GTP_CONFIG.pad_for_alignment = saved_pad
+
+    for name in clean:
+        delta = (dirty[name] - clean[name]).abs().max().item()
+        assert delta == 0.0, (
+            f"{name}: gradient changed by {delta} when the shared dummy-wgrad buffer was "
+            f"poisoned with {DUMMY_POISON}. GTP's placeholder grad leaked into the gradient; it "
+            f"must be zeroed whenever zero_out_wgrad is set (tagged here: {tagged})."
+        )
+
+
 class TestGTPMTP:
     @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
     @pytest.mark.parametrize("repeated_layer", [False, True])
@@ -562,3 +656,15 @@ class TestGTPMTP:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_ddp_grad_ready_counts, 4, repeated_layer)
+
+    @pytest.mark.parametrize("repeated_layer", [False, True])
+    def test_mtp_dummy_wgrad_does_not_leak_into_grad(self, repeated_layer):
+        """MTP sets zero_out_wgrad on the shared embedding, which makes DDP ADD param.grad.
+
+        GTP's placeholder grad must therefore be zeroed, or the shared dummy buffer's stale
+        contents land in main_grad -- silently at first, then as a NaN once enough backward
+        passes have dirtied it.
+        """
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_dummy_wgrad_not_leaked, 4, repeated_layer)
