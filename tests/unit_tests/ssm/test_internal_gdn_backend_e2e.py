@@ -18,9 +18,13 @@ _HEAD_DIM = 128
 _SAMPLES = 5
 
 
-def _make_inputs(device):
+def _make_inputs(device, *, packed=False):
     torch.manual_seed(1234)
-    shape = (_BATCH_SIZE, _SEQUENCE_LENGTH, _HEADS, _HEAD_DIM)
+    shape = (
+        (1, _BATCH_SIZE * _SEQUENCE_LENGTH, _HEADS, _HEAD_DIM)
+        if packed
+        else (_BATCH_SIZE, _SEQUENCE_LENGTH, _HEADS, _HEAD_DIM)
+    )
     gate_shape = shape[:-1]
     q = (0.1 * torch.randn(shape, device=device, dtype=torch.bfloat16)).requires_grad_()
     k = (0.1 * torch.randn(shape, device=device, dtype=torch.bfloat16)).requires_grad_()
@@ -87,7 +91,9 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
     from fla.ops.cp import build_cp_context
 
     from megatron.core import parallel_state
+    from megatron.core.ssm.gated_delta_net.gdn import _bind_cutedsl_cp_context_metadata
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend import implementation
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_cp_cute
     from tests.unit_tests.test_utilities import Utils
 
     cp_context = None
@@ -98,15 +104,18 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
         Utils.initialize_model_parallel(context_parallel_size=cp_size)
         request.addfinalizer(Utils.destroy_model_parallel)
         global_seqlen = _SEQUENCE_LENGTH * cp_size
-        cu_seqlens = torch.tensor([0, global_seqlen], device=device, dtype=torch.long)
+        global_cu_seqlens_cpu = torch.arange(_BATCH_SIZE + 1, dtype=torch.long) * global_seqlen
+        cu_seqlens = global_cu_seqlens_cpu.to(device=device)
         cp_context = build_cp_context(
             cu_seqlens=cu_seqlens,
             group=parallel_state.get_context_parallel_group(),
             conv1d_kernel_size=4,
         )
+        _bind_cutedsl_cp_context_metadata(cp_context, global_cu_seqlens_cpu)
 
-    inputs, grad_output = _make_inputs(device)
+    inputs, grad_output = _make_inputs(device, packed=cp_context is not None)
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "fla")
+    monkeypatch.setenv("MCORE_GDN_CP_CUTEDSL", "0")
     reference_output, reference_gradients = _forward_backward(
         implementation, inputs, grad_output, cp_context=cp_context
     )
@@ -115,6 +124,9 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
     original_forward = implementation._cutedsl_forward
     original_cp_forward = implementation._fla_forward_for_fused_bwd
     original_backward = implementation._call_fused_gdr_bwd_cute
+    cp_forward_before = fused_gdr_cp_cute.get_cutedsl_fused_launch_count()
+    cp_backward_before = fused_gdr_cp_cute.get_cutedsl_fused_bwd_launch_count()
+    fused_gdr_cp_cute.reset_cutedsl_fallback_reasons()
 
     def tracked_forward(**kwargs):
         calls["fwd"] += 1
@@ -129,6 +141,7 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
         return original_backward(**kwargs)
 
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "cute")
+    monkeypatch.setenv("MCORE_GDN_CP_CUTEDSL", "1")
     with monkeypatch.context() as path_guard:
         if cp_context is None:
             path_guard.setattr(
@@ -154,6 +167,10 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
             implementation, inputs, grad_output, cp_context=cp_context
         )
     assert calls == {"fwd": 1, "bwd": 1}
+    if cp_context is not None:
+        assert fused_gdr_cp_cute.get_cutedsl_fused_launch_count() > cp_forward_before
+        assert fused_gdr_cp_cute.get_cutedsl_fused_bwd_launch_count() > cp_backward_before
+        assert fused_gdr_cp_cute.get_cutedsl_fallback_reasons() == {}
 
     torch.testing.assert_close(cute_output, reference_output, atol=1e-2, rtol=1e-2)
     for name, actual, expected in zip(

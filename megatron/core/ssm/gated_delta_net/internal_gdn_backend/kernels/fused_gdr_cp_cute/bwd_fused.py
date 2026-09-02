@@ -998,14 +998,15 @@ class CuteDSLFusedCPBwdPreProcess:
             1, 1, 1, 1, dtype=torch.float32, device=self.device
         )
 
-    def _cu_stream(self):
+    def _cu_stream(self, handle=None):
         """`cuda.CUstream` for the current torch stream, memoized by handle.
 
         See the forward wrapper: the raw accessor avoids building a throwaway
         `torch.cuda.Stream` (0.09 us against 3.1 us) and the ctypes wrapper is
         cached on the handle.
         """
-        handle = _raw_stream(self.device.index)
+        if handle is None:
+            handle = _raw_stream(self.device.index)
         stream = self._stream_cache.get(handle)
         if stream is None:
             stream = cuda.CUstream(handle)
@@ -1048,6 +1049,7 @@ class CuteDSLFusedCPBwdPreProcess:
         dht_out: torch.Tensor | None = None,
         emit_h: bool = True,
         emit_m: bool = True,
+        _stream_handle=None,
     ) -> torch.Tensor:
         """``__call__`` without the argument assertions.
 
@@ -1066,8 +1068,9 @@ class CuteDSLFusedCPBwdPreProcess:
             emit_h = pre_num_ranks > 0
             emit_m = emit_h and post_num_ranks > 0 and one local sequence
         """
-        return self._launch(q, k, w, do, dv, g, gk, scale, dht_out,
-                            emit_h, emit_m)
+        return self._launch(
+            q, k, w, do, dv, g, gk, scale, dht_out, emit_h, emit_m, _stream_handle
+        )
 
     @torch.no_grad()
     def __call__(
@@ -1115,8 +1118,21 @@ class CuteDSLFusedCPBwdPreProcess:
         return self._launch(q, k, w, do, dv, g, gk, scale, dht_out,
                             emit_h, emit_m)
 
-    def _launch(self, q, k, w, do, dv, g, gk, scale, dht_out,
-                emit_h=True, emit_m=True) -> torch.Tensor:
+    def _launch(
+        self,
+        q,
+        k,
+        w,
+        do,
+        dv,
+        g,
+        gk,
+        scale,
+        dht_out,
+        emit_h=True,
+        emit_m=True,
+        _stream_handle=None,
+    ) -> torch.Tensor:
         T, K = q.shape[1], q.shape[3]
         HV, V = do.shape[2], do.shape[-1]
         scale = K ** -0.5 if scale is None else float(scale)
@@ -1184,7 +1200,7 @@ class CuteDSLFusedCPBwdPreProcess:
             cutlass.Int32(original_T),
             cutlass.Int32(self.step),
             cutlass.Int32((1 if emit_h else 0) | (2 if emit_m else 0)),
-            self._cu_stream(),
+            self._cu_stream(_stream_handle),
         )
         geometry = self._op_key(original_T)
         op = self._ops.get(geometry)

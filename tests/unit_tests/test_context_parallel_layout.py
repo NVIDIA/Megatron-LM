@@ -14,6 +14,7 @@ from megatron.core.context_parallel_layout import (
     prebuild_thd_cp_partition_routes,
 )
 from megatron.core.context_parallel_layout.routes import (
+    _get_trusted_thd_cp_cu_seqlens_cpu,
     build_thd_cp_partition_route,
     get_thd_cp_partition_route,
 )
@@ -401,6 +402,48 @@ def test_prebuild_thd_cp_partition_routes_populates_direct_fields():
     assert same_route is route
     assert reverse_route is route
     assert packed_seq_params.cp_partition_route is route
+
+
+def test_thd_cp_route_owns_validated_cpu_metadata():
+    source = torch.tensor([0, 16, 40], dtype=torch.int32)
+    packed_seq_params = SimpleNamespace(
+        qkv_format="thd", cu_seqlens_q=source, cu_seqlens_q_padded=None, cp_partition_route=None
+    )
+    prebuild_thd_cp_partition_routes(packed_seq_params, _FakeGroup(size=2, rank=0))
+
+    cpu_offsets = _get_trusted_thd_cp_cu_seqlens_cpu(packed_seq_params, source)
+
+    assert cpu_offsets.device.type == "cpu"
+    assert cpu_offsets.dtype == torch.long
+    assert torch.equal(cpu_offsets, torch.tensor([0, 16, 40]))
+    assert cpu_offsets.data_ptr() != source.data_ptr()
+
+
+def test_thd_cp_route_rejects_replaced_or_mutated_metadata():
+    source = torch.tensor([0, 16, 40], dtype=torch.int32)
+    packed_seq_params = SimpleNamespace(
+        qkv_format="thd", cu_seqlens_q=source, cu_seqlens_q_padded=None, cp_partition_route=None
+    )
+    prebuild_thd_cp_partition_routes(packed_seq_params, _FakeGroup(size=2, rank=0))
+
+    with pytest.raises(RuntimeError, match="replaced"):
+        _get_trusted_thd_cp_cu_seqlens_cpu(packed_seq_params, source.clone())
+
+    source[1] = 8
+    with pytest.raises(RuntimeError, match="mutated"):
+        _get_trusted_thd_cp_cu_seqlens_cpu(packed_seq_params, source)
+
+    fresh_source = torch.tensor([0, 16, 40], dtype=torch.int32)
+    fresh_params = SimpleNamespace(
+        qkv_format="thd",
+        cu_seqlens_q=fresh_source,
+        cu_seqlens_q_padded=None,
+        cp_partition_route=None,
+    )
+    prebuild_thd_cp_partition_routes(fresh_params, _FakeGroup(size=2, rank=0))
+    fresh_params.cp_partition_route._cu_seqlens_cpu[1] = 8
+    with pytest.raises(RuntimeError, match="CPU snapshot was mutated"):
+        _get_trusted_thd_cp_cu_seqlens_cpu(fresh_params, fresh_source)
 
 
 def test_prebuild_thd_cp_partition_routes_raises_route_errors():
