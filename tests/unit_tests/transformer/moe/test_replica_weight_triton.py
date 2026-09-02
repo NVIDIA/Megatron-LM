@@ -26,7 +26,7 @@ import torch.distributed as dist
 
 from megatron.core.transformer.moe.replica_weight_triton import (
     MAX_REPLICA_WEIGHT_SMS,
-    _grad_tile_elements,
+    _transport_tile,
     _validate_transport_shape,
     compile_replica_weight_kernels,
     launch_replica_grad_reduce,
@@ -47,8 +47,8 @@ def test_replica_weight_kernel_rejects_more_than_32_sms():
 
 def test_replica_weight_kernel_rejects_nondivisible_projections():
     """Require a row-aligned transport tile shared by both projection shapes."""
-    with pytest.raises(ValueError, match="256-element aligned"):
-        _grad_tile_elements((16384, 16385), torch.bfloat16.itemsize)
+    with pytest.raises(ValueError, match="256-aligned"):
+        _transport_tile(32768 // torch.bfloat16.itemsize, 16384, 16385)
 
 
 def _allocate_symmetric(
@@ -68,12 +68,19 @@ def _allocate_symmetric(
     return tensor, symm_mem.rendezvous(tensor, group)
 
 
+def _pointer_table(members: torch.Tensor) -> torch.Tensor:
+    """Return the ``int64`` per-expert base-address table the kernels consume."""
+    return torch.tensor(
+        [members[index].data_ptr() for index in range(members.shape[0])],
+        dtype=torch.int64,
+        device=members.device,
+    )
+
+
 def _gather_samples(samples: list[float], group: dist.ProcessGroup) -> list[float]:
     """Gather fixed-size CUDA-event samples from every rank."""
     device_samples = torch.tensor(samples, dtype=torch.float64, device="cuda")
-    gathered = [
-        torch.empty_like(device_samples) for _ in range(dist.get_world_size(group))
-    ]
+    gathered = [torch.empty_like(device_samples) for _ in range(dist.get_world_size(group))]
     dist.all_gather(gathered, device_samples, group=group)
     return torch.cat(gathered).cpu().tolist()
 
@@ -89,15 +96,12 @@ def _summarize(samples: list[float]) -> dict[str, float]:
 
 
 @pytest.mark.internal
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA and CuTeDSL are required",
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(
     "grad_dtype", [torch.float32, torch.bfloat16], ids=["fp32-grad", "bf16-grad"]
 )
 def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
-    """Cover owner-push, sparse clearing, zero work, and unequal FC shapes."""
+    """Cover owner-push, sparse plans, zero work, and unequal FC shapes."""
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
         pytest.skip("Replica weight kernel coverage requires a 4-rank torchrun launch")
 
@@ -111,9 +115,7 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
     # transactions as the production 2048x640 expert projections.
     member_numels = (262144, 524288)
     arena_numel = num_local_experts * sum(member_numels)
-    weight_storage, weight_handle = _allocate_symmetric(
-        arena_numel, torch.bfloat16, group
-    )
+    weight_storage, weight_handle = _allocate_symmetric(arena_numel, torch.bfloat16, group)
     grad_storage, grad_handle = _allocate_symmetric(arena_numel, grad_dtype, group)
     weight_arena = weight_storage
     grad_arena = grad_storage
@@ -144,9 +146,7 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
     )
 
     def make_plan(placement: str, slots: tuple[int, ...]) -> torch.Tensor:
-        plan = torch.full(
-            (world_size, num_local_experts), -1, dtype=torch.int32, device=device
-        )
+        plan = torch.full((world_size, num_local_experts), -1, dtype=torch.int32, device=device)
         if placement == "asymmetric":
             plan[0, slots[0]] = num_local_experts
             plan[1, slots[0]] = 2 * num_local_experts
@@ -187,7 +187,7 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
             torch.cuda.synchronize(device)
             dist.barrier(group=group, device_ids=[device.index])
             launch_replica_weight_prefetch(
-                sources=sources,
+                sources=tuple(_pointer_table(source) for source in sources),
                 arena=weight_arena,
                 peer_bases=weight_handle.buffer_ptrs_dev,
                 signal_bases=weight_handle.signal_pad_ptrs_dev,
@@ -214,7 +214,7 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
             dist.barrier(group=group, device_ids=[device.index])
             launch_replica_grad_reduce(
                 arena=grad_arena,
-                native_grads=main_grads,
+                native_grads=tuple(_pointer_table(grad) for grad in main_grads),
                 peer_bases=grad_handle.buffer_ptrs_dev,
                 signal_bases=grad_handle.signal_pad_ptrs_dev,
                 experts_to_copy=plan,
@@ -255,7 +255,12 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
                     num_local_experts, member
                 )
                 for slot in range(num_local_experts):
-                    expected_slot = 0 if slot in local_slots else -77
+                    # The reduction reads the slots and leaves them as they were;
+                    # TE's overwriting wgrad GEMM refreshes them on the next backward.
+                    expected_slot = torch.tensor(
+                        projection * 1000 + rank * 100 + slot + 1 if slot in local_slots else -77,
+                        dtype=grad_dtype,
+                    ).item()
                     if view[slot, 0].item() != expected_slot:
                         errors.append(
                             f"{placement}/{slots} projection {projection} slot {slot} "
@@ -273,11 +278,7 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
                 )
                 for slot in range(num_local_experts):
                     semantic_expert = int(plan[rank, slot])
-                    expected = (
-                        -123
-                        if semantic_expert < 0
-                        else projection * 1000 + semantic_expert
-                    )
+                    expected = -123 if semantic_expert < 0 else projection * 1000 + semantic_expert
                     expected = torch.tensor(expected, dtype=torch.bfloat16).item()
                     if view[slot, 0].item() != expected:
                         errors.append(
@@ -302,10 +303,7 @@ def test_replica_weight_kernels_virtual_only_cases(grad_dtype):
 
 
 @pytest.mark.internal
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA and CuTeDSL are required",
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_replica_mxfp8_weight_kernel_copies_data_and_scales_by_orientation():
     """Copy MXFP8 bytes/scales exactly without touching the other GEMM orientation."""
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
@@ -342,18 +340,10 @@ def test_replica_mxfp8_weight_kernel_copies_data_and_scales_by_orientation():
     for projection in range(2):
         for expert in range(num_local_experts):
             semantic_expert = rank * num_local_experts + expert
-            rowwise_data[projection][expert].fill_(
-                semantic_expert + 1 + 20 * projection
-            )
-            rowwise_scales[projection][expert].fill_(
-                semantic_expert + 65 + 20 * projection
-            )
-            columnwise_data[projection][expert].fill_(
-                semantic_expert + 129 + 20 * projection
-            )
-            columnwise_scales[projection][expert].fill_(
-                semantic_expert + 193 + 20 * projection
-            )
+            rowwise_data[projection][expert].fill_(semantic_expert + 1 + 20 * projection)
+            rowwise_scales[projection][expert].fill_(semantic_expert + 65 + 20 * projection)
+            columnwise_data[projection][expert].fill_(semantic_expert + 129 + 20 * projection)
+            columnwise_scales[projection][expert].fill_(semantic_expert + 193 + 20 * projection)
 
     experts_to_copy = torch.full(
         (world_size, num_local_experts), -1, dtype=torch.int32, device=device
@@ -372,8 +362,7 @@ def test_replica_mxfp8_weight_kernel_copies_data_and_scales_by_orientation():
         world_size=world_size,
         num_local_experts=num_local_experts,
         member_numels=member_numels,
-        rowwise_scale_numels=rowwise_scale_numels,
-        columnwise_scale_numels=columnwise_scale_numels,
+        mxfp8=True,
         num_sms=4,
         device_index=device.index,
     )
@@ -384,8 +373,13 @@ def test_replica_mxfp8_weight_kernel_copies_data_and_scales_by_orientation():
         arena = rowwise_arena if rowwise else columnwise_arena
         handle = rowwise_handle if rowwise else columnwise_handle
         launch_replica_weight_prefetch(
-            sources=rowwise_data if rowwise else columnwise_data,
-            scale_sources=rowwise_scales if rowwise else columnwise_scales,
+            sources=tuple(
+                _pointer_table(source) for source in (rowwise_data if rowwise else columnwise_data)
+            ),
+            scale_sources=tuple(
+                _pointer_table(source)
+                for source in (rowwise_scales if rowwise else columnwise_scales)
+            ),
             arena=arena,
             peer_bases=handle.buffer_ptrs_dev,
             signal_bases=handle.signal_pad_ptrs_dev,
@@ -395,18 +389,13 @@ def test_replica_mxfp8_weight_kernel_copies_data_and_scales_by_orientation():
             world_size=world_size,
             num_local_experts=num_local_experts,
             member_numels=member_numels,
-            rowwise_scale_numels=rowwise_scale_numels,
-            columnwise_scale_numels=columnwise_scale_numels,
-            orientation=orientation,
             num_sms=4,
         )
 
     def projection_views(arena, scale_numels, projection):
         projection_offset = num_local_experts * sum(
             member + scale
-            for member, scale in zip(
-                member_numels[:projection], scale_numels[:projection]
-            )
+            for member, scale in zip(member_numels[:projection], scale_numels[:projection])
         )
         data = arena.narrow(
             0, projection_offset, num_local_experts * member_numels[projection]
@@ -425,9 +414,7 @@ def test_replica_mxfp8_weight_kernel_copies_data_and_scales_by_orientation():
         torch.cuda.synchronize(device)
         owner = (rank + 1) % world_size
         for projection in range(2):
-            data, scale = projection_views(
-                rowwise_arena, rowwise_scale_numels, projection
-            )
+            data, scale = projection_views(rowwise_arena, rowwise_scale_numels, projection)
             expected_data = torch.arange(
                 owner * num_local_experts + 1 + 20 * projection,
                 (owner + 1) * num_local_experts + 1 + 20 * projection,
@@ -448,9 +435,7 @@ def test_replica_mxfp8_weight_kernel_copies_data_and_scales_by_orientation():
         torch.cuda.synchronize(device)
         torch.testing.assert_close(rowwise_arena, rowwise_snapshot, rtol=0, atol=0)
         for projection in range(2):
-            data, scale = projection_views(
-                columnwise_arena, columnwise_scale_numels, projection
-            )
+            data, scale = projection_views(columnwise_arena, columnwise_scale_numels, projection)
             expected_data = torch.arange(
                 owner * num_local_experts + 129 + 20 * projection,
                 (owner + 1) * num_local_experts + 129 + 20 * projection,
@@ -470,13 +455,8 @@ def test_replica_mxfp8_weight_kernel_copies_data_and_scales_by_orientation():
 
 
 @pytest.mark.internal
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA and CuTeDSL are required",
-)
-@pytest.mark.skipif(
-    not _PROFILE_ENABLED, reason="set MCORE_RUN_REPLICA_WEIGHT_PROFILE=1"
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(not _PROFILE_ENABLED, reason="set MCORE_RUN_REPLICA_WEIGHT_PROFILE=1")
 def test_replica_mxfp8_weight_kernel_production_bandwidth():
     """Require production-shape MXFP8 owner-push to approach NVLink bandwidth."""
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
@@ -494,9 +474,7 @@ def test_replica_mxfp8_weight_kernel_production_bandwidth():
     )
     scale_numels = tuple(member // 32 for member in member_numels)
     num_sms = int(os.environ.get("MCORE_REPLICA_WEIGHT_NUM_SMS", "32"))
-    active_slots = int(
-        os.environ.get("MCORE_REPLICA_WEIGHT_ACTIVE_SLOTS", str(num_local_experts))
-    )
+    active_slots = int(os.environ.get("MCORE_REPLICA_WEIGHT_ACTIVE_SLOTS", str(num_local_experts)))
     warmups = int(os.environ.get("MCORE_REPLICA_WEIGHT_WARMUPS", "3"))
     iterations = int(os.environ.get("MCORE_REPLICA_WEIGHT_ITERATIONS", "10"))
     batches = int(os.environ.get("MCORE_REPLICA_WEIGHT_BATCHES", "5"))
@@ -522,22 +500,8 @@ def test_replica_mxfp8_weight_kernel_production_bandwidth():
     # The production bridge binds these device tables once. Keep the benchmark
     # on that steady-state path instead of timing four tiny host-to-device table
     # constructions on every owner-push launch.
-    data_source_bases = tuple(
-        torch.tensor(
-            [source[expert].data_ptr() for expert in range(num_local_experts)],
-            dtype=torch.int64,
-            device=device,
-        )
-        for source in data_sources
-    )
-    scale_source_bases = tuple(
-        torch.tensor(
-            [source[expert].data_ptr() for expert in range(num_local_experts)],
-            dtype=torch.int64,
-            device=device,
-        )
-        for source in scale_sources
-    )
+    data_source_bases = tuple(_pointer_table(source) for source in data_sources)
+    scale_source_bases = tuple(_pointer_table(source) for source in scale_sources)
 
     experts_to_copy = torch.full(
         (world_size, num_local_experts), -1, dtype=torch.int32, device=device
@@ -555,8 +519,7 @@ def test_replica_mxfp8_weight_kernel_production_bandwidth():
         world_size=world_size,
         num_local_experts=num_local_experts,
         member_numels=member_numels,
-        rowwise_scale_numels=scale_numels,
-        columnwise_scale_numels=scale_numels,
+        mxfp8=True,
         num_sms=num_sms,
         device_index=device.index,
     )
@@ -575,9 +538,6 @@ def test_replica_mxfp8_weight_kernel_production_bandwidth():
             world_size=world_size,
             num_local_experts=num_local_experts,
             member_numels=member_numels,
-            rowwise_scale_numels=scale_numels,
-            columnwise_scale_numels=scale_numels,
-            orientation="rowwise",
             num_sms=num_sms,
         )
         torch.cuda.nvtx.range_pop()
@@ -610,13 +570,11 @@ def test_replica_mxfp8_weight_kernel_production_bandwidth():
                     member_numels[:projection], scale_numels[:projection]
                 )
             )
-            data_view = arena.narrow(
-                0, projection_offset, num_local_experts * member
-            ).view(num_local_experts, member)
+            data_view = arena.narrow(0, projection_offset, num_local_experts * member).view(
+                num_local_experts, member
+            )
             scale_view = arena.narrow(
-                0,
-                projection_offset + num_local_experts * member,
-                num_local_experts * scale,
+                0, projection_offset + num_local_experts * member, num_local_experts * scale
             ).view(num_local_experts, scale)
             expected = torch.arange(
                 owner * num_local_experts + projection * 97,
@@ -626,16 +584,10 @@ def test_replica_mxfp8_weight_kernel_production_bandwidth():
             ).to(torch.uint8)
             if active_slots:
                 torch.testing.assert_close(
-                    data_view[:active_slots, -1],
-                    expected[:active_slots],
-                    rtol=0,
-                    atol=0,
+                    data_view[:active_slots, -1], expected[:active_slots], rtol=0, atol=0
                 )
                 torch.testing.assert_close(
-                    scale_view[:active_slots, -1],
-                    expected[:active_slots] + 41,
-                    rtol=0,
-                    atol=0,
+                    scale_view[:active_slots, -1], expected[:active_slots] + 41, rtol=0, atol=0
                 )
 
         gathered_samples = _gather_samples(samples, group)
@@ -662,10 +614,7 @@ def test_replica_mxfp8_weight_kernel_production_bandwidth():
                 "effective_gbps": effective_gbps,
                 "minimum_gbps": minimum_gbps,
             }
-            print(
-                "REPLICA_MXFP8_WEIGHT_PROFILE=" + json.dumps(result, sort_keys=True),
-                flush=True,
-            )
+            print("REPLICA_MXFP8_WEIGHT_PROFILE=" + json.dumps(result, sort_keys=True), flush=True)
         assert effective_gbps >= minimum_gbps, (
             f"MXFP8 replica prefetch achieved {effective_gbps:.1f} GB/s, "
             f"below the {minimum_gbps:.1f} GB/s target"
@@ -678,13 +627,8 @@ def test_replica_mxfp8_weight_kernel_production_bandwidth():
 
 
 @pytest.mark.internal
-@pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="CUDA and CuTeDSL are required",
-)
-@pytest.mark.skipif(
-    not _PROFILE_ENABLED, reason="set MCORE_RUN_REPLICA_WEIGHT_PROFILE=1"
-)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(not _PROFILE_ENABLED, reason="set MCORE_RUN_REPLICA_WEIGHT_PROFILE=1")
 def test_replica_weight_kernels_production_profile():
     """Profile correct prefetch and grad-reduce results at the production shape."""
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
@@ -701,28 +645,21 @@ def test_replica_weight_kernels_production_profile():
         int(os.environ.get("MCORE_REPLICA_WEIGHT_FC2_NUMEL", str(2048 * 640))),
     )
     num_sms = int(os.environ.get("MCORE_REPLICA_WEIGHT_NUM_SMS", "32"))
-    active_slots = int(
-        os.environ.get("MCORE_REPLICA_WEIGHT_ACTIVE_SLOTS", str(num_local_experts))
-    )
+    active_slots = int(os.environ.get("MCORE_REPLICA_WEIGHT_ACTIVE_SLOTS", str(num_local_experts)))
     warmups = int(os.environ.get("MCORE_REPLICA_WEIGHT_WARMUPS", "3"))
     iterations = int(os.environ.get("MCORE_REPLICA_WEIGHT_ITERATIONS", "10"))
     grad_dtype_name = os.environ.get("MCORE_REPLICA_WEIGHT_GRAD_DTYPE", "fp32")
     grad_dtypes = {"fp32": torch.float32, "bf16": torch.bfloat16}
     if grad_dtype_name not in grad_dtypes:
         raise ValueError(
-            "MCORE_REPLICA_WEIGHT_GRAD_DTYPE must be 'fp32' or 'bf16', "
-            f"got {grad_dtype_name!r}."
+            "MCORE_REPLICA_WEIGHT_GRAD_DTYPE must be 'fp32' or 'bf16', " f"got {grad_dtype_name!r}."
         )
     grad_dtype = grad_dtypes[grad_dtype_name]
     if not 0 <= active_slots <= num_local_experts:
-        raise ValueError(
-            f"active slots must be in [0, {num_local_experts}], got {active_slots}."
-        )
+        raise ValueError(f"active slots must be in [0, {num_local_experts}], got {active_slots}.")
 
     arena_numel = num_local_experts * sum(member_numels)
-    weight_arena, weight_handle = _allocate_symmetric(
-        arena_numel, torch.bfloat16, group
-    )
+    weight_arena, weight_handle = _allocate_symmetric(arena_numel, torch.bfloat16, group)
     grad_arena, grad_handle = _allocate_symmetric(arena_numel, grad_dtype, group)
     weight_arena.fill_(-123)
     sources = tuple(
@@ -732,14 +669,7 @@ def test_replica_weight_kernels_production_profile():
     for projection, source in enumerate(sources):
         for expert in range(num_local_experts):
             source[expert].fill_(projection * 1000 + rank * num_local_experts + expert)
-    source_bases = tuple(
-        torch.tensor(
-            [source[expert].data_ptr() for expert in range(num_local_experts)],
-            dtype=torch.int64,
-            device=device,
-        )
-        for source in sources
-    )
+    source_bases = tuple(_pointer_table(source) for source in sources)
 
     experts_to_copy = torch.full(
         (world_size, num_local_experts), -1, dtype=torch.int32, device=device
@@ -758,6 +688,7 @@ def test_replica_weight_kernels_production_profile():
         torch.zeros(num_local_experts, member, dtype=grad_dtype, device=device)
         for member in member_numels
     )
+    main_grad_bases = tuple(_pointer_table(grad) for grad in main_grads)
     compile_replica_weight_kernels(
         world_size=world_size,
         num_local_experts=num_local_experts,
@@ -831,7 +762,7 @@ def test_replica_weight_kernels_production_profile():
         torch.cuda.nvtx.range_push("replica_grad_reduce_profile")
         launch_replica_grad_reduce(
             arena=grad_arena,
-            native_grads=main_grads,
+            native_grads=main_grad_bases,
             peer_bases=grad_handle.buffer_ptrs_dev,
             signal_bases=grad_handle.signal_pad_ptrs_dev,
             experts_to_copy=experts_to_copy,
@@ -859,12 +790,9 @@ def test_replica_weight_kernels_production_profile():
             grad_samples.append(start.elapsed_time(end))
 
     for projection, main_grad in enumerate(main_grads):
-        expected = torch.full(
-            (num_local_experts,), 1 + projection, dtype=grad_dtype, device=device
-        )
+        expected = torch.full((num_local_experts,), 1 + projection, dtype=grad_dtype, device=device)
         expected[:active_slots].add_(2 + projection)
         torch.testing.assert_close(main_grad[:, 0], expected)
-    torch.testing.assert_close(grad_arena, torch.zeros_like(grad_arena))
 
     prefetch_samples = _gather_samples(prefetch_samples, group)
     grad_samples = _gather_samples(grad_samples, group)
@@ -881,9 +809,7 @@ def test_replica_weight_kernels_production_profile():
             "prefetch_ms": _summarize(prefetch_samples),
             "grad_reduce_ms": _summarize(grad_samples),
         }
-        print(
-            "REPLICA_WEIGHT_PROFILE=" + json.dumps(result, sort_keys=True), flush=True
-        )
+        print("REPLICA_WEIGHT_PROFILE=" + json.dumps(result, sort_keys=True), flush=True)
 
     dist.barrier(group=group, device_ids=[device.index])
     del weight_handle, grad_handle, weight_arena, grad_arena
