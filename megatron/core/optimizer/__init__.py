@@ -764,8 +764,25 @@ def _get_megatron_emerging_optimizer(
         eopt_name = bare_name
         use_layer_wise = True
 
-    if isinstance(model_chunks[0], FullyShardedDataParallelV2):
-        raise NotImplementedError("MFSDP v2 with emerging optimizers is not currently validated.")
+    is_mfsdp_v2 = isinstance(model_chunks[0], FullyShardedDataParallelV2)
+    if is_mfsdp_v2:
+        if eopt_name != 'muon':
+            raise NotImplementedError(
+                "MFSDP v2 currently supports only Muon among emerging optimizers, "
+                f"got {eopt_name!r}."
+            )
+        if use_layer_wise:
+            raise ValueError(
+                "MFSDP v2 Muon uses owner-compute sharding and does not support the "
+                "layer-wise distributed optimizer."
+            )
+        if config.use_distributed_optimizer:
+            raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
+        if config.muon_scalar_optimizer != 'adam':
+            raise ValueError(
+                "MFSDP v2 Muon routes excluded parameters through Adam and requires "
+                "muon_scalar_optimizer='adam'."
+            )
 
     if not HAVE_EMERGING_OPTIMIZERS:
         raise ImportError(
@@ -904,6 +921,51 @@ def _get_megatron_emerging_optimizer(
             optimizer, init_state_fn = _create_emerging_optimizer(
                 config, groups, eopt_name, model_chunks, pg_collection
             )
+            if is_mfsdp_v2:
+                from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.orthogonalized_optimizer import (
+                    FsdpMuon,
+                )
+
+                parameters = [parameter for group in groups for parameter in group['params']]
+                if not parameters:
+                    raise RuntimeError("MFSDP v2 Muon received no parameters on this rank.")
+
+                dp_mesh = parameters[0].device_mesh
+                if dp_mesh.ndim != 1:
+                    raise ValueError(
+                        "MFSDP v2 Muon currently supports a one-dimensional data-parallel "
+                        f"mesh, got mesh shape {tuple(dp_mesh.mesh.shape)}."
+                    )
+                expected_ranks = tuple(
+                    torch.distributed.get_process_group_ranks(dp_mesh.get_group())
+                )
+                for parameter in parameters[1:]:
+                    parameter_mesh = parameter.device_mesh
+                    if (
+                        parameter_mesh.ndim != 1
+                        or tuple(
+                            torch.distributed.get_process_group_ranks(parameter_mesh.get_group())
+                        )
+                        != expected_ranks
+                    ):
+                        raise ValueError(
+                            "Each MFSDP v2 Muon optimizer instance requires all parameters "
+                            "to use the same one-dimensional data-parallel mesh."
+                        )
+
+                optimizer = FsdpMuon(groups, inner_optimizer=optimizer, dp_mesh=dp_mesh)
+                optimizer = FullyShardedOptimizer(
+                    optimizer, config, None, init_state_fn, model_chunks=model_chunks
+                )
+                setattr(optimizer, 'grad_stats_parallel_group', torch.distributed.group.WORLD)
+                setattr(optimizer, 'tp_group', pg_collection.tp)
+                setattr(
+                    optimizer,
+                    'expert_tp_group',
+                    getattr(pg_collection, 'expt_tp', pg_collection.tp),
+                )
+                results.append(optimizer)
+                continue
             if use_layer_wise:
                 layer_wise_base_results.append((optimizer, init_state_fn))
                 continue
@@ -923,6 +985,16 @@ def _get_megatron_emerging_optimizer(
         else:
             fallback_config = copy.copy(config)
             fallback_config.optimizer = opt_name
+            if is_mfsdp_v2:
+                # Match the standard MFSDP v2 Adam path: empty local DTensor shards
+                # have no optimizer state or data to update and must be omitted.
+                for group in groups:
+                    group['params'] = [
+                        parameter
+                        for parameter in group['params']
+                        if parameter.to_local().numel() > 0
+                    ]
+                groups = [group for group in groups if group['params']]
             if use_separate_distributed_optimizer:
                 # Route non-emerging params (adam/lion) through a real DistributedOptimizer
                 # (byte-level sharding) instead of stuffing them inside LayerWise.

@@ -27,7 +27,7 @@ momentum-SGD step (no orthogonalization).
 Communication is asynchronous and issued on a dedicated owner-comm stream using a dedicated
 (duplicate) owner-comm process group, so owner P2P ordering is independent of FSDP's
 forward/backward collectives. The synchronous waiting (`_wait_for_dist_buffer`) is deferred as late
-as possible so local Newton-Schulz work overlaps owner gathers/scatters. """
+as possible so local Newton-Schulz work overlaps owner gathers/scatters."""
 
 from __future__ import annotations
 
@@ -142,9 +142,9 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             owner-based peer-to-peer communications. Useful to disable for testing
             reasons, giving a synchronous algorithm. Defaults to True.
         reconstruct_full_param: Whether to also gather local weight shards and pass
-            them to orthogonalization. When False, `None` is passed as the
-            parameter to orthogonalize. Defaults to False, since it's not used in
-            the standard case.
+            their full value to orthogonalization. When False, the sharded parameter
+            is passed for shape and tensor-parallel metadata only. Defaults to False,
+            since the standard Muon path does not read parameter values.
         num_ns_steps: Newton-Schulz iteration count, also used by the owner
             load-balancing cost heuristic. If None, defaults to 1.
     """
@@ -539,9 +539,8 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         """
         with eo_utils.fp32_matmul_precision(self._inner.fp32_matmul_prec):
             # `param` (AKA `p`) is typed as `torch.Tensor` in
-            # `emerging_optimizers.OrthogonalizedOptimizer`. However, we explicitly want to error if
-            # the function tries to use it as a tensor, but we pass `None`. So we remove the `None`
-            # type here to remove the type error for that parameter explicitly.
+            # `emerging_optimizers.OrthogonalizedOptimizer`. Some compatible inner optimizers may
+            # accept `None`, so keep that internal flexibility while narrowing the call type here.
             param = cast(torch.Tensor, param)
             # The Newton-Schulz kernel is FP32-only, so cast accordingly.
             return self._inner.orthogonalize(param, pre_ns.to(torch.float32), **kwargs)
@@ -562,12 +561,12 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         parameter with the result of orthogonalization. (Fully-local path: no communication.)
 
         For a fully-local parameter the owning rank's local shard *is* the full
-        parameter, so no gather is needed: pass it directly when
-        `reconstruct_full_param` is enabled, else `None` (matching the
-        boundary path).
+        parameter, so no gather is needed. Pass its local value when
+        `reconstruct_full_param` is enabled; otherwise pass the sharded parameter
+        so the inner optimizer can read shape and tensor-parallel metadata.
         """
         group_kwargs = {k: v for k, v in group.items() if k != "params"}
-        param_arg = param.to_local() if self.reconstruct_full_param else None
+        param_arg = param.to_local() if self.reconstruct_full_param else param
         update = self._orthogonalize_with_precision(param_arg, pre_ns, **group_kwargs)
         self._apply_update(param, update, lr)
 
@@ -881,12 +880,10 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             # unsharded input tensor.
             full = reconstruct_full_tensor(i, plan, gather_plan, recv_buffers, owner_rank=this_rank)
             # `full` is the reconstructed pre-NS matrix and is the
-            # orthogonalization input (`pre_ns`). The `param` (`p`) argument is
-            # unused by the default `OrthogonalizedOptimizer.orthogonalize`, so
-            # by default (`reconstruct_full_param=False`) we pass `None`. When the
-            # flag is enabled, reconstruct the full parameter from the gathered
-            # weight shards (a second P2P round issued in `_issue_owner_gather`) and
-            # pass it as `param` for subclasses that read `p`.
+            # orthogonalization input (`pre_ns`). The default MCore Muon reads shape
+            # and tensor-parallel attributes from `param` but does not read its values,
+            # so pass the original sharded parameter unless the caller explicitly asks
+            # us to reconstruct the full value.
             if self.reconstruct_full_param and state.weight_gather_plan is not None:
                 assert state.weight_recv_buffers is not None
                 param_arg = reconstruct_full_tensor(
@@ -897,7 +894,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                     owner_rank=this_rank,
                 )
             else:
-                param_arg = None
+                param_arg = b_params[i]
             full_updates[i] = self._orthogonalize_with_precision(param_arg, full, **group_kwargs)
 
         # Phase 5: pack + P2P-send update shards from owners (async on owner stream).

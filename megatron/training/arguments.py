@@ -1156,8 +1156,9 @@ def validate_args(args, defaults={}):
                 "GroupedTensor param buffers."
             )
         # Optimizer compatibility check.
-        assert args.optimizer in ('sgd', 'adam'), \
-            f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
+        assert args.optimizer in ('sgd', 'adam') or (
+            args.optimizer == 'muon' and args.megatron_fsdp_version == 2
+        ), f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         if (
             args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]
@@ -1791,7 +1792,7 @@ def validate_args(args, defaults={}):
 
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
-    if args.optimizer not in ('sgd', 'adam'):
+    if args.optimizer not in ('sgd', 'adam') and not args.use_megatron_fsdp:
         if args.optimizer == 'dist_muon':
             warn_rank_0(
                 "optimizer='dist_muon' is deprecated. "
@@ -1804,9 +1805,12 @@ def validate_args(args, defaults={}):
             args.use_layer_wise_distributed_optimizer = True
             args.use_distributed_optimizer = False
 
-        assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+        assert not args.use_torch_fsdp2, (
+            "Emerging optimizer does not support Torch-FSDP2 for now."
+        )
+        assert args.ckpt_format in ["torch", "torch_dist"], (
+            "Emerging optimizer supports torch and torch_dist checkpoint format."
+        )
 
     assert not (
         args.use_layer_wise_distributed_optimizer and args.moe_single_grouped_weight
