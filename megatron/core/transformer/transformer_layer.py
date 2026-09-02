@@ -1708,7 +1708,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         Check if we should call the local cudagraph path.
         """
         # Training and validation mode CUDA graphs.
-        # Standard validation is routed through the manager to run eagerly.
         if (
             hasattr(self, 'cudagraph_manager')
             and kwargs.get('inference_context') is None

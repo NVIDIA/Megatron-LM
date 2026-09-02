@@ -1907,8 +1907,10 @@ class CudaGraphManager(torch.nn.Module):
                 Setting this argument to True always forces the inline capture path to be taken.
             num_warmup_steps: If set, overrides the per-runner warmup step count.
         """
+        self.config = config
         self._inline_capture = inline_capture
         self._num_warmup_steps = num_warmup_steps
+        self._replayed_training_graph_in_eval = False
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
@@ -1968,6 +1970,29 @@ class CudaGraphManager(torch.nn.Module):
         # idempotent, and graph creation removes the hook before capture begins.
         if need_backward:
             _CudagraphGlobalRecord._enable_saved_tensors_observer()
+
+    def train(self, mode: bool = True):
+        """Set training mode and discard temporary state replayed during evaluation."""
+        was_training = self.training
+        super().train(mode)
+
+        if mode and not was_training and self._replayed_training_graph_in_eval:
+            # A training-captured graph preserves capture-time buffer updates even when replayed
+            # under no_grad. Reset each distinct graph owner before its next training forward so
+            # validation state cannot reach the next finalize_model_grads call.
+            from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
+
+            graph_owners = []
+            seen_owner_ids = set()
+            for runner in self.cudagraph_runners:
+                owner = runner.base_module
+                if isinstance(owner, torch.nn.Module) and id(owner) not in seen_owner_ids:
+                    graph_owners.append(owner)
+                    seen_owner_ids.add(id(owner))
+            reset_model_temporary_tensors(self.config, graph_owners)
+            self._replayed_training_graph_in_eval = False
+
+        return self
 
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
@@ -2077,21 +2102,7 @@ class CudaGraphManager(torch.nn.Module):
             is_in_checkpoint_fwd = is_in_checkpoint_fwd or is_fp8_activation_recompute_enabled()
 
         if _CudagraphGlobalRecord.cudagraph_created:
-            is_explicit_inference = is_inference_mode or self._inline_capture
-            module_is_training = getattr(megatron_module, "training", self.training)
-            can_replay_training_graph = module_is_training and (
-                torch.is_grad_enabled() or is_in_checkpoint_fwd
-            )
-            # Validation falls back to eager execution because Python grad-mode branches and
-            # mutable-buffer side effects are fixed at capture time. Forward-only paths such as
-            # freeze-all training or RL evaluation require additional support before they can
-            # safely replay partial CUDA graphs.
-            if not is_explicit_inference and not can_replay_training_graph:
-                if self.func is not None:
-                    return self.func(*args, **kwargs)
-                return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
-
-            if module_is_training and torch.is_grad_enabled():
+            if self.training and torch.is_grad_enabled():
                 # Trigger Mcore DDP pre-forward hooks
                 self.call_ddp_preforward_hook(megatron_module)
                 for module in megatron_module.modules():
@@ -2101,6 +2112,12 @@ class CudaGraphManager(torch.nn.Module):
                 megatron_module, args, kwargs, self.reuse_cudagraphs, cache_key=cache_key
             )
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
+            if (
+                not is_inference_mode
+                and not self._inline_capture
+                and not getattr(megatron_module, "training", self.training)
+            ):
+                self._replayed_training_graph_in_eval = True
         else:
             if is_inference_mode or self._inline_capture:
                 # Inference generation mode creates graphs immediately
