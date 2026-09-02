@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import threading
 
 from megatron.inference.integrations.dynamo.telemetry import (
