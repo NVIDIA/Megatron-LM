@@ -318,6 +318,8 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     )
     a.generated_text = "foo"
     b.generated_text = "bar"
+    a.generated_log_probs = None
+    b.generated_log_probs = [-0.5]
     a.routing_indices = np.array([[1, 2]])
     b.routing_indices = np.array([[3, 4]])
     b.policy_epoch = [(0, 3)]
@@ -327,6 +329,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     merged = rec.merge()
     assert merged.generated_tokens == [10, 11, 12]
     assert merged.generated_text == "foobar"
+    assert merged.generated_log_probs == [-0.5]
     assert merged.generated_length == 3 and merged.latency == 4.2
     assert merged.routing_indices.tolist() == [[1, 2], [3, 4]]
     # Every request mints a distinct chatcmpl- uid; merge() keeps the FIRST
