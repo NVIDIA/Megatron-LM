@@ -19,9 +19,9 @@ from megatron.core.transformer.moe.replica_planner import (
     _ReplicaProjection,
     _WeightDirection,
     map_replica_plan_to_hybridep,
-    start_replica_grad_reduce_after_expert_backward,
+    start_replica_grad_reduce_after_dispatch_backward,
     start_replica_weight_prefetch_before_layer_backward,
-    wait_replica_grad_reduce_after_dispatch_backward,
+    wait_replica_grad_reduce_at_layer_input,
     wait_replica_weight_prefetch_before_expert_backward,
 )
 
@@ -166,11 +166,11 @@ def test_replica_async_collectives_span_transport_backward():
             assert current_plan is plan and direction is _WeightDirection.BACKWARD
             events.append("start_prefetch")
 
-        def wait_prefetch(self, current_plan):
+        def wait_prefetch_for_backward(self, current_plan):
             assert current_plan is plan
             events.append("wait_prefetch")
 
-        def start_grad_reduce(self, current_plan):
+        def start_pending_grad_reduces(self, current_plan):
             assert current_plan is plan
             events.append("start_grad_reduce")
 
@@ -192,9 +192,10 @@ def test_replica_async_collectives_span_transport_backward():
 
     bridge = FakeBridge()
     hidden = torch.ones((), requires_grad=True)
-    hidden = wait_replica_grad_reduce_after_dispatch_backward(hidden, bridge, plan)
+    hidden = wait_replica_grad_reduce_at_layer_input(hidden, bridge, SimpleNamespace(plan=plan))
+    hidden = BackwardMarker.apply(hidden, "router_and_shared_expert_backward")
+    hidden = start_replica_grad_reduce_after_dispatch_backward(hidden, bridge, plan)
     hidden = BackwardMarker.apply(hidden, "dispatch_backward")
-    hidden = start_replica_grad_reduce_after_expert_backward(hidden, bridge, plan)
     hidden = BackwardMarker.apply(hidden, "expert_backward")
     hidden = wait_replica_weight_prefetch_before_expert_backward(hidden, bridge, plan)
     hidden = BackwardMarker.apply(hidden, "combine_backward")
@@ -208,8 +209,9 @@ def test_replica_async_collectives_span_transport_backward():
         "combine_backward",
         "wait_prefetch",
         "expert_backward",
-        "start_grad_reduce",
         "dispatch_backward",
+        "start_grad_reduce",
+        "router_and_shared_expert_backward",
         "wait_grad_reduce",
     ]
     for index, parameter in enumerate(bridge.source_parameters):
@@ -217,6 +219,18 @@ def test_replica_async_collectives_span_transport_backward():
             parameter.grad, torch.full_like(parameter, index + 1), rtol=0, atol=0
         )
         assert parameter.grad.data_ptr() != bridge.source_grads[index].data_ptr()
+
+
+def test_replica_fc2_wgrad_store_runs_gemm_then_starts_reduction():
+    from megatron.core.transformer.moe.experts import _ReplicaFC2WgradStore
+
+    events = []
+    store = _ReplicaFC2WgradStore(
+        SimpleNamespace(start_fc2_grad_reduce=lambda: events.append("start"))
+    )
+    assert store.delay_wgrad_compute() and store.context is None
+    store.put(["x", "dy", "out"], lambda *tensors: events.append(tensors))
+    assert events == [("x", "dy", "out"), "start"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -238,7 +252,9 @@ def test_replica_fused_wgrad_handoff_preserves_fp32():
             return (external_wgrad,)
 
     hidden = torch.ones((), device=device, requires_grad=True)
-    wait_replica_grad_reduce_after_dispatch_backward(hidden, FakeBridge(), plan).backward()
+    wait_replica_grad_reduce_at_layer_input(
+        hidden, FakeBridge(), SimpleNamespace(plan=plan)
+    ).backward()
 
     torch.testing.assert_close(parameter.main_grad, external_wgrad, rtol=0, atol=0)
     assert parameter.grad_added_to_main_grad
@@ -283,9 +299,13 @@ def test_replica_planner_slots_preserve_two_outstanding_forwards(monkeypatch):
             self.last_plan = None
             self.prefetched = []
             self.reduced = []
+            self.started = []
 
         def start_prefetch(self, plan):
             self.prefetched.append(plan)
+
+        def start_pending_grad_reduces(self, plan):
+            self.started.append(plan)
 
         def wait_grad_reduce(self, plan):
             self.reduced.append(plan)
@@ -311,18 +331,18 @@ def test_replica_planner_slots_preserve_two_outstanding_forwards(monkeypatch):
     manager._replica_plan_slots = []
     manager._active_replica_plan_slot = None
     manager._plan = None
+    manager._layer_context = None
 
     retained_outputs = []
     retained_plans = []
     retained_snapshots = []
     for depth in range(2):
         manager.semantic_token_indices.fill_(depth)
+        hidden = manager.wrap_layer_input(torch.ones((), requires_grad=True))
         plan = manager._prepare_replica_plan(torch.ones((2, 4)))
         retained_plans.append(plan)
         retained_snapshots.append((plan.virtual_experts.clone(), plan.experts_to_copy.clone()))
-        retained_outputs.append(
-            manager._wrap_replica_dispatch_input(torch.ones((), requires_grad=True))
-        )
+        retained_outputs.append(manager._wrap_replica_dispatch_input(hidden))
         manager._finish_replica_plan()
 
     assert len(allocated) == 2
