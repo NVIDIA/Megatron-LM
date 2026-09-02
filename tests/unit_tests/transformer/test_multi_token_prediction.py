@@ -3251,6 +3251,7 @@ class TestMultiTokenPredictionHybrid:
         model = types.SimpleNamespace(
             config=types.SimpleNamespace(
                 fine_grained_activation_offloading=False,
+                freeze_base_model_for_mtp=False,
                 moe_paged_stash=False,
                 multi_latent_attention=False,
                 mtp_num_layers=1,
