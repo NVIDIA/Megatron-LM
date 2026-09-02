@@ -76,9 +76,9 @@ def checkpointed_forward(
                 else:
                     inner_quantization_context = nullcontext()
 
-                # Build the full TransformerLayer kwarg set; for non-TL
-                # layers (currently MambaLayer in HybridStack) pop the kwargs
-                # they don't accept and treat the return as a single tensor.
+                # Build the full TransformerLayer kwarg set. Hybrid mHC wrappers expose
+                # an explicit capability flag so this module does not need to import
+                # hybrid_block (which would create a circular import).
                 layer_kwargs = dict(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
@@ -94,7 +94,15 @@ def checkpointed_forward(
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
-                    else:  # MambaLayer (HybridStack `M` slot)
+                    elif getattr(layer, "supports_hybrid_recompute_kwargs", False):
+                        # HyperConnectionHybridLayer accepts the routing metadata
+                        # consumed by wrapped MoE layers, but not cross-attention kwargs
+                        # from the TransformerLayer interface. This also covers a wrapper
+                        # around a MambaLayer; the wrapper narrows kwargs for its inner layer.
+                        for k in ("context", "context_mask", "attention_bias"):
+                            layer_kwargs.pop(k, None)
+                        hidden_states, context = layer(**layer_kwargs)
+                    else:  # An unwrapped layer with a narrower interface, e.g. MambaLayer.
                         for k in (
                             "context",
                             "context_mask",

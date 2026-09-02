@@ -103,6 +103,8 @@ class TestValidateSegmentLayers:
         with pytest.raises(ValueError):
             # Not allowed to have both standard Attention and MLA/DSA
             validate_segment_layers("MDM*-")
+        with pytest.raises(ValueError):
+            validate_segment_layers("M+M*-")
 
     def test_window_symbol(self):
         """'W' (sliding-window-only DSv4 attention) is a first-class MLA layer symbol."""
@@ -179,6 +181,8 @@ class TestParseHybridPattern:
             ("GEGEGE*E", "GEGEGE*E"),
             ("MDMD", "MDMD"),
             ("DM", "DM"),
+            ("M+M+", "M+M+"),
+            ("+M", "+M"),
         ]
         for pattern, expected_main in test_cases:
             result = parse_hybrid_pattern(pattern)
@@ -303,6 +307,8 @@ class TestParseHybridPattern:
             ("GEGEGE*E/GG/GG", "GEGEGE*E", "GG", 2),
             # DSA in main pattern with MTP
             ("MDMD/MD/MD", "MDMD", "MD", 2),
+            # MLA in main pattern with MTP
+            ("M+M+/M+/M+", "M+M+", "M+", 2),
         ]
         for pattern, expected_main, expected_mtp, expected_depths in test_cases:
             result = parse_hybrid_pattern(pattern)
@@ -360,6 +366,19 @@ class TestGetHybridLayerCounts:
             'K': 0,
             'M': 1,
             '+': 0,
+            '-': 1,
+            'E': 1,
+        }
+        assert get_hybrid_layer_counts("MG+-E") == {
+            'C': 0,
+            'H': 0,
+            'W': 0,
+            '*': 0,
+            'D': 0,
+            'G': 1,
+            'K': 0,
+            '+': 1,
+            'M': 1,
             '-': 1,
             'E': 1,
         }
@@ -878,4 +897,40 @@ class TestGetLayerMapsFromLayerTypeList:
         assert attention_map == {}
         assert mamba_map == {0: 0, 1: 1, 2: 2}
         assert mlp_map == {}
+        assert moe_map == {}
+
+    def test_mla(self):
+        """+ layers are mapped independently of other attention types."""
+        maps = get_layer_maps_from_layer_type_list(["+", "M", "+", "M"])
+        attention_map, dsa_map, mamba_map, mla_map, mlp_map, moe_map = operator.itemgetter(
+            Symbols.ATTENTION,
+            Symbols.DS_ATTENTION,
+            Symbols.MAMBA,
+            Symbols.MLA,
+            Symbols.MLP,
+            Symbols.MOE,
+        )(maps)
+        assert attention_map == {}
+        assert dsa_map == {}
+        assert mla_map == {0: 0, 2: 1}
+        assert mamba_map == {1: 0, 3: 1}
+        assert mlp_map == {}
+        assert moe_map == {}
+
+    def test_mixed_dsa_and_mla(self):
+        """D and + can coexist because both use decoupled RoPE."""
+        maps = get_layer_maps_from_layer_type_list(["D", "+", "M", "-"])
+        attention_map, dsa_map, mamba_map, mla_map, mlp_map, moe_map = operator.itemgetter(
+            Symbols.ATTENTION,
+            Symbols.DS_ATTENTION,
+            Symbols.MAMBA,
+            Symbols.MLA,
+            Symbols.MLP,
+            Symbols.MOE,
+        )(maps)
+        assert attention_map == {}
+        assert dsa_map == {0: 0}
+        assert mla_map == {1: 0}
+        assert mamba_map == {2: 0}
+        assert mlp_map == {3: 0}
         assert moe_map == {}

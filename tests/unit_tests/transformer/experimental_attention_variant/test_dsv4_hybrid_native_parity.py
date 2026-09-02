@@ -157,7 +157,8 @@ def _make_config(
         add_bias_linear=False,
         bf16=True,
         params_dtype=torch.bfloat16,
-        layernorm_epsilon=1e-6,
+        layernorm_epsilon=1e-5,
+        attention_latent_norm_epsilon=1e-6,
         normalization="RMSNorm",
         qk_layernorm=True,
         layernorm_zero_centered_gamma=False,
@@ -765,12 +766,12 @@ class NativeDSv4HybridAttention(nn.Module):
             self._rope_yarn_kwargs = dict()
 
         self.linear_q_down_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
-        self.q_layernorm = nn.RMSNorm(config.q_lora_rank, eps=config.layernorm_epsilon)
+        self.q_layernorm = nn.RMSNorm(config.q_lora_rank, eps=config.attention_latent_norm_epsilon)
         self.linear_q_up_proj = nn.Linear(
             config.q_lora_rank, config.num_attention_heads * config.v_head_dim, bias=False
         )
         self.linear_kv_proj = nn.Linear(config.hidden_size, config.v_head_dim, bias=False)
-        self.kv_layernorm = nn.RMSNorm(config.v_head_dim, eps=config.layernorm_epsilon)
+        self.kv_layernorm = nn.RMSNorm(config.v_head_dim, eps=config.attention_latent_norm_epsilon)
         self.core_attention = NativeCompressedSparseAttention(config, compress_ratio)
         group_in = (config.num_attention_heads * config.v_head_dim) // config.o_groups
         self.linear_o_group_proj = NativeBatchedLinear(
@@ -1037,6 +1038,7 @@ class TestDSv4HybridNativeParity:
         use_fused_kernels: bool,
         calculate_per_token_loss: bool,
         dsa_indexer_use_sparse_loss: bool,
+        monkeypatch,
     ):
         if use_fused_kernels:
             _skip_if_real_kernels_unavailable(need_flash_mla=True)
@@ -1068,6 +1070,27 @@ class TestDSv4HybridNativeParity:
             spec, config=config, layer_number=1, cp_comm_type=None, pg_collection=pg_collection
         ).cuda()
         native_layer = NativeDSv4HybridAttention(config, mcore_ratio).cuda()
+
+        native_q_rms_norm_eps = []
+        native_q_rms_norm = _native_q_rms_norm
+
+        def _tracked_native_q_rms_norm(query, eps):
+            native_q_rms_norm_eps.append(eps)
+            return native_q_rms_norm(query, eps)
+
+        monkeypatch.setattr(sys.modules[__name__], "_native_q_rms_norm", _tracked_native_q_rms_norm)
+
+        for layer in (real_layer, native_layer):
+            assert layer.q_layernorm.eps == pytest.approx(config.attention_latent_norm_epsilon)
+            assert layer.kv_layernorm.eps == pytest.approx(config.attention_latent_norm_epsilon)
+        if compress_ratio > 1:
+            assert real_layer.core_attention.compressor.norm.eps == pytest.approx(
+                config.layernorm_epsilon
+            )
+            assert native_layer.core_attention.compressor.norm.eps == pytest.approx(
+                config.layernorm_epsilon
+            )
+
         real_params = _copy_real_params_to_native(real_layer, native_layer)
 
         bsz = 1
@@ -1085,6 +1108,7 @@ class TestDSv4HybridNativeParity:
 
             real_out, _ = real_layer(hidden_states=hidden_states, attention_mask=None)
             native_out, native_indexer_loss = native_layer(hidden_states_native, pg_collection)
+            assert native_q_rms_norm_eps == [config.layernorm_epsilon]
 
             _assert_similarity(
                 real_out.detach(),

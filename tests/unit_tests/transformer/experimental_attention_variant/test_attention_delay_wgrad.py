@@ -150,10 +150,12 @@ def _make_dsa_config(delay_wgrad=True):
         rotary_base=10000,
         rotary_percent=1.0,
         experimental_attention_variant='dsa',
+        apply_rope_fusion=True,
         # Sparse attention specific configs
         dsa_indexer_n_heads=8,
         dsa_indexer_head_dim=64,
         dsa_indexer_topk=32,
+        dsa_indexer_rope_interleaved=True,
         # Indexer top-k is non-differentiable: the indexer linears ONLY receive
         # gradients through the indexer KL loss.  coeff=0 would make this test vacuous.
         dsa_indexer_loss_coeff=1.0,
