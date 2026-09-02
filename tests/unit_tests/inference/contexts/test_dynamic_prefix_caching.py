@@ -2684,6 +2684,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             tensor_model_parallel_size=case.get("tp", 1),
             pipeline_model_parallel_size=case.get("pp", 1),
             expert_model_parallel_size=case.get("ep", 1),
+            use_moe_layer_spec=feature == "moe",
             model_provider=case.get("model_provider", "gpt"),
             ssm_mixer=case.get("ssm_mixer", "mamba"),
             enable_prefix_caching=enable_prefix_caching,
@@ -2691,7 +2692,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             num_speculative_tokens=2 if feature == "mtp" else 0,
             materialize_only_last_token_logits=feature != "mtp",
             position_embedding_type="rope" if feature == "fused-rope" else "learned_absolute",
-            hidden_size=64 if feature == "fused-rope" else None,
+            # Use the smallest head width handled by FlashInfer's dedicated
+            # cos/sin-cache RoPE kernel rather than its generic fallback.
+            hidden_size=256 if feature == "fused-rope" else None,
             top_k=1,
         )
         config.prefix_caching_eviction_policy = case["policy"]
@@ -2841,7 +2844,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             model = engine.controller.inference_wrapped_model.model
             model.rotary_pos_emb.inv_freq = model.rotary_pos_emb.inv_freq.cuda()
             model.rotary_pos_emb_cache.clear()
-            assert model.config.hidden_size // model.config.num_attention_heads == 16
+            assert model.config.hidden_size // model.config.num_attention_heads == 64
         evidence = self._install_runtime_witnesses(engine, case["feature"])
         pool_size = allocator.pool_size
         storage_size = context.memory_buffer.untyped_storage().nbytes()
@@ -3103,6 +3106,37 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
         assert not cached_request.prompt_top_n_logprobs
 
     @staticmethod
+    def _assert_finite_completion(request):
+        """Check completion and score validity without assuming batch-shape parity."""
+        assert request.status == Status.COMPLETED
+        assert len(request.generated_tokens) == 4
+        assert all(
+            0 <= token < DynamicEngineTestConfig.vocab_size for token in request.generated_tokens
+        )
+
+        generated_logprobs = request.generated_log_probs
+        assert generated_logprobs is not None
+        assert len(generated_logprobs) == len(request.generated_tokens)
+        assert np.isfinite(np.asarray(generated_logprobs)).all()
+
+        generated_top_n = request.generated_top_n_logprobs
+        assert generated_top_n is not None
+        assert len(generated_top_n) == len(request.generated_tokens)
+        for token, logprob, values in zip(
+            request.generated_tokens, generated_logprobs, generated_top_n
+        ):
+            assert 0 < len(values) <= request.sampling_params.top_n_logprobs
+            assert np.isfinite(np.asarray(list(values.values()))).all()
+            token_key = f"tok_{token}"
+            assert token_key in values
+            TestPrefixCacheRealEngineMatrix._assert_scalar_logprob_close(
+                values[token_key], logprob, abs=0.1
+            )
+
+        assert not request.prompt_log_probs
+        assert not request.prompt_top_n_logprobs
+
+    @staticmethod
     def _clear_engine_runtime():
         """Release per-row model and inference allocations before rebuilding."""
         torch.cuda.synchronize()
@@ -3122,6 +3156,9 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
             for request_id in range(9):
                 cached_request = cached[request_id]
                 baseline_request = baseline[request_id]
+                if case["feature"] == "fused-rope":
+                    self._assert_finite_completion(cached_request)
+                    self._assert_finite_completion(baseline_request)
                 assert cached_request.generated_tokens == baseline_request.generated_tokens
                 assert cached_request.generated_text == baseline_request.generated_text
                 assert len(cached_request.generated_tokens) == 4
@@ -3144,6 +3181,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 assert stats["saw_chunk"]
             elif feature == "fused-rope":
                 assert stats["fused_rope_calls"] > 0
+                assert baseline_stats["fused_rope_calls"] > 0
             elif feature == "mamba":
                 assert stats["max_mamba_matched_blocks"] > 0
                 assert stats["mamba_restores"] > 0

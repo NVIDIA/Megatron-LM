@@ -343,6 +343,9 @@ class DynamicEngineTestConfig:
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
+    # EP process groups can also exercise dense models; build MoE layers only
+    # when a test explicitly owns that model behavior.
+    use_moe_layer_spec: bool = False
     sequence_parallel: bool = False
 
     use_fixed_output_lengths: bool = False
@@ -638,18 +641,15 @@ class DynamicInferenceEngineTestBase:
                 window_size=test_config.window_size,
                 window_attn_skip_freq=test_config.window_attn_skip_freq,
             )
+            num_experts = (
+                transformer_config.num_moe_experts if test_config.use_moe_layer_spec else None
+            )
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
-                layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                    num_experts=transformer_config.num_moe_experts
-                )
+                layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=num_experts)
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec(
-                    num_experts=transformer_config.num_moe_experts
-                )
+                layer_spec = get_gpt_layer_local_spec(num_experts=num_experts)
             elif test_config.transformer_impl == "inference_optimized":
-                layer_spec = get_gpt_layer_with_inference_spec(
-                    num_experts=transformer_config.num_moe_experts
-                )
+                layer_spec = get_gpt_layer_with_inference_spec(num_experts=num_experts)
 
             # MTP block spec (needed for speculative decoding).
             mtp_block_spec = None
