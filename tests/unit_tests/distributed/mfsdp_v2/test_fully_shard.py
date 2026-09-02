@@ -719,6 +719,26 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
         torch.testing.assert_close(second_loss, first_loss)
 
 
+def test_rejects_optimizer_placements_larger_than_model_weight_placements(distributed_setup):
+    """Optimizer placements must fit within the model-weight placements."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16).to(device)
+    placements = Placements(
+        dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Replicate()]
+    )
+    with pytest.raises(ValueError, match="Replicate-to-Flat slice"):
+        with fully_shard_context(device=device):
+            fully_shard(
+                model,
+                mesh=mesh,
+                placements=placements,
+                mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
+            )
+
+
 def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, monkeypatch):
     """Optimizer synchronization should run once per group, not once per microbatch."""
     world_size = distributed_setup.world_size

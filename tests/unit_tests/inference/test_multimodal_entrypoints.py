@@ -180,7 +180,17 @@ class _ToyInferenceService:
         assert torch.all(decoder_output[~image_positions] == 0)
 
     def add_request(self, prompt, sampling_params, *, multi_modal_data=None):
+        return self.add_request_with_id(prompt, sampling_params, multi_modal_data=multi_modal_data)[
+            1
+        ]
+
+    def add_request_with_id(self, prompt, sampling_params, *, multi_modal_data=None):
+        """Mirror InferenceClient: the endpoints submit through the id-returning form."""
         future = asyncio.get_running_loop().create_future()
+        # Claimed before the work, as the real client claims next_request_id
+        # before its send, so a failed submission still names an id to abort.
+        self._request_id += 1
+        request_id = self._request_id
         try:
             self.last_wire_data = serialize_multimodal_data(multi_modal_data)
             media_cache_key = self.last_wire_data["media_cache_key"]
@@ -202,9 +212,8 @@ class _ToyInferenceService:
             )
             media_tokens_preexpanded = engine_kwargs.pop("media_tokens_preexpanded", False)
             engine_kwargs.setdefault("num_tiles", None)
-            self._request_id += 1
             request = self.engine._build_vlm_request(
-                request_id=self._request_id,
+                request_id=request_id,
                 prompt_str=None,
                 tokens=torch.tensor(prompt, dtype=torch.int64),
                 sampling_params=sampling_params,
@@ -232,7 +241,7 @@ class _ToyInferenceService:
             future.set_result(result)
         except Exception as error:
             future.set_exception(error)
-        return future
+        return request_id, future
 
 
 @pytest.fixture
