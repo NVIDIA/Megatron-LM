@@ -41,7 +41,7 @@ def _default_sparse_backward(q, kv, out, grad_out, lse, sink, indices, scale, le
         softmax_scale=scale,
         topk_length=length,
     )
-    return result["dq"], result["dkv"]
+    return result["dq"], result["dkv"], result["d_sink"]
 
 
 def _compressed_sequence_graph(
@@ -271,7 +271,7 @@ class _VisibleSparseAttentionFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         q, kv, out, lse, indices, length, sink = ctx.saved_tensors
-        dq, dkv = ctx.backward_op(
+        dq, dkv, d_sink = ctx.backward_op(
             q, kv, out, grad_out, lse, sink, indices, ctx.scale, length
         )
         dkv = dkv.reshape_as(kv)
@@ -284,7 +284,7 @@ class _VisibleSparseAttentionFunction(torch.autograd.Function):
                 torch.isfinite(dkv).all(),
                 "native CP sparse attention produced non-finite dkv",
             )
-        return None, None, None, dq, dkv, None, None, None
+        return None, None, None, dq, dkv, None, None, d_sink
 
 
 def visible_sparse_attention(
