@@ -2107,7 +2107,7 @@ class TextGenerationController:
             raise RuntimeError("Async scheduling overlap does not support paused requests.")
 
     def _compact_async_sched_logits(self, survivor_idxs: Tensor) -> None:
-        """Compact pending logits and sampling metadata into survivor order.
+        """Compact pending logits and all active-request metadata into survivor order.
 
         Args:
             survivor_idxs (Tensor): Active-row indices for requests that remain
