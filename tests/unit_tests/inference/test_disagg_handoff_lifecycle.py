@@ -1192,6 +1192,7 @@ def test_unsafe_nccl_receive_failure_is_fatal(handoff_loop):
 
     with pytest.raises(RuntimeError, match="NCCL handoff failed"):
         engine._admit_pending_kv_imports()
+    assert isinstance(pending.future.exception(), TransferStartError)
 
 
 def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):

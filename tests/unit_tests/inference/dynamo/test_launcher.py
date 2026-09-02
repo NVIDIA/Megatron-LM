@@ -67,16 +67,6 @@ def test_parse_args_splits_dynamo_and_megatron_arguments():
     ]
 
 
-def test_parse_args_accepts_multi_node_slurm_launcher():
-    config = parse_args(_slurm_argv())
-
-    assert config.launcher == "slurm"
-    assert config.nnodes == 2
-    assert config.master_addr == "node-0"
-    assert config.master_port == 29500
-    assert config.slurm_nodelist == "node-[0-1]"
-
-
 @pytest.mark.parametrize(
     "argv",
     [

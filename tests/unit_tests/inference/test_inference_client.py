@@ -141,16 +141,6 @@ async def test_add_request_with_kv_handoff_returns_future():
     future.cancel()
 
 
-async def test_abort_preserves_fire_and_forget_api_and_wait_uses_running_loop():
-    client, _, _ = _make_client()
-
-    assert client.abort_request(7) is None
-    future = client.abort_request_and_wait(8)
-
-    assert future.get_loop() is asyncio.get_running_loop()
-    future.cancel()
-
-
 async def test_terminal_error_and_abort_acknowledgement():
     client, _, fake_socket = _make_client()
     recv_queue = [msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
@@ -174,7 +164,9 @@ async def test_terminal_error_and_abort_acknowledgement():
     with pytest.raises(InferenceRequestError, match="read failed") as error:
         await asyncio.wait_for(unsafe, timeout=2.0)
     assert not error.value.source_safe
+    assert 1 not in client.abort_futures
     abort_ack = client.abort_request_and_wait(1)
+    assert abort_ack.get_loop() is asyncio.get_running_loop()
     assert not abort_ack.done()
     abort_payload = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
     assert abort_payload == [Headers.ABORT_REQUEST.value, 1]
@@ -183,20 +175,6 @@ async def test_terminal_error_and_abort_acknowledgement():
     await asyncio.sleep(0)
     assert 1 not in client.abort_futures
     assert 1 not in client.aborted_request_ids
-
-    unsafe = client.add_request("unsafe", SamplingParams())
-    recv_queue.append(msgpack.packb([Headers.REQUEST_ERROR.value, 2, "read failed", False]))
-    with pytest.raises(InferenceRequestError):
-        await asyncio.wait_for(unsafe, timeout=2.0)
-    assert 2 not in client.abort_futures
-    pending_ack = client.abort_request_and_wait(2)
-    abort_payload = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
-    assert abort_payload == [Headers.ABORT_REQUEST.value, 2]
-    recv_queue.append(msgpack.packb([Headers.REQUEST_ABORTED.value, 2, True]))
-    assert await asyncio.wait_for(asyncio.shield(pending_ack), timeout=2.0)
-    await asyncio.sleep(0)
-    assert 2 not in client.abort_futures
-    assert 2 not in client.aborted_request_ids
 
     recv_queue.append(msgpack.packb([Headers.ENGINE_REPLY.value, 1, {}], use_bin_type=True))
     await asyncio.sleep(0.01)
@@ -218,7 +196,7 @@ async def test_fire_and_forget_abort_acknowledgement_clears_late_reply_guard():
     client.start()
 
     request_id, _ = client.add_request_with_id("aborted", SamplingParams())
-    client.abort_request(request_id)
+    assert client.abort_request(request_id) is None
     assert request_id in client.aborted_request_ids
     assert request_id not in client.abort_futures
 

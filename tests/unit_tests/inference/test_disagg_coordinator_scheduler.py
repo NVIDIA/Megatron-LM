@@ -38,9 +38,12 @@ def test_weighted_decode_reservations_are_fifo_and_held_until_release():
 
     assert flow.release_decode(1) == b"decode"
     second = flow.pop_next_admissible(b"decode")
-    third = flow.pop_next_admissible(b"decode")
+    assert second.request_id == 2
+    assert flow.decode_load(b"decode") == (1, 1, 2)
+    assert flow.has_queued(b"decode")
 
-    assert [second.request_id, third.request_id] == [2, 3]
+    third = flow.pop_next_admissible(b"decode")
+    assert third.request_id == 3
     assert flow.decode_load(b"decode") == (0, 2, 3)
 
 
@@ -63,19 +66,6 @@ def test_duplicate_registration_requires_explicit_removal():
         flow.register_engine(b"decode", "decode", [_meta(global_rank=0)])
 
     assert flow.capacity(b"decode") == 5
-
-
-def test_queue_admission_reserves_only_one_handoff_at_a_time():
-    flow = DisaggCoordinatorScheduler()
-    flow.register_engine(b"decode", "decode", [_meta(ssm_slot_capacity=5)])
-    flow.enqueue(b"decode", 1, b"first", 2)
-    flow.enqueue(b"decode", 2, b"second", 2)
-
-    admitted = flow.pop_next_admissible(b"decode")
-
-    assert admitted.request_id == 1
-    assert flow.decode_load(b"decode") == (1, 1, 2)
-    assert flow.has_queued(b"decode")
 
 
 def test_oversized_handoff_is_rejected_without_mutating_usage():
