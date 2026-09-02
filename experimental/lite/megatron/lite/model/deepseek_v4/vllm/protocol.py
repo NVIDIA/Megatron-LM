@@ -126,6 +126,22 @@ def _post_optimizer_step(model: nn.Module) -> None:
             clear_cache()
 
 
+def _post_dist_opt_model_load(model: nn.Module) -> None:
+    """Invalidate checkpoint packing metadata after dist-opt wraps parameters.
+
+    DistributedOptimizer is constructed before HF loading. With parameter
+    offload, its visible storage can differ from the parameter that received
+    checkpoint source-scale metadata, so the actor and first rollout pack the
+    same loaded value through different paths. Re-establish the normal
+    post-update invariant once loading has completed.
+    """
+    invalidate_bound_source_scales(model)
+    for module in model.modules():
+        clear_cache = getattr(module, "clear_deployment_weight_cache", None)
+        if clear_cache is not None:
+            clear_cache()
+
+
 def _validate_contract(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None:
     if impl_cfg.dsa_indexer_loss_coeff < 0.0:
         raise ValueError("dsa_indexer_loss_coeff must be >= 0")
@@ -340,6 +356,17 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         "optimizer_backend": optimizer_backend,
     }
     extras["post_optimizer_step_hook"] = lambda: _post_optimizer_step(model)
+    if optimizer_backend == "dist_opt":
+        prior_post_model_load_hook = post_model_load_hook
+
+        def post_model_load_hook():
+            _post_dist_opt_model_load(model)
+            return (
+                prior_post_model_load_hook()
+                if prior_post_model_load_hook is not None
+                else None
+            )
+
     if post_model_load_hook is not None:
         extras["post_model_load_hook"] = post_model_load_hook
 
