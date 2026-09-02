@@ -430,25 +430,37 @@ class _CudagraphGlobalRecord:
                     return f"{sign}{n / 1024**p:.1f} {s}"
             return f"{sign}{n} bytes"
 
-        for g_idx, g in progress_bar:
-            if torch.distributed.get_rank() == 0:
-                mem_stats = torch.cuda.memory_stats()
-                progress_str = "create cuda graphs | mem: alloc %s, res %s" % (
-                    format_mem_bytes(mem_stats["allocated_bytes.all.current"]),
-                    format_mem_bytes(mem_stats["reserved_bytes.all.current"]),
-                )
-                if HAVE_TQDM:
-                    progress_bar.set_description(progress_str)
-                elif g_idx % 100 == 0 or g_idx == len(cls.cudagraph_record) - 1:
-                    logger.info(f"{g_idx}/{len(cls.cudagraph_record)}. {progress_str}")
+        capture_session = nullcontext()
+        if any(
+            record[0].base_module.config.fine_grained_activation_offloading
+            for record in cls.cudagraph_record
+        ):
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
+            )
 
-            runner, graph_type = g[0:2]
-            if graph_type == 'fwd':
-                args, kwargs, out = g[2:]
-                runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
-            else:
-                assert fwd_buffer_reuse_ref_count == 0
-                runner.create_bwd_graph()
+            capture_session = off_interface.cuda_graph_capture_session()
+
+        with capture_session:
+            for g_idx, g in progress_bar:
+                if torch.distributed.get_rank() == 0:
+                    mem_stats = torch.cuda.memory_stats()
+                    progress_str = "create cuda graphs | mem: alloc %s, res %s" % (
+                        format_mem_bytes(mem_stats["allocated_bytes.all.current"]),
+                        format_mem_bytes(mem_stats["reserved_bytes.all.current"]),
+                    )
+                    if HAVE_TQDM:
+                        progress_bar.set_description(progress_str)
+                    elif g_idx % 100 == 0 or g_idx == len(cls.cudagraph_record) - 1:
+                        logger.info(f"{g_idx}/{len(cls.cudagraph_record)}. {progress_str}")
+
+                runner, graph_type = g[0:2]
+                if graph_type == 'fwd':
+                    args, kwargs, out = g[2:]
+                    runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
+                else:
+                    assert fwd_buffer_reuse_ref_count == 0
+                    runner.create_bwd_graph()
 
         # Memory usage.
         time_end = time.time()
@@ -1093,22 +1105,30 @@ class _CudaGraphRunner(torch.nn.Module):
         if FREEZE_GC:
             gc.freeze()
 
-        with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
-            grad_inputs = torch.autograd.grad(
-                outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
-                inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
-                grad_outputs=tuple(o for o in self.static_grad_outputs if o is not None),
-                retain_graph=self.backward_retain_grad,
-                only_inputs=True,
-                allow_unused=True,
+        capture_scope = nullcontext()
+        if self.base_module.config.fine_grained_activation_offloading:
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
             )
-            # Accumulate wgrads directly into main_grad inside the graph
-            n_act_grads = sum(
-                1 for i in self.fwd_graph_input_surface[: self.num_dgrads] if i.requires_grad
-            )
-            for param, wgrad in zip(self.params_to_backprop, grad_inputs[n_act_grads:]):
-                if wgrad is not None and not getattr(param, 'grad_added_to_main_grad', False):
-                    param.main_grad.add_(wgrad)
+
+            capture_scope = off_interface.cuda_graph_capture_scope(may_cross_graphs=True)
+        with capture_scope:
+            with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
+                grad_inputs = torch.autograd.grad(
+                    outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
+                    inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
+                    grad_outputs=tuple(o for o in self.static_grad_outputs if o is not None),
+                    retain_graph=self.backward_retain_grad,
+                    only_inputs=True,
+                    allow_unused=True,
+                )
+                # Accumulate wgrads directly into main_grad inside the graph
+                n_act_grads = sum(
+                    1 for i in self.fwd_graph_input_surface[: self.num_dgrads] if i.requires_grad
+                )
+                for param, wgrad in zip(self.params_to_backprop, grad_inputs[n_act_grads:]):
+                    if wgrad is not None and not getattr(param, 'grad_added_to_main_grad', False):
+                        param.main_grad.add_(wgrad)
 
         # Unfreeze GC.
         if FREEZE_GC:

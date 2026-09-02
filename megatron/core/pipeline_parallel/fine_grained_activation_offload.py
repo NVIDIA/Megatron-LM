@@ -539,7 +539,9 @@ class PipelineOffloadManager:
         """Associate offload work with one (possibly nested) CUDA graph capture.
 
         The outermost scope creates the owner token. Nested graphable modules
-        reuse that exact object, including its cross-graph policy.
+        reuse that exact object, including its cross-graph policy. Capture
+        implementations are selected exclusively by ``cuda_graph_impl``, so a
+        nested entry belongs to the same physical graph as its outer scope.
         """
         if not isinstance(may_cross_graphs, bool):
             raise TypeError("may_cross_graphs must be a bool")
@@ -551,6 +553,21 @@ class PipelineOffloadManager:
             yield self._cuda_graph_capture_owner
         finally:
             self._cuda_graph_capture_owner = previous_owner
+
+    @contextmanager
+    def cuda_graph_capture_session(self):
+        """Keep throttle FIFOs across sibling captures, then discard capture-only state.
+
+        Local CUDA graphs are captured one at a time but may consume external
+        events produced by an earlier sibling graph. The FIFOs must therefore
+        survive individual capture scopes and be cleared only after the complete
+        local capture session has finished.
+        """
+        try:
+            yield
+        finally:
+            for chunk in self._cached_chunks_forward:
+                chunk.clear_offload_pending()
 
     def push_offload_groups(self, group_hook, name, forced_released_tensors):
         """Push the offload groups to the delayed queue."""
@@ -956,6 +973,10 @@ class ChunkOffloadHandler:
         # group_name -> FIFO of pending offloads for that name (same cap for every name).
         self._offload_pending_by_name: Dict[str, deque[_PendingOffload]] = defaultdict(deque)
 
+    def clear_offload_pending(self):
+        """Clear Python bookkeeping that is not executed during graph replay."""
+        self._offload_pending_by_name.clear()
+
     def reset(self):
         """Reset the chunk offload handler."""
         self._offloaded_group_index = 0
@@ -966,7 +987,7 @@ class ChunkOffloadHandler:
         # Clear eager/warmup Python bookkeeping at the iteration boundary. CUDA
         # graph replay follows the already captured event nodes and does not
         # execute or mutate this FIFO.
-        self._offload_pending_by_name.clear()
+        self.clear_offload_pending()
 
     def find_group_with_name(
         self, groups: list[OffloadTensorGroup], name: str, start_index: int = 0
@@ -1198,14 +1219,15 @@ class ChunkOffloadHandler:
             if (pending.producer_owner is None) != (consumer_owner is None):
                 raise RuntimeError(
                     "Max-inflight offload dependency crossed between eager execution "
-                    "and CUDA graph capture"
+                    f"and CUDA graph capture for group {group_name!r}"
                 )
             if pending.producer_owner is consumer_owner:
                 pending.group.wait_offload_event(cur)
             else:
                 if not pending.external_recorded:
                     raise RuntimeError(
-                        "Cross-graph max-inflight dependency has no recorded external event"
+                        "Cross-graph max-inflight dependency has no recorded external event "
+                        f"for group {group_name!r}"
                     )
                 pending.group.wait_offload_throttle_event(cur)
 
@@ -1484,6 +1506,11 @@ class FineGrainedActivationOffloadingInterface:
     def cuda_graph_capture_scope(may_cross_graphs: bool):
         """Return a nested scope identifying one CUDA graph capture owner."""
         return PipelineOffloadManager.get_instance().cuda_graph_capture_scope(may_cross_graphs)
+
+    @staticmethod
+    def cuda_graph_capture_session():
+        """Return a scope covering all sibling captures in one local capture session."""
+        return PipelineOffloadManager.get_instance().cuda_graph_capture_session()
 
     @staticmethod
     def init_chunk_handler(

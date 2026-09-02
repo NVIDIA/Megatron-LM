@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
 from unittest.mock import Mock, call
 
 import pytest
@@ -11,6 +12,8 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     ChunkOffloadHandler,
     PipelineOffloadManager,
 )
+from megatron.core.transformer import cuda_graphs
+from megatron.core.transformer.cuda_graphs import _CudaGraphRunner
 
 
 @pytest.fixture
@@ -145,6 +148,73 @@ def test_different_capture_owner_waits_on_external_event(mocked_offload_manager,
     assert [entry.group for entry in handler._offload_pending_by_name["core_attn"]] == [
         second_group
     ]
+
+
+def test_local_capture_session_clears_pending_before_returning_to_eager(
+    mocked_offload_manager, monkeypatch
+):
+    manager, _, _ = mocked_offload_manager
+    main_stream = Mock()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main_stream)
+    handler = _new_handler(manager, max_inflight_offloads=1)
+    manager._cached_chunks_forward.append(handler)
+
+    with manager.cuda_graph_capture_session():
+        with manager.cuda_graph_capture_scope(may_cross_graphs=True):
+            first_captured = _bulk_empty_group(handler, "core_attn")
+        with manager.cuda_graph_capture_scope(may_cross_graphs=True):
+            second_captured = _bulk_empty_group(handler, "core_attn")
+
+        main_stream.wait_event.assert_called_once_with(first_captured._offload_throttle_event)
+        assert [entry.group for entry in handler._offload_pending_by_name["core_attn"]] == [
+            second_captured
+        ]
+
+    assert not handler._offload_pending_by_name["core_attn"]
+
+    first_eager = _bulk_empty_group(handler, "core_attn")
+    _bulk_empty_group(handler, "core_attn")
+    assert main_stream.wait_event.call_args_list[-1] == call(first_eager._offload_event)
+
+
+def test_local_backward_capture_uses_offload_capture_owner(mocked_offload_manager, monkeypatch):
+    manager, _, _ = mocked_offload_manager
+    observed_owners = []
+
+    @contextmanager
+    def fake_cuda_graph(*args, **kwargs):
+        observed_owners.append(manager.cuda_graph_capture_owner)
+        yield
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", lambda: Mock())
+    monkeypatch.setattr(torch.cuda, "graph", fake_cuda_graph)
+    monkeypatch.setattr(torch.autograd, "grad", Mock(return_value=()))
+    monkeypatch.setattr(cuda_graphs, "get_all_rng_states", lambda: {})
+    monkeypatch.setattr(cuda_graphs, "FREEZE_GC", False)
+
+    runner = SimpleNamespace(
+        grad_enabled=True,
+        base_module=SimpleNamespace(
+            config=SimpleNamespace(fine_grained_activation_offloading=True)
+        ),
+        mempool=None,
+        outputs=(),
+        args=(),
+        kwargs={},
+        fwd_graph_output_surface=(),
+        fwd_graph_input_surface=(),
+        backward_retain_grad=False,
+        num_dgrads=0,
+        params_to_backprop=(),
+        get_arg_metas=lambda *args: (),
+    )
+
+    _CudaGraphRunner.create_bwd_graph(runner)
+
+    assert len(observed_owners) == 1
+    assert observed_owners[0] is not None
+    assert observed_owners[0].may_cross_graphs
+    assert manager.cuda_graph_capture_owner is None
 
 
 @pytest.mark.parametrize(
