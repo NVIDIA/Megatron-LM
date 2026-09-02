@@ -177,12 +177,7 @@ def load(
     )
 
     ckpt_args = common_state_dict.get("args")
-    async_strategy = (
-        getattr(ckpt_args, "async_strategy", "mcore")
-        if getattr(ckpt_args, "async_save", False)
-        else "mcore"
-    )
-    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
+    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
 
     merge(common_state_dict, loaded_state_dict)
 
@@ -353,7 +348,6 @@ def save(
         Callable[[CommonStateDict], StateDict]
     ] = None,
     content_metadata: Optional[dict] = None,
-    async_strategy: Optional[str] = "nvrx",
     verify_integrity: bool = False,
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
@@ -461,7 +455,7 @@ def save(
             integrity_finalize_fn()
         return None
 
-    async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir, async_strategy)
+    async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir)
     async_request.finalize_fns.append(metadata_finalize_fn)
     if verify_integrity:
         async_request.finalize_fns.append(integrity_finalize_fn)

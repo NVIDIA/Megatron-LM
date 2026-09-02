@@ -163,7 +163,7 @@ pip install .
 
 Starting from mcore v0.17, asynchronous checkpoint saving is supported for `fsdp_dtensor` and `torch_dcp` formats.
 
-Note that async saving for these formats requires the `nvidia-resiliency-ext` package. As a result, the only supported `async_strategy` in this context is `nvrx`.
+Note that async saving for these formats requires the `nvidia-resiliency-ext` package.
 
 ## Subpackages
 

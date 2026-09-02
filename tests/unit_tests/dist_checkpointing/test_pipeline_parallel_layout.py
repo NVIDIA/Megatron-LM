@@ -294,7 +294,7 @@ def test_save_and_load_checkpoint_vpp(
     args.num_attention_heads = 8
     # Ckpt format
     args.ckpt_format = "torch_dist"
-    args.async_strategy = "mcore"
+    args.async_strategy = "nvrx"
     set_args(args)
 
     # Cached metadata is mutated in-place by torch's load planner, so reusing it

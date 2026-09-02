@@ -41,7 +41,6 @@ from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_supp
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
-    get_async_strategy,
 )
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
@@ -907,7 +906,6 @@ def save_checkpoint(
                     validate_access_integrity=validate_sharding_integrity,
                     preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
                     content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata),
-                    async_strategy=args.async_strategy,
                     verify_integrity=args.verify_integrity,
                 )
             # [ModelOpt]: save sharded modelopt_state
@@ -922,11 +920,15 @@ def save_checkpoint(
                 state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
 
             if args.async_save:
+                from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+                    FileSystemWriterAsync,
+                )
+                from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
+                    save_state_dict_async_plan,
+                )
+
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
                 coordinator_rank = 0
-                _, async_modules = get_async_strategy(args.async_strategy)
-                FileSystemWriterAsync = async_modules['FileSystemWriterAsync']
-                save_state_dict_async_plan = async_modules['save_state_dict_async_plan']
                 _cpu_shm = getattr(args, 'async_ckpt_use_cpu_shm', False)
                 _writer_kwargs = {}
                 if _cpu_shm:
@@ -957,7 +959,7 @@ def save_checkpoint(
                     enable_cache=args.ckpt_assume_constant_structure,
                 )
                 async_save_request = get_save_and_finalize_callbacks(
-                    fs_storage_writer, save_state_dict_ret, args.async_strategy
+                    fs_storage_writer, save_state_dict_ret
                 )
             else:
                 fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
@@ -1201,6 +1203,8 @@ def save_checkpoint(
         # "success" callbacks only fire after both writes are confirmed.
         from megatron.training.distillation import get_logits_saver
 
+        from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
+
         logits_saver = get_logits_saver()
         if logits_saver is not None:
             # In frozen-dump mode there is no checkpoint request (async_save_request is None); the
@@ -1226,8 +1230,7 @@ def save_checkpoint(
                                     f"{iteration} to {tracker_filename}")
 
                 logits_finalize_fns.append(progress_finalize_fn)
-            async_request_cls = get_async_strategy(args.async_strategy)[1]['AsyncRequest']
-            async_logits_request = async_request_cls(
+            async_logits_request = AsyncRequest(
                 async_fn=logits_saver._write_batched_tar,
                 async_fn_args=logits_saver.take_pending_data(),
                 finalize_fns=logits_finalize_fns,
