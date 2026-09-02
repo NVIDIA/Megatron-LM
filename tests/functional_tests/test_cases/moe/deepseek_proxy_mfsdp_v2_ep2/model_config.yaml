@@ -123,5 +123,6 @@ MODEL_ARGS:
 TEST_TYPE: regular
 METRICS:
   - "lm loss"
+  - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
 LAUNCHER: ft_launcher
