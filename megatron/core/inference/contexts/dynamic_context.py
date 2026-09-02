@@ -502,14 +502,38 @@ class DynamicInferenceContext(BaseInferenceContext):
         #
         # Always on wherever it is implementable -- there is no opt-in flag. The draft KV is an
         # acceptance-rate optimization that cannot change verified output, so the only gate is
-        # whether this model/config can populate it: speculative decoding must be active, and v2
-        # covers the attention-based repeated-layer MTP head (a per-depth head has no single
-        # `mtp.layers[0]` to seed through, and a Mamba draft has no KV plane at all).
+        # whether this model/config can populate it: speculative decoding must be active, the
+        # head must be the repeated-layer kind (a per-depth head has no single `mtp.layers[0]`
+        # to seed through), and the head itself must be exactly one attention layer.
+        #
+        # The gate is on the MTP HEAD, not the main decoder. A hybrid main decoder is fine: the
+        # reserved slot bypasses `layer_map` on both append and read (see append_key_value_cache
+        # / key_value_cache), so the main model's Mamba/GDN layers never interact with it. What
+        # does not work is a recurrent MTP head (no KV to append) or a multi-attention-layer head
+        # (its layers would collide on the single reserved slot). Hybrid models state the two
+        # patterns independently as "<main>/<mtp>/...", so only the MTP half is consulted here.
+        mtp_head_layer_types = (
+            mamba_inference_state_config.mtp_layer_type_list
+            if mamba_inference_state_config is not None
+            else None
+        )
+        if mtp_head_layer_types is None:
+            # No hybrid MTP pattern to inspect: either a pure-Transformer model, whose MTP head is
+            # a single attention TransformerLayer by construction, or a hybrid head whose pattern
+            # could not be read -- in which case assume it matches the main decoder's recurrence.
+            mtp_head_is_single_attention = not self.is_hybrid_model
+        else:
+            attention_symbols = (Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MLA)
+            num_head_attention = sum(t in attention_symbols for t in mtp_head_layer_types)
+            head_has_recurrent = any(
+                t in (Symbols.MAMBA, Symbols.GDN) for t in mtp_head_layer_types
+            )
+            mtp_head_is_single_attention = num_head_attention == 1 and not head_has_recurrent
         self.enable_mtp_kv_cache = bool(
             self.num_speculative_tokens > 0
             and getattr(model_config, "mtp_num_layers", None)
             and getattr(model_config, "mtp_use_repeated_layer", False)
-            and not self.is_hybrid_model
+            and mtp_head_is_single_attention
         )
         self._mtp_forward_active = False
         # Whether the current MTP draft loop is replaying captured CUDA graphs (True) or running
