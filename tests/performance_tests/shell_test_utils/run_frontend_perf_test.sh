@@ -22,7 +22,7 @@
 #                        and CPU and NIC differences between node types do move these
 #                        numbers.)
 #
-# Expects /usr/local/bin/yq (present in mcore_ci_dev image).
+# Expects PyYAML in the active Megatron-LM Python environment.
 
 set -euo pipefail
 
@@ -45,7 +45,11 @@ PLATFORM=$(detect_platform "${PLATFORM:-}" "cpu_$(uname -m)")
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PERF_DIR="$ROOT_DIR/tests/performance_tests"
-YQ=/usr/local/bin/yq
+
+yaml_scalar() {
+    python -c 'import sys, yaml; value = yaml.safe_load(open(sys.argv[1])).get(sys.argv[2]); print(sys.argv[3] if value is None else value)' \
+        "$CONFIG_PATH" "$1" "$2"
+}
 
 mkdir -p "$RESULTS_ROOT"
 RESULTS_JSON="$RESULTS_ROOT/results.json"
@@ -56,22 +60,40 @@ rm -f "$RESULTS_JSON"
 
 # ── Read model_config.yaml ────────────────────────────────────────────────────
 
-CONCURRENCY=$("$YQ" '.CONCURRENCY // "1,8,32,128,512"' "$CONFIG_PATH")
-SECONDS_PER_LEVEL=$("$YQ" '.SECONDS_PER_LEVEL // 5' "$CONFIG_PATH")
-WARMUP_SECONDS=$("$YQ" '.WARMUP_SECONDS // 2' "$CONFIG_PATH")
-NUM_INPUT_TOKENS=$("$YQ" '.NUM_INPUT_TOKENS // 512' "$CONFIG_PATH")
-NUM_OUTPUT_TOKENS=$("$YQ" '.NUM_OUTPUT_TOKENS // 64' "$CONFIG_PATH")
-NUM_ENGINES=$("$YQ" '.NUM_ENGINES // 1' "$CONFIG_PATH")
-ENGINE_LATENCY_MS=$("$YQ" '.ENGINE_LATENCY_MS // 10' "$CONFIG_PATH")
-MAX_REQUESTS=$("$YQ" '.MAX_REQUESTS // 1024' "$CONFIG_PATH")
+CONCURRENCY=$(yaml_scalar CONCURRENCY "1,8,32,128,512")
+SECONDS_PER_LEVEL=$(yaml_scalar SECONDS_PER_LEVEL 5)
+WARMUP_SECONDS=$(yaml_scalar WARMUP_SECONDS 2)
+NUM_INPUT_TOKENS=$(yaml_scalar NUM_INPUT_TOKENS 512)
+NUM_OUTPUT_TOKENS=$(yaml_scalar NUM_OUTPUT_TOKENS 64)
+NUM_ENGINES=$(yaml_scalar NUM_ENGINES 1)
+ENGINE_LATENCY_MS=$(yaml_scalar ENGINE_LATENCY_MS 10)
+MAX_REQUESTS=$(yaml_scalar MAX_REQUESTS 1024)
+LONG_SEQUENCE_LENGTHS=$(yaml_scalar LONG_SEQUENCE_LENGTHS "")
+LONG_SEQUENCE_CONCURRENCY=$(yaml_scalar LONG_SEQUENCE_CONCURRENCY 1)
+LONG_SEQUENCE_ENGINE_LATENCY_MS=$(yaml_scalar LONG_SEQUENCE_ENGINE_LATENCY_MS 0)
 # Each entry is "<mode>[:stream]" — e.g. "client", "http", "http:stream".
-mapfile -t PATHS < <("$YQ" '.PATHS[]' "$CONFIG_PATH")
+mapfile -t PATHS < <(
+    python -c 'import sys, yaml; print("\n".join(yaml.safe_load(open(sys.argv[1]))["PATHS"]))' \
+        "$CONFIG_PATH"
+)
+
+# Each entry is "input_tokens|concurrency|engine_latency_ms". The regular
+# capacity sweep retains high concurrency and a simulated engine delay. Long
+# prompts run one at a time with no fake compute so the measured time isolates
+# frontend/coordinator payload processing.
+SWEEPS=("$NUM_INPUT_TOKENS|$CONCURRENCY|$ENGINE_LATENCY_MS")
+if [[ -n "$LONG_SEQUENCE_LENGTHS" ]]; then
+    IFS=',' read -r -a LONG_INPUT_LENGTHS <<< "$LONG_SEQUENCE_LENGTHS"
+    for ISL in "${LONG_INPUT_LENGTHS[@]}"; do
+        SWEEPS+=("$ISL|$LONG_SEQUENCE_CONCURRENCY|$LONG_SEQUENCE_ENGINE_LATENCY_MS")
+    done
+fi
 
 echo "[run_frontend_perf_test] PLATFORM=$PLATFORM  paths=${PATHS[*]}"
-echo "[run_frontend_perf_test] concurrency=$CONCURRENCY  ISL=$NUM_INPUT_TOKENS  OSL=$NUM_OUTPUT_TOKENS"
-echo "[run_frontend_perf_test] engines=$NUM_ENGINES  engine_latency=${ENGINE_LATENCY_MS}ms"
+echo "[run_frontend_perf_test] sweeps=${SWEEPS[*]}  OSL=$NUM_OUTPUT_TOKENS"
+echo "[run_frontend_perf_test] engines=$NUM_ENGINES"
 
-# ── Sweep every requested path ────────────────────────────────────────────────
+# ── Sweep every requested path and input length ───────────────────────────────
 
 for PATH_SPEC in "${PATHS[@]}"; do
     MODE="${PATH_SPEC%%:*}"
@@ -79,22 +101,25 @@ for PATH_SPEC in "${PATHS[@]}"; do
     if [[ "$PATH_SPEC" == *:stream ]]; then
         STREAM_ARGS=(--streaming)
     fi
-    echo "[run_frontend_perf_test] === path $PATH_SPEC ==="
-    (
-        cd "$ROOT_DIR"
-        uv run --no-sync python "$PERF_DIR/client/frontend_capacity_benchmark.py" \
-            --mode "$MODE" \
-            "${STREAM_ARGS[@]}" \
-            --concurrency "$CONCURRENCY" \
-            --seconds-per-level "$SECONDS_PER_LEVEL" \
-            --warmup-seconds "$WARMUP_SECONDS" \
-            --num-input-tokens "$NUM_INPUT_TOKENS" \
-            --num-output-tokens "$NUM_OUTPUT_TOKENS" \
-            --num-engines "$NUM_ENGINES" \
-            --engine-latency-ms "$ENGINE_LATENCY_MS" \
-            --max-requests "$MAX_REQUESTS" \
-            --output-json "$RESULTS_JSON"
-    ) 2>&1 | tee -a "$RESULTS_ROOT/benchmark.log"
+    for SWEEP in "${SWEEPS[@]}"; do
+        IFS='|' read -r ISL SWEEP_CONCURRENCY SWEEP_ENGINE_LATENCY_MS <<< "$SWEEP"
+        echo "[run_frontend_perf_test] === path $PATH_SPEC  ISL $ISL  concurrency $SWEEP_CONCURRENCY ==="
+        (
+            cd "$ROOT_DIR"
+            uv run --no-sync python "$PERF_DIR/client/frontend_capacity_benchmark.py" \
+                --mode "$MODE" \
+                "${STREAM_ARGS[@]}" \
+                --concurrency "$SWEEP_CONCURRENCY" \
+                --seconds-per-level "$SECONDS_PER_LEVEL" \
+                --warmup-seconds "$WARMUP_SECONDS" \
+                --num-input-tokens "$ISL" \
+                --num-output-tokens "$NUM_OUTPUT_TOKENS" \
+                --num-engines "$NUM_ENGINES" \
+                --engine-latency-ms "$SWEEP_ENGINE_LATENCY_MS" \
+                --max-requests "$MAX_REQUESTS" \
+                --output-json "$RESULTS_JSON"
+        ) 2>&1 | tee -a "$RESULTS_ROOT/benchmark.log"
+    done
 done
 
 echo "[run_frontend_perf_test] benchmark complete. Results written to $RESULTS_JSON"

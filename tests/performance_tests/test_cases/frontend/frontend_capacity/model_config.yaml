@@ -28,6 +28,15 @@ NUM_ENGINES: 1
 ENGINE_LATENCY_MS: 10
 MAX_REQUESTS: 1024
 
+# Large prompts expose sequence-length-dependent serialization and coordinator
+# overhead that the 512-token capacity sweep cannot see. They run serially with
+# no simulated engine compute, so these numbers measure only request-path work;
+# applying the high-concurrency grid here would instead measure Python heap
+# pressure and the fake engine's unavoidable prompt decode.
+LONG_SEQUENCE_LENGTHS: "50000,100000,150000,200000"
+LONG_SEQUENCE_CONCURRENCY: "1"
+LONG_SEQUENCE_ENGINE_LATENCY_MS: 0
+
 # Gated metrics. Deliberately excludes max_stable_concurrency and
 # scaling_efficiency: both are step functions over the sampled concurrency grid,
 # so they flip between neighbouring levels under normal noise. They are recorded
@@ -42,11 +51,10 @@ METRICS:
 
 # Past saturation, p99 stops describing the frontend and starts describing the
 # queue the load generator built in front of it. HTTP saturates at concurrency
-# 8; on current main, three H100 nodes measured http_concurrency_32 p99 at
-# 42 ms, 42 ms and 293 ms while throughput remained within 8%. Saturation is
-# what throughput_req_per_sec and peak_throughput_req_per_sec already measure.
+# 8; saturation is what throughput_req_per_sec and
+# peak_throughput_req_per_sec already measure.
 METRICS_EXCLUDE:
-  - keys: "http_concurrency_32"
+  - keys: "http*_concurrency_32"
     metrics: [p99_latency_ms]
   - keys: "*_concurrency_128"
     metrics: [p99_latency_ms]

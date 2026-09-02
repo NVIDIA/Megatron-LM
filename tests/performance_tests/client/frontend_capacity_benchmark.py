@@ -23,10 +23,11 @@ Which layers are included depends on the flags:
 
 Running all three and comparing localizes a regression to a layer.
 
-The concurrency sweep offers a fixed number of in-flight requests at each level
-for ``--seconds-per-level`` and records sustained throughput and latency
-percentiles. ``max_stable_concurrency`` is the largest level still served at
-near-linear throughput, i.e. where the path saturates.
+The driver invokes this benchmark for every configured input sequence length.
+Within each invocation, the concurrency sweep offers a fixed number of in-flight
+requests at each level for ``--seconds-per-level`` and records sustained
+throughput and latency percentiles. ``max_stable_concurrency`` is the largest
+level still served at near-linear throughput, i.e. where the path saturates.
 
 Note the http path measures a single frontend replica in-process, while
 _run_text_gen_server forks four, so production HTTP capacity is higher than what
@@ -367,7 +368,8 @@ async def main(args) -> dict:
     else:
         results = await run_http_mode(args)
 
-    prefix = f"{args.mode}_stream" if args.streaming else args.mode
+    path_prefix = f"{args.mode}_stream" if args.streaming else args.mode
+    prefix = f"{path_prefix}_isl_{args.num_input_tokens}"
     base = results[0]
     entries = {}
     for result in results:
