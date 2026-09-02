@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -891,8 +891,20 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
         if config.calculate_per_token_loss:
             raise ValueError("MFSDP v2 does not currently support per-token loss normalization.")
-        if config.fp8 or config.fp4 or ddp_config.fp8_param_gather or ddp_config.fp4_param_gather:
-            raise ValueError("MFSDP v2 does not currently support FP8 or FP4.")
+        if config.fp4 or ddp_config.fp4_param_gather:
+            raise ValueError("MFSDP v2 does not currently support FP4.")
+        if ddp_config.fp8_param_gather and config.fp8_recipe != "mxfp8":
+            raise ValueError(
+                "MFSDP v2 currently supports fp8_param_gather only with --fp8-recipe mxfp8."
+            )
+        # fp8 primary weights (fp8_param_gather) require fp8 mode (--fp8), whose
+        # autocast context the Fp8ParameterGroup path is validated for; any
+        # other fp8/fp4 usage stays rejected.
+        if config.fp8 and not (ddp_config.fp8_param_gather and config.fp8_recipe == "mxfp8"):
+            raise ValueError(
+                "MFSDP v2 fp8 autocast is only supported together with "
+                "--fp8-param-gather and --fp8-recipe mxfp8."
+            )
         if config.cuda_graph_impl != "none" or ddp_config.megatron_fsdp_cuda_graph_mode:
             raise ValueError("MFSDP v2 does not currently support CUDA graphs.")
 

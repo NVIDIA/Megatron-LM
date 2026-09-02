@@ -10,6 +10,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
 from ..openai_streaming import openai_stream
+from .common import abort_requests
 
 logger = logging.getLogger(__name__)
 
@@ -164,34 +165,55 @@ try:
                 return str(error), 400
 
         tasks = []
-        for prompt_tokens in prompts_as_tokens:
-            per_req_params = SamplingParams(
-                temperature=sampling_params.temperature,
-                top_k=sampling_params.top_k,
-                top_p=sampling_params.top_p,
-                return_log_probs=sampling_params.return_log_probs,
-                top_n_logprobs=sampling_params.top_n_logprobs,
-                skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
-                num_tokens_to_generate=sampling_params.num_tokens_to_generate,
-                stop_words=sampling_params.stop_words,
-                termination_id=sampling_params.termination_id,
-                # This endpoint always echoes prompt_token_ids in its response, so
-                # keep the prompt tokens on the payload (default is now to drop them).
-                return_prompt_tokens=True,
-                streaming_interval=sampling_params.streaming_interval,
-            )
-            if stream_requested:
-                tasks.append(
-                    client.add_request_streaming(
+        # Populated on the non-streaming path only; the streaming path aborts
+        # through the AsyncStream callback its generator already owns.
+        request_ids = []
+        # The submission loop itself can fail partway -- the zmq send, or
+        # multimodal serialization on a malformed payload -- with the earlier
+        # prompts already submitted to the engine. Without this the exception
+        # escapes the handler and those requests generate to their token limit
+        # holding batch slots, the same leak the abort below closes.
+        #
+        # TODO: streaming submissions made before a mid-loop failure are not
+        # covered. Their handles are AsyncStreams, not ids, and they abort
+        # through openai_stream's finally, which never runs because the
+        # generator is never started.
+        try:
+            for prompt_tokens in prompts_as_tokens:
+                per_req_params = SamplingParams(
+                    temperature=sampling_params.temperature,
+                    top_k=sampling_params.top_k,
+                    top_p=sampling_params.top_p,
+                    return_log_probs=sampling_params.return_log_probs,
+                    top_n_logprobs=sampling_params.top_n_logprobs,
+                    skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
+                    num_tokens_to_generate=sampling_params.num_tokens_to_generate,
+                    stop_words=sampling_params.stop_words,
+                    termination_id=sampling_params.termination_id,
+                    # This endpoint always echoes prompt_token_ids in its response, so
+                    # keep the prompt tokens on the payload (default is now to drop them).
+                    return_prompt_tokens=True,
+                    streaming_interval=sampling_params.streaming_interval,
+                )
+                if stream_requested:
+                    tasks.append(
+                        client.add_request_streaming(
+                            prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
+                        )
+                    )
+                else:
+                    # add_request_with_id, not add_request: a non-streaming response
+                    # writes nothing to the socket while generating, so a disconnect
+                    # is never discovered as a broken pipe. Aborting needs the ids.
+                    request_id, future = client.add_request_with_id(
                         prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
                     )
-                )
-            else:
-                tasks.append(
-                    client.add_request(
-                        prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
-                    )
-                )
+                    request_ids.append(request_id)
+                    tasks.append(future)
+        except Exception as e:
+            abort_requests(client, request_ids, f"submission failed: {e}")
+            logger.error(f"Error submitting request: {e}")
+            return f"Error submitting request: {e}", 500
 
         if stream_requested:
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
@@ -216,6 +238,15 @@ try:
 
         try:
             batch_results = await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            # Quart cancels this handler when the peer goes away (its ASGI
+            # connection races handle_messages against handle_request and
+            # cancels the loser). Without this the engine would keep generating
+            # for a client that is gone, holding a slot until it hit the token
+            # limit -- orphans then accumulate faster than they retire and the
+            # batch saturates.
+            abort_requests(client, request_ids, "client disconnected")
+            raise
         except Exception as e:
             return f"Error during inference: {e}", 500
 
