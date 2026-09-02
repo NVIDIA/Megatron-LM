@@ -25,7 +25,7 @@ def test_get_fp8_backward_quantization_update_context():
     context = Mock()
     scope = Mock(return_value=context)
     transformer_engine = Mock()
-    transformer_engine.pytorch.backward_quantization_update_scope = scope
+    transformer_engine.pytorch.quantization_backward_scope = scope
 
     with (
         patch.object(fp8_utils, 'HAVE_TE', True),
@@ -44,7 +44,7 @@ def test_get_fp8_backward_quantization_update_context_without_te():
 
 def test_get_fp8_backward_quantization_update_context_without_scope_api():
     transformer_engine = Mock()
-    transformer_engine.pytorch.backward_quantization_update_scope = None
+    transformer_engine.pytorch.quantization_backward_scope = None
 
     with (
         patch.object(fp8_utils, 'HAVE_TE', True),
