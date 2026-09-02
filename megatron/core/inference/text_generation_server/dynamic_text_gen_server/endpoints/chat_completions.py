@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import warnings
+from functools import partial
 
 _MEDIA_FETCH_TIMEOUT_S = 5.0
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB
@@ -23,6 +24,9 @@ _MEDIA_FETCH_USER_AGENT = "megatron-inference"
 from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
@@ -562,6 +566,25 @@ def _replace_prefix_tokens(
     return previous_turn_token_ids + current_turn_additional_token_ids
 
 
+def _apply_chat_template_sync(
+    tokenizer, messages, tools, chat_template_kwargs, add_generation_prompt=True
+):
+    """Apply the chat template and coerce to `list[int]`, for use in a worker thread.
+
+    The coercion runs here too: it walks every token, so leaving it on the event loop
+    would keep part of the stall this offload exists to remove.
+    """
+    return _coerce_to_token_id_list(
+        tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            tools=tools,
+            **chat_template_kwargs,
+        )
+    )
+
+
 def _coerce_to_token_id_list(result):
     """Convert the return value of `tokenizer.apply_chat_template` to `list[int]`.
 
@@ -720,6 +743,9 @@ try:
         parsers = current_app.config['parsers']
 
         req = await request.get_json()
+        prevent_retokenization = req.get(
+            "prevent_retokenization", not current_app.config.get('eval_mode', False)
+        )
         tools = req.get("tools", None)
         tool_choice = req.get("tool_choice", None)
         parallel_tool_calls = req.get("parallel_tool_calls", True)
@@ -764,6 +790,15 @@ try:
         hf_tok = getattr(getattr(tokenizer, '_tokenizer', None), 'tokenizer', None)
         chat_tok = hf_tok if hf_tok is not None else tokenizer
 
+        # Same resolution against the private copy the worker thread applies the
+        # template with; `chat_tok` above is only read for the capability checks.
+        # Falls back to the shared tokenizer when no private copy is registered:
+        # callers that build the app config directly do not set one, and the copy
+        # is a thread-safety isolation measure rather than a correctness one.
+        tokenize_tok = current_app.config.get('tokenizer_copy', tokenizer)
+        tokenize_hf_tok = getattr(getattr(tokenize_tok, '_tokenizer', None), 'tokenizer', None)
+        tokenize_chat_tok = tokenize_hf_tok if tokenize_hf_tok is not None else tokenize_tok
+
         try:
             if hasattr(chat_tok, 'apply_chat_template') and (
                 getattr(chat_tok, "chat_template", None) is not None
@@ -777,6 +812,16 @@ try:
                 # rejected in _sanitize_chat_template_kwargs -- that is the actual
                 # fix. The real win here is the tokenizer half, which drops into
                 # Rust and releases the GIL for long conversations.
+                #
+                # Both paths go through the dedicated single-worker executor
+                # rather than asyncio.to_thread: the default executor is shared
+                # process-wide, so tokenization would queue behind unrelated work
+                # and vice versa, and its worker count would admit many concurrent
+                # Jinja renders that contend for the GIL with the very loop this
+                # offload protects. The executor also owns a private tokenizer
+                # copy, since HF tokenizers are not thread-safe.
+                # The multimodal path is left as-is: it is owned by the multimodal
+                # work and its slot lowering is being looked at separately.
                 if media_slots:
                     prompt_tokens = await _tokenize_with_media_slots(
                         chat_tok,
@@ -788,20 +833,18 @@ try:
                         add_generation_prompt=True,
                     )
                 else:
-                    prompt_tokens = _coerce_to_token_id_list(
-                        await asyncio.to_thread(
-                            functools.partial(
-                                chat_tok.apply_chat_template,
-                                template_messages,
-                                tokenize=True,
-                                add_generation_prompt=True,
-                                tools=template_tools,
-                                **chat_template_kwargs,
-                            )
-                        )
+                    prompt_tokens = await asyncio.get_running_loop().run_in_executor(
+                        current_app.config.get('tokenize_executor'),
+                        partial(
+                            _apply_chat_template_sync,
+                            tokenize_chat_tok,
+                            template_messages,
+                            template_tools,
+                            chat_template_kwargs,
+                        ),
                     )
 
-                if req.get("prevent_retokenization", True):
+                if prevent_retokenization:
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
                     # This improves prefix cache hits and reduces logprob variation between training and inference.
 
@@ -860,16 +903,17 @@ try:
                                 add_generation_prompt=False,
                             )
                         else:
-                            retokenized_previous_turn_token_ids = _coerce_to_token_id_list(
-                                await asyncio.to_thread(
-                                    functools.partial(
-                                        chat_tok.apply_chat_template,
+                            retokenized_previous_turn_token_ids = (
+                                await asyncio.get_running_loop().run_in_executor(
+                                    current_app.config.get('tokenize_executor'),
+                                    partial(
+                                        _apply_chat_template_sync,
+                                        tokenize_chat_tok,
                                         messages_to_last_assistant_message,
-                                        tokenize=True,
+                                        template_tools,
+                                        chat_template_kwargs,
                                         add_generation_prompt=False,
-                                        tools=template_tools,
-                                        **chat_template_kwargs,
-                                    )
+                                    ),
                                 )
                             )
 
@@ -902,9 +946,13 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(_get_non_none(req, "temperature", 1.0))
-            top_p = float(_get_non_none(req, "top_p", 1.0))
-            top_k = int(_get_non_none(req, "top_k", 0))
+            temperature = float(
+                _get_non_none(
+                    req, "temperature", current_app.config.get('default_temperature', 1.0)
+                )
+            )
+            top_p = float(_get_non_none(req, "top_p", current_app.config.get('default_top_p', 1.0)))
+            top_k = int(_get_non_none(req, "top_k", current_app.config.get('default_top_k', 0)))
             n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
 
             if temperature == 0.0:
@@ -937,7 +985,6 @@ try:
             # engine need to keep the prompt_tokens tensor on the response payload.
             # return_tokenized_data (implied by prevent_retokenization) needs the ids;
             # return_raw_text needs the ids to detokenize the prompt into raw_text.
-            prevent_retokenization = req.get("prevent_retokenization", True)
             return_tokenized_data = (
                 req.get("return_tokenized_data", False) or prevent_retokenization
             )
@@ -962,6 +1009,9 @@ try:
                 termination_id=-1 if ignore_eos else None,
                 return_prompt_tokens=return_prompt_tokens,
                 streaming_interval=int(_get_non_none(req, "streaming_interval", 1)),
+                # This frontend detokenizes its own output below. Keeping it off the
+                # coordinator matters because that is one process shared by all DP ranks.
+                detokenize_generations=False,
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
@@ -1113,7 +1163,11 @@ try:
             if response_uid is None:
                 response_uid = result["uid"]
 
-            text_output = result["generated_text"]
+            text_output = TextGenerationController.detokenize(
+                tokenizer,
+                result["generated_tokens"],
+                remove_EOD=not sampling_params.detokenize_stop_sequence,
+            )
             # The engine always reports prompt_length (for usage), but drops the
             # prompt_tokens tensor unless return_prompt_tokens was set.
             prompt_tokens_count = result.get("prompt_length")

@@ -4,6 +4,8 @@
 Unit tests for CUDAGraphBatchDimensionBuilder.match_graph_config with expert parallelism.
 """
 
+import math
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -13,6 +15,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
+from megatron.core.inference.config import CudaGraphSizingDistribution
 from tests.unit_tests.test_utilities import Utils
 
 BD = InferenceBatchDimensions
@@ -25,8 +28,17 @@ TP_SIZE = 1
 MIXED_PREFILL_COUNT = 16
 
 
-def _generate_graphs(num_cuda_graphs, use_non_decode=True):
-    """Generate cuda graph batch dimensions using the builder."""
+def _generate_graphs(
+    num_cuda_graphs,
+    use_non_decode=True,
+    sizing_distribution=CudaGraphSizingDistribution.EXPONENTIAL,
+):
+    """Generate cuda graph batch dimensions using the builder.
+
+    Defaults to EXPONENTIAL rather than the builder default (HYBRID) because the EP
+    matching tests below were written against a single shared ladder; tests that care
+    about the shipping default pass it explicitly.
+    """
     graph_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
         tp_size=TP_SIZE,
         num_cuda_graphs=num_cuda_graphs,
@@ -36,6 +48,7 @@ def _generate_graphs(num_cuda_graphs, use_non_decode=True):
         max_tokens=MAX_TOKENS,
         max_sequence_length=MAX_SEQ_LEN,
         use_cuda_graphs_for_non_decode_steps=use_non_decode,
+        sizing_distribution=sizing_distribution,
     )
     return graph_list
 
@@ -81,14 +94,30 @@ def _assert_consistent_across_ranks(result, ep_group):
 
 
 class TestCUDAGraphTokenCountAlignment:
-    """Verify that mixed/prefill graph token counts are a subset of decode graph token counts."""
+    """Verify that EP ranks can agree on a CUDA graph.
+
+    Two distributions are covered, and they guarantee different things:
+
+    EXPONENTIAL (the pre-HYBRID default) gives both families one shared ladder, so
+    mixed and decode token counts line up exactly -- asserted below.
+
+    HYBRID (the shipping default) deliberately spaces the two families differently, so
+    that alignment does not hold. It does not need to: a prefill on any EP rank sends
+    every rank eager (`adjust_batch_dims_for_expert_parallelism` returns None as soon as
+    the all-reduced non-decode flag is set), so a mixed graph is never selected while
+    another rank is decode-only. What EP does rely on is that every rank picks the same
+    graph for a decode-only step, which
+    `test_decode_only_ep_ranks_select_the_same_graph` covers for both distributions.
+    """
 
     @pytest.mark.parametrize("num_cuda_graphs", [1, 16, 32, -1])
     def test_mixed_token_counts_subset_of_decode(self, num_cuda_graphs):
         """Every token count in the mixed/prefill graph pool must also appear
         in the decode-only pool. Otherwise, when EP syncs token counts across
         ranks, decode-only ranks cannot find a graph at the same token count
-        as prefill ranks, causing inconsistent matching."""
+        as prefill ranks, causing inconsistent matching.
+
+        EXPONENTIAL only -- see the class docstring for why HYBRID is exempt."""
         graph_list = _generate_graphs(num_cuda_graphs)
 
         decode_token_counts = {bd.token_count for bd in graph_list if bd.prefill_req_count == 0}
@@ -112,6 +141,41 @@ class TestCUDAGraphTokenCountAlignment:
             f"with no mixed/prefill graph: {sorted(large_decode_only)}. "
             f"The EP token count elevation cannot guarantee alignment for these."
         )
+
+    @pytest.mark.parametrize(
+        "sizing_distribution",
+        [CudaGraphSizingDistribution.HYBRID, CudaGraphSizingDistribution.EXPONENTIAL],
+        ids=["default_hybrid", "legacy_exponential"],
+    )
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 4, 16, 32, -1])
+    def test_decode_only_ep_ranks_select_the_same_graph(self, num_cuda_graphs, sizing_distribution):
+        """On a decode-only step, EP ranks all-reduce-max their token count and then match
+        independently against their own (identical) graph list. Every rank must land on the
+        same graph, or the ranks replay mismatched captures.
+
+        The all-reduce is emulated here rather than run over a process group: the ranks
+        differ only in their local decode_req_count, which is what could pull them onto
+        different rungs."""
+        graph_list = _generate_graphs(num_cuda_graphs, sizing_distribution=sizing_distribution)
+        per_rank_decode_counts = [1, 3, 7, 16, 33, 64, MAX_REQUESTS]
+
+        # adjust_batch_dims_for_expert_parallelism elevates every rank's token count to
+        # the group max, leaving decode_req_count local.
+        synced_token_count = max(per_rank_decode_counts)
+        selected = {
+            CUDAGraphBatchDimensionBuilder.match_graph_config(
+                real_batch_dim=BD(synced_token_count, 0, decode_req_count),
+                cuda_graph_batch_dimensions_list=graph_list,
+                match_ep_token_counts=False,
+            )
+            for decode_req_count in per_rank_decode_counts
+        }
+
+        assert len(selected) == 1, (
+            f"EP ranks selected different graphs for one decode-only step: "
+            f"{sorted(str(s) for s in selected)}"
+        )
+        assert None not in selected, "Decode-only step at the request limit found no graph"
 
 
 class TestGenerateCUDAGraphEdgeCases:
@@ -183,6 +247,221 @@ class TestGenerateCUDAGraphEdgeCases:
             for g in [g for g in g_list if g.prefill_req_count == 0]:
                 assert g.token_count == g.decode_req_count * (num_spec + 1)
                 assert g.decode_req_count <= 32
+
+
+class TestSizingDistributions:
+    """Coverage for `sizing_distribution`, in particular the HYBRID default.
+
+    HYBRID names one distribution per graph family -- EXPONENTIAL for prefill/mixed,
+    LINEAR for decode-only -- and is resolved inside
+    `generate_cuda_graph_batch_dimensions_list`, the only caller that knows which
+    family it is building.
+    """
+
+    # Decode-only graphs are capped at max_requests * (spec + 1), so with these
+    # settings the decode family spans 64 tokens and the prefill/mixed family 512 --
+    # the order-of-magnitude gap that motivates a distribution per family.
+    MAX_REQUESTS = 64
+    CG_MAX_TOKENS = 512
+
+    def _generate(
+        self,
+        num_cuda_graphs,
+        sizing_distribution,
+        max_requests=None,
+        tp_size=1,
+        num_speculative_tokens=0,
+    ):
+        max_requests = max_requests or self.MAX_REQUESTS
+        cuda_graph_max_tokens = max(self.CG_MAX_TOKENS, max_requests * (num_speculative_tokens + 1))
+        graph_list, _ = CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+            tp_size=tp_size,
+            num_cuda_graphs=num_cuda_graphs,
+            cuda_graph_max_tokens=cuda_graph_max_tokens,
+            cuda_graph_mixed_prefill_request_count=MIXED_PREFILL_COUNT,
+            max_requests=max_requests,
+            max_tokens=cuda_graph_max_tokens,
+            max_sequence_length=MAX_SEQ_LEN,
+            use_cuda_graphs_for_non_decode_steps=True,
+            num_speculative_tokens=num_speculative_tokens,
+            sizing_distribution=sizing_distribution,
+        )
+        return graph_list
+
+    @staticmethod
+    def _token_counts(graph_list):
+        """Token counts of the (prefill/mixed, decode-only) families, descending."""
+        return (
+            sorted({bd.token_count for bd in graph_list if bd.prefill_req_count > 0}, reverse=True),
+            sorted(
+                {bd.token_count for bd in graph_list if bd.prefill_req_count == 0}, reverse=True
+            ),
+        )
+
+    def test_hybrid_ladders(self):
+        """HYBRID halves the prefill/mixed family down from cuda_graph_max_tokens while
+        stepping the decode family evenly across max_requests, so the coarse halving
+        that suits a 512-token range does not also govern a 64-token one. The decode
+        ladder reserves its last two rungs for the 1- and 2-request floors."""
+        prefill_counts, decode_counts = self._token_counts(
+            self._generate(8, CudaGraphSizingDistribution.HYBRID)
+        )
+        assert prefill_counts == [512, 256, 128, 64, 32, 16, 8]
+        assert decode_counts == [64, 60, 48, 36, 24, 12, 2, 1]
+
+    @pytest.mark.parametrize("num_cuda_graphs", [4, 8, 16, -1])
+    def test_hybrid_resolves_to_one_distribution_per_family(self, num_cuda_graphs):
+        """HYBRID must yield exactly EXPONENTIAL's prefill/mixed graphs and exactly
+        LINEAR's decode-only graphs -- not a blend, and not one distribution applied to
+        both families. Passing no distribution at all must resolve the same way, so a
+        direct caller captures what the inference engine captures."""
+        hybrid = self._generate(num_cuda_graphs, CudaGraphSizingDistribution.HYBRID)
+        exponential = self._generate(num_cuda_graphs, CudaGraphSizingDistribution.EXPONENTIAL)
+        linear = self._generate(num_cuda_graphs, CudaGraphSizingDistribution.LINEAR)
+
+        hybrid_prefill, hybrid_decode = self._token_counts(hybrid)
+        exponential_prefill, exponential_decode = self._token_counts(exponential)
+        linear_prefill, linear_decode = self._token_counts(linear)
+
+        assert hybrid_prefill == exponential_prefill
+        assert hybrid_decode == linear_decode
+
+        # The two families really do diverge here, so the equalities above are not
+        # satisfied by every distribution alike.
+        assert hybrid_decode != exponential_decode
+        assert hybrid_prefill != linear_prefill
+
+        assert self._generate(num_cuda_graphs, None) == hybrid
+
+    @pytest.mark.parametrize("max_requests", [8, 64, 256, 1024])
+    @pytest.mark.parametrize("num_cuda_graphs", [2, 4, 16, 32, -1])
+    @pytest.mark.parametrize("tp_size, num_speculative_tokens", [(1, 0), (8, 0), (1, 3), (8, 3)])
+    def test_decode_family_keeps_its_smallest_graphs(
+        self, max_requests, num_cuda_graphs, tp_size, num_speculative_tokens
+    ):
+        """A linear decode ladder starts at its stride, max_requests / num_cuda_graphs,
+        which at a large max_requests is a big graph to run a single decode request in.
+        The smallest decode shape must stay captured: one request, at lcm(spec + 1,
+        tp_size) tokens -- the smallest count that is both TP-aligned and a whole number
+        of speculative steps."""
+        graph_list = self._generate(
+            num_cuda_graphs,
+            CudaGraphSizingDistribution.HYBRID,
+            max_requests=max_requests,
+            tp_size=tp_size,
+            num_speculative_tokens=num_speculative_tokens,
+        )
+        _, decode_counts = self._token_counts(graph_list)
+        min_decode_tokens = math.lcm(num_speculative_tokens + 1, tp_size)
+
+        assert min(decode_counts) == min_decode_tokens
+        assert max(decode_counts) == max_requests * (num_speculative_tokens + 1)
+
+    @pytest.mark.parametrize("max_requests", [8, 64, 1024])
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 2, 3, 4, 16, 32])
+    @pytest.mark.parametrize("sizing_distribution", list(CudaGraphSizingDistribution))
+    def test_decode_family_respects_the_graph_budget(
+        self, max_requests, num_cuda_graphs, sizing_distribution
+    ):
+        """Reserving room for the small-decode floors must come out of the caller's graph
+        budget, not extend it -- including at num_cuda_graphs=1, where the budget leaves
+        room for the max token count alone."""
+        _, decode_counts = self._token_counts(
+            self._generate(num_cuda_graphs, sizing_distribution, max_requests=max_requests)
+        )
+        assert 0 < len(decode_counts) <= num_cuda_graphs
+
+    def test_calculate_token_counts_rejects_unresolved_hybrid(self):
+        """The per-family generator sees only one range and cannot tell which family it
+        serves, so HYBRID must fail loudly there instead of silently falling through to
+        exponential decode graphs."""
+        with pytest.raises(AssertionError, match="HYBRID must be resolved"):
+            CUDAGraphBatchDimensionBuilder._calculate_cuda_graph_token_counts(
+                tp_size=1,
+                num_cuda_graphs=8,
+                cuda_graph_max_tokens=64,
+                sizing_distribution=CudaGraphSizingDistribution.HYBRID,
+            )
+
+    @pytest.mark.parametrize(
+        "tp_size, num_cuda_graphs, cuda_graph_max_tokens, expected",
+        [
+            # A single graph is the max token count alone.
+            (1, 1, 80, [80]),
+            # Exact division: the stride is max / N.
+            (1, 2, 80, [80, 40]),
+            # 80 / 32 = 2.5 rounds up to a stride of 4. Rounding it down to 2 instead
+            # would ladder every even count from 2 to 80: 40 graphs for a budget of 32.
+            # fmt: off
+            (1, 32, 80, [80, 76, 72, 68, 64, 60, 56, 52, 48, 44, 40, 36, 32, 28, 24, 20,
+                         16, 12, 8, 4]),
+            # fmt: on
+            # 64 / 5 = 12.8 rounds up to 14 (CUDA_GRAPH_ROUNDER = 2), so the top gap
+            # (64 -> 56) is narrower than the stride.
+            (1, 5, 64, [64, 56, 42, 28, 14]),
+            # A stride that is already TP-aligned is unchanged by tp_size.
+            (2, 5, 64, [64, 56, 42, 28, 14]),
+            # 10 / 3 = 3.33 rounds up to 4, leaving a 2-token top gap.
+            (1, 3, 10, [10, 8, 4]),
+            # tp_size widens the stride (34 -> 40) and floors the max (100 -> 96).
+            (8, 3, 100, [96, 80, 40]),
+            (4, 7, 100, [100, 96, 80, 64, 48, 32, 16]),
+            # More graphs requested than the stride floor allows: the ladder is shorter
+            # than num_cuda_graphs rather than denser than it.
+            (1, 64, 10, [10, 8, 6, 4, 2]),
+            (8, 64, 8, [8]),
+            # A max token count that is not TP-aligned is floored before laddering.
+            (2, 3, 7, [6, 4]),
+        ],
+    )
+    def test_linear_ladder_rounding(
+        self, tp_size, num_cuda_graphs, cuda_graph_max_tokens, expected
+    ):
+        """Exact linear ladders where the stride, the TP alignment, or the graph budget
+        does not divide evenly."""
+        counts = CUDAGraphBatchDimensionBuilder._calculate_token_counts_linear(
+            tp_size=tp_size,
+            num_cuda_graphs=num_cuda_graphs,
+            cuda_graph_max_tokens=cuda_graph_max_tokens,
+        )
+        assert counts == expected
+
+    @pytest.mark.parametrize("num_cuda_graphs", [1, 2, 3, 5, 8, 16, 32, 64])
+    @pytest.mark.parametrize("cuda_graph_max_tokens", [8, 10, 63, 64, 80, 255, 2048])
+    @pytest.mark.parametrize("tp_size", [1, 2, 8])
+    def test_linear_ladder_invariants(self, num_cuda_graphs, cuda_graph_max_tokens, tp_size):
+        """Across every rounding combination the ladder stays within the caller's graph
+        budget, stays TP-aligned and descending, and always offers the largest usable
+        token count -- a batch at the budget must have a graph to land in."""
+        counts = CUDAGraphBatchDimensionBuilder._calculate_token_counts_linear(
+            tp_size=tp_size,
+            num_cuda_graphs=num_cuda_graphs,
+            cuda_graph_max_tokens=cuda_graph_max_tokens,
+        )
+        assert len(counts) <= num_cuda_graphs
+        assert counts == sorted(set(counts), reverse=True)
+        assert all(c > 0 and c % tp_size == 0 for c in counts)
+        assert counts[0] == (cuda_graph_max_tokens // tp_size) * tp_size
+
+    @pytest.mark.parametrize("tp_size", [2, 8])
+    def test_max_tokens_below_tp_size_yields_no_degenerate_graphs(self, tp_size):
+        """Flooring a max token count below tp_size leaves nothing to capture. Graph
+        generation must drop those shapes rather than emit a zero-token graph."""
+        graph_list, token_counts = (
+            CUDAGraphBatchDimensionBuilder.generate_cuda_graph_batch_dimensions_list(
+                tp_size=tp_size,
+                num_cuda_graphs=2,
+                cuda_graph_max_tokens=4,
+                cuda_graph_mixed_prefill_request_count=MIXED_PREFILL_COUNT,
+                max_requests=4,
+                max_tokens=4,
+                max_sequence_length=MAX_SEQ_LEN,
+                use_cuda_graphs_for_non_decode_steps=False,
+                sizing_distribution=CudaGraphSizingDistribution.HYBRID,
+            )
+        )
+        assert all(bd.token_count > 0 for bd in graph_list)
+        assert token_counts is None or all(tc > 0 for tc in token_counts)
 
 
 class TestMatchGraphConfigWithEP:
