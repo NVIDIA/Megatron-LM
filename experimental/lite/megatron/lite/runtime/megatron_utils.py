@@ -182,18 +182,25 @@ def offload_optimizer(optimizer) -> None:
     for _opt in _iter_opts(optimizer, ChainedOptimizer):
         if _opt.optimizer is not None:
             hdo = _opt.optimizer
+            state_offloader = getattr(_opt, "_optimizer_state_offloader", None)
             if all(
                 hasattr(hdo, a) for a in ("sub_optimizers", "inner_param_to_orig_param", "state")
             ):
                 for sub_opt in hdo.sub_optimizers:
                     for param, state in sub_opt.state.items():
+                        orig_param = hdo.inner_param_to_orig_param.get(param, param)
+                        if state_offloader is not None and state_offloader.is_param_offloaded(
+                            orig_param
+                        ):
+                            continue
                         for k, v in state.items():
                             if not isinstance(v, torch.Tensor):
                                 continue
-                            orig_param = hdo.inner_param_to_orig_param.get(param, param)
                             hdo.state[orig_param][k] = state[k] = v.to("cpu")
             else:
-                for v in _opt.optimizer.state.values():
+                for param, v in _opt.optimizer.state.items():
+                    if state_offloader is not None and state_offloader.is_param_offloaded(param):
+                        continue
                     if "exp_avg" in v:
                         v["exp_avg"] = v["exp_avg"].to("cpu", non_blocking=True)
                     if "exp_avg_sq" in v:
@@ -212,7 +219,13 @@ def load_optimizer(optimizer) -> None:
             if hasattr(_opt.optimizer, "_move_new_state_to_right_device"):
                 _opt.optimizer._move_new_state_to_right_device()
             else:
-                for v in _opt.optimizer.state.values():
+                state_offloader = getattr(_opt, "_optimizer_state_offloader", None)
+                for param, v in _opt.optimizer.state.items():
+                    # Chunk-managed state is CPU-canonical and is staged by MCore's
+                    # optimizer lifecycle.  Moving it wholesale here defeats the
+                    # configured memory bound and can OOM a colocated train/rollout job.
+                    if state_offloader is not None and state_offloader.is_param_offloaded(param):
+                        continue
                     if "exp_avg" in v:
                         v["exp_avg"] = v["exp_avg"].to("cuda", non_blocking=True)
                     if "exp_avg_sq" in v:

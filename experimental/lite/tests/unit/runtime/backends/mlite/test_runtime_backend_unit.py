@@ -410,6 +410,62 @@ def test_runtime_to_prefers_optimizer_specific_offload_hooks():
     assert optimizer.calls == ["offload", "load"]
 
 
+def test_runtime_optimizer_transfer_preserves_chunk_managed_cpu_state(monkeypatch):
+    from megatron.lite.runtime.megatron_utils import load_optimizer, offload_optimizer
+
+    moves = []
+
+    class TensorState:
+        def __init__(self, name):
+            self.name = name
+
+        def to(self, device, **_kwargs):
+            moves.append((self.name, device))
+            return self
+
+    managed_param = object()
+    resident_param = object()
+
+    class StateOffloader:
+        def is_param_offloaded(self, param):
+            return param is managed_param
+
+    inner_optimizer = types.SimpleNamespace(
+        state={
+            managed_param: {
+                "exp_avg": TensorState("managed_avg"),
+                "exp_avg_sq": TensorState("managed_avg_sq"),
+            },
+            resident_param: {
+                "exp_avg": TensorState("resident_avg"),
+                "exp_avg_sq": TensorState("resident_avg_sq"),
+            },
+        }
+    )
+    child = types.SimpleNamespace(
+        optimizer=inner_optimizer,
+        _optimizer_state_offloader=StateOffloader(),
+    )
+
+    class ChainedOptimizer:
+        def __init__(self):
+            self.chained_optimizers = [child]
+
+    monkeypatch.setattr("megatron.core.optimizer.ChainedOptimizer", ChainedOptimizer)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    optimizer = ChainedOptimizer()
+    offload_optimizer(optimizer)
+    load_optimizer(optimizer)
+
+    assert moves == [
+        ("resident_avg", "cpu"),
+        ("resident_avg_sq", "cpu"),
+        ("resident_avg", "cuda"),
+        ("resident_avg_sq", "cuda"),
+    ]
+
+
 def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
     events = []
 
