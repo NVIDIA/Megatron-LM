@@ -15,7 +15,10 @@ import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
@@ -70,6 +73,64 @@ class TestMcoreAdapterDense:
 
     def teardown_method(self):
         _destroy_model_parallel()
+
+    def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(self):
+        """init_model_with_meta_device should materialize FSDP v2 parameters with configured values."""
+
+        def initialize_to_constant(weight):
+            return torch.nn.init.constant_(weight, 0.25)
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            init_method=initialize_to_constant,
+            output_layer_init_method=initialize_to_constant,
+            # The FSDP adapter uses this flag to materialize and initialize meta parameters.
+            init_model_with_meta_device=True,
+        )
+        with torch.device("meta"):
+            meta_layer = TransformerLayer(
+                config=config,
+                submodules=get_gpt_layer_with_transformer_engine_spec().submodules,
+                layer_number=1,
+                add_layer_offset=False,
+            )
+        meta_parameters = list(meta_layer.parameters())
+        assert meta_parameters
+        assert all(parameter.is_meta for parameter in meta_parameters)
+
+        wrapped = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=meta_layer,
+            fsdp_unit_modules=[TransformerLayer],
+            pg_collection=self.pg_collection,
+        )
+
+        assert isinstance(wrapped.module, FsdpModule)
+
+        parameters = dict(wrapped.module.named_parameters())
+        assert parameters
+        for name, parameter in parameters.items():
+            local_parameter = parameter.to_local()
+
+            # Some parameters use module-specific initializers, so only check those
+            # initialized by the configured init method.
+            if name.endswith("bias") or "layernorm" in name or "layer_norm" in name:
+                continue
+            torch.testing.assert_close(
+                local_parameter,
+                torch.full_like(local_parameter, 0.25),
+                rtol=0,
+                atol=0,
+                msg=f"{name} was not initialized to 0.25",
+            )
 
     def test_wraps_fsdp_unit_modules_before_root(self):
         config = TransformerConfig(
