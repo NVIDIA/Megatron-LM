@@ -23,6 +23,21 @@ logger = logging.getLogger(__name__)
 # receive budget to exceed) and disables paged stashing, so the retry cannot fail either way.
 _MAX_RERUN_ATTEMPTS = 2
 
+# Dtypes the paged-stash Triton copy kernels address natively. Anything else is
+# moved as uint8 bytes; see allocate_stash_buffers().
+_STASH_NATIVE_DTYPES = (
+    torch.float64,
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+    torch.int64,
+    torch.int32,
+    torch.int16,
+    torch.int8,
+    torch.uint8,
+    torch.bool,
+)
+
 SCALE_INV_BLOCK_SIZE = 32
 
 
@@ -611,9 +626,16 @@ class PagedStashManager:
                 if host_tokens_dict is not None and (dtype, hidden_size) in host_tokens_dict
                 else 0
             )
-            buf_dtype = (
-                torch.uint8 if dtype in [torch.float8_e4m3fn, torch.float8_e8m0fnu] else dtype
-            )
+            # Dtypes Triton can address natively are stashed as-is; all others (FP8, FP4, ...)
+            # are byte-copied as uint8, which only preserves shape for 1-byte dtypes.
+            if dtype in _STASH_NATIVE_DTYPES:
+                buf_dtype = dtype
+            else:
+                assert dtype.itemsize == 1, (
+                    f"Paged stash cannot byte-copy {dtype} (itemsize {dtype.itemsize}); "
+                    "add it to _STASH_NATIVE_DTYPES if Triton supports it."
+                )
+                buf_dtype = torch.uint8
             self.stash_buffers[dtype][hidden_size] = PagedStashBuffer(
                 num_tokens,
                 hidden_size,
