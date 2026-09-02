@@ -33,7 +33,7 @@ class _CapturingClient:
     def __init__(self):
         self.sampling_params = []
 
-    async def add_request(self, prompt_tokens, sampling_params, *, multi_modal_data=None):
+    def add_request_with_id(self, prompt_tokens, sampling_params, *, multi_modal_data=None):
         del prompt_tokens, multi_modal_data
         self.sampling_params.append(sampling_params)
         raise RuntimeError("stop after request submission")
