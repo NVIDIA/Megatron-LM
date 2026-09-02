@@ -8,27 +8,23 @@ import weakref
 import pytest
 import torch
 
-from megatron.core.pipeline_parallel.tensor_lifetime import (
-    ReleaseAction,
-    ScheduleTensorLifetimeManager,
-)
+from megatron.core.pipeline_parallel.tensor_lifetime import ScheduleTensorLifetimeManager
 from megatron.core.pipeline_parallel.utils import NoopScheduleNode
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 
-def _publish(manager, tensor, stream):
-    manager.publish((), tensor, stream)
+def _retire_forward(manager, tensor, owner, consumer, node="consumer"):
+    manager.retire_forward_inputs(tensor, owner_stream=owner, consumer_stream=consumer, node=node)
 
 
-def _retire(manager, tensor, owner_action, consumer, node="consumer"):
-    manager.retire_and_publish(
+def _retire_gradient(manager, tensor, owner, consumer, node="consumer", fallback_consumed=()):
+    manager.retire_backward_inputs(
         tensor,
-        (),
-        action=owner_action,
-        producer_stream=consumer,
+        owner_stream=owner,
         consumer_stream=consumer,
         node=node,
+        fallback_consumed=fallback_consumed,
     )
 
 
@@ -43,9 +39,7 @@ def test_same_stream_empty_storage_is_immediate():
     manager = ScheduleTensorLifetimeManager()
     with torch.cuda.stream(owner):
         tensor = torch.empty(1024, device="cuda")
-    _publish(manager, tensor, owner)
-
-    _retire(manager, tensor, ReleaseAction.EMPTY_STORAGE, owner)
+    _retire_forward(manager, tensor, owner, owner)
 
     assert tensor.untyped_storage().nbytes() == 0
     assert not manager.pending
@@ -60,13 +54,11 @@ def test_cross_stream_release_waits_for_owner_acquire():
     with torch.cuda.stream(owner):
         tensor = torch.empty(1024, device="cuda")
         event.record(owner)
-    _publish(manager, tensor, owner)
-
     event.wait(consumer)
     with torch.cuda.stream(consumer):
         tensor.add_(1)
         event.record(consumer)
-    _retire(manager, tensor, ReleaseAction.EMPTY_STORAGE, consumer)
+    _retire_forward(manager, tensor, owner, consumer)
 
     assert tensor.untyped_storage().nbytes() > 0
     assert len(manager.pending) == 1
@@ -87,13 +79,11 @@ def test_two_managers_do_not_drain_another_microbatch():
     with torch.cuda.stream(owner):
         tensor = torch.empty(1024, device="cuda")
         backward_event.record(owner)
-    _publish(backward, tensor, owner)
-
     backward_event.wait(consumer)
     with torch.cuda.stream(consumer):
         tensor.add_(1)
         backward_event.record(consumer)
-    _retire(backward, tensor, ReleaseAction.EMPTY_STORAGE, consumer, "B MLP")
+    _retire_forward(backward, tensor, owner, consumer, node="B MLP")
 
     # An intervening F dispatch uses the same physical stream but a different
     # microbatch plan.  It must not release B's tensor or add a B -> F edge.
@@ -116,12 +106,11 @@ def test_terminal_hand_back_drains_all_owner_streams():
     with torch.cuda.stream(owner):
         tensor = torch.empty(1024, device="cuda")
         event.record(owner)
-    _publish(manager, tensor, owner)
     event.wait(consumer)
     with torch.cuda.stream(consumer):
         tensor.add_(1)
         event.record(consumer)
-    _retire(manager, tensor, ReleaseAction.EMPTY_STORAGE, consumer)
+    _retire_forward(manager, tensor, owner, consumer)
 
     manager.finalize_phase(event, "test")
 
@@ -140,12 +129,11 @@ def test_cross_stream_drop_reference_holds_gradient_until_owner_acquire():
         grad = torch.empty(1024, device="cuda")
         event.record(owner)
     grad_ref = weakref.ref(grad)
-    _publish(manager, grad, owner)
     event.wait(consumer)
     with torch.cuda.stream(consumer):
         grad.add_(1)
         event.record(consumer)
-    _retire(manager, grad, ReleaseAction.DROP_REFERENCE, consumer)
+    _retire_gradient(manager, grad, owner, consumer)
     del grad
     gc.collect()
 
@@ -156,82 +144,29 @@ def test_cross_stream_drop_reference_holds_gradient_until_owner_acquire():
 
 
 def test_unknown_external_gradient_uses_record_stream_fallback():
+    owner = torch.cuda.Stream()
     consumer = torch.cuda.Stream()
     manager = ScheduleTensorLifetimeManager()
     grad = torch.empty(16, device="cuda")
+    manager.mark_external_gradients(grad)
 
-    _retire(manager, grad, ReleaseAction.DROP_REFERENCE, consumer)
+    _retire_gradient(manager, grad, owner, consumer)
 
     assert not manager.pending
     assert manager.stats["record_stream_fallback"] == 1
 
 
-def test_noop_preserves_owner_tag_until_real_consumer():
+def test_noop_preserves_tensor_until_statically_mapped_real_consumer():
     owner = torch.cuda.Stream()
     consumer = torch.cuda.Stream()
     manager = ScheduleTensorLifetimeManager()
     tensor = torch.empty(16, device="cuda")
-    _publish(manager, tensor, owner)
 
     assert NoopScheduleNode().forward(tensor) is tensor
-    _retire(manager, tensor, ReleaseAction.DROP_REFERENCE, consumer)
+    _retire_gradient(manager, tensor, owner, consumer)
 
     assert len(manager.pending) == 1
     assert manager.pending[0].owner_stream.cuda_stream == owner.cuda_stream
-
-
-def test_free_input_output_alias_is_rejected():
-    owner = torch.cuda.Stream()
-    consumer = torch.cuda.Stream()
-    tensor = torch.empty(16, device="cuda")
-    alias = tensor.view_as(tensor)
-    manager = ScheduleTensorLifetimeManager()
-    _publish(manager, tensor, owner)
-
-    with pytest.raises(RuntimeError, match="aliases output storage"):
-        manager.retire_and_publish(
-            tensor,
-            alias,
-            action=ReleaseAction.EMPTY_STORAGE,
-            producer_stream=consumer,
-            consumer_stream=consumer,
-            node="alias consumer",
-        )
-
-
-def test_drop_reference_alias_inherits_owner_stream():
-    owner = torch.cuda.Stream()
-    consumer = torch.cuda.Stream()
-    tensor = torch.empty(16, device="cuda")
-    alias = tensor.view_as(tensor)
-    manager = ScheduleTensorLifetimeManager()
-    _publish(manager, tensor, owner)
-
-    manager.retire_and_publish(
-        tensor,
-        alias,
-        action=ReleaseAction.DROP_REFERENCE,
-        producer_stream=consumer,
-        consumer_stream=consumer,
-        node="alias transfer",
-    )
-    _retire(manager, alias, ReleaseAction.DROP_REFERENCE, consumer)
-
-    assert len(manager.pending) == 1
-    assert manager.pending[0].owner_stream.cuda_stream == owner.cuda_stream
-
-
-def test_external_alias_remains_untagged_and_falls_back():
-    consumer = torch.cuda.Stream()
-    manager = ScheduleTensorLifetimeManager()
-    tensor = torch.empty(16, device="cuda")
-    alias = tensor.view_as(tensor)
-
-    manager.publish(tensor, alias, consumer)
-    _retire(manager, alias, ReleaseAction.DROP_REFERENCE, consumer)
-
-    assert manager.stats["record_stream_fallback"] == 1
-    assert not manager.pending
 
 
 def test_detached_gradient_without_explicit_producer_tag_falls_back():
@@ -243,7 +178,7 @@ def test_detached_gradient_without_explicit_producer_tag_falls_back():
         (leaf.square().sum()).backward()
     detached_grad = leaf.grad
 
-    _retire(manager, detached_grad, ReleaseAction.DROP_REFERENCE, consumer)
+    _retire_gradient(manager, detached_grad, None, consumer)
 
     assert manager.stats["record_stream_fallback"] == 1
     assert not manager.pending
@@ -263,14 +198,12 @@ def test_allocator_reuse_poison_does_not_overwrite_delayed_consumer():
         with torch.cuda.stream(owner):
             tensor = torch.full((256 * 1024,), pattern, dtype=torch.int32, device="cuda")
             event.record(owner)
-        _publish(manager, tensor, owner)
-
         event.wait(consumer)
         with torch.cuda.stream(consumer):
             torch.cuda._sleep(1_000_000)
             observed.append(tensor.clone())
             event.record(consumer)
-        _retire(manager, tensor, ReleaseAction.EMPTY_STORAGE, consumer)
+        _retire_forward(manager, tensor, owner, consumer)
 
         # The wait is enqueued before drain makes storage allocator-visible.
         _wait_and_drain(manager, event, owner)
@@ -293,20 +226,14 @@ def test_full_graph_capture_drains_during_capture_not_replay():
         event = torch.cuda.Event()
         manager = ScheduleTensorLifetimeManager()
         tensor = torch.full((1024,), 7, dtype=torch.int32, device="cuda")
-        _publish(manager, tensor, capture_stream)
         event.record(capture_stream)
 
         event.wait(consumer)
         with torch.cuda.stream(consumer):
             output = tensor + 1
             event.record(consumer)
-        manager.retire_and_publish(
-            tensor,
-            output,
-            action=ReleaseAction.EMPTY_STORAGE,
-            producer_stream=consumer,
-            consumer_stream=consumer,
-            node="captured consumer",
+        manager.retire_forward_inputs(
+            tensor, owner_stream=capture_stream, consumer_stream=consumer, node="captured consumer"
         )
         _wait_and_drain(manager, event, capture_stream, "captured owner hand-back")
         manager.finalize_phase(event, "capture")
