@@ -938,6 +938,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
                         hook = getattr(param, '_grad_accum_hook', None)
                         if hook is not None:
                             hook()
+
         return None, None, *runner.static_grad_inputs, *(None,) * len(runner.params_to_backprop)
 
 

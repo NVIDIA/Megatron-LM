@@ -1023,9 +1023,6 @@ class TransformerConfig(ModelParallelConfig):
     GEMM backward consumes directly. Same requirements as moe_dispatch_fwd_dtype. Defaults to
     'bf16' (no quantization on the wire)."""
 
-    moe_ncclep_static_shape: bool = False
-    """Use fixed NCCL-EP dispatch and receive shapes. Retained for launcher compatibility."""
-
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
     block interleaved format. Instead of interpreting the input tensor
@@ -1810,84 +1807,80 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_flex_dispatcher_backend == "replica_hybridep":
             if self.moe_expert_rank_capacity_factor is None:
                 self.moe_expert_rank_capacity_factor = 1.0
-            replica_errors = []
-            if self.grad_reduce_in_bf16 and not self.ddp_reduce_scatter_with_fp32_accumulation:
-                replica_errors.append(
-                    "--ddp-reduce-scatter-with-fp32-accumulation with " "--grad-reduce-in-bf16"
-                )
-            if (
-                self.grad_reduce_in_bf16
-                and self.expert_gtp_weight_remat_size > 1
-                and not self.gtp_remat_reduce_scatter_with_fp32_accumulation
-            ):
-                replica_errors.append(
-                    "--gtp-remat-reduce-scatter-with-fp32-accumulation with expert GTP and "
-                    "--grad-reduce-in-bf16"
-                )
             replica_mxfp8 = (
                 self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
             )
-            if not self.bf16 or self.params_dtype != torch.bfloat16:
-                replica_errors.append("BF16 execution and BF16 parameters")
-            if (self.fp8 and not replica_mxfp8) or self.fp4:
-                replica_errors.append(
-                    "quantization disabled or MXFP8 E4M3 with native FP8 parameters"
-                )
-            if self.add_bias_linear:
-                replica_errors.append("add_bias_linear=False")
-            if not self.moe_grouped_gemm:
-                replica_errors.append("moe_grouped_gemm=True")
-            if self.moe_single_grouped_weight:
-                replica_errors.append("moe_single_grouped_weight=False")
-            if self.moe_single_grouped_bias:
-                replica_errors.append("moe_single_grouped_bias=False")
-            if not self.use_transformer_engine_op_fuser:
-                replica_errors.append("use_transformer_engine_op_fuser=True")
-            if not self.gradient_accumulation_fusion:
-                replica_errors.append("gradient_accumulation_fusion=True")
-            if self.moe_router_dtype != "fp32":
-                replica_errors.append("moe_router_dtype='fp32'")
-            if self.expert_tensor_parallel_size != 1:
-                replica_errors.append("expert_tensor_parallel_size=1")
-            if self.moe_router_topk > 32:
-                replica_errors.append("moe_router_topk<=32")
-            supported_glu = self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu)
-            supported_squared_relu = (
+            fused_activation = (
+                self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu)
+            ) or (
                 not self.gated_linear_unit
                 and self.activation_func == squared_relu
                 and self.use_fused_weighted_squared_relu
             )
-            if not (supported_glu or supported_squared_relu):
-                replica_errors.append(
-                    "fused SwiGLU, quick-GeGLU, or weighted squared-ReLU activation"
-                )
-            if self.delay_wgrad_compute:
-                replica_errors.append("delay_wgrad_compute=False")
-            if self.overlap_dispatch_backward_with_experts_wgrad:
-                replica_errors.append("overlap_dispatch_backward_with_experts_wgrad=False")
-            if self.overlap_moe_expert_parallel_comm:
-                replica_errors.append("overlap_moe_expert_parallel_comm=False")
-            if self.moe_shared_expert_overlap:
-                replica_errors.append("moe_shared_expert_overlap=False")
-            expert_input_size = self.moe_latent_size or self.hidden_size
-            if expert_input_size % 128 != 0:
-                replica_errors.append("moe_latent_size (or hidden_size) divisible by 128")
-            if self.moe_ffn_hidden_size % 128 != 0:
-                replica_errors.append("moe_ffn_hidden_size divisible by 128")
-            if self.moe_expert_capacity_factor is not None:
-                replica_errors.append("moe_expert_capacity_factor=None")
-            if self.moe_expert_rank_capacity_factor < 1.0:
-                replica_errors.append("moe_expert_rank_capacity_factor>=1.0")
-            if self.moe_hybridep_pad_uneven_dispatch_inputs:
-                replica_errors.append("moe_hybridep_pad_uneven_dispatch_inputs=False")
-            if self.moe_pad_expert_input_to_capacity:
-                replica_errors.append("moe_pad_expert_input_to_capacity=False")
-            if self.moe_router_padding_for_quantization and not replica_mxfp8:
-                replica_errors.append("moe_router_padding_for_quantization=False")
-            if self.moe_token_dropping:
-                replica_errors.append("moe_token_dropping=False")
-            if self.moe_apply_probs_on_input:
-                replica_errors.append("moe_apply_probs_on_input=False")
+            required_values = {
+                "add_bias_linear": False,
+                "moe_grouped_gemm": True,
+                "moe_single_grouped_weight": False,
+                "moe_single_grouped_bias": False,
+                "use_transformer_engine_op_fuser": True,
+                "gradient_accumulation_fusion": True,
+                "moe_router_dtype": "fp32",
+                "expert_tensor_parallel_size": 1,
+                "delay_wgrad_compute": False,
+                "overlap_dispatch_backward_with_experts_wgrad": False,
+                "overlap_moe_expert_parallel_comm": False,
+                "moe_shared_expert_overlap": False,
+                "moe_expert_capacity_factor": None,
+                "moe_hybridep_pad_uneven_dispatch_inputs": False,
+                "moe_pad_expert_input_to_capacity": False,
+                "moe_token_dropping": False,
+                "moe_apply_probs_on_input": False,
+            }
+            # (requirement satisfied, requirement description)
+            replica_requirements = [
+                (getattr(self, name) == value, f"{name}={value!r}")
+                for name, value in required_values.items()
+            ] + [
+                (
+                    not self.grad_reduce_in_bf16 or self.ddp_reduce_scatter_with_fp32_accumulation,
+                    "--ddp-reduce-scatter-with-fp32-accumulation with --grad-reduce-in-bf16",
+                ),
+                (
+                    not (self.grad_reduce_in_bf16 and self.expert_gtp_weight_remat_size > 1)
+                    or self.gtp_remat_reduce_scatter_with_fp32_accumulation,
+                    "--gtp-remat-reduce-scatter-with-fp32-accumulation with expert GTP and "
+                    "--grad-reduce-in-bf16",
+                ),
+                (
+                    self.bf16 and self.params_dtype == torch.bfloat16,
+                    "BF16 execution and BF16 parameters",
+                ),
+                (
+                    (not self.fp8 or replica_mxfp8) and not self.fp4,
+                    "quantization disabled or MXFP8 E4M3 with native FP8 parameters",
+                ),
+                (self.moe_router_topk <= 32, "moe_router_topk<=32"),
+                (
+                    fused_activation,
+                    "fused SwiGLU, quick-GeGLU, or weighted squared-ReLU activation",
+                ),
+                (
+                    (self.moe_latent_size or self.hidden_size) % 128 == 0,
+                    "moe_latent_size (or hidden_size) divisible by 128",
+                ),
+                (self.moe_ffn_hidden_size % 128 == 0, "moe_ffn_hidden_size divisible by 128"),
+                (
+                    self.moe_expert_rank_capacity_factor >= 1.0,
+                    "moe_expert_rank_capacity_factor>=1.0",
+                ),
+                (
+                    not self.moe_router_padding_for_quantization or replica_mxfp8,
+                    "moe_router_padding_for_quantization=False",
+                ),
+            ]
+            replica_errors = [
+                message for satisfied, message in replica_requirements if not satisfied
+            ]
             if replica_errors:
                 raise ValueError(
                     "Replica-HybridEP flex dispatcher configuration is unsupported; require "
