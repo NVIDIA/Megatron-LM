@@ -2764,7 +2764,18 @@ class TECudaGraphHelper:
                 rng_context = nullcontext()
             from megatron.core.transformer.moe.paged_stash import paged_stash_te_graph_capture
 
+            capture_session = nullcontext()
+            if self.config.fine_grained_activation_offloading:
+                from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                    FineGrainedActivationOffloadingInterface as off_interface,
+                )
+
+                # TE captures the callables as sibling graphs. Preserve throttle
+                # FIFOs across those captures, then clear them even if TE raises.
+                capture_session = off_interface.cuda_graph_capture_session()
+
             with (
+                capture_session,
                 rng_context,
                 paged_stash_te_graph_capture(
                     self._should_enable_paged_stash_capture(),

@@ -377,9 +377,8 @@ class OffloadTensorGroup:
         # also the correct max-inflight edge within one capture. Separately captured
         # module graphs cannot share that internal edge, so cap > 0 groups may also
         # carry an external event whose explicit record/wait nodes bridge graphs.
-        self._offload_throttle_event: Optional[torch.cuda.Event] = (
-            torch.cuda.Event(external=True) if enable_offload_throttle else None
-        )
+        self._offload_throttle_enabled = enable_offload_throttle
+        self._offload_throttle_event: Optional[torch.cuda.Event] = None
         self.offload = True
         self.total_offload_bytes = 0
         self.total_tensor_count = 0
@@ -409,8 +408,13 @@ class OffloadTensorGroup:
 
     def record_offload_throttle_event(self, stream):
         """Record the external event used only for max-inflight throttling."""
-        if self._offload_throttle_event is None:
+        if not self._offload_throttle_enabled:
             raise RuntimeError("Offload throttle event was not enabled for this group")
+        # Full-iteration capture never crosses graph boundaries, so avoid even
+        # creating the external-event wrapper unless a sibling-graph producer
+        # actually needs to publish an event node.
+        if self._offload_throttle_event is None:
+            self._offload_throttle_event = torch.cuda.Event(external=True)
         self._offload_throttle_event.record(stream)
 
     def wait_offload_throttle_event(self, stream):
@@ -480,6 +484,10 @@ class PipelineOffloadManager:
         # modules inherit it so max-inflight dependencies can distinguish a
         # same-graph edge from a dependency between separately captured graphs.
         self._cuda_graph_capture_owner: Optional[_OffloadCudaGraphCaptureOwner] = None
+        # The outermost capture session owns every handler that enqueues a
+        # capture-time throttle entry. Tracking touched handlers, rather than
+        # only cached forward/backward lists, makes exception cleanup complete.
+        self._cuda_graph_capture_session_handlers: Optional[set] = None
         # Cache OffloadChunkHandler objects for each virtual pipeline stage and each forward pass.
         self._cached_chunks_forward = []
         # Cache OffloadChunkHandler objects for each virtual pipeline stage and each backward pass.
@@ -554,21 +562,33 @@ class PipelineOffloadManager:
         finally:
             self._cuda_graph_capture_owner = previous_owner
 
+    def register_cuda_graph_capture_handler(self, handler) -> None:
+        """Register a handler for cleanup at the outer capture-session boundary."""
+        if self._cuda_graph_capture_session_handlers is not None:
+            self._cuda_graph_capture_session_handlers.add(handler)
+
     @contextmanager
     def cuda_graph_capture_session(self):
         """Keep throttle FIFOs across sibling captures, then discard capture-only state.
 
-        Local CUDA graphs are captured one at a time but may consume external
-        events produced by an earlier sibling graph. The FIFOs must therefore
-        survive individual capture scopes and be cleared only after the complete
-        local capture session has finished.
+        CUDA graphs are captured one at a time but may consume external events
+        produced by an earlier sibling graph. The FIFOs must therefore survive
+        individual capture scopes and be cleared only after the complete outer
+        capture session has finished.
         """
+        outermost = self._cuda_graph_capture_session_handlers is None
+        if outermost:
+            self._cuda_graph_capture_session_handlers = set()
         try:
             yield
         finally:
-            cached_chunks = set(self._cached_chunks_forward) | set(self._cached_chunks_backward)
-            for chunk in cached_chunks:
-                chunk.clear_offload_pending()
+            if outermost:
+                touched_chunks = self._cuda_graph_capture_session_handlers
+                assert touched_chunks is not None
+                self._cuda_graph_capture_session_handlers = None
+                cached_chunks = set(self._cached_chunks_forward) | set(self._cached_chunks_backward)
+                for chunk in cached_chunks | touched_chunks:
+                    chunk.clear_offload_pending()
 
     def push_offload_groups(self, group_hook, name, forced_released_tensors):
         """Push the offload groups to the delayed queue."""
@@ -1092,7 +1112,8 @@ class ChunkOffloadHandler:
         debug_rank("------bulk_offload_group")
         nvtx_msg = "activation offloading " + group_to_offload._name
         nvtx_range_push(nvtx_msg)
-        capture_owner = PipelineOffloadManager.get_instance().cuda_graph_capture_owner
+        offload_manager = PipelineOffloadManager.get_instance()
+        capture_owner = offload_manager.cuda_graph_capture_owner
         external_recorded = bool(
             self._max_inflight_offloads is not None
             and self._max_inflight_offloads > 0
@@ -1114,6 +1135,8 @@ class ChunkOffloadHandler:
                 group_to_offload.record_offload_throttle_event(self.d2h_stream)
         nvtx_range_pop(nvtx_msg)
         if self._max_inflight_offloads is not None:
+            if capture_owner is not None:
+                offload_manager.register_cuda_graph_capture_handler(self)
             gname = group_to_offload._name
             self._offload_pending_by_name[gname].append(
                 _PendingOffload(group_to_offload, capture_owner, external_recorded)
@@ -1220,7 +1243,10 @@ class ChunkOffloadHandler:
             if (pending.producer_owner is None) != (consumer_owner is None):
                 raise RuntimeError(
                     "Max-inflight offload dependency crossed between eager execution "
-                    f"and CUDA graph capture for group {group_name!r}"
+                    f"and CUDA graph capture for group {group_name!r}. This indicates "
+                    "that the throttle FIFO was not cleared at a capture-session boundary; "
+                    "unset fine_grained_offloading_max_inflight_offloads to disable "
+                    "throttling while reporting this capture-boundary bug."
                 )
             if pending.producer_owner is consumer_owner:
                 pending.group.wait_offload_event(cur)
@@ -1510,7 +1536,7 @@ class FineGrainedActivationOffloadingInterface:
 
     @staticmethod
     def cuda_graph_capture_session():
-        """Return a scope covering all sibling captures in one local capture session."""
+        """Return a scope covering all sibling captures in one capture session."""
         return PipelineOffloadManager.get_instance().cuda_graph_capture_session()
 
     @staticmethod

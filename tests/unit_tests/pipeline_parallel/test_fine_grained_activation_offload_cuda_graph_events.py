@@ -13,7 +13,11 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     PipelineOffloadManager,
 )
 from megatron.core.transformer import cuda_graphs
-from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, _CudaGraphRunner
+from megatron.core.transformer.cuda_graphs import (
+    TECudaGraphHelper,
+    _CudagraphGlobalRecord,
+    _CudaGraphRunner,
+)
 
 
 @pytest.fixture
@@ -42,8 +46,12 @@ def mocked_offload_manager(monkeypatch):
     old_manager = PipelineOffloadManager.OFFLOAD_MGR
     manager = PipelineOffloadManager()
     PipelineOffloadManager.OFFLOAD_MGR = manager
-    yield manager, events, streams
-    PipelineOffloadManager.OFFLOAD_MGR = old_manager
+    try:
+        yield manager, events, streams
+    finally:
+        assert manager.cuda_graph_capture_owner is None, "test leaked a capture scope"
+        assert manager._cuda_graph_capture_session_handlers is None, "test leaked a capture session"
+        PipelineOffloadManager.OFFLOAD_MGR = old_manager
 
 
 def _new_handler(manager, max_inflight_offloads):
@@ -66,17 +74,40 @@ def _bulk_empty_group(handler, name):
 
 
 @pytest.mark.parametrize("max_inflight_offloads", [None, 0, 2])
-def test_handler_allocates_external_event_only_for_positive_throttling_cap(
+def test_handler_lazily_allocates_external_event_only_when_cross_graph_recorded(
     mocked_offload_manager, max_inflight_offloads
 ):
     manager, _, _ = mocked_offload_manager
     handler = _new_handler(manager, max_inflight_offloads=max_inflight_offloads)
 
     group = _empty_group(handler, "core_attn")
+    assert group._offload_throttle_event is None
+
+    with manager.cuda_graph_capture_session():
+        with manager.cuda_graph_capture_scope(may_cross_graphs=True):
+            handler.bulk_offload_group(group)
 
     assert (group._offload_throttle_event is not None) == (
         max_inflight_offloads is not None and max_inflight_offloads > 0
     )
+
+
+def test_capture_local_throttle_never_allocates_external_event(mocked_offload_manager, monkeypatch):
+    manager, _, _ = mocked_offload_manager
+    main_stream = Mock()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main_stream)
+    handler = _new_handler(manager, max_inflight_offloads=1)
+    first_group = _empty_group(handler, "core_attn")
+    second_group = _empty_group(handler, "core_attn")
+
+    with manager.cuda_graph_capture_scope(may_cross_graphs=False):
+        handler.bulk_offload_group(first_group)
+        handler.bulk_offload_group(second_group)
+
+    main_stream.wait_event.assert_called_once_with(first_group._offload_event)
+    assert first_group._offload_throttle_event is None
+    assert second_group._offload_throttle_event is None
+    handler.clear_offload_pending()
 
 
 def test_capture_scope_nests_but_sibling_scopes_get_distinct_owners(mocked_offload_manager):
@@ -137,17 +168,122 @@ def test_different_capture_owner_waits_on_external_event(mocked_offload_manager,
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: main_stream)
     handler = _new_handler(manager, max_inflight_offloads=1)
 
-    with manager.cuda_graph_capture_scope(may_cross_graphs=True):
-        group = _bulk_empty_group(handler, "core_attn")
+    with manager.cuda_graph_capture_session():
+        with manager.cuda_graph_capture_scope(may_cross_graphs=True):
+            group = _bulk_empty_group(handler, "core_attn")
 
-    with manager.cuda_graph_capture_scope(may_cross_graphs=True):
-        second_group = _bulk_empty_group(handler, "core_attn")
+        with manager.cuda_graph_capture_scope(may_cross_graphs=True):
+            second_group = _bulk_empty_group(handler, "core_attn")
 
-    assert group._offload_throttle_event is not None
-    main_stream.wait_event.assert_called_once_with(group._offload_throttle_event)
-    assert [entry.group for entry in handler._offload_pending_by_name["core_attn"]] == [
-        second_group
+        assert group._offload_throttle_event is not None
+        main_stream.wait_event.assert_called_once_with(group._offload_throttle_event)
+        assert [entry.group for entry in handler._offload_pending_by_name["core_attn"]] == [
+            second_group
+        ]
+
+    assert not handler._offload_pending_by_name["core_attn"]
+
+
+def test_nested_capture_session_clears_only_at_outer_boundary(mocked_offload_manager, monkeypatch):
+    manager, _, _ = mocked_offload_manager
+    main_stream = Mock()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main_stream)
+    handler = _new_handler(manager, max_inflight_offloads=1)
+
+    with manager.cuda_graph_capture_session():
+        with manager.cuda_graph_capture_scope(may_cross_graphs=True):
+            first_group = _bulk_empty_group(handler, "core_attn")
+        with manager.cuda_graph_capture_session():
+            with manager.cuda_graph_capture_scope(may_cross_graphs=True):
+                second_group = _bulk_empty_group(handler, "core_attn")
+            assert [entry.group for entry in handler._offload_pending_by_name["core_attn"]] == [
+                second_group
+            ]
+        assert [entry.group for entry in handler._offload_pending_by_name["core_attn"]] == [
+            second_group
+        ]
+        with manager.cuda_graph_capture_scope(may_cross_graphs=True):
+            third_group = _bulk_empty_group(handler, "core_attn")
+        assert [entry.group for entry in handler._offload_pending_by_name["core_attn"]] == [
+            third_group
+        ]
+
+    assert main_stream.wait_event.call_args_list == [
+        call(first_group._offload_throttle_event),
+        call(second_group._offload_throttle_event),
     ]
+    assert not handler._offload_pending_by_name["core_attn"]
+
+
+def test_capture_session_tracks_handler_outside_cached_chunk_lists(
+    mocked_offload_manager, monkeypatch
+):
+    manager, _, _ = mocked_offload_manager
+    monkeypatch.setattr(torch.cuda, "current_stream", Mock())
+
+    with manager.cuda_graph_capture_session():
+        handler = _new_handler(manager, max_inflight_offloads=1)
+        assert handler not in manager._cached_chunks_forward
+        assert handler not in manager._cached_chunks_backward
+        with manager.cuda_graph_capture_scope(may_cross_graphs=True):
+            group = _bulk_empty_group(handler, "core_attn")
+        assert [entry.group for entry in handler._offload_pending_by_name["core_attn"]] == [group]
+
+    assert not handler._offload_pending_by_name["core_attn"]
+
+
+@pytest.mark.parametrize("raise_during_capture", [False, True], ids=["success", "exception"])
+def test_te_capture_session_preserves_sibling_fifo_and_always_clears(
+    mocked_offload_manager, monkeypatch, raise_during_capture
+):
+    manager, _, _ = mocked_offload_manager
+    main_stream = Mock()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main_stream)
+    handler = _new_handler(manager, max_inflight_offloads=1)
+
+    helper = object.__new__(TECudaGraphHelper)
+    helper.config = SimpleNamespace(
+        fine_grained_activation_offloading=True, sequence_parallel=False
+    )
+    helper.flattened_callables = [Mock()]
+    helper.callables_per_chunk = []
+    helper._start_capturing = lambda: 0.0
+    helper._finish_capturing = Mock()
+    helper._get_cuda_graph_input_data = lambda: ([()], {"_order": [1, -1]})
+    helper._validate_mhc_static_hidden_inputs = Mock()
+    helper._uses_mhc_direct_write_arena = lambda: False
+    helper._should_enable_paged_stash_capture = lambda: False
+
+    monkeypatch.setattr(cuda_graphs, "validate_moe_cuda_graph_support", Mock())
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.paged_stash.paged_stash_te_graph_capture",
+        lambda *args, **kwargs: nullcontext(),
+    )
+
+    def fake_make_graphed_callables(*args, **kwargs):
+        with manager.cuda_graph_capture_scope(may_cross_graphs=True):
+            first_group = _bulk_empty_group(handler, "core_attn")
+        if raise_during_capture:
+            raise ValueError("original TE capture failure")
+        with manager.cuda_graph_capture_scope(may_cross_graphs=True):
+            second_group = _bulk_empty_group(handler, "core_attn")
+        main_stream.wait_event.assert_called_once_with(first_group._offload_throttle_event)
+        assert [entry.group for entry in handler._offload_pending_by_name["core_attn"]] == [
+            second_group
+        ]
+        return ()
+
+    monkeypatch.setattr(cuda_graphs, "make_graphed_callables", fake_make_graphed_callables)
+
+    if raise_during_capture:
+        with pytest.raises(ValueError, match="original TE capture failure"):
+            helper.create_cudagraphs()
+        helper._finish_capturing.assert_not_called()
+    else:
+        helper.create_cudagraphs()
+        helper._finish_capturing.assert_called_once_with(0.0)
+
+    assert not handler._offload_pending_by_name["core_attn"]
 
 
 def test_local_capture_session_clears_pending_before_returning_to_eager(

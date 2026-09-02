@@ -243,7 +243,12 @@ class FullCudaGraphWrapper:
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
             capture_scope = nullcontext()
-            config = get_model_config(model[0] if isinstance(model, list) else model)
+            try:
+                config = get_model_config(model[0] if isinstance(model, list) else model)
+            except RuntimeError:
+                # FullCudaGraphWrapper historically accepted model wrappers with
+                # no reachable config; only offload integration needs this flag.
+                config = None
             if getattr(config, 'fine_grained_activation_offloading', False):
                 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
                     FineGrainedActivationOffloadingInterface as off_interface,

@@ -435,10 +435,9 @@ class GraphableMegatronModule(MegatronModule):
         if self._should_call_local_cudagraph(*args, **kwargs):
             return self.cudagraph_manager(self, args, kwargs)
         elif self._should_call_te_cudagraph(*args, **kwargs):
-            capture_scope = nullcontext()
             if not self.cuda_graphs:
                 # Do CUDA Graphs capture.
-                cuda_graph_func = self._te_cuda_graph_capture
+                capture_scope = nullcontext()
                 if self.config.fine_grained_activation_offloading:
                     from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
                         FineGrainedActivationOffloadingInterface as off_interface,
@@ -448,11 +447,10 @@ class GraphableMegatronModule(MegatronModule):
                     # graphable modules reuse this owner rather than pretending to
                     # be a separate graph.
                     capture_scope = off_interface.cuda_graph_capture_scope(may_cross_graphs=True)
-            else:
-                # Do CUDA Graphs replay.
-                cuda_graph_func = self._te_cuda_graph_replay
-            with capture_scope:
-                return cuda_graph_func(*args, **kwargs)
+                with capture_scope:
+                    return self._te_cuda_graph_capture(*args, **kwargs)
+            # Do CUDA Graphs replay without entering a context manager on the hot path.
+            return self._te_cuda_graph_replay(*args, **kwargs)
         return super().__call__(*args, **kwargs)
 
 
