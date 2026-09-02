@@ -683,7 +683,7 @@ else:
 
 
 def get_fp8_backward_quantization_update_context() -> AbstractContextManager:
-    """Run the TE delayed-scaling update once for a logical backward made of several autograd calls."""
+    """Run the TE delayed-scaling update once for a backward made of several autograd calls."""
     if not HAVE_TE:
         return nullcontext()
     scope = getattr(transformer_engine.pytorch, "quantization_backward_scope", None)
