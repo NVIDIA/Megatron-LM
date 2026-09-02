@@ -22,6 +22,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
+from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import collect_linked_event_groups
 
 logger = logging.getLogger(__name__)
@@ -609,6 +610,88 @@ def test_tied_child_parameters_allocate_one_physical_weight(distributed_setup):
     assert parameter_group.main_weight.layout.size == 8 * 4
     # Both aliases must expose the same optimizer-visible sharded parameter.
     assert len(list(model.parameters())) == 1
+
+
+@pytest.mark.parametrize("init_device", ["cpu", "meta"])
+def test_optimizer_metadata_and_shared_grad_stats_survive_sharding(distributed_setup, init_device):
+    """MFSDP replacements retain optimizer tags and exclude a shared PP copy from stats."""
+    model = TinyModel().to(device=init_device)
+    model.fc2.weight.allreduce = False
+    model.fc2.weight.is_embedding_or_output_parameter = True
+    model.fc2.weight.is_embedding_parameter = True
+    model.fc2.bias.shared = True
+    model.fc2.bias.shared_embedding = True
+    model.fc2.bias.zero_out_wgrad = True
+    model.fc2.bias.zero_out_wgrad = True
+    model.fc1.bias.grad_norm_group = "mtp"
+    model.fc1.weight.tensor_model_parallel = True
+    model.fc1.weight.partition_dim = 0
+    model.fc1.weight.partition_stride = 1
+
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    with fully_shard_context(device=distributed_setup.device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    assert model.fc2.weight.allreduce is False
+    assert model.fc2.weight.is_embedding_or_output_parameter is True
+    assert model.fc2.weight.is_embedding_parameter is True
+    assert model.fc2.bias.shared is True
+    assert model.fc2.bias.shared_embedding is True
+    assert model.fc2.bias.zero_out_wgrad is True
+    assert model.fc2.bias.zero_out_wgrad is True
+    assert model.fc1.bias.grad_norm_group == "mtp"
+    assert model.fc1.weight.tensor_model_parallel is True
+    assert model.fc1.weight.partition_dim == 0
+    assert model.fc1.weight.partition_stride == 1
+
+    (parameter_group,) = model.parameter_groups
+    parameters_by_fqn = {
+        fsdp_parameter.fqns[0]: fsdp_parameter for fsdp_parameter in parameter_group.fsdp_parameters
+    }
+    # Meta materialization swaps TensorImpls, so check the compute-facing parameter too.
+    assert parameters_by_fqn["fc2.bias"].unsharded.shared is True
+    assert parameters_by_fqn["fc2.bias"].unsharded.shared_embedding is True
+    assert parameters_by_fqn["fc2.bias"].unsharded.zero_out_wgrad is True
+    assert parameters_by_fqn["fc2.bias"].unsharded.zero_out_wgrad is True
+    assert parameters_by_fqn["fc1.bias"].unsharded.grad_norm_group == "mtp"
+
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    model.fc2.bias.grad = torch.zeros_like(model.fc2.bias)
+
+    class RankZeroGroup:
+        @staticmethod
+        def rank():
+            return 0
+
+    class ParameterContainer:
+        def __init__(self, parameters):
+            self.param_groups = [{"params": list(parameters)}]
+
+    optimizer = object.__new__(FullyShardedOptimizer)
+    optimizer.optimizer = ParameterContainer(model.parameters())
+    optimizer.grad_stats_parallel_group = dist.group.WORLD
+    optimizer.tp_group = RankZeroGroup()
+    optimizer.expert_tp_group = RankZeroGroup()
+
+    main_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if not getattr(parameter, "shared", False) and not hasattr(parameter, "grad_norm_group")
+    ]
+    expected_main_norm = sum(parameter.numel() for parameter in main_parameters) ** 0.5
+    torch.testing.assert_close(
+        optimizer.get_grad_norm(), torch.tensor(expected_main_norm, device=distributed_setup.device)
+    )
+
+    grouped_norms = optimizer._compute_grad_norms_by_group()
+    expected_mtp_norm = model.fc1.bias.numel() ** 0.5
+    torch.testing.assert_close(
+        grouped_norms["mtp"], torch.tensor(expected_mtp_norm, device=distributed_setup.device)
+    )
+    # Only the shared parameter has a zero gradient, so MCore's duplicate filter
+    # should keep it out of the logged zero count as well as the gradient norm.
+    assert optimizer.count_zeros() == 0
 
 
 def test_parameterless_parent_with_child_modules_trains(distributed_setup):

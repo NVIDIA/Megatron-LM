@@ -7,14 +7,20 @@ from typing import Callable, List, Optional, override
 import torch
 from torch.distributed.tensor import DTensor
 
+from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
 from ..distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
     sync_model_weights_from_main_weights,
 )
-from ..transformer.module import MegatronModule
+from ..transformer.module import MegatronModule, param_is_not_shared
 from .grad_scaler import MegatronGradScaler
-from .optimizer import MixedPrecisionOptimizer
+from .optimizer import (
+    SEPARATE_GRAD_NORM_GROUPS,
+    MixedPrecisionOptimizer,
+    _get_param_grad_norm_group,
+    _is_separate_grad_norm_group,
+)
 from .optimizer_config import OptimizerConfig
 
 
@@ -87,8 +93,8 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     @staticmethod
     def _validate_config(config: OptimizerConfig, model_chunks: List[MegatronModule]) -> None:
         """Validate the MFSDP v2 optimizer support contract."""
-        if len(model_chunks) != 1:
-            raise ValueError("MFSDP v2 currently supports exactly one model chunk.")
+        if not model_chunks:
+            raise ValueError("MFSDP v2 requires at least one model chunk.")
         if config.use_distributed_optimizer:
             raise ValueError("MFSDP v2 currently requires use_distributed_optimizer=False.")
         if config.loss_scale is not None:
@@ -132,6 +138,49 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """Build a sharded optimizer state dict."""
         raise NotImplementedError("MFSDP v2 optimizer checkpointing is not yet supported.")
 
+    def _iter_grad_stat_parameters(self):
+        """Yield unique parameters and their DTensor grads for global statistics."""
+        for parameter in self.get_parameters():
+            # MFSDP v2 reduces into parameter.grad; it never populates decoupled_grad,
+            # which is a v1 param-and-grad-buffer concept.
+            grad = parameter.grad
+            if grad is None or not param_is_not_shared(parameter):
+                continue
+            if not tensor_parallel.param_is_not_tensor_parallel_duplicate(
+                parameter,
+                tp_group=getattr(self, "tp_group", None),
+                expert_tp_group=getattr(self, "expert_tp_group", None),
+            ):
+                continue
+            if not tensor_parallel.param_is_not_gtp_duplicate(parameter):
+                continue
+            yield parameter, grad
+
+    def _get_grad_norm_for_group(self, grad_norm_group: str | None):
+        """Compute an L2 norm while retaining each selected gradient's DTensor layout."""
+        total_norm_squared = torch.zeros(
+            (), dtype=torch.float32, device=torch.cuda.current_device()
+        )
+        for parameter, grad in self._iter_grad_stat_parameters():
+            parameter_grad_norm_group = _get_param_grad_norm_group(parameter)
+            if grad_norm_group is None:
+                if _is_separate_grad_norm_group(parameter_grad_norm_group):
+                    continue
+            elif parameter_grad_norm_group != grad_norm_group:
+                continue
+
+            replication = count_replication(grad)
+            local_grad = grad.to_local()
+            if local_grad.numel() > 0:
+                total_norm_squared += local_grad.float().pow(2).sum() / replication
+
+        torch.distributed.all_reduce(
+            total_norm_squared,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self.get_grad_stats_parallel_group(),
+        )
+        return total_norm_squared.sqrt()
+
     @override
     def get_grad_norm(self):
         """Compute the global gradient L2 norm from each gradient's own DTensor layout.
@@ -153,26 +202,18 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         ``get_data_parallel_group_if_dtensor`` always sees plain tensors, returns None,
         and the layout is gone by the time the norm is taken.
         """
-        total_norm_squared = torch.zeros(
-            (), dtype=torch.float32, device=torch.cuda.current_device()
-        )
-        for parameter in self.get_parameters():
-            # MFSDP v2 reduces into parameter.grad; it never populates decoupled_grad,
-            # which is a v1 param-and-grad-buffer concept.
-            grad = parameter.grad
-            if grad is None:
-                continue
-            replication = count_replication(grad)
-            local_grad = grad.to_local()
-            if local_grad.numel() > 0:
-                total_norm_squared += local_grad.float().pow(2).sum() / replication
+        return self._get_grad_norm_for_group(None)
 
-        torch.distributed.all_reduce(
-            total_norm_squared,
-            op=torch.distributed.ReduceOp.SUM,
-            group=self.get_grad_stats_parallel_group(),
-        )
-        return total_norm_squared.sqrt()
+    @override
+    def _compute_grad_norms_by_group(self):
+        """Compute separate norms without discarding MFSDP gradients' DTensor layouts."""
+        self.grad_norms_by_group = {}
+        for grad_norm_group in SEPARATE_GRAD_NORM_GROUPS:
+            if self.has_grad_norm_group(grad_norm_group):
+                self.grad_norms_by_group[grad_norm_group] = self._get_grad_norm_for_group(
+                    grad_norm_group
+                )
+        return self.grad_norms_by_group
 
     @override
     def count_zeros(self) -> float:
@@ -185,10 +226,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         divided by the size of any replicated mesh axis, summed over the grad-stats group.
         """
         total_zeros = torch.zeros((), dtype=torch.float32, device=torch.cuda.current_device())
-        for parameter in self.get_parameters():
-            grad = parameter.grad
-            if grad is None:
-                continue
+        for _, grad in self._iter_grad_stat_parameters():
             replication = count_replication(grad)
             local_grad = grad.to_local()
             if local_grad.numel() > 0:
@@ -213,6 +251,25 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         # can still have stale module grads to clear.
         for model_chunk in self.model_chunks:
             model_chunk.zero_grad(set_to_none=set_to_none)
+
+    @torch.no_grad()
+    def step(self):
+        """Close each FSDP execution trace before the optimizer mutates its parameters."""
+        completed_context_ids: set[int] = set()
+        for model_chunk in self.model_chunks:
+            complete_fsdp_trace = getattr(model_chunk, "complete_fsdp_trace", None)
+            if complete_fsdp_trace is None:
+                continue
+
+            callback_owner = getattr(complete_fsdp_trace, "__self__", model_chunk)
+            fsdp_module = getattr(callback_owner, "module", callback_owner)
+            context = getattr(fsdp_module, "context", None)
+            context_id = id(context) if context is not None else id(callback_owner)
+            if context_id in completed_context_ids:
+                continue
+            completed_context_ids.add(context_id)
+            complete_fsdp_trace()
+        return super().step()
 
     def _copy_model_grads_to_main_grads(self) -> None:
         """Install optimizer-compatible gradients for non-precision-aware optimizers."""

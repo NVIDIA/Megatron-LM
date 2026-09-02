@@ -6,6 +6,10 @@ from typing import Callable, Dict, List, Optional, Union
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    uneven_dtensor_to_full_tensor,
+)
+
 try:
     from torch.distributed._tensor import DTensor, distribute_tensor
 
@@ -14,6 +18,7 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core.pipeline_parallel.utils import (
+    get_pp_first_rank,
     get_pp_last_rank,
     is_pp_first_stage,
     is_pp_last_stage,
@@ -148,6 +153,59 @@ def _get_shared_word_embedding_weight(
     return None
 
 
+@torch.no_grad()
+def sync_mfsdp_v2_shared_embedding_weights(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    embd_group: Optional[torch.distributed.ProcessGroup],
+    pp_group: torch.distributed.ProcessGroup,
+) -> None:
+    """Synchronize meta-initialized MFSDP v2 tied embeddings across PP stages.
+
+    MFSDP v2 materializes meta parameters while constructing its packed buffers, after
+    ``LanguageModule`` has intentionally deferred the usual first/last-stage weight
+    synchronization. First- and last-stage roots can have different packed-buffer
+    layouts, so synchronize each full logical DTensor and then copy this rank's own
+    metadata slice back into the optimizer-facing shard.
+    """
+    if get_pg_size(embd_group) <= 1:
+        return
+    if torch.distributed.get_rank() not in torch.distributed.get_process_group_ranks(embd_group):
+        return
+
+    if is_pp_first_stage(pp_group):
+        model_module = model[0]
+    elif is_pp_last_stage(pp_group):
+        model_module = model[-1]
+    elif getattr(config, "mtp_num_layers", 0):
+        model_module = model[-1]
+    else:
+        model_module = model[0]
+
+    model_module = get_attr_wrapped_model(model_module, "pre_process", return_model_obj=True)
+    weight = _get_shared_word_embedding_weight(model_module, config)
+    if weight is None:
+        return
+    if not HAVE_DTENSOR or not isinstance(weight, DTensor):
+        raise TypeError("MFSDP v2 shared embedding weight must be a DTensor after wrapping.")
+
+    full_weight = uneven_dtensor_to_full_tensor(weight)
+    torch.distributed.broadcast(full_weight, src=get_pp_first_rank(pp_group), group=embd_group)
+    chunk = weight.__create_chunk_list__()[0]
+    local_slice = tuple(
+        slice(offset, offset + size) for offset, size in zip(chunk.offsets, chunk.sizes)
+    )
+    weight._local_tensor.copy_(full_weight[local_slice])
+
+    # The sharded DTensor is backed by main_weight, while forward compute reads a
+    # potentially lower-precision model_weight buffer. Refresh that buffer as well.
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+        sync_model_weights_from_main_weights,
+    )
+
+    sync_model_weights_from_main_weights([weight])
+
+
 def _get_position_embedding_weight(model_module: torch.nn.Module) -> torch.nn.Parameter:
     """Return the position-embedding weight tensor from the given model module.
 
@@ -249,14 +307,25 @@ def _allreduce_embedding_grad(
 
         grad_attr = _get_main_grad_attr(weight)
         orig_grad = getattr(weight, grad_attr)
-        if ddp_config.use_megatron_fsdp:
-            orig_grad = orig_grad._local_tensor if orig_grad is not None else None
-        grad = _unshard_if_dtensor(orig_grad)
+        is_mfsdp_v2 = ddp_config.use_megatron_fsdp and ddp_config.megatron_fsdp_version == 2
+        if is_mfsdp_v2:
+            grad = uneven_dtensor_to_full_tensor(orig_grad) if orig_grad is not None else None
+        else:
+            if ddp_config.use_megatron_fsdp:
+                orig_grad = orig_grad._local_tensor if orig_grad is not None else None
+            grad = _unshard_if_dtensor(orig_grad)
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
         torch.distributed.all_reduce(grad, group=embd_group)
-        setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
+        if is_mfsdp_v2:
+            chunk = orig_grad.__create_chunk_list__()[0]
+            local_slice = tuple(
+                slice(offset, offset + size) for offset, size in zip(chunk.offsets, chunk.sizes)
+            )
+            orig_grad._local_tensor.copy_(grad[local_slice])
+        else:
+            setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 
 def _allreduce_position_embedding_grads(

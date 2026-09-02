@@ -107,7 +107,7 @@ def is_submodule(module, parent_module, strict=True):
 
 
 def find_megatron_fsdp(model):
-    """Walk the model wrapper chain to find a Megatron-FSDP wrapper or module, if any."""
+    """Walk the model wrapper chain to find a Megatron-FSDP wrapper, if any."""
     # Lazy import to avoid a circular import: megatron_fsdp.py transitively imports
     # this module during its own initialization, so a top-level import of
     # MegatronFSDP here would fail with a partially-initialized module error.

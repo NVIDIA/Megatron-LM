@@ -26,11 +26,34 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import Partial, Replicate
 from torch.distributed.tensor.placement_types import Placement
 
+from megatron.core import tensor_parallel
+
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
 from .placement import changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
+
+
+def _copy_parameter_metadata(destination: nn.Parameter, source: nn.Parameter) -> None:
+    """Preserve model- and optimizer-parallel tags on an MFSDP parameter replacement."""
+    tensor_parallel.copy_tensor_model_parallel_attributes(destination, source)
+    tensor_parallel.copy_gtp_attributes(destination, source)
+    # Mirror optimizer.optimizer.copy_optimizer_param_metadata without importing the
+    # optimizer package back into the FSDP module graph (which would form an import cycle).
+    for attribute in (
+        "allreduce",
+        "shared",
+        "grad_norm_group",
+        # These tags are consumed while optimizer param groups are built, after
+        # MFSDP has installed its optimizer-facing sharded Parameters.
+        "is_embedding_or_output_parameter",
+        "is_embedding_parameter",
+        "shared_embedding",
+        "zero_out_wgrad",
+    ):
+        if hasattr(source, attribute):
+            setattr(destination, attribute, getattr(source, attribute))
 
 
 def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGroup | None":
@@ -227,11 +250,10 @@ class FsdpParameterGroup:
             if parameter.is_meta:
                 # A meta Parameter cannot set .data to a real tensor because their
                 # TensorImpl types are incompatible, so swap in a materialized Parameter.
-                # This may be problematic if attributes from the original Parameter need
-                # to be copied to the unsharded Parameter.
                 materialized_parameter = nn.Parameter(
                     unsharded_tensor, requires_grad=parameter.requires_grad
                 )
+                _copy_parameter_metadata(materialized_parameter, parameter)
                 torch.utils.swap_tensors(parameter, materialized_parameter)
             else:
                 parameter.data = unsharded_tensor
@@ -242,6 +264,8 @@ class FsdpParameterGroup:
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
+            _copy_parameter_metadata(sharded_parameter, parameter)
+            sharded_parameter.__fsdp_param__ = True
             if main_grad_dtype:
                 sharded_parameter.grad_dtype = main_grad_dtype
             setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
