@@ -482,9 +482,7 @@ class RankGenerator(object):
         rank_offset: int = 0,
         gtp_remat: int = 1,
     ) -> None:
-        assert (
-            ep == 1 or cp == 1
-        ), "Both EP and CP > 1 in not allow in one rank generator. \
+        assert ep == 1 or cp == 1, "Both EP and CP > 1 are not allowed in one rank generator. \
             CP is only included in default RankGenerator, and EP only in expert RankGenerator."
 
         self.tp = tp
@@ -585,11 +583,12 @@ def overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, key_value_pair):
     nccl_comm_cfgs[pg_name][key_value_pair[0]] = key_value_pair[1]
 
 
-def _inject_gtp_remat_axis(order_str: str, after: str = "tp") -> str:
+def _inject_gtp_remat_axis(order_str: str, after: str = "cp") -> str:
     """Inject the 'gtp_remat' axis into a RankGenerator order string for NCCL locality.
 
     Position controls locality (leftmost token = smallest stride = most adjacent ranks):
-      - dense/decoder: inject after 'tp' -> 'tp-gtp_remat-cp-ep-dp-pp' (GTP_remat local).
+      - dense/decoder: inject after 'cp' -> 'tp-cp-gtp_remat-ep-dp-pp' (CP kept more local than
+        GTP_remat).
       - expert: inject after 'ep' -> 'tp-cp-ep-gtp_remat-dp-pp' so EP keeps more-local placement
         than EGTP (the MoE EP all-to-all is the heavier expert-side collective).
     When gtp_remat/egtp_remat size is 1 the injected axis is a no-op (singleton groups).
@@ -700,7 +699,7 @@ def initialize_model_parallel(
             Shards model weights along ``out_features`` across this many ranks;
             each weight is rematerialized independently (per-weight, not per-
             layer) via async all-gather on every forward AND backward pass. A
-            first-class orthogonal axis (world_size = TP*GTP*CP*DP). Maps to the
+            first-class orthogonal axis (world_size = TP*CP*GTP*DP). Maps to the
             dataclass field ``ModelParallelConfig.gtp_weight_remat_size``.
             NOTE: "remat" here is NOT activation recomputation/checkpointing.
 
@@ -860,7 +859,7 @@ def initialize_model_parallel(
     for pg_name in high_priority_stream_groups:
         overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ("is_high_priority_stream", True))
 
-    decoder_order = _inject_gtp_remat_axis(order, after="tp")
+    decoder_order = _inject_gtp_remat_axis(order, after="cp")
 
     decoder_rank_generator = RankGenerator(
         tp=tensor_model_parallel_size,

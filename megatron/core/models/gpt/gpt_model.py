@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Literal, Optional
 
@@ -28,6 +29,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
+from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
@@ -41,10 +43,13 @@ from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
     is_using_quantization_scales,
+    log_single_rank,
 )
 
+logger = logging.getLogger(__name__)
 
-class GPTModel(LanguageModule):
+
+class GPTModel(LanguageModule, GraphableMegatronModule):
     """GPT Transformer language model.
 
     Args:
@@ -62,6 +67,9 @@ class GPTModel(LanguageModule):
             Include an output layer (used with pipeline parallelism). Defaults to True.
         fp16_lm_cross_entropy (bool, optional):
             Defaults to False.
+        logit_dtype (torch.dtype, optional):
+            Dtype for the output-layer GEMM result. Defaults to None, which uses
+            the hidden-state dtype.
         parallel_output (bool, optional):
             Do not gather the outputs, keep them split across tensor
             parallel ranks. Defaults to True.
@@ -96,6 +104,7 @@ class GPTModel(LanguageModule):
         pre_process: bool = True,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
+        logit_dtype: Optional[torch.dtype] = None,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         position_embedding_type: Literal[
@@ -111,6 +120,13 @@ class GPTModel(LanguageModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ) -> None:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "GPTModel IS DEPRECATED. GPTModel is only accepting critical bug fixes, no new "
+            "features. Please reference the migration guide "
+            "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`",
+        )
         super().__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
@@ -122,6 +138,7 @@ class GPTModel(LanguageModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
+        self.logit_dtype = logit_dtype
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.vp_stage = vp_stage
@@ -151,6 +168,8 @@ class GPTModel(LanguageModule):
             mtp_num_layers=self.config.mtp_num_layers,
             ignore_virtual=False,
             vp_stage=vp_stage,
+            pp_group=self.pg_collection.pp,
+            vp_size=self.config.virtual_pipeline_model_parallel_size,
         )
 
         if self.pre_process or self.mtp_process:
@@ -221,6 +240,8 @@ class GPTModel(LanguageModule):
             pg_collection=self.pg_collection,
             vp_stage=vp_stage,
         )
+        if hasattr(self, 'cudagraph_manager') and hasattr(self.decoder, 'cudagraph_manager'):
+            del self.decoder.cudagraph_manager
 
         if self.mtp_process:
             self.mtp = MultiTokenPredictionBlock(
@@ -272,6 +293,7 @@ class GPTModel(LanguageModule):
                 embedding_activation_buffer=self.embedding_activation_buffer,
                 grad_output_buffer=self.grad_output_buffer,
                 tp_group=self.pg_collection.tp,
+                output_dtype=self.logit_dtype,
             )
 
         if self.pre_process or self.post_process or self.mtp_process:
@@ -505,6 +527,42 @@ class GPTModel(LanguageModule):
             vp_size=self.config.virtual_pipeline_model_parallel_size, vp_stage=self.vp_stage
         )
 
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        """
+        Check if we should call the local cudagraph path.
+        """
+        if (
+            InferenceMode.is_active()
+            and hasattr(self, 'cudagraph_manager')
+            and (
+                kwargs.get('inference_context') is not None
+                or kwargs.get('inference_params') is not None
+            )
+            and self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        ):
+            if kwargs['inference_context'].is_static_batching():
+                using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            else:
+                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+
+            if using_cuda_graph:
+                return True
+        return False
+
+    def __call__(self, *args, **kwargs):
+        if self._should_call_local_cudagraph(*args, **kwargs):
+            return super().__call__(*args, **kwargs)[0]
+        return super().__call__(*args, **kwargs)
+
+    def create_mcore_cudagraph_manager(self, config):
+        """
+        Create the cudagraph manager for the full iteration inference scope
+        """
+        if config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+            from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+            self.cudagraph_manager = CudaGraphManager(config)
+
     def forward(
         self,
         input_ids: Tensor,
@@ -519,10 +577,11 @@ class GPTModel(LanguageModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
+        mtp_input_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-        output_processor: Optional[Callable[..., Tensor]] = None,
+        output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
-    ) -> Tensor:
+    ) -> Any:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
         processing layer (optional).
@@ -593,6 +652,7 @@ class GPTModel(LanguageModule):
             rotary_pos_sin=rotary_pos_sin,
             mtp_in_postprocess=self.mtp_process,
             loss_mask=loss_mask,
+            mtp_input_mask=mtp_input_mask,
             decoder_input=decoder_input,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
@@ -617,6 +677,7 @@ class GPTModel(LanguageModule):
         rotary_pos_sin,
         mtp_in_postprocess=None,
         loss_mask=None,
+        mtp_input_mask=None,
         decoder_input=None,
         attention_mask=None,
         padding_mask=None,
@@ -666,6 +727,7 @@ class GPTModel(LanguageModule):
                 sequence_len_offset=sequence_len_offset,
                 padding_mask=padding_mask,
                 embedding=self.embedding,
+                mtp_input_mask=mtp_input_mask,
                 **(extra_block_kwargs or {}),
             )
 
@@ -702,6 +764,11 @@ class GPTModel(LanguageModule):
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
+                    mtp_input_mask=mtp_input_mask,
+                    metric_avg_group=(
+                        getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
+                        or self.pg_collection.dp_cp
+                    ),
                 )
         sequence_parallel_override = False
 
@@ -799,7 +866,8 @@ class GPTModel(LanguageModule):
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         *,
-        output_processor: Optional[Callable[..., Tensor]] = None,
+        mtp_input_mask: Optional[Tensor] = None,
+        output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
     ):
         """Builds a computation schedule plan for the model.
@@ -827,6 +895,7 @@ class GPTModel(LanguageModule):
                 Parameters for inference. Defaults to None.
             loss_mask (Optional[Tensor], optional): Loss mask. Defaults to None.
             padding_mask (Optional[Tensor], optional): Padding mask. Defaults to None.
+            mtp_input_mask (Optional[Tensor], optional): Mask of valid MTP conditioning tokens.
             output_processor (Callable, optional): Custom postprocess hook to run in the
                 schedule-plan postprocess node instead of the default logits/loss path.
             output_processor_context (Any, optional): User-defined context object forwarded to
@@ -855,6 +924,7 @@ class GPTModel(LanguageModule):
             runtime_gather_output,
             loss_mask,
             padding_mask,
+            mtp_input_mask=mtp_input_mask,
             output_processor=output_processor,
             output_processor_context=output_processor_context,
         )

@@ -31,7 +31,7 @@ def _args(**overrides):
         "mimo_encoder_prefetch_depth": 2,
         "freeze_vit": True,
         "freeze_projection": False,
-        "encoder_tp": 1,
+        "mimo_encoder_tp": 1,
         "rerun_mode": "disabled",
     }
     values.update(overrides)
@@ -43,10 +43,10 @@ def _args(**overrides):
     [
         ("freeze_vit", False, "freeze-vit"),
         ("freeze_projection", True, "trainable projection"),
-        ("encoder_tp", 2, "TP=1"),
-        ("encoder_cp", 2, "CP=1"),
-        ("encoder_pp", 2, "PP=1"),
-        ("encoder_ep", 2, "EP=1"),
+        ("mimo_encoder_tp", 2, "TP=1"),
+        ("mimo_encoder_cp", 2, "CP=1"),
+        ("mimo_encoder_pp", 2, "PP=1"),
+        ("mimo_encoder_ep", 2, "EP=1"),
         ("mimo_encoder_prefetch_depth", 0, "positive"),
         ("rerun_mode", "validate_results", "rerun"),
     ],
@@ -157,6 +157,17 @@ class _Source:
             "input_ids": torch.tensor(sequence),
             "modality_inputs": {ENCODER: {"radio": {"x": torch.tensor(sequence)}}},
         }
+
+
+def test_prefetch_state_is_not_authoritative():
+    loader = EncoderPrefetchLoader(
+        source=_Source(1),
+        encoder_name=ENCODER,
+        feature_producer=lambda _inputs: torch.empty(0),
+        depth=1,
+    )
+
+    assert loader.save_state() is None
 
 
 def _wait_until(predicate):
@@ -294,6 +305,26 @@ def test_prefetch_keeps_input_ids_on_cpu_path(fake_cuda, monkeypatch):
     assert batch["input_ids"] is input_ids
     assert len(moved) == 1
     assert moved[0] is encoder_inputs
+
+
+def test_prefetch_passes_through_text_only_batches(fake_cuda):
+    input_ids = torch.tensor([[1, 2]])
+    loader = EncoderPrefetchLoader(
+        source=[{"input_ids": input_ids}],
+        encoder_name=ENCODER,
+        feature_producer=lambda _inputs: pytest.fail("text-only batches must not run the encoder"),
+        depth=1,
+        stream=fake_cuda.producer,
+        debug=True,
+    )
+    loader.start()
+    _wait_until(lambda: len(loader._ready) == 1)
+
+    batch = next(loader)
+    loader.close()
+
+    assert set(batch) == {"input_ids"}
+    assert batch["input_ids"] is input_ids
 
 
 def test_debug_logs_prefetch_timing_and_queue_state(fake_cuda, caplog):

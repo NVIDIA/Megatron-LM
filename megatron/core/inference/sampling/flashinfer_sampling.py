@@ -49,6 +49,7 @@ class FlashInferSampling(Sampling):
         no_top_p: bool,
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
+        output: Optional[Tensor] = None,
         eager: bool = False,
         cache_key: Any = None,
     ) -> Tensor:
@@ -65,10 +66,11 @@ class FlashInferSampling(Sampling):
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: When set, sampling parameters are gathered
                 per-token rather than per-request (speculative decoding path).
+            output: Optional caller-owned destination tensor of shape `[n]`.
             eager, cache_key: Accepted for API symmetry; ignored (no CUDA graph).
 
         Returns:
-            Sampled token ids of shape `[n]`.
+            Sampled token IDs in `output`, or a newly allocated tensor when it is not provided.
         """
         del eager, cache_key
 
@@ -106,21 +108,21 @@ class FlashInferSampling(Sampling):
             # multinomial forces a device-to-host sync, whereas sampling_from_probs
             # stays on-device and keeps the RNG's philox offset advancing per launch.
             probs = torch.softmax(scaled, dim=-1)
-            return flashinfer.sampling.sampling_from_probs(
+            sampled_tokens = flashinfer.sampling.sampling_from_probs(
                 probs, deterministic=True, generator=self._rng
             ).long()
         elif no_top_k:
             # Top-p only -> dedicated exact nucleus kernel.
             probs = torch.softmax(scaled, dim=-1)
             top_p_safe = top_p.masked_fill(top_p == 0.0, 1.0)
-            return flashinfer.sampling.top_p_sampling_from_probs(
+            sampled_tokens = flashinfer.sampling.top_p_sampling_from_probs(
                 probs, top_p_safe, deterministic=True, generator=self._rng
             ).long()
         elif no_top_p:
             # Top-k only -> dedicated exact top-k kernel.
             probs = torch.softmax(scaled, dim=-1)
             top_k_safe = top_k.masked_fill(top_k == 0, self._vocab_size)
-            return flashinfer.sampling.top_k_sampling_from_probs(
+            sampled_tokens = flashinfer.sampling.top_k_sampling_from_probs(
                 probs, top_k_safe, deterministic=True, generator=self._rng
             ).long()
         else:
@@ -128,14 +130,41 @@ class FlashInferSampling(Sampling):
             # kernel, fed the temperature-scaled logits.
             top_k_safe = top_k.masked_fill(top_k == 0, self._vocab_size)
             top_p_safe = top_p.masked_fill(top_p == 0.0, 1.0)
-            return flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            sampled_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(
                 scaled, top_k_safe, top_p_safe, deterministic=True, generator=self._rng
             ).long()
 
+        if output is None:
+            return sampled_tokens
+        output.copy_(sampled_tokens)
+        return output
+
     def log_probs_kernel(
-        self, logits: Tensor, temperature: Tensor, top_k: Tensor, top_p: Tensor
+        self, logits: Tensor, context, *, token_to_request_index: Optional[Tensor] = None
     ) -> Tensor:
-        """Per-row log-probs of the FlashInfer top-k / top-p sampling distribution."""
+        """Per-row log-probs of the FlashInfer top-k / top-p sampling distribution.
+
+        Args:
+            logits (Tensor): Raw logits with shape `[num_rows, vocab_size]`.
+            context: Active dynamic inference context providing GPU sampling metadata.
+            token_to_request_index (Optional[Tensor]): Optional mapping from each
+                logits row to its request index.
+
+        Returns:
+            Tensor: Per-row log probabilities for the processed distribution.
+        """
+        gpu_view = context.gpu_view
+        if token_to_request_index is None:
+            num_rows = logits.size(0)
+            temperature = gpu_view.temperature[:num_rows]
+            top_k = gpu_view.top_k[:num_rows]
+            top_p = gpu_view.top_p[:num_rows]
+        else:
+            token_to_request_index = token_to_request_index.to(logits.device, non_blocking=True)
+            temperature = gpu_view.temperature[token_to_request_index]
+            top_k = gpu_view.top_k[token_to_request_index]
+            top_p = gpu_view.top_p[token_to_request_index]
+
         temperature = temperature.clamp(min=1e-6)
         probs = torch.softmax(logits / temperature.unsqueeze(1), dim=-1)
 
