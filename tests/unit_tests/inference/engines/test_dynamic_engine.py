@@ -1187,6 +1187,69 @@ def test_streaming_partials_are_sent():
     assert partial["prompt_top_n_logprobs"] == request.prompt_top_n_logprobs
 
 
+class _RecordingStager:
+    """RequestPayloadStager test double: keeps every staged (uid, payload)."""
+
+    def __init__(self):
+        self.staged = []
+
+    def stage(self, uid, payload):
+        self.staged.append((uid, payload))
+
+
+def _reply_request(uid, status, log_probs):
+    request = DynamicInferenceRequest(
+        request_id=1,
+        uid=uid,
+        prompt_tokens=torch.tensor([1, 2, 3]),
+        sampling_params=SamplingParams(
+            num_tokens_to_generate=2, termination_id=0, return_log_probs=True
+        ),
+        generated_tokens=[10, 11],
+    )
+    request.status = status
+    request.generated_log_probs = log_probs
+    return request
+
+
+@pytest.mark.parametrize("with_stager", [False, True])
+def test_payload_offload_stages_and_strips_completed_replies(with_stager):
+    """With a stager attached, each completed request's payload is staged once and its reply
+    is stripped and marked; failed requests are neither staged nor stripped. Without a stager
+    the reply is untouched. The ledger is a separate mechanism and stays off here."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.local_metadata_ledger_enabled = False
+    engine.local_metadata_ledger = {}
+    engine.payload_stager = _RecordingStager() if with_stager else None
+    engine.socket_for_receiving_requests = mock.Mock()
+    completed = _reply_request("chatcmpl-ok", Status.COMPLETED, [-0.5, -0.25])
+    failed = _reply_request("chatcmpl-failed", Status.FAILED, None)
+    records = [types.SimpleNamespace(merge=lambda r=r: r) for r in (completed, failed)]
+
+    engine._send_request_records_to_coordinator(records)
+
+    engine.socket_for_receiving_requests.send_multipart.assert_called_once()
+    frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
+    header, _ = msgpack.unpackb(frames[0], raw=False)
+    ok_wire, failed_wire = [msgpack.unpackb(frame, raw=False) for frame in frames[1:]]
+    assert header == Headers.ENGINE_REPLY.value
+    assert failed_wire["payload_offloaded"] is False
+    assert engine.local_metadata_ledger == {}
+    if with_stager:
+        ((uid, payload),) = engine.payload_stager.staged
+        assert uid == "chatcmpl-ok"
+        assert payload.prompt_token_ids == [1, 2, 3]
+        assert payload.generated_token_ids == [10, 11]
+        assert payload.generated_log_probs == [-0.5, -0.25]
+        assert ok_wire["payload_offloaded"] is True and ok_wire["generated_log_probs"] is None
+    else:
+        assert ok_wire["payload_offloaded"] is False
+        assert ok_wire["generated_log_probs"] == [-0.5, -0.25]
+    # Token ids stay on the wire, and the drop is wire-only: the request keeps its log probs.
+    assert ok_wire["generated_tokens"] == [10, 11]
+    assert completed.generated_log_probs == [-0.5, -0.25]
+
+
 def test_streaming_partials_buffer_until_token_interval():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._partial_emit_lengths = {}
@@ -3949,6 +4012,67 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ledger = engine.local_metadata_ledger
         assert list(ledger.keys()) == [merged.uid]
         assert ledger[merged.uid].policy_epoch == [(0, 3)]
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_payload_offload_mode(self):
+        """With a stager attached, a finished request's per-token payload is staged, keyed by
+        the response uid, and dropped from the reply sent to the coordinator."""
+        PROMPT_LEN = 8
+        NUM_TOKENS = 4
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=PROMPT_LEN,
+            max_prompt_length=PROMPT_LEN,
+            num_tokens_to_generate=NUM_TOKENS,
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        engine.use_coordinator = True
+        engine.is_mp_coordinator = True
+        engine.socket_for_receiving_requests = mock.MagicMock()
+        engine.payload_stager = _RecordingStager()
+
+        engine._add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.ones(
+                    PROMPT_LEN, dtype=torch.int64, device=torch.cuda.current_device()
+                ),
+                # The RL client shape: return_log_probs is the compute trigger;
+                # under offload the values are staged, not sent.
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=NUM_TOKENS,
+                    termination_id=-1,
+                    return_log_probs=True,
+                    skip_prompt_log_probs=True,
+                ),
+            )
+        )
+        finished_records = []
+        while engine.has_unfinished_requests():
+            finished_records.extend(engine.step_modern()["finished_request_records"])
+        merged = finished_records[0].merge()
+
+        # The staged payload is the exact per-token data of the request, keyed by its uid.
+        ((uid, payload),) = engine.payload_stager.staged
+        assert uid == merged.uid
+        assert payload.prompt_token_ids == merged.prompt_tokens.tolist()
+        assert payload.generated_token_ids == list(merged.generated_tokens)
+        assert len(payload.generated_log_probs) == len(payload.generated_token_ids)
+
+        # The reply drops the staged payload and marks the takeover; token ids stay.
+        engine.socket_for_receiving_requests.send_multipart.assert_called_once()
+        frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
+        header, _ = msgpack.unpackb(frames[0], raw=False)
+        wire = msgpack.unpackb(frames[1], raw=False)
+        assert header == Headers.ENGINE_REPLY.value
+        assert wire["uid"] == merged.uid and wire["payload_offloaded"] is True
+        assert wire["generated_log_probs"] is None and wire["routing_indices"] is None
+        assert wire["generated_tokens"] == list(merged.generated_tokens)
 
     @pytest.mark.internal
     @pytest.mark.skipif(

@@ -1225,9 +1225,12 @@ try:
             prompt_tokens_counts.append(prompt_tokens_count)
             cached_tokens_counts.append(result.get("num_cached_tokens", 0))
 
+            # Under payload offload the engine dropped the per-token log probs from the reply
+            # so the OpenAI logprobs block is absent.
+            payload_offloaded = bool(result.get("payload_offloaded"))
             logprobs_content = None
-            if sampling_params.return_log_probs:
-                token_logprobs = json_safe_logprobs(result.get('log_probs') or [])
+            if sampling_params.return_log_probs and not payload_offloaded:
+                token_logprobs = json_safe_logprobs(result.get("generated_log_probs") or [])
 
                 tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
                 tokens = list(map(tokenizer.detokenize, tokens_to_decode))
@@ -1307,8 +1310,9 @@ try:
             if return_raw_text:
                 prompt_str = tokenizer.detokenize(result["prompt_tokens"])
                 message["raw_text"] = prompt_str + text_output
-            # Small RL/debug scalars (a few bytes each); harmless to keep for NeMo-RL compatibility.
-            message["generation_log_probs"] = result.get("generated_log_probs", [])
+            if not payload_offloaded:
+                # Small RL/debug scalars (a few bytes each); harmless to keep for compatibility.
+                message["generation_log_probs"] = result.get("generated_log_probs", [])
             return_log_probs = sampling_params.return_log_probs
 
             # Determine finish_reason following vLLM conventions:
@@ -1332,7 +1336,7 @@ try:
                 "index": request_idx,
                 "message": message,
                 # 'logprobs' in chat API is an object containing 'content'
-                "logprobs": {"content": logprobs_content} if return_log_probs else None,
+                "logprobs": {"content": logprobs_content} if logprobs_content is not None else None,
                 "finish_reason": finish_reason,
             }
             if current_app.config['verbose']:
@@ -1346,7 +1350,7 @@ try:
                     ]
 
             choices.append(choice_data)
-            if result.get("generated_log_probs") is None:
+            if not payload_offloaded and result.get("generated_log_probs") is None:
                 logger.warning(
                     "Generation log probs is None for request:\n%s",
                     json.dumps(_redact_token_id_lists_for_logging(result), indent=4),

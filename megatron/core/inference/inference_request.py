@@ -7,7 +7,7 @@ import uuid
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 import numpy as np
 import torch
@@ -739,6 +739,11 @@ class DynamicInferenceRequest(InferenceRequest):
     # Hybrid models may add kv_meta["ssm"] for recurrent state.
     disaggregated_params: Optional[dict] = None
 
+    # Wire marker: serialize(payload_offloaded=True) writes this key after dropping the
+    # per-token payload (log probs, MoE routing indices) from the wire; the engine sets it
+    # only for requests whose payload it handed to its RequestPayloadStager.
+    payload_offloaded: bool = False
+
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
@@ -787,8 +792,12 @@ class DynamicInferenceRequest(InferenceRequest):
             )
         )
 
-    def serialize(self):
+    def serialize(self, payload_offloaded: bool = False):
         """Converts the instance into a serializable dictionary.
+
+        Args:
+            payload_offloaded (bool): Drop the per-token payload (log probs, MoE routing
+                indices) from the wire; the engine's RequestPayloadStager has custody of it.
 
         Returns:
             (dict) A dictionary representation of the instance suitable for
@@ -799,23 +808,8 @@ class DynamicInferenceRequest(InferenceRequest):
         # The prompt length is always reported (needed for usage.prompt_tokens),
         # but the prompt_tokens tensor is dropped from the wire payload unless the
         # client asked for it back (return_prompt_tokens). This keeps the large
-        # prompt tensor off the engine->coordinator->API path. Null it around
-        # super() so the tensor is never serialized, then restore local state.
+        # prompt tensor off the engine->coordinator->API path.
         prompt_len = len(self.prompt_tokens) if self.prompt_tokens is not None else None
-        drop_prompt = (
-            self.prompt_tokens is not None
-            and self.sampling_params is not None
-            and not getattr(self.sampling_params, "return_prompt_tokens", False)
-        )
-        saved_prompt_tokens = None
-        if drop_prompt:
-            saved_prompt_tokens = self.prompt_tokens
-            self.prompt_tokens = None
-
-        obj = super().serialize()
-        obj["events"] = [e.serialize() for e in self.events]
-        obj.pop("event_add_engine", None)
-        obj["prompt_length"] = prompt_len
 
         # Sanity check routing_indices: ndarray [total_tokens - 1, num_layers, topk]
         if self.routing_indices is not None:
@@ -827,8 +821,33 @@ class DynamicInferenceRequest(InferenceRequest):
                 f"total tokens {total_tokens-1}."
             )
 
-        if drop_prompt:
-            self.prompt_tokens = saved_prompt_tokens
+        sampling_params = self.sampling_params
+        dropped_fields = {}
+        if (
+            self.prompt_tokens is not None
+            and sampling_params is not None
+            and not getattr(sampling_params, "return_prompt_tokens", False)
+        ):
+            dropped_fields["prompt_tokens"] = self.prompt_tokens
+        if payload_offloaded:
+            dropped_fields["generated_log_probs"] = self.generated_log_probs
+            dropped_fields["prompt_log_probs"] = self.prompt_log_probs
+            dropped_fields["routing_indices"] = self.routing_indices
+
+        # Dropped fields are nulled only for the duration of super().serialize();
+        # this mutate-and-restore makes serialize() non-reentrant on one request object.
+        try:
+            for field_name in dropped_fields:
+                setattr(self, field_name, None)
+            obj = super().serialize()
+        finally:
+            for field_name, value in dropped_fields.items():
+                setattr(self, field_name, value)
+
+        obj["events"] = [e.serialize() for e in self.events]
+        obj.pop("event_add_engine", None)
+        obj["prompt_length"] = prompt_len
+        obj["payload_offloaded"] = payload_offloaded
 
         nvtx_range_pop("DynamicInferenceRequest.serialize")
         return obj
@@ -1205,6 +1224,51 @@ class FinishedRequestRecord:
             ),
         )
         return record
+
+
+@dataclass
+class OffloadedRequestPayload:
+    """A finished request's per-token payload, kept off the RESTful reply by payload offload.
+
+    Self-contained: a consumer can rebuild the served sequence from it alone,
+    keyed by the request uid (the OpenAI response id).
+    """
+
+    prompt_token_ids: Optional[list[int]]
+    generated_token_ids: list[int]
+    generated_log_probs: Optional[list[float]]
+    prompt_log_probs: Optional[list[float]]
+    routing_indices: Optional[np.ndarray]
+
+    @classmethod
+    def from_request(cls, request: "DynamicInferenceRequest") -> "OffloadedRequestPayload":
+        """Copy the payload off a finished (merged) request as plain host-side values."""
+
+        def to_plain_list(value):
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                return value.cpu().tolist()
+            return list(value)
+
+        if isinstance(request.prompt_tokens, torch.Tensor):
+            # One device-to-host copy serves both the payload and the wire reply.
+            request.prompt_tokens = request.prompt_tokens.cpu()
+        return cls(
+            prompt_token_ids=to_plain_list(request.prompt_tokens),
+            generated_token_ids=list(request.generated_tokens),
+            generated_log_probs=to_plain_list(request.generated_log_probs),
+            prompt_log_probs=to_plain_list(request.prompt_log_probs),
+            routing_indices=request.routing_indices,
+        )
+
+
+class RequestPayloadStager(Protocol):
+    """Protocol to handle offloading of request payloads to a storage backend."""
+
+    def stage(self, uid: str, payload: OffloadedRequestPayload) -> None:
+        """Take custody of one finished request's payload, keyed by its OpenAI response id."""
+        ...
 
 
 @dataclass(kw_only=True)
