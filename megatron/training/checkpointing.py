@@ -91,7 +91,12 @@ except Exception:
 if has_nvrx_async_support():
     from nvidia_resiliency_ext.checkpointing.utils import _disable_gc
 else:
-    _disable_gc = None
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _disable_gc():
+        """No-op fallback when nvidia-resiliency-ext is unavailable."""
+        yield
 
 
 _CHECKPOINT_VERSION = None

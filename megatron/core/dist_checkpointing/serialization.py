@@ -12,7 +12,7 @@ import io
 import logging
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Set, Tuple, Union
 
 import torch
 
@@ -144,7 +144,6 @@ def load(
     )
     # Common (non-tensor) data is stored either as a single ShardedObject inside the
     # torch_dist checkpoint (current format) or in a legacy common.pt. Loading it up front
-    # is also required to determine `async_strategy` for the sharded load below.
     common_state_dict = load_common_state_dict(checkpoint_dir)
     merge(common_state_dict, nonpersistent_state_dict)
 
@@ -176,7 +175,6 @@ def load(
         ckpt_sharded_metadata,
     )
 
-    ckpt_args = common_state_dict.get("args")
     loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
 
     merge(common_state_dict, loaded_state_dict)
