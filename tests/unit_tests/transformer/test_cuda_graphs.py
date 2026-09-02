@@ -1145,8 +1145,7 @@ class TestHybridTECudaGraphDiscovery:
         )
         helper = object.__new__(TECudaGraphHelper)
         helper.config = SimpleNamespace(
-            multi_latent_attention=multi_latent_attention,
-            cuda_graph_modules=[CudaGraphModule.attn],
+            multi_latent_attention=multi_latent_attention, cuda_graph_modules=[CudaGraphModule.attn]
         )
         helper.seq_length = 8
         helper.micro_batch_size = 1
