@@ -74,6 +74,7 @@ from .shard_plan import (
 )
 
 logger = logging.getLogger(__name__)
+_MAX_PARAMS_PER_OWNER_CHUNK = 16
 
 
 def _require_emerging_optimizers() -> None:
@@ -435,14 +436,19 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         - same collective group
         - same dtype and device of orthogonalization input shards
         - same dtype of parameter
+        - at most 16 parameters per chunk, so later owner gathers can overlap
+          orthogonalization of earlier chunks
         """
-        chunks: dict[tuple, list[int]] = {}
+        chunks: dict[tuple, list[list[int]]] = {}
         for index, (param, shard) in enumerate(zip(params, local_shards)):
             group = get_containing_parameter_group(param)
             collective_group = group.mesh.get_group() if group is not None else None
             key = (id(collective_group), shard.device, shard.dtype, param.dtype)
-            chunks.setdefault(key, []).append(index)
-        return list(chunks.values())
+            compatible_chunks = chunks.setdefault(key, [])
+            if not compatible_chunks or len(compatible_chunks[-1]) >= _MAX_PARAMS_PER_OWNER_CHUNK:
+                compatible_chunks.append([])
+            compatible_chunks[-1].append(index)
+        return [chunk for compatible_chunks in chunks.values() for chunk in compatible_chunks]
 
     def _assign_owner_work(self, plans: Sequence[ShardPlan]) -> dict[int, int]:
         """Assign the logical full, unsharded update tensor to one owner rank.
