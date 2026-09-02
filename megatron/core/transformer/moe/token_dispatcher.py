@@ -54,7 +54,7 @@ from megatron.core.transformer.moe.replica_planner import (
     map_replica_plan_to_hybridep,
     plan_replica_routes,
     start_replica_grad_reduce_after_expert_backward,
-    start_replica_weight_prefetch_before_combine_backward,
+    start_replica_weight_prefetch_before_layer_backward,
     wait_replica_grad_reduce_after_dispatch_backward,
     wait_replica_weight_prefetch_before_expert_backward,
 )
@@ -126,6 +126,14 @@ class MoETokenDispatcher:
     def set_experts(self, experts) -> None:
         """Bind the expert module when a dispatcher backend needs runtime expert state."""
         del experts
+
+    def dispatch_plan(self, hidden_states: torch.Tensor) -> None:
+        """Start backend work that depends only on routing, right after preprocessing."""
+        del hidden_states
+
+    def finalize_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Attach backward-side backend work to the MoE layer output."""
+        return output
 
     @abstractmethod
     def dispatch_preprocess(
@@ -1353,6 +1361,8 @@ class _ReplicaHybridEPManager(_HybridEPManager):
         self._replica_plan_slots: list[_ReplicaPlanSlot] = []
         self._active_replica_plan_slot: Optional[_ReplicaPlanSlot] = None
         self._plan: Optional[ReplicaPlan] = None
+        self._plan_awaits_dispatch = False
+        self._combined_plan: Optional[ReplicaPlan] = None
 
     def bind_experts(self, experts) -> None:
         """Bind the dispatcher-independent runtime weights to the expert MLP."""
@@ -1491,13 +1501,21 @@ class _ReplicaHybridEPManager(_HybridEPManager):
         self.num_local_tokens = num_tokens
         self.token_probs = self.semantic_token_probs
 
+    def plan_dispatch(self, hidden_states: torch.Tensor) -> None:
+        """Plan the routes and start the weight push before the shared experts run."""
+        self._prepare_replica_plan(hidden_states)
+        self._plan_awaits_dispatch = True
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
-        plan = self._prepare_replica_plan(hidden_states)
+        if not self._plan_awaits_dispatch:
+            raise RuntimeError("Replica-HybridEP dispatch requires dispatch_plan to run first.")
+        self._plan_awaits_dispatch = False
+        plan = self._plan
         self.routing_map, self.token_probs = map_replica_plan_to_hybridep(
             plan, self.semantic_token_probs, num_experts=self.num_experts
         )
@@ -1538,14 +1556,21 @@ class _ReplicaHybridEPManager(_HybridEPManager):
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
-        if torch.is_grad_enabled() and hidden_states.requires_grad:
-            hidden_states = start_replica_weight_prefetch_before_combine_backward(
-                hidden_states, self._bridge, self._plan
-            )
         self.token_probs = None
         self.routing_map = None
+        self._combined_plan = self._plan
         self._finish_replica_plan()
         return hidden_states
+
+    def finalize_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Start the backward weight push from the layer output, ahead of the latent
+        up-projection backward, so it overlaps that GEMM instead of the combine all-to-all."""
+        plan, self._combined_plan = self._combined_plan, None
+        if plan is None:
+            raise RuntimeError("Replica-HybridEP finalize_output requires a combined plan.")
+        if torch.is_grad_enabled() and output.requires_grad:
+            output = start_replica_weight_prefetch_before_layer_backward(output, self._bridge, plan)
+        return output
 
 
 class _DeepepManager(_DispatchManager):
@@ -2212,6 +2237,15 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         bind_experts = getattr(self._comm_manager, "bind_experts", None)
         if bind_experts is not None:
             bind_experts(experts)
+
+    def dispatch_plan(self, hidden_states: torch.Tensor) -> None:
+        plan = getattr(self._comm_manager, "plan_dispatch", None)
+        if plan is not None:
+            plan(hidden_states)
+
+    def finalize_output(self, output: torch.Tensor) -> torch.Tensor:
+        finalize = getattr(self._comm_manager, "finalize_output", None)
+        return output if finalize is None else finalize(output)
 
     def get_expert_zero_copy_buffers(self):
         """NCCL-EP zero-copy: ``(output_buffer, grad_input_buffer)`` — the shared symm buffers the

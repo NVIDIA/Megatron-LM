@@ -503,6 +503,9 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
+        # Backend work that only depends on routing (the replica planner and weight
+        # push) starts here, ahead of the shared experts that follow.
+        self.token_dispatcher.dispatch_plan(hidden_states)
         return hidden_states, probs
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
@@ -614,7 +617,7 @@ class MoELayer(BaseMoELayer):
             torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
             output = output + self._latent_shared_expert_output
             self._latent_shared_expert_output = None
-        return output
+        return self.token_dispatcher.finalize_output(output)
 
     def router_and_preprocess(self, hidden_states: torch.Tensor):
         """This method is a combined method of route and preprocess. Deprecated."""
@@ -668,11 +671,16 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+            shared_expert_output = None
             try:
                 if "route" in self.fwd_execution_map:
-                    shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(hidden_states, padding_mask)
-                    hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                    layer_input = hidden_states
+                    probs, routing_map = self.route(layer_input, padding_mask)
+                    hidden_states, probs = self.preprocess(layer_input, probs, routing_map)
+                    # The shared experts follow preprocessing so that asynchronous
+                    # backend work started there (the replica weight push) overlaps
+                    # their GEMMs instead of the token all-to-all.
+                    shared_expert_output = self.shared_experts_compute(layer_input)
 
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output
@@ -682,7 +690,11 @@ class MoELayer(BaseMoELayer):
                 # It means we should early-return from the MoE layer forward pass.
                 # This happens when we are partially capturing the CUDA graph of the MoE layer,
                 # like cuda_graph_modules=["moe_router", "moe_preprocess"].
-                # We need to return the intermediate tensors as CUDA graph outputs.
+                # We need to return the intermediate tensors as CUDA graph outputs. The shared
+                # experts have not run yet at this point; compute them here so they stay inside
+                # the captured segment.
+                if shared_expert_output is None:
+                    shared_expert_output = self.shared_experts_compute(layer_input)
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
             if "expert_compute" in self.fwd_execution_map:
