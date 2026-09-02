@@ -10,6 +10,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
 from ..openai_streaming import openai_stream
+from .common import abort_requests
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +69,11 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(req.get("temperature", 1.0))
-            top_p = float(req.get("top_p", 1.0))
-            top_k = int(req.get("top_k", 0))
+            temperature = float(
+                req.get("temperature", current_app.config.get('default_temperature', 1.0))
+            )
+            top_p = float(req.get("top_p", current_app.config.get('default_top_p', 1.0)))
+            top_k = int(req.get("top_k", current_app.config.get('default_top_k', 0)))
             echo = bool(req.get("echo", False))
 
             if temperature == 0.0:
@@ -98,24 +101,40 @@ try:
 
             ignore_eos = bool(req.get("ignore_eos", False))
 
-            # Optional vLLM-style multimodal input. Image entries are
-            # base64-encoded bytes ordered to match prompt placeholders.
+            # Optional vLLM-style multimodal input. HTTP callers provide
+            # base64/data-URL bytes; preprocessed tensors are direct-API only.
             request_multi_modal_data = req.get("multi_modal_data") or {}
             if not isinstance(request_multi_modal_data, dict):
                 raise ValueError("multi_modal_data must be a dictionary.")
-            unsupported_modalities = set(request_multi_modal_data) - {"image"}
+            unsupported_modalities = set(request_multi_modal_data) - {"image", "video"}
             if unsupported_modalities:
                 raise ValueError(
-                    "Unsupported multimodal modalities: "
-                    f"{sorted(unsupported_modalities)}; only 'image' is supported."
+                    "Unsupported multimodal modalities: " f"{sorted(unsupported_modalities)}."
                 )
-            encoded_images = request_multi_modal_data.get("image") or []
-            if isinstance(encoded_images, str):
-                encoded_images = [encoded_images]
-            if not isinstance(encoded_images, list):
-                raise ValueError("multi_modal_data.image must be a string or list.")
-            image_bytes_list = [base64.b64decode(encoded_image) for encoded_image in encoded_images]
-            multi_modal_data = {"image": image_bytes_list} if image_bytes_list else None
+            populated_modalities = [
+                modality
+                for modality in ("image", "video")
+                if request_multi_modal_data.get(modality)
+            ]
+            if len(populated_modalities) > 1:
+                raise ValueError("A completions request cannot mix image and video inputs.")
+            multi_modal_data = None
+            if populated_modalities:
+                modality = populated_modalities[0]
+                encoded_media = request_multi_modal_data[modality]
+                if isinstance(encoded_media, str):
+                    encoded_media = [encoded_media]
+                if not isinstance(encoded_media, list) or any(
+                    not isinstance(item, str) for item in encoded_media
+                ):
+                    raise ValueError(f"multi_modal_data.{modality} must be a string or list[str].")
+                media_bytes = [
+                    base64.b64decode(
+                        item.split(",", 1)[1] if item.startswith("data:") and "," in item else item
+                    )
+                    for item in encoded_media
+                ]
+                multi_modal_data = {modality: media_bytes}
 
             sampling_params = SamplingParams(
                 temperature=temperature,
@@ -146,34 +165,55 @@ try:
                 return str(error), 400
 
         tasks = []
-        for prompt_tokens in prompts_as_tokens:
-            per_req_params = SamplingParams(
-                temperature=sampling_params.temperature,
-                top_k=sampling_params.top_k,
-                top_p=sampling_params.top_p,
-                return_log_probs=sampling_params.return_log_probs,
-                top_n_logprobs=sampling_params.top_n_logprobs,
-                skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
-                num_tokens_to_generate=sampling_params.num_tokens_to_generate,
-                stop_words=sampling_params.stop_words,
-                termination_id=sampling_params.termination_id,
-                # This endpoint always echoes prompt_token_ids in its response, so
-                # keep the prompt tokens on the payload (default is now to drop them).
-                return_prompt_tokens=True,
-                streaming_interval=sampling_params.streaming_interval,
-            )
-            if stream_requested:
-                tasks.append(
-                    client.add_request_streaming(
+        # Populated on the non-streaming path only; the streaming path aborts
+        # through the AsyncStream callback its generator already owns.
+        request_ids = []
+        # The submission loop itself can fail partway -- the zmq send, or
+        # multimodal serialization on a malformed payload -- with the earlier
+        # prompts already submitted to the engine. Without this the exception
+        # escapes the handler and those requests generate to their token limit
+        # holding batch slots, the same leak the abort below closes.
+        #
+        # TODO: streaming submissions made before a mid-loop failure are not
+        # covered. Their handles are AsyncStreams, not ids, and they abort
+        # through openai_stream's finally, which never runs because the
+        # generator is never started.
+        try:
+            for prompt_tokens in prompts_as_tokens:
+                per_req_params = SamplingParams(
+                    temperature=sampling_params.temperature,
+                    top_k=sampling_params.top_k,
+                    top_p=sampling_params.top_p,
+                    return_log_probs=sampling_params.return_log_probs,
+                    top_n_logprobs=sampling_params.top_n_logprobs,
+                    skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
+                    num_tokens_to_generate=sampling_params.num_tokens_to_generate,
+                    stop_words=sampling_params.stop_words,
+                    termination_id=sampling_params.termination_id,
+                    # This endpoint always echoes prompt_token_ids in its response, so
+                    # keep the prompt tokens on the payload (default is now to drop them).
+                    return_prompt_tokens=True,
+                    streaming_interval=sampling_params.streaming_interval,
+                )
+                if stream_requested:
+                    tasks.append(
+                        client.add_request_streaming(
+                            prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
+                        )
+                    )
+                else:
+                    # add_request_with_id, not add_request: a non-streaming response
+                    # writes nothing to the socket while generating, so a disconnect
+                    # is never discovered as a broken pipe. Aborting needs the ids.
+                    request_id, future = client.add_request_with_id(
                         prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
                     )
-                )
-            else:
-                tasks.append(
-                    client.add_request(
-                        prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
-                    )
-                )
+                    request_ids.append(request_id)
+                    tasks.append(future)
+        except Exception as e:
+            abort_requests(client, request_ids, f"submission failed: {e}")
+            logger.error(f"Error submitting request: {e}")
+            return f"Error submitting request: {e}", 500
 
         if stream_requested:
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
@@ -198,6 +238,15 @@ try:
 
         try:
             batch_results = await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            # Quart cancels this handler when the peer goes away (its ASGI
+            # connection races handle_messages against handle_request and
+            # cancels the loser). Without this the engine would keep generating
+            # for a client that is gone, holding a slot until it hit the token
+            # limit -- orphans then accumulate faster than they retire and the
+            # batch saturates.
+            abort_requests(client, request_ids, "client disconnected")
+            raise
         except Exception as e:
             return f"Error during inference: {e}", 500
 

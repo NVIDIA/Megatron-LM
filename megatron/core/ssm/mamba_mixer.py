@@ -225,6 +225,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         self.cached_batch_size = None
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
+        if self.config.linear_cp_mode == "chunkwise" and self.pg_collection.cp.size() > 1:
+            raise NotImplementedError(
+                "This branch supports linear_cp_mode='chunkwise' only for FLA GDP mixers."
+            )
         self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
         self.mamba_training_ssm_states_dtype = (
             config.mamba_training_ssm_states_dtype or config.params_dtype
@@ -468,6 +472,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             A_log_cp1=self.A_log,
             D_cp1=self.D,
             D_has_hdim=self.D_has_hdim,
+            sequence_is_contiguous=self.config.linear_cp_layout == "contiguous",
         )
         self.tp_group = pg_collection.tp
 

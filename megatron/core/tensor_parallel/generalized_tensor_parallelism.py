@@ -42,6 +42,7 @@ from megatron.core.tensor_parallel.gtp_cuda_graphs import (
     cuda_graph_pool_allocation,
     register_capture_comm,
     register_capture_params_to_ensure_ready,
+    register_capture_wgrad_finalize,
     register_capture_wgrad_ring_slot,
 )
 from megatron.core.tensor_parallel.gtp_symmetric_memory import (
@@ -502,6 +503,10 @@ def configure_gtp_remat_from_recipe(
         update_gtp_config(pad_for_alignment=32)
     elif fp8:
         update_gtp_config(pad_for_alignment=16)
+    else:
+        # No MXFP8/NVFP4 tile-size requirement in this recipe -- pad only to the minimum
+        # gtp_remat_size needed for even AG/RS sharding, not a fixed quantization tile size.
+        update_gtp_config(pad_for_alignment=1)
 
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         logger.info("> GTP_remat enabled. %s", GTP_CONFIG)
@@ -545,6 +550,26 @@ def gtp_remat_shard_dim0(dim0, gtp_remat_group):
         pad_length = 0
     padded = dim0 + pad_length
     return padded // gtp_remat_size, pad_length
+
+
+def gtp_remat_slice_rows(unsharded, gtp_remat_group):
+    """Take this rank's GTP_remat rows out of a tensor that is not yet GTP-sharded.
+
+    Use this to fill a weight that was **already allocated pre-sharded**; padding matches
+    :func:`gtp_remat_shard_dim0`, so the rows line up with that shard. Unlike
+    :func:`_gtp_slice_one_param`, this returns a plain tensor and replaces nothing.
+
+    Returns:
+        This rank's rows, sized like one GTP shard (padding included).
+    """
+    shard_dim0, pad_length = gtp_remat_shard_dim0(unsharded.shape[0], gtp_remat_group)
+    if pad_length > 0:
+        # Append the alignment rows to the tail of dim 0. Spelled as a concat rather than F.pad,
+        # whose spec is ordered last-dim-first and so reads backwards for a dim-0 pad.
+        alignment_rows = unsharded.new_zeros(pad_length, *unsharded.shape[1:])
+        unsharded = torch.cat([unsharded, alignment_rows], dim=0)
+    gtp_rank = gtp_remat_group.rank()
+    return unsharded[gtp_rank * shard_dim0 : (gtp_rank + 1) * shard_dim0]
 
 
 def _gtp_slice_one_param(param, gtp_remat_group, *, name="<unnamed>"):
@@ -710,6 +735,37 @@ def attach_gtp_to_presharded_module(
         new_weights.append(gtp_param)
     if is_grouped and new_weights:
         new_weights[0].weight_list = new_weights
+    _gtp_restore_replicated_bias(module, gtp_remat_group, pad_length, is_grouped=is_grouped)
+
+
+def _gtp_restore_replicated_bias(module, gtp_remat_group, pad_length, is_grouped=False):
+    """Restore the module's linear bias(es) to full size, replicated across the GTP group.
+
+    ``_gtp_pre_init`` passes TE a pre-sharded ``out_features`` so that TE builds the weight already
+    sharded; TE sizes the bias from that same value, so the bias comes out sharded as well. GTP
+    shards weights only, so this undoes that side effect.
+
+    Re-allocating zeros reproduces the values exactly because TE zero-initializes every linear bias
+    (``init_method_constant(0.0)``); a future non-zero bias init would need a gather instead.
+    """
+    # A packed bias has no per-gemm entries to re-allocate, so it would silently stay sharded.
+    assert not getattr(
+        module, "single_grouped_bias", False
+    ), f"GTP grouped module {type(module).__name__} requires single_grouped_bias=False."
+    # GroupedLinear does not declare bias_names; its biases are bias0..bias{num_gemms-1}.
+    bias_names = getattr(module, "bias_names", None)
+    if not bias_names:
+        bias_names = [f"bias{idx}" for idx in range(module.num_gemms)] if is_grouped else ["bias"]
+    gtp_remat_size = gtp_remat_group.size()
+    for name in bias_names:
+        bias = getattr(module, name, None)
+        # TE registers an empty plain tensor (not a Parameter) for the bias-free case.
+        if not isinstance(bias, torch.nn.Parameter) or bias.numel() == 0:
+            continue
+        # Resize in place: the Parameter keeps its identity, so its module registration and the
+        # attributes DDP / the optimizer / checkpointing read off it all survive untouched.
+        with torch.no_grad():
+            bias.data = bias.new_zeros(bias.shape[0] * gtp_remat_size - pad_length)
 
 
 # Cache of dynamic ``GTP_<Fp8TensorClass>`` subclasses, keyed by the FP8 base class.
@@ -1850,8 +1906,11 @@ class GTPShardedParam(torch.nn.Parameter):
             dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype, zero=True)
         else:
             dummy_grad = get_dummy_wgrad(list(param.main_grad.shape), param.dtype)
-        if getattr(param, "_grad_accum_hook", None) is not None:
-            param._grad_accum_hook()
+        hook = getattr(param, "_grad_accum_hook", None)
+        if hook is not None:
+            if _chain_is_graphed(param.chain_id):
+                register_capture_wgrad_finalize(param)
+            hook()
 
         param._set_rs_state(GTPWeightState.NONE)
         return dummy_grad
@@ -2737,7 +2796,6 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
         tensor_parallel_layers_axis_map = {}
 
     tp_rank = get_pg_rank(tp_group)
-    tp_size = get_pg_size(tp_group)
     # All GTP params in this state_dict share the same gtp_remat_group (set by the
     # wrap hook at module init), so pick it off the first GTP shard.
     first_gtp_param = next(t for t in state_dict.values() if is_gtp_param(t))
@@ -2790,16 +2848,15 @@ def make_sharded_tensors_for_checkpoint_with_gtp_remat(
                 )
             continue
 
-        # GTP-sharded tensor: delegate to the GTP-aware single-tensor helper — it layers the
-        # axis-0 GTP split onto TP, elects the writer over the gtp_remat-excluded DP group, and sets
-        # allow_shape_mismatch for alignment padding. (tp_axis None → 0; tp_size 1 when no TP.)
+        # Only tensors present in the axis map are also sharded across TP.
         tp_axis = tensor_parallel_layers_axis_map.get(layer_name, None)
         sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(
             tensor,
             layer_key,
             tp_axis=tp_axis if tp_axis is not None else 0,
+            replica_id=None if tp_axis is not None else (0, tp_rank, dp_replica_rank),
             prepend_offsets=sharded_offsets,
-            tp_group=tp_group,
+            tp_group=tp_group if tp_axis is not None else None,
             dp_cp_group=dp_cp_group,
         )
 

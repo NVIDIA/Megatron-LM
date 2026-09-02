@@ -25,6 +25,8 @@ Test groups
 - TestGTPDDPGradReadyWiring  - GTP params drive DDP grad-ready via the manual hook, not autograd
 - TestGTPWeightCacheSchedulingDomain - cache reuse stays within one chain/process-group domain
 - TestGTPGraphWgradRing       - partial-CG wgrad ring ownership and RS-input correctness
+- TestGTPCountZerosExcludesPadding - real distributed optimizer: count_zeros_fp32 must not
+                                count structural alignment-padding rows as zero gradient
 
 Multi-GPU tests skip when ``torch.distributed.get_world_size()`` != the required world size (4).
 """
@@ -45,6 +47,7 @@ from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 
 import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
 import megatron.core.tensor_parallel.gtp_cuda_graphs as gtp_cuda_graphs
+import megatron.core.transformer.cuda_graphs as cuda_graphs_module
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
@@ -1600,6 +1603,72 @@ class TestActivationRecomputePhaseFlag:
 
 
 class TestGTPCaptureParamReadiness:
+    def test_wgrad_finalization_registration_matches_hook_calls(self, monkeypatch):
+        hook_calls = []
+
+        class Param:
+            main_grad = torch.empty(2, 3)
+            dtype = torch.float32
+            zero_out_wgrad = False
+
+            def __init__(self):
+                self.chain_id = GTPChain.GRAPHED.value
+                self._grad_accum_hook = lambda: hook_calls.append(self)
+                self.rs_states = []
+
+            def _set_rs_state(self, state):
+                self.rs_states.append(state)
+
+        param = Param()
+        dummy_wgrad = object()
+        monkeypatch.setattr(gtp_module, "get_dummy_wgrad", lambda *args, **kwargs: dummy_wgrad)
+
+        with gtp_cuda_graphs.track_gtp_capture_comms() as capture:
+            assert GTPShardedParam._handle_megatron_grad_accum(param) is dummy_wgrad
+            assert GTPShardedParam._handle_megatron_grad_accum(param) is dummy_wgrad
+            param.chain_id = GTPChain.UNGRAPHED.value
+            assert GTPShardedParam._handle_megatron_grad_accum(param) is dummy_wgrad
+            param._grad_accum_hook = None
+            assert GTPShardedParam._handle_megatron_grad_accum(param) is dummy_wgrad
+
+        assert capture.finalized_params == [param, param]
+        assert hook_calls == [param, param, param]
+        assert param.rs_states == [gtp_module.GTPWeightState.NONE] * 4
+
+    def test_finalize_hook_plan_groups_streams_and_preserves_occurrences(self, monkeypatch):
+        dense_group = object()
+        expert_group = object()
+        pg_collection = type(
+            "ProcessGroups", (), {"gtp_remat": dense_group, "expt_gtp_remat": expert_group}
+        )()
+        monkeypatch.setattr(
+            cuda_graphs_module.ProcessGroupCollection,
+            "use_mpu_process_groups",
+            staticmethod(lambda required_pgs: pg_collection),
+        )
+        monkeypatch.setattr(
+            cuda_graphs_module, "get_rs_stream", lambda chain_id, group: (chain_id, group)
+        )
+
+        class Param:
+            def __init__(self, chain_id, *, allreduce=True):
+                self.chain_id = chain_id
+                self.allreduce = allreduce
+
+        dense = Param(GTPChain.GRAPHED.value)
+        expert = Param(GTPChain.GRAPHED.value, allreduce=False)
+        runner = type("Runner", (), {"gtp_remat": True})()
+
+        cuda_graphs_module._CudaGraphRunner._set_gtp_finalize_hook_plan(
+            runner, [dense, expert, dense]
+        )
+
+        assert runner.finalized_during_bwd_capture == [dense, expert, dense]
+        assert runner._gtp_finalize_hook_plan == [
+            ((GTPChain.GRAPHED.value, dense_group), [dense, dense]),
+            ((GTPChain.GRAPHED.value, expert_group), [expert]),
+        ]
+
     def test_forward_gather_registers_params_before_ensuring_readiness(self, monkeypatch):
         class StopAfterReadiness(Exception):
             pass
@@ -1786,3 +1855,217 @@ class TestGTPCaptureParamReadiness:
         assert params == [graphed_param]
         assert ag_streams == [graphed_ag_stream]
         assert rs_streams == [graphed_rs_stream]
+
+
+# ---------------------------------------------------------------------------
+# count_zeros_fp32 must exclude GTP alignment padding, end-to-end through the
+# real distributed optimizer (build_model_and_main_param_groups stamps
+# .gtp_pad_zeros; count_zeros_fp32 subtracts it).
+# ---------------------------------------------------------------------------
+
+
+def _worker_count_zeros_excludes_gtp_padding(rank, world_size, port):
+    """GTP alignment padding is a permanent structural zero (never written by the wgrad GEMM),
+    not a real zero gradient. Left uncorrected, count_zeros_fp32 over-counts by exactly the
+    padding-element count on whichever (GTP-rank, DP-sub-shard) fragment physically owns it.
+
+    OUT_F=48 with gtp_remat_size=2 forces real padding (48 is not a multiple of
+    pad_for_alignment(16) * gtp_remat_size(2) = 32). With real random bf16 gradients, no element
+    is coincidentally exactly zero, so:
+      - the FIXED count_zeros() must report 0 (padding correctly excluded)
+      - artificially zeroing the .gtp_pad_zeros correction (simulating the pre-fix code) must
+        make count_zeros() jump by exactly pad_length * IN_F -- the total padding this weight
+        carries, summed over however the distributed optimizer's DP-bucket slicing split it
+        across ranks.
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.distributed.finalize_model_grads import (
+        _allreduce_replicated_grads_over_gtp_remat_group,
+    )
+    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    IN_F, OUT_F = 64, 48  # OUT_F not a multiple of pad_for_alignment * gtp_remat_size(2) -> pads.
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    try:
+        model_parallel_cuda_manual_seed(42)
+        gtp_remat_group = ps.get_gtp_weight_remat_group()
+        assert gtp_remat_group.size() == 2, f"expected gtp_remat=2, got {gtp_remat_group.size()}"
+
+        layer = _make_gtp_linear(IN_F, OUT_F, gtp_remat_group)
+        w = layer.weight
+        assert isinstance(w, GTPShardedParam)
+        alignment = gtp_module.GTP_CONFIG.pad_for_alignment * gtp_remat_group.size()
+        expected_pad_length = (alignment - OUT_F % alignment) % alignment
+        assert (
+            w.pad_length == expected_pad_length > 0
+        ), f"test needs real padding to exercise the fix, got pad_length={w.pad_length}"
+        pad_elems = w.pad_length * IN_F
+
+        tconfig = TransformerConfig(
+            num_attention_heads=1, num_layers=1, hidden_size=IN_F, tensor_model_parallel_size=1
+        )
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=True, overlap_grad_reduce=False
+        )
+        module = torch.nn.Sequential(layer)
+        ddp_model = DistributedDataParallel(tconfig, ddp_config, module)
+
+        opt_config = OptimizerConfig(
+            optimizer='adam',
+            lr=0.01,
+            bf16=True,
+            use_distributed_optimizer=True,
+            use_precision_aware_optimizer=False,
+            main_params_dtype=torch.float32,
+            main_grads_dtype=torch.float32,
+            exp_avg_dtype=torch.float32,
+            exp_avg_sq_dtype=torch.float32,
+            log_num_zeros_in_grad=True,
+        )
+        optim = get_megatron_optimizer(opt_config, [ddp_model])
+
+        optim.zero_grad()
+        ddp_model.zero_grad_buffer()
+        torch.manual_seed(1000 + rank)
+        x = torch.randn(8, IN_F, dtype=torch.bfloat16, device='cuda')
+        out = ddp_model.module(x)
+        loss = out.float().mean()
+        loss.backward()
+        ddp_model.finish_grad_sync()
+        _allreduce_replicated_grads_over_gtp_remat_group(
+            [ddp_model],
+            ps.get_gtp_weight_remat_group(check_initialized=False),
+            ps.get_expert_gtp_weight_remat_group(check_initialized=False),
+        )
+        # count_zeros() reads the master-shard .grad, which optim.step() normally populates as
+        # its first internal step. Do that copy explicitly so count_zeros() can be exercised
+        # standalone, without running (and being coupled to) the rest of step()'s update logic.
+        for sub_optimizer in getattr(optim, 'chained_optimizers', [optim]):
+            sub_optimizer._copy_model_grads_to_main_grads()
+
+        num_zeros_fixed = optim.count_zeros()
+        assert num_zeros_fixed == 0, (
+            f"expected 0 zeros with real random gradients (padding correctly excluded), "
+            f"got {num_zeros_fixed}"
+        )
+
+        # Simulate the pre-fix code: zero out this rank's own .gtp_pad_zeros correction(s) --
+        # whatever fraction of the padding the distributed optimizer's DP-bucket slicing handed
+        # to this rank -- then restore it.
+        params = optim.get_parameters()
+        pad_attrs = [(p, getattr(p, "gtp_pad_zeros", 0)) for p in params]
+        for p, saved in pad_attrs:
+            if saved:
+                p.gtp_pad_zeros = 0
+        try:
+            num_zeros_unfixed = optim.count_zeros()
+        finally:
+            for p, saved in pad_attrs:
+                if saved:
+                    p.gtp_pad_zeros = saved
+
+        assert num_zeros_unfixed - num_zeros_fixed == pad_elems, (
+            f"expected the pre-fix simulation to over-count by exactly pad_elems={pad_elems}, "
+            f"got delta={num_zeros_unfixed - num_zeros_fixed} "
+            f"(fixed={num_zeros_fixed}, unfixed={num_zeros_unfixed})"
+        )
+    finally:
+        ps.destroy_model_parallel()
+        GTPShardedParam._chain_state = {}
+
+
+class TestGTPCountZerosExcludesPadding:
+    def test_count_zeros_excludes_gtp_padding_end_to_end(self):
+        """Real DistributedOptimizer + count_zeros_fp32: GTP alignment padding must not be
+        counted as zero gradient. Regression test for the count_zeros_fp32 + distrib_optimizer
+        .gtp_pad_zeros wiring."""
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_count_zeros_excludes_gtp_padding, 4)
+
+
+# ---------------------------------------------------------------------------
+# TestGTPReplicatedBias - the linear bias must stay replicated, not follow the weight
+# ---------------------------------------------------------------------------
+
+
+def _worker_bias_is_replicated(rank, world_size, port, gtp_remat_size):
+    from megatron.core import parallel_state as ps
+    from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    hidden, out_features, bias_value = 256, 512, 100.0
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(gtp_remat_size=gtp_remat_size)
+    try:
+        model_parallel_cuda_manual_seed(1234, force_reset_rng=True)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'cp', 'pp', 'ep', 'expt_tp', 'gtp_remat', 'expt_gtp_remat']
+        )
+        layer = TEColumnParallelLinear(
+            hidden,
+            out_features,
+            config=TransformerConfig(
+                num_layers=1,
+                hidden_size=hidden,
+                num_attention_heads=8,
+                add_bias_linear=True,
+                params_dtype=torch.bfloat16,
+                bf16=True,
+            ),
+            init_method=lambda w: nn.init.normal_(w, std=0.02),
+            gather_output=False,
+            bias=True,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name=None,
+            pg_collection=pg_collection,
+        ).cuda()
+
+        assert layer.bias.shape == (out_features,), (
+            f"bias is {tuple(layer.bias.shape)} at GTP_remat={gtp_remat_size}; expected the "
+            f"replicated size ({out_features},)"
+        )
+
+        # The shape alone is not enough: a sharded bias fails silently, still returning the full
+        # out_features but biasing only the first out_features/gtp_remat_size columns.
+        with torch.no_grad():
+            layer.bias.fill_(bias_value)
+        shard = layer.weight.data.contiguous()
+        shards = [torch.empty_like(shard) for _ in range(gtp_remat_size)]
+        dist.all_gather(shards, shard, group=pg_collection.gtp_remat)
+        full_weight = torch.cat(shards, dim=0)[:out_features].float()
+
+        inputs = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda")
+        dist.broadcast(inputs, src=0)
+        # GTP writes the reduce-scattered wgrad here; it must exist before backward.
+        layer.weight.main_grad = torch.zeros(
+            layer.weight.shape, dtype=torch.bfloat16, device="cuda"
+        )
+
+        applied = (layer(inputs)[0].float() - inputs.float() @ full_weight.T).mean(dim=0)
+        missing = (applied - bias_value).abs() > 1.0
+        assert not missing.any(), (
+            f"{int(missing.sum())} of {out_features} outputs did not receive the bias at "
+            f"GTP_remat={gtp_remat_size}: the bias is still sharded"
+        )
+    finally:
+        ps.destroy_model_parallel()
+        GTPShardedParam._chain_state = {}
+
+
+class TestGTPReplicatedBias:
+    @pytest.mark.parametrize("gtp_remat_size", [2, 4])
+    def test_bias_is_replicated(self, gtp_remat_size):
+        """``_gtp_pre_init`` gives TE a pre-sharded ``out_features`` and TE sizes the bias from it,
+        so without ``_gtp_restore_replicated_bias`` the bias is sharded too (256 of 512 outputs
+        biased at GTP_remat=2, with no error)."""
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_bias_is_replicated, 4, gtp_remat_size)
