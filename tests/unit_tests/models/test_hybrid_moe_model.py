@@ -305,6 +305,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "recompute_num_layers": None,
     "rotary_interleaved": False,
     "sequence_parallel": True,
+    "situ_glu_beta1": 4.0,
+    "situ_glu_beta2": 25.0,
     "softmax_scale": None,
     "softmax_type": "vanilla",
     "symmetric_ar_type": None,

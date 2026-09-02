@@ -1740,7 +1740,7 @@ def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
         if 'optimizer' in state_dict:
             state_dict['optimizer'] = optimizer_state_dict
 
-    if args.swiglu:
+    if args.swiglu or getattr(args, "situ_glu", False):
         apply(handle_swiglu_in_state_dict)
     # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
     # layout used on disk. No-op for unfused models.
@@ -2288,6 +2288,9 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('add_qkv_bias', force=True)
     _set_arg('squared_relu', force=True)
     _set_arg('swiglu', force=True)
+    _set_arg('situ_glu', force=True)
+    _set_arg('situ_glu_beta1', force=True)
+    _set_arg('situ_glu_beta2', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
     _set_arg('normalization', force=True)
