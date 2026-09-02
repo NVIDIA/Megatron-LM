@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import re
+
 import pytest
 import torch
 from torch.nn import functional as F
@@ -61,7 +63,8 @@ def test_gdp_num_householder_accepts_positive_values():
     assert config.gdp_num_householder == 5
 
 
-def _make_replica_hybridep_config(**overrides):
+def _replica_hybridep_config(**overrides):
+    """Build a minimal valid replica_hybridep config, then apply one override."""
     kwargs = dict(
         num_layers=1,
         hidden_size=128,
@@ -84,43 +87,58 @@ def _make_replica_hybridep_config(**overrides):
     return TransformerConfig(**kwargs)
 
 
-def test_replica_hybridep_allows_moe_cuda_graph_without_drop_padding():
-    config = _make_replica_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=["moe"])
+def test_replica_hybridep_defaults_a_dropless_rank_capacity():
+    """The backend is dropless by construction and allows the whole-layer moe graph."""
+    config = _replica_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=["moe"])
 
-    assert config.moe_flex_dispatcher_backend == "replica_hybridep"
     assert config.moe_expert_rank_capacity_factor == 1.0
     assert config.moe_single_grouped_weight is False
     assert config.grad_reduce_in_bf16 is False
 
 
-@pytest.mark.parametrize("scope", ["moe_router", "moe_preprocess"])
-def test_replica_hybridep_rejects_partial_moe_cuda_graph_scopes(scope):
-    with pytest.raises(AssertionError, match="moe CUDA graph scope only"):
-        _make_replica_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=[scope])
-
-
-def test_replica_hybridep_rejects_single_grouped_weight():
-    with pytest.raises(ValueError, match="moe_single_grouped_weight=False"):
-        _make_replica_hybridep_config(moe_single_grouped_weight=True)
-
-
-def test_replica_hybridep_bf16_grad_reduce_requires_ddp_fp32_accumulation():
-    with pytest.raises(ValueError, match="ddp-reduce-scatter-with-fp32-accumulation"):
-        _make_replica_hybridep_config(grad_reduce_in_bf16=True)
-
-
-def test_replica_hybridep_bf16_grad_reduce_requires_gtp_fp32_accumulation_with_gtp():
-    with pytest.raises(ValueError, match="gtp-remat-reduce-scatter-with-fp32-accumulation"):
-        _make_replica_hybridep_config(
-            grad_reduce_in_bf16=True,
-            ddp_reduce_scatter_with_fp32_accumulation=True,
-            expert_tensor_parallel_num_weight_shards=2,
-        )
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        # Every runtime expert needs its own weight address for the owner push.
+        ({"moe_single_grouped_weight": True}, "moe_single_grouped_weight=False"),
+        ({"moe_grouped_gemm": False}, "moe_grouped_gemm=True"),
+        ({"use_transformer_engine_op_fuser": False}, "use_transformer_engine_op_fuser=True"),
+        # The bridge reads wgrads out of main_grad buffers.
+        ({"gradient_accumulation_fusion": False}, "gradient_accumulation_fusion=True"),
+        ({"add_bias_linear": True}, "add_bias_linear=False"),
+        ({"moe_router_dtype": "fp64"}, "moe_router_dtype='fp32'"),
+        # The planner owns dispatch scheduling, so these overlap paths conflict.
+        ({"delay_wgrad_compute": True}, "delay_wgrad_compute=False"),
+        ({"moe_shared_expert_overlap": True}, "moe_shared_expert_overlap=False"),
+        ({"moe_expert_capacity_factor": 1.0}, "moe_expert_capacity_factor=None"),
+        # Route ids are packed against these limits.
+        ({"moe_router_topk": 33}, "moe_router_topk<=32"),
+        # The transport tile assumes 128-aligned projections.
+        ({"moe_ffn_hidden_size": 129}, "moe_ffn_hidden_size divisible by 128"),
+        ({"hidden_size": 129, "kv_channels": 32}, "moe_latent_size (or hidden_size)"),
+        # Only fused SwiGLU, quick-GeGLU and weighted squared-ReLU are supported.
+        ({"activation_func": F.gelu}, "fused SwiGLU"),
+        ({"params_dtype": torch.float32}, "BF16 execution and BF16 parameters"),
+        # BF16 grad transport needs FP32 accumulation on the DDP reduce-scatter.
+        ({"grad_reduce_in_bf16": True}, "ddp-reduce-scatter-with-fp32-accumulation"),
+        (
+            {
+                "grad_reduce_in_bf16": True,
+                "ddp_reduce_scatter_with_fp32_accumulation": True,
+                "expert_tensor_parallel_num_weight_shards": 2,
+            },
+            "gtp-remat-reduce-scatter-with-fp32-accumulation",
+        ),
+    ],
+)
+def test_replica_hybridep_rejects_unsupported_configurations(overrides, message):
+    with pytest.raises(ValueError, match=re.escape(message)):
+        _replica_hybridep_config(**overrides)
 
 
 @pytest.mark.parametrize("expert_gtp", [False, True])
 def test_replica_hybridep_accepts_bf16_grad_reduce_with_fp32_accumulation(expert_gtp):
-    config = _make_replica_hybridep_config(
+    config = _replica_hybridep_config(
         grad_reduce_in_bf16=True,
         ddp_reduce_scatter_with_fp32_accumulation=True,
         expert_tensor_parallel_num_weight_shards=2 if expert_gtp else 1,
@@ -130,33 +148,13 @@ def test_replica_hybridep_accepts_bf16_grad_reduce_with_fp32_accumulation(expert
     assert config.grad_reduce_in_bf16 is True
 
 
-def test_replica_hybridep_allows_native_mxfp8_and_router_padding():
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=128,
-        num_attention_heads=4,
-        num_moe_experts=2,
-        expert_model_parallel_size=2,
-        moe_token_dispatcher_type="flex",
-        moe_flex_dispatcher_backend="replica_hybridep",
-        moe_grouped_gemm=True,
-        moe_router_dtype="fp32",
-        moe_router_padding_for_quantization=True,
-        use_transformer_engine_op_fuser=True,
-        gradient_accumulation_fusion=True,
-        add_bias_linear=False,
-        activation_func=F.silu,
-        gated_linear_unit=True,
-        bf16=True,
-        params_dtype=torch.bfloat16,
-        fp8="e4m3",
-        fp8_recipe="mxfp8",
-        fp8_param=True,
+def test_replica_hybridep_accepts_native_mxfp8_with_router_padding():
+    """Native MXFP8 parameters are the only quantized storage the push understands."""
+    config = _replica_hybridep_config(
+        fp8="e4m3", fp8_recipe="mxfp8", fp8_param=True, moe_router_padding_for_quantization=True
     )
 
-    assert config.fp8 == "e4m3"
-    assert config.fp8_recipe == "mxfp8"
-    assert config.fp8_param
+    assert (config.fp8, config.fp8_recipe, config.fp8_param) == ("e4m3", "mxfp8", True)
     assert config.moe_router_padding_for_quantization
 
 
@@ -166,27 +164,14 @@ def test_replica_hybridep_allows_native_mxfp8_and_router_padding():
 )
 def test_replica_hybridep_rejects_unsupported_fp8_parameter_storage(fp8, fp8_recipe, fp8_param):
     with pytest.raises(ValueError, match="MXFP8 E4M3 with native FP8 parameters"):
-        TransformerConfig(
-            num_layers=1,
-            hidden_size=128,
-            num_attention_heads=4,
-            num_moe_experts=2,
-            expert_model_parallel_size=2,
-            moe_token_dispatcher_type="flex",
-            moe_flex_dispatcher_backend="replica_hybridep",
-            moe_grouped_gemm=True,
-            moe_router_dtype="fp32",
-            use_transformer_engine_op_fuser=True,
-            gradient_accumulation_fusion=True,
-            add_bias_linear=False,
-            activation_func=F.silu,
-            gated_linear_unit=True,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            fp8=fp8,
-            fp8_recipe=fp8_recipe,
-            fp8_param=fp8_param,
-        )
+        _replica_hybridep_config(fp8=fp8, fp8_recipe=fp8_recipe, fp8_param=fp8_param)
+
+
+@pytest.mark.parametrize("scope", ["moe_router", "moe_preprocess"])
+def test_replica_hybridep_rejects_partial_moe_cuda_graph_scopes(scope):
+    """Only the whole-layer moe scope preserves the planner's per-forward metadata."""
+    with pytest.raises(AssertionError, match="moe CUDA graph scope only"):
+        _replica_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=[scope])
 
 
 @pytest.mark.parametrize("num_householder", [0, -1])
