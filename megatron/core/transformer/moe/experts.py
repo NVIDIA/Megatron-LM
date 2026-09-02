@@ -434,9 +434,9 @@ class TEGroupedMLP(MegatronModule):
                 f"(gated_linear_unit={self.config.gated_linear_unit}, "
                 f"use_fused_weighted_squared_relu={self.config.use_fused_weighted_squared_relu})"
             )
-        if self.config.activation_func is situlu and self.activation_recompute:
+        if use_glu_fusion and self.activation_recompute:
             return _unsupported(
-                "Transformer Engine ScaledSiTUGLU does not support activation recompute"
+                "Transformer Engine scaled GLU ops do not support activation recompute"
             )
         if self.config.activation_func == situlu:
             if not hasattr(te_ops, "ScaledSiTUGLU"):

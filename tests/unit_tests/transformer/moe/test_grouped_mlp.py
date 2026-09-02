@@ -720,38 +720,31 @@ def test_make_fused_ops_selects_scaled_situ_glu(monkeypatch):
     assert activation.beta2 == 25.0
 
 
-def test_is_fused_impl_supported_rejects_situ_glu_activation_recompute(monkeypatch):
-    """ScaledSiTUGLU cannot honor selective MoE activation recompute."""
+@pytest.mark.parametrize(
+    ("activation_func", "activation_func_clamp_value"),
+    [(F.silu, None), (F.silu, 7.0), (situlu, None), (quick_gelu, None)],
+    ids=("swiglu", "clamped-swiglu", "situ-glu", "quick-geglu"),
+)
+def test_is_fused_impl_supported_rejects_scaled_glu_activation_recompute(
+    monkeypatch, activation_func, activation_func_clamp_value
+):
+    """TE scaled GLU ops cannot honor selective MoE activation recompute."""
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
     monkeypatch.setattr(experts_module, "HAVE_TE", True)
     monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
     monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
     _install_fake_te_ops_modules(monkeypatch, fake_te)
+
     module = _make_fused_impl_support_module(
-        FakeGroupedLinear, activation_func=situlu, gated_linear_unit=True
+        FakeGroupedLinear,
+        activation_func=activation_func,
+        activation_func_clamp_value=activation_func_clamp_value,
+        gated_linear_unit=True,
     )
     module.activation_recompute = True
 
     assert module._is_fused_impl_supported() is False
-
-
-@pytest.mark.parametrize("activation_func", [F.silu, quick_gelu], ids=("swiglu", "quick-geglu"))
-def test_is_fused_impl_supported_preserves_existing_glu_recompute(monkeypatch, activation_func):
-    """Existing scaled GLUs continue to forward activation recompute to TE."""
-    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
-    monkeypatch.setattr(experts_module, "te", fake_te)
-    monkeypatch.setattr(experts_module, "HAVE_TE", True)
-    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
-    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
-    _install_fake_te_ops_modules(monkeypatch, fake_te)
-
-    module = _make_fused_impl_support_module(
-        FakeGroupedLinear, activation_func=activation_func, gated_linear_unit=True
-    )
-    module.activation_recompute = True
-
-    assert module._is_fused_impl_supported() is True
 
 
 def test_is_fused_impl_supported_requires_cutedsl_env(monkeypatch):
