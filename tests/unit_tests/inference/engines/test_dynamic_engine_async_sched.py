@@ -4,7 +4,7 @@ import asyncio
 import gc
 import os
 from collections import Counter, deque
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest import mock
@@ -35,6 +35,7 @@ from megatron.core.inference.inference_request import (
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    AsyncScheduleLogitsState,
     DecodeOnly,
     DynamicBatchControllerStepResult,
     TextGenerationController,
@@ -690,6 +691,21 @@ _ASYNC_PAIR_SCENARIOS = (
         "attention:learnable-sink",
         config={"window_size": (4, 0), "window_attn_skip_freq": 2, "softmax_type": "learnable"},
         signals=("softmax-sink", "swa-alternating"),
+    ),
+)
+
+_ASYNC_SUSPEND_RESUME_SCENARIOS = (
+    _pair_scenario(
+        "offload-suspend-resume",
+        "kv:offload",
+        config={"kv_cache_management_mode": "offload", "static_kv_memory_pointers": False},
+        signals=("offload", "suspend-resume"),
+    ),
+    _pair_scenario(
+        "recompute-suspend-resume",
+        "kv:recompute",
+        config={"kv_cache_management_mode": "recompute", "static_kv_memory_pointers": False},
+        signals=("recompute", "suspend-resume"),
     ),
 )
 
@@ -1425,6 +1441,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     env.engine.controller._async_sched_logits.is_valid
                 )
                 env.engine.resume()
+                for request_id in env.engine.resume_request_ids:
+                    env.requests[request_id] = env.engine.get_request(request_id)
                 runtime["pending-after-resume"] += int(
                     env.engine.controller._async_sched_logits.is_valid
                 )
@@ -1478,16 +1496,22 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["sampling-backend:torch"] > 0
         if "persist" in signals:
             assert context.kv_cache_management_mode == KVCacheManagementMode.PERSIST
+        if "offload" in signals:
+            assert context.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+        if "recompute" in signals:
+            assert context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE
         if "static-pointers" in signals:
             assert context.static_kv_memory_pointers
         if "suspend-resume" in signals:
-            assert runtime["suspend-resume"] == runtime["static-pointer-preserved"] == 1
-            assert (
-                runtime["pending-before-suspend"]
-                == runtime["pending-after-suspend"]
-                == runtime["pending-after-resume"]
-                == 1
-            )
+            assert runtime["suspend-resume"] == runtime["pending-before-suspend"] == 1
+            if "recompute" in signals:
+                assert runtime["pending-after-suspend"] == 0
+                assert runtime["pending-after-resume"] == 0
+            else:
+                assert runtime["pending-after-suspend"] == 1
+                assert runtime["pending-after-resume"] == 1
+            if "static-pointers" in signals:
+                assert runtime["static-pointer-preserved"] == 1
         if "dp-offset" in signals:
             assert context.config.offset_sampling_seed_by_dp_rank
         if "last-logits" in signals:
@@ -1884,6 +1908,19 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
             delete_cuda_graphs()
             torch.cuda.empty_cache()
 
+    @pytest.mark.parametrize(
+        "scenario", _ASYNC_SUSPEND_RESUME_SCENARIOS, ids=lambda case: case.name
+    )
+    @torch.inference_mode()
+    def test_async_suspend_resume_mode_matches_legacy(self, scenario):
+        """Real OFFLOAD and RECOMPUTE cycles preserve output parity."""
+        try:
+            self._assert_scenario_pair(scenario)
+        finally:
+            gc.collect()
+            delete_cuda_graphs()
+            torch.cuda.empty_cache()
+
 
 @pytest.mark.internal
 @pytest.mark.skipif(
@@ -1927,6 +1964,80 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             torch.cuda.empty_cache()
             _set_rounder(64)
             Utils.destroy_model_parallel()
+
+
+def _controller_with_pending_logits():
+    controller = TextGenerationController.__new__(TextGenerationController)
+    controller._async_sched_logits = AsyncScheduleLogitsState()
+    controller._async_sched_logits.set_pending(4, torch.tensor([0, 1, 2]))
+    return controller
+
+
+def test_async_reset_clears_pending_logits():
+    """Engine reset cannot expose logits produced for the previous request batch."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = SimpleNamespace(reset=mock.Mock())
+    engine.controller = _controller_with_pending_logits()
+    engine.num_speculative_tokens = 1
+    engine._loop = None
+    engine._vision_embedding_cache = {}
+    engine._vision_embedding_cache_bytes = 0
+
+    with (
+        mock.patch(
+            "megatron.core.inference.engines.dynamic_engine.torch.distributed.get_rank",
+            return_value=0,
+        ),
+        mock.patch(
+            "megatron.core.inference.engines.dynamic_engine.torch.cuda.Event",
+            return_value=mock.Mock(),
+        ),
+    ):
+        engine.reset()
+
+    assert not engine.controller._async_sched_logits.is_valid
+    assert engine.controller._async_sched_logits.token_row_indices is None
+
+
+@pytest.mark.parametrize(
+    ("mode", "preserve_pending"),
+    [
+        pytest.param(KVCacheManagementMode.PERSIST, True, id="persist-preserves"),
+        pytest.param(KVCacheManagementMode.OFFLOAD, True, id="offload-preserves"),
+        pytest.param(KVCacheManagementMode.RECOMPUTE, False, id="recompute-clears"),
+    ],
+)
+def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
+    """Only recomputation invalidates a forward result pending across suspend."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = _controller_with_pending_logits()
+    engine.context = SimpleNamespace(
+        deallocate_inference_state_buffers=mock.Mock(),
+        dynamo_helper=None,
+        kv_cache_management_mode=mode,
+        static_kv_memory_pointers=True,
+    )
+    engine.state = EngineState.RUNNING
+    engine.unified_memory_level = 0
+    engine.waiting_request_ids = deque()
+    engine.requests = {}
+    engine.use_coordinator = False
+    engine._vision_embedding_cache = {}
+    engine._vision_embedding_cache_bytes = 0
+
+    with (
+        mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
+        mock.patch("megatron.core.inference.engines.dynamic_engine.InferenceMode.unset_active"),
+    ):
+        engine.suspend()
+
+    assert engine.controller._async_sched_logits.is_valid is preserve_pending
+    if preserve_pending:
+        assert torch.equal(
+            engine.controller._async_sched_logits.token_row_indices, torch.tensor([0, 1, 2])
+        )
+    else:
+        assert engine.controller._async_sched_logits.token_row_indices is None
 
 
 def test_async_negative_routing_replay():
