@@ -67,7 +67,7 @@ def group_layers_into_shortcut_blocks(
             physical_index += 1
             continue
 
-        compute_layer = layers[physical_index]
+        attn_layer = layers[physical_index]
         paired_type = layer_type_list[physical_index]
         supported_predecessors = {
             LayerSymbols.MAMBA,
@@ -80,16 +80,22 @@ def group_layers_into_shortcut_blocks(
             )
 
         supports_two_stage = (
-            isinstance(compute_layer, TwoStageAttentionLayer)
-            and compute_layer.supports_two_stage_attention()
+            isinstance(attn_layer, TwoStageAttentionLayer)
+            and attn_layer.supports_two_stage_attention()
         )
         if not supports_two_stage:
             raise ValueError(
-                f"Shortcut compute layer {paired_type!r} does not support two-stage attention"
+                f"Shortcut attention layer {paired_type!r} does not support two-stage attention"
             )
         moe_layer = layers[physical_index + 1]
         grouped_layers.append(
-            ShortcutMoEBlock(compute_layer, moe_layer, overlap_a2a=config.moe_shortcut_parallel)
+            ShortcutMoEBlock(
+                attn_layer,
+                moe_layer,
+                overlap_a2a=config.moe_shortcut_parallel,
+                attn_local_idx=physical_index,
+                moe_local_idx=physical_index + 1,
+            )
         )
         physical_index += 2
 
@@ -97,7 +103,7 @@ def group_layers_into_shortcut_blocks(
 
 
 class ShortcutMoEBlock(MegatronModule):
-    """Own and execute one compute-layer/shortcut-MoE pair."""
+    """Own and execute one attention-layer/shortcut-MoE pair."""
 
     _parallel_stream: torch.cuda.Stream | None = None
 
@@ -108,17 +114,27 @@ class ShortcutMoEBlock(MegatronModule):
             cls._parallel_stream = torch.cuda.Stream(priority=-1)
         return cls._parallel_stream
 
-    def __init__(self, compute_layer, moe_layer, overlap_a2a: bool):
-        super().__init__(compute_layer.config)
+    def __init__(
+        self,
+        attn_layer,
+        moe_layer,
+        overlap_a2a: bool,
+        attn_local_idx: int | None = None,
+        moe_local_idx: int | None = None,
+    ):
+        super().__init__(attn_layer.config)
 
         self.overlap_mode = overlap_a2a
-        self.layer_number = compute_layer.layer_number
-        self.attn_layer_num = compute_layer.layer_number - 1
-        self.moe_layer_num = moe_layer.layer_number - 1
-        self.is_first_layer = getattr(compute_layer, "is_first_layer", False)
+        self.layer_number = attn_layer.layer_number
+        self.attn_layer_idx = attn_layer.layer_number - 1
+        self.attn_local_idx = attn_local_idx
+        self.moe_layer_idx = moe_layer.layer_number - 1
+        self.moe_local_idx = moe_local_idx
+
+        self.is_first_layer = getattr(attn_layer, "is_first_layer", False)
         self.is_last_layer = getattr(moe_layer, "is_last_layer", False)
         self.tp_group = moe_layer.mlp.tp_group
-        self.compute_layer = compute_layer
+        self.attn_layer = attn_layer
         self.moe_layer = moe_layer
         self.recompute_shortcut_pre_mlp_layernorm = (
             self.config.recompute_granularity == "selective"
@@ -253,31 +269,48 @@ class ShortcutMoEBlock(MegatronModule):
         packed_seq_params,
         padding_mask,
         quant_context_factory,
-        quant_config,
+        quant_config=None,
+        cp_layout_state=None,
+        packed_sequence_cp_metadata=None,
     ):
         """Run the eager schedule with each physical layer's quantization context."""
 
+        attn_config = getattr(self.attn_layer, "config", quant_config)
+        moe_config = getattr(self.moe_layer, "config", quant_config)
+        if cp_layout_state is not None:
+            assert self.attn_local_idx is not None and self.moe_local_idx is not None
+            hidden_states, packed_seq_params = cp_layout_state.prepare_layer(
+                self.attn_local_idx, hidden_states
+            )
+        moe_hidden_states = hidden_states
+        moe_packed_seq_params = packed_seq_params
+        if cp_layout_state is not None:
+            moe_hidden_states, moe_packed_seq_params = cp_layout_state.prepare_layer(
+                self.moe_local_idx, moe_hidden_states
+            )
+
         # Launch the moe_router
-        with quant_context_factory(quant_config, self.moe_layer_num):
+        with quant_context_factory(moe_config, self.moe_layer_idx):
             route_input, route_probs = self._moe_router_preprocess(
-                shortcut_hidden=hidden_states,
+                shortcut_hidden=moe_hidden_states,
                 padding_mask=padding_mask,
-                packed_seq_params=packed_seq_params,
+                packed_seq_params=moe_packed_seq_params,
             )
             if self.overlap_mode:
                 self.route_ready_event.record(torch.cuda.current_stream())
 
         # Launch the input and attn of the attention layer
-        with quant_context_factory(quant_config, self.attn_layer_num):
-            paired_state = self.compute_layer.forward_pre_attn_and_core_attn(
+        with quant_context_factory(attn_config, self.attn_layer_idx):
+            paired_state = self.attn_layer.forward_pre_attn_and_core_attn(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
+                packed_sequence_cp_metadata=packed_sequence_cp_metadata,
             )
 
         # Launch the dispatch, experts, and combine
-        with quant_context_factory(quant_config, self.moe_layer_num):
+        with quant_context_factory(moe_config, self.moe_layer_idx):
             dispatched_input, dispatched_probs = self._launch_dispatch(
                 route_input, route_probs, async_op=self.overlap_mode
             )
@@ -295,27 +328,35 @@ class ShortcutMoEBlock(MegatronModule):
                 self.shortcut_pre_mlp_layernorm_checkpoint = None
 
         # launch the output layer of the attention layer
-        with quant_context_factory(quant_config, self.attn_layer_num):
-            attn_layer_output = self.compute_layer.forward_post_core_attn(*paired_state)
+        with quant_context_factory(attn_config, self.attn_layer_idx):
+            attn_layer_output = self.attn_layer.forward_post_core_attn(*paired_state)
             if isinstance(attn_layer_output, tuple):
                 attn_layer_output = attn_layer_output[0]
 
+        if cp_layout_state is not None:
+            attn_layer_output, moe_packed_seq_params = cp_layout_state.prepare_layer(
+                self.moe_local_idx, attn_layer_output
+            )
+
         # launch the moe shared experts and combine attn and moe layer outputs
-        with quant_context_factory(quant_config, self.moe_layer_num):
+        with quant_context_factory(moe_config, self.moe_layer_idx):
             shared_expert_output, moe_unflatten_mbs = self._moe_shared_experts(
                 attn_layer_output,
                 padding_mask=padding_mask,
-                packed_seq_params=packed_seq_params,
+                packed_seq_params=moe_packed_seq_params,
             )
             if self.overlap_mode:
                 combined_output = self._wait_combine(combined_output)
 
             # Ensure the combine autograd node is scheduled first before shared_experts
             set_tensor_grad_fn_sequence_sr(combined_output, torch.iinfo(torch.int).max)
-            return self._postprocess(
+            output = self._postprocess(
                 attn_layer_output,
                 combined_output,
                 shared_expert_output,
-                packed_seq_params=packed_seq_params,
+                packed_seq_params=moe_packed_seq_params,
                 moe_unflatten_mbs=moe_unflatten_mbs,
             )
+        if cp_layout_state is not None:
+            output = cp_layout_state.finalize_layer(self.moe_local_idx, output)
+        return output
