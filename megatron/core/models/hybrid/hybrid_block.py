@@ -327,6 +327,7 @@ class HybridStack(MegatronModule):
                 self.layers,
                 physical_layer_types,
                 self.config,
+                pp_layer_offset=pp_layer_offset,
             )
             self._execution_layer_config_list = [
                 layer_config

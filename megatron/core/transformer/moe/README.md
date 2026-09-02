@@ -373,7 +373,6 @@ A new output-discarding checkpointing method is also supported. This method disc
 * `core_attn`: Recompute the core attention submodule (uses standard checkpointing rather than output-discarding).
 * `mlp`: Recompute the dense MLP submodule (uses standard checkpointing rather than output-discarding) which is useful for hybrid-models like DeepSeek-V3.
 * `moe`: Recompute the MoE layer submodule (uses standard checkpointing rather than output-discarding).
-* `shortcut_pre_mlp_layernorm`: Recompute the shortcut router's input normalization with output-discarding checkpointing. Requires `--moe-shortcut-connection`.
 
 #### Fine-grained Activation Offloading
 

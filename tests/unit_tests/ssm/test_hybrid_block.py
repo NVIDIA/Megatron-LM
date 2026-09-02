@@ -750,6 +750,7 @@ class TestHybridBlock:
             moe_router_pre_softmax=True,
             moe_token_dispatcher_type="allgather",
             moe_shortcut_connection=True,
+            moe_shortcut_post_norm=True,
             moe_shortcut_parallel=parallel,
             moe_shared_expert_intermediate_size=256,
             add_bias_linear=False,

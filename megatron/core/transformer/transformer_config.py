@@ -766,6 +766,10 @@ class TransformerConfig(ModelParallelConfig):
     paired compute. CUDA graphs are not supported. For the first MoE layer (no preceding layer),
     falls back to standard routing."""
 
+    moe_shortcut_post_norm: bool = False
+    """Apply the configured normalization to the combined routed and shared expert output.
+    Requires moe_shortcut_connection = True."""
+
     moe_shortcut_parallel: bool = False
     """Overlap shortcut MoE All-to-All communication with paired Attention/Mamba compute.
     Dispatch and combine collectives run on a side CUDA stream; routing, experts, and paired
@@ -2013,6 +2017,16 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_shortcut_connection is mutually exclusive with "
                     "moe_shared_expert_overlap. ScMoE computes shared experts inline."
                 )
+
+        if self.moe_shortcut_post_norm and not self.moe_shortcut_connection:
+            raise ValueError(
+                "moe_shortcut_post_norm requires moe_shortcut_connection = True."
+            )
+        if shortcut_post_norm_offload and not self.moe_shortcut_post_norm:
+            raise ValueError(
+                "shortcut_post_norm in offload_modules requires "
+                "moe_shortcut_post_norm = True."
+            )
 
         if self.moe_shortcut_parallel:
             assert (

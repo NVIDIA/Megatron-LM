@@ -467,8 +467,11 @@ class MoELayer(BaseMoELayer):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
-        producing routing probabilities and a mapping.
+        producing routing probabilities and a mapping. The input padding mask is batch-first;
+        routing consumes it sequence-first to align with ``hidden_states``.
         """
+        if padding_mask is not None:
+            padding_mask = padding_mask.transpose(0, 1).bool()
         probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
         return probs, routing_map
 
@@ -651,7 +654,7 @@ class MoELayer(BaseMoELayer):
         Args:
             hidden_states (torch.Tensor): The input tensor shape [seq_length, bsz, hidden_size].
             padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
-                                                   Shape [seq_length, bsz]. True = padding,
+                                                   Shape [bsz, seq_length]. True = padding,
                                                    False = valid. Defaults to None.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
@@ -673,10 +676,6 @@ class MoELayer(BaseMoELayer):
             else:
                 self.token_dispatcher = self._training_token_dispatcher
                 self.shared_expert_overlap = self.config.moe_shared_expert_overlap
-        # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
-        if padding_mask is not None:
-            padding_mask = padding_mask.transpose(0, 1).bool()
-
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             try:
