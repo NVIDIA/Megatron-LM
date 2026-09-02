@@ -1,7 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from copy import deepcopy
-
 import pytest
 
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -124,31 +122,6 @@ def test_from_config_creates_independent_target_config_without_reinitializing():
 
     layer_config.dynamic_value["items"].append("changed")
     assert config.dynamic_value == {"items": []}
-
-
-def test_from_config_preserves_declared_runtime_handles_by_reference():
-    class NonCopyableHandle:
-
-        def __deepcopy__(self, memo):
-            raise AssertionError("runtime handle must not be deep-copied")
-
-    class ExternalConfig(TransformerConfig):
-        _NO_COPY_KEYS = {"runtime_handle"}
-
-    class LayerConfig(TransformerConfig):
-        pass
-
-    config = ExternalConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
-    config.runtime_handle = NonCopyableHandle()
-    config.runtime_handle_alias = config.runtime_handle
-
-    layer_config = LayerConfig.from_config(config)
-    copied_layer_config = deepcopy(layer_config)
-
-    assert layer_config.runtime_handle is config.runtime_handle
-    assert layer_config.runtime_handle_alias is config.runtime_handle
-    assert copied_layer_config.runtime_handle is config.runtime_handle
-    assert copied_layer_config.runtime_handle_alias is config.runtime_handle
 
 
 @pytest.mark.parametrize("num_householder", [0, -1])

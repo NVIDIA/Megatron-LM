@@ -5,7 +5,7 @@ import math
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Callable, ClassVar, Collection, List, Literal, Optional, Self, Tuple, Union
+from typing import Callable, List, Literal, Optional, Self, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -1464,35 +1464,13 @@ class TransformerConfig(ModelParallelConfig):
     insert these joins. This feature is particularly useful when using with full-iteration CUDA
     graphs"""
 
-    _NO_COPY_KEYS: ClassVar[Collection[str]] = ()
-    """Names of runtime attributes that config copies preserve by reference.
-
-    Config subclasses can use this for non-copyable resources such as process-group
-    collections. The policy is carried across :meth:`from_config` type conversions,
-    and aliases to a preserved value remain aliases in the resulting config.
-    """
-
-    def __deepcopy__(self, memo: dict[int, object]) -> Self:
-        """Deep-copy config state while sharing declared runtime resources."""
-        new_config = self.__class__.__new__(self.__class__)
-        memo[id(self)] = new_config
-        for key in self._NO_COPY_KEYS:
-            if key in self.__dict__:
-                value = self.__dict__[key]
-                if value is not self:
-                    memo.setdefault(id(value), value)
-        new_config.__dict__ = deepcopy(self.__dict__, memo)
-        return new_config
-
     @classmethod
     def from_config(cls, config: "TransformerConfig") -> Self:
         """Create this config type from an existing normalized transformer config.
 
-        The source config's complete instance state is copied without invoking the
-        target class's initializer or ``__post_init__``. Values are deep-copied unless
-        their attribute names are declared in either config type's ``_NO_COPY_KEYS``;
-        those runtime resources are shared by reference. The source copy policy and
-        dynamically added attributes are preserved on the converted config.
+        The source config's complete instance state is deep-copied without invoking
+        the target class's initializer or ``__post_init__``. This preserves normalized
+        values and dynamically added attributes while producing an independent config.
 
         Args:
             config: The transformer config to copy.
@@ -1501,20 +1479,7 @@ class TransformerConfig(ModelParallelConfig):
             An independent copy of ``config`` whose type is ``cls``.
         """
         new_config = cls.__new__(cls)
-        memo = {id(config): new_config}
-        no_copy_keys = frozenset(config._NO_COPY_KEYS) | frozenset(cls._NO_COPY_KEYS)
-        for key in no_copy_keys:
-            if key in config.__dict__:
-                value = config.__dict__[key]
-                if value is not config:
-                    memo.setdefault(id(value), value)
-        new_config.__dict__ = deepcopy(config.__dict__, memo)
-        if no_copy_keys:
-            # The target type can differ from the source, so keep source-specific
-            # copy policy on this instance for subsequent ``deepcopy`` calls.
-            new_config.__dict__["_NO_COPY_KEYS"] = no_copy_keys
-        else:
-            new_config.__dict__.pop("_NO_COPY_KEYS", None)
+        new_config.__dict__ = deepcopy(config.__dict__, {id(config): new_config})
         return new_config
 
     def _validate_cp_layouts(self) -> None:
