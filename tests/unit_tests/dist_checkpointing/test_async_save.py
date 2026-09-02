@@ -8,7 +8,6 @@ from torch.distributed.checkpoint import CheckpointException
 
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
@@ -59,6 +58,8 @@ class TestAsyncSave:
             TempNamedDir(tmp_path_dist_ckpt / 'test_equivalence_sync') as sync_ckpt_dir,
         ):
             # async
+            from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue
+
             async_calls = AsyncCallsQueue(persistent)
             async_request = save(
                 sharded_state_dict, async_ckpt_dir, async_sharded_save=True, async_strategy="mcore"

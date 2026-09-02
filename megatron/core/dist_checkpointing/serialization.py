@@ -12,7 +12,7 @@ import io
 import logging
 import os
 from pathlib import Path
-from typing import Callable, Dict, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Set, Tuple, Union
 
 import torch
 
@@ -29,7 +29,6 @@ from .mapping import (
     apply_factory_merges,
 )
 from .state_dict_utils import load_preprocess, save_preprocess
-from .strategies.async_utils import AsyncRequest
 from .strategies.common import COMMON_STATE_FNAME, load_common
 from .strategies.torch import (
     TorchDistLoadShardedStrategy,
@@ -46,6 +45,12 @@ from .validation import (
     verify_checkpoint,
     verify_integrity_manifest,
 )
+
+if TYPE_CHECKING:
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
+else:
+    AsyncRequest = Any
+
 
 logger = logging.getLogger(__name__)
 

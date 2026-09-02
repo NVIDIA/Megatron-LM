@@ -33,11 +33,11 @@ from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
-from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
 )
+from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
@@ -87,6 +87,12 @@ try:
     has_nvidia_modelopt = True
 except Exception:
     has_nvidia_modelopt = False
+
+
+if has_nvrx_async_support():
+    from nvidia_resiliency_ext.checkpointing.utils import _disable_gc
+else:
+    _disable_gc = None
 
 
 _CHECKPOINT_VERSION = None
@@ -1422,7 +1428,7 @@ def _async_delete_checkpoint_impl(
         io_priority (int): I/O class when lower_priority is True (from args.async_ckpt_io_priority).
     """
     if lower_priority:
-        from megatron.core.dist_checkpointing.strategies.async_utils import _set_process_qos
+        from nvidia_resiliency_ext.checkpointing.async_ckpt.core import _set_process_qos
 
         _set_process_qos(cpu_priority=cpu_priority, io_priority=io_priority)
 
