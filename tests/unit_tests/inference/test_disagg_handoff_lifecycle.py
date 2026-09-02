@@ -759,13 +759,25 @@ def test_peer_failure_quarantines_an_unfinished_local_transfer(handoff_loop):
     engine._pending_kv_imports.append(pending)
     engine._record_handoff_completion_notification(4, failed=True, source_safe=False)
 
-    engine._poll_pending_kv_imports()
-    engine._admit_pending_kv_imports()
+    with (
+        mock.patch(
+            "megatron.core.inference.disaggregation.inference_state_handoff.logging.error"
+        ) as log_error,
+        mock.patch(
+            "megatron.core.inference.disaggregation.inference_state_handoff.logging.exception"
+        ) as log_exception,
+    ):
+        engine._poll_pending_kv_imports()
+        engine._admit_pending_kv_imports()
 
     assert isinstance(pending.future.exception(), RuntimeError)
     assert engine.context.kv_block_allocator.releases == []
     assert not engine._pending_kv_imports
     assert engine._quarantined_kv_imports == [pending]
+    log_error.assert_called_once_with(
+        "Quarantining request %d cache storage after an incomplete handoff", 4
+    )
+    log_exception.assert_called_once_with("DISAGG_DECODE_PULL_FAILED request_id=%d", 4)
 
     pending.handle.storage_safe = True
     engine._poll_pending_kv_imports()
@@ -1155,13 +1167,17 @@ def test_handoff_submission_failure_is_reported_to_model_parallel_coordinator(ha
     engine._handoff_completion_tracker.report.assert_called_once_with(8, True, True)
 
     engine._record_handoff_completion_notification(8, failed=True, source_safe=True)
-    engine._admit_pending_kv_imports()
+    with mock.patch(
+        "megatron.core.inference.disaggregation.inference_state_handoff.logging.exception"
+    ) as log_exception:
+        engine._admit_pending_kv_imports()
 
     assert isinstance(future.exception(), RuntimeError)
     assert engine.context.kv_block_allocator.releases == [[10, 11, 12]]
     assert not engine._pending_kv_imports
     engine._notify_request_error.assert_called_once()
     assert engine._notify_request_error.call_args.kwargs == {"source_safe": True}
+    log_exception.assert_called_once_with("DISAGG_DECODE_PULL_FAILED request_id=%d", 8)
 
 
 def test_unsafe_nccl_receive_failure_is_fatal(handoff_loop):

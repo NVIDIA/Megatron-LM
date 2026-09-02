@@ -21,11 +21,14 @@ from weakref import ref
 import torch
 from torch import nn
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Shard
+from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
+from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
-from .placement import Placements
+from .placement import Flat
 
 
 def _is_in_backward() -> bool:
@@ -39,8 +42,8 @@ class FsdpContext:
     allgather_stream: torch.cuda.Stream
     reduce_scatter_stream: torch.cuda.Stream
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
-    # unnecessary because it can be detected when ``model_weight``, after syncing
-    # from ``main_weight``, has placements different from ``Placements.optimizer``.
+    # unnecessary because each parameter group tracks whether model_weight is stale
+    # after syncing from main_weight.
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool
@@ -153,9 +156,8 @@ class FsdpModule:
     _name: str | None
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext
-    _num_ready_grad_parameters: int
+    _trainable_parameter_countdown: Countdown
     _is_root: bool
-    _num_trainable_parameters: int
     # Event recorded after this FsdpModule's full parameters are materialized.
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
     # already prefetched this module.
@@ -170,7 +172,9 @@ class FsdpModule:
         self,
         context: FsdpContext,
         mesh: DeviceMesh,
-        placements: Placements,
+        model_weight_placements: tuple[Placement, ...],
+        main_grad_placements: tuple[Placement, ...],
+        main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
@@ -182,29 +186,36 @@ class FsdpModule:
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
         owned_parameters = _collect_owned_parameters(self)
-        assert tuple(placements.dp_axes) == tuple(
-            range(mesh.ndim)
-        ), "FSDP requires dp_axes to match every mesh axis in mesh order for now."
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
-        parameter_groups = [
-            FsdpParameterGroup(
-                owning_module=self,
-                parameters=group_parameters,
-                mesh=mesh,
-                placements=placements,
-                mixed_precision_policy=mixed_precision_policy,
-                allgather_stream=context.allgather_stream,
-                reduce_scatter_stream=context.reduce_scatter_stream,
-                grad_divisor=grad_divisor,
-                use_symmetric_memory=use_symmetric_memory,
+        parameter_groups = []
+        for group_parameters in _group_parameters(owned_parameters):
+            group_dtype = next(iter(group_parameters.values())).dtype
+            parameter_groups.append(
+                FsdpParameterGroup(
+                    owning_module=self,
+                    parameters=group_parameters,
+                    mesh=mesh,
+                    model_weight_placements=_specialize_placements(
+                        model_weight_placements, group_dtype
+                    ),
+                    main_grad_placements=_specialize_placements(main_grad_placements, group_dtype),
+                    main_weight_placements=_specialize_placements(
+                        main_weight_placements, group_dtype
+                    ),
+                    mixed_precision_policy=mixed_precision_policy,
+                    reduce_scatter_stream=context.reduce_scatter_stream,
+                    grad_divisor=grad_divisor,
+                    use_symmetric_memory=use_symmetric_memory,
+                )
             )
-            for group_parameters in _group_parameters(owned_parameters)
-        ]
         self._parameter_groups = tuple(parameter_groups)
-        self._num_ready_grad_parameters = 0
-        self._num_trainable_parameters = sum(
-            len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
+        self._trainable_parameter_countdown = Countdown(
+            sum(
+                len(group.fsdp_parameters)
+                for group in self._parameter_groups
+                if group.requires_grad
+            )
         )
         self._register_hooks()
         context.register_module(self)
@@ -258,7 +269,7 @@ class FsdpModule:
         module.register_full_backward_pre_hook(
             lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
         )
-        if self._num_trainable_parameters == 0:
+        if self._trainable_parameter_countdown.initial_value == 0:
             module.register_full_backward_hook(
                 lambda hooked_module, _grad_input, _grad_output: cast(
                     FsdpModule, hooked_module
@@ -276,8 +287,7 @@ class FsdpModule:
             module = module_ref()
             if module is None:
                 return
-            module._num_ready_grad_parameters += 1
-            if module._num_ready_grad_parameters == module._num_trainable_parameters:
+            if module._trainable_parameter_countdown.decrement():
                 module.post_backward()
 
         for group in self._parameter_groups:
@@ -322,7 +332,6 @@ class FsdpModule:
         if self.phase is not FsdpModule.Phase.BACKWARD:
             self.phase = FsdpModule.Phase.FORWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
-        self._num_ready_grad_parameters = 0
         allgather_stream = context.allgather_stream
         current_stream = context.current_stream()
 
@@ -502,3 +511,22 @@ def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.
         key = (parameter.dtype, parameter.requires_grad)
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
+
+
+def _specialize_placements(
+    placements: tuple[Placement, ...], dtype: torch.dtype
+) -> tuple[Placement, ...]:
+    """Specialize public placements for one homogeneous parameter group.
+
+    Today every parameter group maps Torch's user-facing ``Shard(0)`` to the
+    DBuffer-specific ``Flat`` format. This dtype-homogeneous group boundary is
+    where MXFP8 groups will instead select ``BlockAtomic``.
+    """
+    if dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise NotImplementedError(f"Unsupported dtype: {dtype}.")
+    for placement in placements:
+        if type(placement) is Shard and placement.dim != 0:
+            raise NotImplementedError(
+                "MFSDP currently supports only dim-0 Shard placements, " f"got {placement!r}."
+            )
+    return tuple(Flat() if type(placement) is Shard else placement for placement in placements)

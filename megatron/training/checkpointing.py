@@ -46,6 +46,7 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.post_training.modelopt.checkpointing import save_modelopt_state, save_sharded_modelopt_state
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
@@ -81,8 +82,6 @@ except ImportError:
 
 # [ModelOpt]: Import
 try:
-    from modelopt.torch.opt.plugins import save_modelopt_state, save_sharded_modelopt_state
-
     from megatron.post_training.utils import print_distributed_quant_summary
 
     has_nvidia_modelopt = True
@@ -2347,6 +2346,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
 
     # MoE latent projection.
     _set_arg('moe_latent_size', force=True)
+    _set_arg('moe_use_norm_before_up_proj', force=True)
 
     # Tokenizer args.
     if args.use_tokenizer_model_from_checkpoint_args:
@@ -2385,6 +2385,7 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     """
     from megatron.core.dist_checkpointing.gpt_checkpoint_interop import gpt_compatible_layer_maps
     from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.models.mimo.model.base import MimoModel
 
     # Model-only inference checkpoints may omit the saved argument namespace.
     if ckpt_args is None:
@@ -2398,6 +2399,10 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
         while module is not None:
             if isinstance(module, HybridModel):
                 return True
+            if isinstance(module, MimoModel):
+                language_module = module.mimo_config.language_model_spec.module
+                if isinstance(language_module, type) and issubclass(language_module, HybridModel):
+                    return True
             inner = getattr(module, 'language_model', None)
             if inner is not None and isinstance(inner, HybridModel):
                 return True

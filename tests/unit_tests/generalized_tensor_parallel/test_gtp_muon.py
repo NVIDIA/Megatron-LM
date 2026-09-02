@@ -230,7 +230,7 @@ def _worker_gtp_blockwise(rank, world_size, port):
 class TestGTPMuonDistributedNS:
     """Distributed-NS orthogonalization matches full-matrix NS, per shard."""
 
-    @pytest.mark.parametrize("tp_mode", ["distributed", "duplicated"])
+    @pytest.mark.parametrize("tp_mode", ["distributed", "duplicated", "auto"])
     @pytest.mark.parametrize("world_size", _GTP_ONLY_WORLD_SIZES)
     def test_gtp_only_parity(self, world_size, tp_mode):
         _requires_multi_gpu(world_size)

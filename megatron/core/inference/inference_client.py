@@ -97,6 +97,7 @@ class InferenceClient:
         self.request_submission_times = {}
         self.next_request_id = 0
         self.streams: dict[int, AsyncStream[dict]] = {}
+        self.aborted_request_ids: set[int] = set()
         # Resolves when abort cleanup makes transferred state safe to reuse.
         self.abort_futures: dict[int, asyncio.Future] = {}
         # Background socket receiver for request, stream, and abort replies.
@@ -127,8 +128,8 @@ class InferenceClient:
                     ``"image"`` accepts raw image bytes, a list of raw image
                     bytes, or a preprocessed image tensor dictionary.
                 Video:
-                    Video does not yet have any supported data preprocessing
-                    or modeling formats.
+                    ``"video"`` accepts raw video bytes, a list of raw video
+                    bytes, or a preprocessed video tensor dictionary.
                 Audio:
                     Audio does not yet have any supported data preprocessing
                     or modeling formats.
@@ -137,6 +138,35 @@ class InferenceClient:
             asyncio.Future: A future that will be resolved with a
             `DynamicInferenceRequest` object (if deserialize=True) or a raw
             serialized dict (if deserialize=False) containing the completed result.
+        """
+        return self.add_request_with_id(prompt, sampling_params, multi_modal_data=multi_modal_data)[
+            1
+        ]
+
+    def add_request_with_id(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        *,
+        multi_modal_data=None,
+    ) -> tuple[int, asyncio.Future]:
+        """Submit a request and return its id alongside its completion future.
+
+        Same submission as add_request, which delegates here. The id is what
+        abort_request takes, so a caller that may need to cancel -- an HTTP
+        handler whose client can disconnect mid-generation, for instance -- has
+        to use this form. With only the future in hand there is no way to name
+        the request to the coordinator, and cancelling the future alone leaves
+        the engine generating.
+
+        Args:
+            prompt: A string or list of token IDs.
+            sampling_params: Sampling parameters for the request.
+            multi_modal_data: Optional vLLM-style modality dictionary; see
+                add_request.
+
+        Returns:
+            tuple[int, asyncio.Future]: The request id and its completion future.
         """
         request_id = self.next_request_id
         self.next_request_id += 1
@@ -147,7 +177,7 @@ class InferenceClient:
             sampling_params.serialize(),
             serialize_multimodal_data(multi_modal_data),
         ]
-        return self._submit_request(payload, request_id)
+        return request_id, self._submit_request(payload, request_id)
 
     def _make_kv_handoff_request(
         self,
@@ -250,9 +280,20 @@ class InferenceClient:
     def _send_abort(self, request_id: int) -> None:
         request_id = int(request_id)
         stream = self.streams.pop(request_id, None)
+        future = self.completion_futures.pop(request_id, None)
+        abort_future = self.abort_futures.get(request_id)
+        if stream is None and future is None and abort_future is None:
+            # Already completed (or never submitted): _submit_request and
+            # _submit_stream register synchronously and _recv_task pops only
+            # immediately before delivering, so absence from both means the
+            # reply has been consumed. No further ENGINE_REPLY will arrive to
+            # prune aborted_request_ids, and the coordinator has already
+            # dropped its mapping, so recording the id would leak an entry
+            # nothing ever removes and the ABORT_REQUEST send would be wasted.
+            return
+        self.aborted_request_ids.add(request_id)
         if stream is not None:
             stream.finish()
-        future = self.completion_futures.pop(request_id, None)
         if future is not None and not future.done():
             future.cancel()
         self.request_submission_times.pop(request_id, None)
@@ -304,8 +345,8 @@ class InferenceClient:
                     ``"image"`` accepts raw image bytes, a list of raw image
                     bytes, or a preprocessed image tensor dictionary.
                 Video:
-                    Video does not yet have any supported data preprocessing
-                    or modeling formats.
+                    ``"video"`` accepts raw video bytes, a list of raw video
+                    bytes, or a preprocessed video tensor dictionary.
                 Audio:
                     Audio does not yet have any supported data preprocessing
                     or modeling formats.
@@ -363,6 +404,9 @@ class InferenceClient:
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
                     request_id, reply = data[1:]
+                    if request_id in self.aborted_request_ids:
+                        self.aborted_request_ids.discard(request_id)
+                        continue
                     submitted = self.request_submission_times.pop(request_id, None)
                     if submitted is not None:
                         reply['latency'] = time.perf_counter() - submitted
@@ -401,6 +445,7 @@ class InferenceClient:
                     error = InferenceRequestError(str(reason), source_safe=bool(source_safe))
                     abort_future = self.abort_futures.get(request_id)
                     if source_safe:
+                        self.aborted_request_ids.discard(request_id)
                         if abort_future is not None and not abort_future.done():
                             abort_future.set_result(True)
                     stream = self.streams.pop(request_id, None)
@@ -412,6 +457,8 @@ class InferenceClient:
                         future.set_exception(error)
                 elif header == Headers.REQUEST_ABORTED:
                     request_id, source_safe = int(data[1]), bool(data[2])
+                    if source_safe:
+                        self.aborted_request_ids.discard(request_id)
                     future = self.abort_futures.get(request_id)
                     if future is None:
                         continue
@@ -554,5 +601,6 @@ class InferenceClient:
             if not future.done():
                 future.cancel()
         self.abort_futures.clear()
+        self.aborted_request_ids.clear()
         self.socket.close(linger=0)
         self.context.term()

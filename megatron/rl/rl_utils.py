@@ -165,6 +165,7 @@ def refit_inference_model(model, inference_model, args) -> int:
         target_model=inference_model,
         num_dst_pools=num_dst_pools,
         dst_pool_index=dst_pool_index,
+        execution_batch_bytes=args.refit_execution_batch_bytes,
     )
     swap_model_weights(
         model,
@@ -172,6 +173,7 @@ def refit_inference_model(model, inference_model, args) -> int:
         args.refit_method,
         num_dst_pools=num_dst_pools,
         dst_pool_index=dst_pool_index,
+        execution_batch_bytes=args.refit_execution_batch_bytes,
     )
     return num_dst_pools
 
@@ -1476,6 +1478,11 @@ def compute_group_stats(
     return stats
 
 
+def _safe_metric_key(label):
+    """Sanitize a free-form label for use inside a wandb metric key."""
+    return ''.join(c if c.isalnum() or c in ('_', '-') else '_' for c in label)
+
+
 def _bounded_artifact_key(key, limit=100):
     """Bound a metric key so the artifact name wandb derives from it stays within wandb's limit.
 
@@ -1551,10 +1558,6 @@ def prep_wandb_metrics(
         ),
     }
 
-    def _safe_key(label):
-        """Sanitize a free-form label for use inside a wandb metric key."""
-        return ''.join(c if c.isalnum() or c in ('_', '-') else '_' for c in label)
-
     if rollout_statuses is None:
         rollout_statuses = [['ok'] * len(g) for g in rewards]
     if failure_reasons is None:
@@ -1562,7 +1565,7 @@ def prep_wandb_metrics(
     status_counts = Counter(s for g in rollout_statuses for s in g)
     status_counts.update({status: 0 for status in KNOWN_ROLLOUT_STATUSES})
     for status, count in sorted(status_counts.items()):
-        safe_status = _safe_key(status)
+        safe_status = _safe_metric_key(status)
         rollout_metrics[f'rollout/{safe_status}_count'] = count
         rollout_metrics[f'rollout/{safe_status}_rate'] = (
             count / total_rollouts if total_rollouts else 0.0
@@ -1836,8 +1839,15 @@ def _collect_rollout_pipeline_metrics() -> dict:
         "rollout_pipeline_inferred_count": pipeline.inferred_count,
         "rollout_pipeline_assembled_count": pipeline.assembled_count,
         "rollout_pipeline_filtered_count": pipeline.filtered_count,
+        "rollout_pipeline_refilled_placeholder_groups": pipeline.refilled_placeholder_groups,
+        "rollout_pipeline_restored_count": pipeline.restored_count,
         "rollout_pipeline_yielded_count": pipeline.yielded_count,
     })
+    # Refilled groups never reach the trainer-side failure accounting,
+    # so their members' failure reasons are surfaced here instead.
+    for reason, count in sorted(pipeline.refill_failure_reasons.items()):
+        key = f"rollout_pipeline_refill_reason_{_safe_metric_key(reason)}_count"
+        metrics[_bounded_artifact_key(key)] = count
     for name, samples in (
         ("infer_queue_dwell", pipeline.infer_queue_dwell),
         ("engine_dwell", pipeline.engine_dwell),
@@ -1853,15 +1863,24 @@ def _collect_rollout_pipeline_metrics() -> dict:
     # Per-env metrics, in env layout order (the pipeline arrays are env-indexed;
     # weighted env_ids are unique by construction).
     for env_index, allocation in enumerate(pipeline.allocations):
+        restored_groups = pipeline.restored_groups_per_env[env_index]
+        yielded_groups = pipeline.yielded_groups_per_env[env_index]
+        if yielded_groups:
+            restored_groups_percentage = 100.0 * restored_groups / yielded_groups
+            fresh_groups_percentage = 100.0 - restored_groups_percentage
+        else:
+            restored_groups_percentage = 0.0
+            fresh_groups_percentage = 0.0
         metrics[f"{allocation.env_id}_prepared_groups"] = (
             pipeline.prepared_groups_per_env[env_index]
         )
         metrics[f"{allocation.env_id}_assembled_groups"] = (
             pipeline.assembled_groups_per_env[env_index]
         )
-        metrics[f"{allocation.env_id}_yielded_groups"] = (
-            pipeline.yielded_groups_per_env[env_index]
-        )
+        metrics[f"{allocation.env_id}_restored_groups"] = restored_groups
+        metrics[f"{allocation.env_id}_restored_groups_percentage"] = restored_groups_percentage
+        metrics[f"{allocation.env_id}_fresh_groups_percentage"] = fresh_groups_percentage
+        metrics[f"{allocation.env_id}_yielded_groups"] = yielded_groups
         metrics[f"{allocation.env_id}_agent_groups"] = allocation.num_groups
         # The realized weight: the constant share of each batch the env actually owns.
         metrics[f"{allocation.env_id}_weight"] = (
@@ -1875,12 +1894,16 @@ def _collect_rollout_pipeline_metrics() -> dict:
     pipeline.prepared_count = 0
     pipeline.inferred_count = 0
     pipeline.assembled_count = 0
+    pipeline.dropped_count = 0
     pipeline.filtered_count = 0
+    pipeline.refilled_placeholder_groups = 0
+    pipeline.refill_failure_reasons = {}
     pipeline.restored_count = 0
     pipeline.yielded_count = 0
     num_envs = len(pipeline.gran_policy.num_groups_per_env)
     pipeline.prepared_groups_per_env = [0] * num_envs
     pipeline.assembled_groups_per_env = [0] * num_envs
+    pipeline.restored_groups_per_env = [0] * num_envs
     pipeline.yielded_groups_per_env = [0] * num_envs
     gate.prepare_blocked_seconds = 0.0
     gate.acquire_calls = 0

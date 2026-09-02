@@ -27,6 +27,11 @@ class Rollout(AgentBaseModel):
     rollout_status: str = 'ok'
     failure_reason: str | None = None
 
+    @property
+    def is_placeholder(self) -> bool:
+        """An empty trajectory is the placeholder left by a failed episode."""
+        return not self.trajectory
+
 
 class TokenRollout(AgentBaseModel):
     """Tokenized representation of a language-based Rollout."""
@@ -41,6 +46,11 @@ class TokenRollout(AgentBaseModel):
     generation_cap: int | None = None
     rollout_status: str = 'ok'
     failure_reason: str | None = None
+
+    @property
+    def is_placeholder(self) -> bool:
+        """An empty trajectory is the placeholder left by a failed episode."""
+        return not self.trajectory
 
 
 Rollouts = list[TokenRollout | Rollout]
