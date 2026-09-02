@@ -842,7 +842,9 @@ class ReplicaWeightBridge:
         self.last_plan = None
         self._prefetch_plan = None
         self._completed_plan = None
+        self._backward_plan = None
         self._grad_reduce_plan = None
+        self._grad_reduce_started: set[int] = set()
         self._experts_ref = weakref.ref(experts)
         self._destroyed = False
 
@@ -878,12 +880,12 @@ class ReplicaWeightBridge:
         self.prefetch_ready = torch.cuda.Event()
         self.prefetch_done = torch.cuda.Event()
         self.grad_reduce_ready = torch.cuda.Event()
-        self.grad_reduce_done = torch.cuda.Event()
+        self.grad_reduce_done = (torch.cuda.Event(), torch.cuda.Event())
         for event in (
             self.prefetch_ready,
             self.prefetch_done,
             self.grad_reduce_ready,
-            self.grad_reduce_done,
+            *self.grad_reduce_done,
         ):
             event.record(torch.cuda.current_stream(self.device))
 
@@ -1061,12 +1063,19 @@ class ReplicaWeightBridge:
         self._completed_plan = plan
         self._prefetch_plan = None
 
+    def wait_prefetch_for_backward(self, plan: ReplicaPlan) -> None:
+        """Wait for the backward push and remember which plan the expert backward reduces."""
+        self.wait_prefetch(plan)
+        self._backward_plan = plan
+
     @torch.no_grad()
     @nvtx_decorator(message="replica_grad_reduce_start")
-    def start_grad_reduce(self, plan: ReplicaPlan) -> None:
-        """Enqueue replica-gradient reduction into native wgrad staging."""
-        if self._grad_reduce_plan is not None:
-            raise RuntimeError("Replica gradient reduction is already outstanding.")
+    def start_grad_reduce(self, plan: ReplicaPlan, projection: int) -> None:
+        """Enqueue the replica-gradient reduction of one projection (0 = FC1, 1 = FC2)."""
+        if self._grad_reduce_plan is not None and self._grad_reduce_plan is not plan:
+            raise RuntimeError("Replica gradient reduction is outstanding for another plan.")
+        if projection in self._grad_reduce_started:
+            raise RuntimeError(f"Replica gradient reduction of FC{projection + 1} started twice.")
         self._validate_plan(plan)
         workspace = self.workspace
         current_stream = torch.cuda.current_stream(self.device)
@@ -1085,20 +1094,44 @@ class ReplicaWeightBridge:
                 num_local_experts=self.num_local_experts,
                 member_numels=workspace.member_numels,
                 num_sms=workspace.num_sms,
+                projections=(projection,),
             )
-            self.grad_reduce_done.record(workspace.grad_stream)
+            self.grad_reduce_done[projection].record(workspace.grad_stream)
         self._grad_reduce_plan = plan
+        self._grad_reduce_started.add(projection)
+
+    def start_fc2_grad_reduce(self) -> None:
+        """Start the FC2 reduction from the expert backward, once FC2's wgrad GEMM is enqueued."""
+        if self._backward_plan is None:
+            raise RuntimeError("Replica FC2 gradient reduction needs the backward plan.")
+        self.start_grad_reduce(self._backward_plan, 1)
+
+    def start_pending_grad_reduces(self, plan: ReplicaPlan) -> None:
+        """Start every reduction not yet started, FC2 first, after dispatch backward.
+
+        FC2 normally starts from the FC2 op's wgrad store during the expert backward;
+        this covers a backward that computed no FC2 wgrad. FC1 starts here once the
+        dispatch-backward all-to-all has finished and hides behind the latent,
+        shared-expert and router backward.
+        """
+        if self._grad_reduce_plan is not None and self._grad_reduce_plan is not plan:
+            raise RuntimeError("Replica gradient reduction is outstanding for another plan.")
+        for projection in (1, 0):
+            if projection not in self._grad_reduce_started:
+                self.start_grad_reduce(plan, projection)
 
     @torch.no_grad()
     @nvtx_decorator(message="replica_grad_reduce_wait")
     def wait_grad_reduce(self, plan: ReplicaPlan) -> tuple[torch.Tensor | None, ...]:
-        """Finish replica reduction and return source-parameter wgrads."""
-        if self._grad_reduce_plan is None:
-            self.start_grad_reduce(plan)
-        elif self._grad_reduce_plan is not plan:
-            raise RuntimeError("Replica grad-reduction plan changed while outstanding.")
-        torch.cuda.current_stream(self.device).wait_event(self.grad_reduce_done)
+        """Finish both replica reductions and return source-parameter wgrads."""
+        if self._grad_reduce_plan is not plan or self._grad_reduce_started != {0, 1}:
+            raise RuntimeError("Replica gradient reduction of both projections must be started.")
+        current_stream = torch.cuda.current_stream(self.device)
+        for event in self.grad_reduce_done:
+            current_stream.wait_event(event)
         self._grad_reduce_plan = None
+        self._grad_reduce_started.clear()
+        self._backward_plan = None
 
         # Expert backward computes FC2 before FC1. Preserve that reverse order
         # when handing full wgrads to GTP so its linked RS cascade remains valid.
@@ -1187,19 +1220,23 @@ class _ReplicaBackwardHook(torch.autograd.Function):
 
 
 class _ReplicaWaitGradReduce(torch.autograd.Function):
-    """Finalize replica gradients after activation-dispatch backward."""
+    """Finalize replica gradients once every consumer of the layer input has run backward.
+
+    ``context`` is any object whose ``plan`` attribute holds the layer's plan by
+    the time backward runs; the dispatcher fills it in after routing.
+    """
 
     @staticmethod
     def forward(ctx, hidden_states, *args):
-        bridge, plan = args[-2:]
+        bridge, context = args[-2:]
         ctx.bridge = bridge
-        ctx.plan = plan
+        ctx.context = context
         ctx.num_source_parameters = len(args) - 2
         return hidden_states
 
     @staticmethod
     def backward(ctx, grad_hidden_states):
-        source_grads = ctx.bridge.wait_grad_reduce(ctx.plan)
+        source_grads = ctx.bridge.wait_grad_reduce(ctx.context.plan)
         if len(source_grads) != ctx.num_source_parameters:
             raise RuntimeError(
                 "Replica reduction returned a different number of wgrads than source parameters."
@@ -1249,23 +1286,25 @@ def wait_replica_weight_prefetch_before_expert_backward(
     expert_output: torch.Tensor, bridge: ReplicaWeightBridge, plan: ReplicaPlan
 ) -> torch.Tensor:
     """Wait for weight communication immediately before expert backward."""
-    return _ReplicaBackwardHook.apply(expert_output, functools.partial(bridge.wait_prefetch, plan))
-
-
-def start_replica_grad_reduce_after_expert_backward(
-    dispatched_hidden: torch.Tensor, bridge: ReplicaWeightBridge, plan: ReplicaPlan
-) -> torch.Tensor:
-    """Start replica-gradient communication after expert backward."""
     return _ReplicaBackwardHook.apply(
-        dispatched_hidden, functools.partial(bridge.start_grad_reduce, plan)
+        expert_output, functools.partial(bridge.wait_prefetch_for_backward, plan)
     )
 
 
-def wait_replica_grad_reduce_after_dispatch_backward(
-    hidden_states: torch.Tensor, bridge: ReplicaWeightBridge, plan: ReplicaPlan
+def start_replica_grad_reduce_after_dispatch_backward(
+    dispatch_input: torch.Tensor, bridge: ReplicaWeightBridge, plan: ReplicaPlan
 ) -> torch.Tensor:
-    """Wait for replica gradients before registered-parameter DDP hooks."""
-    return _ReplicaWaitGradReduce.apply(hidden_states, *bridge.source_parameters, bridge, plan)
+    """Start the replica-gradient reductions still pending once dispatch backward is done."""
+    return _ReplicaBackwardHook.apply(
+        dispatch_input, functools.partial(bridge.start_pending_grad_reduces, plan)
+    )
+
+
+def wait_replica_grad_reduce_at_layer_input(
+    hidden_states: torch.Tensor, bridge: ReplicaWeightBridge, context
+) -> torch.Tensor:
+    """Wait for replica gradients after every consumer of the layer input ran backward."""
+    return _ReplicaWaitGradReduce.apply(hidden_states, *bridge.source_parameters, bridge, context)
 
 
 def extract_semantic_routes(

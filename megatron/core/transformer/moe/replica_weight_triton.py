@@ -881,6 +881,8 @@ def _replica_grad_reduce_kernel(
     FC2_ROWS: tl.constexpr,
     TILE_ROWS: tl.constexpr,
     ELEMENT_BYTES: tl.constexpr,
+    TILE_BEGIN: tl.constexpr,
+    TILE_END: tl.constexpr,
     NUM_LOCAL_EXPERTS: tl.constexpr,
     WORLD: tl.constexpr,
     WORLD_POW2: tl.constexpr,
@@ -889,6 +891,10 @@ def _replica_grad_reduce_kernel(
     THREADS: tl.constexpr,
 ):
     """Reduce every peer's replica gradients into native wgrad staging.
+
+    ``[TILE_BEGIN, TILE_END)`` selects the transport tiles of one launch: the FC1
+    members, the FC2 members, or both. The bridge launches the projections
+    separately so each can start as soon as its wgrad GEMM has finished.
 
     ``plan`` holds the destination-major ``[world, num_local_experts]`` table of
     globally numbered experts the planner materialized, so the sources of one
@@ -940,8 +946,8 @@ def _replica_grad_reduce_kernel(
     )
     replicated = tl.load(replicas + NUM_LOCAL_EXPERTS)
 
-    low = block * TILES // NUM_SMS
-    high = (block + 1) * TILES // NUM_SMS
+    low = TILE_BEGIN + block * (TILE_END - TILE_BEGIN) // NUM_SMS
+    high = TILE_BEGIN + (block + 1) * (TILE_END - TILE_BEGIN) // NUM_SMS
     for step in tl.range(0, replicated, num_stages=1):
         expert = tl.load(replicas + (step + block) % tl.maximum(replicated, 1))
         count = tl.sum((mine & (owner_expert == expert)).to(tl.int32), 0)
@@ -1130,13 +1136,21 @@ def _grad_arguments(
     world_size: int,
     num_local_experts: int,
     num_sms: int,
+    projections: tuple[int, ...] = (0, 1),
 ) -> dict:
     tile = _transport_tile(_MAX_TILE_BYTES // grad_dtype.itemsize, *member_numels)
+    fc1_tiles, fc2_tiles = (numel // tile for numel in member_numels)
+    if not projections or any(projection not in (0, 1) for projection in projections):
+        raise ValueError(
+            f"Replica gradient projections must be a subset of (0, 1), got {projections}."
+        )
     return dict(
         FC1_ROWS=member_numels[0] // _ROW.value,
         FC2_ROWS=member_numels[1] // _ROW.value,
         TILE_ROWS=tile // _ROW.value,
         ELEMENT_BYTES=grad_dtype.itemsize,
+        TILE_BEGIN=0 if 0 in projections else fc1_tiles,
+        TILE_END=fc1_tiles + fc2_tiles if 1 in projections else fc1_tiles,
         NUM_LOCAL_EXPERTS=num_local_experts,
         WORLD=world_size,
         WORLD_POW2=triton.next_power_of_2(world_size),
@@ -1183,20 +1197,23 @@ def compile_replica_weight_kernels(
             grid=(num_sms,),
             **_push_arguments(member_numels, mxfp8=mxfp8, **shape),
         )
-        _replica_grad_reduce_kernel.warmup(
-            torch.zeros(1, dtype=grad_dtype, device="cuda"),
-            table,
-            table,
-            table.data_ptr(),
-            table.data_ptr(),
-            plan,
-            plan,
-            plan,
-            plan,
-            0,
-            grid=(num_sms,),
-            **_grad_arguments(member_numels, grad_dtype, **shape),
-        )
+        # The bridge reduces FC2 and FC1 in separate launches; tests and benches
+        # reduce both at once.
+        for projections in ((1,), (0,), (0, 1)):
+            _replica_grad_reduce_kernel.warmup(
+                torch.zeros(1, dtype=grad_dtype, device="cuda"),
+                table,
+                table,
+                table.data_ptr(),
+                table.data_ptr(),
+                plan,
+                plan,
+                plan,
+                plan,
+                0,
+                grid=(num_sms,),
+                **_grad_arguments(member_numels, grad_dtype, projections=projections, **shape),
+            )
 
 
 def launch_replica_weight_prefetch(
@@ -1262,12 +1279,14 @@ def launch_replica_grad_reduce(
     num_local_experts: int,
     member_numels: tuple[int, int],
     num_sms: int,
+    projections: tuple[int, ...] = (0, 1),
 ) -> None:
     """Accumulate every peer's replica gradients into native wgrad staging.
 
     ``native_grads`` are ``int64`` pointer tables with one FC1 or FC2 staging
-    base per local expert. Used replica slots are left holding their partials;
-    the next wgrad GEMM overwrites them.
+    base per local expert; ``projections`` selects which of the two this launch
+    reduces. Used replica slots are left holding their partials; the next wgrad
+    GEMM overwrites them.
     """
     _validate_transport_shape(world_size, num_local_experts, num_sms)
     _validate_grad_dtype(arena.dtype)
@@ -1289,5 +1308,6 @@ def launch_replica_grad_reduce(
                 world_size=world_size,
                 num_local_experts=num_local_experts,
                 num_sms=num_sms,
+                projections=projections,
             ),
         )
