@@ -1091,6 +1091,82 @@ class TestHybridTECudaGraphDiscovery:
 
         return RecordingOffloadInterface
 
+    @pytest.mark.parametrize(
+        ('has_attention', 'position_embedding_type', 'multi_latent_attention', 'expects_rotary'),
+        [
+            (True, 'rope', False, True),
+            (False, 'rope', False, False),
+            (True, 'learned_absolute', False, False),
+            (True, 'rope', True, False),
+        ],
+    )
+    def test_hybrid_wrapper_sample_inputs_include_rotary_embeddings(
+        self,
+        monkeypatch,
+        has_attention,
+        position_embedding_type,
+        multi_latent_attention,
+        expects_rotary,
+    ):
+        """The TE sample signature must match the wrapped attention replay signature."""
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        inner = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(inner)
+        inner.self_attention = torch.nn.Linear(2, 2) if has_attention else IdentityOp()
+        inner.cross_attention = IdentityOp()
+
+        wrapper = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(wrapper)
+        wrapper.inner_layer = inner
+        object.__setattr__(
+            wrapper,
+            'get_layer_static_inputs',
+            lambda _seq_length, _micro_batch_size: {
+                'hidden_states': torch.ones(8, 1, 8, requires_grad=True)
+            },
+        )
+
+        rotary_pos_emb = torch.ones(8, 1, 1, 2)
+
+        class RotaryEmbedding:
+            @staticmethod
+            def get_rotary_seq_len(*_args):
+                return 8
+
+            @staticmethod
+            def __call__(_seq_length):
+                return rotary_pos_emb
+
+        chunk = SimpleNamespace(
+            decoder=SimpleNamespace(layers=[wrapper]),
+            position_embedding_type=position_embedding_type,
+            rotary_pos_emb=RotaryEmbedding(),
+        )
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = SimpleNamespace(
+            multi_latent_attention=multi_latent_attention,
+            cuda_graph_modules=[CudaGraphModule.attn],
+        )
+        helper.seq_length = 8
+        helper.micro_batch_size = 1
+        helper.num_model_chunks = 1
+        helper.num_microbatches = 1
+        helper.flattened_callables = [wrapper]
+        helper.num_layers_per_chunk = [1]
+        helper.callables_per_chunk = [[wrapper]]
+        helper.chunks_with_decoder = [chunk]
+        helper._needs_full_local_padding_mask = lambda *_args: False
+        helper._uses_mhc_direct_write_arena = lambda: False
+        monkeypatch.setattr(cuda_graphs_module, 'is_te_min_version', lambda _version: True)
+
+        _sample_args, sample_kwargs = helper._get_sample_arguments([1, -1])
+
+        if expects_rotary:
+            assert sample_kwargs[0]['rotary_pos_emb'] is rotary_pos_emb
+        else:
+            assert 'rotary_pos_emb' not in sample_kwargs[0]
+
     def test_hybrid_mtp_layers_are_flattened_and_adjacent_layers_are_grouped(self, monkeypatch):
         from megatron.core.transformer import cuda_graphs
 
