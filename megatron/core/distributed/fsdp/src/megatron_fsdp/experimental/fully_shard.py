@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -131,6 +131,10 @@ def fully_shard(
             the expert-data-parallel mesh alone therefore divides by too little, and
             ``grad_divisor=ep_size`` makes up the difference. Dense parameters see only
             their own rank's tokens and need no divisor.
+
+        Parameters that are TE MXFP8 primary weights (detected via
+        ``is_float8tensor`` + ``fp8_need_transpose_data``) are grouped into
+        ``Fp8ParameterGroup`` automatically; no flag is needed.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
