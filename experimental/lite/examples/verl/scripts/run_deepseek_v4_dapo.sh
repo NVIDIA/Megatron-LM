@@ -281,6 +281,11 @@ VLLM_CONFIG="actor_rollout_ref.rollout.engine_kwargs.vllm"
 VLLM_QUANT_CONFIG="${VLLM_CONFIG}.hf_overrides.quantization_config"
 VLLM_WORKER_EXTENSION="verl.workers.rollout.vllm_rollout.utils"
 VLLM_WORKER_EXTENSION+=".vLLMColocateWorkerExtension"
+CUDA_ARCH_MAJOR="$(python3 -c 'import torch; print(torch.cuda.get_device_capability()[0])')"
+if [[ "${CUDA_ARCH_MAJOR}" == 9 ]]; then
+  VLLM_WORKER_EXTENSION="verl_mlite.rollout.vllm_worker"
+  VLLM_WORKER_EXTENSION+=".MLiteVLLMColocateWorkerExtension"
+fi
 
 ROLLOUT=(
   "actor_rollout_ref.rollout.name=vllm"
