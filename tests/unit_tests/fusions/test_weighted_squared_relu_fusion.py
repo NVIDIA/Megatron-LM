@@ -91,4 +91,4 @@ def test_clamped_weighted_squared_relu_fusion_matches_unfused(input_dtype):
 
     assert weights_fused.grad.dtype == weights.grad.dtype
     if input_dtype == torch.float32:
-        assert torch.allclose(weights_fused.grad, weights.grad, **tols)
+        assert torch.allclose(weights_fused.grad, weights.grad, rtol=1.0e-5, atol=1.0e-5)
