@@ -2,6 +2,7 @@
 
 """Megatron Module."""
 
+from contextlib import nullcontext
 from functools import partial
 from typing import Optional, Tuple
 

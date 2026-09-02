@@ -566,7 +566,8 @@ class PipelineOffloadManager:
         try:
             yield
         finally:
-            for chunk in self._cached_chunks_forward:
+            cached_chunks = set(self._cached_chunks_forward) | set(self._cached_chunks_backward)
+            for chunk in cached_chunks:
                 chunk.clear_offload_pending()
 
     def push_offload_groups(self, group_hook, name, forced_released_tensors):
@@ -1091,6 +1092,13 @@ class ChunkOffloadHandler:
         debug_rank("------bulk_offload_group")
         nvtx_msg = "activation offloading " + group_to_offload._name
         nvtx_range_push(nvtx_msg)
+        capture_owner = PipelineOffloadManager.get_instance().cuda_graph_capture_owner
+        external_recorded = bool(
+            self._max_inflight_offloads is not None
+            and self._max_inflight_offloads > 0
+            and capture_owner is not None
+            and capture_owner.may_cross_graphs
+        )
         with torch.cuda.stream(self.d2h_stream):
             for tensor_tag, tensor_on_device in group_to_offload._tensors.items():
                 if self.tensor_need_offloading_checker(tensor_on_device):
@@ -1102,13 +1110,6 @@ class ChunkOffloadHandler:
                     tensor_on_device.record_stream(self.d2h_stream)
                     group_to_offload.push_tensor(tensor_tag, state)
             group_to_offload.record_offload_event(self.d2h_stream)
-            capture_owner = PipelineOffloadManager.get_instance().cuda_graph_capture_owner
-            external_recorded = bool(
-                self._max_inflight_offloads is not None
-                and self._max_inflight_offloads > 0
-                and capture_owner is not None
-                and capture_owner.may_cross_graphs
-            )
             if external_recorded:
                 group_to_offload.record_offload_throttle_event(self.d2h_stream)
         nvtx_range_pop(nvtx_msg)
@@ -1212,10 +1213,10 @@ class ChunkOffloadHandler:
         if self._max_inflight_offloads is None:
             return
         cur = torch.cuda.current_stream()
+        consumer_owner = PipelineOffloadManager.get_instance().cuda_graph_capture_owner
         q = self._offload_pending_by_name[group_name]
         while len(q) > self._max_inflight_offloads:
             pending = q.popleft()
-            consumer_owner = PipelineOffloadManager.get_instance().cuda_graph_capture_owner
             if (pending.producer_owner is None) != (consumer_owner is None):
                 raise RuntimeError(
                     "Max-inflight offload dependency crossed between eager execution "

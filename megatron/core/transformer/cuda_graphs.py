@@ -432,7 +432,7 @@ class _CudagraphGlobalRecord:
 
         capture_session = nullcontext()
         if any(
-            record[0].base_module.config.fine_grained_activation_offloading
+            getattr(record[0], "fine_grained_activation_offloading", False)
             for record in cls.cudagraph_record
         ):
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -725,6 +725,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.status = _GraphStatus.FWD_READY
 
         self.backward_retain_grad = False
+        self.fine_grained_activation_offloading = False
         self.fp8_enabled = False
         self.fp4_enabled = False
         self.fp8_runtime_enabled = None
@@ -747,6 +748,9 @@ class _CudaGraphRunner(torch.nn.Module):
             self.base_module.config, TransformerConfig
         ):
             self.backward_retain_grad = self.base_module.config.cuda_graph_retain_backward_graph
+            self.fine_grained_activation_offloading = (
+                self.base_module.config.fine_grained_activation_offloading
+            )
             self.deallocate_pipeline_outputs = self.base_module.config.deallocate_pipeline_outputs
             self.num_warmup_steps = self.base_module.config.cuda_graph_warmup_steps
             self.fp8_enabled = self.base_module.config.fp8 is not None
@@ -977,7 +981,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     gc.freeze()
 
                 capture_scope = nullcontext()
-                if self.base_module.config.fine_grained_activation_offloading:
+                if self.fine_grained_activation_offloading:
                     from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
                         FineGrainedActivationOffloadingInterface as off_interface,
                     )
@@ -1106,7 +1110,7 @@ class _CudaGraphRunner(torch.nn.Module):
             gc.freeze()
 
         capture_scope = nullcontext()
-        if self.base_module.config.fine_grained_activation_offloading:
+        if self.fine_grained_activation_offloading:
             from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
