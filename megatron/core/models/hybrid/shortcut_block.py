@@ -8,6 +8,7 @@ import torch
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
 from megatron.core.transformer.spec_utils import build_module
@@ -25,7 +26,10 @@ def _get_offloading_interface():
 
 
 def group_layers_into_shortcut_blocks(
-    layers: torch.nn.ModuleList, layer_type_list: Sequence[str], config: TransformerConfig
+    layers: torch.nn.ModuleList,
+    layer_type_list: Sequence[str],
+    config: TransformerConfig,
+    pp_layer_offset: int = 0,
 ) -> torch.nn.ModuleList:
     """Group physical layers into their registered shortcut-block hierarchy.
 
@@ -36,13 +40,21 @@ def group_layers_into_shortcut_blocks(
         layers: Physical layers in execution order.
         layer_type_list: Physical layer symbols in execution order.
         config: Transformer configuration controlling shortcut scheduling.
+        pp_layer_offset: Global offset of this pipeline stage's first physical layer.
 
     Returns:
         The registered logical layers.
 
     Raises:
-        ValueError: If an MoE has an unsupported predecessor.
+        ValueError: If an MoE has an unsupported predecessor or its shortcut pair crosses a
+            pipeline-stage boundary.
     """
+    if pp_layer_offset > 0 and layer_type_list and layer_type_list[0] == LayerSymbols.MOE:
+        raise ValueError(
+            "Shortcut MoE pairs cannot cross pipeline-stage boundaries; this pipeline stage "
+            "begins with an MoE layer."
+        )
+
     grouped_layers = torch.nn.ModuleList()
     physical_index = 0
     while physical_index < len(layers):
@@ -127,15 +139,19 @@ class ShortcutMoEBlock(MegatronModule):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
-        self.shortcut_post_norm = build_module(
-            moe_layer.submodules_config.pre_mlp_layernorm,
-            config=self.config,
-            hidden_size=self.config.hidden_size,
-            eps=self.config.layernorm_epsilon,
+        self.shortcut_post_norm = (
+            build_module(
+                moe_layer.submodules_config.pre_mlp_layernorm,
+                config=self.config,
+                hidden_size=self.config.hidden_size,
+                eps=self.config.layernorm_epsilon,
+            )
+            if self.config.moe_shortcut_post_norm
+            else IdentityOp()
         )
         self.route_ready_event = torch.cuda.Event() if self.overlap_mode else None
 
-    def _moe_router_preprocess(self, shortcut_hidden, padding_mask=None):
+    def _moe_router_preprocess(self, shortcut_hidden, padding_mask=None, packed_seq_params=None):
         """Run shortcut normalization, routing, and dispatch preprocessing."""
         if self.recompute_shortcut_pre_mlp_layernorm:
             self.shortcut_pre_mlp_layernorm_checkpoint = CheckpointWithoutOutput()
@@ -144,17 +160,29 @@ class ShortcutMoEBlock(MegatronModule):
             )
         else:
             shortcut_input = apply_module(self.shortcut_pre_mlp_layernorm)(shortcut_hidden)
-        if padding_mask is not None:
-            padding_mask = padding_mask.transpose(0, 1).bool()
+        shortcut_input, padding_mask, _ = self.moe_layer._maybe_unflatten_for_moe(
+            shortcut_input, padding_mask, packed_seq_params
+        )
         probs, routing_map = self.moe_layer.mlp.route(shortcut_input, padding_mask)
         return self.moe_layer.mlp.preprocess(shortcut_input, probs, routing_map)
 
-    def _moe_shared_experts(self, hidden_states):
+    def _moe_shared_experts(self, hidden_states, padding_mask=None, packed_seq_params=None):
         """Run the paired MoE layer's pre-MLP norm and shared experts."""
         pre_mlp_output = self.moe_layer._forward_pre_mlp_layernorm(hidden_states)
-        return self.moe_layer.mlp.shared_experts_compute(pre_mlp_output)
+        pre_mlp_output, _, moe_unflatten_mbs = self.moe_layer._maybe_unflatten_for_moe(
+            pre_mlp_output, padding_mask, packed_seq_params
+        )
+        shared_expert_output = self.moe_layer.mlp.shared_experts_compute(pre_mlp_output)
+        return shared_expert_output, moe_unflatten_mbs
 
-    def _postprocess(self, hidden_states, combined_output, shared_expert_output):
+    def _postprocess(
+        self,
+        hidden_states,
+        combined_output,
+        shared_expert_output,
+        packed_seq_params=None,
+        moe_unflatten_mbs=None,
+    ):
         """Join routed/shared output, apply shortcut post-norm, and finish residual/BDA."""
         residual = hidden_states.float() if self.config.fp32_residual_connection else hidden_states
         output = self.moe_layer.mlp.postprocess(combined_output, shared_expert_output)
@@ -165,6 +193,9 @@ class ShortcutMoEBlock(MegatronModule):
         with post_norm_manager as post_norm_input:
             output = self.shortcut_post_norm(post_norm_input)
         output = post_norm_manager.group_offload(output, forced_released_tensors=[post_norm_input])
+        output = self.moe_layer._maybe_reflatten_from_moe(
+            output, packed_seq_params, moe_unflatten_mbs
+        )
         output = self.moe_layer._apply_mlp_bda_step((output, None), residual)
         return output[0] if isinstance(output, tuple) else output
 
@@ -229,7 +260,9 @@ class ShortcutMoEBlock(MegatronModule):
         # Launch the moe_router
         with quant_context_factory(quant_config, self.moe_layer_num):
             route_input, route_probs = self._moe_router_preprocess(
-                shortcut_hidden=hidden_states, padding_mask=padding_mask
+                shortcut_hidden=hidden_states,
+                padding_mask=padding_mask,
+                packed_seq_params=packed_seq_params,
             )
             if self.overlap_mode:
                 self.route_ready_event.record(torch.cuda.current_stream())
@@ -269,10 +302,20 @@ class ShortcutMoEBlock(MegatronModule):
 
         # launch the moe shared experts and combine attn and moe layer outputs
         with quant_context_factory(quant_config, self.moe_layer_num):
-            shared_expert_output = self._moe_shared_experts(attn_layer_output)
+            shared_expert_output, moe_unflatten_mbs = self._moe_shared_experts(
+                attn_layer_output,
+                padding_mask=padding_mask,
+                packed_seq_params=packed_seq_params,
+            )
             if self.overlap_mode:
                 combined_output = self._wait_combine(combined_output)
 
             # Ensure the combine autograd node is scheduled first before shared_experts
             set_tensor_grad_fn_sequence_sr(combined_output, torch.iinfo(torch.int).max)
-            return self._postprocess(attn_layer_output, combined_output, shared_expert_output)
+            return self._postprocess(
+                attn_layer_output,
+                combined_output,
+                shared_expert_output,
+                packed_seq_params=packed_seq_params,
+                moe_unflatten_mbs=moe_unflatten_mbs,
+            )

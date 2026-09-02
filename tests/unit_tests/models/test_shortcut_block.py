@@ -23,6 +23,11 @@ def _shortcut_config(*, parallel: bool = False, normalization: str = "RMSNorm"):
         layernorm_epsilon=1e-5,
         normalization=normalization,
         sequence_parallel=True,
+        moe_shortcut_post_norm=True,
+        recompute_granularity=None,
+        recompute_modules=[],
+        fine_grained_activation_offloading=False,
+        offload_modules=[],
     )
 
 
@@ -53,10 +58,9 @@ class _FakeMLP(torch.nn.Module):
 
 class _FakeNorm:
     def __new__(cls, *, config, hidden_size, eps):
-        norm_cls = {
-            "LayerNorm": torch.nn.LayerNorm,
-            "RMSNorm": torch.nn.RMSNorm,
-        }[config.normalization]
+        norm_cls = {"LayerNorm": torch.nn.LayerNorm, "RMSNorm": torch.nn.RMSNorm}[
+            config.normalization
+        ]
         norm = norm_cls(hidden_size, eps=eps)
         for parameter in norm.parameters():
             setattr(parameter, "sequence_parallel", config.sequence_parallel)
@@ -75,6 +79,14 @@ class _FakeMoE(torch.nn.Module):
         )
         self.submodules_config = SimpleNamespace(pre_mlp_layernorm=_FakeNorm)
         self.mlp = _FakeMLP()
+
+    @staticmethod
+    def _maybe_unflatten_for_moe(hidden_states, padding_mask, packed_seq_params):
+        return hidden_states, padding_mask, None
+
+    @staticmethod
+    def _maybe_reflatten_from_moe(output, packed_seq_params, mbs):
+        return output
 
 
 @pytest.mark.parametrize(
@@ -108,7 +120,7 @@ def test_group_layers_into_shortcut_blocks(compute_symbol, parallel):
     assert isinstance(shortcut, ShortcutMoEBlock)
     assert shortcut.compute_layer is compute
     assert shortcut.moe_layer is paired_moe
-    assert shortcut.compute_layer_num == compute.layer_number - 1
+    assert shortcut.attn_layer_num == compute.layer_number - 1
     assert shortcut.moe_layer_num == paired_moe.layer_number - 1
     assert shortcut.overlap_mode is parallel
     assert shortcut.shortcut_pre_mlp_layernorm is not paired_moe.pre_mlp_layernorm
@@ -150,8 +162,8 @@ def test_parallel_stream_is_initialized_once(monkeypatch):
     monkeypatch.setattr(ShortcutMoEBlock, "_parallel_stream", None)
     monkeypatch.setattr(torch.cuda, "Stream", make_stream)
 
-    first = ShortcutMoEBlock._get_parallel_stream()
-    second = ShortcutMoEBlock._get_parallel_stream()
+    first = ShortcutMoEBlock._get_a2a_overlap_stream()
+    second = ShortcutMoEBlock._get_a2a_overlap_stream()
 
     assert first is second
     assert streams == [first]
@@ -248,13 +260,17 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             self.shared_scale = torch.nn.Parameter(torch.tensor(19.0))
             self.mlp = FakeMLP()
 
-        def shortcut_route_preprocess(self, shortcut_hidden, padding_mask=None):
+        def shortcut_route_preprocess(
+            self, shortcut_hidden, padding_mask=None, packed_seq_params=None
+        ):
             assert_quant_layer(1)
             return shortcut_hidden * self.route_scale, shortcut_hidden * self.prob_scale
 
-        def shortcut_shared_experts(self, hidden_states):
+        def shortcut_shared_experts(
+            self, hidden_states, padding_mask=None, packed_seq_params=None
+        ):
             assert_quant_layer(1)
-            return hidden_states * self.shared_scale
+            return hidden_states * self.shared_scale, None
 
         def _apply_mlp_bda_step(self, output_with_bias, residual):
             assert_quant_layer(1)
@@ -271,11 +287,9 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
     def run(overlap):
         block = ShortcutMoEBlock(FakeCompute(), FakeMoE(), overlap_a2a=overlap)
         monkeypatch.setattr(
-            block, "_shortcut_route_preprocess", block.moe_layer.shortcut_route_preprocess
+            block, "_moe_router_preprocess", block.moe_layer.shortcut_route_preprocess
         )
-        monkeypatch.setattr(
-            block, "_shortcut_shared_experts", block.moe_layer.shortcut_shared_experts
-        )
+        monkeypatch.setattr(block, "_moe_shared_experts", block.moe_layer.shortcut_shared_experts)
         if overlap:
             monkeypatch.setattr(
                 block,
@@ -287,18 +301,14 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
             monkeypatch.setattr(
                 block,
                 "_wait_dispatch",
-                lambda dispatch_output: dispatch_output,
+                lambda dispatched_input, dispatched_probs: (dispatched_input, dispatched_probs),
             )
             monkeypatch.setattr(
                 block,
                 "_launch_combine",
                 lambda output, async_op=False: block.moe_layer.mlp.combine(output),
             )
-            monkeypatch.setattr(
-                block,
-                "_wait_combine",
-                lambda combined_output: combined_output,
-            )
+            monkeypatch.setattr(block, "_wait_combine", lambda combined_output: combined_output)
 
         hidden_states = torch.arange(1.0, 5.0, requires_grad=True)
         output = block(
@@ -332,3 +342,101 @@ def test_eager_overlap_matches_serial_output_and_gradients(monkeypatch):
     assert overlap_gradients.keys() == serial_gradients.keys()
     for name in overlap_gradients:
         torch.testing.assert_close(overlap_gradients[name], serial_gradients[name])
+
+
+def test_shortcut_norm_recompute_and_offload(monkeypatch):
+    """The shortcut path wires pre-norm recompute and post-norm offload together."""
+    from megatron.core.models.hybrid import shortcut_block as shortcut_block_module
+
+    calls = {}
+
+    class RecordingCheckpoint:
+        def checkpoint(self, run_function, hidden_states):
+            calls["checkpoint_input"] = hidden_states
+            calls["checkpoint_output"] = run_function(hidden_states)
+            return calls["checkpoint_output"]
+
+        def discard_output_and_register_recompute(self, hook_tensor):
+            calls["recompute_hook"] = hook_tensor
+
+    class RecordingOffload:
+        def __init__(self, enabled, tensor, name):
+            calls["offload_enabled"] = enabled
+            calls["offload_input"] = tensor
+            calls["offload_name"] = name
+            self.tensor = tensor
+
+        def __enter__(self):
+            calls["offload_entered"] = True
+            return self.tensor
+
+        def __exit__(self, *_args):
+            calls["offload_exited"] = True
+
+        def group_offload(self, tensor, forced_released_tensors=None):
+            calls["offloaded_tensor"] = tensor
+            calls["forced_released_tensors"] = forced_released_tensors
+            return tensor
+
+    monkeypatch.setattr(shortcut_block_module, "CheckpointWithoutOutput", RecordingCheckpoint)
+    monkeypatch.setattr(
+        shortcut_block_module, "_get_offloading_interface", lambda: RecordingOffload
+    )
+
+    config = _shortcut_config()
+    config.recompute_granularity = "selective"
+    config.recompute_modules = ["shortcut_pre_mlp_layernorm"]
+    config.fine_grained_activation_offloading = True
+    config.offload_modules = ["shortcut_post_norm"]
+
+    moe_layer = _FakeMoE(config)
+    mlp = moe_layer.mlp
+    mlp.route = lambda hidden_states, padding_mask=None: (
+        torch.ones_like(hidden_states),
+        torch.ones_like(hidden_states, dtype=torch.bool),
+    )
+    mlp.preprocess = lambda hidden_states, probs, routing_map: (hidden_states, probs)
+    mlp.dispatch = lambda hidden_states, probs: (hidden_states, probs)
+    mlp.routed_experts_compute = lambda hidden_states, probs: (hidden_states + probs, None)
+
+    def combine(routed_output):
+        calls["combined_output"] = routed_output * 2
+        return calls["combined_output"]
+
+    mlp.combine = combine
+    mlp.shared_experts_compute = torch.zeros_like
+    mlp.postprocess = lambda combined_output, shared_expert_output: combined_output
+    moe_layer._forward_pre_mlp_layernorm = lambda hidden_states: hidden_states
+    moe_layer._apply_mlp_bda_step = (
+        lambda output_with_bias, residual: output_with_bias[0] + residual
+    )
+
+    block = ShortcutMoEBlock(_FakeCompute(config), moe_layer, overlap_a2a=False)
+    hidden_states = torch.randn(2, 1, config.hidden_size, requires_grad=True)
+
+    @contextmanager
+    def quant_context_factory(*_args):
+        yield
+
+    output = block(
+        hidden_states=hidden_states,
+        attention_mask=None,
+        inference_context=None,
+        rotary_pos_emb=None,
+        sequence_len_offset=None,
+        packed_seq_params=None,
+        padding_mask=None,
+        quant_context_factory=quant_context_factory,
+        quant_config=None,
+    )
+    output.sum().backward()
+
+    assert calls["checkpoint_input"] is hidden_states
+    assert calls["recompute_hook"] is calls["combined_output"]
+    assert block.shortcut_pre_mlp_layernorm_checkpoint is None
+    assert calls["offload_enabled"]
+    assert calls["offload_name"] == "shortcut_post_norm"
+    assert calls["offload_input"] is calls["combined_output"]
+    assert calls["offload_entered"] and calls["offload_exited"]
+    assert calls["forced_released_tensors"][0] is calls["offload_input"]
+    assert hidden_states.grad is not None

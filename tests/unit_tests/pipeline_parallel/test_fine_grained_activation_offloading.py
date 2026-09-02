@@ -4,6 +4,7 @@ import gc
 import logging
 import os
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 import pytest
@@ -199,6 +200,35 @@ def _run_post_warmup_callback(chunk: ChunkOffloadHandler) -> None:
     manager._delta_offload_bytes_across_pp_ranks = 0
     manager._activation_offload_fraction = 1.0
     manager.post_warmup_callback()
+
+
+def test_shortcut_post_norm_bypasses_last_group_margin(monkeypatch):
+    """All shortcut post-norm inputs remain eligible for the requested peak-memory recovery."""
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off_module
+
+    groups = [OffloadTensorGroup("shortcut_post_norm") for _ in range(2)]
+    for group in groups:
+        group.total_offload_bytes = 512 * 1024 * 1024
+        group.total_tensor_count = 1
+    chunk = _make_warmup_chunk(groups)
+
+    monkeypatch.setattr(off_module, "print_offload_summary_table", lambda *_args, **_kwargs: None)
+    _run_post_warmup_callback(chunk)
+
+    assert all(group.offload for group in groups)
+
+
+def test_shortcut_post_norm_offloads_when_it_is_the_next_backward_group(monkeypatch):
+    """The runtime policy honors the shortcut post-norm last-group margin exemption."""
+    group = OffloadTensorGroup("shortcut_post_norm")
+    chunk = _make_warmup_chunk([group])
+    chunk.is_warmup = False
+    chunk._groups_to_offload = [group]
+
+    manager = SimpleNamespace(front_backward_chunk=lambda _name: chunk)
+    monkeypatch.setattr(PipelineOffloadManager, "get_instance", lambda: manager)
+
+    assert chunk.should_bulk_offload(group)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
