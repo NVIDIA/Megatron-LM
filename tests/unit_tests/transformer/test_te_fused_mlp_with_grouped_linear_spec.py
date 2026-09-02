@@ -228,7 +228,7 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
     def test_make_fused_impl_validates_te_linear_types(self, monkeypatch, bad_attr, match):
         fake_te = _patch_fake_te_ops(monkeypatch)
         module = _make_fake_grouped_mlp(fake_te)
-        setattr(module, bad_attr, object())
+        setattr(module, bad_attr, torch.nn.Identity())
 
         with pytest.raises(ValueError, match=match):
             TEFusedMLPWithGroupedLinear._make_fused_impl(module)
