@@ -27,6 +27,12 @@ from megatron.core.transformer.enums import (
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
+# Activation groups whose saved tensors can use fixed addresses during whole-layer
+# local CUDA graph capture. Keep this list shared with the runner predicate.
+LOCAL_GRAPH_ACTIVATION_OFFLOAD_MODULES = frozenset(
+    {"expert_fc1", "moe_act", "fused_group_mlp", "attn_norm", "qkv_linear"}
+)
+
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
@@ -1895,15 +1901,15 @@ class TransformerConfig(ModelParallelConfig):
                 self.delta_offload_bytes_across_pp_ranks >= 0
             ), "delta_offload_bytes_across_pp_ranks must be non-negative."
 
-            if "fused_group_mlp" in self.offload_modules:
-                if not self.use_transformer_engine_op_fuser:
-                    raise ValueError("fused_group_mlp requires use_transformer_engine_op_fuser.")
-                moe_partial_offload = {"expert_fc1", "moe_act"} & set(self.offload_modules)
-                if moe_partial_offload:
-                    raise ValueError(
-                        "fused_group_mlp offloads the whole fused grouped MLP and cannot be "
-                        f"combined with expert_fc1 or moe_act. Remove: {moe_partial_offload}"
-                    )
+            # if "fused_group_mlp" in self.offload_modules:
+            #     if not self.use_transformer_engine_op_fuser:
+            #         raise ValueError("fused_group_mlp requires use_transformer_engine_op_fuser.")
+            #     moe_partial_offload = {"expert_fc1", "moe_act"} & set(self.offload_modules)
+            #     if moe_partial_offload:
+            #         raise ValueError(
+            #             "fused_group_mlp offloads the whole fused grouped MLP and cannot be "
+            #             f"combined with expert_fc1 or moe_act. Remove: {moe_partial_offload}"
+            #         )
         if self.moe_paged_stash:
             if self.cpu_offloading:
                 raise ValueError("moe_paged_stash cannot be enabled with cpu_offloading.")
@@ -2599,12 +2605,15 @@ class TransformerConfig(ModelParallelConfig):
             if self.fine_grained_activation_offloading:
                 offload_modules = set(self.offload_modules or [])
                 if self.cuda_graph_impl == "local":
-                    local_supported_offload_modules = {"expert_fc1", "moe_act", "fused_group_mlp"}
-                    unsupported_offload_modules = offload_modules - local_supported_offload_modules
+                    supported_offload_modules = (
+                        LOCAL_GRAPH_ACTIVATION_OFFLOAD_MODULES
+                        if not self.cuda_graph_modules
+                        else {"expert_fc1", "moe_act", "fused_group_mlp"}
+                    )
+                    unsupported_offload_modules = offload_modules - supported_offload_modules
                     assert not unsupported_offload_modules, (
                         "fine-grained activation offloading with cuda_graph_impl='local' "
-                        "only supports offload_modules 'expert_fc1', 'moe_act', and "
-                        "'fused_group_mlp'. "
+                        "only supports the selected activation modules for this graph scope. "
                         f"Unsupported offload_modules: {sorted(unsupported_offload_modules)}."
                     )
                 local_moe_offload = (
@@ -2613,7 +2622,7 @@ class TransformerConfig(ModelParallelConfig):
                     and offload_modules <= {"expert_fc1", "moe_act", "fused_group_mlp"}
                 )
                 assert (
-                    self.cuda_graph_impl in ("transformer_engine", "full_iteration")
+                    self.cuda_graph_impl in ("transformer_engine", "full_iteration", "local")
                     or local_moe_offload
                 ), (
                     "fine-grained activation offloading is only supported with "

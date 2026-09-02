@@ -428,6 +428,11 @@ class LocalCudaGraphOffloadGroup:
         self.remap_context = None
         self.slot_bank = None
         self.resident = False
+        # Build-time ownership of the resident bank.  The backward graph must
+        # restore the values captured by this exact forward runner, not merely
+        # whichever runner most recently used the same ping-pong bank.
+        self.capture_forward_runner = None
+        self.capture_snapshot_event = None
 
     def _eligible(self, tensor):
         return (
@@ -532,6 +537,34 @@ class LocalCudaGraphOffloadGroup:
     def physical_bytes(self):
         return sum(allocation.aligned_bytes for allocation in self.allocations)
 
+    def _debug_slot_state(self, stage):
+        """Log VMM and tensor storage state at resident-slot checkpoints."""
+        if os.getenv("MEGATRON_LOCAL_GRAPH_OFFLOAD_DEBUG") != "1":
+            return
+        slots = []
+        for index, (allocation, tensor, host_tensor) in enumerate(
+            zip(self.allocations, self.device_tensors, self.host_tensors)
+        ):
+            try:
+                device_storage_bytes = tensor.untyped_storage().nbytes()
+            except Exception:  # pragma: no cover - backend diagnostic only
+                device_storage_bytes = "unavailable"
+            try:
+                allocation_info = allocation.info()
+            except Exception as exc:  # pragma: no cover - backend diagnostic only
+                allocation_info = f"error={type(exc).__name__}: {exc}"
+            slots.append(
+                f"slot={index} device_shape={tuple(tensor.shape)} "
+                f"device_numel={tensor.numel()} device_ptr={hex(tensor.data_ptr())} "
+                f"device_storage_bytes={device_storage_bytes} "
+                f"host_shape={tuple(host_tensor.shape)} host_numel={host_tensor.numel()} "
+                f"allocation={allocation_info}"
+            )
+        PipelineOffloadManager._local_graph_debug(
+            f"checkpoint={stage} group={self.name} bank={self.slot_bank} state={self.state} "
+            + " | ".join(slots)
+        )
+
     def rebind_resident(self, manager, slot_bank, group_index):
         """Replace provisional capture allocations with a shared resident bank."""
         if self.resident:
@@ -549,22 +582,42 @@ class LocalCudaGraphOffloadGroup:
             )
             self.allocations.append(allocation)
             self.device_tensors.append(allocation.tensor)
+        self._debug_slot_state("after_resident_rebind")
         for allocation in old_allocations:
             allocation.close()
 
-    def capture_snapshot(self):
-        """Preserve capture-time values before another runner reuses this bank."""
+    def capture_snapshot(self, runner=None):
+        """Preserve values and ownership for this runner's later bwd capture."""
         if not self.resident:
             return
+        self._debug_slot_state("before_capture_snapshot")
+        # This copy is intentionally synchronous: it establishes the host
+        # snapshot before another forward is allowed to reuse the bank.
         for host_tensor, device_tensor in zip(self.host_tensors, self.device_tensors):
             host_tensor.copy_(device_tensor, non_blocking=False)
+        self.capture_forward_runner = runner
+        # Keep an explicit stream dependency even on backends where the
+        # synchronous copy currently happens to drain the stream.  MUSA graph
+        # capture and the caller's stream are not assumed to be identical.
+        self.capture_snapshot_event = torch.cuda.Event()
+        self.capture_snapshot_event.record(torch.cuda.current_stream())
+        self._debug_slot_state("after_capture_snapshot")
 
-    def capture_restore(self):
-        """Restore capture-time values before capturing the backward graph."""
+    def capture_restore(self, forward_runner=None):
+        """Restore the exact forward snapshot before capturing its bwd graph."""
         if not self.resident:
             return
+        if self.capture_forward_runner is not forward_runner:
+            raise RuntimeError(
+                f"{self.name}: backward capture is bound to the wrong forward runner "
+                f"(expected={id(self.capture_forward_runner)}, actual={id(forward_runner)})"
+            )
+        if self.capture_snapshot_event is not None:
+            torch.cuda.current_stream().wait_event(self.capture_snapshot_event)
+        self._debug_slot_state("before_capture_restore")
         for device_tensor, host_tensor in zip(self.device_tensors, self.host_tensors):
             device_tensor.copy_(host_tensor, non_blocking=False)
+        self._debug_slot_state("after_capture_restore")
 
     def enqueue_resident_d2h(self, d2h_stream, compute_stream):
         """Save a resident slot without releasing its fixed mapping."""
@@ -844,18 +897,27 @@ class PipelineOffloadManager:
         return allocations[key]
 
     def local_graph_capture_snapshot(self, runner):
-        """Preserve shared-slot values needed by this runner's later bwd capture."""
+        """Preserve the values belonging to this forward runner."""
         if not self._local_graph_ping_pong_enabled(runner):
             return
         for group in runner.local_graph_offload_groups:
-            group.capture_snapshot()
+            group.capture_snapshot(runner)
+        # The next runner may reuse this bank immediately during its warmup.
+        # Drain every device stream here, not just the current stream, so a
+        # side-stream producer cannot still touch the old bank while the next
+        # graph is being prepared.
+        torch.cuda.synchronize()
 
-    def local_graph_capture_restore(self, runner):
-        """Restore shared-slot values before this runner's backward capture."""
+    def local_graph_capture_restore(self, runner, forward_runner=None):
+        """Restore the forward runner explicitly bound to this bwd runner."""
         if not self._local_graph_ping_pong_enabled(runner):
             return
+        if forward_runner is None:
+            forward_runner = runner
+        if forward_runner is not runner:
+            raise RuntimeError("local graph bwd runner must use its own forward snapshot")
         for group in runner.local_graph_offload_groups:
-            group.capture_restore()
+            group.capture_restore(forward_runner)
 
     def begin_local_graph_discovery(self, runner):
         """Discover saved activation descriptors during the final eager warmup."""
@@ -1002,6 +1064,27 @@ class PipelineOffloadManager:
             for group in active_groups:
                 group.enqueue_d2h(self.d2h_stream, compute_stream)
             self.drain_pending_d2h(runner)
+            # The first backward-consumed runner has no earlier backward replay
+            # to look ahead from: without this its own backward() would submit
+            # the remap and immediately host-wait for it, absorbing the whole
+            # RemapWorker latency (muMemSetAccess drains in-flight DMA, ~40 µs
+            # per offloaded MiB) on the critical path. Dispatch its reload now,
+            # right after the forward D2H submission: the RemapWorker internally
+            # waits on each slot's release dependency, so this stays behind the
+            # D2H completion while overlapping the remaining forward replay.
+            # Later runners keep the existing look-ahead from the predecessor's
+            # backward(); only the per-runner (non-bank) slot path does this.
+            if (
+                getattr(runner, "is_first_bwd_runner", False)
+                and not self._local_graph_ping_pong_enabled(runner)
+                and getattr(runner, "local_graph_reload_state", None) is None
+            ):
+                # Async here on purpose: the chain head's release dependency is
+                # its own just-submitted forward D2H burst, so blocking now
+                # would serialize the offload copies. Its context completes
+                # during the remaining forward work; backward's synchronous
+                # scheduling takes over from the second runner on.
+                self.local_graph_backward_prepare(runner, block_until_submitted=False)
         self._local_graph_debug(f"d2h bytes={step_bytes} total_d2h={self._local_graph_d2h_bytes}")
 
     def drain_pending_d2h(self, runner):
@@ -1016,8 +1099,17 @@ class PipelineOffloadManager:
         groups = getattr(runner, "local_graph_offload_groups", [])
         return [group for group in reversed(groups) if group.device_tensors]
 
-    def local_graph_backward_prepare(self, runner):
-        """Submit one runner's resident reload or VMM remap/H2D batch."""
+    def local_graph_backward_prepare(self, runner, block_until_submitted=True):
+        """Submit one runner's resident reload or VMM remap/H2D batch.
+
+        With ``block_until_submitted=True`` (per-runner slot path default) the
+        call additionally blocks until the RemapWorker finished the VMM
+        transition and submitted the H2D — see the call site in
+        ``Graphed.backward`` for why this runs before the predecessor's
+        replay. The forward-time priming of the backward-chain head passes
+        ``False`` because its release dependency (the forward D2H burst) is
+        still in flight there; blocking would serialize the offload copies.
+        """
         active_groups = self._local_graph_active_groups(runner)
         if not active_groups:
             return False
@@ -1055,6 +1147,19 @@ class PipelineOffloadManager:
             reload_context = remap_and_copy_after(
                 allocations, host_tensors, self.h2d_stream
             )
+            if block_until_submitted:
+                # Synchronous remap: block right here until the worker finished
+                # the VMM transition and submitted the H2D, instead of deferring
+                # the host wait to this runner's own backward() boundary. Call
+                # this BEFORE the predecessor's backward replay is submitted:
+                # the GPU is momentarily quiet, so muMemSetAccess drains almost
+                # no in-flight DMA, and the reload H2D is already queued on the
+                # h2d stream by the time the backward graph launches — compute
+                # and H2D then run concurrently instead of the H2D landing in
+                # the bubble after the compute segment. The consumer-side wait
+                # in wait_ready afterwards only installs the compute-stream
+                # dependency on an already-completed context.
+                wait_remap_copy_on_stream(reload_context, self.h2d_stream)
             for group in active_groups:
                 group.prepare_remap(reload_context)
             runner.local_graph_reload_context = reload_context

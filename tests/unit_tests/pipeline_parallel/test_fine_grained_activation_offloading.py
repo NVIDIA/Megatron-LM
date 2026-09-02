@@ -1159,14 +1159,23 @@ def test_local_graph_backward_prepare_finish_wait_pipeline(monkeypatch):
     assert [e[1] for e in log if e[0] == "group.prepare_remap"] == reverse_names
     assert [e[1] for e in log if e[0] == "group.adopt_reload_submission"] == reverse_names
     assert [e for e in log if e[0] == "runner.wait_remap_copy_on_stream"] == [
-        ("runner.wait_remap_copy_on_stream", "compute")
+        # Synchronous remap: prepare blocks on the h2d stream first, then the
+        # consumer wait installs the compute-stream dependency on the
+        # already-completed context.
+        ("runner.wait_remap_copy_on_stream", "h2d"),
+        ("runner.wait_remap_copy_on_stream", "compute"),
     ]
     assert runner.local_graph_reload_state is None
     assert mgr._local_graph_h2d_bytes == sum(g.logical_bytes for g in groups)
 
 
 def test_local_graph_backward_wait_ready_primes_unprefetched_runner(monkeypatch):
-    """The first backward runner synchronously submits and finishes its own reload."""
+    """The unprefetched fallback path synchronously submits and waits its own reload.
+
+    prepare() blocks until the worker submitted the H2D (wait before
+    prepare_remap bookkeeping); wait_ready then only installs the
+    compute-stream dependency on the completed context.
+    """
     log = []
     _record_remap_batch(monkeypatch, log)
     compute_stream = _RecordingStream("compute", log)
@@ -1182,7 +1191,60 @@ def test_local_graph_backward_wait_ready_primes_unprefetched_runner(monkeypatch)
 
     assert [entry[0] for entry in log] == [
         "runner.remap_and_copy_after",
+        "runner.wait_remap_copy_on_stream",
         "group.prepare_remap",
+        "runner.wait_remap_copy_on_stream",
+        "group.adopt_reload_submission",
+    ]
+
+
+def test_local_graph_forward_replay_primes_first_backward_runner(monkeypatch):
+    """The backward-chain head dispatches its reload at forward-D2H time.
+
+    Without this, the runner consumed first in backward has no predecessor
+    replay to look ahead from, so its own backward() would submit the remap
+    and immediately host-wait for it (absorbing the RemapWorker latency,
+    including the muMemSetAccess in-flight-DMA drain) on the critical path.
+    """
+    log = []
+    _record_remap_batch(monkeypatch, log)
+    compute_stream = _RecordingStream("compute", log)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: compute_stream)
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: nullcontext())
+    monkeypatch.setattr(
+        torch.cuda, "Event", lambda *args, **kwargs: _RecordingEvent(log, "reload_ready")
+    )
+    first = _RecordingRunner([_RecordingGraphGroup("first", log)])
+    first.is_first_bwd_runner = True
+    later = _RecordingRunner([_RecordingGraphGroup("later", log)])
+    mgr = _make_local_graph_batch_manager(log)
+
+    # Forward replay of the chain head submits its reload immediately after
+    # the D2H burst; later runners are not touched here.
+    mgr.local_graph_forward_replay(first)
+    assert first.local_graph_reload_state == "reload_pending"
+    assert [e[0] for e in log if e[0] == "runner.remap_and_copy_after"] == [
+        "runner.remap_and_copy_after"
+    ]
+    assert not any(e[1] == "later" for e in log if e[0] == "group.prepare_remap")
+
+    mgr.local_graph_forward_replay(later)
+    assert later.local_graph_reload_state is None
+    assert [e[0] for e in log if e[0] == "runner.remap_and_copy_after"] == [
+        "runner.remap_and_copy_after"
+    ]
+
+    # Backward consumption of the head no longer submits anything; it only
+    # installs the stream wait and adopts the already-submitted reload.
+    # (`later`'s D2H entries sit between because its forward replay ran too.)
+    assert mgr.local_graph_backward_wait_ready(first, compute_stream)
+    assert [entry[0] for entry in log] == [
+        "group.enqueue_d2h",
+        "group.try_release",
+        "runner.remap_and_copy_after",
+        "group.prepare_remap",
+        "group.enqueue_d2h",
+        "group.try_release",
         "runner.wait_remap_copy_on_stream",
         "group.adopt_reload_submission",
     ]

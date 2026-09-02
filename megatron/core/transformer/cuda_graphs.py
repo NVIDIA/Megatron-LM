@@ -30,7 +30,10 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import (
+    LOCAL_GRAPH_ACTIVATION_OFFLOAD_MODULES,
+    TransformerConfig,
+)
 from megatron.core.utils import (
     get_attr_wrapped_model,
     get_torch_version,
@@ -528,6 +531,10 @@ class _CudagraphGlobalRecord:
     @classmethod
     def record_bwd_graph(cls, runner):
         """Record a bwd graph to 'cudagraph_record"""
+        # The autograd node is created by this runner's forward invocation.
+        # Preserve that identity explicitly; resident banks may be reused by a
+        # later forward runner before this bwd graph is captured.
+        runner.local_graph_forward_runner = runner
         cls.cudagraph_record.append((runner, "bwd"))
 
     @classmethod
@@ -541,12 +548,27 @@ class _CudagraphGlobalRecord:
                 runner, "_uses_local_graph_activation_offload", lambda: False
             )()
             runner.local_graph_slot_bank = (
-                local_graph_offload_index % 2 if uses_local_offload else None
+                local_graph_offload_index % 2
+                if uses_local_offload and os.getenv("MEGATRON_LOCAL_GRAPH_OFFLOAD_PING_PONG", "1") != "0"
+                else None
             )
             if uses_local_offload:
                 local_graph_offload_index += 1
         for runner, next_runner in zip(cls.backward_runners, cls.backward_runners[1:]):
             runner.next_bwd_runner = next_runner
+        # The head of the backward chain is consumed first, yet no earlier
+        # backward replay exists to look ahead from. Mark it so its reload can
+        # be dispatched right after its forward D2H instead of inside its own
+        # backward() host wait (which would absorb the whole RemapWorker latency
+        # including the muMemSetAccess DMA-drain).
+        for runner in cls.backward_runners:
+            runner.is_first_bwd_runner = False
+            # A bwd graph is captured from this runner's forward graph state.
+            # Keep that association explicit even when adjacent runners share
+            # a resident ping-pong bank.
+            runner.local_graph_forward_runner = runner
+        if cls.backward_runners:
+            cls.backward_runners[0].is_first_bwd_runner = True
 
     @classmethod
     def create_cudagraphs(cls):
@@ -731,6 +753,8 @@ def delete_cuda_graphs():
     for runner in _CudagraphGlobalRecord.backward_runners:
         runner.next_bwd_runner = None
         runner.local_graph_reload_state = None
+        runner.is_first_bwd_runner = False
+        runner.local_graph_forward_runner = runner
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
@@ -878,30 +902,44 @@ class _CudagraphReplayNode(torch.autograd.Function):
 
         offload_manager = None
         next_runner = runner.next_bwd_runner
-        next_prepared = False
         if runner.local_graph_offload_groups:
             offload_manager = runner._local_graph_offload_manager()
             replay_stream = runner.stream if runner.use_stream else torch.cuda.current_stream()
             offload_manager.local_graph_backward_wait_ready(runner, replay_stream)
+        # Submit the successor's reload BEFORE this runner's backward replay:
+        # with synchronous remap, prepare() blocks until VMM transition and H2D
+        # submission are done. Doing it pre-replay means muMemSetAccess runs
+        # while the GPU is quiet (the predecessor graph just finished), and the
+        # successor's H2D is already on the h2d stream when this backward graph
+        # launches — current-layer compute and next-layer reload H2D overlap on
+        # the device. Resident ping-pong keeps its async one-layer semantics:
+        # prepare is cheap there, and deferring past replay preserves overlap.
         if next_runner is not None and next_runner.local_graph_offload_groups:
             if offload_manager is None:
                 offload_manager = next_runner._local_graph_offload_manager()
-            next_prepared = offload_manager.local_graph_backward_prepare(next_runner)
-
-        try:
-            if runner.use_stream:
-                runner.stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(runner.stream):
-                    runner.bwd_graph.replay()
-                torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
+            if offload_manager._local_graph_ping_pong_enabled(next_runner):
+                offload_manager.local_graph_backward_prepare(next_runner)
             else:
+                second_runner = next_runner.next_bwd_runner
+                offload_manager.local_graph_backward_prepare(next_runner)
+                # Prime the layer after next as well: its synchronous remap now
+                # runs while only the (already submitted) next-layer H2D is in
+                # flight, keeping the remap chain ahead without ever parking a
+                # context behind a running communication/compute segment.
+                if (
+                    second_runner is not None
+                    and second_runner.local_graph_offload_groups
+                    and not offload_manager._local_graph_ping_pong_enabled(second_runner)
+                ):
+                    offload_manager.local_graph_backward_prepare(second_runner)
+
+        if runner.use_stream:
+            runner.stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(runner.stream):
                 runner.bwd_graph.replay()
-        finally:
-            # The current graph has already been submitted. Waiting for the
-            # successor's remap worker and enqueueing H2D now overlaps both with
-            # current-runner GPU execution.
-            if next_prepared:
-                offload_manager.local_graph_backward_finish_prepare(next_runner)
+            torch.cuda.current_stream().wait_event(runner.bwd_completion_event)
+        else:
+            runner.bwd_graph.replay()
 
         runner.bwd_graph_replay_complete_event.record(torch.cuda.current_stream())
         if runner.local_graph_offload_groups:
@@ -971,6 +1009,8 @@ class _CudaGraphRunner(torch.nn.Module):
         self.local_graph_slot_bank = None
         self.local_graph_reload_state = None
         self.local_graph_reload_event = None
+        self.is_first_bwd_runner = False
+        self.local_graph_forward_runner = self
 
         self.fwd_graph_recorded = False
         self.bwd_graph_recorded = False
@@ -1109,15 +1149,14 @@ class _CudaGraphRunner(torch.nn.Module):
         )
 
     def _uses_local_graph_activation_offload(self):
-        """Whether this runner captures the whole layer with MoE-only activation offload."""
+        """Whether this runner captures a whole layer with local Graph activation offload."""
         config = getattr(self.base_module, "config", None)
         return bool(
             config is not None
             and config.cuda_graph_impl == "local"
             and not config.cuda_graph_modules
             and config.fine_grained_activation_offloading
-            and set(config.offload_modules or [])
-            <= {"expert_fc1", "moe_act", "fused_group_mlp"}
+            and set(config.offload_modules or []) <= LOCAL_GRAPH_ACTIVATION_OFFLOAD_MODULES
         )
 
     @staticmethod
@@ -1549,7 +1588,9 @@ class _CudaGraphRunner(torch.nn.Module):
         # Shared ping-pong slots may have been overwritten while later forward
         # graphs were captured. Restore this runner before capturing its consumers.
         if self.local_graph_offload_groups:
-            self._local_graph_offload_manager().local_graph_capture_restore(self)
+            self._local_graph_offload_manager().local_graph_capture_restore(
+                self, self.local_graph_forward_runner
+            )
 
         # Freeze GC, to speed up capture time ~15-20x.
         if FREEZE_GC:
