@@ -71,7 +71,9 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
         default=None,
         help="Hostname or IP address to bind the server to. Defaults to 0.0.0.0 (all interfaces).",
     )
-    parser.add_argument("--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response")
+    parser.add_argument(
+        "--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response"
+    )
     parser.add_argument(
         "--frontend-replicas",
         type=int,
@@ -173,7 +175,7 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
                 args.max_num_tiles,
                 args.tokenizer_prompt_format,
             )
-            max_num_tiles = args.max_num_tiles + int(getattr(args, "use_thumbnail", False))
+            max_num_tiles = args.max_num_tiles + int(getattr(args, 'use_thumbnail', False))
             max_img_tokens = max_num_tiles * args.num_img_embeddings_per_tile
             inference_config.max_sequence_length = max(
                 inference_config.max_sequence_length,
