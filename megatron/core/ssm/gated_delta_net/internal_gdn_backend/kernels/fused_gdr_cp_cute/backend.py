@@ -8,6 +8,7 @@ from __future__ import annotations
 import bisect
 import importlib.util
 import os
+import threading
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,6 +19,8 @@ if TYPE_CHECKING:
 
 
 _WRAPPER_CACHE: dict[tuple, object] = {}
+_WRAPPER_CACHE_LOCKS: dict[object, threading.Lock] = {}
+_WRAPPER_CACHE_LOCKS_GUARD = threading.Lock()
 _FUSED_LAUNCH_COUNT = 0
 _BWD_WRAPPER_CACHE: dict[tuple, object] = {}
 _FUSED_BWD_LAUNCH_COUNT = 0
@@ -35,16 +38,134 @@ _CP_NOOP_COUNT = 0
 _FALLBACK_REASONS: dict[str, int] = {}
 
 
+def _make_raw_stream():
+    """Return the current CUDA stream handle without constructing a Stream object."""
+    raw = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if raw is None:
+
+        def raw(_index):
+            return torch.cuda.current_stream(_index).cuda_stream
+
+    return raw
+
+
+_raw_stream = _make_raw_stream()
+
+
 def _reject(reason: str) -> None:
     """Record why this call is not taking the fused path, and refuse it."""
     _FALLBACK_REASONS[reason] = _FALLBACK_REASONS.get(reason, 0) + 1
     return None
 
 
+def _wrapper_cache_key(group, device, H, HV, K, V) -> tuple:
+    """Return the rank-stable ownership key for a mutable CP wrapper."""
+    return (id(group), device.index, H, HV, K, V, "g")
+
+
+class _SerializedWrapper:
+    """Marshal one mutable symmetric-memory wrapper onto its first CUDA stream.
+
+    A wrapper advances communication epochs in launch order. CP callers already
+    submit collectives in the same order on every rank; marshalling every local
+    call onto one stream avoids adding rank-local stream scheduling as another
+    source of epoch order. The common owner-stream path uses the raw stream
+    accessor and does not construct a temporary ``torch.cuda.Stream`` object.
+    """
+
+    def __init__(self, wrapper, device: torch.device):
+        self._wrapper = wrapper
+        self._device = torch.device(device)
+        self._lock = threading.Lock()
+        # The inner wrapper constructor may enqueue asynchronous CUDA
+        # initialization. Bind that construction stream immediately, before the
+        # wrapper can be published through the shared cache, so a racing first
+        # launch on another stream is ordered after initialization.
+        self._owner_handle = _raw_stream(self._device.index)
+        self._owner_stream = torch.cuda.current_stream(self._device)
+        self._external_streams = {}
+        self._input_ready = None
+        self._completion = None
+
+    def launch_validated(self, *args, **kwargs):
+        caller_handle = _raw_stream(self._device.index)
+        with self._lock:
+            kwargs["_stream_handle"] = self._owner_handle
+            if caller_handle == self._owner_handle:
+                return self._wrapper.launch_validated(*args, **kwargs)
+
+            caller_stream = self._external_streams.get(caller_handle)
+            if caller_stream is None:
+                caller_stream = torch.cuda.ExternalStream(caller_handle, device=self._device)
+                self._external_streams[caller_handle] = caller_stream
+            if self._input_ready is None:
+                self._input_ready = torch.cuda.Event()
+                self._completion = torch.cuda.Event()
+
+            self._input_ready.record(caller_stream)
+            self._owner_stream.wait_event(self._input_ready)
+            # The wrappers perform ATen preprocessing (padding, gate conversion,
+            # and descriptor updates) before the compiled launch. Run the whole
+            # call on the owner stream so the ready event orders those operations
+            # together with the kernel that consumes their results.
+            with torch.cuda.stream(self._owner_stream):
+                result = self._wrapper.launch_validated(*args, **kwargs)
+            self._completion.record(self._owner_stream)
+            caller_stream.wait_event(self._completion)
+            return result
+
+
+def _rank_consistent_wrapper_init(group, device: torch.device, signature: tuple[int, ...]) -> bool:
+    """Confirm every rank is about to construct the same wrapper.
+
+    This collective runs only on a cache miss. It prevents two local host
+    threads that win their process locks in different orders on different ranks
+    from crossing symmetric-memory rendezvous for different wrapper shapes.
+    """
+    world_size = dist.get_world_size(group)
+    local = torch.tensor(signature, dtype=torch.int64, device=device)
+    gathered = torch.empty(world_size * len(signature), dtype=torch.int64, device=device)
+    dist.all_gather_into_tensor(gathered, local, group=group)
+    return bool((gathered.view(world_size, -1) == local).all().item())
+
+
+def _wrapper_cache_lock(group) -> threading.Lock:
+    """Return an initialization lock scoped to one process group."""
+    with _WRAPPER_CACHE_LOCKS_GUARD:
+        lock = _WRAPPER_CACHE_LOCKS.get(group)
+        if lock is None:
+            lock = threading.Lock()
+            _WRAPPER_CACHE_LOCKS[group] = lock
+        return lock
+
+
+def _get_or_create_wrapper(
+    cache: dict, key: tuple, factory, *, group, device: torch.device, signature: tuple[int, ...]
+):
+    """Construct a rendezvous-owning wrapper once and in rank-consistent order."""
+    wrapper = cache.get(key)
+    if wrapper is not None:
+        return wrapper
+    with _wrapper_cache_lock(group):
+        wrapper = cache.get(key)
+        if wrapper is None:
+            if not _rank_consistent_wrapper_init(group, device, signature):
+                raise RuntimeError(
+                    "CuTeDSL CP wrapper initialization order differs across ranks; "
+                    "distributed calls must enter the same direction and shape order."
+                )
+            wrapper = factory()
+            cache[key] = wrapper
+    return wrapper
+
+
+def _cuda_graphs_enabled(context: FLACPContext) -> bool:
+    """Read the rank-invariant model configuration copied onto the CP context."""
+    return bool(getattr(context, "_cutedsl_cuda_graph_enabled", False))
+
+
 def _backend_mode() -> str:
-    value = os.environ.get(
-        "MCORE_GDN_CP_CUTEDSL", os.environ.get("FLA_CP_CUTEDSL", "auto")
-    ).lower()
+    value = os.environ.get("MCORE_GDN_CP_CUTEDSL", os.environ.get("FLA_CP_CUTEDSL", "auto")).lower()
     if value in {"0", "false", "no", "off"}:
         return "disabled"
     if value in {"1", "true", "yes", "on"}:
@@ -94,12 +215,7 @@ def _rank_chains(global_cu_cpu, world_size: int) -> list[tuple[int, int]] | None
 
 
 def _chain_mode(
-    *,
-    context: FLACPContext,
-    cu_seqlens: torch.Tensor | None,
-    T: int,
-    rank: int,
-    world_size: int,
+    *, context: FLACPContext, cu_seqlens: torch.Tensor | None, T: int, rank: int, world_size: int
 ) -> str | None:
     """Classify the CP chain for this call, identically on every rank.
 
@@ -151,23 +267,18 @@ def _chain_mode(
     if memo is None:
         memo = {}
         context._cutedsl_chain_memo = memo
-    elif T in memo:
-        return memo[T]
+    memo_key = (getattr(context, "_cutedsl_metadata_generation", 0), T)
+    if memo_key in memo:
+        return memo[memo_key]
     mode = _classify_chain(
-        context=context, cu_seqlens=cu_seqlens, T=T,
-        rank=rank, world_size=world_size,
+        context=context, cu_seqlens=cu_seqlens, T=T, rank=rank, world_size=world_size
     )
-    memo[T] = mode
+    memo[memo_key] = mode
     return mode
 
 
 def _classify_chain(
-    *,
-    context: FLACPContext,
-    cu_seqlens: torch.Tensor | None,
-    T: int,
-    rank: int,
-    world_size: int,
+    *, context: FLACPContext, cu_seqlens: torch.Tensor | None, T: int, rank: int, world_size: int
 ) -> str | None:
     """Uncached body of :func:`_chain_mode`; see there for the reasoning."""
     cu_cpu = context.cu_seqlens_cpu
@@ -204,9 +315,7 @@ def _classify_chain(
             "FLACPContext is inconsistent: rank {} records pre/post_num_ranks "
             "{} but its global_cu_seqlens_cpu implies {}. The offsets tensor "
             "was probably mutated after build_cp_context().".format(
-                rank,
-                (context.pre_num_ranks, context.post_num_ranks),
-                chains[rank],
+                rank, (context.pre_num_ranks, context.post_num_ranks), chains[rank]
             )
         )
     # Every chain must name ranks that exist.  Unreachable for a context built
@@ -256,9 +365,6 @@ def _emit_flags(context: FLACPContext, *, forward: bool) -> tuple[bool, bool]:
     boundary, so ``r-1``'s last local sequence ended there, so ``post_{r-1}``
     is 0 and BOTH of ``r-1``'s halves are zero.
 
-    ``tests/context_parallel/test_cp_chain_emit.py`` checks both branches
-    against a directly-simulated scan.
-
     The backward is the mirror image: ``pre`` and ``post`` swap roles, the
     window is the FIRST local sequence, and the fold runs ``r+1 .. W-1``.
     """
@@ -287,26 +393,27 @@ def _boundary_window(context: FLACPContext, T: int, *, forward: bool) -> tuple[i
     FIRST, the only one that can be a continuation from an earlier rank).  See
     ``fla/ops/cp/chunk_delta_h.py``.
 
-    Memoized on the context alongside the chain classification: the offsets are
-    cloned at ``build_cp_context`` time and do not change afterwards, so this is
-    a pure function of ``(context, forward)``.  Uncached it is two CPU-tensor
-    scalar extractions (~1 us each) on the per-step path of every layer.
+    Memoized on the context alongside the chain classification. The generation,
+    direction, and local length are part of the key so rebinding metadata cannot
+    reuse a stale boundary. Uncached it is two CPU-tensor scalar extractions
+    (~1 us each) on the per-step path of every layer.
     """
     cu = context.cu_seqlens_cpu
     if cu is None:
         return 0, T
+    memo_key = (getattr(context, "_cutedsl_metadata_generation", 0), forward, T)
     memo = getattr(context, "_cutedsl_window_memo", None)
     if memo is None:
         memo = {}
         context._cutedsl_window_memo = memo
     else:
-        window = memo.get(forward)
+        window = memo.get(memo_key)
         if window is not None:
             return window
     bos, eos = (int(cu[-2]), int(cu[-1])) if forward else (int(cu[0]), int(cu[1]))
     if not (0 <= bos < eos <= T):
         raise ValueError(f"invalid boundary window [{bos}, {eos}) for T={T}")
-    memo[forward] = (bos, eos)
+    memo[memo_key] = (bos, eos)
     return bos, eos
 
 
@@ -431,8 +538,7 @@ def _is_supported(
     # must be refused here rather than silently repacked; production `g` comes
     # from `chunk_local_cumsum` and is always contiguous, so this refuses
     # nothing real and a refusal is a correct Triton call either way.
-    if not (k.is_contiguous() and u.is_contiguous() and w.is_contiguous()
-            and g.is_contiguous()):
+    if not (k.is_contiguous() and u.is_contiguous() and w.is_contiguous() and g.is_contiguous()):
         return _reject("non-contiguous operand")
     device = k.device
     if u.device != device or w.device != device or g.device != device:
@@ -445,11 +551,7 @@ def _is_supported(
     # importlib.util.find_spec path walks, because `cutlass` is only imported
     # on the first successful dispatch.
     mode = _chain_mode(
-        context=context,
-        cu_seqlens=cu_seqlens,
-        T=T,
-        rank=rank,
-        world_size=world_size,
+        context=context, cu_seqlens=cu_seqlens, T=T, rank=rank, world_size=world_size
     )
     if mode is None:
         return _reject("chain not classifiable")
@@ -461,6 +563,8 @@ def _is_supported(
     # toolchain probe.
     if not (k.is_cuda and _runtime_supported(device=k.device, group=context.group)):
         return _reject("runtime unsupported (device/toolchain/backend/world size)")
+    if _cuda_graphs_enabled(context):
+        return _reject("CUDA graph configuration unsupported")
     return mode
 
 
@@ -523,7 +627,11 @@ def try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl(
     # zero.
     N = len(context.cu_seqlens_cpu) - 1
     initial_state = _out_state(
-        N, HV, K, V, k.device,
+        N,
+        HV,
+        K,
+        V,
+        k.device,
         # `_merge_role` writes every element of slot 0 on a merging rank
         # (every `hv`, every V-subtile `b`, rows 0..K), so pre-zeroing it there
         # is an 8 MB memset the kernel immediately overwrites. Rank 0 folds
@@ -543,33 +651,26 @@ def try_chunk_gated_delta_rule_fwd_h_pre_process_cutedsl(
             initial_state = initial_state.transpose(-1, -2).contiguous()
         return initial_state
 
-    key = (
-        id(context.group),
-        k.device.index,
-        H,
-        HV,
-        K,
-        V,
-        "g",
-    )
+    key = _wrapper_cache_key(context.group, k.device, H, HV, K, V)
     fused = _WRAPPER_CACHE.get(key)
     if fused is None:
-        # Imported on the cache miss only: a module-level `from ... import` is
-        # still a `__import__` call plus a getattr on every execution, and this
-        # function runs twice per layer per step.
+        # Wrapper construction performs a symmetric-memory rendezvous; the
+        # process-wide helper prevents two local host threads from racing it.
         from .fused_ws import CuteDSLFusedCPPreProcessWS
 
-        fused = CuteDSLFusedCPPreProcessWS(
-            context.group,
-            H,
-            HV,
-            K,
-            V,
-            gate_mode="g",
+        fused = _get_or_create_wrapper(
+            _WRAPPER_CACHE,
+            key,
+            lambda: _SerializedWrapper(
+                CuteDSLFusedCPPreProcessWS(
+                    context.group, H, HV, K, V, gate_mode="g", device=k.device, split=1
+                ),
+                k.device,
+            ),
+            group=context.group,
             device=k.device,
-            split=1,
+            signature=(0, H, HV, K, V),
         )
-        _WRAPPER_CACHE[key] = fused
 
     # The kernel scans one contiguous window. For a packed batch that window is
     # the last local sequence -- the only one that can continue onto a later
@@ -662,30 +763,40 @@ def _is_supported_bwd(
         return _reject("bwd: operand shape mismatch")
     if g.shape != (B, T, HV):
         return _reject("bwd: operand shape mismatch")
-    if (q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16
-            or w.dtype != torch.bfloat16 or do.dtype != torch.bfloat16
-            or dv.dtype != torch.bfloat16):
+    if (
+        q.dtype != torch.bfloat16
+        or k.dtype != torch.bfloat16
+        or w.dtype != torch.bfloat16
+        or do.dtype != torch.bfloat16
+        or dv.dtype != torch.bfloat16
+    ):
         return _reject(f"bwd: dtype {q.dtype} (only bfloat16)")
     if g.dtype not in {torch.bfloat16, torch.float32}:
         return _reject(f"bwd: gate dtype {g.dtype}")
     # See the forward twin: `g` joins the contiguity check now that the window
     # slice is a pure view.
-    if not (q.is_contiguous() and k.is_contiguous() and w.is_contiguous()
-            and do.is_contiguous() and dv.is_contiguous()
-            and g.is_contiguous()):
+    if not (
+        q.is_contiguous()
+        and k.is_contiguous()
+        and w.is_contiguous()
+        and do.is_contiguous()
+        and dv.is_contiguous()
+        and g.is_contiguous()
+    ):
         return _reject("bwd: non-contiguous operand")
     device = q.device
-    if (k.device != device or w.device != device or do.device != device
-            or dv.device != device or g.device != device):
+    if (
+        k.device != device
+        or w.device != device
+        or do.device != device
+        or dv.device != device
+        or g.device != device
+    ):
         return _reject("bwd: operands on different devices")
 
     world_size, rank = _group_topology(context.group)
     mode = _chain_mode(
-        context=context,
-        cu_seqlens=cu_seqlens,
-        T=T,
-        rank=rank,
-        world_size=world_size,
+        context=context, cu_seqlens=cu_seqlens, T=T, rank=rank, world_size=world_size
     )
     if mode is None:
         return _reject("bwd: chain not classifiable")
@@ -693,6 +804,8 @@ def _is_supported_bwd(
     # same contract instead of taking effect on unsupported hardware.
     if not (q.is_cuda and _runtime_supported(device=q.device, group=context.group)):
         return _reject("bwd: runtime unsupported (device/toolchain/backend/world size)")
+    if _cuda_graphs_enabled(context):
+        return _reject("bwd: CUDA graph configuration unsupported")
     return mode
 
 
@@ -739,7 +852,11 @@ def try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl(
     # zero. (Mirror image of the forward, which writes slot 0.)
     N = len(context.cu_seqlens_cpu) - 1
     dht_out = _out_state(
-        N, HV, K, V, q.device,
+        N,
+        HV,
+        K,
+        V,
+        q.device,
         # Mirror of the forward: a merging rank's `_merge_role` fills the last
         # slot completely; the last rank folds nothing and needs the zeros.
         live_slot=N - 1 if (mode == "fused" and rank < world_size - 1) else None,
@@ -754,38 +871,30 @@ def try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl(
 
     # Keyed on the same tuple the wrapper class is chosen from, so the class
     # itself is only imported and selected on a cache miss (see the forward).
-    key = (
-        id(context.group),
-        q.device.index,
-        H,
-        HV,
-        K,
-        V,
-        "g",
-    )
+    key = _wrapper_cache_key(context.group, q.device, H, HV, K, V)
     fused = _BWD_WRAPPER_CACHE.get(key)
     if fused is None:
         from .bwd_fused import CuteDSLFusedCPBwdPreProcess
         from .bwd_ws import CuteDSLFusedCPBwdPreProcessWS, ws_supported
 
         # The warp-specialized Blackwell engine is 2.7x exact FLA at the
-        # canonical shape versus 0.99x for the SM80 engine it replaces; it is
-        # specialized for K == V == 128 and everything else keeps the non-WS
-        # engine, which additionally supports K=64 and any 64-multiple V.
+        # canonical shape versus 0.99x for the SM80 engine it replaces. Other
+        # shapes keep the non-WS engine.
         wrapper_cls = (
-            CuteDSLFusedCPBwdPreProcessWS if ws_supported(K, V, "g")
+            CuteDSLFusedCPBwdPreProcessWS
+            if ws_supported(K, V, "g")
             else CuteDSLFusedCPBwdPreProcess
         )
-        fused = wrapper_cls(
-            context.group,
-            H,
-            HV,
-            K,
-            V,
-            gate_mode="g",
+        fused = _get_or_create_wrapper(
+            _BWD_WRAPPER_CACHE,
+            key,
+            lambda: _SerializedWrapper(
+                wrapper_cls(context.group, H, HV, K, V, gate_mode="g", device=q.device), q.device
+            ),
+            group=context.group,
             device=q.device,
+            signature=(1, H, HV, K, V),
         )
-        _BWD_WRAPPER_CACHE[key] = fused
 
     # The reverse scan runs over the first local sequence -- the only one that
     # can be a continuation from an earlier rank -- matching the Triton
@@ -805,7 +914,7 @@ def try_chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl(
         _window(do, bos, eos),
         _window(dv, bos, eos),
         g=_window(g, bos, eos),
-        scale=K ** -0.5 if scale is None else float(scale),
+        scale=K**-0.5 if scale is None else float(scale),
         dht_out=dht_out[-1],
         emit_h=emit_h,
         emit_m=emit_m,

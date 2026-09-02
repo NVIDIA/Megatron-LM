@@ -3,6 +3,9 @@
 """Tests for the internal GDR backend adapter."""
 
 import ast
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -63,6 +66,7 @@ def test_internal_backend_rejects_conflicting_state_layout_options():
             **_inputs(), state_v_first=True, transpose_state_layout=False
         )
 
+
 def test_cutedsl_cp_context_metadata_owns_global_offsets():
     from megatron.core.ssm.gated_delta_net.gdn import _bind_cutedsl_cp_context_metadata
 
@@ -75,6 +79,223 @@ def test_cutedsl_cp_context_metadata_owns_global_offsets():
     assert torch.equal(context.global_cu_seqlens_cpu, torch.tensor([0, 32768]))
     assert context.global_cu_seqlens_cpu.data_ptr() != source.data_ptr()
 
+
+def test_cutedsl_cp_context_metadata_rebind_invalidates_memos():
+    from megatron.core.ssm.gated_delta_net.gdn import _bind_cutedsl_cp_context_metadata
+
+    context = SimpleNamespace(
+        _cutedsl_chain_memo={(0, 64): "fused"}, _cutedsl_window_memo={(0, True): (0, 64)}
+    )
+    first_offsets = torch.tensor([0, 64])
+    _bind_cutedsl_cp_context_metadata(context, first_offsets)
+    first_generation = context._cutedsl_metadata_generation
+
+    assert context._cutedsl_chain_memo == {}
+    assert context._cutedsl_window_memo == {}
+
+    context._cutedsl_chain_memo[(first_generation, 64)] = "fused"
+    _bind_cutedsl_cp_context_metadata(context, first_offsets)
+    assert context._cutedsl_metadata_generation == first_generation
+    assert context._cutedsl_chain_memo == {(first_generation, 64): "fused"}
+
+    _bind_cutedsl_cp_context_metadata(context, torch.tensor([0, 32, 64]))
+
+    assert context._cutedsl_metadata_generation == first_generation + 1
+    assert context.global_num_seqs == 2
+
+
+def test_packed_chunkwise_cp_cuda_graph_is_rejected_before_layout_conversion(monkeypatch):
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.ssm.gated_delta_net import gdn
+
+    class FakeGroup:
+        @staticmethod
+        def size():
+            return 4
+
+    fake = SimpleNamespace(
+        pg_collection=SimpleNamespace(cp=FakeGroup()),
+        tp_group=object(),
+        config=SimpleNamespace(linear_cp_mode="chunkwise", cuda_graph_impl="transformer_engine"),
+    )
+    packed = PackedSeqParams(qkv_format="thd")
+    monkeypatch.setattr(
+        gdn,
+        "convert_module_input_tensors_cp_partition_mode",
+        lambda **_kwargs: pytest.fail("layout conversion ran before the CUDA-graph guard"),
+    )
+
+    with pytest.raises(RuntimeError, match="does not support CUDA graphs"):
+        gdn.GatedDeltaNet.forward(fake, torch.empty(8, 1, 4), None, packed_seq_params=packed)
+
+
+def test_packed_chunkwise_cp_partial_mlp_cuda_graph_remains_eager(monkeypatch):
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.ssm.gated_delta_net import gdn
+    from megatron.core.transformer.enums import CudaGraphModule
+
+    class FakeGroup:
+        @staticmethod
+        def size():
+            return 4
+
+    class LayoutConversionReached(Exception):
+        pass
+
+    fake = SimpleNamespace(
+        pg_collection=SimpleNamespace(cp=FakeGroup()),
+        tp_group=object(),
+        config=SimpleNamespace(
+            linear_cp_mode="chunkwise",
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.mlp],
+            sequence_parallel=False,
+        ),
+    )
+    packed = PackedSeqParams(qkv_format="thd")
+
+    def conversion(**_kwargs):
+        raise LayoutConversionReached
+
+    monkeypatch.setattr(gdn, "convert_module_input_tensors_cp_partition_mode", conversion)
+    with pytest.raises(LayoutConversionReached):
+        gdn.GatedDeltaNet.forward(fake, torch.empty(8, 1, 4), None, packed_seq_params=packed)
+
+
+def test_cutedsl_cp_wrapper_cache_key_is_rank_stable():
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_cp_cute import (
+        backend as cp_backend,
+    )
+
+    group = object()
+
+    first = cp_backend._wrapper_cache_key(group, torch.device("cuda", 0), 64, 64, 128, 128)
+    second = cp_backend._wrapper_cache_key(group, torch.device("cuda", 0), 64, 64, 128, 128)
+
+    assert first == second
+    assert first == (id(group), 0, 64, 64, 128, 128, "g")
+
+
+def test_cutedsl_cp_wrapper_marshals_different_streams(monkeypatch):
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_cp_cute import (
+        backend as cp_backend,
+    )
+
+    calls = []
+
+    class FakeWrapper:
+        def launch_validated(self, value, *, _stream_handle):
+            calls.append(("launch", value, _stream_handle))
+            return value
+
+    class FakeEvent:
+        def record(self, stream):
+            calls.append(("record", stream.name))
+
+    class FakeStream:
+        def __init__(self, name, handle):
+            self.name = name
+            self.cuda_stream = handle
+
+        def wait_event(self, event):
+            calls.append(("wait", self.name, event))
+
+    class FakeStreamContext:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            calls.append(("enter", self.stream.name))
+
+        def __exit__(self, *_args):
+            calls.append(("exit", self.stream.name))
+
+    owner = FakeStream("owner", 11)
+    caller = FakeStream("caller", 22)
+    # Construction binds owner=11 before the first launch can race in.
+    handles = iter([11, 11, 22])
+    monkeypatch.setattr(cp_backend, "_raw_stream", lambda _device: next(handles))
+    monkeypatch.setattr(cp_backend.torch.cuda, "current_stream", lambda _device: owner)
+    monkeypatch.setattr(cp_backend.torch.cuda, "ExternalStream", lambda handle, device: caller)
+    monkeypatch.setattr(cp_backend.torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(cp_backend.torch.cuda, "stream", FakeStreamContext)
+    wrapper = cp_backend._SerializedWrapper(FakeWrapper(), torch.device("cuda", 0))
+    assert wrapper._owner_handle == 11
+
+    assert wrapper.launch_validated(1) == 1
+    assert wrapper.launch_validated(2) == 2
+
+    assert calls[0] == ("launch", 1, 11)
+    assert calls[1][0:2] == ("record", "caller")
+    assert calls[2][0:2] == ("wait", "owner")
+    assert calls[3] == ("enter", "owner")
+    assert calls[4] == ("launch", 2, 11)
+    assert calls[5] == ("exit", "owner")
+    assert calls[6][0:2] == ("record", "owner")
+    assert calls[7][0:2] == ("wait", "caller")
+
+
+def test_cutedsl_cp_wrapper_is_constructed_once_under_concurrent_miss(monkeypatch):
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_cp_cute import (
+        backend as cp_backend,
+    )
+
+    cache = {}
+    group = object()
+    barrier = threading.Barrier(2)
+    constructed = []
+    monkeypatch.setattr(cp_backend, "_rank_consistent_wrapper_init", lambda *_args: True)
+
+    def factory():
+        constructed.append(object())
+        time.sleep(0.01)
+        return constructed[-1]
+
+    def get_wrapper():
+        barrier.wait()
+        return cp_backend._get_or_create_wrapper(
+            cache,
+            ("shape",),
+            factory,
+            group=group,
+            device=torch.device("cuda", 0),
+            signature=(0, 64, 64, 128, 128),
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        wrappers = list(pool.map(lambda _: get_wrapper(), range(2)))
+
+    assert len(constructed) == 1
+    assert wrappers[0] is wrappers[1] is constructed[0]
+
+
+def test_cutedsl_cp_wrapper_raises_on_cross_rank_initialization_mismatch(monkeypatch):
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_cp_cute import (
+        backend as cp_backend,
+    )
+
+    monkeypatch.setattr(cp_backend, "_rank_consistent_wrapper_init", lambda *_args: False)
+    constructed = []
+    with pytest.raises(RuntimeError, match="initialization order differs across ranks"):
+        cp_backend._get_or_create_wrapper(
+            {},
+            ("shape",),
+            lambda: constructed.append(object()),
+            group=object(),
+            device=torch.device("cuda", 0),
+            signature=(0, 64, 64, 128, 128),
+        )
+
+    assert constructed == []
+
+
+def test_cutedsl_cp_cuda_graph_gate_uses_context_configuration():
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_cp_cute import (
+        backend as cp_backend,
+    )
+
+    assert cp_backend._cuda_graphs_enabled(SimpleNamespace(_cutedsl_cuda_graph_enabled=True))
+    assert not cp_backend._cuda_graphs_enabled(SimpleNamespace())
 
 
 def test_fused_forward_package_exports_wrapper():
@@ -233,11 +454,7 @@ def test_cute_mode_dispatches_to_local_autograd_function(
     )
 
     local_cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
-    cp_context = (
-        SimpleNamespace(group=object(), cu_seqlens=local_cu_seqlens)
-        if use_cp
-        else None
-    )
+    cp_context = SimpleNamespace(group=object(), cu_seqlens=local_cu_seqlens) if use_cp else None
     result = implementation.chunk_gated_delta_rule(
         **inputs, scale=scale, recompute_h=recompute_h, cp_context=cp_context
     )
@@ -915,10 +1132,7 @@ def test_fla_forward_can_save_fused_backward_h(monkeypatch, save_fused_bwd_state
 
     _g, output, _A, saved_h, _chunk_indices, _initial_state = (
         implementation._fla_forward_for_fused_bwd(
-            **inputs,
-            scale=0.5,
-            cu_seqlens=None,
-            save_fused_bwd_state=save_fused_bwd_state,
+            **inputs, scale=0.5, cu_seqlens=None, save_fused_bwd_state=save_fused_bwd_state
         )
     )
 
@@ -955,10 +1169,7 @@ def test_cutedsl_forward_controls_fused_backward_h(monkeypatch, save_fused_bwd_s
     monkeypatch.setattr(fused_gdr_fwd_cute, "chunk_gated_delta_rule_prefill_cute", launcher)
 
     _g, _output, _A, saved_h, _chunk_indices, _chunk_offsets = implementation._cutedsl_forward(
-        **inputs,
-        scale=0.5,
-        cu_seqlens=None,
-        save_fused_bwd_state=save_fused_bwd_state,
+        **inputs, scale=0.5, cu_seqlens=None, save_fused_bwd_state=save_fused_bwd_state
     )
 
     assert seen["output_h"] is saved_h
@@ -1082,10 +1293,7 @@ def test_cutedsl_forward_trusts_validated_varlen_cu_seqlens(monkeypatch):
     monkeypatch.setattr(fused_gdr_fwd_cute, "chunk_gated_delta_rule_prefill_cute", launcher)
 
     implementation._cutedsl_forward(
-        **inputs,
-        scale=0.5,
-        cu_seqlens=cu_seqlens,
-        save_fused_bwd_state=False,
+        **inputs, scale=0.5, cu_seqlens=cu_seqlens, save_fused_bwd_state=False
     )
 
     assert seen["cu_seqlens"].dtype == torch.int32
@@ -1430,9 +1638,7 @@ def test_fused_backward_adapter_forwards_chunk_offsets(monkeypatch):
 def test_gated_delta_net_preserves_dense_batch_cp_rejection():
     package = Path(__file__).parents[3] / "megatron/core"
     gdn_source = (package / "ssm/gated_delta_net/gdn.py").read_text()
-    rejection = (
-        "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
-    )
+    rejection = "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
 
     # Keep both the fused and unfused pre-GDR paths aligned with the established
     # MCore contract: dense B>1 is unsupported when chunkwise CP is active.

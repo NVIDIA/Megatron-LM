@@ -2889,8 +2889,18 @@ class CuteDSLFusedCPPreProcessWS:
         self._desc_nt = nt
 
     @torch.no_grad()
-    def launch_validated(self, k, v, w, g=None, gk=None, h0_out=None,
-                         emit_h=True, emit_m=True):
+    def launch_validated(
+        self,
+        k,
+        v,
+        w,
+        g=None,
+        gk=None,
+        h0_out=None,
+        emit_h=True,
+        emit_m=True,
+        _stream_handle=None,
+    ):
         """``__call__`` without the argument validation.
 
         For callers that have already established every condition ``__call__``
@@ -2926,7 +2936,9 @@ class CuteDSLFusedCPPreProcessWS:
         The default ``True, True`` is the single-sequence case, where the whole
         group is one chain.
         """
-        return self._launch(k, v, w, g, gk, h0_out, emit_h, emit_m)
+        return self._launch(
+            k, v, w, g, gk, h0_out, emit_h, emit_m, _stream_handle
+        )
 
     @torch.no_grad()
     def __call__(self, k, v, w, g=None, gk=None, h0_out=None,
@@ -2993,7 +3005,7 @@ class CuteDSLFusedCPPreProcessWS:
                 f"{self.device}"
             )
 
-    def _cu_stream(self):
+    def _cu_stream(self, handle=None):
         """`cuda.CUstream` for the current torch stream, memoized by handle.
 
         The handle still has to be read every call -- the caller may have
@@ -3003,7 +3015,8 @@ class CuteDSLFusedCPPreProcessWS:
         ctypes object too, and a training run uses a handful of distinct
         streams for its whole life, so that is cached on the handle.
         """
-        handle = _raw_stream(self.device.index)
+        if handle is None:
+            handle = _raw_stream(self.device.index)
         stream = self._stream_cache.get(handle)
         if stream is None:
             stream = cuda.CUstream(handle)
@@ -3019,7 +3032,9 @@ class CuteDSLFusedCPPreProcessWS:
             gate = gate.float()
         return gate if gate.is_contiguous() else gate.contiguous()
 
-    def _launch(self, k, v, w, g, gk, h0_out, emit_h=True, emit_m=True):
+    def _launch(
+        self, k, v, w, g, gk, h0_out, emit_h=True, emit_m=True, _stream_handle=None
+    ):
         T = k.shape[1]
         if h0_out is None:
             if self.rank == 0:
@@ -3066,7 +3081,7 @@ class CuteDSLFusedCPPreProcessWS:
             self._p(self.seg_flags, cutlass.Uint32),
             cutlass.Int32(T), cutlass.Int32(self.step),
             cutlass.Int32((1 if emit_h else 0) | (2 if emit_m else 0)),
-            self._cu_stream(),
+            self._cu_stream(_stream_handle),
         )
         # `full_chunks` reaches codegen through exactly one flag,
         # `need_lam = use_g or not full_chunks`, so in g-mode -- the only mode
