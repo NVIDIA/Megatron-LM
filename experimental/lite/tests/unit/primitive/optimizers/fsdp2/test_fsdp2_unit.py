@@ -118,6 +118,7 @@ def test_fsdp2_pipeline_wraps_dense_and_experts_with_reshard(monkeypatch):
     expert_calls = []
     expert_mesh = SimpleNamespace(name="expert_dp")
     optimizer = object()
+    optimizer_kwargs = {}
     ps = ParallelState(
         pp_size=2,
         ep_size=2,
@@ -141,11 +142,11 @@ def test_fsdp2_pipeline_wraps_dense_and_experts_with_reshard(monkeypatch):
     )
     monkeypatch.setattr(fsdp2_optimizer, "wrap_fsdp2_module", fake_wrap_expert)
     monkeypatch.setattr(fsdp2_optimizer, "wrap_fsdp2", fake_wrap_dense)
-    monkeypatch.setattr(
-        fsdp2_optimizer,
-        "build_fsdp2_adamw",
-        lambda *args, **kwargs: optimizer,
-    )
+    def fake_build_optimizer(*_args, **kwargs):
+        optimizer_kwargs.update(kwargs)
+        return optimizer
+
+    monkeypatch.setattr(fsdp2_optimizer, "build_fsdp2_adamw", fake_build_optimizer)
 
     result = fsdp2_optimizer.build_fsdp2_training_optimizer(
         [model],
@@ -154,8 +155,8 @@ def test_fsdp2_pipeline_wraps_dense_and_experts_with_reshard(monkeypatch):
         unit_modules=(ToyMoEBlock,),
         expert_classifier=lambda name: ".experts." in f".{name}",
         reshard_after_forward=True,
-        use_fp32_shards=False,
-        use_fp32_master=False,
+        use_fp32_shards=True,
+        use_fp32_master=True,
     )
 
     assert result is optimizer
@@ -172,6 +173,7 @@ def test_fsdp2_pipeline_wraps_dense_and_experts_with_reshard(monkeypatch):
     assert dense_config.reshard_after_forward is True
     assert dense_config.last_unit_reshard_after_forward is True
     assert dense_kwargs["ignored_params"] == set(model.experts.parameters())
+    assert optimizer_kwargs["use_fp32_master"] is False
 
 
 def test_fsdp2_replicates_parameters_that_must_keep_their_compute_dtype(monkeypatch):

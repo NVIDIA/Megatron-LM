@@ -403,16 +403,18 @@ def build_fsdp2_training_optimizer(
         from megatron.lite.primitive.deterministic import deterministic_requested
 
         deterministic = deterministic_requested()
-    effective_use_fp32_shards = (
+    fsdp2_use_fp32_shards = (
         bool(use_fp32_shards)
         if use_fp32_shards is not None
         else get_bool_opt(opt, "fsdp2_use_fp32_shards", default=_DEFAULT_USE_FP32_SHARDS)
     )
-    effective_use_fp32_master = (
+    fsdp2_use_fp32_master = (
         bool(use_fp32_master)
         if use_fp32_master is not None
         else get_bool_opt(opt, "fsdp2_use_fp32_master", default=_DEFAULT_USE_FP32_MASTER)
     )
+    if fsdp2_use_fp32_shards:
+        fsdp2_use_fp32_master = False
 
     unit_reshard_after_forward = _fsdp2_unit_reshard_after_forward(
         ps, reshard_after_forward=reshard_after_forward
@@ -430,7 +432,7 @@ def build_fsdp2_training_optimizer(
         reduce_dtype=reduce_dtype,
         cast_forward_inputs=cast_forward_inputs,
     )
-    if effective_use_fp32_shards:
+    if fsdp2_use_fp32_shards:
         model_param_dtypes = _collect_model_param_dtypes(model_chunks)
         for chunk in model_chunks:
             promote_fsdp2_trainable_params_to_fp32(chunk)
@@ -493,7 +495,7 @@ def build_fsdp2_training_optimizer(
         tp_replicated_grad_sync_group=ps.tp_group if tp_replicated_grad_params else None,
         grad_norm_accum_dtype="float32",
         adamw_foreach=False if deterministic else adamw_foreach,
-        use_fp32_master=effective_use_fp32_master,
+        use_fp32_master=fsdp2_use_fp32_master,
         model_param_dtypes=model_param_dtypes,
     )
 

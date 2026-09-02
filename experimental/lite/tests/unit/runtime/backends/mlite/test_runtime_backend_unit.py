@@ -600,11 +600,23 @@ def test_megatron_ddp_detection_accepts_ddp_and_subclasses(monkeypatch):
 
 @pytest.mark.parametrize("model_cls", [_FakeMegatronDDP, _FakeMegatronDDPSubclass])
 def test_megatron_ddp_model_move_helpers_use_buffer_path(monkeypatch, model_cls):
+    import megatron.lite.runtime.megatron_utils as megatron_utils
     from megatron.lite.runtime.megatron_utils import load_model_to_gpu, offload_model_to_cpu
 
     _install_fake_megatron_ddp(monkeypatch)
     model = model_cls()
     buffer = model.buffer
+    pinned_copies = []
+
+    def fake_pinned_cpu_copy(tensor):
+        pinned_copies.append(tensor)
+        return tensor.cpu().pin_memory()
+
+    monkeypatch.setattr(
+        megatron_utils,
+        "_pinned_cpu_copy",
+        fake_pinned_cpu_copy,
+    )
 
     offload_model_to_cpu([model])
 
@@ -624,6 +636,14 @@ def test_megatron_ddp_model_move_helpers_use_buffer_path(monkeypatch, model_cls)
     assert buffer.param_data.copied_from is buffer.param_data.cpu_data
     assert buffer.param_data.copy_non_blocking is True
     assert buffer.grad_data.zero_calls == 1
+
+    cpu_data = buffer.param_data.cpu_data
+    offload_model_to_cpu([model])
+
+    assert pinned_copies == [buffer.param_data]
+    assert buffer.param_data.cpu_data is cpu_data
+    assert cpu_data.copied_from is buffer.param_data
+    assert cpu_data.copy_non_blocking is False
 
 
 def test_native_model_move_helpers_do_not_require_megatron_core(monkeypatch):
