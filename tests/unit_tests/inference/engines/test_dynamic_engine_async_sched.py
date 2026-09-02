@@ -671,7 +671,7 @@ _ASYNC_PAIR_SCENARIOS = (
     _pair_scenario(
         "fp8-transformer-engine",
         "precision:fp8",
-        config={"fp8": True},
+        config={"fp8": True, "hidden_size": 128},
         signals=("fp8",),
         prerequisite="fp8",
         atol=5.0e-3,
@@ -683,7 +683,7 @@ _ASYNC_PAIR_SCENARIOS = (
         config={
             "hidden_size": 64,
             "position_embedding_type": "rope",
-            "inference_config_overrides": {"use_flashinfer_fused_rope": True},
+            "use_flashinfer_fused_rope": True,
         },
         signals=("fused-rope",),
         prerequisite="flashinfer",

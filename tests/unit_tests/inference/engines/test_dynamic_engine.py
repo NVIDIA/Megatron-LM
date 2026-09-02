@@ -358,6 +358,7 @@ class DynamicEngineTestConfig:
     cuda_graph_mixed_prefill_count: Optional[int] = 16
     cuda_graph_max_tokens: int = 512
     fp8: bool = False
+    hidden_size: int = 32
     model_provider: str = "gpt"
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
     # "gdn"). Ignored unless model_provider == "hybrid": all three build a
@@ -391,6 +392,7 @@ class DynamicEngineTestConfig:
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
+    use_flashinfer_fused_rope: Optional[bool] = None
     sampling_backend: str = 'torch'
     temperature: float = 1.0
     top_k: int = 0
@@ -558,7 +560,7 @@ class DynamicInferenceEngineTestBase:
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
                 prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
-                use_flashinfer_fused_rope=None,  # default to using flash-infer if available
+                use_flashinfer_fused_rope=test_config.use_flashinfer_fused_rope,
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 track_generated_token_events=test_config.track_generated_token_events,
@@ -604,7 +606,7 @@ class DynamicInferenceEngineTestBase:
                 params_dtype=torch.bfloat16,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
-                hidden_size=128 if test_config.fp8 else 32,
+                hidden_size=test_config.hidden_size,
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 cuda_graph_impl=effective_cuda_graph_impl,
@@ -2323,7 +2325,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         if not fp8_available:
             pytest.skip(reason_for_no_fp8)
 
-        self._run_test(model_provider=model_provider, fp8=True)
+        self._run_test(model_provider=model_provider, fp8=True, hidden_size=128)
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
