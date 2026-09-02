@@ -11,6 +11,9 @@ from megatron.lite.primitive.modules.experts import swiglu_with_probs
 from megatron.lite.model.deepseek_v4.vllm.primitive.block_fp8 import (
     DeploymentGroupedBlockFP8Adapter,
 )
+from megatron.lite.model.deepseek_v4.vllm.primitive.dense import (
+    dynamic_clamped_swiglu_vjp,
+)
 
 _M_ALIGNMENT = 128
 _PACK_DEBUG_SYNC = os.getenv("MLITE_VLLM_PACK_DEBUG_SYNC") == "1"
@@ -296,13 +299,11 @@ def _te_grouped_bf16_backward(
     hidden_mats = tuple(torch.split(hidden_states, counts))
     grad_output_mats = tuple(torch.split(grad_output.contiguous(), counts))
 
-    with torch.enable_grad():
-        gate_up_graph = gate_up.detach().requires_grad_(True)
-        activated = swiglu_with_probs(
-            gate_up_graph,
-            None,
-            swiglu_limit,
-        )
+    activated = swiglu_with_probs(
+        gate_up,
+        None,
+        swiglu_limit,
+    )
 
     grad_activated = torch.empty_like(activated)
     with _nvtx_range("moe_bwd/fc2_dgrad"):
@@ -344,10 +345,10 @@ def _te_grouped_bf16_backward(
         ]
 
     with _nvtx_range("moe_bwd/swiglu"):
-        (grad_gate_up,) = torch.autograd.grad(
-            activated,
-            gate_up_graph,
+        grad_gate_up = dynamic_clamped_swiglu_vjp(
             grad_activated,
+            gate_up,
+            swiglu_limit,
         )
     grad_gate_up_mats = tuple(torch.split(grad_gate_up.contiguous(), counts))
 
