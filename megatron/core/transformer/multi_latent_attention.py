@@ -66,13 +66,18 @@ if HAVE_TE:
             FusedMLAQUpProjFunction,
             FusedMLAQUpProjRopeQuant,
         )
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+            mxfp8_quantize_only,
+            mxfp8_transpose_swizzle,
+        )
     except ImportError:
+        # Older TE lacks the fused MLA Q up-proj kernel and its MXFP8 quantize/swizzle
+        # helpers. Stub them all together so this module still imports; the fused path is
+        # gated on FusedMLAQUpProjRopeQuant being non-None.
         FusedMLAQUpProjFunction = None
         FusedMLAQUpProjRopeQuant = None
-    from transformer_engine.pytorch.attention.dot_product_attention.utils import (
-        mxfp8_quantize_only,
-        mxfp8_transpose_swizzle,
-    )
+        mxfp8_quantize_only = None
+        mxfp8_transpose_swizzle = None
     from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
