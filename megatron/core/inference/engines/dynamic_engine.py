@@ -8,7 +8,7 @@ import multiprocessing
 import socket
 import time
 import warnings
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,7 +23,11 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import AsyncScheduleMode, KVCacheManagementMode
+from megatron.core.inference.config import (
+    AsyncScheduleMode,
+    KVCacheManagementMode,
+    MediaCacheCoordinatorPolicy,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
     DynamicInferenceContext,
@@ -40,8 +44,11 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    DynamicVLMInferenceRequest,
     FinishedRequestRecord,
     Status,
+    compute_media_cache_key,
+    resolve_multimodal_data_for_engine,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -69,7 +76,7 @@ from megatron.core.utils import (
     unwrap_model,
 )
 
-from .async_zmq_communicator import AsyncZMQCommunicator
+from .async_zmq_communicator import AsyncZMQCommunicator, RankedPubSub
 
 try:
     from tqdm import tqdm
@@ -298,6 +305,16 @@ class DynamicInferenceEngine(AbstractEngine):
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.disable_ep_consensus = inference_config.disable_ep_consensus
         self.ep_consensus_interval = inference_config.ep_consensus_interval
+        self.vision_embedding_cache_max_bytes = int(
+            getattr(inference_config, "vision_embedding_cache_max_bytes", 0)
+        )
+        self.allow_stale_multimodal_embeddings = bool(
+            getattr(inference_config, "allow_stale_multimodal_embeddings", False)
+        )
+        if self.vision_embedding_cache_max_bytes < 0:
+            raise ValueError("vision_embedding_cache_max_bytes must be non-negative.")
+        self._vision_embedding_cache: OrderedDict[str, Tensor] = OrderedDict()
+        self._vision_embedding_cache_bytes = 0
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.cuda_graph_modules = model_config.cuda_graph_modules
@@ -432,6 +449,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """Reset by removing all requests and reset all state."""
 
         self._reset_pending_kv_imports()
+        self.clear_vision_embedding_cache()
         self.context.reset()
 
         # Request state.
@@ -492,6 +510,130 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Coordinator state.
         self.use_coordinator = False
+
+    @staticmethod
+    def _tensor_nbytes(tensor: Tensor) -> int:
+        return tensor.numel() * tensor.element_size()
+
+    def clear_vision_embedding_cache(self) -> None:
+        """Release all projected-media embeddings retained by this engine."""
+        self._vision_embedding_cache.clear()
+        self._vision_embedding_cache_bytes = 0
+
+    def _invalidate_vision_state(self) -> None:
+        """Mark cached and request-local projected media as weight-stale."""
+        if getattr(self, "allow_stale_multimodal_embeddings", False):
+            return
+        self.clear_vision_embedding_cache()
+        for entry in self.requests.values():
+            request = entry.record[-1]
+            if isinstance(request, DynamicVLMInferenceRequest):
+                request.image_embeddings = None
+                request.image_token_mask = None
+
+    def _refresh_vlm_request_data(self, request: DynamicVLMInferenceRequest) -> None:
+        """Rebuild missing media state for a known-multimodal request."""
+        if request.image_embeddings is not None and request.image_token_mask is not None:
+            return
+        if request.imgs is None:
+            raise RuntimeError(
+                f"Cannot refresh vision state for request {request.request_id}: raw media "
+                "tensors were not retained."
+            )
+
+        # Move request tensors to local device for multimodal embedding recomputation.
+        # Prompt token tensors are persistently stored on the inference device.
+        device = request.prompt_tokens.device
+        imgs = request.imgs.to(device=device)
+        num_tiles = request.num_tiles.to(device=device) if request.num_tiles is not None else None
+        imgs_sizes = (
+            request.imgs_sizes.to(device=device) if request.imgs_sizes is not None else None
+        )
+        num_frames = (
+            request.num_frames.to(device=device) if request.num_frames is not None else None
+        )
+
+        # Re-construct the input mask that provides multimodal embedding injection guidelines
+        # for the inference wrapper decoder inputs.
+        wrapper = self.controller.inference_wrapped_model
+        modality = "video" if num_frames is not None else "image"
+        if request.media_tokens_preexpanded:
+            mask = wrapper.build_preexpanded_media_token_mask(request.prompt_tokens, modality)
+        else:
+            if request.compact_prompt_tokens is None:
+                raise RuntimeError(
+                    f"Cannot refresh vision state for request {request.request_id}: the compact "
+                    "multimodal prompt was not retained."
+                )
+            media_token_id = wrapper.resolve_media_token_id(self.controller.tokenizer, modality)
+            expansion_kwargs = {"num_tiles": num_tiles, "imgs_sizes": imgs_sizes}
+            if num_frames is not None:
+                expansion_kwargs["num_frames"] = num_frames
+            _, mask_list = wrapper.expand_image_tokens(
+                [request.compact_prompt_tokens.tolist()],
+                image_token_id=media_token_id,
+                **expansion_kwargs,
+            )
+            mask_values = [(-1 if value is None else int(value)) for value in mask_list[0]]
+            generated_suffix_length = len(request.prompt_tokens) - len(mask_values)
+            if generated_suffix_length < 0:
+                raise RuntimeError(
+                    f"Refreshed media mask for request {request.request_id} is longer than "
+                    "its checkpointed prompt."
+                )
+            mask = torch.tensor(
+                mask_values + ([-1] * generated_suffix_length),
+                dtype=torch.int64,
+                device=request.prompt_tokens.device,
+            )
+
+        encoder_kwargs = {"num_image_tiles": num_tiles, "imgs_sizes": imgs_sizes}
+        if num_frames is not None:
+            encoder_kwargs["num_frames"] = num_frames
+        with torch.inference_mode():
+            embeddings = wrapper._forward_vision_encoder(imgs, **encoder_kwargs)
+
+        expected_count = int((mask >= 0).sum().item())
+        actual_count = embeddings.numel() // embeddings.shape[-1] if embeddings.ndim > 0 else 0
+        if actual_count != expected_count:
+            raise ValueError(
+                f"Refreshed request {request.request_id} has {expected_count} media-token "
+                f"position(s), but the vision encoder produced {actual_count} embedding(s)."
+            )
+
+        request.image_embeddings = embeddings
+        request.image_token_mask = mask
+        self._cache_vision_embedding(request.block_hash_salt, embeddings)
+        self.context.add_vlm_request_data(
+            request.request_id, image_embeddings=embeddings, image_token_mask=mask
+        )
+
+    def _get_cached_vision_embedding(self, cache_key: Optional[str]) -> Optional[Tensor]:
+        if not cache_key or self.vision_embedding_cache_max_bytes == 0:
+            return None
+        embedding = self._vision_embedding_cache.pop(cache_key, None)
+        if embedding is not None:
+            self._vision_embedding_cache[cache_key] = embedding
+        return embedding
+
+    def _cache_vision_embedding(self, cache_key: Optional[str], embedding: Tensor) -> None:
+        if not cache_key or self.vision_embedding_cache_max_bytes == 0:
+            return
+        embedding_bytes = self._tensor_nbytes(embedding)
+        if embedding_bytes > self.vision_embedding_cache_max_bytes:
+            return
+        previous = self._vision_embedding_cache.pop(cache_key, None)
+        if previous is not None:
+            self._vision_embedding_cache_bytes -= self._tensor_nbytes(previous)
+        while (
+            self._vision_embedding_cache
+            and self._vision_embedding_cache_bytes + embedding_bytes
+            > self.vision_embedding_cache_max_bytes
+        ):
+            _, evicted = self._vision_embedding_cache.popitem(last=False)
+            self._vision_embedding_cache_bytes -= self._tensor_nbytes(evicted)
+        self._vision_embedding_cache[cache_key] = embedding
+        self._vision_embedding_cache_bytes += embedding_bytes
 
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
@@ -745,6 +887,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         mp_group = self.pg_collection.mp
         mp_src = get_pg_src_rank(mp_group)
+        mp_size = get_pg_size(mp_group)
+        mp_rank = get_pg_rank(mp_group)
+        dp_replica_mp_request_broadcast = RankedPubSub(
+            b"DynamicInferenceEngine.mp_request_broadcast:"
+        )
         tp_rank = get_pg_rank(self.pg_collection.tp)
         pp_rank = get_pg_rank(self.pg_collection.pp)
 
@@ -773,6 +920,15 @@ class DynamicInferenceEngine(AbstractEngine):
                     "enable_prefix_caching": self.context.enable_prefix_caching,
                     "prefix_caching_coordinator_policy": self.context.prefix_caching_coordinator_policy,
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
+                    "media_cache_coordinator_policy": getattr(
+                        self.context,
+                        "media_cache_coordinator_policy",
+                        MediaCacheCoordinatorPolicy.AFFINITY,
+                    ),
+                    "media_cache_routing_weight": getattr(
+                        self.context, "media_cache_routing_weight", 1.0
+                    ),
+                    "vision_embedding_cache_enabled": (self.vision_embedding_cache_max_bytes > 0),
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
                 },
@@ -797,10 +953,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Find available ports for MP and bind to them.
         if self.is_mp_coordinator:
-            mp_req_sock = self.zmq_context.socket(zmq.PUB)
+            mp_req_sock = dp_replica_mp_request_broadcast.create_publisher(self.zmq_context)
             mp_req_sock.bind_to_random_port(f"tcp://{local_ip}")
             mp_req_addr = mp_req_sock.getsockopt_string(zmq.LAST_ENDPOINT)
-
         else:
             mp_req_addr = None
 
@@ -832,11 +987,16 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.model_parallel_publisher_socket,
             ]
         # All MP ranks subscribe to the publisher socket
-        self.model_parallel_subscriber_socket = self.zmq_context.socket(zmq.SUB)
-        self.model_parallel_subscriber_socket.connect(mp_req_addr)
-        self.model_parallel_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        self.model_parallel_subscriber_socket = dp_replica_mp_request_broadcast.create_subscriber(
+            self.zmq_context, mp_req_addr, mp_rank
+        )
 
         self.zmq_sockets += [self.model_parallel_subscriber_socket]
+
+        if self.is_mp_coordinator:
+            dp_replica_mp_request_broadcast.wait_for_subscribers(
+                self.model_parallel_publisher_socket, range(mp_size)
+            )
 
         self._setup_handoff_completion_tracking(hostname)
 
@@ -946,6 +1106,9 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
 
+        # A suspend may be followed by an in-place weight refit. Invalidate
+        # shared and request-local projected media unless explicitly permitted.
+        self._invalidate_vision_state()
         InferenceMode.unset_active()
         dynamo_helper = getattr(self.context, "dynamo_helper", None)
         if dynamo_helper is not None:
@@ -985,6 +1148,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 if req.finished_chunk_token_count > 0:
                     req.remaining_prompt_tokens = req.prompt_tokens
                     req.finished_chunk_token_count = 0
+                    req.num_matched_prefix_blocks = 0
 
             # Reset the chunked prefill request id
             self.chunked_prefill_request_id = -1
@@ -1030,11 +1194,29 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
+            # Request records outlive the context buffers. Refresh every stale
+            # VLM record, including PERSIST/OFFLOAD requests that need not be
+            # re-added below, so no later checkpoint can carry old projections.
+            for entry in self.requests.values():
+                request = entry.record[-1]
+                if isinstance(request, DynamicVLMInferenceRequest):
+                    self._refresh_vlm_request_data(request)
+
             # Re-add requests saved during suspend.
             add_time = time.time()
             torch.cuda.synchronize()
             for request_id in self.resume_request_ids:
-                self._add_request(self.get_request(request_id))
+                request = self.get_request(request_id)
+                self._add_request(request)
+                if isinstance(request, DynamicVLMInferenceRequest):
+                    # Buffer reinitialization wipes the context maps. Restore
+                    # either the freshly recomputed state or the explicitly
+                    # permitted retained state.
+                    self.context.add_vlm_request_data(
+                        request_id,
+                        image_embeddings=request.image_embeddings,
+                        image_token_mask=request.image_token_mask,
+                    )
 
             # Ensure chunked prefill request remains at the head of the waiting queue
             if self.context.chunked_prefill_request_id != -1:
@@ -1141,6 +1323,35 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 request.generated_text = ""
         request_entry.future.set_result(request_entry.record)
+
+    def _fail_submission(
+        self, request_id: int, sampling_params: Optional[SamplingParams], exc: BaseException
+    ) -> None:
+        """Register a minimal failed request so a rejected admission still
+        produces a client-visible failure reply.
+
+        Called from the SUBMIT_REQUEST handler when image preprocessing or
+        add_request raises. Registering a placeholder record with
+        Status.FAILED lets ``_handle_failed_request`` publish the ENGINE_REPLY
+        without leaving the client hanging or killing the engine loop.
+        """
+        if self.rank == 0:
+            warnings.warn(
+                f"Request {request_id} rejected before admission: " f"{type(exc).__name__}: {exc}"
+            )
+        # Empty prompt tokens are safe — the reply short-circuits at
+        # Status.FAILED and the client sees the failure, not a completion.
+        placeholder_request = DynamicInferenceRequest(
+            request_id=request_id,
+            prompt_tokens=torch.empty(0, dtype=torch.int64),
+            sampling_params=(sampling_params or SamplingParams()),
+        )
+        placeholder_request.status = Status.FAILED
+        self.requests[request_id] = RequestEntry(
+            record=DynamicInferenceRequestRecord.from_request(placeholder_request),
+            future=self._loop.create_future(),
+        )
+        self._handle_failed_request(request_id)
 
     def has_unfinished_requests(self) -> bool:
         """Test if context contains unfinished requests."""
@@ -1301,8 +1512,26 @@ class DynamicInferenceEngine(AbstractEngine):
         prompt: Union[str, List[int], Tensor],
         sampling_params: Optional[SamplingParams] = None,
         precomputed_block_hashes: Optional[List[int]] = None,
+        *,
+        imgs: Optional[Tensor] = None,
+        num_tiles: Optional[Tensor] = None,
+        num_img_embeddings_per_tile: int = 0,
+        imgs_sizes: Optional[Tensor] = None,
+        num_frames: Optional[Tensor] = None,
+        media_tokens_preexpanded: bool = False,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
+
+        Supports both text-only and multimodal requests. For text-only, call
+        with just (request_id, prompt, sampling_params). For multimodal, also
+        pass imgs and either (num_tiles + num_img_embeddings_per_tile) for static
+        resolution or imgs_sizes for dynamic resolution.
+
+        When multimodal kwargs are provided the method will:
+        1. Expand compact media tokens, or derive a mask from pre-expanded tokens.
+        2. Run the vision encoder to produce image embeddings.
+        3. Store the embeddings and mask in the context for later use by the
+           controller's forward step.
 
         Args:
             request_id (int): Unique ID of request.
@@ -1311,12 +1540,30 @@ class DynamicInferenceEngine(AbstractEngine):
             precomputed_block_hashes (Optional[List[int]]): Prefix-cache hashes already
                 computed for the prompt's complete blocks. Values must match
                 ``compute_block_hashes_batched(prompt_tokens, block_size_tokens)``.
+            imgs (Optional[Tensor]): Image tensor [num_tiles, C, H, W] or
+                [1, total_patches, patch_features] (or None).
+            num_tiles (Optional[Tensor]): Number of tiles per image (1-D tensor, or None).
+                Static resolution.
+            num_img_embeddings_per_tile (int): Number of image embeddings per tile.
+                Static resolution.
+            imgs_sizes (Optional[Tensor]): Per-image sizes [N, 2] with [H, W].
+                Dynamic resolution.
+            num_frames (Optional[Tensor]): Number of frames per image/video item.
+            media_tokens_preexpanded (bool): Whether prompt token IDs already contain
+                one model token per projected media embedding.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
         """
+        input_modalities = ["text"]
+        if num_frames is not None:
+            input_modalities.append("video")
+        elif imgs is not None:
+            input_modalities.append("image")
+        self.controller.inference_wrapped_model.validate_input_modalities(*input_modalities)
+
         prompt_str = None
-        # Tokenize prompt if text.
+        # Tokenize prompt if text. Move prompt tokens to the CUDA device for inference.
         if isinstance(prompt, str):
             # Tokenize prompt if text. Support legacy single-arg mocks.
             prompt_str = prompt
@@ -1345,19 +1592,245 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
-        # Initialize request.
-        request = DynamicInferenceRequest(
+        if (
+            imgs is not None
+            or num_tiles is not None
+            or num_img_embeddings_per_tile != 0
+            or imgs_sizes is not None
+            or num_frames is not None
+        ):
+            request = self._build_vlm_request(
+                request_id=request_id,
+                prompt_str=prompt_str,
+                tokens=tokens,
+                sampling_params=sampling_params,
+                imgs=imgs,
+                num_tiles=num_tiles,
+                num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+                imgs_sizes=imgs_sizes,
+                precomputed_block_hashes=precomputed_block_hashes,
+                num_frames=num_frames,
+                media_tokens_preexpanded=media_tokens_preexpanded,
+            )
+            # _build_vlm_request has already registered the image embeddings
+            # and token mask into the context (add_vlm_request_data). If
+            # _add_request now rejects the request (oversized prompt, cache
+            # exhaustion, ...), those tensors would linger in the context
+            # dicts and leak GPU memory. Clean them up on failure.
+            try:
+                return self._add_request(request)
+            except Exception:
+                self.context.remove_vlm_request_data(request_id)
+                raise
+        else:
+            request = DynamicInferenceRequest(
+                request_id=request_id,
+                prompt=prompt_str,
+                prompt_tokens=tokens,
+                sampling_params=sampling_params,
+                block_size_tokens=self.context.block_size_tokens,
+                enable_prefix_caching=self.context.enable_prefix_caching,
+                precomputed_block_hashes=precomputed_block_hashes or [],
+            )
+
+        return self._add_request(request)
+
+    def _build_vlm_request(
+        self,
+        *,
+        request_id: int,
+        prompt_str: Optional[str],
+        tokens: Tensor,
+        sampling_params: Optional[SamplingParams],
+        imgs: Optional[Tensor],
+        num_tiles: Optional[Tensor],
+        num_img_embeddings_per_tile: int,
+        imgs_sizes: Optional[Tensor],
+        precomputed_block_hashes: Optional[List[int]] = None,
+        num_frames: Optional[Tensor] = None,
+        media_tokens_preexpanded: bool = False,
+    ) -> DynamicVLMInferenceRequest:
+        """Prepare media tokens, run the vision encoder, register per-request
+        media data on the context, and return a DynamicVLMInferenceRequest.
+        """
+        if num_frames is not None:
+            missing = [
+                name
+                for name, value in (("imgs", imgs), ("imgs_sizes", imgs_sizes))
+                if value is None
+            ]
+            if missing:
+                raise ValueError(
+                    "Video input requires imgs, imgs_sizes, and num_frames; " f"missing {missing}."
+                )
+        elif imgs_sizes is not None:
+            if imgs is None:
+                raise ValueError("Dynamic-resolution image input requires imgs and imgs_sizes.")
+        elif imgs is None or num_tiles is None or num_img_embeddings_per_tile <= 0:
+            raise ValueError(
+                "Static-tiling image input requires imgs, num_tiles, and "
+                "num_img_embeddings_per_tile > 0."
+            )
+
+        # PP>1 needs a non-first-stage embedding recv path (the wrapper's
+        # _recv_only_vision_embeds TODO). Until that lands, only PP=1 is
+        # correct: non-first stages would see None embeddings but a non-None
+        # mask and silently skip image splicing.
+        pp_group = self.controller.pp_group
+        if (
+            pp_group is not None
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size(pp_group) > 1
+        ):
+            raise NotImplementedError(
+                "Dynamic VLM inference does not support pipeline parallel. "
+                "PP>1 requires the non-first-stage embedding recv path "
+                "which is not yet available upstream."
+            )
+
+        # Compute multimodal media cache key, which is used by generators to
+        # skip re-computing multimodal embeddings if the cache is hit.
+        modality = "video" if num_frames is not None else "image"
+        media_cache_key = None
+        needs_media_identity = self.context.enable_prefix_caching or (
+            getattr(self, "vision_embedding_cache_max_bytes", 0) > 0
+        )
+        if imgs is not None and needs_media_identity:
+            media_inputs = {"imgs": imgs}
+            for name, value in (
+                ("num_tiles", num_tiles),
+                ("imgs_sizes", imgs_sizes),
+                ("num_frames", num_frames),
+            ):
+                if value is not None:
+                    media_inputs[name] = value
+            if num_img_embeddings_per_tile:
+                media_inputs["num_img_embeddings_per_tile"] = num_img_embeddings_per_tile
+            media_cache_key = compute_media_cache_key(modality, media_inputs)
+
+        device = torch.cuda.current_device()
+        num_tiles = num_tiles.to(device=device) if num_tiles is not None else None
+        imgs_sizes = imgs_sizes.to(device=device) if imgs_sizes is not None else None
+        num_frames = num_frames.to(device=device) if num_frames is not None else None
+
+        # Dynamic-resolution requests derive their embedding count from
+        # imgs_sizes downstream and don't need num_tiles.sum() at admission.
+        # Static-tiling requests do; only pay the D2H sync on that path so
+        # dynamic-res admissions stay sync-free here.
+        has_images = imgs_sizes is not None and imgs is not None
+        if not has_images:
+            total_num_tiles = int(num_tiles.sum().item()) if num_tiles is not None else 0
+            num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
+            has_images = num_img_embeddings > 0
+        if not has_images:
+            raise ValueError("Multimodal input did not contain any processable media.")
+
+        mask_tensor: Optional[Tensor] = None
+        image_embeddings: Optional[Tensor] = None
+        compact_prompt_tokens: Optional[Tensor] = None
+        expected_embedding_count = 0
+
+        if has_images:
+            inference_wrapper = self.controller.inference_wrapped_model
+
+            # Compute input mask that provides multimodal embedding injection
+            # guidelines for the inference wrapper decoder inputs.
+            if media_tokens_preexpanded:
+                mask_tensor = inference_wrapper.build_preexpanded_media_token_mask(tokens, modality)
+                expected_embedding_count = int((mask_tensor >= 0).sum().item())
+            else:
+                media_token_id = inference_wrapper.resolve_media_token_id(
+                    self.controller.tokenizer, modality
+                )
+                compact_prompt_tokens = tokens.clone()
+                token_list: List[List[int]] = [tokens.tolist()]
+                expansion_kwargs = {"num_tiles": num_tiles, "imgs_sizes": imgs_sizes}
+                if num_frames is not None:
+                    expansion_kwargs["num_frames"] = num_frames
+                expanded_tokens_list, mask_list = inference_wrapper.expand_image_tokens(
+                    token_list, image_token_id=media_token_id, **expansion_kwargs
+                )
+                # expand_image_tokens pads the embedding slots with -1, but the mask
+                # below is what splices the embeddings in, so keep a real token id in
+                # prompt_tokens where the model has one: they are echoed to HTTP
+                # clients, detokenized for raw_text and hashed for prefix caching, and
+                # none of those accept a negative id.
+                expanded_tokens = [
+                    media_token_id if token < 0 else token for token in expanded_tokens_list[0]
+                ]
+                tokens = torch.tensor(expanded_tokens, dtype=torch.int64, device=device)
+                mask_tensor = torch.tensor(
+                    [(-1 if v is None else int(v)) for v in mask_list[0]], device=device
+                )
+                expected_embedding_count = sum(value is not None for value in mask_list[0])
+
+            # Retrieve or compute the vision embedding.
+            image_embeddings = self._get_cached_vision_embedding(media_cache_key)
+            if image_embeddings is None and imgs is not None:
+                imgs = imgs.to(device=device)
+                # PP>1 is rejected above, so this is the only stage that owns
+                # the vision encoder.
+                with torch.inference_mode():
+                    encoder_kwargs = {"num_image_tiles": num_tiles, "imgs_sizes": imgs_sizes}
+                    if num_frames is not None:
+                        encoder_kwargs["num_frames"] = num_frames
+                    image_embeddings = (
+                        self.controller.inference_wrapped_model._forward_vision_encoder(
+                            imgs, **encoder_kwargs
+                        )
+                    )
+
+            # Cache the image embedding.
+            if image_embeddings is not None:
+                actual_embedding_count = (
+                    image_embeddings.numel() // image_embeddings.shape[-1]
+                    if image_embeddings.ndim > 0
+                    else 0
+                )
+                if actual_embedding_count != expected_embedding_count:
+                    prompt_kind = "Pre-expanded" if media_tokens_preexpanded else "Expanded"
+                    raise ValueError(
+                        f"{prompt_kind} prompt has {expected_embedding_count} media-token "
+                        f"position(s), but the vision encoder produced "
+                        f"{actual_embedding_count} embedding(s)."
+                    )
+                self._cache_vision_embedding(media_cache_key, image_embeddings)
+
+        self.context.add_vlm_request_data(
+            request_id, image_embeddings=image_embeddings, image_token_mask=mask_tensor
+        )
+
+        # Image-bearing requests can share KV only when their block-hash chain
+        # is salted by the media identity computed from resolved media tensors.
+        # Requests without enough media data to derive an identity remain
+        # uncached rather than risk cross-media KV reuse for identical
+        # placeholder token sequences.
+        request_has_images = has_images
+        enable_prefix_caching = self.context.enable_prefix_caching and (
+            not request_has_images or bool(media_cache_key)
+        )
+        return DynamicVLMInferenceRequest(
             request_id=request_id,
             prompt=prompt_str,
             prompt_tokens=tokens,
+            compact_prompt_tokens=compact_prompt_tokens,
             sampling_params=sampling_params,
             block_size_tokens=self.context.block_size_tokens,
-            enable_prefix_caching=self.context.enable_prefix_caching,
-            precomputed_block_hashes=precomputed_block_hashes or [],
+            enable_prefix_caching=enable_prefix_caching,
+            # Recompute the block hashes for multimodal embeddings,
+            # which are injected dynamically into the sequence.
+            precomputed_block_hashes=[] if request_has_images else (precomputed_block_hashes or []),
+            block_hash_salt=media_cache_key if request_has_images else None,
+            num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+            imgs=imgs,
+            num_tiles=num_tiles,
+            imgs_sizes=imgs_sizes,
+            num_frames=num_frames,
+            media_tokens_preexpanded=media_tokens_preexpanded,
+            decoder_seq_length=0,
+            image_embeddings=image_embeddings,
+            image_token_mask=mask_tensor,
         )
-
-        # Add request.
-        return self._add_request(request)
 
     def post_process_requests(
         self,
@@ -1725,6 +2198,11 @@ class DynamicInferenceEngine(AbstractEngine):
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
 
+        # Remove VLM data for finished requests from the context.
+        for record in finished_request_records:
+            req = record[-1]
+            self.context.remove_vlm_request_data(req.request_id)
+
         return active_request_ids, finished_request_records
 
     def _get_and_clear_stop_word_finished_ids(self, active_request_ids: list[int]) -> set[int]:
@@ -1809,19 +2287,19 @@ class DynamicInferenceEngine(AbstractEngine):
     def _mamba_batch_invariant_prefill_chunk_length(
         self, req: DynamicInferenceRequest, capacity: int
     ) -> int:
-        """Raw prefill length that computes an aligned chunk within ``capacity``.
+        """Raw prefill length that computes an aligned chunk within `capacity`.
 
-        Non-final calls must start and end at Mamba chunk boundaries. The final
+        Non-final calls must start and end at SSM chunk boundaries. The final
         prompt call may be shorter because it seeds the decode replay tail.
         """
         remaining = len(req.remaining_prompt_tokens)
         if capacity >= remaining:
             return remaining
 
-        chunk_size = self.context.mamba_chunk_size
-        computed_tokens = (capacity // chunk_size) * chunk_size
+        alignment = self.context.ssm_chunk_alignment
+        computed_tokens = (capacity // alignment) * alignment
         if remaining - computed_tokens == 1:
-            computed_tokens -= chunk_size
+            computed_tokens -= alignment
         if computed_tokens <= 0:
             return 0
         return computed_tokens
@@ -2849,10 +3327,45 @@ class DynamicInferenceEngine(AbstractEngine):
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
-                request_id, prompt, sampling_params = data[1:]
+                # Payload is [request_id, prompt, sampling_params, multi_modal_data].
+                fields = data[1:]
+                if len(fields) == 3:
+                    request_id, prompt, sampling_params = fields
+                    multi_modal_data = None
+                else:
+                    request_id, prompt, sampling_params, multi_modal_data = fields[:4]
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request")
-                self.add_request(request_id, prompt, sampling_params)
+                # TODO(perf): media preprocessing (decode / resize / normalize /
+                # patchify) runs synchronously on the engine step
+                # loop, adding directly to inter-token latency for every
+                # in-flight request. Move off the engine thread — either via a
+                # bounded ThreadPoolExecutor here or, better, on the
+                # server/coordinator side before the ZMQ hop so the engine
+                # receives ready tensors.
+                try:
+                    if multi_modal_data is None:
+                        # Skip the config-attribute lookup for text-only
+                        # requests so test fixtures (DummyContext) without an
+                        # image_preprocessing_config don't AttributeError on
+                        # every SUBMIT_REQUEST and desync the ranks.
+                        vlm_kwargs = {}
+                    else:
+                        vlm_kwargs = resolve_multimodal_data_for_engine(
+                            multi_modal_data,
+                            image_preprocessing_config=(
+                                self.context.config.image_preprocessing_config
+                            ),
+                            video_preprocessing_config=(
+                                self.context.config.video_preprocessing_config
+                            ),
+                        )
+                    if vlm_kwargs:
+                        self.add_request(request_id, prompt, sampling_params, **vlm_kwargs)
+                    else:
+                        self.add_request(request_id, prompt, sampling_params)
+                except Exception as error:  # pylint: disable=broad-except
+                    self._fail_submission(request_id, sampling_params, error)
                 nvtx_range_pop("add_request")
             elif header == Headers.SUBMIT_REQUEST_WITH_KV:
                 # Decode-side KV import.
@@ -2904,6 +3417,15 @@ class DynamicInferenceEngine(AbstractEngine):
         self._poll_pending_kv_pushes()
 
         if new_generation_epoch is not None:
+            if new_generation_epoch != self._generation_epoch:
+                self._invalidate_vision_state()
+                # Unlike suspend/resume, an epoch transition does not naturally
+                # re-admit requests. Refresh active request-local state here so
+                # a later checkpoint cannot retain projections from old weights.
+                for entry in self.requests.values():
+                    request = entry.record[-1]
+                    if isinstance(request, DynamicVLMInferenceRequest):
+                        self._refresh_vlm_request_data(request)
             self._generation_epoch = new_generation_epoch
             # Stamp all active requests with the new epoch.
             # Each field stores a sparse list of (start_token_index, epoch) boundaries.
