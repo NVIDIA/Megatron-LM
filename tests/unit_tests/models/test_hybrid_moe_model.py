@@ -605,9 +605,8 @@ class TestHybridMoEModel:
 
         assert self.model.pre_process is True, "pre_process should be True"
         assert self.model.post_process is True, "post_process should be True"
-        assert (
-            self.model.hybrid_layer_pattern == args.hybrid_layer_pattern
-        ), f"hybrid_layer_pattern should be {args.hybrid_layer_pattern}"
+        assert not hasattr(self.model, "hybrid_layer_pattern")
+        assert len(self.model.layer_config_list) == len(args.hybrid_layer_pattern)
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 8449294624, f"Expected 8449294624 parameters, got {num_weights}"
 

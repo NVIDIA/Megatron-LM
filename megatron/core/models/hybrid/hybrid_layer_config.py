@@ -1,10 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Sequence, TypeAlias
+from typing import Sequence, TypeAlias, get_args
 
-from megatron.core.models.hybrid.layers import utils as layer_utils
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
 
 class PipelineSplit:
@@ -21,7 +26,18 @@ class MTPSplit:
     """
 
 
-ArchitectureEntry: TypeAlias = TransformerConfig | type[PipelineSplit] | type[MTPSplit]
+_SupportedLayerConfig: TypeAlias = (
+    MambaLayerConfig
+    | GDNLayerConfig
+    | AttentionLayerConfig
+    | DSALayerConfig
+    | MLALayerConfig
+    | MLPLayerConfig
+    | MoELayerConfig
+)
+ArchitectureEntry: TypeAlias = _SupportedLayerConfig | type[PipelineSplit] | type[MTPSplit]
+
+_SUPPORTED_LAYER_CONFIG_TYPES = get_args(_SupportedLayerConfig)
 
 
 @dataclass(frozen=True)
@@ -59,6 +75,10 @@ def scan_hybrid_layer_config_list(
 
     if pp_size < 1:
         raise ValueError(f"pp_size must be positive, got {pp_size}.")
+    if not layer_config_list:
+        raise ValueError(
+            "layer_config_list must not be empty; use a leading MTPSplit for a zero-decoder model."
+        )
 
     pipeline_split_indices: list[int] = []
     mtp_split_indices: list[int] = []
@@ -74,14 +94,11 @@ def scan_hybrid_layer_config_list(
         elif entry is MTPSplit:
             seen_mtp = True
             mtp_split_indices.append(index)
-        else:
-            try:
-                layer_utils.get_layer_symbol_from_config(entry)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"Invalid hybrid layer config entry at index {index}: {entry!r}. "
-                    "Expected a supported TransformerConfig, PipelineSplit, or MTPSplit."
-                ) from exc
+        elif type(entry) not in _SUPPORTED_LAYER_CONFIG_TYPES:
+            raise ValueError(
+                f"Invalid hybrid layer config entry at index {index}: {entry!r}. "
+                "Expected a supported TransformerConfig, PipelineSplit, or MTPSplit."
+            )
 
     decoder_end = mtp_split_indices[0] if mtp_split_indices else len(layer_config_list)
     decoder_layer_count = sum(

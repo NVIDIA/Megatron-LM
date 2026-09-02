@@ -11,14 +11,18 @@ Run with:
     torchrun --nproc_per_node=1 -m pytest tests/unit_tests/elastification/test_flextron_mamba_elasticity_manager.py
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.elastification.flextron_elasticity_hooks import (
     FlextronMambaElasticityManager,
     add_flextron_mamba_elasticity,
@@ -34,7 +38,14 @@ def _flextron_fields(hidden_size, num_heads):
         flex_hetero_mamba=False,
         flex_hetero_ffn=False,
         flex_hetero_moe_expert=False,
-        hybrid_layer_pattern="M",
+        flextron_layer_config_list=(
+            MambaLayerConfig(
+                num_layers=1,
+                hidden_size=hidden_size,
+                num_attention_heads=1,
+                mamba_num_heads=num_heads,
+            ),
+        ),
         emb_int_list=[hidden_size, hidden_size // 2],
         mamba_int_list=[num_heads, num_heads // 2],
     )
@@ -48,6 +59,20 @@ class TestFlextronMambaElasticityManager:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_mixed_list_uses_mamba_ordinal(self):
+        config = SimpleNamespace(
+            flextron=True,
+            flextron_layer_config_list=(
+                MambaLayerConfig(num_layers=1, hidden_size=8, num_attention_heads=1),
+                AttentionLayerConfig(num_layers=1, hidden_size=8, num_attention_heads=1),
+                MambaLayerConfig(num_layers=1, hidden_size=8, num_attention_heads=1),
+            ),
+        )
+
+        manager = FlextronMambaElasticityManager(config, layer_idx=2)
+
+        assert manager.mamba_idx == 1
 
     def _build_mixer_and_config(self, hidden_size=256, num_heads=8):
         """Construct a bf16 MambaMixer on CUDA + a flextron-enabled config."""

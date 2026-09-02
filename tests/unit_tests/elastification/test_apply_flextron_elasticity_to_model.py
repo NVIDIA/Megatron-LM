@@ -14,6 +14,9 @@ import pytest
 import torch
 import torch.nn as nn
 
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.elastification import flextron_elasticity_hooks as hooks_module
 from megatron.elastification.flextron_elasticity_hooks import apply_flextron_elasticity_to_model
 
@@ -63,8 +66,20 @@ class _StubModel(nn.Module):
         self.decoder = decoder
 
 
-def _make_config(pattern="MEM*", flextron=True):
-    return SimpleNamespace(hybrid_layer_pattern=pattern, flextron=flextron)
+def _make_layer_config(layer_config_type):
+    return layer_config_type(num_layers=1, hidden_size=8, num_attention_heads=1)
+
+
+def _make_config(
+    layer_config_types=(MambaLayerConfig, MoELayerConfig, MambaLayerConfig, AttentionLayerConfig),
+    flextron=True,
+):
+    return SimpleNamespace(
+        flextron_layer_config_list=tuple(
+            _make_layer_config(layer_config_type) for layer_config_type in layer_config_types
+        ),
+        flextron=flextron,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -112,14 +127,14 @@ def stub_managers(monkeypatch):
 
 
 class TestEarlyReturns:
-    def test_missing_hybrid_pattern_returns_empty(self):
+    def test_missing_layer_config_list_returns_empty(self):
         model = _StubModel([_mamba_layer()])
-        config = SimpleNamespace()  # no hybrid_layer_pattern
+        config = SimpleNamespace()
         assert apply_flextron_elasticity_to_model(model, config) == []
 
-    def test_empty_hybrid_pattern_returns_empty(self):
+    def test_empty_layer_config_list_returns_empty(self):
         model = _StubModel([_mamba_layer()])
-        config = _make_config(pattern="")
+        config = _make_config(layer_config_types=())
         assert apply_flextron_elasticity_to_model(model, config) == []
 
     def test_missing_decoder_returns_empty(self):
@@ -131,7 +146,7 @@ class TestEarlyReturns:
 class TestLayerRouting:
     def test_m_layer_registers_mamba_only(self, stub_managers):
         model = _StubModel([_mamba_layer()])
-        config = _make_config(pattern="M")
+        config = _make_config(layer_config_types=(MambaLayerConfig,))
         apply_flextron_elasticity_to_model(model, config)
         assert len(stub_managers["mamba"]) == 1
         assert stub_managers["mamba"][0].layer_idx == 0
@@ -141,7 +156,7 @@ class TestLayerRouting:
 
     def test_star_layer_registers_attention_only(self, stub_managers):
         model = _StubModel([_attention_layer()])
-        config = _make_config(pattern="*")
+        config = _make_config(layer_config_types=(AttentionLayerConfig,))
         apply_flextron_elasticity_to_model(model, config)
         assert len(stub_managers["attention"]) == 1
         assert stub_managers["attention"][0].target.__class__.__name__ == "SelfAttention"
@@ -150,7 +165,7 @@ class TestLayerRouting:
 
     def test_e_layer_registers_all_four_moe_managers(self, stub_managers):
         model = _StubModel([_moe_layer()])
-        config = _make_config(pattern="E")
+        config = _make_config(layer_config_types=(MoELayerConfig,))
         apply_flextron_elasticity_to_model(model, config)
         assert len(stub_managers["transformer_layer"]) == 1
         assert len(stub_managers["moe"]) == 1
@@ -163,15 +178,15 @@ class TestLayerRouting:
         model = _StubModel(
             [_moe_layer(cls="TransformerLayer"), _moe_layer(cls="MoETransformerLayer")]
         )
-        config = _make_config(pattern="EE")
+        config = _make_config(layer_config_types=(MoELayerConfig, MoELayerConfig))
         apply_flextron_elasticity_to_model(model, config)
         # Both E-layers should have TransformerLayer elasticity attached.
         assert len(stub_managers["transformer_layer"]) == 2
 
-    def test_hybrid_pattern_routes_each_layer(self, stub_managers):
+    def test_layer_config_list_routes_each_layer(self, stub_managers):
         layers = [_mamba_layer(), _moe_layer(), _mamba_layer(), _attention_layer()]
         model = _StubModel(layers, with_final_norm=True)
-        config = _make_config(pattern="MEM*")
+        config = _make_config()
         apply_flextron_elasticity_to_model(model, config)
 
         # One mamba manager per M, one attention per *, and all four moe managers per E.
@@ -184,17 +199,61 @@ class TestLayerRouting:
         # And a single stack-level manager for the final norm.
         assert len(stub_managers["stack"]) == 1
 
+    def test_layer_managers_combine_typed_behavior_with_root_flextron_settings(self, stub_managers):
+        mamba_config = _make_layer_config(MambaLayerConfig)
+        moe_config = _make_layer_config(MoELayerConfig)
+        attention_config = _make_layer_config(AttentionLayerConfig)
+        mamba_config.layernorm_epsilon = 1e-4
+        moe_config.layernorm_epsilon = 2e-4
+        attention_config.layernorm_epsilon = 3e-4
+        layer_config_list = (mamba_config, moe_config, attention_config)
+        config = SimpleNamespace(
+            flextron_layer_config_list=layer_config_list,
+            flextron=True,
+            soft_mask=True,
+            layernorm_epsilon=9e-6,
+        )
+        model = _StubModel([_mamba_layer(), _moe_layer(), _attention_layer()])
+
+        apply_flextron_elasticity_to_model(model, config)
+
+        mamba_manager_config = stub_managers["mamba"][0].config
+        moe_manager_configs = [
+            stub_managers[manager_name][0].config
+            for manager_name in ("transformer_layer", "moe", "topk_router", "grouped_mlp")
+        ]
+        attention_manager_config = stub_managers["attention"][0].config
+
+        assert mamba_manager_config.layer_config is mamba_config
+        assert mamba_manager_config.layernorm_epsilon == 1e-4
+        assert all(
+            manager_config.layer_config is moe_config for manager_config in moe_manager_configs
+        )
+        assert all(
+            manager_config.layernorm_epsilon == 2e-4 for manager_config in moe_manager_configs
+        )
+        assert attention_manager_config.layer_config is attention_config
+        assert attention_manager_config.layernorm_epsilon == 3e-4
+        for manager_config in (
+            mamba_manager_config,
+            *moe_manager_configs,
+            attention_manager_config,
+        ):
+            assert manager_config.flextron is True
+            assert manager_config.soft_mask is True
+            assert manager_config.flextron_layer_config_list is layer_config_list
+
 
 class TestStackManager:
     def test_stack_manager_registered_when_final_norm_present(self, stub_managers):
         model = _StubModel([_mamba_layer()], with_final_norm=True)
-        config = _make_config(pattern="M")
+        config = _make_config(layer_config_types=(MambaLayerConfig,))
         apply_flextron_elasticity_to_model(model, config)
         assert len(stub_managers["stack"]) == 1
 
     def test_stack_manager_skipped_when_no_final_norm(self, stub_managers):
         model = _StubModel([_mamba_layer()], with_final_norm=False)
-        config = _make_config(pattern="M")
+        config = _make_config(layer_config_types=(MambaLayerConfig,))
         apply_flextron_elasticity_to_model(model, config)
         assert stub_managers["stack"] == []
 
@@ -206,7 +265,7 @@ class TestMissingSubmodules:
         layer.__class__ = type("MambaLayer", (nn.Module,), {})
         # intentionally no 'mixer' submodule
         model = _StubModel([layer])
-        config = _make_config(pattern="M")
+        config = _make_config(layer_config_types=(MambaLayerConfig,))
         apply_flextron_elasticity_to_model(model, config)
         assert stub_managers["mamba"] == []
 
@@ -215,7 +274,7 @@ class TestMissingSubmodules:
         layer.__class__ = type("TransformerLayer", (nn.Module,), {})
         # no SelfAttention submodule
         model = _StubModel([layer])
-        config = _make_config(pattern="*")
+        config = _make_config(layer_config_types=(AttentionLayerConfig,))
         apply_flextron_elasticity_to_model(model, config)
         assert stub_managers["attention"] == []
 
@@ -223,14 +282,18 @@ class TestMissingSubmodules:
 class TestManagersStoredOnModel:
     def test_model_gets_flextron_managers_attribute(self, stub_managers):
         model = _StubModel([_mamba_layer()])
-        config = _make_config(pattern="M")
+        config = _make_config(layer_config_types=(MambaLayerConfig,))
         returned = apply_flextron_elasticity_to_model(model, config)
         assert model._flextron_managers is returned
         assert len(returned) == len(stub_managers["mamba"])
 
-    def test_pattern_shorter_than_layers_only_uses_pattern_length(self, stub_managers):
+    @pytest.mark.parametrize(
+        "layer_config_types",
+        [(MambaLayerConfig,), (MambaLayerConfig, MambaLayerConfig, MambaLayerConfig)],
+    )
+    def test_layer_config_count_must_match_local_decoder(self, layer_config_types):
         layers = [_mamba_layer(), _mamba_layer(), _mamba_layer()]
-        model = _StubModel(layers)
-        config = _make_config(pattern="M")  # only first layer is covered
-        apply_flextron_elasticity_to_model(model, config)
-        assert len(stub_managers["mamba"]) == 1
+        model = _StubModel(layers[:2])
+        config = _make_config(layer_config_types=layer_config_types)
+        with pytest.raises(ValueError, match="layer configs.*local decoder"):
+            apply_flextron_elasticity_to_model(model, config)

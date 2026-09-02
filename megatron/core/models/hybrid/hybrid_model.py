@@ -118,10 +118,11 @@ def _select_pipeline_config_segment(
     topology_conflicts = []
     if config.pipeline_model_parallel_layout is not None:
         topology_conflicts.append("pipeline_model_parallel_layout")
-    if config.num_layers_in_first_pipeline_stage is not None:
-        topology_conflicts.append("num_layers_in_first_pipeline_stage")
-    if config.num_layers_in_last_pipeline_stage is not None:
-        topology_conflicts.append("num_layers_in_last_pipeline_stage")
+    if architecture_metadata.pipeline_split_indices:
+        if config.num_layers_in_first_pipeline_stage is not None:
+            topology_conflicts.append("num_layers_in_first_pipeline_stage")
+        if config.num_layers_in_last_pipeline_stage is not None:
+            topology_conflicts.append("num_layers_in_last_pipeline_stage")
     if config.account_for_embedding_in_pipeline_split:
         topology_conflicts.append("account_for_embedding_in_pipeline_split")
     if config.account_for_loss_in_pipeline_split:
@@ -163,16 +164,12 @@ def _select_pipeline_config_segment(
         segment_index = vp_rank * pp_size + pp_rank
         layer_offset = sum(len(segment) for segment in segments[:segment_index])
         selected = _clone_layer_config_list(segments[segment_index])
-        layer_types = ''.join(
-            layer_utils.get_layer_symbol_from_config(layer_config)
-            for layer_config in segments[segment_index]
-        )
         log_on_each_pipeline_stage(
             logger,
             logging.INFO,
             f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_rank}, "
-            f"segment_index={segment_index}/{len(segments)}, layers='{layer_types}' "
-            f"({len(selected)} layers), layer_offset={layer_offset}",
+            f"segment_index={segment_index}/{len(segments)}, "
+            f"num_layers={len(selected)}, layer_offset={layer_offset}",
             tp_group=tp_group,
             dp_cp_group=dp_cp_group,
         )
@@ -180,6 +177,57 @@ def _select_pipeline_config_segment(
 
     vp_size = config.virtual_pipeline_model_parallel_size or 1
     vp_rank = _normalize_vp_stage(vp_stage, vp_size)
+    first_stage_layers = config.num_layers_in_first_pipeline_stage
+    last_stage_layers = config.num_layers_in_last_pipeline_stage
+    if first_stage_layers is not None or last_stage_layers is not None:
+        if vp_size > 1:
+            raise ValueError(
+                "Uneven first/last pipeline stages cannot be combined with virtual "
+                "pipeline parallelism."
+            )
+        num_explicit_stages = int(first_stage_layers is not None) + int(
+            last_stage_layers is not None
+        )
+        if num_explicit_stages > pp_size:
+            raise ValueError("First/last pipeline stage overrides exceed the PP size.")
+        middle_stage_count = pp_size - num_explicit_stages
+        middle_layer_count = (
+            len(global_layer_config_list) - (first_stage_layers or 0) - (last_stage_layers or 0)
+        )
+        if middle_layer_count < 0 or (middle_stage_count == 0 and middle_layer_count != 0):
+            raise ValueError("First/last pipeline stage overrides exceed the decoder layer count.")
+        if middle_stage_count > 0 and middle_layer_count % middle_stage_count != 0:
+            raise ValueError(
+                f"Middle layers ({middle_layer_count}) must be evenly divisible by "
+                f"middle pipeline stages ({middle_stage_count})."
+            )
+        middle_layers_per_stage = (
+            middle_layer_count // middle_stage_count if middle_stage_count else 0
+        )
+
+        if first_stage_layers is not None and pp_rank == 0:
+            layer_offset, num_layers_to_build = 0, first_stage_layers
+        elif last_stage_layers is not None and pp_rank == pp_size - 1:
+            num_layers_to_build = last_stage_layers
+            layer_offset = len(global_layer_config_list) - last_stage_layers
+        else:
+            middle_rank = pp_rank - int(first_stage_layers is not None)
+            layer_offset = (first_stage_layers or 0) + middle_rank * middle_layers_per_stage
+            num_layers_to_build = middle_layers_per_stage
+
+        selected = _clone_layer_config_list(
+            global_layer_config_list[layer_offset : layer_offset + num_layers_to_build]
+        )
+        log_on_each_pipeline_stage(
+            logger,
+            logging.INFO,
+            f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_rank}, "
+            f"num_layers={len(selected)}, layer_offset={layer_offset}",
+            tp_group=tp_group,
+            dp_cp_group=dp_cp_group,
+        )
+        return selected, layer_offset
+
     num_pipeline_segments = pp_size * vp_size
     if len(global_layer_config_list) % num_pipeline_segments != 0:
         raise ValueError(
@@ -192,14 +240,11 @@ def _select_pipeline_config_segment(
     layer_end = layer_offset + num_layers_to_build
     selected_source = global_layer_config_list[layer_offset:layer_end]
     selected = _clone_layer_config_list(selected_source)
-    layer_types = ''.join(
-        layer_utils.get_layer_symbol_from_config(layer_config) for layer_config in selected_source
-    )
     log_on_each_pipeline_stage(
         logger,
         logging.INFO,
         f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_rank}, "
-        f"layers='{layer_types}' ({len(selected)} layers), layer_offset={layer_offset}",
+        f"num_layers={len(selected)}, layer_offset={layer_offset}",
         tp_group=tp_group,
         dp_cp_group=dp_cp_group,
     )
@@ -217,6 +262,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             This is used for positional embedding
         hybrid_layer_pattern (str): Unified hybrid layer pattern with optional MTP and
             pipeline stage boundaries.
+            This compatibility input is immediately converted to ``layer_config_list``
+            and is not retained by the model.
             Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
             The main pattern may contain "|" to define pipeline stage boundaries.
             Examples:
@@ -286,6 +333,76 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         vp_stage: Optional[int] = None,
         layer_config_list: Sequence[ArchitectureEntry] | None = None,
     ) -> None:
+        has_deprecated_ratios = (
+            hybrid_attention_ratio is not None and hybrid_attention_ratio > 0.0
+        ) or (hybrid_mlp_ratio is not None and hybrid_mlp_ratio > 0.0)
+        if layer_config_list is not None and (
+            hybrid_layer_pattern is not None
+            or hybrid_override_pattern is not None
+            or hybrid_attention_ratio is not None
+            or hybrid_mlp_ratio is not None
+        ):
+            raise ValueError(
+                "layer_config_list cannot be combined with hybrid_layer_pattern, "
+                "hybrid_override_pattern, hybrid_attention_ratio, or hybrid_mlp_ratio."
+            )
+
+        if layer_config_list is None:
+            if hybrid_override_pattern is not None:
+                if hybrid_layer_pattern is None:
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        "hybrid_override_pattern has been deprecated. "
+                        "Use hybrid_layer_pattern instead.",
+                    )
+                    hybrid_layer_pattern = hybrid_override_pattern
+                else:
+                    raise ValueError(
+                        "hybrid_override_pattern and hybrid_layer_pattern cannot both be set. "
+                        "hybrid_override_pattern has been deprecated; "
+                        "use hybrid_layer_pattern instead."
+                    )
+            if has_deprecated_ratios:
+                if hybrid_layer_pattern is not None:
+                    raise ValueError(
+                        "hybrid_layer_pattern cannot be used together with "
+                        "hybrid_attention_ratio or hybrid_mlp_ratio. "
+                        "These ratios have been deprecated; use hybrid_layer_pattern alone."
+                    )
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "hybrid_attention_ratio and hybrid_mlp_ratio have been deprecated. "
+                    "Use hybrid_layer_pattern instead.",
+                )
+                if hybrid_layer_pattern is None:
+                    from megatron.core.models.hybrid.hybrid_layer_allocation import (
+                        pattern_from_ratios,
+                    )
+
+                    attn_ratio = hybrid_attention_ratio if hybrid_attention_ratio else 0.0
+                    mlp_ratio = hybrid_mlp_ratio if hybrid_mlp_ratio else 0.0
+                    hybrid_layer_pattern = pattern_from_ratios(
+                        config.num_layers, attn_ratio, mlp_ratio
+                    )
+            if hybrid_layer_pattern is None:
+                raise ValueError(
+                    "Either hybrid_layer_pattern or layer_config_list must be provided."
+                )
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
+                layer_config_list_from_hybrid_layer_pattern,
+            )
+
+            layer_config_list = layer_config_list_from_hybrid_layer_pattern(
+                hybrid_layer_pattern, config
+            )
+            # The pattern is only a compatibility input. Do not retain it as a second
+            # architecture representation after producing the config list.
+            hybrid_layer_pattern = None
+            hybrid_override_pattern = None
+        layer_config_list = tuple(layer_config_list)
+
         super().__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
@@ -302,10 +419,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.hybrid_stack_spec: ModuleSpec = hybrid_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
-        self.hybrid_layer_pattern = hybrid_layer_pattern
-        self.layer_config_list: tuple[ArchitectureEntry, ...] | None = (
-            tuple(layer_config_list) if layer_config_list is not None else None
-        )
+        self.layer_config_list: tuple[ArchitectureEntry, ...] = layer_config_list
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
@@ -316,117 +430,44 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.vp_stage = vp_stage
         self.disable_param_offloading = True
 
-        has_deprecated_ratios = (
-            hybrid_attention_ratio is not None and hybrid_attention_ratio > 0.0
-        ) or (hybrid_mlp_ratio is not None and hybrid_mlp_ratio > 0.0)
-        if self.layer_config_list is not None and (
-            hybrid_layer_pattern is not None
-            or hybrid_override_pattern is not None
-            or hybrid_attention_ratio is not None
-            or hybrid_mlp_ratio is not None
-        ):
-            raise ValueError(
-                "layer_config_list cannot be combined with hybrid_layer_pattern, "
-                "hybrid_override_pattern, hybrid_attention_ratio, or hybrid_mlp_ratio."
-            )
-
-        # Backward compatibility for deprecated hybrid parameters
-        if self.layer_config_list is None and hybrid_override_pattern is not None:
-            if self.hybrid_layer_pattern is None:
-                log_single_rank(
-                    logger,
-                    logging.WARNING,
-                    "hybrid_override_pattern has been deprecated. "
-                    "Use hybrid_layer_pattern instead.",
-                )
-                self.hybrid_layer_pattern = hybrid_override_pattern
-            else:
-                raise ValueError(
-                    "hybrid_override_pattern and hybrid_layer_pattern cannot both be set. "
-                    "hybrid_override_pattern has been deprecated; use hybrid_layer_pattern instead."
-                )
-        if self.layer_config_list is None and has_deprecated_ratios:
-            if hybrid_layer_pattern is not None:
-                raise ValueError(
-                    "hybrid_layer_pattern cannot be used together with "
-                    "hybrid_attention_ratio or hybrid_mlp_ratio. "
-                    "These ratios have been deprecated; use hybrid_layer_pattern alone."
-                )
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                "hybrid_attention_ratio and hybrid_mlp_ratio have been deprecated. "
-                "Use hybrid_layer_pattern instead.",
-            )
-            if self.hybrid_layer_pattern is None:
-                from megatron.core.models.hybrid.hybrid_layer_allocation import pattern_from_ratios
-
-                attn_ratio = hybrid_attention_ratio if hybrid_attention_ratio else 0.0
-                mlp_ratio = hybrid_mlp_ratio if hybrid_mlp_ratio else 0.0
-                self.hybrid_layer_pattern = pattern_from_ratios(
-                    config.num_layers, attn_ratio, mlp_ratio
-                )
-
         logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
         mtp_layer_config_list: Sequence[TransformerConfig] | None = None
-
-        if self.layer_config_list is not None:
-            architecture_metadata = scan_hybrid_layer_config_list(
-                self.layer_config_list, pp_size=get_pg_size(self.pg_collection.pp)
+        architecture_metadata = scan_hybrid_layer_config_list(
+            self.layer_config_list, pp_size=get_pg_size(self.pg_collection.pp)
+        )
+        self.mtp_num_depths = architecture_metadata.mtp_num_depths
+        configured_mtp_num_layers = self.config.mtp_num_layers or 0
+        if configured_mtp_num_layers != self.mtp_num_depths:
+            raise ValueError(
+                f"layer_config_list defines {self.mtp_num_depths} MTP depths, but "
+                f"config.mtp_num_layers is {self.config.mtp_num_layers}."
             )
-            self.mtp_pattern = None
-            self.mtp_num_depths = architecture_metadata.mtp_num_depths
-            configured_mtp_num_layers = self.config.mtp_num_layers or 0
-            if configured_mtp_num_layers != self.mtp_num_depths:
-                raise ValueError(
-                    f"layer_config_list defines {self.mtp_num_depths} MTP depths, but "
-                    f"config.mtp_num_layers is {self.config.mtp_num_layers}."
-                )
 
-            decoder_end = (
-                architecture_metadata.mtp_split_indices[0]
-                if architecture_metadata.mtp_split_indices
+        decoder_end = (
+            architecture_metadata.mtp_split_indices[0]
+            if architecture_metadata.mtp_split_indices
+            else len(self.layer_config_list)
+        )
+        decoder_entries = self.layer_config_list[:decoder_end]
+        local_layer_config_list, layer_offset = _select_pipeline_config_segment(
+            decoder_entries,
+            architecture_metadata,
+            self.config,
+            self.pg_collection.pp,
+            self.vp_stage,
+            **logging_pg_kwargs,
+        )
+        if architecture_metadata.mtp_split_indices:
+            first_mtp_end = (
+                architecture_metadata.mtp_split_indices[1]
+                if len(architecture_metadata.mtp_split_indices) > 1
                 else len(self.layer_config_list)
             )
-            decoder_entries = self.layer_config_list[:decoder_end]
-            local_layer_config_list, layer_offset = _select_pipeline_config_segment(
-                decoder_entries,
-                architecture_metadata,
-                self.config,
-                self.pg_collection.pp,
-                self.vp_stage,
-                **logging_pg_kwargs,
-            )
-            if architecture_metadata.mtp_split_indices:
-                first_mtp_end = (
-                    architecture_metadata.mtp_split_indices[1]
-                    if len(architecture_metadata.mtp_split_indices) > 1
-                    else len(self.layer_config_list)
-                )
-                mtp_layer_config_list = cast(
-                    Sequence[TransformerConfig],
-                    self.layer_config_list[
-                        architecture_metadata.mtp_split_indices[0] + 1 : first_mtp_end
-                    ],
-                )
-        else:
-            # Legacy string architecture path.
-            from megatron.core.models.hybrid.hybrid_layer_allocation import (
-                parse_hybrid_pattern,
-                select_pipeline_segment,
-            )
-
-            parsed = parse_hybrid_pattern(self.hybrid_layer_pattern)
-            self.mtp_pattern = parsed.mtp_pattern
-            self.mtp_num_depths = parsed.mtp_num_depths
-            local_layer_config_list, layer_offset = select_pipeline_segment(
-                parsed.main_pattern or '',
-                self.config,
-                self.pg_collection.pp,
-                vp_stage,
-                first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
-                last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
-                **logging_pg_kwargs,
+            mtp_layer_config_list = cast(
+                Sequence[TransformerConfig],
+                self.layer_config_list[
+                    architecture_metadata.mtp_split_indices[0] + 1 : first_mtp_end
+                ],
             )
 
         # Determine whether this model instance builds MTP.
@@ -449,7 +490,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Validate TP communication overlap after determining whether this rank builds MTP,
         # before constructing the decoder or MTP modules.
-        layer_utils.validate_tp_comm_overlap(self.config, '', has_mtp=self.mtp_process)
+        layer_utils.validate_tp_comm_overlap(
+            self.config, local_layer_config_list, has_mtp=self.mtp_process
+        )
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -524,11 +567,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 spec=mtp_block_spec,
                 pg_collection=self.pg_collection,
                 vp_stage=self.vp_stage,
-                mtp_layer_pattern=self.mtp_pattern,
                 mtp_layer_config_list=mtp_layer_config_list,
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
-                is_hybrid_mtp=True,
                 name="mtp",
             )
             self._setup_mtp_cuda_graphs()

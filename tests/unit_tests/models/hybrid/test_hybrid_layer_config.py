@@ -75,6 +75,11 @@ def test_scanner_allows_decoder_only_and_leading_mtp_split():
     )
 
 
+def test_scanner_rejects_an_empty_architecture():
+    with pytest.raises(ValueError, match="must not be empty"):
+        scan_hybrid_layer_config_list([])
+
+
 @pytest.mark.parametrize(
     "architecture",
     [

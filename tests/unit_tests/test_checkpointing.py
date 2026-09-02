@@ -22,7 +22,10 @@ from megatron.core.utils import is_torch_min_version
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
+    _checkpoint_is_hybrid_model,
     _load_base_checkpoint,
+    _maybe_setup_gpt_to_hybrid_load,
+    generate_state_dict,
     get_checkpoint_tracker_filename,
     load_args_from_checkpoint,
     load_checkpoint,
@@ -74,6 +77,48 @@ class MockState:
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+@pytest.mark.parametrize("is_hybrid", [False, True])
+def test_generate_state_dict_persists_actual_model_family(is_hybrid):
+    """Checkpoint args record the built model family even when no pattern exists."""
+    args = SimpleNamespace(ckpt_format="torch", no_save_optim=True, no_save_rng=True)
+    model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
+
+    with mock.patch(
+        "megatron.training.checkpointing._contains_hybrid_model", return_value=is_hybrid
+    ):
+        state_dict = generate_state_dict(args, [model], None, None, None)
+
+    assert state_dict["args"] is args
+    assert state_dict["args"].checkpoint_model_is_hybrid is is_hybrid
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_args", "expected"),
+    [
+        (SimpleNamespace(checkpoint_model_is_hybrid=True), True),
+        (SimpleNamespace(checkpoint_model_is_hybrid=False, hybrid_layer_pattern="M*"), False),
+        (SimpleNamespace(hybrid_layer_pattern="M*"), True),
+        (SimpleNamespace(hybrid_override_pattern="M*"), True),
+        (SimpleNamespace(), False),
+    ],
+)
+def test_checkpoint_model_family_prefers_explicit_flag(checkpoint_args, expected):
+    """New metadata wins, while pattern-only checkpoints remain compatible."""
+    assert _checkpoint_is_hybrid_model(checkpoint_args) is expected
+
+
+def test_list_only_hybrid_checkpoint_does_not_take_gpt_remap_path():
+    """A list-authored HybridModel resume is identified without a saved pattern."""
+    args = SimpleNamespace(hybrid_layer_pattern=None)
+    checkpoint_args = SimpleNamespace(checkpoint_model_is_hybrid=True)
+
+    with mock.patch("megatron.training.checkpointing._contains_hybrid_model", return_value=True):
+        layer_maps, load_optim = _maybe_setup_gpt_to_hybrid_load(args, checkpoint_args, [object()])
+
+    assert layer_maps is None
+    assert load_optim is False
 
 
 def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):

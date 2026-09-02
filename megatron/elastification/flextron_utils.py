@@ -14,6 +14,9 @@ import torch.nn.functional as F
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron.core import mpu, parallel_state
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.elastification.arguments import convert_per_lists_to_int_lists
 from megatron.elastification.flextron_config import inject_flextron_config
 from megatron.elastification.flextron_elasticity_hooks import apply_flextron_elasticity_to_model
@@ -21,6 +24,7 @@ from megatron.elastification.memory_config import MemoryConfig, load_memory_conf
 from megatron.elastification.router.flex_budget_utils import (
     get_memory_footprint,
     get_num_parameters,
+    validate_flextron_layer_config_list,
 )
 from megatron.elastification.router.hybrid_flex_router import FlextronRouter
 from megatron.training import get_args
@@ -35,14 +39,40 @@ class FlextronModelManager:
     def __init__(self, model, config):
         self.model = model
         self.config = config
-        inject_flextron_config(get_args(), config)
+        args = get_args()
+        inject_flextron_config(args, config)
         convert_per_lists_to_int_lists(config)
-        config.hybrid_layer_pattern = getattr(model, 'hybrid_layer_pattern', '')
+
+        if config.pipeline_model_parallel_size != 1:
+            raise NotImplementedError(
+                "Flextron does not support pipeline model parallelism; "
+                f"got pipeline_model_parallel_size={config.pipeline_model_parallel_size}."
+            )
+        if config.virtual_pipeline_model_parallel_size not in (None, 1):
+            raise NotImplementedError(
+                "Flextron does not support virtual pipeline model parallelism; "
+                "got virtual_pipeline_model_parallel_size="
+                f"{config.virtual_pipeline_model_parallel_size}."
+            )
+
+        source_layer_config_list = getattr(model, 'layer_config_list', None)
+        if source_layer_config_list is None:
+            raise ValueError("Flextron requires a HybridModel with layer_config_list.")
+        self.layer_config_list = validate_flextron_layer_config_list(
+            source_layer_config_list, root_config=config
+        )
+        if len(self.layer_config_list) != config.num_layers:
+            raise ValueError(
+                f"Flextron received {len(self.layer_config_list)} layer configs for "
+                f"config.num_layers={config.num_layers}."
+            )
+
+        # Router and hook managers receive the same typed architecture snapshot.
+        config.flextron_layer_config_list = self.layer_config_list
         self.router = None
         self.budget_type = getattr(config, 'budget_type', 'param')
 
         # Load memory quantization profile from args
-        args = get_args()
         self.memory_config = load_memory_config(args)
 
         # Budget calculation attributes
@@ -84,7 +114,7 @@ class FlextronModelManager:
 
         self.all_param, self.active_param = torch.tensor(
             get_num_parameters(
-                hybrid_pattern=self.model.hybrid_layer_pattern,
+                layer_config_list=self.layer_config_list,
                 mamba_num_heads=self.config.mamba_num_heads,
                 mamba_d_head=self.config.mamba_head_dim,
                 mamba_d_state=self.config.mamba_state_dim,
@@ -107,7 +137,7 @@ class FlextronModelManager:
         """Setup memory loss function by calculating the baseline memory footprint."""
         self.total_memory = (
             get_memory_footprint(
-                hybrid_pattern=self.model.hybrid_layer_pattern,
+                layer_config_list=self.layer_config_list,
                 mamba_num_heads=self.config.mamba_num_heads,
                 mamba_d_head=self.config.mamba_head_dim,
                 mamba_d_state=self.config.mamba_state_dim,
@@ -164,18 +194,28 @@ class FlextronModelManager:
             logit_skip_all[self.config.layer_ranking_list] = logit_skip_selected
 
             mamba_idxs = [
-                i for i, char in enumerate(self.model.hybrid_layer_pattern) if char == 'M'
+                i
+                for i, layer_config in enumerate(self.layer_config_list)
+                if type(layer_config) is MambaLayerConfig
             ]
             mamba_idxs = torch.tensor(mamba_idxs, dtype=torch.long)
             flex_mamba_num_head = flex_mamba_num_head * logit_skip_all[mamba_idxs]
             flex_mamba_num_head = flex_mamba_num_head.unsqueeze(-1)
 
-            head_idxs = [i for i, char in enumerate(self.model.hybrid_layer_pattern) if char == '*']
+            head_idxs = [
+                i
+                for i, layer_config in enumerate(self.layer_config_list)
+                if type(layer_config) is AttentionLayerConfig
+            ]
             head_idxs = torch.tensor(head_idxs, dtype=torch.long)
             num_attention_heads = num_attention_heads * logit_skip_all[head_idxs]
             num_attention_heads = num_attention_heads.unsqueeze(-1)
 
-            moe_idxs = [i for i, char in enumerate(self.model.hybrid_layer_pattern) if char == 'E']
+            moe_idxs = [
+                i
+                for i, layer_config in enumerate(self.layer_config_list)
+                if type(layer_config) is MoELayerConfig
+            ]
             moe_idxs = torch.tensor(moe_idxs, dtype=torch.long)
             flex_ffn_hidden_size = flex_ffn_hidden_size * logit_skip_all[moe_idxs]
             flex_ffn_hidden_size = flex_ffn_hidden_size.unsqueeze(-1)
@@ -191,7 +231,7 @@ class FlextronModelManager:
             flex_moe_expert = flex_moe_expert.unsqueeze(-1)
 
         current_param_all, current_param_active = get_num_parameters(
-            hybrid_pattern=self.model.hybrid_layer_pattern,
+            layer_config_list=self.layer_config_list,
             mamba_num_heads=flex_mamba_num_head.float(),
             mamba_d_head=self.config.mamba_head_dim,
             mamba_d_state=self.config.mamba_state_dim,
@@ -211,7 +251,6 @@ class FlextronModelManager:
             moe_router_topk=self.config.moe_router_topk,
         )
 
-
         if self.config.budget_type == 'param':
             if self.memory_config.param_budget_target == 'active':
                 diff = abs(current_param_active / (budget_item * self.active_param) - 1)
@@ -219,7 +258,7 @@ class FlextronModelManager:
                 diff = abs(current_param_all / (budget_item * self.all_param) - 1)
         elif self.config.budget_type == 'mem':
             current_mem = get_memory_footprint(
-                hybrid_pattern=self.model.hybrid_layer_pattern,
+                layer_config_list=self.layer_config_list,
                 mamba_num_heads=flex_mamba_num_head.float(),
                 mamba_d_head=self.config.mamba_head_dim,
                 mamba_d_state=self.config.mamba_state_dim,
@@ -297,11 +336,7 @@ class FlextronModelManager:
             mse_loss_emb = F.mse_loss(flextron_kwargs['router_emb'][0], label_emb)
 
             diff += 10 * (
-                mse_loss_mamba
-                + mse_loss_mlp
-                + mse_loss_moe_expert
-                + mse_loss_skip
-                + mse_loss_emb
+                mse_loss_mamba + mse_loss_mlp + mse_loss_moe_expert + mse_loss_skip + mse_loss_emb
             )
 
         return diff.bfloat16(), {}
@@ -315,8 +350,8 @@ class FlextronModelManager:
         if self.router is None:
             return {}, None
 
-        (router_mlp, router_skip, router_emb, router_mamba, router_moe_expert) = (
-            self.router(budget_item)
+        router_mlp, router_skip, router_emb, router_mamba, router_moe_expert = self.router(
+            budget_item
         )
 
         flextron_kwargs = {

@@ -145,6 +145,16 @@ class TestValidateTpCommOverlap:
         assert str(exc_info.value) == expected_error
 
     @pytest.mark.parametrize(
+        ("config_type", "unsupported_feature"), [(MLALayerConfig, "MLA"), (DSALayerConfig, "DSA")]
+    )
+    def test_accepts_layer_configs(self, config_type, unsupported_feature):
+        config = _make_transformer_config(tp_comm_overlap=True)
+        layer_config = config_type.from_config(config)
+
+        with pytest.raises(ValueError, match=f"hybrid {unsupported_feature} layers"):
+            layer_utils.validate_tp_comm_overlap(config, [layer_config])
+
+    @pytest.mark.parametrize(
         ("tp_comm_overlap", "segment", "has_mtp"),
         [
             (

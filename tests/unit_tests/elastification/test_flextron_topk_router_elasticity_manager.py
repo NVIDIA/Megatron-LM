@@ -19,6 +19,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.elastification.flextron_elasticity_hooks import (
     FlextronTopKRouterElasticityManager,
     add_flextron_topk_router_elasticity,
@@ -32,7 +35,9 @@ def _config(num_moe_experts=8, soft_mask=False, flex_hetero_moe_expert=False):
         flex_hetero_moe_expert=flex_hetero_moe_expert,
         num_moe_experts=num_moe_experts,
         moe_expert_int_list=[num_moe_experts, num_moe_experts // 2],
-        hybrid_layer_pattern="E",
+        flextron_layer_config_list=(
+            MoELayerConfig(num_layers=1, hidden_size=8, num_attention_heads=1),
+        ),
     )
 
 
@@ -110,6 +115,28 @@ class TestFlextronTopKRouterElasticityManager:
         torch.testing.assert_close(seen[:, :4], torch.ones(2, 4))
         # Upper 4 columns: -inf.
         assert torch.isinf(seen[:, 4:]).all() and (seen[:, 4:] < 0).all()
+
+    def test_heterogeneous_expert_budget_uses_moe_ordinal(self):
+        cfg = _config(num_moe_experts=8, soft_mask=False, flex_hetero_moe_expert=True)
+        cfg.flextron_layer_config_list = (
+            MambaLayerConfig(num_layers=1, hidden_size=8, num_attention_heads=1),
+            MoELayerConfig(num_layers=1, hidden_size=8, num_attention_heads=1),
+            AttentionLayerConfig(num_layers=1, hidden_size=8, num_attention_heads=1),
+            MoELayerConfig(num_layers=1, hidden_size=8, num_attention_heads=1),
+        )
+        router = _StubRouter(expert_bias=torch.zeros(8))
+        manager = FlextronTopKRouterElasticityManager(cfg, layer_idx=3)
+        manager.attach_hooks(router)
+        manager.set_elasticity_params(
+            router_moe_expert=(torch.tensor([[1.0, 0.0], [0.0, 1.0]]), [8, 4])
+        )
+
+        router.routing(torch.ones(2, 8))
+
+        assert manager.moe_idx == 1
+        seen = router.calls[0]["logits"]
+        assert torch.isfinite(seen[:, :4]).all()
+        assert torch.isneginf(seen[:, 4:]).all()
 
     def test_hard_mask_preserves_expert_bias_after_call(self):
         """Regression: the wrapper must save and restore router.expert_bias.

@@ -790,8 +790,8 @@ def get_mtp_inner_layer_paths(model):
 
     Hybrid MTP layers are excluded, matching
     ``MultiTokenPredictionLayer.sharded_state_dict``: for them ``mtp_model_layer`` is already
-    the native checkpoint name. ``MultiTokenPredictionLayer`` exposes ``is_hybrid_mtp``
-    explicitly for both config-list and legacy-pattern construction.
+    the native checkpoint name. ``MultiTokenPredictionLayer`` derives ``is_hybrid_mtp``
+    from whether it was constructed with a layer-config list.
     """
     return [
         _strip_wrapper_prefixes(name)
