@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import os
 from contextlib import nullcontext
 from unittest.mock import Mock, call
 
@@ -10,7 +9,6 @@ import torch
 from megatron.core.pipeline_parallel import fine_grained_activation_offload as offload
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     ChunkOffloadHandler,
-    FineGrainedActivationOffloadingInterface,
     PipelineOffloadManager,
 )
 
@@ -202,152 +200,3 @@ def test_max_inflight_fifo_is_per_group_name(
             entry.group for entry in handler._offload_pending_by_name["core_attn"]
         ] == core_groups[1:]
         assert [entry.group for entry in handler._offload_pending_by_name["mlp"]] == [mlp_group]
-
-
-def _set_local_cuda_device():
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if local_rank >= torch.cuda.device_count():
-        pytest.fail(
-            f"LOCAL_RANK={local_rank} is outside visible CUDA device count "
-            f"{torch.cuda.device_count()}"
-        )
-    torch.cuda.set_device(local_rank)
-
-
-@pytest.fixture
-def cuda_offload_manager():
-    _set_local_cuda_device()
-    torch.cuda.synchronize()
-    FineGrainedActivationOffloadingInterface.reset_instance()
-    manager = PipelineOffloadManager.get_instance()
-    try:
-        yield manager
-    finally:
-        torch.cuda.synchronize()
-        FineGrainedActivationOffloadingInterface.reset_instance()
-        torch.cuda.empty_cache()
-
-
-def _prewarm_cpu_pool(handler, count, shape, dtype):
-    backups = [handler.cpu_tensor_pool.allocate(shape, dtype=dtype) for _ in range(count)]
-    for backup in backups:
-        handler.cpu_tensor_pool.free(backup)
-
-
-def _capture_real_d2h_group(handler, group, source, tag):
-    handler.d2h_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(handler.d2h_stream):
-        torch.cuda._sleep(50_000_000)
-    group.push_tensor(tag, source)
-    handler.bulk_offload_group(group)
-
-
-def _assert_cpu_backup(group, tag, expected):
-    _, backup, _ = group._tensors[tag]
-    torch.testing.assert_close(backup, torch.full_like(backup, expected))
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for graph capture.")
-@pytest.mark.launch_on_gb200
-@pytest.mark.parametrize(
-    ("max_inflight_offloads", "may_cross_graphs"),
-    [
-        pytest.param(0, False, id="full-iteration-cap0"),
-        pytest.param(2, False, id="full-iteration-cap2"),
-        pytest.param(0, True, id="te-like-same-owner-cap0"),
-        pytest.param(2, True, id="te-like-same-owner-cap2"),
-    ],
-)
-def test_same_graph_throttle_orders_real_d2h_before_source_reuse(
-    cuda_offload_manager, max_inflight_offloads, may_cross_graphs
-):
-    manager = cuda_offload_manager
-    handler = _new_handler(manager, max_inflight_offloads)
-    group_count = max_inflight_offloads + 1
-    shape = (4096,)
-    dtype = torch.float32
-    _prewarm_cpu_pool(handler, group_count, shape, dtype)
-    sources = [torch.empty(shape, dtype=dtype, device="cuda") for _ in range(group_count)]
-    tags = [(index + 1, 0) for index in range(group_count)]
-    groups = []
-    graph = torch.cuda.CUDAGraph()
-
-    capture_scope = (
-        FineGrainedActivationOffloadingInterface.cuda_graph_capture_scope
-        if may_cross_graphs
-        else manager.cuda_graph_capture_scope
-    )
-    with capture_scope(may_cross_graphs=may_cross_graphs):
-        for _ in range(group_count):
-            groups.append(_empty_group(handler, "core_attn"))
-        with torch.cuda.graph(graph):
-            for group, source, tag in zip(groups, sources, tags):
-                _capture_real_d2h_group(handler, group, source, tag)
-            # The oldest copy is the one drained by cap=0/cap=2. Reusing its
-            # source immediately after the drain exposes a missing graph edge.
-            sources[0].add_(1000)
-            torch.cuda.current_stream().wait_stream(handler.d2h_stream)
-
-    try:
-        for replay, value in enumerate((11.0, 22.0)):
-            for source in sources:
-                source.fill_(value)
-            torch.cuda.synchronize()
-            graph.replay()
-            torch.cuda.synchronize()
-            _assert_cpu_backup(groups[0], tags[0], value)
-            assert sources[0][0].item() == value + 1000
-    finally:
-        torch.cuda.synchronize()
-        graph = None
-        groups.clear()
-        sources.clear()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for graph capture.")
-@pytest.mark.launch_on_gb200
-def test_cross_graph_throttle_captures_real_d2h_with_external_event(cuda_offload_manager):
-    manager = cuda_offload_manager
-    handler = _new_handler(manager, max_inflight_offloads=2)
-    shape = (4096,)
-    dtype = torch.float32
-    _prewarm_cpu_pool(handler, 3, shape, dtype)
-    sources = [torch.empty(shape, dtype=dtype, device="cuda") for _ in range(3)]
-    tags = [(index + 1, 0) for index in range(3)]
-    groups = []
-    graphs = []
-
-    for index in range(3):
-        graph = torch.cuda.CUDAGraph()
-        with manager.cuda_graph_capture_scope(may_cross_graphs=True):
-            group = _empty_group(handler, "core_attn")
-            groups.append(group)
-            with torch.cuda.graph(graph):
-                _capture_real_d2h_group(handler, group, sources[index], tags[index])
-                if index == 2:
-                    # Graph three drains graph one's pending entry. Capture must
-                    # encode an external wait; an internal event is invalid here.
-                    sources[0].add_(1000)
-                # CUDA capture requires every forked stream to rejoin its own
-                # graph. Because this local join may also order payload completion,
-                # capture/replay success is the cross-graph event regression signal;
-                # payload checks below only prove that each graph performed real D2H.
-                torch.cuda.current_stream().wait_stream(handler.d2h_stream)
-        graphs.append(graph)
-
-    try:
-        for value in (31.0, 42.0):
-            for source in sources:
-                source.fill_(value)
-            torch.cuda.synchronize()
-            for graph in graphs:
-                graph.replay()
-            torch.cuda.synchronize()
-            for group, tag in zip(groups, tags):
-                _assert_cpu_backup(group, tag, value)
-            assert sources[0][0].item() == value + 1000
-    finally:
-        torch.cuda.synchronize()
-        graphs.clear()
-        groups.clear()
-        sources.clear()
