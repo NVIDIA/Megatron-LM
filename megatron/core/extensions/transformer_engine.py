@@ -2106,7 +2106,6 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
             num_attention_heads=num_attention_heads,
             kv_channels=(qk_head_dim, value_head_dim),
             qkv_format="bshd",
-            attn_mask_type="causal",
             layer_number=layer_number,
         )
 

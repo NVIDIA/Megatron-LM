@@ -520,7 +520,6 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
             assert (g <= 0).all()
             assert (beta >= 0).all() and (beta <= 1).all()
 
-    @pytest.mark.launch_on_gb200
     def test_gpu_forward_thd_padding_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
@@ -587,7 +586,6 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
 @pytest.mark.skipif(not HAVE_TE_GDN, reason="TransformerEngine GDN is not available.")
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.internal
-@pytest.mark.launch_on_gb200
 def test_te_gdn_matches_previous_fla_path():
     """TE's fused GDN core matches the previously used FLA rule."""
     Utils.initialize_model_parallel(
@@ -742,7 +740,6 @@ class TestGDNCuSeqlensResolve:
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-@pytest.mark.launch_on_gb200
 def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
     transformer_config = TransformerConfig(
         hidden_size=128,
