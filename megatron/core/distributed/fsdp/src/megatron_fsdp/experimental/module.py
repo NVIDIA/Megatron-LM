@@ -25,6 +25,7 @@ from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
+from .countdown import Countdown
 from .indexed_order import IndexedOrder
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import Flat
@@ -41,8 +42,8 @@ class FsdpContext:
     allgather_stream: torch.cuda.Stream
     reduce_scatter_stream: torch.cuda.Stream
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
-    # unnecessary because it can be detected when ``model_weight``, after syncing
-    # from ``main_weight``, has placements different from ``Placements.optimizer``.
+    # unnecessary because each parameter group tracks whether model_weight is stale
+    # after syncing from main_weight.
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool
@@ -155,9 +156,8 @@ class FsdpModule:
     _name: str | None
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext
-    _num_ready_grad_parameters: int
+    _trainable_parameter_countdown: Countdown
     _is_root: bool
-    _num_trainable_parameters: int
     # Event recorded after this FsdpModule's full parameters are materialized.
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
     # already prefetched this module.
@@ -205,16 +205,18 @@ class FsdpModule:
                         main_weight_placements, group_dtype
                     ),
                     mixed_precision_policy=mixed_precision_policy,
-                    allgather_stream=context.allgather_stream,
                     reduce_scatter_stream=context.reduce_scatter_stream,
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
-        self._num_ready_grad_parameters = 0
-        self._num_trainable_parameters = sum(
-            len(group.fsdp_parameters) for group in self._parameter_groups if group.requires_grad
+        self._trainable_parameter_countdown = Countdown(
+            sum(
+                len(group.fsdp_parameters)
+                for group in self._parameter_groups
+                if group.requires_grad
+            )
         )
         self._register_hooks(skip_forward_backward_hooks=skip_forward_backward_hooks)
         context.register_module(self)
@@ -271,7 +273,7 @@ class FsdpModule:
         module.register_full_backward_pre_hook(
             lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
         )
-        if self._num_trainable_parameters == 0:
+        if self._trainable_parameter_countdown.initial_value == 0:
             module.register_full_backward_hook(
                 lambda hooked_module, _grad_input, _grad_output: cast(
                     FsdpModule, hooked_module
@@ -289,8 +291,7 @@ class FsdpModule:
             module = module_ref()
             if module is None:
                 return
-            module._num_ready_grad_parameters += 1
-            if module._num_ready_grad_parameters == module._num_trainable_parameters:
+            if module._trainable_parameter_countdown.decrement():
                 module.post_backward()
 
         for group in self._parameter_groups:
@@ -335,7 +336,6 @@ class FsdpModule:
         if self.phase is not FsdpModule.Phase.BACKWARD:
             self.phase = FsdpModule.Phase.FORWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
-        self._num_ready_grad_parameters = 0
         allgather_stream = context.allgather_stream
         current_stream = context.current_stream()
 

@@ -7,7 +7,6 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from gpt_builders import gpt_builder
 from hybrid_builders import hybrid_builder
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
@@ -53,13 +52,18 @@ def make_gpt_mock_data_iterator(
         yield batch
 
 
-def make_moe_args_model_and_optimizer(ut_filename, model_family="hybrid", **overrides):
+def make_moe_args_model_and_optimizer(ut_filename, **overrides):
     sys.argv = [ut_filename]
     base_args = dict(
+        hybrid_layer_pattern="MEME/ME",
+        spec=["megatron.core.models.hybrid.hybrid_layer_specs", "hybrid_stack_spec"],
         num_layers=4,
+        mtp_num_layers=1,
         hidden_size=128,
         num_attention_heads=2,
         max_position_embeddings=128,
+        mamba_num_groups=4,
+        mamba_num_heads=16,
         bf16=False,
         add_bias_linear=False,
         swiglu=True,
@@ -80,20 +84,6 @@ def make_moe_args_model_and_optimizer(ut_filename, model_family="hybrid", **over
         use_distributed_optimizer=True,
         finalize_model_grads_func=finalize_model_grads,
     )
-    if model_family == "hybrid":
-        base_args.update(
-            hybrid_layer_pattern="MEME/ME",
-            spec=["megatron.core.models.hybrid.hybrid_layer_specs", "hybrid_stack_spec"],
-            mtp_num_layers=1,
-            mamba_num_groups=4,
-            mamba_num_heads=16,
-        )
-        model_builder = hybrid_builder
-    elif model_family == "gpt":
-        base_args.update(hybrid_layer_pattern=None, spec=None, mtp_num_layers=None)
-        model_builder = gpt_builder
-    else:
-        raise ValueError(f"Unsupported model family: {model_family}")
 
     base_args.update(overrides)
     args = parse_args()
@@ -106,11 +96,11 @@ def make_moe_args_model_and_optimizer(ut_filename, model_family="hybrid", **over
     destroy_num_microbatches_calculator()
     set_global_variables(args, build_tokenizer=False)
 
-    cfg_container = Utils.pretrain_config_from_global_args(args, model_family)
+    cfg_container = Utils.pretrain_config_from_global_args(args, "hybrid")
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     model, optimizer, _ = setup_model_and_optimizer(
         model_type=ModelType.encoder_or_decoder,
-        model_provider_func=partial(model_provider, model_builder),
+        model_provider_func=partial(model_provider, hybrid_builder),
         cfg_container=cfg_container,
         pg_collection=pg_collection,
     )
@@ -183,7 +173,7 @@ class GPTMockDataset(Dataset):
         }
 
 
-def _forward_step_func(data_iterator, model, device="cuda", return_schedule_plan=False):
+def _forward_step_func(data_iterator, model, device="cuda"):
 
     def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
 
@@ -193,7 +183,7 @@ def _forward_step_func(data_iterator, model, device="cuda", return_schedule_plan
         # If you have data parallel reduce loss across data parallel groups.
         # If pipeline parallel, loss computation is done only in last stage.
 
-        return loss, {'lm loss': loss.detach().clone()}
+        return loss, {'lm loss': loss}
 
     vp_stage = get_attr_wrapped_model(model, "vp_stage")
 
@@ -211,11 +201,6 @@ def _forward_step_func(data_iterator, model, device="cuda", return_schedule_plan
         )
         position_ids = data["position_ids"].to(device, non_blocking=True)
 
-    if return_schedule_plan:
-        schedule_plan = model.build_schedule_plan(
-            tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
-        )
-        return schedule_plan, partial(loss_func, loss_mask)
-
     output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
+
     return output_tensor, partial(loss_func, loss_mask)

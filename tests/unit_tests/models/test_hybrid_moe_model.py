@@ -171,6 +171,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "layernorm_zero_centered_gamma": False,
     "linear_attention_freq": None,
     "linear_cp_layout": "zigzag",
+    "linear_cp_mode": "headwise",
     "linear_conv_kernel_dim": 4,
     "linear_key_head_dim": 128,
     "linear_num_key_heads": 16,
@@ -184,6 +185,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mamba_training_ssm_states_dtype": None,
     "masked_softmax_fusion": True,
     "memory_efficient_layer_norm": False,
+    "mhc_fused_backend": "auto",
     "mhc_init_gating_factor": 0.01,
     "mhc_recompute_layer_num": None,
     "mhc_sinkhorn_iterations": 20,
@@ -326,6 +328,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "tp_only_amax_red": False,
     "transformer_impl": "transformer_engine",
     "use_cpu_initialization": None,
+    "use_fused_mhc": False,
     "use_fused_weighted_squared_relu": False,
     "use_inference_optimized_layers": False,
     "use_kitchen": False,
@@ -358,6 +361,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "inference_disable_triton_nvls_kernels": False,
     "moe_router_force_biased": None,
     "inference_grouped_gemm_backend": "vllm",
+    "inference_flashinfer_mxfp8_token_capacity": None,
     "inference_moe_disable_fused_quant_kernels": False,
     "inference_moe_token_dispatcher_type": "nvls",
     "moe_mlp_glu_interleave_size": None,
@@ -366,6 +370,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_single_grouped_bias": False,
     "sequence_packing_scheduler": None,
     "moe_hybridep_pad_uneven_dispatch_inputs": False,
+    "sequence_packing_scheduler": None,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

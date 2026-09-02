@@ -12,7 +12,8 @@ import torch
 import torch.distributed as dist
 
 try:
-    import nccl.core as nccl
+    import nccl
+    import nccl.core as nccl_core
     import nccl.m2n as m2n
 
     HAVE_NCCL_M2N = True
@@ -108,7 +109,7 @@ def _validate_role_roster(roles: list[tuple[bool, bool]]) -> _M2NTopology:
 def _validate_nccl_version(nccl_module: Any) -> None:
     """Ensure the loaded NCCL library supports the current M2N API."""
     try:
-        version = nccl_module.get_version().libnccl.version
+        version = nccl_module.get_version().nccl.version
         release = tuple(version.release)
     except AttributeError as exc:
         raise RuntimeError("NCCL M2N requires the current NCCL4Py package") from exc
@@ -116,6 +117,21 @@ def _validate_nccl_version(nccl_module: Any) -> None:
     if release < _MINIMUM_NCCL_VERSION:
         required = ".".join(str(value) for value in _MINIMUM_NCCL_VERSION)
         raise RuntimeError(f"NCCL M2N requires NCCL >= {required}, found {version}")
+
+
+def _has_nccl_cuda_backend(group: Any) -> bool:
+    """Return whether CUDA collectives on *group* dispatch through NCCL."""
+    if dist.get_backend(group) == dist.Backend.NCCL:
+        return True
+    if group is None:
+        return False
+    # NeMo RL's cross-world refit group keeps Gloo as its default for CPU
+    # object collectives and registers NCCL specifically for CUDA tensors.
+    try:
+        cuda_backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
+    except RuntimeError:
+        return False
+    return cuda_backend._get_backend_name() == dist.Backend.NCCL
 
 
 def _stage_pairs(specs: list[TensorReshardSpec]) -> tuple[_StagePair, ...]:
@@ -205,7 +221,7 @@ class NCCLM2NCopyService(CopyService):
         super().__init__(group=group)
 
         self._device = torch.device("cuda", torch.cuda.current_device())
-        if dist.get_backend(group) != "nccl":
+        if not _has_nccl_cuda_backend(group):
             raise RuntimeError("NCCLM2NCopyService requires an NCCL process group")
 
         _validate_nccl_version(nccl)
@@ -237,6 +253,20 @@ class NCCLM2NCopyService(CopyService):
             )
         self._is_source = is_source
         self._is_destination = is_destination
+
+    def set_plan(self, plan: object, *, transform: object | None = None) -> None:
+        """Adopt the plan's cross-rank-coordinated grouped-submission limit."""
+        if not isinstance(plan, ReshardPlan):
+            raise TypeError("NCCL M2N requires a ReshardPlan")
+        max_group_bytes = plan.execution_batch_bytes
+        if max_group_bytes is None:
+            return
+        if self._topology is not None and max_group_bytes != self._max_group_bytes:
+            raise RuntimeError(
+                "NCCL M2N grouped-submission limit changed while reusing a service; "
+                "close the service before using a plan with a different limit"
+            )
+        self._max_group_bytes = max_group_bytes
 
     def submit_send(
         self, src_tensor: torch.Tensor, dest_rank: int, task_id: int | None = None
@@ -302,7 +332,7 @@ class NCCLM2NCopyService(CopyService):
                 raise RuntimeError(f"NCCL M2N meshes overlap for {spec.resolved_name}")
 
     def _broadcast_unique_id(self, root_rank: int) -> Any:
-        unique_id = bytes(nccl.get_unique_id(empty=self.rank != root_rank))
+        unique_id = bytes(nccl_core.get_unique_id(empty=self.rank != root_rank))
         if self.rank == root_rank and not unique_id:
             raise RuntimeError("NCCL4Py returned an empty NCCL unique ID")
         unique_id_tensor = torch.tensor(list(unique_id), dtype=torch.uint8, device=self._device)
@@ -310,7 +340,7 @@ class NCCLM2NCopyService(CopyService):
             unique_id_tensor = torch.empty(128, dtype=torch.uint8, device=self._device)
         src_rank = root_rank if self.group is None else dist.get_global_rank(self.group, root_rank)
         dist.broadcast(unique_id_tensor, src=src_rank, group=self.group)
-        return nccl.UniqueId.from_bytes(bytes(unique_id_tensor.cpu().tolist()))
+        return nccl_core.UniqueId.from_bytes(bytes(unique_id_tensor.cpu().tolist()))
 
     def _prepare_channels(self, pairs: tuple[_StagePair, ...]) -> None:
         """Collectively bootstrap one exact communicator per stage pair."""
@@ -328,7 +358,7 @@ class NCCLM2NCopyService(CopyService):
             unique_id = self._broadcast_unique_id(members[0])
             if self.rank in members:
                 channel_rank = members.index(self.rank)
-                comm = nccl.Communicator.init(len(members), channel_rank, unique_id)
+                comm = nccl_core.Communicator.init(len(members), channel_rank, unique_id)
                 stream = torch.cuda.Stream(device=self._device)
                 self._channels[pair] = _M2NChannel(
                     comm=comm,

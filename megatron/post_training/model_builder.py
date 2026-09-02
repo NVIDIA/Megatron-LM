@@ -373,7 +373,10 @@ def modelopt_gpt_hybrid_builder(
                 config, use_transformer_engine=use_te,
             )
             mtp_block_spec = get_gpt_mtp_block_spec(
-                config, decoder_layer_specs[-1], use_transformer_engine=use_te,
+                config,
+                decoder_layer_specs[-1],
+                use_transformer_engine=use_te,
+                pp_rank=pg_collection.pp.rank() if pg_collection is not None else None,
             )
 
         model_kwargs = {

@@ -38,6 +38,11 @@ class SamplingParams:
     # drops prompt_tokens before serializing the finished request, saving the ZMQ
     # transmission cost for long prompts. Opt in when the client needs them.
     return_prompt_tokens: bool = False
+    # When False, the DP coordinator skips detokenizing this request's output. The
+    # coordinator is a single process serving every DP rank, so per-request work there
+    # is a throughput ceiling; callers that can detokenize themselves (e.g. the HTTP
+    # frontend, which is replicated) should set this to False.
+    detokenize_generations: bool = True
     streaming: bool = False  # Emit incremental ENGINE_REPLY_PARTIAL frames.
     streaming_interval: int = 1  # Minimum unsent tokens per ENGINE_REPLY_PARTIAL.
     do_kv_handoff: bool = False  # Pin KV blocks and expose metadata for peer transfer.

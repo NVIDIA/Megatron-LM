@@ -12,6 +12,7 @@ import torch.distributed as dist
 
 from megatron.core.resharding.copy_services.nccl_m2n_copy_service import (
     NCCLM2NCopyService,
+    _has_nccl_cuda_backend,
     _M2NChannel,
     _parameter_groups,
     _stage_pairs,
@@ -25,7 +26,7 @@ from tests.unit_tests.test_utilities import Utils
 
 def _nccl_with_version(*release: int):
     version = SimpleNamespace(release=release)
-    version_info = SimpleNamespace(libnccl=SimpleNamespace(version=version))
+    version_info = SimpleNamespace(nccl=SimpleNamespace(version=version))
     return SimpleNamespace(get_version=lambda: version_info)
 
 
@@ -57,6 +58,21 @@ def test_validate_nccl_version():
     _validate_nccl_version(_nccl_with_version(2, 30, 5))
     with pytest.raises(RuntimeError, match=r"NCCL >= 2\.30\.5"):
         _validate_nccl_version(_nccl_with_version(2, 30, 4))
+
+
+def test_hybrid_group_uses_registered_nccl_cuda_backend(monkeypatch):
+    cuda_backend = SimpleNamespace(_get_backend_name=lambda: "nccl")
+    group = SimpleNamespace(_get_backend=lambda device: cuda_backend)
+    monkeypatch.setattr(dist, "get_backend", lambda _group: "gloo")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+
+    assert _has_nccl_cuda_backend(group)
+
+    def get_missing_backend(_device):
+        raise RuntimeError("no CUDA backend")
+
+    gloo_only_group = SimpleNamespace(_get_backend=get_missing_backend)
+    assert not _has_nccl_cuda_backend(gloo_only_group)
 
 
 def test_validate_role_roster_accepts_source_first_disjoint_meshes():
@@ -128,6 +144,17 @@ def test_model_roles_cannot_change_while_reusing_service():
 
     with pytest.raises(RuntimeError, match="roles cannot change"):
         service.set_model_roles(is_source=False, is_destination=True)
+
+
+def test_plan_overrides_local_group_limit_with_coordinated_value():
+    service = object.__new__(NCCLM2NCopyService)
+    service._topology = None
+    service._max_group_bytes = 256
+    plan = ReshardPlan([], [], execution_batch_bytes=128)
+
+    service.set_plan(plan)
+
+    assert service._max_group_bytes == 128
 
 
 def test_topology_is_collected_once(monkeypatch):

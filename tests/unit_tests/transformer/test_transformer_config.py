@@ -46,6 +46,44 @@ def test_batch_invariant_backend_rejects_unknown_value_at_construction():
         )
 
 
+def test_mhc_fused_backend_defaults_to_auto():
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+
+    assert config.mhc_fused_backend == "auto"
+
+
+@pytest.mark.parametrize("backend", ["native", "triton", "cutile"])
+def test_mhc_fused_backend_accepts_explicit_policy(backend: str):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        enable_mhc_connections=True,
+        use_fused_mhc=True,
+        mhc_fused_backend=backend,
+    )
+
+    assert config.mhc_fused_backend == backend
+
+
+def test_mhc_fused_backend_rejects_unknown_value_at_construction():
+    with pytest.raises(ValueError, match="Unknown mhc_fused_backend"):
+        TransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=4, mhc_fused_backend="cuda"
+        )
+
+
+def test_explicit_mhc_fused_backend_requires_fused_mhc():
+    with pytest.raises(ValueError, match="requires use_fused_mhc"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            mhc_fused_backend="native",
+        )
+
+
 def test_gdp_num_householder_defaults_to_three():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 
@@ -58,6 +96,32 @@ def test_gdp_num_householder_accepts_positive_values():
     )
 
     assert config.gdp_num_householder == 5
+
+
+def test_from_config_creates_independent_target_config_without_reinitializing():
+    class LayerConfig(TransformerConfig):
+
+        def __post_init__(self):
+            raise AssertionError("from_config must not reinitialize the target config")
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    config.dynamic_value = {"items": []}
+    config.dynamic_alias = config.dynamic_value
+    config.self_reference = config
+    config.state_reference = config.__dict__
+
+    layer_config = LayerConfig.from_config(config)
+
+    assert type(layer_config) is LayerConfig
+    assert vars(layer_config).keys() == vars(config).keys()
+    assert layer_config.dynamic_value == config.dynamic_value
+    assert layer_config.dynamic_value is not config.dynamic_value
+    assert layer_config.dynamic_alias is layer_config.dynamic_value
+    assert layer_config.self_reference is layer_config
+    assert layer_config.state_reference is layer_config.__dict__
+
+    layer_config.dynamic_value["items"].append("changed")
+    assert config.dynamic_value == {"items": []}
 
 
 @pytest.mark.parametrize("num_householder", [0, -1])
