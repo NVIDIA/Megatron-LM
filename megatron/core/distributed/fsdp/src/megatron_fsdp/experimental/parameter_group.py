@@ -14,19 +14,21 @@
 
 """Parameter-group runtime state for the minimal Megatron-FSDP path."""
 
+from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from weakref import ReferenceType, ref
 
 import torch
-import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from torch import nn
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Partial, Replicate
+from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import Partial, Placements, Replicate, changed_mesh_axis
+from .placement import changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -39,6 +41,22 @@ def get_containing_parameter_group(parameter: nn.Parameter) -> "FsdpParameterGro
     if parameter_group_ref is None:
         return None
     return parameter_group_ref()
+
+
+def sync_model_weights_from_main_weights(parameters: Iterable[nn.Parameter]) -> None:
+    """Sync MFSDP compute weights for parameter groups represented by ``parameters``.
+
+    Parameters outside the experimental MFSDP path are ignored. A parameter group
+    may own multiple parameters, but its compute-weight buffer is synced once.
+    """
+    seen_parameter_groups = set()
+    for parameter in parameters:
+        if (parameter_group := get_containing_parameter_group(parameter)) is None:
+            continue
+        if parameter_group in seen_parameter_groups:
+            continue
+        seen_parameter_groups.add(parameter_group)
+        parameter_group.sync_model_weight_from_main_weight()
 
 
 @dataclass(frozen=True, eq=False)
@@ -64,6 +82,11 @@ class FsdpParameterGroup:
     requires_grad: bool
     main_weight: DBuffer
     model_weight: DBuffer
+    # Optimizer-layout view into model_weight storage, avoiding a second allocation.
+    post_optimizer_model_weight: DBuffer
+    # sync_model_weight_from_main_weight() updates only this rank's optimizer-layout
+    # view; the remaining model_weight slices must be all-gathered before compute.
+    _model_weight_is_stale: bool
     main_grad: DBuffer | None
     _unsharded_model_weight: DBuffer
     _symm_mem_pool: torch.cuda.MemPool | None
@@ -74,38 +97,42 @@ class FsdpParameterGroup:
         owning_module: nn.Module,
         parameters: dict[str, nn.Parameter],
         mesh: DeviceMesh,
-        placements: Placements,
+        model_weight_placements: tuple[Placement, ...],
+        main_grad_placements: tuple[Placement, ...],
+        main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
         reduce_scatter_stream: torch.cuda.Stream,
-        use_symm_mem: bool = False,
         grad_divisor: int = 1,
+        use_symmetric_memory: bool = False,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
         Args:
             owning_module: Closest FSDP root module that owns this parameter group.
             parameters: Root-module-relative FQNs and their parameters.
-            mesh: Device mesh used for all DBuffer storage in this version.
-            placements: Parameter, gradient, and optimizer placements.
+            mesh: Parent device mesh containing the data-parallel axes.
+            model_weight_placements: Compute-weight buffer placements.
+            main_grad_placements: Main-gradient buffer placements.
+            main_weight_placements: Main-weight buffer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
             reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
-            use_symm_mem: Allocate communication staging buffers from PyTorch's
+            use_symmetric_memory: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
             grad_divisor: Additional divisor applied on top of the mesh-size
                 averaging. See ``fully_shard``.
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
-        if use_symm_mem and not hasattr(symm_mem, "is_symm_mem_tensor"):
+        if use_symmetric_memory and not hasattr(symm_mem, "is_symm_mem_tensor"):
             raise RuntimeError("Symmetric-memory MFSDP requires PyTorch 2.12 or later.")
 
         parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
         for fqn, parameter in parameters.items():
             parameter_to_fqns.setdefault(parameter, []).append(fqn)
 
-        model_weight_placements = tuple(placements.parameter)
-        main_grad_placements = tuple(placements.gradient)
-        main_weight_placements = tuple(placements.optimizer)
+        # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
+        # is finalized to main_weight's placements after the last microbatch.
+        self._main_grad_placements = main_grad_placements
 
         # Python dicts preserve insertion order, so parameter_to_fqns and
         # fsdp_parameters define the same stable DBuffer tensor order.
@@ -135,27 +162,39 @@ class FsdpParameterGroup:
             placements=main_weight_placements,
         )
 
-        if use_symm_mem:
+        if use_symmetric_memory:
             # PyTorch caches this in C++ and returns early when the backend is already NCCL.
             symm_mem.set_backend("NCCL")
             self._symm_mem_pool = symm_mem.get_mem_pool(self.main_weight.device)
         else:
             self._symm_mem_pool = None
 
+        if main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
+            self.model_weight = self.main_weight
+        else:
+            # Keep the configured compute-weight layout alive for the lifetime of this
+            # parameter group. The optimizer-layout sync buffer below is only a view
+            # into its local storage, so the first ZeRO-1 unshard can all-gather
+            # directly into this allocation.
+            with self._symmetric_memory_context():
+                self.model_weight = DBuffer(
+                    mesh=self.mesh,
+                    placements=model_weight_placements,
+                    tensor_shapes=tensor_shapes,
+                    dtype=self.dtype,
+                    device=self.main_weight.device,
+                )
+        self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
+        # Cast into the preallocated optimizer-layout view on the current stream.
+        self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
+        self._model_weight_is_stale = (
+            self.post_optimizer_model_weight.placements != self.model_weight.placements
+        )
+
         with self._symmetric_memory_context():
             self._unsharded_model_weight = DBuffer(
                 mesh=self.mesh,
                 placements=[Replicate()] * self.mesh.ndim,
-                tensor_shapes=tensor_shapes,
-                dtype=self.dtype,
-                device=self.main_weight.device,
-            )
-        if main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
-            self.model_weight = self.main_weight
-        else:
-            self.model_weight = DBuffer(
-                mesh=self.mesh,
-                placements=model_weight_placements,
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
                 device=self.main_weight.device,
@@ -181,9 +220,6 @@ class FsdpParameterGroup:
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
                 "and DBuffer layouts are deterministic from those shapes and mesh size."
             )
-            # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
-            # is finalized to main_weight's placements after the last microbatch.
-            self._accumulation_placements = main_grad_placements
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
@@ -214,11 +250,8 @@ class FsdpParameterGroup:
             )
         self.fsdp_parameters = tuple(fsdp_parameters)
 
-        # Compute weights must be initialized before the first forward; subsequent
-        # refreshes happen from the FSDP optimizer's post-step hook.
-        self.sync_model_weight_from_main_weight()
-        self._switch_to_sharded_parameters()
         self._unsharded_model_weight.release_storage()
+        self._switch_to_sharded_parameters()
 
     def _symmetric_memory_context(self):
         if self._symm_mem_pool is None:
@@ -243,42 +276,37 @@ class FsdpParameterGroup:
 
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
-        if self.main_weight is self.model_weight:
-            return
-
-        if self.main_weight.placements == self.model_weight.placements:
-            self.main_weight.cast(self.model_weight.dtype, out=self.model_weight)
-            return
-
-        # main_weight is typically the higher-precision optimizer dtype, while
-        # model_weight is the lower-precision compute dtype. Cast before redistributing
-        # so cross-rank communication moves the smaller compute-dtype payload.
-        self.main_weight.cast(self.model_weight.dtype).redistribute(
-            self.model_weight.placements, out=self.model_weight
+        self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
+        self._model_weight_is_stale = (
+            self.post_optimizer_model_weight.placements != self.model_weight.placements
         )
 
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
-        with self._symmetric_memory_context():
-            self._unsharded_model_weight.reallocate_storage()
-        # This buffer backs unsharded Parameters whose views may be saved by autograd.
-        # Autograd records a tensor's version counter when saving it for backward, and
-        # in-place writes like the out= redistribution below increment that counter even
-        # under no_grad. Without preserving it, backward can fail with "modified by an
-        # inplace operation" even though FSDP only materialized internal storage.
-        gather_axis = changed_mesh_axis(
-            self.model_weight.placements, self._unsharded_model_weight.placements
-        )
-        if gather_axis is None:
-            raise RuntimeError("FSDP parameter unshard requires a changed placement axis.")
-        with torch.autograd._unsafe_preserve_version_counter(
-            self._unsharded_model_weight.local_buffer
-        ):
-            if self._symm_mem_pool is not None:
-                self._unsharded_model_weight.rendezvous(gather_axis)
-            self.model_weight.redistribute(
-                self._unsharded_model_weight.placements, out=self._unsharded_model_weight
+        if self._model_weight_is_stale:
+            self.post_optimizer_model_weight.redistribute(
+                self.model_weight.placements, out=self.model_weight
             )
+            self._model_weight_is_stale = False
+        if self.model_weight.placements == self._unsharded_model_weight.placements:
+            unsharded_model_weight = self.model_weight
+        else:
+            with self._symmetric_memory_context():
+                self._unsharded_model_weight.reallocate_storage()
+            # This buffer backs unsharded Parameters whose views may be saved by autograd.
+            # Autograd records a tensor's version counter when saving it for backward, and
+            # in-place writes like the out= redistribution below increment that counter even
+            # under no_grad. Without preserving it, backward can fail with "modified by an
+            # inplace operation" even though FSDP only materialized internal storage.
+            with torch.autograd._unsafe_preserve_version_counter(
+                self._unsharded_model_weight.local_buffer
+            ):
+                self.model_weight.redistribute(
+                    self._unsharded_model_weight.placements, out=self._unsharded_model_weight
+                )
+            unsharded_model_weight = self._unsharded_model_weight
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            fsdp_parameter.unsharded.data = unsharded_model_weight.get_local_tensor(index)
         self._switch_to_unsharded_parameters()
 
     def reshard_parameters(self) -> None:
@@ -309,7 +337,7 @@ class FsdpParameterGroup:
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
-                placements=[Partial(dist.ReduceOp.AVG)] * self.mesh.ndim,
+                placements=[Partial("avg")] * self.mesh.ndim,
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,
@@ -339,12 +367,13 @@ class FsdpParameterGroup:
     ) -> None:
         """Reduce a packed partial gradient buffer into sharded parameter gradients.
 
-        For HSDP main_grad rests DP-outer-Partial (Partial where main_weight is
-        Replicate) between microbatches, accumulating each backward through the
-        standard zero_grad contract; the last microbatch reduces the DP-outer axes,
-        finalizing main_grad to main_weight's placements so ``.grad`` is the fully
-        reduced gradient before ``optimizer.step()``. With every axis Flat (plain
-        DP) main_grad already rests finalized.
+        For HSDP/HFSDP main_grad rests DP-outer-Partial between microbatches,
+        accumulating each backward through the standard zero_grad contract; the
+        last microbatch reduces the DP-outer axes, finalizing main_grad to
+        main_weight's placements (all-reduce to Replicate for HSDP, reduce-scatter
+        to Flat for HFSDP) so ``.grad`` is the fully reduced gradient before
+        ``optimizer.step()``. With every axis Flat (plain DP) main_grad already
+        rests finalized.
         """
         assert self.main_grad is not None
 
@@ -354,33 +383,51 @@ class FsdpParameterGroup:
         has_sharded_grads = self._has_sharded_grads()
 
         # A non-accumulation main_grad means the previous step finalized it; this
-        # only happens on the first microbatch. Redistribute it back to the
-        # DP-outer-Partial accumulation placement -- a metadata relabel for HSDP,
-        # and a fresh reduce-scattered buffer for HFSDP in the future.
-        if self.main_grad.placements != self._accumulation_placements:
-            self.main_grad = self.main_grad.redistribute(self._accumulation_placements)
+        # only happens on the first microbatch. Restore it to the DP-outer-Partial
+        # accumulation placement. HSDP's finalize keeps the buffer size (Replicate
+        # on DP-outer), so relabel it in place; HFSDP's finalize reduce-scattered
+        # DP-outer to a smaller optimizer-sharded buffer, so allocate a fresh one
+        # (zeroed only when we accumulate into it, i.e. sharded grads are still set).
+        if self.main_grad.placements != self._main_grad_placements:
+            assert self.main_grad.allocation_stream == (
+                torch.cuda.current_stream(self.main_grad.device)
+            )
+            reset_axis = changed_mesh_axis(self.main_grad.placements, self._main_grad_placements)
+            assert reset_axis is not None  # the placements differ, so an axis changed
+            if isinstance(self.main_grad.placements[reset_axis], Replicate):
+                # HSDP: Replicate -> Partial changes only metadata and reuses the tensor.
+                self.main_grad = self.main_grad.redistribute(self._main_grad_placements)
+            else:
+                # HFSDP: main_grad was reduce-scattered to the optimizer shard, too small
+                # to hold the accumulation, so re-allocate. This runs inside the
+                # reduce_scatter stream context (see FsdpModule._reduce_gradient_groups),
+                # so the buffer is allocated on that stream and stays race-safe. Zero it
+                # only when we accumulate (set_to_none=False); with set_to_none=True the
+                # reduction below overwrites it via out=.
+                self.main_grad = DBuffer(
+                    mesh=self.mesh,
+                    placements=self._main_grad_placements,
+                    tensor_shapes=self.main_weight.layout.tensor_shapes,
+                    dtype=self.main_grad.dtype,
+                    device=self.main_weight.device,
+                )
+                if has_sharded_grads:
+                    self.main_grad.local_buffer.zero_()
 
-        can_reduce_into_main_grad = (
+        if can_reduce_into_main_grad := (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
-        )
-        reduce_axis = changed_mesh_axis(partial_grad.placements, self.main_grad.placements)
-        if reduce_axis is None:
-            raise RuntimeError("FSDP gradient reduction requires a changed placement axis.")
-        if self._symm_mem_pool is not None:
-            partial_grad.rendezvous(reduce_axis)
-        # Divide this backward's contribution, not the accumulated total: with plain
-        # all-Flat DP every backward is a last microbatch, so main_grad accumulates
-        # across microbatches below and a scale applied to the running sum would
-        # compound. Dividing before the deferred DP-outer reduction is equivalent because
-        # both that reduction and this scale are linear.
-        if can_reduce_into_main_grad:
+        ):
             partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
-            if self.grad_divisor != 1:
-                self.main_grad.local_buffer.div_(self.grad_divisor)
+            reduced_grad = self.main_grad
         else:
             reduced_grad = partial_grad.redistribute(self.main_grad.placements)
-            if self.grad_divisor != 1:
-                reduced_grad.local_buffer.div_(self.grad_divisor)
+
+        # Scale this backward's contribution before accumulating it so repeated
+        # backwards do not repeatedly scale the running total.
+        if self.grad_divisor != 1:
+            reduced_grad.local_buffer.div_(self.grad_divisor)
+
+        if reduced_grad is not self.main_grad:
             if has_sharded_grads:
                 self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
             else:
@@ -389,6 +436,9 @@ class FsdpParameterGroup:
         if is_last_microbatch:
             # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
             # reduce-scatter for HFSDP) before binding the sharded parameter grads.
+            assert self.main_grad.allocation_stream == (
+                torch.cuda.current_stream(self.main_grad.device)
+            )
             self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
 
         # Make each sharded parameter's .grad consistent with the final main_grad.

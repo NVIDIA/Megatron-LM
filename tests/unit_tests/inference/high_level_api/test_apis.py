@@ -10,6 +10,8 @@ from unittest.mock import MagicMock
 import pytest
 
 import megatron.core.inference.apis._llm_base as base_mod
+import megatron.core.inference.apis.async_llm as async_llm_mod
+import megatron.core.inference.apis.llm as llm_mod
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
 from megatron.core.inference.apis.llm import MegatronLLM
@@ -25,6 +27,11 @@ def mock_pipeline(monkeypatch):
     monkeypatch.setattr(base_mod, "GPTInferenceWrapper", MagicMock())
     monkeypatch.setattr(base_mod, "TextGenerationController", MagicMock())
     monkeypatch.setattr(base_mod, "DynamicInferenceEngine", MagicMock())
+    # MegatronLLM / MegatronAsyncLLM default their inference_wrapper_cls to
+    # None and resolve to base_mod.GPTInferenceWrapper at call time, so the
+    # base_mod patch above is what steers them at construction time.
+    monkeypatch.setattr(llm_mod, "GPTInferenceWrapper", MagicMock())
+    monkeypatch.setattr(async_llm_mod, "GPTInferenceWrapper", MagicMock())
     # Bypass the EP-group initialization assert when no distributed setup
     # is in scope. Individual tests can override (e.g.,
     # ``test_ep_gt_1_requires_use_coordinator``).
@@ -170,10 +177,65 @@ class TestLifecycleGuards:
         monkeypatch.setattr(dist, "get_rank", lambda: 0)
         monkeypatch.setattr(tgs, "start_text_gen_server", lambda **kw: started.update(kw))
 
-        llm.serve(ServeConfig(port=1234), blocking=False)
+        sock = MagicMock()
+        llm.serve(
+            ServeConfig(
+                port=1234,
+                sock=sock,
+                default_temperature=0.7,
+                default_top_p=0.95,
+                default_top_k=20,
+                eval_mode=True,
+            ),
+            blocking=False,
+        )
         assert llm._serve_started is True
         assert started["coordinator_addr"] == "tcp://coord:5555"
         assert started["server_port"] == 1234
+        assert started["sock"] is sock
+        assert started["default_temperature"] == 0.7
+        assert started["default_top_p"] == 0.95
+        assert started["default_top_k"] == 20
+        assert started["eval_mode"] is True
+
+    @pytest.mark.asyncio
+    async def test_async_serve_primary_rank_starts_frontend(self, monkeypatch):
+        """Async serving forwards sampling defaults to the HTTP frontend."""
+        tgs = pytest.importorskip(
+            "megatron.core.inference.text_generation_server.dynamic_text_gen_server"
+            ".text_generation_server"
+        )
+        import torch.distributed as dist
+
+        llm = _make_worker_instance(MegatronAsyncLLM)
+        llm._is_primary_rank = True
+        llm._coord_runtime = MagicMock()
+        llm._coord_runtime.coord_addr = "tcp://coord:5555"
+
+        started = {}
+        monkeypatch.setattr(dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(tgs, "start_text_gen_server", lambda **kw: started.update(kw))
+
+        sock = MagicMock()
+        await llm.serve(
+            ServeConfig(
+                port=1234,
+                sock=sock,
+                default_temperature=0.7,
+                default_top_p=0.95,
+                default_top_k=20,
+                eval_mode=True,
+            ),
+            blocking=False,
+        )
+        assert llm._serve_started is True
+        assert started["coordinator_addr"] == "tcp://coord:5555"
+        assert started["server_port"] == 1234
+        assert started["sock"] is sock
+        assert started["default_temperature"] == 0.7
+        assert started["default_top_p"] == 0.95
+        assert started["default_top_k"] == 20
+        assert started["eval_mode"] is True
 
 
 class TestNormalizePrompts:
