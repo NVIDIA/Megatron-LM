@@ -2253,23 +2253,29 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         num_splits: Optional[int] = None,
     ) -> torch.Tensor:
         """Forward."""
+        original_cp_group = self.cp_group
+        original_cp_global_ranks = self.cp_global_ranks
+
         if packed_seq_params is not None:
-            # If Dynamic CP group is provided, update TE DPA CP group
-            if packed_seq_params.cp_group is not None:
-                self.cp_group = packed_seq_params.cp_group
-                super().set_context_parallel_group(
-                    self.cp_group,
-                    torch.distributed.get_process_group_ranks(self.cp_group),
-                    TEDotProductAttention.cp_stream,
-                    self.cp_comm_type,
-                )
-            # If cp_group is None but local_cp_size is provided,
-            # Indicates to turn off CP dynamically
-            elif packed_seq_params.local_cp_size is not None:
-                assert (
-                    packed_seq_params.local_cp_size == 1
-                ), "local_cp_size must be == 1 if provided without cp_group"
-                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+            if packed_seq_params.local_cp_size is not None:
+                if packed_seq_params.local_cp_size == 1:
+                    assert (
+                        packed_seq_params.cp_group is None
+                    ), "cp_group must be None when local_cp_size == 1"
+                    super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+                else:
+                    assert (
+                        packed_seq_params.cp_group is not None
+                    ), "cp_group must be set when local_cp_size > 1"
+                    if TEDotProductAttention.cp_stream is None:
+                        TEDotProductAttention.cp_stream = torch.cuda.Stream()
+                    self.cp_group = packed_seq_params.cp_group
+                    super().set_context_parallel_group(
+                        self.cp_group,
+                        torch.distributed.get_process_group_ranks(self.cp_group),
+                        TEDotProductAttention.cp_stream,
+                        self.cp_comm_type,
+                    )
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
 
@@ -2349,6 +2355,17 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if num_splits is not None:
                 _fa_kwargs["num_splits"] = num_splits
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
+
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            if original_cp_group is None or original_cp_group.size() == 1:
+                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+            else:
+                super().set_context_parallel_group(
+                    original_cp_group,
+                    original_cp_global_ranks,
+                    TEDotProductAttention.cp_stream,
+                    self.cp_comm_type,
+                )
 
         return core_attn_out
 

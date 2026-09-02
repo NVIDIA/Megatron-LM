@@ -11,7 +11,6 @@ from torch.utils.data import Dataset
 
 from megatron.core import mpu
 from megatron.core.datasets.utils import Split
-
 from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 
@@ -52,7 +51,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'single':
-        if args.hybrid_context_parallel and args.sequence_packing_scheduler is None:
+        if args.dynamic_context_parallel and args.sequence_packing_scheduler is None:
             batch_sampler = HybridCPMegatronPretrainingSampler(
                 total_samples=len(dataset),
                 consumed_samples=consumed_samples,
@@ -111,7 +110,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     # normally.
     if (
         (args.use_varlen_dataset and not args.varlen_sbhd_validation)
-        or args.hybrid_context_parallel
+        or args.dynamic_context_parallel
         or args.sequence_packing_scheduler is not None
     ):
         extra_kwargs = {"collate_fn": lambda x: x}

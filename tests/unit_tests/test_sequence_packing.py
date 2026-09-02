@@ -9,10 +9,15 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule import (
+    DefaultDynamicCPScheduler,
     _build_thd_padding_mask,
     _sanitize_thd_padding_values,
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
+)
+from megatron.core.datasets.data_schedule_utils import (
+    next_hdp_group_packing_aware,
+    reroute_samples_to_dcp_ranks,
 )
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
@@ -45,6 +50,184 @@ def test_scheduler_sanitizes_thd_padding_values():
     assert torch.equal(batch['labels'], torch.tensor([12, 13, 0, 22, 0]))
     assert torch.equal(batch['loss_mask'], torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0]))
     assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
+
+
+def test_next_hdp_group_packing_aware_can_expand_short_sequence_group():
+    micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+        [(0, 6144), (1, 2048)], total_gpus=2, max_seq_len_per_rank=4096
+    )
+
+    assert leftovers == []
+    assert micro_batches == [[6144, 2048], [6144, 2048]]
+    assert sample_ids == [[0, 1], [0, 1]]
+    assert exec_times[0] == exec_times[1]
+
+
+def test_next_hdp_group_packing_aware_fills_non_power_of_two_group():
+    micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+        [(0, 50), (1, 50)], total_gpus=14, max_seq_len_per_rank=100
+    )
+
+    assert leftovers == []
+    assert micro_batches == [[50, 50] for _ in range(14)]
+    assert sample_ids == [[0, 1] for _ in range(14)]
+    assert exec_times == [exec_times[0] for _ in range(14)]
+
+
+def test_default_dynamic_cp_scheduler_uses_packing_aware_grouping():
+    scheduler = DefaultDynamicCPScheduler(
+        max_seqlen_per_dp_cp_rank=4096,
+        cp_size=2,
+        dp_size=1,
+        microbatch_group_size_per_vp_stage=None,
+    )
+
+    groups = scheduler.get_groups_and_subsamples([(0, 6144), (1, 2048)])
+
+    assert groups == [[[0, 1], [0, 1]]]
+
+
+def test_dynamic_cp_group_sizes_partition_dpxcp_ranks():
+    assert parallel_state.get_valid_dynamic_context_parallel_group_sizes(8) == [1, 2, 4, 8]
+    assert parallel_state.get_valid_dynamic_context_parallel_group_sizes(6) == [1, 2, 6]
+
+
+def test_default_dynamic_cp_scheduler_rejects_uncreated_min_group_size():
+    with pytest.raises(ValueError, match="min_cp_size=3.*expected one of"):
+        DefaultDynamicCPScheduler(
+            max_seqlen_per_dp_cp_rank=4096,
+            cp_size=8,
+            dp_size=1,
+            microbatch_group_size_per_vp_stage=None,
+            min_cp_size=3,
+        )
+
+
+def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
+    class _Group:
+        def __init__(self, size, rank):
+            self._size = size
+            self._rank = rank
+
+        def size(self):
+            return self._size
+
+        def rank(self):
+            return self._rank
+
+    dp_group = _Group(size=2, rank=0)
+    dp_cp_group = _Group(size=2, rank=0)
+    batch = [
+        {
+            'tokens': torch.tensor([10, 11]),
+            'labels': torch.tensor([110, 111]),
+            'loss_mask': torch.tensor([1.0, 0.0]),
+            'position_ids': torch.tensor([0, 1]),
+            'original_seq_len': torch.tensor([2], dtype=torch.int32),
+            'padded_seq_len': torch.tensor([2], dtype=torch.int32),
+        },
+        {
+            'tokens': torch.tensor([20]),
+            'labels': torch.tensor([120]),
+            'loss_mask': torch.tensor([1.0]),
+            'position_ids': torch.tensor([0]),
+            'original_seq_len': torch.tensor([1], dtype=torch.int32),
+            'padded_seq_len': torch.tensor([1], dtype=torch.int32),
+        },
+    ]
+    remote_inputs = iter(
+        [
+            torch.tensor([30, 31, 32, 33]),
+            torch.tensor([130, 131, 132, 133]),
+            torch.tensor([1.0, 1.0, 0.0, 0.0]),
+            torch.tensor([0, 1, 2, 3]),
+            torch.tensor([4, 0], dtype=torch.int32),
+            torch.tensor([4, 0], dtype=torch.int32),
+        ]
+    )
+    gather_groups = []
+
+    def _all_gather_into_tensor(output, input_, group):
+        gather_groups.append(group)
+        remote = next(remote_inputs)
+        assert input_.numel() == remote.numel()
+        output.copy_(torch.cat([input_, remote]))
+
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: torch.device('cpu'))
+    monkeypatch.setattr(torch.distributed, 'all_gather_into_tensor', _all_gather_into_tensor)
+    monkeypatch.setattr(
+        torch.distributed,
+        'all_to_all_single',
+        lambda *args, **kwargs: pytest.fail('reroute must not use all_to_all_single'),
+    )
+
+    received = reroute_samples_to_dcp_ranks(
+        batch=batch,
+        global_ids_this_rank=torch.tensor([0, 1]),
+        global_id_seqlens=[(0, 2), (1, 1), (2, 4)],
+        sample_id_groups=[[[2], [0, 1]]],
+        offsets=torch.tensor([0, 2, 3]),
+        dp_group=dp_group,
+        dp_cp_group=dp_cp_group,
+    )
+
+    assert list(received) == [2]
+    assert torch.equal(received[2]['tokens'], torch.tensor([30, 31, 32, 33]))
+    assert torch.equal(received[2]['labels'], torch.tensor([130, 131, 132, 133]))
+    assert torch.equal(received[2]['loss_mask'], torch.tensor([1.0, 1.0, 0.0, 0.0]))
+    assert torch.equal(received[2]['position_ids'], torch.tensor([0, 1, 2, 3]))
+    assert received[2]['original_seq_len'].item() == 4
+    assert received[2]['padded_seq_len'].item() == 4
+    assert gather_groups == [dp_group] * 6
+
+
+def test_scheduler_reroute_rejects_multimodal_metadata_in_text_contract():
+    group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    batch = [
+        {
+            'tokens': torch.tensor([10]),
+            'original_seq_len': torch.tensor([1], dtype=torch.int32),
+            'padded_seq_len': torch.tensor([1], dtype=torch.int32),
+            'image_grid_thw': torch.tensor([[1, 2, 2]]),
+        }
+    ]
+
+    with pytest.raises(
+        AssertionError,
+        match=r"supports only the text sample schema.*unsupported sample keys \['image_grid_thw'\]",
+    ):
+        reroute_samples_to_dcp_ranks(
+            batch=batch,
+            global_ids_this_rank=torch.tensor([0]),
+            global_id_seqlens=[(0, 1)],
+            sample_id_groups=[[[0]]],
+            offsets=torch.tensor([0, 1]),
+            dp_group=group,
+            dp_cp_group=group,
+        )
+
+
+def test_scheduler_reroute_rejects_inconsistent_sample_keys():
+    group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    batch = [
+        {
+            'tokens': torch.tensor([10]),
+            'original_seq_len': torch.tensor([1], dtype=torch.int32),
+            'padded_seq_len': torch.tensor([1], dtype=torch.int32),
+        },
+        {'tokens': torch.tensor([20]), 'original_seq_len': torch.tensor([1], dtype=torch.int32)},
+    ]
+
+    with pytest.raises(AssertionError, match='Sample 1 keys'):
+        reroute_samples_to_dcp_ranks(
+            batch=batch,
+            global_ids_this_rank=torch.tensor([0, 1]),
+            global_id_seqlens=[(0, 1), (1, 1)],
+            sample_id_groups=[[[0, 1]]],
+            offsets=torch.tensor([0, 2]),
+            dp_group=group,
+            dp_cp_group=group,
+        )
 
 
 class MockVariableLengthSequencePackingDataIterator:
@@ -343,6 +526,8 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp):
         (2, 4, 1, None, "dp_balanced"),
         (2, 2, 1, None, "dp_balanced"),
         (1, 4, 1, 4, "dp_balanced"),
+        (1, 2, 1, None, "default_dynamic_cp"),
+        (1, 4, 1, 4, "default_dynamic_cp"),
     ],
 )
 def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
@@ -384,7 +569,15 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
         }
 
     # Initialize model parallel
-    Utils.initialize_model_parallel(tp, pp, vpp, context_parallel_size=cp)
+    dynamic_cp = scheduler_type == "default_dynamic_cp"
+    Utils.initialize_model_parallel(
+        tp,
+        pp,
+        vpp,
+        context_parallel_size=cp,
+        dynamic_context_parallel=dynamic_cp,
+        min_dynamic_context_parallel_size=1,
+    )
 
     global_batch_size = 64
     micro_batch_size = 1
@@ -395,6 +588,7 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
     config.microbatch_group_size_per_vp_stage = pp
     config.virtual_pipeline_model_parallel_size = vpp
     config.sequence_packing_scheduler = scheduler_type
+    config.min_dynamic_context_parallel_size = 1
 
     dp_rank = parallel_state.get_data_parallel_rank()
     dp_size = parallel_state.get_data_parallel_world_size()

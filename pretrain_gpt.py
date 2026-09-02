@@ -42,12 +42,12 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.gpt import GPTModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
-    get_hybrid_data_context_parallel_groups,
+    get_dynamic_data_context_parallel_groups,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -126,6 +126,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 vp_stage=vp_stage,
             ),
             vp_stage=vp_stage,
+            dynamic_cp=args.dynamic_context_parallel,
+            config=config,
         )
 
     cp_size = args.context_parallel_size
@@ -139,7 +141,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         ignore_virtual=False,
         vp_stage=vp_stage,
     )
-    is_hybrid_cp = args.hybrid_context_parallel
+    is_hybrid_cp = args.dynamic_context_parallel
 
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
@@ -196,7 +198,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         batch,
         is_hybrid_cp=is_hybrid_cp,
         cp_group=get_context_parallel_group(),
-        hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+        hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
     )
 
@@ -465,7 +467,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "context_parallel_size": args.context_parallel_size,
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
-        "hybrid_context_parallel": args.hybrid_context_parallel,
+        "dynamic_context_parallel": args.dynamic_context_parallel,
         "inter_document_masking": args.dataloader_inter_document_masking,
         "sft_mock_dataset_config_json": args.sft_mock_dataset_config_json,
         "varlen_mock_dataset_config_json": args.varlen_mock_dataset_config_json,
