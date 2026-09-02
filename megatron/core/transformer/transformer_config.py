@@ -3556,11 +3556,11 @@ class MLATransformerConfig(TransformerConfig):
     mscale_all_dim: float = 0.0
     """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
-    o_groups: int = 8
-    """Number of groups for grouped low-rank output projection (wo_a)."""
+    output_projection_groups: int = 8
+    """Number of groups for the grouped low-rank output projection (wo_a)."""
 
-    o_lora_rank: int = 1024
-    """Low-rank dimension per group for grouped output (wo_a). Used when o_groups > 0."""
+    output_projection_lora_rank: int = 1024
+    """Low-rank dimension per group for the grouped output projection (wo_a)."""
 
     cache_mla_latents: bool = False
     """Cache the low dimensional tensors for MLA rather than full KV cache.
@@ -3594,12 +3594,16 @@ class MLATransformerConfig(TransformerConfig):
                 not self.mla_down_proj_fusion
             ), "MLA down projection fusion must be disabled for DSv4 hybrid mode."
             assert self.q_lora_rank is not None, "DSv4 hybrid mode requires q_lora_rank."
-            assert self.o_groups > 0, "DSv4 hybrid mode requires o_groups to be positive."
-            assert self.o_lora_rank > 0, "DSv4 hybrid mode requires o_lora_rank to be positive."
+            assert (
+                self.output_projection_groups > 0
+            ), "DSv4 hybrid mode requires output_projection_groups to be positive."
+            assert (
+                self.output_projection_lora_rank > 0
+            ), "DSv4 hybrid mode requires output_projection_lora_rank to be positive."
             assert (
                 self.num_attention_heads * self.v_head_dim
-            ) % self.o_groups == 0, (
-                "num_attention_heads * v_head_dim must be divisible by o_groups."
+            ) % self.output_projection_groups == 0, (
+                "num_attention_heads * v_head_dim must be divisible by " "output_projection_groups."
             )
             log_single_rank(
                 logger,

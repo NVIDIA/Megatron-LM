@@ -179,12 +179,14 @@ class DSv4HybridAttention(Attention):
         )
 
         # Output.
-        self.o_local_groups = self.config.o_groups
+        self.output_projection_local_groups = self.config.output_projection_groups
         assert (
-            self.query_projection_size % self.config.o_groups == 0
-        ), "num_attention_heads * v_head_dim must be divisible by o_groups"
-        group_proj_in_size = self.query_projection_size // self.config.o_groups
-        group_proj_out_size = self.config.o_groups * self.config.o_lora_rank
+            self.query_projection_size % self.config.output_projection_groups == 0
+        ), "num_attention_heads * v_head_dim must be divisible by output_projection_groups"
+        group_proj_in_size = self.query_projection_size // self.config.output_projection_groups
+        group_proj_out_size = (
+            self.config.output_projection_groups * self.config.output_projection_lora_rank
+        )
 
         group_proj_device = (
             'cpu' if self.config.use_cpu_initialization else torch.cuda.current_device()
@@ -199,7 +201,9 @@ class DSv4HybridAttention(Attention):
             self.config.init_method(_linear_o_group_proj)
         self.linear_o_group_proj = torch.nn.Parameter(_linear_o_group_proj)
 
-        linear_proj_in_size = self.config.o_groups * self.config.o_lora_rank
+        linear_proj_in_size = (
+            self.config.output_projection_groups * self.config.output_projection_lora_rank
+        )
 
         self.linear_proj = build_module(
             submodules.linear_proj,
@@ -377,10 +381,10 @@ class DSv4HybridAttention(Attention):
 
         # Grouped output
         core_attn_out = core_attn_out.view(
-            core_attn_out.size(0), core_attn_out.size(1), self.o_local_groups, -1
+            core_attn_out.size(0), core_attn_out.size(1), self.output_projection_local_groups, -1
         )
         wo_a_weight = self.linear_o_group_proj.view(
-            self.o_local_groups, self.config.o_lora_rank, -1
+            self.output_projection_local_groups, self.config.output_projection_lora_rank, -1
         )
         core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)

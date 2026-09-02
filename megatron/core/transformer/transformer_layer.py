@@ -391,11 +391,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         attention_optional_kwargs["pg_collection"] = pg_collection
         if pp_layer_offset is not None:
             attention_optional_kwargs["pp_layer_offset"] = pp_layer_offset
-        # DSv4 uses this flag to select its MTP compression-ratio slot and to offset
-        # indexer-loss tracking. Other experimental attention modules (for example GDN)
-        # do not accept the keyword.
-        if is_mtp_layer and config.experimental_attention_variant == "dsv4_hybrid":
-            attention_optional_kwargs["is_mtp_layer"] = True
+        attention_optional_kwargs["is_mtp_layer"] = is_mtp_layer
 
         # [Module 2: SelfAttention]
         self.self_attention = build_module(

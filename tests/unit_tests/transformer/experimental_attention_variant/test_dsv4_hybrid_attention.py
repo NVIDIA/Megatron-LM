@@ -59,8 +59,8 @@ def _make_config(
     v_head_dim=64,
     qk_pos_emb_head_dim=32,
     q_lora_rank=64,
-    o_groups=8,
-    o_lora_rank=64,
+    output_projection_groups=8,
+    output_projection_lora_rank=64,
     csa_compress_ratios=None,
     csa_window_size=8,
     tensor_model_parallel_size=1,
@@ -89,8 +89,8 @@ def _make_config(
         qk_head_dim=v_head_dim - qk_pos_emb_head_dim,
         qk_pos_emb_head_dim=qk_pos_emb_head_dim,
         v_head_dim=v_head_dim,
-        o_groups=o_groups,
-        o_lora_rank=o_lora_rank,
+        output_projection_groups=output_projection_groups,
+        output_projection_lora_rank=output_projection_lora_rank,
         rope_type='rope',
         rotary_base=10000,
         rotary_percent=1.0,
@@ -608,14 +608,17 @@ class TestDSv4HybridGroupedOutput:
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
 
-        o_groups = 8
-        o_lora_rank = 64
-        config = _make_config(o_groups=o_groups, o_lora_rank=o_lora_rank)
+        output_projection_groups = 8
+        output_projection_lora_rank = 64
+        config = _make_config(
+            output_projection_groups=output_projection_groups,
+            output_projection_lora_rank=output_projection_lora_rank,
+        )
         pg = ProcessGroupCollection.use_mpu_process_groups()
         attn = _build_attention(config, layer_number=1, pg_collection=pg)
 
-        expected_out = o_groups * o_lora_rank
-        expected_in = (config.v_head_dim * config.num_attention_heads) // o_groups
+        expected_out = output_projection_groups * output_projection_lora_rank
+        expected_in = (config.v_head_dim * config.num_attention_heads) // output_projection_groups
         assert attn.linear_o_group_proj.shape == (expected_out, expected_in)
         assert attn.linear_o_group_proj.requires_grad
 
