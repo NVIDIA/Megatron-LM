@@ -2184,7 +2184,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 num_experts=self.tp_size * self.config.num_moe_experts,
                 config=self.config,
             )
-            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
+            self.cudagraph_attrs = [
+                '_comm_manager.semantic_token_probs',
+                '_comm_manager.semantic_token_indices',
+                '_comm_manager.semantic_tokens_per_expert',
+            ]
         elif self.config.moe_flex_dispatcher_backend == "ncclep":
             assert self.tp_size * self.ep_size > 1, "NCCL EP dispatcher requires TPxEP > 1"
             self._comm_manager = _NCCLEPManager(

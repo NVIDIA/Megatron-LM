@@ -1292,9 +1292,10 @@ def extract_semantic_routes(
     """
     num_tokens, num_experts = (int(size) for size in routing_map.shape)
     tokens_per_expert = torch.zeros(num_experts, dtype=torch.int32, device=routing_map.device)
-    # Zeroed rather than empty: a routing map that selects fewer than
-    # router_topk experts for some token would otherwise leave stale slots,
-    # and the planner indexes tables with these ids.
+    # Zero-filled so a token with fewer than router_topk selections leaves a
+    # zero-probability route to expert 0 rather than a stale id; the kernel's
+    # assert (eager paths) and the placement kernel's route-total check (always)
+    # report the malformed map.
     token_indices = torch.zeros(
         (num_tokens, router_topk), dtype=torch.int32, device=routing_map.device
     )
