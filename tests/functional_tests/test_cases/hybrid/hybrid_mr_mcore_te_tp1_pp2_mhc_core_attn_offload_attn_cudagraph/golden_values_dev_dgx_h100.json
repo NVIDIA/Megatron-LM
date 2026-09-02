@@ -1,0 +1,68 @@
+{
+    "lm loss": {
+        "start_step": 1,
+        "end_step": 4,
+        "step_interval": 1,
+        "values": {
+            "1": 10.48293,
+            "2": 10.2397,
+            "3": 9.99191,
+            "4": 9.88682
+        }
+    },
+    "grad-norm": {
+        "start_step": 1,
+        "end_step": 4,
+        "step_interval": 1,
+        "values": {
+            "1": 1.23828,
+            "2": 1.1464,
+            "3": 1.33764,
+            "4": 1.31791
+        }
+    },
+    "num-zeros": {
+        "start_step": 1,
+        "end_step": 4,
+        "step_interval": 1,
+        "values": {
+            "1": 14668159.0,
+            "2": 14430083.0,
+            "3": 14826618.0,
+            "4": 14671716.0
+        }
+    },
+    "mem-allocated-bytes": {
+        "start_step": 1,
+        "end_step": 4,
+        "step_interval": 1,
+        "values": {
+            "1": 439328256.0,
+            "2": 439328768.0,
+            "3": 439328768.0,
+            "4": 588933120.0
+        }
+    },
+    "mem-max-allocated-bytes": {
+        "start_step": 1,
+        "end_step": 4,
+        "step_interval": 1,
+        "values": {
+            "1": 651911168.0,
+            "2": 698570240.0,
+            "3": 698570240.0,
+            "4": 817107968.0
+        }
+    },
+    "iteration-time": {
+        "start_step": 1,
+        "end_step": 4,
+        "step_interval": 1,
+        "values": {
+            "1": "nan",
+            "2": 0.14202,
+            "3": 0.10639,
+            "4": 1.50123
+        }
+    }
+}
