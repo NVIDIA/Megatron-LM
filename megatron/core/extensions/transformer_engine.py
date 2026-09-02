@@ -2138,7 +2138,7 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
             k,
             v,
             qkv_format=qkv_format,
-            cu_seqlens_q=cu_seqlens,
+            cu_seqlens=cu_seqlens,
             g=g.float(),
             beta=beta.float(),
             initial_state=initial_state,
