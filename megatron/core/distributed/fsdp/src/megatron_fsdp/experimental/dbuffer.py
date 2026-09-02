@@ -20,12 +20,12 @@ from collections.abc import Iterable
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-import torch.distributed.tensor as dist_tensor
 from torch.distributed import DeviceMesh
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Partial, Replicate
+from torch.distributed.tensor.placement_types import Placement
 
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import Flat, Partial, Placement, Replicate, changed_mesh_axis
+from .placement import Flat, changed_mesh_axis
 
 
 @dataclasses.dataclass(frozen=True)
@@ -50,6 +50,12 @@ def _validate_placements(placements: Iterable[Placement]) -> None:
             )
 
 
+def _get_reduce_op(partial_placement: Partial) -> dist.ReduceOp.RedOpType:
+    """Convert a DTensor Partial reduction name to a torch.distributed op."""
+    reduce_ops = {"sum": dist.ReduceOp.SUM, "avg": dist.ReduceOp.AVG}
+    return reduce_ops[partial_placement.reduce_op]
+
+
 class DBuffer:
     """A distributed buffer holding a group of logical tensors.
 
@@ -67,6 +73,10 @@ class DBuffer:
     layout: GlobalLayout
     offset: int
     local_buffer: torch.Tensor
+    # Record the allocation stream so DBuffer users can check that uses are joined back to it
+    # before deleting the buffer. See https://github.com/NVIDIA/Megatron-LM/pull/6187 and
+    # https://docs.pytorch.org/docs/2.13/generated/torch.Tensor.record_stream.html.
+    allocation_stream: torch.cuda.Stream | None
 
     def __init__(
         self,
@@ -100,6 +110,11 @@ class DBuffer:
 
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
         self.local_buffer = torch.empty(local_numel, dtype=dtype, device=device)
+        self.allocation_stream = (
+            torch.cuda.current_stream(self.local_buffer.device)
+            if self.local_buffer.is_cuda
+            else None
+        )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -111,8 +126,18 @@ class DBuffer:
         """Device of the local buffer."""
         return self.local_buffer.device
 
+    @property
+    def is_symmetric_memory(self) -> bool:
+        """Whether the local buffer is allocated from symmetric memory."""
+        return hasattr(symm_mem, "is_symm_mem_tensor") and symm_mem.is_symm_mem_tensor(
+            self.local_buffer
+        )
+
     def reallocate_storage(self) -> None:
         """Restore the local buffer's backing storage to its logical size."""
+        # The allocator may hand back a different address than release_storage() freed.
+        # Tensors sharing this Storage read its pointer on each access, so views into the
+        # buffer -- including ones autograd saved -- follow it to the new allocation.
         self._resize_storage(self.local_buffer.numel())
 
     def release_storage(self) -> None:
@@ -155,6 +180,8 @@ class DBuffer:
         mesh: DeviceMesh,
         placements: Iterable[Placement],
         tensor_shapes: Iterable[Shape],
+        *,
+        allocation_stream: torch.cuda.Stream | None,
     ) -> "DBuffer":
         """Create a DBuffer from an existing local buffer.
 
@@ -165,6 +192,7 @@ class DBuffer:
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
             tensor_shapes: Global shapes for each logical tensor in this buffer.
+            allocation_stream: CUDA stream that allocated ``local_buffer``, or ``None`` for CPU.
 
         Returns:
             A DBuffer that reuses ``local_buffer`` without allocating storage.
@@ -195,7 +223,42 @@ class DBuffer:
         buffer.layout = layout
         buffer.offset = offset
         buffer.local_buffer = local_buffer
+        buffer.allocation_stream = allocation_stream
         return buffer
+
+    def view(self, placements: Iterable[Placement]) -> "DBuffer":
+        """Return a storage-sharing buffer with supported ``placements``.
+
+        Views preserve placements or locally slice one Replicate axis to Flat.
+        Other placement changes require communication and are not views.
+        """
+        placements = tuple(placements)
+        if len(placements) != self.mesh.ndim:
+            raise ValueError(
+                f"Expected {self.mesh.ndim} placements for device mesh, got {len(placements)}."
+            )
+
+        changed_axis = changed_mesh_axis(self.placements, placements)
+        if changed_axis is None:
+            return self
+        if isinstance(self.placements[changed_axis], Replicate) and isinstance(
+            placements[changed_axis], Flat
+        ):
+            offset, local_numel = self.layout.get_local_range(self.mesh, placements)
+            local_offset = offset - self.offset
+            if local_offset < 0 or local_offset + local_numel > self.local_buffer.numel():
+                raise RuntimeError("DBuffer view is not contained in its source local buffer.")
+            return DBuffer.from_local(
+                self.local_buffer.narrow(0, local_offset, local_numel),
+                self.mesh,
+                placements,
+                self.layout.tensor_shapes,
+                allocation_stream=self.allocation_stream,
+            )
+        raise ValueError(
+            "DBuffer.view() supports identical placements or a Replicate-to-Flat slice, "
+            f"got {self.placements!r} -> {placements!r}."
+        )
 
     @classmethod
     def distribute_tensors(
@@ -324,13 +387,18 @@ class DBuffer:
         if isinstance(old_placement, Partial) and isinstance(new_placement, Flat):
             return self.reduce_scatter(axis, new_placement, out=out)
         if isinstance(old_placement, Replicate) and isinstance(new_placement, Flat):
-            return self.scatter(axis, new_placement, out=out)
+            view = self.view(new_placements)
+            if out is None:
+                return view
+            out = self._create_or_validate_out(out, placements=new_placements)
+            out.local_buffer.copy_(view.local_buffer)
+            return out
         if isinstance(old_placement, Replicate) and isinstance(new_placement, Partial):
             # Replicate and Partial share the same local layout, so relabel the
             # buffer without communication. Value-preserving for AVG only -- the
             # mean of identical per-rank locals is that value; SUM would need a
             # 1/axis_size rescale, which no caller needs.
-            if new_placement.reduce_op != dist.ReduceOp.AVG:
+            if new_placement.reduce_op != "avg":
                 raise NotImplementedError(
                     "Replicate -> Partial redistribute supports AVG only, got "
                     f"{new_placement.reduce_op!r}."
@@ -340,7 +408,11 @@ class DBuffer:
                     "Replicate -> Partial redistribute does not support an out buffer."
                 )
             return DBuffer.from_local(
-                self.local_buffer, self.mesh, new_placements, self.layout.tensor_shapes
+                self.local_buffer,
+                self.mesh,
+                new_placements,
+                self.layout.tensor_shapes,
+                allocation_stream=self.allocation_stream,
             )
         raise NotImplementedError(
             "Unsupported DBuffer placement transition on axis "
@@ -358,6 +430,10 @@ class DBuffer:
         placements[mesh_axis] = Replicate()
         _validate_placements(placements)
         out = self._create_or_validate_out(out, placements=placements)
+        # Symmetric-memory registration is scoped to the collective's process
+        # group, so rendezvous the output on the same mesh axis as the all-gather.
+        if out.is_symmetric_memory:
+            out.rendezvous(mesh_axis)
         dist.all_gather_into_tensor(
             output_tensor=out.local_buffer,
             input_tensor=self.local_buffer,
@@ -377,7 +453,7 @@ class DBuffer:
         out = self._create_or_validate_out(out, placements=placements)
         out.local_buffer.copy_(self.local_buffer)
         dist.all_reduce(
-            out.local_buffer, op=partial_placement.reduce_op, group=self.mesh.get_group(axis)
+            out.local_buffer, op=_get_reduce_op(partial_placement), group=self.mesh.get_group(axis)
         )
         return out
 
@@ -396,13 +472,10 @@ class DBuffer:
         placements[axis] = new_placement
         _validate_placements(placements)
         out = self._create_or_validate_out(out, placements=placements)
-        reduce_op = partial_placement.reduce_op
+        reduce_op = _get_reduce_op(partial_placement)
         # Symmetric-memory MFSDP requires this detector, but ordinary DBuffer
         # reductions remain supported on older PyTorch versions that lack it.
-        is_symm_mem = hasattr(symm_mem, "is_symm_mem_tensor") and symm_mem.is_symm_mem_tensor(
-            self.local_buffer
-        )
-        if is_symm_mem:
+        if self.is_symmetric_memory:
             self.rendezvous(axis)
             # NCCL symmetric-memory reduce-scatter selects its symmetric kernel
             # for SUM. Preserve the placement's AVG semantics by scaling the
@@ -415,44 +488,8 @@ class DBuffer:
             op=reduce_op,
             group=self.mesh.get_group(axis),
         )
-        if is_symm_mem and partial_placement.reduce_op == dist.ReduceOp.AVG:
+        if self.is_symmetric_memory and partial_placement.reduce_op == "avg":
             out.local_buffer.div_(self.mesh.size(axis))
-        return out
-
-    def scatter(
-        self, mesh_axis: int, new_placement: Placement, *, out: "DBuffer | None" = None
-    ) -> "DBuffer":
-        """Locally chunk a Replicate axis into ``new_placement``."""
-        axis = mesh_axis
-        if not isinstance(new_placement, Flat):
-            raise NotImplementedError("DBuffer currently supports scatter() to Flat only.")
-        if not isinstance(self.placements[axis], Replicate):
-            raise ValueError(f"scatter() requires Replicate placement on axis {mesh_axis!r}.")
-
-        placements = list(self.placements)
-        placements[axis] = new_placement
-        _validate_placements(placements)
-
-        if out is None:
-            destination_offset, destination_numel = self.layout.get_local_range(
-                self.mesh, placements
-            )
-        else:
-            out = self._create_or_validate_out(out, placements=placements)
-            destination_offset = out.offset
-            destination_numel = out.local_buffer.numel()
-
-        local_buffer_offset = destination_offset - self.offset
-        if (
-            local_buffer_offset < 0
-            or local_buffer_offset + destination_numel > self.local_buffer.numel()
-        ):
-            raise RuntimeError("scatter() destination is not contained in the source local buffer.")
-        local_slice = self.local_buffer.narrow(0, local_buffer_offset, destination_numel)
-        if out is None:
-            return DBuffer.from_local(local_slice, self.mesh, placements, self.layout.tensor_shapes)
-
-        out.local_buffer.copy_(local_slice)
         return out
 
     def get_local_tensor(self, index: int) -> torch.Tensor:
@@ -480,27 +517,6 @@ class DBuffer:
 
     def get_dtensor(self, index: int) -> DTensor:
         """Return logical tensor ``index`` as a DTensor."""
-        torch_placements = []
-        for placement in self.placements:
-            if isinstance(placement, Replicate):
-                torch_placements.append(dist_tensor.Replicate())
-            elif isinstance(placement, Flat):
-                torch_placements.append(dist_tensor.Shard(0))
-            elif isinstance(placement, Partial):
-                # main_grad backs .grad while it rests DP-outer-Partial between
-                # microbatches, so a Partial placement must round-trip to a DTensor.
-                if placement.reduce_op == dist.ReduceOp.AVG:
-                    reduce_op = "avg"
-                elif placement.reduce_op == dist.ReduceOp.SUM:
-                    reduce_op = "sum"
-                else:
-                    raise ValueError(
-                        f"Unsupported Partial reduce op for DTensor: {placement.reduce_op!r}."
-                    )
-                torch_placements.append(dist_tensor.Partial(reduce_op))
-            else:
-                raise TypeError(f"Unsupported placement for DTensor conversion: {placement!r}.")
-
         local_tensor = self.get_local_tensor(index)
         tensor_shape = self.layout.tensor_shapes[index]
         # DBuffer uses contiguous flat storage, and Flat only shards dim 0, so
@@ -508,7 +524,7 @@ class DBuffer:
         return DTensor.from_local(
             local_tensor=local_tensor,
             device_mesh=self.mesh,
-            placements=tuple(torch_placements),
+            placements=self.placements,
             run_check=False,
             shape=tensor_shape,
             stride=local_tensor.stride(),
