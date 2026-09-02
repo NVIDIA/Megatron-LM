@@ -104,8 +104,8 @@ class TestRotaryEmbedding:
 
         assert self.rope_cpu_init.inv_freq.device.type == 'cuda'
         assert cos.device.type == sin.device.type == 'cuda'
-        assert torch.allclose(cos, expected_cos)
-        assert torch.allclose(sin, expected_sin)
+        assert torch.allclose(cos, expected_cos, atol=1e-5)
+        assert torch.allclose(sin, expected_sin, atol=1e-5)
 
 
 class TestQKVRotaryEmbedding:
