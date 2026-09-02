@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Iterable, MutableMapping
 from dataclasses import replace
+from pathlib import Path
 from types import MethodType
 from typing import Any
 
@@ -14,6 +15,12 @@ import torch.nn as nn
 
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
+from megatron.lite.primitive.ckpt.local_stage import (
+    NodeLocalStagingFileSystem,
+    allocate_stage_path,
+    publish_staged_file,
+)
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
@@ -66,6 +73,7 @@ def save_dist_opt_checkpoint(
     *,
     save_model: bool = True,
     save_optimizer: bool = True,
+    local_stage_root: Path | None = None,
 ) -> None:
     """Save model and DistributedOptimizer state through mcore dist_checkpointing."""
 
@@ -84,12 +92,56 @@ def save_dist_opt_checkpoint(
             )
         finally:
             _restore_state_dict_patches(patches)
+    save_strategy = (
+        _NodeLocalDistSaveStrategy(local_stage_root)
+        if local_stage_root is not None
+        else None
+    )
     dist_checkpointing.save(
         state_dict,
         checkpoint_dir,
+        sharded_strategy=save_strategy,
         validate_access_integrity=False,
         content_metadata=metadata,
     )
+
+
+class _NodeLocalDistSaveStrategy(TorchDistSaveShardedStrategy):
+    def __init__(self, stage_root: Path):
+        super().__init__()
+        self._stage_root = stage_root
+
+    def _get_save_and_finalize_callbacks(
+        self, writer, save_state_dict_ret, async_strategy
+    ):
+        writer.fs = NodeLocalStagingFileSystem(self._stage_root)
+        request = super()._get_save_and_finalize_callbacks(
+            writer, save_state_dict_ret, async_strategy
+        )
+        if len(request.async_fn_args) < 2:
+            return request
+
+        staged_files: list[tuple[Path, Path]] = []
+        write_buckets = request.async_fn_args[1]
+        for index, (destination, storage_key, payload) in enumerate(write_buckets):
+            destination = Path(destination)
+            stage_path = allocate_stage_path(self._stage_root, destination.name)
+            write_buckets[index] = (str(stage_path), storage_key, payload)
+            staged_files.append((stage_path, destination))
+
+        original_finalize_fns = tuple(request.finalize_fns)
+
+        def finalize_and_publish() -> None:
+            try:
+                for finalize_fn in original_finalize_fns:
+                    finalize_fn()
+                for stage_path, destination in staged_files:
+                    publish_staged_file(stage_path, destination)
+            finally:
+                for stage_path, _ in staged_files:
+                    stage_path.unlink(missing_ok=True)
+
+        return request._replace(finalize_fns=[finalize_and_publish])
 
 
 def load_dist_opt_checkpoint(
