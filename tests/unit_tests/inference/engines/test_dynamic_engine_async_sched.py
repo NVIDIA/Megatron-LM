@@ -694,6 +694,21 @@ _ASYNC_PAIR_SCENARIOS = (
     ),
 )
 
+_ASYNC_SUSPEND_RESUME_SCENARIOS = (
+    _pair_scenario(
+        "offload-suspend-resume",
+        "kv:offload",
+        config={"kv_cache_management_mode": "offload", "static_kv_memory_pointers": False},
+        signals=("offload", "suspend-resume"),
+    ),
+    _pair_scenario(
+        "recompute-suspend-resume",
+        "kv:recompute",
+        config={"kv_cache_management_mode": "recompute", "static_kv_memory_pointers": False},
+        signals=("recompute", "suspend-resume"),
+    ),
+)
+
 _ASYNC_PARALLEL_SCENARIOS = (
     _pair_scenario(
         "tp2-pp2-sp-dp2",
@@ -1479,16 +1494,22 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
             assert runtime["sampling-backend:torch"] > 0
         if "persist" in signals:
             assert context.kv_cache_management_mode == KVCacheManagementMode.PERSIST
+        if "offload" in signals:
+            assert context.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+        if "recompute" in signals:
+            assert context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE
         if "static-pointers" in signals:
             assert context.static_kv_memory_pointers
         if "suspend-resume" in signals:
-            assert runtime["suspend-resume"] == runtime["static-pointer-preserved"] == 1
-            assert (
-                runtime["pending-before-suspend"]
-                == runtime["pending-after-suspend"]
-                == runtime["pending-after-resume"]
-                == 1
-            )
+            assert runtime["suspend-resume"] == runtime["pending-before-suspend"] == 1
+            if "recompute" in signals:
+                assert runtime["pending-after-suspend"] == 0
+                assert runtime["pending-after-resume"] == 0
+            else:
+                assert runtime["pending-after-suspend"] == 1
+                assert runtime["pending-after-resume"] == 1
+            if "static-pointers" in signals:
+                assert runtime["static-pointer-preserved"] == 1
         if "dp-offset" in signals:
             assert context.config.offset_sampling_seed_by_dp_rank
         if "last-logits" in signals:
@@ -1878,6 +1899,19 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
     @torch.inference_mode()
     def test_async_matches_legacy_for_owned_pair(self, scenario):
         _check_scenario_prerequisite(scenario)
+        try:
+            self._assert_scenario_pair(scenario)
+        finally:
+            gc.collect()
+            delete_cuda_graphs()
+            torch.cuda.empty_cache()
+
+    @pytest.mark.parametrize(
+        "scenario", _ASYNC_SUSPEND_RESUME_SCENARIOS, ids=lambda case: case.name
+    )
+    @torch.inference_mode()
+    def test_async_suspend_resume_mode_matches_legacy(self, scenario):
+        """Real OFFLOAD and RECOMPUTE cycles preserve output parity."""
         try:
             self._assert_scenario_pair(scenario)
         finally:
