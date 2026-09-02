@@ -118,10 +118,12 @@ def test_group_layers_into_shortcut_blocks(compute_symbol, parallel):
     assert grouped[2] is trailing_layer
     shortcut = grouped[1]
     assert isinstance(shortcut, ShortcutMoEBlock)
-    assert shortcut.compute_layer is compute
+    assert shortcut.attn_layer is compute
     assert shortcut.moe_layer is paired_moe
-    assert shortcut.attn_layer_num == compute.layer_number - 1
-    assert shortcut.moe_layer_num == paired_moe.layer_number - 1
+    assert shortcut.attn_layer_idx == compute.layer_number - 1
+    assert shortcut.moe_layer_idx == paired_moe.layer_number - 1
+    assert shortcut.attn_local_idx == 1
+    assert shortcut.moe_local_idx == 2
     assert shortcut.overlap_mode is parallel
     assert shortcut.shortcut_pre_mlp_layernorm is not paired_moe.pre_mlp_layernorm
     assert isinstance(shortcut.shortcut_post_norm, torch.nn.RMSNorm)
@@ -131,6 +133,96 @@ def test_group_layers_into_shortcut_blocks(compute_symbol, parallel):
     state_keys = set(grouped.state_dict())
     assert "1.shortcut_pre_mlp_layernorm.weight" in state_keys
     assert "1.shortcut_post_norm.weight" in state_keys
+
+
+def test_shortcut_owns_cp_layout_transitions(monkeypatch):
+    config = _shortcut_config()
+    attn_layer = _FakeCompute(config)
+    moe_layer = _FakeMoE(config)
+    block = ShortcutMoEBlock(
+        attn_layer,
+        moe_layer,
+        overlap_a2a=False,
+        attn_local_idx=4,
+        moe_local_idx=5,
+    )
+    calls = []
+    observed = {}
+
+    class RecordingCPLayoutState:
+        def prepare_layer(self, layer_idx, hidden_states):
+            calls.append(("prepare", layer_idx))
+            return hidden_states + layer_idx, f"packed-{layer_idx}"
+
+        def finalize_layer(self, layer_idx, hidden_states):
+            calls.append(("finalize", layer_idx))
+            return hidden_states + layer_idx
+
+    def attn_forward(hidden_states, packed_seq_params=None, **kwargs):
+        observed["attn_packed"] = packed_seq_params
+        observed["cp_metadata"] = kwargs.get("packed_sequence_cp_metadata")
+        return (hidden_states,)
+
+    def route(shortcut_hidden, padding_mask=None, packed_seq_params=None):
+        observed["route_packed"] = packed_seq_params
+        return shortcut_hidden, shortcut_hidden
+
+    def shared(hidden_states, padding_mask=None, packed_seq_params=None):
+        observed["shared_packed"] = packed_seq_params
+        return torch.zeros_like(hidden_states), None
+
+    def postprocess(
+        hidden_states,
+        combined_output,
+        shared_expert_output,
+        packed_seq_params=None,
+        moe_unflatten_mbs=None,
+    ):
+        observed["postprocess_packed"] = packed_seq_params
+        return hidden_states
+
+    @contextmanager
+    def quant_context_factory(*_args):
+        yield
+
+    monkeypatch.setattr(attn_layer, "forward_pre_attn_and_core_attn", attn_forward)
+    monkeypatch.setattr(attn_layer, "forward_post_core_attn", lambda hidden_states: hidden_states)
+    monkeypatch.setattr(block, "_moe_router_preprocess", route)
+    monkeypatch.setattr(block, "_launch_dispatch", lambda hidden, probs, **_: (hidden, probs))
+    monkeypatch.setattr(
+        moe_layer.mlp,
+        "routed_experts_compute",
+        lambda hidden, probs: (hidden, None),
+        raising=False,
+    )
+    monkeypatch.setattr(block, "_launch_combine", lambda output, **_: output)
+    monkeypatch.setattr(block, "_moe_shared_experts", shared)
+    monkeypatch.setattr(block, "_postprocess", postprocess)
+
+    cp_metadata = object()
+    hidden_states = torch.zeros(2, 1, config.hidden_size)
+    output = block(
+        hidden_states=hidden_states,
+        attention_mask=None,
+        inference_context=None,
+        rotary_pos_emb=None,
+        sequence_len_offset=None,
+        packed_seq_params="packed-input",
+        padding_mask=None,
+        quant_context_factory=quant_context_factory,
+        cp_layout_state=RecordingCPLayoutState(),
+        packed_sequence_cp_metadata=cp_metadata,
+    )
+
+    assert calls == [("prepare", 4), ("prepare", 5), ("prepare", 5), ("finalize", 5)]
+    assert observed == {
+        "attn_packed": "packed-4",
+        "cp_metadata": cp_metadata,
+        "route_packed": "packed-5",
+        "shared_packed": "packed-5",
+        "postprocess_packed": "packed-5",
+    }
+    torch.testing.assert_close(output, hidden_states + 14)
 
 
 @pytest.mark.parametrize(

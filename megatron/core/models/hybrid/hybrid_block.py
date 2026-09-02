@@ -320,20 +320,25 @@ class HybridStack(MegatronModule):
                 setattr(self.hc_head_base, 'sequence_parallel', True)
                 setattr(self.hc_head_scale, 'sequence_parallel', True)
 
-        self._execution_layer_config_list = self.layer_config_list
+        self._execution_layer_indices = list(range(len(self.layers)))
         if self.config.moe_shortcut_connection:
-            physical_layer_types = self.layer_type_list
             self.layers = group_layers_into_shortcut_blocks(
                 self.layers,
-                physical_layer_types,
+                self.layer_type_list,
                 self.config,
                 pp_layer_offset=pp_layer_offset,
             )
-            self._execution_layer_config_list = [
-                layer_config
-                for layer_index, layer_config in enumerate(self.layer_config_list)
-                if layer_index == 0 or physical_layer_types[layer_index] != layer_utils.Symbols.MOE
+            self._execution_layer_indices = [
+                (
+                    layer.attn_local_idx
+                    if isinstance(layer, ShortcutMoEBlock)
+                    else layer.layer_number - pp_layer_offset - 1
+                )
+                for layer in self.layers
             ]
+        self._execution_layer_config_list = [
+            self.layer_config_list[layer_index] for layer_index in self._execution_layer_indices
+        ]
 
     @property
     def layer_type_list(self) -> list[str]:
@@ -569,18 +574,15 @@ class HybridStack(MegatronModule):
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )
             else:
-                for layer_idx, (layer_config, layer) in enumerate(
-                    zip(self._execution_layer_config_list, self.layers, strict=True)
+                for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
+                    zip(
+                        self._execution_layer_indices,
+                        self._execution_layer_config_list,
+                        self.layers,
+                        strict=True,
+                    )
                 ):
                     layer_packed_seq_params = packed_seq_params
-                    if cp_layout_state is not None:
-                        hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
-                            layer_idx, hidden_states
-                        )
-                    # Layers have 1-indexed layer numbers attribute.
-                    inner_quant_context = get_inner_quant_context(
-                        layer_config, layer.layer_number - 1
-                    )
                     mhc_manager = mhc_layer_managers[layer_idx]
                     if mhc_manager is not None:
                         mhc_manager.is_last_layer_in_recompute_block = mhc_block_ends[layer_idx]
@@ -601,9 +603,18 @@ class HybridStack(MegatronModule):
                             packed_seq_params=layer_packed_seq_params,
                             padding_mask=padding_mask,
                             quant_context_factory=get_inner_quant_context,
-                            quant_config=self.config,
+                            cp_layout_state=cp_layout_state,
+                            packed_sequence_cp_metadata=layer_cp_metadata,
                         )
                     else:
+                        if cp_layout_state is not None:
+                            hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
+                                physical_layer_idx, hidden_states
+                            )
+                        # Layers have 1-indexed layer numbers attribute.
+                        inner_quant_context = get_inner_quant_context(
+                            layer_config, layer.layer_number - 1
+                        )
                         with inner_quant_context:
                             if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                                 layer_kwargs = dict(
@@ -615,26 +626,35 @@ class HybridStack(MegatronModule):
                                     packed_seq_params=layer_packed_seq_params,
                                     padding_mask=padding_mask,
                                 )
+                                if layer_cp_metadata is not None:
+                                    layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
                                 if mhc_manager is not None and isinstance(
                                     layer, HyperConnectionHybridLayer
                                 ):
                                     layer_kwargs["mhc_recompute_manager"] = mhc_manager
                                 hidden_states, _ = layer(**layer_kwargs)
+                            elif layer_cp_metadata is not None:
+                                hidden_states = layer(
+                                    hidden_states=hidden_states,
+                                    attention_mask=attention_mask,
+                                    inference_context=inference_context,
+                                    packed_seq_params=layer_packed_seq_params,
+                                    packed_sequence_cp_metadata=layer_cp_metadata,
+                                )
                             else:  # MambaLayer, Expert, or MLP
                                 hidden_states = layer(
                                     hidden_states=hidden_states,
                                     attention_mask=attention_mask,
                                     inference_context=inference_context,
-                                packed_seq_params=layer_packed_seq_params,
-                            )
+                                    packed_seq_params=layer_packed_seq_params,
+                                )
 
-                    # The attention layer (currently a simplified transformer layer)
-                    # outputs a tuple of (hidden_states, context). Context is intended
-                    # for cross-attention, and is not needed in our model.
-                    if isinstance(hidden_states, tuple):
-                        hidden_states = hidden_states[0]
-                    if cp_layout_state is not None:
-                        hidden_states = cp_layout_state.finalize_layer(layer_idx, hidden_states)
+                        if isinstance(hidden_states, tuple):
+                            hidden_states = hidden_states[0]
+                        if cp_layout_state is not None:
+                            hidden_states = cp_layout_state.finalize_layer(
+                                physical_layer_idx, hidden_states
+                            )
 
                     self._finalize_mhc_recompute_layer(
                         manager=mhc_manager,

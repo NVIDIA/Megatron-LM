@@ -1321,6 +1321,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        packed_sequence_cp_metadata=None,
     ) -> Tensor:
         """
         Run the QKV input projection and core attention, stopping before linear_proj.
@@ -1346,6 +1347,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             Tensor consumed by the attention output projection.
 
         """
+        assert packed_sequence_cp_metadata is None, (
+            "Attention does not support packed-sequence chunkwise CP metadata."
+        )
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
         no_rope = (

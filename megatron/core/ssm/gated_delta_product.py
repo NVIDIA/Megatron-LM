@@ -496,9 +496,19 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             self.nheads_local_cp = self.nheads_local_tp
             self.ngroups_local_cp = self.ngroups_local_tp
 
-    def forward_pre_attn_and_core_attn(self, hidden_states, *, packed_seq_params=None):
+    def forward_pre_attn_and_core_attn(
+        self,
+        hidden_states,
+        *,
+        packed_seq_params=None,
+        packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
+    ):
         """Run the training pre-attention and core-attention stage."""
-        return self._gdp_chunk(hidden_states, packed_seq_params=packed_seq_params)
+        return self._gdp_chunk(
+            hidden_states,
+            packed_seq_params=packed_seq_params,
+            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+        )
 
     def forward_post_core_attn(self, y):
         """Apply GDP's output projection to a recurrence output."""

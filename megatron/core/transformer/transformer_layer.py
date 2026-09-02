@@ -793,6 +793,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         rotary_pos_emb: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        *,
+        packed_sequence_cp_metadata=None,
     ):
         """Run the training path through pre-attention and core attention."""
         assert self.supports_two_stage_attention()
@@ -807,6 +809,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 rotary_pos_emb=rotary_pos_emb,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
+                packed_sequence_cp_metadata=packed_sequence_cp_metadata,
             )
         nvtx_range_pop(suffix="self_attention")
 

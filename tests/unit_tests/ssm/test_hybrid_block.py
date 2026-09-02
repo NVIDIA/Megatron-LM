@@ -717,7 +717,9 @@ class TestHybridBlock:
 
             model_parallel_cuda_manual_seed(123)
             stage_one_state = layer.forward_pre_attn_and_core_attn(
-                hidden_states, attention_mask=attention_mask
+                hidden_states,
+                attention_mask=attention_mask,
+                packed_sequence_cp_metadata=None,
             )
             two_stage_output = layer.forward_post_core_attn(*stage_one_state)
 
@@ -766,7 +768,7 @@ class TestHybridBlock:
         assert shortcut.overlap_mode is parallel
         assert isinstance(shortcut.moe_layer, TransformerLayer)
         state_keys = set(block.state_dict())
-        assert any(key.startswith("layers.0.compute_layer.") for key in state_keys)
+        assert any(key.startswith("layers.0.attn_layer.") for key in state_keys)
         assert any(key.startswith("layers.0.moe_layer.") for key in state_keys)
         assert any(key.startswith("layers.0.shortcut_pre_mlp_layernorm.") for key in state_keys)
         assert "layers.0.shortcut_post_norm.weight" in state_keys
@@ -782,12 +784,12 @@ class TestHybridBlock:
             attention_mask = torch.triu(
                 torch.ones(1, 1, 16, 16, dtype=torch.bool, device=hidden_states.device), diagonal=1
             )
-            compute_layer = shortcut.compute_layer
+            attn_layer = shortcut.attn_layer
 
             def fail_if_mlp_runs(*args, **kwargs):
                 pytest.fail("attention shortcut output projection must not execute an MLP")
 
-            monkeypatch.setattr(compute_layer, "_forward_mlp", fail_if_mlp_runs)
+            monkeypatch.setattr(attn_layer, "_forward_mlp", fail_if_mlp_runs)
 
         output = block(hidden_states, attention_mask=attention_mask)
         output.float().square().mean().backward()
