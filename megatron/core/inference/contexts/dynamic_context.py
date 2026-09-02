@@ -216,6 +216,7 @@ class ContextErrorFactory:
             "MaxSequenceLengthOverflowError": MaxSequenceLengthOverflowError,
             "BlockOverflowError": BlockOverflowError,
             "ActiveRequestCountOverflowError": ActiveRequestCountOverflowError,
+            "TensorStateDeallocatedError": TensorStateDeallocatedError,
         }[obj["type"]]
         error = ContextOverflowError(**{k: v for k, v in obj.items() if k != "type"})
         error.__class__ = error_cls  # todo (@lmcafee): better/safer alternative?
@@ -226,7 +227,7 @@ def get_mem_size_str(n_bytes: int) -> str:
     """Convert number of bytes to human-readable string."""
     if n_bytes == 0:
         return "0 bytes"
-    for exp, suffix in ((4, "TB"), (3, "GB"), (2, "MB"), (3, "KB"), (0, "bytes")):
+    for exp, suffix in ((4, "TB"), (3, "GB"), (2, "MB"), (1, "KB"), (0, "bytes")):
         nquery = int(1024**exp)
         if round(n_bytes / nquery) >= 1:
             return "%.3g %s" % (n_bytes / nquery, suffix)

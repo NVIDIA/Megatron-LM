@@ -19,5 +19,6 @@ from .dynamic_context import (
     ContextOverflowError,
     DynamicInferenceContext,
     RequestOverflowError,
+    TensorStateDeallocatedError,
     TokenOverflowError,
 )
