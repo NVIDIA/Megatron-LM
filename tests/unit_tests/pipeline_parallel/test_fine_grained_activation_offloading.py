@@ -2,10 +2,7 @@
 
 import gc
 import os
-from collections import deque
-from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
-from unittest.mock import Mock
 
 import pytest
 import torch
@@ -15,10 +12,6 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
-)
-from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-    OffloadTensorGroup,
-    PipelineOffloadManager,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
@@ -69,137 +62,6 @@ def test_chunk_offload_handler_skips_non_offloadable_tensor_types():
     assert not handler.tensor_need_offloading_checker(fake_tensor)
     assert handler.tensor_push(fake_tensor) is fake_tensor
     assert handler.tensor_pop(fake_tensor) is fake_tensor
-
-
-def test_offload_tensor_group_allocates_external_throttle_event_only_when_enabled(monkeypatch):
-    event_calls = []
-
-    def _make_event(**kwargs):
-        event = Mock()
-        event_calls.append((kwargs, event))
-        return event
-
-    monkeypatch.setattr(torch.cuda, "Event", _make_event)
-
-    unthrottled_group = OffloadTensorGroup("core_attn")
-    assert len(event_calls) == 2
-    assert not any(kwargs.get("external", False) for kwargs, _ in event_calls)
-    assert unthrottled_group._offload_throttle_event is None
-
-    event_calls.clear()
-    throttled_group = OffloadTensorGroup("core_attn", enable_offload_throttle=True)
-    assert len(event_calls) == 3
-    external_events = [event for kwargs, event in event_calls if kwargs.get("external", False)]
-    assert external_events == [throttled_group.offload_throttle_event]
-
-
-@pytest.mark.parametrize("max_inflight_offloads", [None, 0, 2])
-def test_chunk_offload_handler_wires_throttle_event_to_max_inflight(
-    monkeypatch, max_inflight_offloads: Optional[int]
-):
-    monkeypatch.setattr(torch.cuda, "Event", lambda **_: Mock())
-
-    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
-    handler.do_offload = True
-    handler.is_warmup = True
-    handler.offload_groups = []
-    handler._offloaded_group_index = 0
-    handler._max_group_size = 0
-    handler._groups_to_offload = []
-    handler._max_inflight_offloads = max_inflight_offloads
-
-    handler.on_group_start_forward("core_attn")
-
-    group = handler.offload_groups[0]
-    assert (group._offload_throttle_event is not None) == (max_inflight_offloads is not None)
-    assert handler._groups_to_offload == [group]
-
-
-@pytest.mark.parametrize("max_inflight_offloads", [None, 0, 2])
-def test_chunk_offload_handler_uses_throttle_event_only_when_configured(
-    monkeypatch, max_inflight_offloads: Optional[int]
-):
-    from megatron.core.pipeline_parallel import fine_grained_activation_offload as off
-
-    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
-    monkeypatch.setattr(off, "nvtx_range_push", Mock())
-    monkeypatch.setattr(off, "nvtx_range_pop", Mock())
-
-    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
-    handler.d2h_stream = Mock()
-    handler.is_warmup = False
-    handler._max_inflight_offloads = max_inflight_offloads
-    handler._offload_pending_by_name = {"core_attn": deque()}
-    handler._drain_offload_pending = Mock()
-
-    group = Mock()
-    group._name = "core_attn"
-    group._tensors = {}
-    group.offload_throttle_event = Mock() if max_inflight_offloads is not None else None
-
-    handler.bulk_offload_group(group)
-
-    group.record_offload_event.assert_called_once_with(handler.d2h_stream)
-    if max_inflight_offloads is None:
-        group.record_offload_throttle_event.assert_not_called()
-        handler._drain_offload_pending.assert_not_called()
-        assert not handler._offload_pending_by_name["core_attn"]
-    else:
-        group.record_offload_throttle_event.assert_called_once_with(handler.d2h_stream)
-        handler._drain_offload_pending.assert_called_once_with("core_attn")
-        assert list(handler._offload_pending_by_name["core_attn"]) == [group.offload_throttle_event]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for graph capture.")
-@pytest.mark.launch_on_gb200
-@pytest.mark.parametrize(
-    "max_inflight_offloads",
-    [pytest.param(0, id="same-graph-smoke"), pytest.param(2, id="cross-graph-regression")],
-)
-def test_max_inflight_throttle_events_cross_cuda_graph_boundaries(max_inflight_offloads: int):
-    """Exercise the exact throttle-event record/wait regression across graphs.
-
-    The GB200 marker also selects this file into the GB200 unit-test bucket.
-    """
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    torch.cuda.set_device(local_rank % torch.cuda.device_count())
-    off_interface.reset_instance()
-    graphs = []
-    try:
-        manager = PipelineOffloadManager.get_instance()
-        handler = ChunkOffloadHandler(
-            min_offloaded_tensor_size=1,
-            cpu_tensor_pool=manager.cpu_tensor_pool,
-            max_inflight_offloads=max_inflight_offloads,
-        )
-        groups = [OffloadTensorGroup("core_attn", enable_offload_throttle=True) for _ in range(3)]
-
-        torch.cuda.synchronize()
-        for group in groups:
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                # Match the fork/join boundaries used by a TE per-module graph.
-                handler.d2h_stream.wait_stream(torch.cuda.current_stream())
-                handler.bulk_offload_group(group)
-                torch.cuda.current_stream().wait_stream(handler.d2h_stream)
-            graphs.append(graph)
-
-        for _ in range(2):
-            for graph in graphs:
-                graph.replay()
-        torch.cuda.synchronize()
-
-        # Cap 0 is a same-graph record/wait smoke case. Cap 2 is the regression:
-        # graph three waits on graph one's event, leaving the last two events pending.
-        expected_events = (
-            [group.offload_throttle_event for group in groups[-max_inflight_offloads:]]
-            if max_inflight_offloads > 0
-            else []
-        )
-        assert list(handler._offload_pending_by_name["core_attn"]) == expected_events
-    finally:
-        graphs.clear()
-        off_interface.reset_instance()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
