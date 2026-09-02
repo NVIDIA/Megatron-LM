@@ -19,9 +19,14 @@ upstream (a `-1` slot zeroes its conv output, which propagates here).
 
 It is deterministic: a pure elementwise map where each program owns a disjoint
 slice of every output, with no atomics, no reductions and no autotuning, so
-nothing depends on scheduling order. That is reproducibility against itself,
-not bitwise agreement with the eager path -- `beta` and `g` use libdevice
-`exp`/`log1p` rather than torch's `sigmoid`/`softplus` and may land a ulp apart.
+nothing depends on scheduling order.
+
+It also aims to be bitwise identical to the eager path, which the inference
+functional tests rely on. `query`/`key`/`value` are plain copies and match for
+free; `beta` and `g` match only because the transcendentals and the division go
+through libdevice rather than Triton's fp32 defaults. `test_decode_prepare.py`
+asserts that with `torch.equal`, so a Triton or torch upgrade that breaks the
+agreement fails there rather than in a functional test.
 """
 
 import torch
@@ -29,7 +34,10 @@ import torch
 from .common import HAVE_TRITON, tl, triton
 
 if HAVE_TRITON:
-    # `log1p` is a libdevice function; `triton.language.math` does not carry it.
+    # Everything numeric here goes through libdevice rather than `tl`: on fp32
+    # `tl.exp` lowers to `ex2.approx.f32` and `/` to `div.full.f32`, both of which
+    # cost bitwise agreement with the eager path. `log1p` is libdevice-only
+    # regardless; `triton.language.math` does not carry it.
     # The `triton.language.extra.libdevice` path dates to Triton 3.0 -- 2.x
     # exposed it as `extra.cuda.libdevice`, which this package does not support.
     try:
@@ -51,8 +59,11 @@ def softplus(x):
     `log1p` rather than `log(1 + ...)` so the far-negative tail, where `exp(x)`
     falls below fp32's epsilon and `1 + exp(x)` rounds to exactly 1, keeps its
     significant digits instead of flushing to zero.
+
+    Mirrors `F.softplus`'s `(x * beta) > threshold ? x : log1p(exp(x * beta)) / beta`
+    at the default `beta == 1.0`, where the multiply and divide are exact.
     """
-    return tl.where(x > 20.0, x, libdevice.log1p(tl.exp(x)))
+    return tl.where(x > 20.0, x, libdevice.log1p(libdevice.exp(x)))
 
 
 @triton.jit
@@ -117,14 +128,17 @@ def gdp_decode_prepare_kernel(
     p_ba = ba + i_n * ba_n_stride
     # beta is per (copy, head); `b` is laid out as (M, H) inside `ba`.
     b_b = tl.load(p_ba + i_m * H + i_h).to(tl.float32)
-    tl.store(beta + i_o, (1.0 / (1.0 + tl.exp(-b_b))).to(beta.dtype.element_ty))
+    # `1 / (1 + exp(-x))` in fp32, as torch's sigmoid computes it; `div_rn` because
+    # Triton's fp32 `/` is the approximate `div.full.f32`.
+    b_beta = libdevice.div_rn(1.0, 1.0 + libdevice.exp(-b_b))
+    tl.store(beta + i_o, b_beta.to(beta.dtype.element_ty))
 
     # The decay is per token, not per copy, and belongs on the *first* copy: the
     # state decays once per step, before the M Householder updates.
     b_a = tl.load(p_ba + M * H + i_h).to(tl.float32)
     b_dt = tl.load(dt_bias + i_h).to(tl.float32)
     b_A = tl.load(A_log + i_h).to(tl.float32)
-    b_g = tl.where(i_m == 0, -tl.exp(b_A) * softplus(b_a + b_dt), 0.0)
+    b_g = tl.where(i_m == 0, -libdevice.exp(b_A) * softplus(b_a + b_dt), 0.0)
     tl.store(g + i_o, b_g)
 
 
@@ -161,7 +175,7 @@ def gdp_decode_prepare(
     """
     assert HAVE_TRITON, "gdp_decode_prepare requires Triton"
     assert HAVE_TRITON_LIBDEVICE, (
-        "gdp_decode_prepare needs `triton.language.extra.libdevice` for log1p, which "
+        "gdp_decode_prepare needs `triton.language.extra.libdevice` for its math, which "
         f"requires Triton >= 3.0; found {getattr(triton, '__version__', 'unknown')}"
     )
     assert x.shape[1] == 1 and ba.shape[1] == 1, "decode runs one token per request"

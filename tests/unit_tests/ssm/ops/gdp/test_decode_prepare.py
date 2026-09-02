@@ -88,11 +88,15 @@ class TestGDPDecodePrepare:
         assert g.dtype == torch.float32
         assert value.dtype == dtype and beta.dtype == dtype
 
-        # query/key/value are pure copies, so they must match bit for bit.
-        for got, want, name in zip(out[:3], ref[:3], ("query", "key", "value")):
-            assert torch.equal(got, want), f"{name} mismatch"
-        torch.testing.assert_close(beta, ref[3])
-        torch.testing.assert_close(g, ref[4], rtol=1e-5, atol=1e-6)
+        # Every output must match bit for bit, not just closely: the GDP inference
+        # functional tests compare against golden values produced by the eager
+        # path, so a ulp in `beta` or `g` compounds through the recurrence. That
+        # holds only while the kernel's math goes through libdevice rather than
+        # Triton's approximate fp32 `exp` and `/` -- if a Triton or torch upgrade
+        # changes either side's lowering, this is where it should surface.
+        names = ("query", "key", "value", "beta", "g")
+        for got, want, name in zip(out, ref, names):
+            assert torch.equal(got, want), f"{name} is not bitwise equal to the eager path"
 
     def test_decay_and_query_placement(self):
         """The decay sits on the first Householder copy, the query on the last."""
