@@ -116,8 +116,8 @@ class InferenceClient:
                     ``"image"`` accepts raw image bytes, a list of raw image
                     bytes, or a preprocessed image tensor dictionary.
                 Video:
-                    Video does not yet have any supported data preprocessing
-                    or modeling formats.
+                    ``"video"`` accepts raw video bytes, a list of raw video
+                    bytes, or a preprocessed video tensor dictionary.
                 Audio:
                     Audio does not yet have any supported data preprocessing
                     or modeling formats.
@@ -126,6 +126,35 @@ class InferenceClient:
             asyncio.Future: A future that will be resolved with a
             `DynamicInferenceRequest` object (if deserialize=True) or a raw
             serialized dict (if deserialize=False) containing the completed result.
+        """
+        return self.add_request_with_id(prompt, sampling_params, multi_modal_data=multi_modal_data)[
+            1
+        ]
+
+    def add_request_with_id(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        *,
+        multi_modal_data=None,
+    ) -> tuple[int, asyncio.Future]:
+        """Submit a request and return its id alongside its completion future.
+
+        Same submission as add_request, which delegates here. The id is what
+        abort_request takes, so a caller that may need to cancel -- an HTTP
+        handler whose client can disconnect mid-generation, for instance -- has
+        to use this form. With only the future in hand there is no way to name
+        the request to the coordinator, and cancelling the future alone leaves
+        the engine generating.
+
+        Args:
+            prompt: A string or list of token IDs.
+            sampling_params: Sampling parameters for the request.
+            multi_modal_data: Optional vLLM-style modality dictionary; see
+                add_request.
+
+        Returns:
+            tuple[int, asyncio.Future]: The request id and its completion future.
         """
         request_id = self.next_request_id
         self.next_request_id += 1
@@ -136,7 +165,7 @@ class InferenceClient:
             sampling_params.serialize(),
             serialize_multimodal_data(multi_modal_data),
         ]
-        return self._submit_request(payload, request_id)
+        return request_id, self._submit_request(payload, request_id)
 
     def _make_kv_handoff_request(
         self,
@@ -223,11 +252,20 @@ class InferenceClient:
     def abort_request(self, request_id: int) -> None:
         """Cancel an in-flight request and close its local response stream."""
         request_id = int(request_id)
-        self.aborted_request_ids.add(request_id)
         stream = self.streams.pop(request_id, None)
+        future = self.completion_futures.pop(request_id, None)
+        if stream is None and future is None:
+            # Already completed (or never submitted): _submit_request and
+            # _submit_stream register synchronously and _recv_task pops only
+            # immediately before delivering, so absence from both means the
+            # reply has been consumed. No further ENGINE_REPLY will arrive to
+            # prune aborted_request_ids, and the coordinator has already
+            # dropped its mapping, so recording the id would leak an entry
+            # nothing ever removes and the ABORT_REQUEST send would be wasted.
+            return
+        self.aborted_request_ids.add(request_id)
         if stream is not None:
             stream.finish()
-        future = self.completion_futures.pop(request_id, None)
         if future is not None and not future.done():
             future.cancel()
         self.request_submission_times.pop(request_id, None)
@@ -265,8 +303,8 @@ class InferenceClient:
                     ``"image"`` accepts raw image bytes, a list of raw image
                     bytes, or a preprocessed image tensor dictionary.
                 Video:
-                    Video does not yet have any supported data preprocessing
-                    or modeling formats.
+                    ``"video"`` accepts raw video bytes, a list of raw video
+                    bytes, or a preprocessed video tensor dictionary.
                 Audio:
                     Audio does not yet have any supported data preprocessing
                     or modeling formats.

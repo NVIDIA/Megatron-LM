@@ -59,6 +59,54 @@ class TinyModel(nn.Module):
         return self.fc1(x)
 
 
+class _FakeLayerwiseBucket:
+    def __init__(self, params):
+        self.params_list = params
+        self.params = set(params)
+        self.layerwise_params_list = None
+        self.layerwise_param_flat_sizes = None
+
+    def set_layerwise_params_list(self, layerwise_params_list):
+        self.layerwise_params_list = layerwise_params_list
+        self.layerwise_param_flat_sizes = [
+            sum(param.numel() for param in param_list) for param_list in layerwise_params_list
+        ]
+
+
+class _FakeBucketGroup:
+    def __init__(self, buckets):
+        self.buckets = buckets
+
+
+class _FakeModelChunk:
+    def __init__(self, bucket):
+        self.bucket_groups = [_FakeBucketGroup([bucket])]
+        self.expert_parallel_bucket_groups = []
+
+
+def test_set_bucket_layerwise_params_list_single_dp_rank():
+    """Single-DP-rank LayerWise buckets should still receive param lists.
+
+    Regression for #5203: shard_params() sets dp_cp_params_list to None when
+    dp_cp_size == 1, but set_bucket_layerwise_params_list() still needs to
+    initialize bucket.layerwise_params_list for the overlap param-gather path.
+    """
+    params = [torch.nn.Parameter(torch.empty(4, 4)), torch.nn.Parameter(torch.empty(2, 2))]
+    for param in params:
+        param.is_managed_by_layer_wise_optimizer = True
+    bucket = _FakeLayerwiseBucket(params)
+
+    optimizer = object.__new__(LayerWiseDistributedOptimizer)
+    optimizer.pg_collection = ProcessGroupCollection(dp_cp=None, expt_dp=None)
+    optimizer.dp_cp_params_list = None
+    optimizer.expt_dp_params_list = None
+
+    optimizer.set_bucket_layerwise_params_list([_FakeModelChunk(bucket)])
+
+    assert bucket.layerwise_params_list == [params]
+    assert bucket.layerwise_param_flat_sizes == [sum(param.numel() for param in params)]
+
+
 class MuonExcludedMatrixModel(nn.Module):
     """Model with a 2D matrix explicitly routed to the scalar optimizer."""
 
@@ -498,6 +546,29 @@ class TestLayerWiseOptimizer:
         update_successful, grad_norm, num_zeros = optimizer.step()
 
         assert update_successful, "Optimizer step should be successful"
+
+    def test_bf16_wrapper_uses_preserved_high_precision_initializer(self):
+        """FP32 masters must not be initialized from an already-quantized model weight."""
+        model_param = torch.nn.Parameter(
+            torch.full((2, 2), -1.0, dtype=torch.bfloat16, device='cuda')
+        )
+        preserved_init = torch.full((2, 2), 1.25, dtype=torch.bfloat16)
+        init_state = {'value': preserved_init}
+        model_param.get_high_precision_init_val = lambda: init_state['value']
+        model_param.clear_high_precision_init_val = lambda: init_state.update(value=None)
+
+        base_optimizer = torch.optim.SGD([model_param], lr=0.1)
+        wrapped_optimizer = Float16OptimizerWithFloat16Params(
+            base_optimizer,
+            OptimizerConfig(optimizer='sgd', lr=0.1, bf16=True),
+            None,
+            lambda opt, config: None,
+        )
+
+        main_param = wrapped_optimizer.fp32_from_float16_groups[0][0]
+        torch.testing.assert_close(main_param, preserved_init.cuda().float(), rtol=0, atol=0)
+        assert init_state['value'] is None
+        assert model_param.main_param is main_param
 
     def test_bf16_error(self):
         """Test LayerWiseDistributedOptimizer raises error when receiving pre-wrapped Float16 optimizer."""
