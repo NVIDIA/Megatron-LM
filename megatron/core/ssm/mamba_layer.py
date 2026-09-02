@@ -155,6 +155,7 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        packed_sequence_cp_metadata: PackedSequenceCPMetadata | None = None,
     ):
         """Run normalization, input projection, and the selective SSM/SSD.
 
@@ -176,7 +177,9 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
         hidden_states, residual = self._prepare_mixer_input(hidden_states)
 
         ssm_output = self.mixer.forward_pre_attn_and_core_attn(
-            hidden_states, packed_seq_params=packed_seq_params
+            hidden_states,
+            packed_seq_params=packed_seq_params,
+            packed_sequence_cp_metadata=packed_sequence_cp_metadata,
         )
         return ssm_output, residual
 
