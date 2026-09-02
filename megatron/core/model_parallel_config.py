@@ -343,9 +343,10 @@ class ModelParallelConfig:
     ep_overlap_use_scheduled_tensor_lifetime: bool = False
     """Use schedule-aware cross-stream tensor retirement for fine-grained EP overlap.
 
-    When enabled, schedule nodes explicitly hand tensor storage back to its creation
-    stream instead of relying on allocator ``record_stream`` retirement. This option
-    is experimental and disabled by default.
+    When enabled, schedule nodes hand internally produced tensors back to their creation
+    stream through the plan's existing event chain. Tensors without a schedule-local
+    owner tag keep using allocator ``record_stream`` retirement. This option is experimental
+    and disabled by default.
     """
 
     delay_wgrad_compute: bool = False

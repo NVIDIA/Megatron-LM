@@ -401,7 +401,6 @@ class TransformerLayerNode(ScheduleNode):
             "is_last_layer_in_mhc_recompute_group", False
         )
         self.post_wgrad_grad_acc_hooks = None
-        self.detached_grad_hook_handles = []
 
         # Create flags to indicate first and last layer
         self.is_first_layer = extra_args.get("is_first_layer", False)
@@ -420,7 +419,6 @@ class TransformerLayerNode(ScheduleNode):
         Under full recompute only each segment's input survives the forward->backward
         gap; the same node is later re-run with grad enabled to rebuild its state.
         """
-        self._remove_detached_grad_hooks()
         self.inputs = None
         self.output = None
         self.detached = tuple()
@@ -432,10 +430,6 @@ class TransformerLayerNode(ScheduleNode):
         detached.requires_grad = t.requires_grad
         self.before_detached = self.before_detached + (t,)
         self.detached = self.detached + (detached,)
-        if self.lifetime_manager is not None and detached.requires_grad:
-            self.detached_grad_hook_handles.append(
-                self.lifetime_manager.track_detached_leaf(detached)
-            )
         return detached
 
     def forward_impl(self, *args):
@@ -460,19 +454,10 @@ class TransformerLayerNode(ScheduleNode):
 
     def backward(self, *output_grad):
         """Execute backward pass and corresponding hooks."""
-        try:
-            grads = super().backward(*output_grad)
-        finally:
-            self._remove_detached_grad_hooks()
+        grads = super().backward(*output_grad)
         if not self.delay_wgrad_compute and self.is_layer_first_node:
             self._post_backward_hook()
         return grads
-
-    def _remove_detached_grad_hooks(self):
-        """Remove detached-leaf hooks after their gradients have been consumed."""
-        for handle in getattr(self, "detached_grad_hook_handles", ()):
-            handle.remove()
-        self.detached_grad_hook_handles = []
 
     def backward_dw(self):
         """Computes the weight gradients for the transformer layer node."""
@@ -528,7 +513,6 @@ class TransformerLayerNode(ScheduleNode):
 
     def __del__(self):
         # Release reference as early as possible, this helps avoid memory leak.
-        self._remove_detached_grad_hooks()
         self.before_detached = None
         self.detached = None
         self.layer_state = None

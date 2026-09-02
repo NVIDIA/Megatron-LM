@@ -9,7 +9,6 @@ import torch
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.pipeline_parallel.tensor_lifetime import register_external_tensor
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     ScheduleNode,
@@ -454,10 +453,6 @@ def combined_forward_backward_step(
             # Backward pass for loss function
             torch.autograd.backward(b_output_tensor[0], grad_tensors=b_output_tensor_grad[0])
             b_output_tensor_grad[0] = loss_node.get_grad()
-            if config.ep_overlap_use_scheduled_tensor_lifetime:
-                register_external_tensor(
-                    b_output_tensor_grad[0], loss_node.stream, producer_node="loss backward"
-                )
             loss_node_inputs_to_release = loss_node.inputs
             loss_node._release_state()
 

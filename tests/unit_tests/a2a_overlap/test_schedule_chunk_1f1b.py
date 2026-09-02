@@ -11,7 +11,6 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.pipeline_parallel.tensor_lifetime import register_external_tensor
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.utils import is_te_min_version
@@ -85,7 +84,6 @@ def run_two_chunk_parity(
     after release_layer_activations().
     """
     assert len(layers) == 2, "the 1F1B pattern below is written for exactly two chunks"
-    scheduled_lifetime = extra_kwargs.get("ep_overlap_use_scheduled_tensor_lifetime", False)
 
     gpt_models = []
     schedule_plans = []
@@ -143,22 +141,14 @@ def run_two_chunk_parity(
                 on_forward_done(schedule_plans[0])
             capture_0["outputs"].append(f_input_0)
             # overlap
-            b_grad_0 = torch.ones_like(f_input_0)
-            if scheduled_lifetime:
-                register_external_tensor(
-                    b_grad_0, torch.cuda.current_stream(), "unit-test external gradient"
-                )
             f_input_1 = TransformerModelChunkSchedulePlan.run(
-                schedule_plans[1], schedule_plans[0], b_grad=b_grad_0
+                schedule_plans[1], schedule_plans[0], b_grad=torch.ones_like(f_input_0)
             )
             capture_1["outputs"].append(f_input_1)
             # last backward
-            b_grad_1 = torch.ones_like(f_input_1)
-            if scheduled_lifetime:
-                register_external_tensor(
-                    b_grad_1, torch.cuda.current_stream(), "unit-test external gradient"
-                )
-            TransformerModelChunkSchedulePlan.run(None, schedule_plans[1], b_grad=b_grad_1)
+            TransformerModelChunkSchedulePlan.run(
+                None, schedule_plans[1], b_grad=torch.ones_like(f_input_1)
+            )
         for i in range(len(gpt_models)):
             for name, param in gpt_models[i].named_parameters():
                 a2a_captures[i][name] = param.grad
