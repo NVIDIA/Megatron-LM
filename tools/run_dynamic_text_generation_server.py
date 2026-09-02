@@ -24,9 +24,7 @@ from megatron.core.inference.config import (  # noqa: E402
     ImageProcessingConfig,
     VideoProcessingConfig,
 )
-from megatron.core.inference.contexts.dynamic_context import (
-    DynamicInferenceContext,  # noqa: E402
-)
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext  # noqa: E402
 from megatron.core.inference.engines import DynamicInferenceEngine  # noqa: E402
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (  # noqa: E402,E501
     VLMInferenceWrapper,
@@ -42,8 +40,6 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_
     _detect_vlm_from_checkpoint,
     _print_resolved_args,
     add_vlm_inference_args,
-)
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_dynamic_inference import (
     get_model as get_vlm_model,
 )
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer  # noqa: E402
@@ -68,22 +64,14 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     # add_vlm_inference_args calls add_inference_args internally; don't double-add.
     parser = add_vlm_inference_args(parser)
     parser = add_multimodal_extra_args(parser)
-    parser.add_argument(
-        "--port", type=int, default=5000, help="Port for Flask server to run on"
-    )
+    parser.add_argument("--port", type=int, default=5000, help="Port for Flask server to run on")
     parser.add_argument(
         "--host",
         type=str,
         default=None,
         help="Hostname or IP address to bind the server to. Defaults to 0.0.0.0 (all interfaces).",
     )
-    parser.add_argument(
-        "--parsers",
-        type=str,
-        nargs="+",
-        default=[],
-        help="Parsers to use for parsing the response",
-    )
+    parser.add_argument("--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response")
     parser.add_argument(
         "--frontend-replicas",
         type=int,
@@ -137,20 +125,6 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     return parser
 
 
-def _load_chat_template(value):
-    """Resolve a --chat-template arg into the template string itself.
-
-    If the value is a path to an existing file, read it. Otherwise treat the
-    value as the inline template.
-    """
-    if value is None:
-        return None
-    if os.path.isfile(value):
-        with open(value) as f:
-            return f.read()
-    return value
-
-
 def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
     """Build a DynamicInferenceEngine, wrapping with VLMInferenceWrapper when needed.
 
@@ -176,9 +150,9 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
             args, 'use_tiling', False
         )
         if dynamic_res:
-            max_patches = getattr(args, "dynamic_resolution_max_patches", 128)
+            max_patches = getattr(args, 'dynamic_resolution_max_patches', 128)
             max_img_embeddings = max_patches
-            if getattr(args, "pixel_shuffle", False):
+            if getattr(args, 'pixel_shuffle', False):
                 max_img_embeddings = max_img_embeddings // 4
             inference_config.max_sequence_length = max(
                 inference_config.max_sequence_length,
@@ -199,9 +173,7 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
                 args.max_num_tiles,
                 args.tokenizer_prompt_format,
             )
-            max_num_tiles = args.max_num_tiles + int(
-                getattr(args, "use_thumbnail", False)
-            )
+            max_num_tiles = args.max_num_tiles + int(getattr(args, "use_thumbnail", False))
             max_img_tokens = max_num_tiles * args.num_img_embeddings_per_tile
             inference_config.max_sequence_length = max(
                 inference_config.max_sequence_length,
@@ -348,6 +320,19 @@ async def run_text_generation_server(
         stop_text_gen_server()
 
 
+def _load_chat_template(value):
+    """Resolve a --chat-template arg into the template string itself.
+
+    If the value is a path to an existing file, read it. Otherwise treat the
+    value as the inline template.
+    """
+    if value is None:
+        return None
+    if os.path.isfile(value):
+        with open(value) as f:
+            return f.read()
+    return value
+
 def main(
     args_defaults: dict | None = None,
     force_return_log_probs: bool = True,
@@ -366,9 +351,9 @@ def main(
         # defaults / parser defaults.  Precedence: CLI > checkpoint > default.
         user_passed_attrs = set()
         for tok in sys.argv[1:]:
-            if tok.startswith("--"):
-                name = tok[2:].split("=", 1)[0]
-                user_passed_attrs.add(name.replace("-", "_"))
+            if tok.startswith('--'):
+                name = tok[2:].split('=', 1)[0]
+                user_passed_attrs.add(name.replace('-', '_'))
 
         # Defaults that align this server with the VLM dynamic-batching path.
         # Injected into argv (not as parser defaults) so they appear *before*
@@ -420,7 +405,7 @@ def main(
         # CLI > checkpoint > parser default.  Tiling and dynamic_resolution are
         # mutually exclusive at inference, so honor --use-tiling explicitly.
         is_vlm = _detect_vlm_from_checkpoint(args, user_passed_attrs=user_passed_attrs)
-        if getattr(args, "use_tiling", False):
+        if getattr(args, 'use_tiling', False):
             args.dynamic_resolution = False
         if is_vlm:
             _print_resolved_args("resolved VLM arguments", args)
@@ -443,7 +428,7 @@ def main(
         if force_prompt_log_probs:
             args.skip_prompt_log_probs = False
 
-        chat_template = _load_chat_template(getattr(args, "chat_template", None))
+        chat_template = _load_chat_template(getattr(args, 'chat_template', None))
 
         engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm)
 
