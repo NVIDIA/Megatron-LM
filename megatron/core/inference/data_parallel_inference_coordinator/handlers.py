@@ -17,7 +17,10 @@ import logging
 
 import torch
 
-from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.config import (
+    MediaCacheCoordinatorPolicy,
+    PrefixCachingCoordinatorPolicy,
+)
 from megatron.core.inference.headers import Headers
 
 from .state import CONTROL_TRANSITIONS, CoordinatorState
@@ -110,24 +113,23 @@ def handle_submit_request(coordinator, sender_identity, payload):
         use_bin_type=True,
     )
 
-    # Skip prefix-aware routing for image-bearing requests. Prefix *caching*
-    # itself is disabled for these requests in _build_vlm_request, so cross-image
-    # cache reuse can't happen; clearing hashes here just prevents affinity
-    # routing that would concentrate multimodal requests onto whichever rank
-    # happened to serve a text-identical prompt first.
-    if multi_modal_data:
-        request_hashes = []
-    else:
-        request_hashes = coordinator.compute_request_hashes(prompt)
-        if (
-            coordinator.prefix_caching_coordinator_policy
-            == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
-        ):
-            request_hashes = request_hashes[:1]
+    # Multimodal routing hashes cover the compact prompt and are salted with
+    # the internally generated media identity to compute coordinator affinity.
+    media_cache_key = (
+        multi_modal_data.get("media_cache_key") if isinstance(multi_modal_data, dict) else None
+    )
+    request_hashes = coordinator.compute_request_hashes(prompt, cache_salt=media_cache_key)
+    if (
+        coordinator.prefix_caching_coordinator_policy
+        == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
+    ):
+        request_hashes = request_hashes[:1]
 
     # Account for the fact that some engines may have died.
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
-        next_identity = coordinator.get_best_data_parallel_rank(request_hashes)
+        next_identity = coordinator.get_best_data_parallel_rank(
+            request_hashes, media_cache_key=media_cache_key
+        )
         if coordinator._send_to_engine(next_identity, engine_payload):
             break
     else:
@@ -140,6 +142,12 @@ def handle_submit_request(coordinator, sender_identity, payload):
 
     coordinator.request_id_to_rank[request_id] = next_identity
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
+    if (
+        isinstance(media_cache_key, str)
+        and coordinator.vision_embedding_cache_enabled
+        and coordinator.media_cache_coordinator_policy == MediaCacheCoordinatorPolicy.AFFINITY
+    ):
+        coordinator._update_media_affinity(media_cache_key, next_identity)
     if request_hashes:
         coordinator._update_rank_hashes(next_identity, request_hashes)
     if coordinator.schedule_records is not None:
