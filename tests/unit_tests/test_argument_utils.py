@@ -56,9 +56,7 @@ class CapturingTransformerConfig:
 
 
 def _minimal_training_args(monkeypatch):
-    monkeypatch.setattr(
-        sys, 'argv', ['test_argument_utils.py', '--freeze-base-model-for-mtp']
-    )
+    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py', '--freeze-base-model-for-mtp'])
     args = parse_args()
     args.num_layers = 2
     args.hidden_size = 128
