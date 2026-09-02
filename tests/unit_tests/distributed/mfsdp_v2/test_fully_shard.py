@@ -273,7 +273,6 @@ def test_fully_shard_waits_for_delayed_te_weight_gradient(distributed_setup):
     assert model.phase is FsdpModule.Phase.BACKWARD
 
     model.backward_dw()
-    torch.cuda.synchronize(device)
 
     assert model.weight.grad is not None
     assert model.phase is FsdpModule.Phase.RESTING
