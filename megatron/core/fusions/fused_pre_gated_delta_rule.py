@@ -2588,8 +2588,7 @@ def fused_streamed_pre_gated_delta_rule(
 
     Args:
         qkvzba: ``[seq_len, batch, in_proj_dim]`` projection output. Must be
-            on CUDA. Dense SBHD supports any positive batch size, including
-            chunkwise context parallelism.
+            on CUDA.
         conv1d_weight: ``[conv_dim, 1, k_w]`` depthwise conv weight.
         conv1d_bias: Must be ``None`` (conv bias is not supported).
         A_log: ``[num_value_heads]`` raw decay parameter.
@@ -2635,6 +2634,11 @@ def fused_streamed_pre_gated_delta_rule(
     ), f"{num_value_heads=} must be a multiple of {num_key_heads=}."
     cp_size = cp_group.size() if cp_group is not None else 1
     if cp_size > 1:
+        if qkvzba.shape[1] != 1:
+            raise ValueError(
+                "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
+                f"for fused_pre_gated_delta_rule; got batch={qkvzba.shape[1]}."
+            )
         boundary = conv1d_weight.shape[-1] - 1
         if boundary > 0 and qkvzba.shape[0] < boundary:
             raise ValueError(

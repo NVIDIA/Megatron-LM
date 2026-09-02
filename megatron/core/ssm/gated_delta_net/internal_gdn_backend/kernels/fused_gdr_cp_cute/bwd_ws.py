@@ -88,7 +88,7 @@ rendezvous are the item boundary and the epilogue.  Every MMA is issued by
 one warp (tcgen05 issue and tcgen05.commit are elect-one-per-warp; multi-warp
 issue duplicates MMAs and over-arrives the 1-count producer mbarriers).
 
-Restrictions: sm_100a, K == V == 128, BT = 64, gate modes
+Restrictions: sm_100a, K == V == 128, B = 1, BT = 64, gate modes
 none/g/gk, no DPLR.  Other shapes fall back to the non-WS backward.
 """
 
@@ -105,11 +105,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from .bwd_fused import _FLA_WRAPPER_CACHE  # noqa: F401
-from .bwd_fused import (
-    BT,
-    CuteDSLFusedCPBwdPreProcess,
-    PreProcessBwdFused,
-)
+from .bwd_fused import BT, CuteDSLFusedCPBwdPreProcess, PreProcessBwdFused
 from .bwd_fused import chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl_fused as _bwd_entry
 from .fused_ws import PreProcessFwdFusedWS, tmem_alloc_ptr
 
@@ -133,11 +129,9 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
     """Warp-specialized reverse producer with peer push and suffix fold."""
 
     def __init__(self, H, HV, K, V, gate_mode, R, rank, n_sm=None,
-                 full_chunks=False, B=1):
+                 full_chunks=False):
         # Backward protocol/geometry first (peer counts, NSTRIPS, NB, ...).
-        PreProcessBwdFused.__init__(
-            self, H, HV, K, V, gate_mode, R, rank, B=B
-        )
+        PreProcessBwdFused.__init__(self, H, HV, K, V, gate_mode, R, rank)
         assert K == V == 128, "WS backward is specialized for K == V == 128"
         assert gate_mode in ("none", "g", "gk"), gate_mode
         if self.use_g:
@@ -182,8 +176,8 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
         self.n_sm = n_sm
         # Reverse direction: rank r produces for consumers 0..r-1 and merges
         # sources R-1..r+1 -- the mirror of the forward's counts.
-        self.n_citems = B * HV if rank > 0 else 0
-        self.n_mitems = B * HV * self.NB if rank < R - 1 else 0
+        self.n_citems = HV if rank > 0 else 0
+        self.n_mitems = HV * self.NB if rank < R - 1 else 0
         self.n_items = self.n_citems + self.n_mitems
         # A rank whose local sequence neither enters nor leaves this CP shard
         # still participates in symmetric-buffer init; one idle CTA keeps the
@@ -218,34 +212,26 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
         NG, SPP = self.NG, self.SPP
         dtype = self.io_dtype
 
-        # gmem views shaped for the TMA atoms.  Batch and time collapse into
-        # one contiguous row mode, exactly as in the forward WS kernel.  K and
-        # Q are [B*T,H,K]; the
+        # gmem views shaped for the TMA atoms.  K and Q are [T,H,K]; the
         # mn-major views transpose in the descriptor (stride 1 on the K mode)
         # exactly as the forward does for K^T.
-        BT_rows = self.B * T
         mQt3 = cute.make_tensor(
-            pQ, cute.make_layout((K, BT_rows, H), stride=(1, H * K, K)))
+            pQ, cute.make_layout((K, T, H), stride=(1, H * K, K)))
         mWt3 = cute.make_tensor(
-            pW, cute.make_layout((K, BT_rows, HV), stride=(1, HV * K, K)))
+            pW, cute.make_layout((K, T, HV), stride=(1, HV * K, K)))
         mK3 = cute.make_tensor(
-            pK, cute.make_layout((BT_rows, K, H), stride=(H * K, 1, K)))
+            pK, cute.make_layout((T, K, H), stride=(H * K, 1, K)))
         mDV3 = cute.make_tensor(
-            pDV, cute.make_layout((BT_rows, V, HV), stride=(HV * V, 1, V)))
+            pDV, cute.make_layout((T, V, HV), stride=(HV * V, 1, V)))
         mDO3 = cute.make_tensor(
-            pDO, cute.make_layout((BT_rows, V, HV), stride=(HV * V, 1, V)))
-        mG2 = cute.make_tensor(
-            pG, cute.make_layout((BT_rows, HV), stride=(HV, 1)))
+            pDO, cute.make_layout((T, V, HV), stride=(HV * V, 1, V)))
+        mG2 = cute.make_tensor(pG, cute.make_layout((T, HV), stride=(HV, 1)))
         mGk2 = cute.make_tensor(
-            pGK, cute.make_layout((BT_rows * HV, K), stride=(K, 1)))
+            pGK, cute.make_layout((T * HV, K), stride=(K, 1)))
         mPtrs = cute.make_tensor(
             pPtrs, cute.make_layout((3, self.R), stride=(self.R, 1)))
         mDHT = cute.make_tensor(
-            pDHT,
-            cute.make_layout(
-                (self.B, HV, K, V), stride=(HV * K * V, K * V, V, 1)
-            ),
-        )
+            pDHT, cute.make_layout((HV, K, V), stride=(K * V, V, 1)))
 
         # ---- tcgen05 tiled MMAs (strip-width N=64), flipped "v5" shapes
         def mk_mma(amaj, bmaj, shape):
@@ -620,9 +606,8 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
                 nb_item.arrive_and_wait()
                 if tidx == 0:
                     wid = cutlass.Int32(bidx) + slot * self.n_ctas
-                    sI_t[0] = wid % self.HV             # hv
+                    sI_t[0] = wid                       # hv
                     sI_t[4] = (1 if wid < self.n_citems else 0)
-                    sI_t[6] = wid // self.HV            # batch
                     # slot 7 = this launch's emit mask; see the forward twin in
                     # `fused_ws.py`.  Read only by the cold push epilogue, so it
                     # never lives in a register across the reverse scan.
@@ -637,21 +622,17 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
                             atom_g, tG, atom_gk, tGk,
                             tiled_mma1, tiled_mma2,
                             sK_t, sWt_t, sDV_t, sG_t, sGk_t,
-                            T, nc, hv, p_fk, p_vg, st_fk_p, st_vg_p, sI_t,
+                            T, nc, hv, p_fk, p_vg, st_fk_p, st_vg_p,
                         )
                         # ack throttle before anyone pushes
                         ackv = cutlass.max(step - 2, 0).to(cutlass.Uint32)
                         ak_loc = mPtrs[2, rank]
-                        batch = (sI_t[6] if cutlass.const_expr(self.B > 1)
-                                 else 0)
                         if tidx == self.tma_warp * 32:
                             for cc in cutlass.range_constexpr(
                                     self.consumer_lo, rank):
                                 for b in cutlass.range_constexpr(self.NB):
                                     self._spin_ge_sys(
-                                        ak_loc,
-                                        ((cc * self.B + batch) * self.HV + hv)
-                                        * self.NB + b,
+                                        ak_loc, (cc * self.HV + hv) * self.NB + b,
                                         ackv)
                         nb_epilog.arrive_and_wait()
                     elif warp_idx == self.mma_warp:
@@ -669,7 +650,7 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
                         st_bk_p, st_g1b_c = self._back_tma(
                             atom_qt, tQt, atom_do, tDO,
                             tiled_mma1, tiled_mma2, sQt_t, sDO_t,
-                            T, nc, hv, p_bk, p_g1b, st_bk_p, st_g1b_c, sI_t,
+                            T, nc, hv, p_bk, p_g1b, st_bk_p, st_g1b_c,
                         )
                         nb_epilog.arrive_and_wait()
                     elif warp_idx == self.lam_warp:
@@ -702,23 +683,18 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
                     nb_epilog.arrive_and_wait()
                     cute.arch.fence_acq_rel_sys()
                     if tidx == 0:
-                        batch = (sI_t[6] if cutlass.const_expr(self.B > 1)
-                                 else 0)
-                        self._flag_bwd_consumers(mPtrs, batch, hv, stepu)
+                        self._flag_bwd_consumers(mPtrs, hv, stepu)
 
         if cutlass.const_expr(self.n_mitems > 0):
             wi = cutlass.Int32(bidx)
             while wi < self.n_mitems:
                 nb_item.arrive_and_wait()
                 mb = wi % self.NB
-                gh = wi // self.NB
-                mhv = gh % self.HV
-                mbatch = gh // self.HV
+                mhv = wi // self.NB
                 if warp_idx <= 3:
                     self._bwd_merge_role(
                         tidx, mb, mhv, par, stepu, mPtrs, mDHT, pHMloc,
                         storage, tiled_mma_sm80, tiled_copy_M, sM_layout,
-                        mbatch,
                     )
                 nb_item.arrive_and_wait()
                 wi += self.n_ctas
@@ -759,13 +735,12 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
         self, atom_k, tKtile, atom_wt, tWt, atom_dv, tDV, atom_g, tG,
         atom_gk, tGk, tiled_mma1, tiled_mma2,
         sK_t, sWt_t, sDV_t, sG_t, sGk_t,
-        T, nc, hv, p_fk, p_vg, st_fk, st_vg, sI_t,
+        T, nc, hv, p_fk, p_vg, st_fk, st_vg,
     ):
         hk = hv // (self.HV // self.H)
         thr_mma1 = tiled_mma1.get_slice(0)
         thr_mma2 = tiled_mma2.get_slice(0)
         K, V = self.K, self.V
-        bT = (sI_t[6] * T) if cutlass.const_expr(self.B > 1) else 0
 
         def tma_ld(atom, gt, off, tiler, thr, s_t, stage, bar):
             g = cute.local_tile(cute.domain_offset(off, gt), tiler,
@@ -790,7 +765,7 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
         for tq in cutlass.range(nc, unroll=1):
             cq = self._rev(tq, nc)
             t0 = cq * BT
-            t_ofs = bT + cutlass.max(cutlass.min(t0, T - BT), 0)
+            t_ofs = cutlass.max(cutlass.min(t0, T - BT), 0)
 
             p_fk.producer_acquire(st_fk)
             bar_fk = p_fk.producer_get_barrier(st_fk)
@@ -807,7 +782,7 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
                 gate_ld(atom_g, tG, (t_ofs, (hv // 4) * 4), (BT, 4),
                         sG_t, st_vg.index, bar_vg)
             if cutlass.const_expr(self.use_gk):
-                last_idx = bT + t0 + cutlass.min(T - t0, BT) - 1
+                last_idx = t0 + cutlass.min(T - t0, BT) - 1
                 gate_ld(atom_gk, tGk, (last_idx * self.HV + hv, 0),
                         (1, self.K), sGk_t, st_vg.index, bar_vg)
 
@@ -819,7 +794,7 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
     @cute.jit
     def _back_tma(
         self, atom_qt, tQt, atom_do, tDO, tiled_mma1, tiled_mma2,
-        sQt_t, sDO_t, T, nc, hv, p_bk, p_g1b, st_bk, st_g1b, sI_t,
+        sQt_t, sDO_t, T, nc, hv, p_bk, p_g1b, st_bk, st_g1b,
     ):
         """Q^T and dO land in the pair-0 sX half, which is dead only after
         gemm1(H) of the SAME chunk has consumed the published X_H^T."""
@@ -827,7 +802,6 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
         thr_mma1 = tiled_mma1.get_slice(0)
         thr_mma2 = tiled_mma2.get_slice(0)
         K, V = self.K, self.V
-        bT = (sI_t[6] * T) if cutlass.const_expr(self.B > 1) else 0
 
         def tma_ld(atom, gt, off, tiler, thr, s_t, bar):
             g = cute.local_tile(cute.domain_offset(off, gt), tiler,
@@ -843,7 +817,7 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
         for tq in cutlass.range(nc, unroll=1):
             cq = self._rev(tq, nc)
             t0 = cq * BT
-            t_ofs = bT + cutlass.max(cutlass.min(t0, T - BT), 0)
+            t_ofs = cutlass.max(cutlass.min(t0, T - BT), 0)
             # gemm1(H) retired: the overlay bytes are free.  This edge also
             # transitively orders the H pair's previous-chunk dO reads (its
             # own chain runs pass1a -> pub -> gemm1, and pass1a waits gemm3).
@@ -1352,11 +1326,10 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
                 rX[i] = cutlass.Float32(0.0)
         lane = ltid & 31
         warp_row0 = row0 - lane
-        batch = sI_t[6] if cutlass.const_expr(self.B > 1) else 0
         for ss in cutlass.range_constexpr(2):
             strip = strip0 + ss
             xbase = ss * NS
-            off0 = self._hm_off(par, self.rank, hv, strip, batch)
+            off0 = self._hm_off(par, self.rank, hv, strip)
             warp_slot = (4 * strip + ltid // 32) * (32 * 32)
             for half in cutlass.range_constexpr(2):
                 for v4 in cutlass.range_constexpr(8):
@@ -1394,9 +1367,9 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
 
     # ------------------------------------------------------------- protocol
     @cute.jit
-    def _flag_bwd_consumers(self, mPtrs, batch, hv, stepu):
+    def _flag_bwd_consumers(self, mPtrs, hv, stepu):
         """Reverse direction: rank r flags every EARLIER consumer."""
-        rb = (self.rank * self.B + batch) * self.HV + hv
+        rb = self.rank * self.HV + hv
         for j in cutlass.range_constexpr(self.consumer_lo, self.rank):
             for s in cutlass.range_constexpr(self.NSTRIPS):
                 self._signal_relaxed_sys(
@@ -1405,7 +1378,7 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
     # ------------------------------------------------------------ merge role
     @cute.jit
     def _bwd_merge_role(self, tidx, b, hv, par, stepu, mPtrs, mDHT, pHMloc,
-                        storage, tiled_mma, tiled_copy_M, sM_layout, batch=0):
+                        storage, tiled_mma, tiled_copy_M, sM_layout):
         """Descending suffix fold z <- P_j @ z + Htilde_j on warps 0-3.
 
         The incoming gradient to the global right boundary is zero, so the
@@ -1438,11 +1411,9 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
 
         if tidx == 0:
             self._spin_ge_sys(
-                fl_loc,
-                ((last * self.B + batch) * self.HV + hv) * self.NSTRIPS + b,
-                stepu)
+                fl_loc, (last * self.HV + hv) * self.NSTRIPS + b, stepu)
         bar.arrive_and_wait()
-        self._stage_he_issue(pHMloc + self._hm_off(par, last, hv, b, batch),
+        self._stage_he_issue(pHMloc + self._hm_off(par, last, hv, b),
                              mRawHe, tiled_copy_M, tidx)
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
@@ -1455,14 +1426,11 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
         if cutlass.const_expr(rank + 1 < self.source_hi):
             j0 = self.source_hi - 1
             if tidx == 0:
-                self._spin_producer_sys(fl_loc, j0, hv, b, stepu, batch)
+                self._spin_producer_sys(fl_loc, j0, hv, b, stepu)
             bar.arrive_and_wait()
-            self._stage_issue(
-                              pHMloc + self._hm_off(
-                                  par, j0, hv, self.NV, batch),
+            self._stage_issue(pHMloc + self._hm_off(par, j0, hv, self.NV),
                               mRaw, tiled_copy_M, tidx)
-            self._stage_he_issue(
-                                 pHMloc + self._hm_off(par, j0, hv, b, batch),
+            self._stage_he_issue(pHMloc + self._hm_off(par, j0, hv, b),
                                  mRawHe, tiled_copy_M, tidx)
             cute.arch.cp_async_commit_group()
 
@@ -1474,24 +1442,21 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
                                     mAddT_smem, True)
             if cutlass.const_expr(j - 1 > rank):
                 if tidx == 0:
-                    self._spin_producer_sys(
-                        fl_loc, j - 1, hv, b, stepu, batch)
+                    self._spin_producer_sys(fl_loc, j - 1, hv, b, stepu)
             bar.arrive_and_wait()
             if cutlass.const_expr(j - 1 > rank):
                 self._stage_issue(
-                    pHMloc + self._hm_off(
-                        par, j - 1, hv, self.NV, batch),
+                    pHMloc + self._hm_off(par, j - 1, hv, self.NV),
                     mRaw, tiled_copy_M, tidx)
                 self._stage_he_issue(
-                    pHMloc + self._hm_off(par, j - 1, hv, b, batch),
+                    pHMloc + self._hm_off(par, j - 1, hv, b),
                     mRawHe, tiled_copy_M, tidx)
                 cute.arch.cp_async_commit_group()
             self._fold_gemms(thr_mma, tiled_mma, macc, rAhi, rAlo,
                              sMhi, sMlo, tidx)
 
         gDHT = cute.make_tensor(
-            mDHT.iterator + (batch * self.HV * self.K * self.V
-                             + hv * self.K * self.V + b * 64),
+            mDHT.iterator + (hv * self.K * self.V + b * 64),
             cute.make_layout((64, self.K), stride=(1, self.V)))
         tDHT = thr_mma.partition_C(gDHT)
         for i in cutlass.range_constexpr(cute.size(macc)):
@@ -1502,8 +1467,7 @@ class PreProcessBwdFusedWS(PreProcessBwdFused, PreProcessFwdFusedWS):
             for j in cutlass.range_constexpr(rank + 1, self.source_hi + 1):
                 self._signal_relaxed_sys(
                     mPtrs[2, j],
-                    ((rank * self.B + batch) * self.HV + hv) * self.NB + b,
-                    stepu)
+                    (rank * self.HV + hv) * self.NB + b, stepu)
 
 
 # ---------------------------------------------------------------------- host
@@ -1525,7 +1489,7 @@ class CuteDSLFusedCPBwdPreProcessWS(CuteDSLFusedCPBwdPreProcess):
         (full_chunks,) = key
         return PreProcessBwdFusedWS(
             self.H, self.HV, self.DK, self.DV, self.gate_mode,
-            self.R, self.rank, full_chunks=full_chunks, B=self.B,
+            self.R, self.rank, full_chunks=full_chunks,
         )
 
 

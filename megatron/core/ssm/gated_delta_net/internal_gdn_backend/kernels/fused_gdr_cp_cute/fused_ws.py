@@ -2736,7 +2736,7 @@ class CuteDSLFusedCPPreProcessWS:
     """Host wrapper for whole-head or balanced T-split WS execution."""
 
     def __init__(self, group, H, HV, DK, DV, gate_mode="g", device=None,
-                 split=1, auto_split=True, B=1):
+                 split=1, auto_split=True):
         import torch.distributed as dist
 
         from .symm import CPSymmBuffers
@@ -2746,11 +2746,10 @@ class CuteDSLFusedCPPreProcessWS:
         self.group = group
         self.R = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
-        self.B = B
         self.H, self.HV, self.DK, self.DV = H, HV, DK, DV
         self.gate_mode = gate_mode
         self.device = device or torch.device("cuda", torch.cuda.current_device())
-        self.bufs = CPSymmBuffers(group, HV, DK, DV, self.device, B=B)
+        self.bufs = CPSymmBuffers(group, HV, DK, DV, self.device)
         self.ptrs = torch.stack(
             [self.bufs.hm_ptrs, self.bufs.fl_ptrs, self.bufs.ak_ptrs]
         ).contiguous()
@@ -2767,7 +2766,7 @@ class CuteDSLFusedCPPreProcessWS:
         self._ops = {
             aligned_key: PreProcessFwdFusedWS(
                 H, HV, DK, DV, gate_mode, self.R, self.rank,
-                tsplit=self.tsplit, B=B, full_chunks=True,
+                tsplit=self.tsplit, full_chunks=True,
             )
         }
         self.op = self._ops[aligned_key]
@@ -2800,7 +2799,7 @@ class CuteDSLFusedCPPreProcessWS:
         self._seg_i32 = None
         # Only producer ranks own a walk table; the last rank never retunes.
         if not self.tsplit and self.rank < self.R - 1:
-            nwork = self.B * self.HV
+            nwork = self.HV
             eff0 = min(self.op.n_ctas, nwork)
             i = torch.arange(self.op.n_ctas, dtype=torch.int64)
             s = torch.arange(self.op.NSLOT, dtype=torch.int64)
@@ -2861,7 +2860,6 @@ class CuteDSLFusedCPPreProcessWS:
                 self.op.n_ctas,
                 self.op.NSLOT,
                 self.tsplit,
-                B=self.B,
             )
             self._descriptor_cache[nt] = descriptor
             if len(self._descriptor_cache) > self._descriptor_cache_limit:
@@ -2906,11 +2904,10 @@ class CuteDSLFusedCPPreProcessWS:
 
         The contract is exactly the validation block of ``__call__``: `k`,
         `v`(=u) and `w` contiguous bf16 CUDA tensors on ``self.device`` with
-        shapes ``[B,T,H,K] / [B,T,HV,V] / [B,T,HV,K]``, ``T > 0``, the gate
+        shapes ``[1,T,H,K] / [1,T,HV,V] / [1,T,HV,K]``, ``T > 0``, the gate
         matching ``self.gate_mode`` (contiguous, fp32 or bf16, shape
-        ``[B,T,HV]`` for `g`), and `h0_out` a contiguous fp32
-        ``[B,HV,K,V]`` tensor (with the leading mode omitted when ``B==1``)
-        on ``self.device``.
+        ``[1,T,HV]`` for `g`), and `h0_out` a contiguous fp32 ``[HV,K,V]``
+        tensor on ``self.device``.
 
         ``emit_h`` / ``emit_m`` select which halves of this rank's summary
         ``h_out = M . h_in + X`` actually reach its consumers.  The kernel
@@ -2939,16 +2936,16 @@ class CuteDSLFusedCPPreProcessWS:
 
     def _validate(self, k, v, w, g, gk, h0_out):
         if k.ndim != 4:
-            raise ValueError("k must have shape [B,T,H,K]")
+            raise ValueError("k must have shape [1,T,H,K]")
         B, T, H, K = k.shape
         if T <= 0:
             raise ValueError("T must be positive")
-        if (B, H, K) != (self.B, self.H, self.DK):
+        if (B, H, K) != (1, self.H, self.DK):
             raise ValueError("k shape does not match the wrapper geometry")
-        if tuple(v.shape) != (self.B, T, self.HV, self.DV):
-            raise ValueError("v must have shape [B,T,HV,V]")
-        if tuple(w.shape) != (self.B, T, self.HV, self.DK):
-            raise ValueError("w must have shape [B,T,HV,K]")
+        if tuple(v.shape) != (1, T, self.HV, self.DV):
+            raise ValueError("v must have shape [1,T,HV,V]")
+        if tuple(w.shape) != (1, T, self.HV, self.DK):
+            raise ValueError("w must have shape [1,T,HV,K]")
         for tensor, name in ((k, "k"), (v, "v"), (w, "w")):
             if tensor.dtype != torch.bfloat16:
                 raise TypeError(f"{name} must be bfloat16")
@@ -2971,30 +2968,28 @@ class CuteDSLFusedCPPreProcessWS:
                 f"got {supplied_mode!r} inputs"
             )
         if g is not None:
-            if tuple(g.shape) != (self.B, T, self.HV):
-                raise ValueError("g must have shape [B,T,HV]")
+            if tuple(g.shape) != (1, T, self.HV):
+                raise ValueError("g must have shape [1,T,HV]")
             if g.dtype not in (torch.float32, torch.bfloat16):
                 raise TypeError("g must be fp32 or bfloat16")
             if not g.is_cuda or g.device != self.device:
                 raise ValueError(f"g must be on {self.device}")
         if gk is not None:
-            if tuple(gk.shape) != (self.B, T, self.HV, self.DK):
-                raise ValueError("gk must have shape [B,T,HV,K]")
+            if tuple(gk.shape) != (1, T, self.HV, self.DK):
+                raise ValueError("gk must have shape [1,T,HV,K]")
             if gk.dtype not in (torch.float32, torch.bfloat16):
                 raise TypeError("gk must be fp32 or bfloat16")
             if not gk.is_cuda or gk.device != self.device:
                 raise ValueError(f"gk must be on {self.device}")
-        out_shape = ((self.HV, self.DK, self.DV) if self.B == 1 else
-                     (self.B, self.HV, self.DK, self.DV))
         if h0_out is not None and (
-            tuple(h0_out.shape) != out_shape
+            tuple(h0_out.shape) != (self.HV, self.DK, self.DV)
             or h0_out.dtype != torch.float32
             or not h0_out.is_cuda
             or not h0_out.is_contiguous()
             or h0_out.device != self.device
         ):
             raise ValueError(
-                f"h0_out must be contiguous fp32 {out_shape} on "
+                "h0_out must be contiguous fp32 [HV,K,V] on "
                 f"{self.device}"
             )
 
@@ -3030,15 +3025,12 @@ class CuteDSLFusedCPPreProcessWS:
             if self.rank == 0:
                 if self._h0_zero is None:
                     self._h0_zero = torch.zeros(
-                        *((self.HV, self.DK, self.DV) if self.B == 1 else
-                          (self.B, self.HV, self.DK, self.DV)),
+                        self.HV, self.DK, self.DV,
                         dtype=torch.float32, device=self.device)
                 h0_out = self._h0_zero
             else:
-                out_shape = ((self.HV, self.DK, self.DV) if self.B == 1 else
-                             (self.B, self.HV, self.DK, self.DV))
-                h0_out = torch.empty(*out_shape, dtype=torch.float32,
-                                     device=self.device)
+                h0_out = torch.empty(self.HV, self.DK, self.DV,
+                                     dtype=torch.float32, device=self.device)
         # The gate normalisation used to be an unconditional
         # `.float().contiguous()` on both slots. The dummies are already fp32
         # and contiguous, and the live gate arrives fp32 from
@@ -3093,8 +3085,7 @@ class CuteDSLFusedCPPreProcessWS:
         if op is None:
             op = PreProcessFwdFusedWS(
                 self.H, self.HV, self.DK, self.DV, self.gate_mode,
-                self.R, self.rank, tsplit=self.tsplit, B=self.B,
-                full_chunks=False,
+                self.R, self.rank, tsplit=self.tsplit, full_chunks=False,
             )
             self._ops[key] = op
             # Geometry and scratch sizing are protocol-visible and must not
