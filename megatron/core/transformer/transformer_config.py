@@ -379,11 +379,32 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k^T scores before weighting."""
 
+    dsa_indexer_qk_proj_disable_quantization: bool = False
+    """Disable FP8/FP4 for indexer query/key parameter initialization and GEMMs.
+    These projections use the configured unquantized dtype (e.g. BF16); this does not
+    control ``linear_weights_proj`` or index-score quantization.
+    """
+
     dsa_indexer_k_norm_epsilon: Optional[float] = None
     """Optional epsilon override for the DSA indexer key LayerNorm."""
 
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
+
+    dsa_indexer_kpool: int = 1
+    """Number of keys per softmax-weighted indexer pool; 1 keeps per-token selection."""
+
+    dsa_indexer_kpool_use_quantization: bool = False
+    """Quantize KPool scoring inputs to E4M3 with power-of-two scales after Hadamard
+    rotation. This does not change projection parameter or GEMM precision.
+    """
+
+    dsa_indexer_kpool_always_select_tail: bool = True
+    """Append each query's incomplete causal pool after selected history tokens.
+    The default preserves legacy fixed-width pool selection; models that require the explicit
+    tail contract should enable it in their model bridge. Only applies when
+    ``dsa_indexer_kpool > 1``.
+    """
 
     ####################
     # Compressed sparse attention
@@ -1749,6 +1770,11 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
+                )
+            if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
+                raise ValueError(
+                    "DSA indexer loss is not supported with kpool selection; set "
+                    "dsa_indexer_loss_coeff=0 or dsa_indexer_kpool=1."
                 )
         elif self.experimental_attention_variant == "dsv4_hybrid":
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
@@ -3799,6 +3825,11 @@ class MLATransformerConfig(TransformerConfig):
 
     multi_latent_attention: bool = True
     """Whether to use Multi-Latent Attention."""
+
+    mla_proj_disable_quantization: bool = False
+    """Disable FP8/FP4 initialization and GEMMs for absorbed-MLA projections, using
+    the configured unquantized dtype (e.g. BF16). Core-attention precision is unchanged.
+    """
 
     use_fused_mla_q_uproj: bool = False
     """Use the cuDNN fused MLA Q up-proj + per-head RoPE + MXFP8-quant kernel (SM100 only).
