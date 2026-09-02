@@ -144,24 +144,6 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
     assert list(context.backward_order) == [model.layers[1], model.layers[0]]
 
 
-def test_skip_forward_backward_hooks(distributed_setup):
-    """Integrations may replace the standard FSDP module lifecycle hooks."""
-    device = distributed_setup.device
-
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = nn.Sequential(nn.Linear(4, 4, bias=False)).to(device)
-
-    with fully_shard_context(device=device):
-        fully_shard(
-            model, mesh=mesh, placements=_flat_placements(), skip_forward_backward_hooks=True
-        )
-
-    assert not model._forward_pre_hooks
-    assert not model._forward_hooks
-    assert not model._backward_pre_hooks
-    assert not model._backward_hooks
-
-
 def test_nested_prefetch_orders_use_dfs(distributed_setup):
     """Nested FsdpModules should use DFS orders for one-step prefetch."""
     device = distributed_setup.device

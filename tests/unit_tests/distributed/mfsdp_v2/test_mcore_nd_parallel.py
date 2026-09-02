@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+"""End-to-end ND-parallel parity coverage for experimental MFSDP v2."""
+
 import pytest
 import torch
 from torch.distributed.tensor import DTensor
@@ -40,7 +42,7 @@ class TestMegatronFSDPE2E:
         destroy_num_microbatches_calculator()
 
     @staticmethod
-    def _normalize_parameter_name(name):
+    def _normalize_parameter_name(name: str) -> str:
         while name.startswith("module."):
             name = name[len("module.") :]
         return name
@@ -177,6 +179,8 @@ class TestMegatronFSDPE2E:
             run_name = "MFSDP v2" if use_mfsdp_v2 else "Reference"
 
             for step in range(cls.NUM_STEPS):
+                for model_chunk in model:
+                    model_chunk.zero_grad_buffer()
                 optimizer.zero_grad()
                 output = pretrain_forward_backward(
                     model=model,
@@ -299,10 +303,14 @@ class TestMegatronFSDPE2E:
     )
     def test_compatible_with_nd_parallel(self, case):
         """MFSDP v2 ND-parallel cases match a distributed-optimizer reference."""
-        if case["model_config"].get("overlap_moe_expert_parallel_comm") and not is_te_min_version(
-            "2.3.0"
-        ):
-            pytest.skip("1F1B expert-parallel overlap requires Transformer Engine 2.3.0 or newer.")
+        overlap_case = case["model_config"].get("overlap_moe_expert_parallel_comm")
+        if overlap_case and not is_torch_min_version("2.6.0"):
+            pytest.skip("Combined expert-parallel overlap requires PyTorch 2.6.0 or newer.")
+        if overlap_case and not is_te_min_version("2.7.0"):
+            pytest.skip(
+                "Delayed wgrad without gradient-accumulation fusion requires "
+                "Transformer Engine 2.7.0 or newer."
+            )
 
         reference = self._run_training(use_mfsdp_v2=False, case=case)
         if torch.distributed.get_rank() == 0:
@@ -313,6 +321,14 @@ class TestMegatronFSDPE2E:
         )
         if torch.distributed.get_rank() == 0:
             print(f"[{case['name']}] MFSDP v2 run completed successfully.", flush=True)
+
+        for run_name, run in (("Reference", reference), ("MFSDP v2", actual)):
+            changed_parameters = [
+                name
+                for name, initial_parameter in run["initial_parameters"].items()
+                if not torch.equal(initial_parameter, run["parameters"][-1][name])
+            ]
+            assert changed_parameters, f"{run_name} did not update any parameters."
 
         assert len(actual["losses"]) == len(reference["losses"])
         for step, (loss, reference_loss) in enumerate(zip(actual["losses"], reference["losses"])):

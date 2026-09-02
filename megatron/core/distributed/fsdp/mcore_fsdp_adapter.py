@@ -672,10 +672,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             optimizer=[expert_axis.optimizer],
         )
         overlap_moe_expert_parallel = config.overlap_moe_expert_parallel_comm
-        common_fully_shard_kwargs = dict(
-            mixed_precision_policy=self.mp_policy,
-            skip_forward_backward_hooks=overlap_moe_expert_parallel,
-        )
 
         if has_outer_dp_axis := ddp_config.num_distributed_optimizer_instances > 1:
             # Dense parameters get an outer DP axis. There is no HSDP/HFSDP special case:
@@ -729,7 +725,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             mesh=expert_dp_mesh,
                             placements=expert_placements,
                             grad_divisor=config.expert_model_parallel_size,
-                            **common_fully_shard_kwargs,
+                            mixed_precision_policy=self.mp_policy,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -743,12 +739,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         submodule,
                         mesh=dp_mesh,
                         placements=dense_placements,
-                        **common_fully_shard_kwargs,
+                        mixed_precision_policy=self.mp_policy,
                     )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
             fully_shard(
-                module, mesh=dp_mesh, placements=dense_placements, **common_fully_shard_kwargs
+                module,
+                mesh=dp_mesh,
+                placements=dense_placements,
+                mixed_precision_policy=self.mp_policy,
             )
         super().__init__(config=config, module=module)
         if overlap_moe_expert_parallel:
@@ -778,6 +777,25 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     continue
                 if fsdp_module.phase is not FsdpModule.Phase.BACKWARD:
                     continue
+                countdown = fsdp_module._trainable_parameter_countdown
+                if countdown._value != countdown.initial_value:
+                    ready = []
+                    missing = []
+                    for group in fsdp_module.parameter_groups:
+                        if not group.requires_grad:
+                            continue
+                        for fsdp_parameter in group.fsdp_parameters:
+                            destination = (
+                                ready if fsdp_parameter.unsharded.grad is not None else missing
+                            )
+                            destination.append(fsdp_parameter.fqns)
+                    observed = countdown.initial_value - countdown._value
+                    raise RuntimeError(
+                        "MFSDP schedule ended with an incomplete gradient-completion cycle "
+                        f"for {fsdp_module.name or '<root>'}: "
+                        f"callbacks={observed}/{countdown.initial_value}, "
+                        f"ready={ready!r}, missing={missing!r}."
+                    )
                 fsdp_module.post_backward()
 
         def release_module(module: torch.nn.Module, *, reduce_grad: bool) -> None:

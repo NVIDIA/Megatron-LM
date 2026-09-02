@@ -30,6 +30,7 @@ from megatron.core import tensor_parallel
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
+from .module_utils import get_parameter_owner
 from .placement import changed_mesh_axis
 from .quantization import (
     E4M3_BLOCK_SIZE,
@@ -346,7 +347,7 @@ class FsdpParameterGroup:
         if owning_module is None:
             raise RuntimeError("FSDP parameter group outlived its owning module.")
         for fqn in fqns:
-            module, parameter_name = _get_parameter_owner(owning_module, fqn)
+            module, parameter_name = get_parameter_owner(owning_module, fqn)
             module._parameters[parameter_name] = parameter
 
     def _switch_to_sharded_parameters(self) -> None:
@@ -790,10 +791,3 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             clear_payloads(fsdp_parameter.unsharded)
         self._unsharded_rowwise.release_storage()
         self._unsharded_colwise.release_storage()
-
-
-def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
-    """Resolve a root-module-relative parameter FQN to its direct owner."""
-    module_name, separator, parameter_name = name.rpartition(".")
-    owner = module.get_submodule(module_name) if separator else module
-    return owner, parameter_name

@@ -28,6 +28,7 @@ from ..mixed_precision import MixedPrecisionPolicy, fp8_need_transpose_data, is_
 from .countdown import Countdown
 from .execution_runner import FsdpExecutionRunner
 from .indexed_order import IndexedOrder
+from .module_utils import get_parameter_owner
 from .parameter_group import Fp8ParameterGroup, FsdpParameterGroup, get_containing_parameter_group
 from .placement import Flat
 
@@ -195,7 +196,6 @@ class FsdpModule:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
-        skip_forward_backward_hooks: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
@@ -248,7 +248,7 @@ class FsdpModule:
                 if group.requires_grad
             )
         )
-        self._register_hooks(skip_forward_backward_hooks=skip_forward_backward_hooks)
+        self._register_hooks()
         context.register_module(self)
 
     @property
@@ -286,11 +286,9 @@ class FsdpModule:
         """Return whether this module is an outermost FsdpModule in its context."""
         return self._is_root
 
-    def _register_hooks(self, skip_forward_backward_hooks: bool = False) -> None:
+    def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
         module.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
-        if skip_forward_backward_hooks:
-            return
 
         # Use PyTorch's callback module argument instead of capturing self so
         # these hooks do not retain a deleted FSDP module.
@@ -328,7 +326,22 @@ class FsdpModule:
             if not group.requires_grad:
                 continue
             for fsdp_parameter in group.fsdp_parameters:
-                fsdp_parameter.unsharded.register_post_accumulate_grad_hook(grad_hook)
+                parameter = fsdp_parameter.unsharded
+                # ``skip_backward_post_hook`` is TE's delayed-wgrad contract: these
+                # gradients are materialized by ``backward_dw()``, not autograd.
+                if not getattr(parameter, "skip_backward_post_hook", False):
+                    parameter.register_post_accumulate_grad_hook(grad_hook)
+                    continue
+                if len(fsdp_parameter.fqns) > 1:
+                    raise ValueError(
+                        "Tied parameters with delayed wgrad are not supported because "
+                        "Transformer Engine does not accumulate their gradients. See "
+                        "https://github.com/NVIDIA/TransformerEngine/issues/3437"
+                    )
+                parameter_module, _ = get_parameter_owner(module, fsdp_parameter.fqns[0])
+                parameter_module.register_wgrad_accumulation_and_reduce_hooks(
+                    lambda parameter=parameter: grad_hook(parameter)
+                )
 
     @staticmethod
     def _pre_load_state_dict(
@@ -360,6 +373,9 @@ class FsdpModule:
         # This is the first MFSDP hook to run, so finalize the context here once
         # before any module begins communication.
         context.ensure_finalized()
+        if not self.training and context.runner.use_trace_replay:
+            self.unshard_parameters_for_forward_only()
+            return
         if self.phase is not FsdpModule.Phase.BACKWARD:
             self.phase = FsdpModule.Phase.FORWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
@@ -448,18 +464,23 @@ class FsdpModule:
     def unshard_parameters_for_forward_only(self) -> None:
         """Materialize parameters for evaluation without changing the training trace.
 
-        The combined-1F1B integration suppresses the standard module lifecycle hooks,
-        while evaluation intentionally runs the conventional forward-only schedule.
-        Fine-grained hooks therefore use this demand-only path during ``eval()`` and a
-        root post-hook releases every materialized unit after the model invocation.
+        Evaluation runs the conventional forward-only schedule even when combined
+        1F1B is configured. Both standard and fine-grained hooks use this demand-only
+        path during ``eval()`` so the training trace remains unchanged.
         """
-        self.context.ensure_finalized()
+        context = self.context
+        context.ensure_finalized()
+        if self.is_root():
+            context.allgather_stream.wait_stream(context.current_stream())
         self._unshard_parameter_groups("rowwise")
         if self._unshard_event is not None:
-            self.context.current_stream().wait_event(self._unshard_event)
+            context.current_stream().wait_event(self._unshard_event)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
+        if not self.training and self.context.runner.use_trace_replay:
+            self._release_unsharded_parameter_groups()
+            return
         # Recomputed parameters are consumed immediately by this module's
         # backward. Keep them materialized to avoid an unnecessary all-gather;
         # post_backward() will reshard them after gradient reduction.
@@ -543,7 +564,12 @@ class FsdpModule:
             next_module._unshard_parameter_groups(next_orientation)
 
     def post_backward(self) -> None:
-        """Reduce gradients and return parameters to their sharded resting state."""
+        """Reduce gradients and return parameters to their sharded resting state.
+
+        This is a no-op when the module has already left the backward phase.
+        """
+        if self.phase is not FsdpModule.Phase.BACKWARD:
+            return
         self._reshard_parameter_groups()
         self._reduce_gradient_groups()
         self.phase = FsdpModule.Phase.RESTING
