@@ -3,10 +3,10 @@
 """Byte-level accounting for inference client/coordinator ZMQ traffic.
 
 Every request and reply on the frontend path (HTTP frontend -> InferenceClient ->
-coordinator -> engine) travels as a msgpack-packed list over ZMQ. None of those
-sites recorded how large the messages were, so payload growth -- a field added to
-a reply, prompt log probs left on by default -- only surfaced later as a
-throughput regression with no obvious cause.
+coordinator -> engine) travels as one or more msgpack-packed frames over ZMQ.
+None of those sites recorded how large the messages were, so payload growth -- a
+field added to a reply, prompt log probs left on by default -- only surfaced
+later as a throughput regression with no obvious cause.
 
 :class:`WireMetrics` accumulates message counts and byte totals per header at the
 send and receive sites. Recording costs one dict lookup and a few integer adds
@@ -39,9 +39,9 @@ def _header_name(header):
 class WireMetrics:
     """Counts messages and bytes crossing a ZMQ socket, broken down by header.
 
-    Sizes are of the msgpack-serialized payload frame, which is what the socket
-    actually moves. ZMQ's own framing and the routing-identity frame are not
-    counted, so totals are payload bytes rather than bytes on the NIC.
+    Sizes are the combined msgpack-serialized payload frames, which is what the
+    socket actually moves. ZMQ's own framing and the routing-identity frame are
+    not counted, so totals are payload bytes rather than bytes on the NIC.
     """
 
     __slots__ = ("sent_messages", "sent_bytes", "received_messages", "received_bytes", "per_header")

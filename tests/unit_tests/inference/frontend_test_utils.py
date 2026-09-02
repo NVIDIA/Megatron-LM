@@ -255,10 +255,11 @@ class FakeEngine:
                 # capacity sweep.
                 while True:
                     try:
-                        raw = self.socket.recv(flags=zmq.NOBLOCK)
+                        frames = self.socket.recv_multipart(flags=zmq.NOBLOCK)
                     except zmq.Again:
                         break
-                    self._handle(msgpack.unpackb(raw, raw=False))
+                    metadata = msgpack.unpackb(frames[0], raw=False)
+                    self._handle(metadata, frames[1:])
                     if self._stop.is_set():
                         return
             self._flush_due_replies()
@@ -268,13 +269,14 @@ class FakeEngine:
         # Min-heap on due time: only the frames that are actually due are
         # touched, so a large in-flight backlog costs nothing per iteration.
         while self._pending_replies and self._pending_replies[0][0] <= now:
-            _, _, payload, is_final = heapq.heappop(self._pending_replies)
-            self._send_frame(payload, is_final)
+            _, _, frames, is_final = heapq.heappop(self._pending_replies)
+            self._send_frames(frames, is_final)
 
-    def _handle(self, payload):
-        header = Headers(payload[0])
+    def _handle(self, metadata, bodies):
+        header = Headers(metadata[0])
         if header == Headers.SUBMIT_REQUEST:
-            request_id, prompt, serialized_params = payload[1:4]
+            request_id, serialized_params = metadata[1:3]
+            prompt = msgpack.unpackb(bodies[0], raw=False)
             self._reply(request_id, prompt, serialized_params)
         elif header in (Headers.STOP, Headers.SHUTDOWN):
             self._stop.set()
@@ -307,28 +309,47 @@ class FakeEngine:
                 (
                     step * (index + 1),
                     [
-                        Headers.ENGINE_REPLY_PARTIAL.value,
-                        [{"request_id": request_id, "new_tokens": [token]}],
+                        msgpack.packb(
+                            [Headers.ENGINE_REPLY_PARTIAL.value, [request_id]], use_bin_type=True
+                        ),
+                        msgpack.packb(
+                            {"request_id": request_id, "new_tokens": [token]}, use_bin_type=True
+                        ),
                     ],
                     False,
                 )
                 for index, token in enumerate(generated_tokens)
             )
-        frames.append((self.reply_delay_s, [Headers.ENGINE_REPLY.value, [reply]], True))
+        frames.append(
+            (
+                self.reply_delay_s,
+                [
+                    msgpack.packb(
+                        [
+                            Headers.ENGINE_REPLY.value,
+                            [[request_id, sampling_params.detokenize_generations]],
+                        ],
+                        use_bin_type=True,
+                    ),
+                    msgpack.packb(reply, use_bin_type=True),
+                ],
+                True,
+            )
+        )
 
-        for delay, payload, is_final in frames:
+        for delay, reply_frames, is_final in frames:
             if delay > 0:
-                # The counter breaks ties so heapq never has to order the payloads.
+                # The counter breaks ties so heapq never has to order the frames.
                 self._reply_sequence += 1
                 heapq.heappush(
                     self._pending_replies,
-                    (time.monotonic() + delay, self._reply_sequence, payload, is_final),
+                    (time.monotonic() + delay, self._reply_sequence, reply_frames, is_final),
                 )
             else:
-                self._send_frame(payload, is_final)
+                self._send_frames(reply_frames, is_final)
 
-    def _send_frame(self, payload, is_final):
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+    def _send_frames(self, frames, is_final):
+        self.socket.send_multipart(frames)
         if is_final:
             self.num_requests_served += 1
 

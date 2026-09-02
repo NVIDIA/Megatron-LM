@@ -3,10 +3,10 @@
 """How large are the packets on the frontend wire?
 
 Every request and reply between the HTTP frontend, the coordinator and the
-engines is a msgpack-packed list on a ZMQ socket. Nothing measured those payloads
-before, so growth was invisible until it showed up as a throughput regression
-with no obvious cause -- a field added to a reply, or log probs left enabled by
-default, silently multiplies the bytes moved per request.
+engines is one or more msgpack-packed frames on a ZMQ socket. Nothing measured
+those payloads before, so growth was invisible until it showed up as a
+throughput regression with no obvious cause -- a field added to a reply, or log
+probs left enabled by default, silently multiplies the bytes moved per request.
 
 These tests pin the *shape* of the size curve rather than exact byte counts:
 
@@ -60,13 +60,18 @@ def token_ids(count, seed=1234):
     return [rng.randrange(10000, 99999) for _ in range(count)]
 
 
-def submit_request_payload(prompt_tokens, sampling_params):
-    """The SUBMIT_REQUEST payload InferenceClient.add_request builds."""
-    return [Headers.SUBMIT_REQUEST.value, 0, prompt_tokens, sampling_params.serialize()]
+def submit_request_frames(prompt_tokens, sampling_params, request_id=0):
+    """The SUBMIT_REQUEST frames an unconfigured InferenceClient builds."""
+    return [
+        [Headers.SUBMIT_REQUEST.value, request_id, sampling_params.serialize(), None],
+        prompt_tokens,
+        None,
+        None,
+    ]
 
 
-def engine_reply_payload(prompt_tokens, num_generated, return_prompt_tokens=False, log_probs=False):
-    """The ENGINE_REPLY payload the coordinator forwards to a client."""
+def engine_reply_frames(prompt_tokens, num_generated, return_prompt_tokens=False, log_probs=False):
+    """The ENGINE_REPLY frames the coordinator forwards to a client."""
     tokenizer = ByteTokenizer()
     sampling_params = SamplingParams(
         num_tokens_to_generate=num_generated,
@@ -82,7 +87,12 @@ def engine_reply_payload(prompt_tokens, num_generated, return_prompt_tokens=Fals
         generated_log_probs=[-0.512345] * num_generated if log_probs else None,
     )
     reply["generated_text"] = tokenizer.detokenize(generated_tokens)
-    return [Headers.ENGINE_REPLY.value, 0, reply]
+    return [[Headers.ENGINE_REPLY.value, 0], reply]
+
+
+def frames_size(frames) -> int:
+    """Combined serialized payload bytes across a multipart message."""
+    return sum(packed_size(frame) for frame in frames)
 
 
 def marginal_bytes_per_token(size_fn, counts):
@@ -101,7 +111,7 @@ class TestRequestPacketSize:
 
     def test_minimal_request_fits_in_budget(self):
         """A request with a one-token prompt is almost entirely fixed overhead."""
-        size = packed_size(submit_request_payload([42], SamplingParams(num_tokens_to_generate=16)))
+        size = frames_size(submit_request_frames([42], SamplingParams(num_tokens_to_generate=16)))
         assert size <= MAX_REQUEST_FIXED_BYTES
 
     def test_sampling_params_are_the_fixed_cost_of_every_request(self):
@@ -123,7 +133,7 @@ class TestRequestPacketSize:
         """
         sampling_params = SamplingParams(num_tokens_to_generate=16)
         slope = marginal_bytes_per_token(
-            lambda n: packed_size(submit_request_payload(token_ids(n), sampling_params)),
+            lambda n: frames_size(submit_request_frames(token_ids(n), sampling_params)),
             [0, 256, 1024, 4096],
         )
         assert slope <= MAX_REQUEST_BYTES_PER_PROMPT_TOKEN
@@ -149,12 +159,12 @@ class TestReplyPacketSize:
     """Engine -> coordinator -> client reply payloads."""
 
     def test_minimal_reply_fits_in_budget(self):
-        size = packed_size(engine_reply_payload([], 0))
+        size = frames_size(engine_reply_frames([], 0))
         assert size <= MAX_REPLY_FIXED_BYTES
 
     def test_reply_bytes_grow_linearly_with_generated_tokens(self):
         slope = marginal_bytes_per_token(
-            lambda n: packed_size(engine_reply_payload([], n)), [0, 16, 128, 512]
+            lambda n: frames_size(engine_reply_frames([], n)), [0, 16, 128, 512]
         )
         assert slope <= MAX_REPLY_BYTES_PER_GENERATED_TOKEN
 
@@ -165,8 +175,8 @@ class TestReplyPacketSize:
         is why the frontend must not enable them by default. Serialized as
         float64; switching to float32 would nearly halve this.
         """
-        without = packed_size(engine_reply_payload([], 512, log_probs=False))
-        with_log_probs = packed_size(engine_reply_payload([], 512, log_probs=True))
+        without = frames_size(engine_reply_frames([], 512, log_probs=False))
+        with_log_probs = frames_size(engine_reply_frames([], 512, log_probs=True))
         assert (with_log_probs - without) / 512 <= MAX_LOGPROB_BYTES_PER_GENERATED_TOKEN
 
     def test_reply_size_is_independent_of_prompt_length(self):
@@ -184,14 +194,14 @@ class TestReplyPacketSize:
         large the constant part becomes.
         """
         for num_prompt_tokens in (8, 4096):
-            size = packed_size(engine_reply_payload(token_ids(num_prompt_tokens), 16))
+            size = frames_size(engine_reply_frames(token_ids(num_prompt_tokens), 16))
             assert size <= MAX_REPLY_FIXED_BYTES + 16 * MAX_REPLY_BYTES_PER_GENERATED_TOKEN
 
     def test_prompt_tokens_are_returned_when_requested(self):
         """return_prompt_tokens=True must actually put the prompt on the wire."""
-        without = packed_size(engine_reply_payload(token_ids(512), 16))
-        with_prompt = packed_size(
-            engine_reply_payload(token_ids(512), 16, return_prompt_tokens=True)
+        without = frames_size(engine_reply_frames(token_ids(512), 16))
+        with_prompt = frames_size(
+            engine_reply_frames(token_ids(512), 16, return_prompt_tokens=True)
         )
         assert with_prompt > without
 
@@ -234,17 +244,15 @@ class TestWireMetricsAccounting:
         assert per_header["SUBMIT_REQUEST"]["sent_messages"] == num_requests
         assert metrics["sent_messages"] == num_requests + 1
 
-        # The SUBMIT_REQUEST bytes must equal what msgpack produces for the same
-        # payload; add_request assigns ids 0..n-1, which can change the size.
+        # The SUBMIT_REQUEST bytes must equal the sum of its four msgpack frame
+        # sizes; add_request assigns ids 0..n-1, which can change the size.
         expected_bytes = sum(
-            packed_size(
-                [
-                    Headers.SUBMIT_REQUEST.value,
-                    request_id,
+            frames_size(
+                submit_request_frames(
                     list(prompt),
-                    SamplingParams(num_tokens_to_generate=num_output_tokens).serialize(),
-                    None,
-                ]
+                    SamplingParams(num_tokens_to_generate=num_output_tokens),
+                    request_id,
+                )
             )
             for request_id in range(num_requests)
         )

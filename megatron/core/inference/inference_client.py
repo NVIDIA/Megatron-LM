@@ -345,9 +345,7 @@ class InferenceClient:
         request_id, frames = self._make_kv_handoff_request(
             prompt, sampling_params, kv_meta, src_block_ids
         )
-        return self._submit_request(
-            frames, request_id, header=Headers.SUBMIT_REQUEST_WITH_KV.value
-        )
+        return self._submit_request(frames, request_id, header=Headers.SUBMIT_REQUEST_WITH_KV.value)
 
     def add_request_with_kv_handoff_streaming(
         self,
@@ -374,9 +372,7 @@ class InferenceClient:
         request_id, frames = self._make_kv_handoff_request(
             prompt, sampling_params, kv_meta, src_block_ids
         )
-        return self._submit_stream(
-            frames, request_id, header=Headers.SUBMIT_REQUEST_WITH_KV.value
-        )
+        return self._submit_stream(frames, request_id, header=Headers.SUBMIT_REQUEST_WITH_KV.value)
 
     def release_handoff(self, request_id: int) -> None:
         """Tell the coordinator to release the KV blocks pinned for `request_id`.
@@ -467,7 +463,9 @@ class InferenceClient:
             int: The number of serialized payload bytes sent.
         """
         serialized = msgpack.packb(payload, use_bin_type=True)
-        return self._send_frames([serialized], payload[0])
+        self.socket.send(serialized)
+        self.wire_metrics.record_sent(payload[0], len(serialized))
+        return len(serialized)
 
     def _send_frames(self, frames: list, header) -> int:
         """Send prepared frames and account for their combined payload size."""

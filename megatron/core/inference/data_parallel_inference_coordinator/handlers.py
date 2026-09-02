@@ -280,9 +280,7 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
         next_identity = coordinator.get_least_loaded_data_parallel_rank()
         if coordinator._send_to_engine(
-            next_identity,
-            [engine_metadata, *bodies],
-            header=Headers.SUBMIT_REQUEST_WITH_KV.value,
+            next_identity, [engine_metadata, *bodies], header=Headers.SUBMIT_REQUEST_WITH_KV.value
         ):
             break
     else:
@@ -421,9 +419,7 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
             [Headers.ENGINE_REPLY.value, client_request_id], use_bin_type=True
         )
         coordinator._send_to_client(
-            client_identity,
-            [reply_metadata, body],
-            header=Headers.ENGINE_REPLY.value,
+            client_identity, [reply_metadata, body], header=Headers.ENGINE_REPLY.value
         )
 
 
