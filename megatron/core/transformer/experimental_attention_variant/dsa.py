@@ -153,6 +153,7 @@ def _run_sparse_attention(
     varlen_ends: Optional[torch.Tensor],
     key_positions: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor] = None,
+    all_topk_rows_nonempty: bool = False,
 ) -> torch.Tensor:
     """Run sparse attention for absorbed and non-absorbed MLA paths."""
     if absorbed_mla:
@@ -180,6 +181,7 @@ def _run_sparse_attention(
                 softmax_scale,
                 latent_v_channels,
                 topk_length=topk_length,
+                all_topk_rows_nonempty=all_topk_rows_nonempty,
             )
         # Fused backends may decline unsupported shapes or layouts by returning
         # None, so keep the absorbed PyTorch path as the authoritative fallback.
@@ -2759,6 +2761,18 @@ class DSAttention(MegatronModule):
         # ===================================
         # Run sparse attention kernel
         # ===================================
+        all_topk_rows_nonempty = dsa_masking.can_prove_all_topk_rows_nonempty(
+            computes_topk=computes_topk,
+            indexer_topk=self.index_topk,
+            kv_sequence_length=skv,
+            attention_mask=attention_mask,
+            query_valid_rows=query_valid_rows,
+            varlen_is_plain_causal=varlen_is_plain_causal,
+            use_local_indexer_varlen=use_local_indexer_varlen,
+            varlen_starts=varlen_starts,
+            varlen_ends=varlen_ends,
+            key_positions=key_positions,
+        )
         output = _run_sparse_attention(
             absorbed_mla=absorbed_mla,
             query=query,
@@ -2773,6 +2787,7 @@ class DSAttention(MegatronModule):
             varlen_starts=varlen_starts,
             varlen_ends=varlen_ends,
             key_positions=key_positions,
+            all_topk_rows_nonempty=all_topk_rows_nonempty,
         )
 
         if use_indexer_loss:

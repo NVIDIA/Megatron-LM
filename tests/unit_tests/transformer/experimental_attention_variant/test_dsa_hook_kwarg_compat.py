@@ -240,6 +240,49 @@ def test_split_hook_type_error_propagates_without_retry(monkeypatch):
     assert calls == 1
 
 
+def test_sparse_attention_hook_filters_static_row_certificate_for_legacy_signature(monkeypatch):
+    """The fixed-row certificate must not break an older exact backend hook."""
+    expected = object()
+
+    def legacy_hook(query, key, topk_indices, softmax_scale, v_channels, topk_length):
+        del query, key, topk_indices, softmax_scale, v_channels, topk_length
+        return expected
+
+    monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", lambda _config, _name: legacy_hook)
+
+    marker = object()
+    result = dsa_kernels.run_fused_absorbed_sparse_attention(
+        object(), marker, marker, marker, 1.0, 8, marker, all_topk_rows_nonempty=True
+    )
+
+    assert result is expected
+
+
+def test_opaque_sparse_attention_hook_receives_no_static_row_certificate(monkeypatch):
+    """An opaque out-of-tree hook receives only its established positional contract."""
+    calls = []
+    expected = object()
+
+    def opaque_hook(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected
+
+    def fail_signature(_fn):
+        raise ValueError("opaque callable")
+
+    monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", lambda _config, _name: opaque_hook)
+    monkeypatch.setattr(dsa_kernels.inspect, "signature", fail_signature)
+
+    marker = object()
+    result = dsa_kernels.run_fused_absorbed_sparse_attention(
+        object(), marker, marker, marker, 1.0, 8, marker, all_topk_rows_nonempty=True
+    )
+
+    assert result is expected
+    assert len(calls[0][0]) == 6
+    assert calls[0][1] == {}
+
+
 def test_legacy_exact_full_hook_excludes_new_optional_kwarg(monkeypatch):
     calls = []
     expected = object()
