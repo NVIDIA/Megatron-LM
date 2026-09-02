@@ -40,6 +40,7 @@ def mocked_offload_manager(monkeypatch):
     monkeypatch.setattr(torch.cuda, "Event", make_event)
     monkeypatch.setattr(torch.cuda, "Stream", make_stream)
     monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", Mock(name="current_stream"))
     monkeypatch.setattr(offload, "nvtx_range_push", Mock())
     monkeypatch.setattr(offload, "nvtx_range_pop", Mock())
 
