@@ -166,11 +166,27 @@ class FsdpParameterGroup:
 
         tensor_shapes = tuple(parameter.shape for parameter in parameter_to_fqns)
         main_weight_dtype = mixed_precision_policy.main_params_dtype or torch.float32
+        main_weight_sources = []
+        parameters_with_high_precision_init = []
+        for parameter in parameter_to_fqns:
+            source = parameter
+            get_high_precision_init_val = getattr(parameter, "get_high_precision_init_val", None)
+            if get_high_precision_init_val is not None:
+                high_precision_init_val = get_high_precision_init_val()
+                if high_precision_init_val is not None:
+                    source = high_precision_init_val
+                    parameters_with_high_precision_init.append(parameter)
+            main_weight_sources.append(source.to(dtype=main_weight_dtype))
         self.main_weight = DBuffer.distribute_tensors(
-            (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
-            mesh=self.mesh,
-            placements=main_weight_placements,
+            main_weight_sources, mesh=self.mesh, placements=main_weight_placements
         )
+        for parameter in parameters_with_high_precision_init:
+            parameter.clear_high_precision_init_val()
+        # Drop full-tensor initialization references before allocating and
+        # quantizing the compute-weight buffers below.
+        main_weight_sources.clear()
+        source = None
+        high_precision_init_val = None
 
         if use_symmetric_memory:
             # PyTorch caches this in C++ and returns early when the backend is already NCCL.
