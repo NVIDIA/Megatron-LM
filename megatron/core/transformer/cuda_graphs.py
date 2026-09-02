@@ -993,7 +993,10 @@ class _CudagraphReplayNode(torch.autograd.Function):
         else:
             runner.bwd_graph.replay()
 
-        runner.bwd_graph_replay_complete_event.record(torch.cuda.current_stream())
+        # The early bwd_completion_event releases outer-stream work before GTP phase 2. DDP must
+        # instead wait for the graph tail, so record its readiness event on the replay stream.
+        replay_complete_stream = runner.stream if runner.use_stream else torch.cuda.current_stream()
+        runner.bwd_graph_replay_complete_event.record(replay_complete_stream)
         for param in runner.params_to_backprop:
             param._cudagraph_wgrad_ready_event = runner.bwd_graph_replay_complete_event
             if hasattr(param, 'grad_added_to_main_grad'):

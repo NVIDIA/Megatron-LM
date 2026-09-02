@@ -580,6 +580,58 @@ class TestCudaGraphConfigAndArguments:
 
 
 class TestCudaGraphReplay:
+    def test_backward_ready_event_records_on_runner_stream(self, monkeypatch):
+        calls = []
+
+        class FakeStream:
+            def __init__(self, name):
+                self.name = name
+
+            def wait_stream(self, stream):
+                calls.append((self.name, "wait_stream", stream.name))
+
+            def wait_event(self, event):
+                calls.append((self.name, "wait_event", event))
+
+        class FakeStreamContext:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+        class FakeEvent:
+            def record(self, stream):
+                calls.append(("ready_event", "record", stream.name))
+
+        outer_stream = FakeStream("outer")
+        runner_stream = FakeStream("runner")
+        early_completion_event = object()
+        runner = SimpleNamespace(
+            bwd_graph=SimpleNamespace(replay=lambda: calls.append(("graph", "replay"))),
+            status=_GraphStatus.BWD_READY,
+            static_grad_outputs=(),
+            use_stream=True,
+            stream=runner_stream,
+            gtp_remat=True,
+            _gtp_wgrad_ring_slots=(),
+            _gtp_finalize_hook_plan=(),
+            bwd_completion_event=early_completion_event,
+            bwd_graph_replay_complete_event=FakeEvent(),
+            params_to_backprop=(),
+            fp8_enabled=False,
+            static_grad_inputs=(),
+        )
+        ctx = SimpleNamespace(runner=runner)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: outer_stream)
+        monkeypatch.setattr(torch.cuda, "stream", lambda stream: FakeStreamContext())
+
+        _CudagraphReplayNode.backward(ctx)
+
+        assert ("outer", "wait_event", early_completion_event) in calls
+        assert ("ready_event", "record", "runner") in calls
+        assert ("ready_event", "record", "outer") not in calls
+
     def test_gtp_forward_ensures_captured_params_ready_before_replay(self, monkeypatch):
         calls = []
         first = object()
