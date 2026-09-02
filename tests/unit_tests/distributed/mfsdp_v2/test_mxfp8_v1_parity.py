@@ -294,8 +294,8 @@ class TestMegatronFSDPE2EMxfp8:
         ):
             if grad_norm is not None and reference_grad_norm is not None:
                 assert_close(
-                    torch.as_tensor(grad_norm),
-                    torch.as_tensor(reference_grad_norm),
+                    torch.as_tensor(grad_norm).reshape(()),
+                    torch.as_tensor(reference_grad_norm).reshape(()),
                     atol=0,
                     rtol=0.05,
                     msg=lambda msg: f"Grad norm mismatch at step {step}: {msg}",
