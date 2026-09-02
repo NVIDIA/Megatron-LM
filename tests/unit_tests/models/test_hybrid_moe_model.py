@@ -35,7 +35,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "activation_func_fp8_input_store": False,
     "activation_func_tanh_clamp_scale": None,
     "activation_func_tanh_clamp_scale_linear": None,
-    "actual_vocab_size": 131072,
+    "hash_moe_vocab_size": 131072,
     "add_bias_linear": False,
     "add_qkv_bias": False,
     "apply_query_key_layer_scaling": False,

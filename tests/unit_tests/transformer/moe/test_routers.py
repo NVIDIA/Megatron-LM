@@ -728,7 +728,7 @@ def _hash_routing_config(**overrides):
         add_bias_linear=False,
         use_cpu_initialization=True,
         moe_n_hash_layers=2,
-        actual_vocab_size=128,
+        hash_moe_vocab_size=128,
     )
     defaults.update(overrides)
     return TransformerConfig(**defaults)
@@ -770,7 +770,7 @@ class TestHashRouting:
         router = _make_hash_router(config, layer_number=1).cuda()
 
         logits = torch.randn(16, config.num_moe_experts, device="cuda")
-        input_ids = torch.randint(0, config.actual_vocab_size, (4, 4), device="cuda")
+        input_ids = torch.randint(0, config.hash_moe_vocab_size, (4, 4), device="cuda")
         routing_probs, routing_map = router._hash_routing(logits, input_ids)
 
         if score_function == "softmax":
@@ -853,7 +853,7 @@ class TestHashRouting:
         config = _hash_routing_config(moe_router_score_function="sqrtsoftplus")
         router = _make_hash_router(config, layer_number=1, inference=True).cuda()
         hidden_states = torch.randn(4, 4, config.hidden_size, device="cuda")
-        input_ids = torch.randint(0, config.actual_vocab_size, (4, 4), device="cuda")
+        input_ids = torch.randint(0, config.hash_moe_vocab_size, (4, 4), device="cuda")
 
         with InferenceMode.active():
             routing_probs, top_indices = router(hidden_states, input_ids=input_ids)
@@ -873,7 +873,7 @@ class TestHashRouting:
         )
         layer = TransformerLayer(config, submodules, layer_number=1).cuda()
         hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
-        input_ids = torch.randint(0, config.actual_vocab_size, (2, 8), device="cuda")
+        input_ids = torch.randint(0, config.hash_moe_vocab_size, (2, 8), device="cuda")
 
         output, _ = layer(hidden_states=hidden_states, attention_mask=None, input_ids=input_ids)
 

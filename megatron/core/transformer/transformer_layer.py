@@ -441,6 +441,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         from megatron.core.extensions.transformer_engine import TEFusedMLP
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
+        mlp_builder = (
+            submodules.mlp.module if isinstance(submodules.mlp, ModuleSpec) else submodules.mlp
+        )
+        while isinstance(mlp_builder, functools.partial):
+            mlp_builder = mlp_builder.func
+        is_moe_mlp_builder = isinstance(mlp_builder, type) and issubclass(mlp_builder, MoELayer)
+
         # MLP expects tp_group but MoELayer expects pg_collection to be passed in.
         # We can change MLP to accept pg_collection but it makes the logic implicit
         # The conditional below is to make the logic explicit
@@ -464,7 +471,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             is_mtp_layer=self.is_mtp_layer,
             name=(name + ".mlp") if name is not None else None,
         )
-        if hash_moe_layer_threshold is not None:
+        if is_moe_mlp_builder and hash_moe_layer_threshold is not None:
             mlp_kwargs["hash_moe_layer_threshold"] = hash_moe_layer_threshold
         self.mlp = submodules.mlp(**mlp_kwargs)
         if hasattr(self.mlp, 'set_layer_number'):
@@ -722,7 +729,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             packed_seq_params (object, optional): Parameters for packed sequence processing.
             sequence_len_offset (Tensor, optional): Offset along sequence dimension
                 during inference.
-            input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
+            input_ids (Tensor, optional): Token IDs retained in the shared layer-forward
+                signature for the MLP phase. Self-attention does not consume them; hash-routed
+                MoE layers use them later in ``_forward_mlp``.
 
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:

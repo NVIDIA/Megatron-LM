@@ -289,7 +289,7 @@ class TopKRouter(Router):
             return
 
         if self.tid2eid is None:
-            token_ids = torch.arange(self.config.actual_vocab_size, device=self.weight.device)
+            token_ids = torch.arange(self.config.hash_moe_vocab_size, device=self.weight.device)
             expert_offsets = torch.arange(self.topk, device=token_ids.device)
             self.tid2eid = ((token_ids[:, None] + expert_offsets) % self.num_experts).to(
                 torch.int32

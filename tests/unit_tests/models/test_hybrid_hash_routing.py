@@ -317,7 +317,7 @@ def test_hybrid_model_passes_ids_to_decoder_only_for_hash_routing(
         fine_grained_activation_offloading=False,
         moe_paged_stash=False,
         moe_n_hash_layers=moe_n_hash_layers,
-        actual_vocab_size=128,
+        hash_moe_vocab_size=128,
         sequence_parallel=False,
     )
     model = SimpleNamespace(
@@ -342,7 +342,7 @@ def test_hybrid_model_passes_ids_to_decoder_only_for_hash_routing(
     )
 
     assert output is hidden_states
-    assert config.actual_vocab_size == 128
+    assert config.hash_moe_vocab_size == 128
     expected_input_ids = input_ids if expects_input_ids else None
     assert decoder.kwargs['input_ids'] is expected_input_ids
 
@@ -367,7 +367,7 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch):
             fine_grained_activation_offloading=False,
             moe_paged_stash=False,
             moe_n_hash_layers=1,
-            actual_vocab_size=128,
+            hash_moe_vocab_size=128,
             sequence_parallel=True,
         ),
         decoder=decoder,
@@ -462,7 +462,7 @@ def test_hybrid_hash_moe_pp_does_not_require_explicit_pipeline_layout():
         pipeline_dtype=torch.float32,
         num_moe_experts=4,
         moe_n_hash_layers=3,
-        actual_vocab_size=128,
+        hash_moe_vocab_size=128,
         is_hybrid_model=True,
     )
 
@@ -478,7 +478,7 @@ def test_hybrid_hash_moe_pp_does_not_require_explicit_pipeline_layout():
             pipeline_dtype=torch.float32,
             num_moe_experts=4,
             moe_n_hash_layers=3,
-            actual_vocab_size=128,
+            hash_moe_vocab_size=128,
             is_hybrid_model=False,
         )
 

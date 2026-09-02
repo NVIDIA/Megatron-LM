@@ -602,6 +602,7 @@ class TestBuildTokenizer:
         assert tokenizer.library == "huggingface"
         assert tokenizer.chat_template == chat_template
         assert tokenizer._tokenizer.include_special_tokens == True
+        assert config.tokenizer_vocab_size == tokenizer.vocab_size
 
     def test_build_hf_tokenizer_fast(self):
         tokenizer_model = "/opt/data/tokenizers/huggingface"

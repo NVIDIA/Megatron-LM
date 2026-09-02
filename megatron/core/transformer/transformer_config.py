@@ -883,8 +883,8 @@ class TransformerConfig(ModelParallelConfig):
     In HybridModel this counts MoE positions in the layer pattern rather than
     all hybrid symbols. Other transformer stacks use the layer number directly."""
 
-    actual_vocab_size: Optional[int] = None
-    """Vocabulary size of the token-to-expert lookup table.
+    hash_moe_vocab_size: Optional[int] = None
+    """TP-independent vocabulary size of the token-to-expert lookup table.
     Required when ``moe_n_hash_layers > 0``."""
 
     use_grouped_gemm_for_dense_mlp: bool = False
@@ -2853,8 +2853,8 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_n_hash_layers > 0:
             assert (
-                self.actual_vocab_size is not None and self.actual_vocab_size > 0
-            ), "actual_vocab_size must be positive when moe_n_hash_layers > 0."
+                self.hash_moe_vocab_size is not None and self.hash_moe_vocab_size > 0
+            ), "hash_moe_vocab_size must be positive when moe_n_hash_layers > 0."
             assert (
                 self.num_moe_experts is not None
             ), "num_moe_experts must be set when moe_n_hash_layers > 0."

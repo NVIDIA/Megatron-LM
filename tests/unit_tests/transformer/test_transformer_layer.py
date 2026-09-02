@@ -101,6 +101,21 @@ class TestParallelTransformerLayer:
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])
         assert num_weights == 1884
 
+    def test_dense_mlp_does_not_receive_hash_layer_threshold(self):
+        class DenseMlp(torch.nn.Module):
+            def __init__(self, *, config, pg_collection, is_mtp_layer, name=None):
+                super().__init__()
+
+            def forward(self, hidden_states, **_kwargs):
+                return hidden_states, None
+
+        submodules = TransformerLayerSubmodules(mlp=DenseMlp)
+        layer = TransformerLayer(
+            self.parallel_transformer_layer.config, submodules, hash_moe_layer_threshold=1
+        )
+
+        assert isinstance(layer.mlp, DenseMlp)
+
     def test_gpu_forward(self):
         parallel_transformer_layer = self.parallel_transformer_layer
         config: TransformerConfig = parallel_transformer_layer.config

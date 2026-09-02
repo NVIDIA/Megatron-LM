@@ -78,6 +78,25 @@ class TestGPTModel:
         num_weights = sum([p.numel() for p in self.gpt_model.parameters()])
         assert num_weights == 6240
 
+    def test_constructor_rejects_hash_routed_moe(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            moe_n_hash_layers=1,
+            hash_moe_vocab_size=100,
+            use_cpu_initialization=True,
+        )
+
+        with pytest.raises(ValueError, match="supported only by HybridModel"):
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=100,
+                max_sequence_length=4,
+            )
+
     @pytest.mark.internal
     def test_set_input_tensor(self):
         config: TransformerConfig = self.gpt_model.config
