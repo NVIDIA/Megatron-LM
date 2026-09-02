@@ -9,14 +9,20 @@ share the cooperative-grid synchronization used by the weight transport.
 Only virtual weights and gradients occupy PyTorch native symmetric memory. Source
 weights remain in parameter or GTP-gather storage: each owner pushes them directly
 into the destination virtual slots of its peers, and pulls the resulting replica
-gradients back into native wgrad staging, clearing the local slots behind the
-transport. No activation transport is involved.
+gradients back into native wgrad staging. No activation transport is involved.
 
 Both directions are pure wire movement, so they are bound by NVLink bandwidth
 rather than by arithmetic, and within the reserved SM budget only the TMA unit can
 saturate the link. ``tl.make_tensor_descriptor`` reaches that bandwidth from a peer
 base address resolved at runtime, and Triton's loop pipeliner supplies the
 multi-stage schedule that the transfer needs.
+
+Ordering between the transport and the expert GEMMs that read or write the
+symmetric arenas is stream order on each rank plus the collectives already in
+the layer: the planner's histogram all-gather precedes every owner push, and the
+reduction's device-side rendezvous brackets every gradient exchange. The
+replica gradient slots are never cleared; the runtime parameters carry
+``overwrite_main_grad`` so TE's wgrad GEMM rewrites them on every backward.
 """
 
 import functools
@@ -39,13 +45,13 @@ MAX_REPLICA_EP_RANKS = 64
 # arithmetic and views it as 256 gradient elements.
 _ROW = tl.constexpr(256)
 # Measured on GB300 at 32 SMs: 32 KiB tiles over four pipeline stages sustain the
-# peer write bandwidth. Halving the tile or moving to three stages costs about
-# 3%, and eight stages exceed the shared-memory budget.
+# peer bandwidth in both directions. Halving the tile or moving to three stages
+# costs 3-20%, and eight stages exceed the shared-memory budget.
 _MAX_TILE_BYTES = 32768
 _MAX_SCALE_TILE_BYTES = 8192
-_NUM_WARPS = 4
 _NUM_STAGES = tl.constexpr(4)
-_THREADS = 32 * _NUM_WARPS
+_PUSH_NUM_WARPS = 4
+_GRAD_NUM_WARPS = 8
 
 # Toggling one high bit lets a block detect completion from its own pre-arrival
 # value, so the barrier resets itself and needs no separate clearing pass.
@@ -85,7 +91,7 @@ def _grid_sync(grid_barrier, TAG: tl.constexpr, NUM_SMS: tl.constexpr):
     tl.debug_barrier()
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["source_rank"])
 def _plan_replica_placement_kernel(
     gathered_tokens_per_expert,
     rank_load_balance,
@@ -94,8 +100,8 @@ def _plan_replica_placement_kernel(
     experts_to_copy,
     expert_replica_slots,
     grid_sync,
+    source_rank,
     RANK_ROUTE_CAPACITY: tl.constexpr,
-    SOURCE_EP_RANK: tl.constexpr,
     EP_SIZE: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     NUM_EXPERTS_PER_GPU: tl.constexpr,
@@ -125,7 +131,7 @@ def _plan_replica_placement_kernel(
     )
     native_totals = tl.sum(source_counts, axis=0).to(tl.int32)
     routes_before_source = tl.sum(
-        tl.where(ranks[:, None] < SOURCE_EP_RANK, source_counts, 0), axis=0
+        tl.where(ranks[:, None] < source_rank, source_counts, 0), axis=0
     ).to(tl.int32)
     tl.store(
         rank_load_balance + rank, tl.sum(native_totals, axis=0).to(tl.int32) - RANK_ROUTE_CAPACITY
@@ -133,6 +139,12 @@ def _plan_replica_placement_kernel(
 
     _grid_sync(grid_sync, _GRID_SYNC_TAG, EP_SIZE)
 
+    # Pair the most overloaded rank with the emptiest one and move the
+    # receiver's whole deficit from that single sender. This can send more than
+    # the sender's excess, but it gives every receiver exactly one sender, and
+    # a sender owns NUM_EXPERTS_PER_GPU experts, so a receiver never needs more
+    # replica slots than it has. Moving only min(excess, deficit) would cut
+    # traffic but let a receiver draw on several senders and overflow the slots.
     balances = tl.load(rank_load_balance + ranks, mask=valid_ranks, other=0)
     quotas = tl.zeros((BLOCK_EP_SIZE,), dtype=tl.int32)
     for _ in tl.range(0, EP_SIZE, 1, loop_unroll_factor=1):
@@ -199,6 +211,12 @@ def _plan_replica_placement_kernel(
         tl.store(experts_to_copy + rank * NUM_EXPERTS_PER_GPU + slot, selected)
         tl.store(expert_replica_slots + selected * EP_SIZE + rank, slot, mask=selected >= 0)
         counts = tl.where(experts == expert, -1, counts)
+    # Allocations name the destination of every route, so an expert allocated
+    # here without a slot would map its routes to a stale slot id. The
+    # single-sender rule above makes this unreachable; keep it loud anyway.
+    if tl.max(tl.where(valid_remote, counts, -1), axis=0) > 0:
+        tl.device_print("replica placement needs more replica slots than experts on rank", rank)
+        _emit_on_every_thread("trap; mov.u32 $0, 0;", THREADS=1)
 
 
 @triton.jit
@@ -214,7 +232,12 @@ def _rank_routes_within_experts_kernel(
     BLOCK_SCAN_PARTITIONS: tl.constexpr,
     NUM_SCAN_EXPERTS: tl.constexpr,
 ):
-    """Give each route its stable ordinal within its expert's local stream."""
+    """Give each route its stable ordinal within its expert's local stream.
+
+    The intra-tile ordinal comes from ``match.sync`` lane masks plus a first-warp
+    histogram, so ``BLOCK_NUM_ROUTES=64`` with two warps is a correctness
+    constraint, not a tuning choice.
+    """
     partition = tl.program_id(0)
     num_partitions = tl.num_programs(0)
     expert_offsets = tl.arange(0, BLOCK_NUM_EXPERTS)
@@ -450,8 +473,8 @@ def launch_replica_placement(
         experts_to_copy,
         expert_replica_slots,
         grid_sync,
+        source_rank,
         RANK_ROUTE_CAPACITY=rank_route_capacity,
-        SOURCE_EP_RANK=source_rank,
         EP_SIZE=ep_size,
         NUM_EXPERTS=num_experts,
         NUM_EXPERTS_PER_GPU=num_local_experts,
@@ -583,7 +606,7 @@ def _cross_rank_barrier(
             COMPARE=0,
             VALUE=1,
             SEM="release",
-            LABEL="replica push send stalled on rank",
+            LABEL="replica transport send stalled on rank",
             TIMEOUT_NS=_BARRIER_TIMEOUT_NS,
         )
         _handshake(
@@ -594,7 +617,7 @@ def _cross_rank_barrier(
             COMPARE=1,
             VALUE=0,
             SEM="acquire",
-            LABEL="replica push receive stalled on rank",
+            LABEL="replica transport receive stalled on rank",
             TIMEOUT_NS=_BARRIER_TIMEOUT_NS,
         )
     _grid_sync(grid_barrier, _GRID_SYNC_TAG, NUM_SMS)
@@ -620,9 +643,9 @@ def _push_projection(
     NUM_LOCAL_EXPERTS: tl.constexpr,
     NUM_SMS: tl.constexpr,
 ):
-    """Push this block's share of one projection into every replica slot.
+    """Push this block's share of one component into every replica slot.
 
-    Both descriptors span a whole projection and stay fixed across the tile loop.
+    Both descriptors span a whole member and stay fixed across the tile loop.
     That is a requirement, not a convenience: Triton cannot predicate a descriptor
     construction, so one built inside the pipelined loop would refuse to compile.
     """
@@ -632,7 +655,7 @@ def _push_projection(
     # Cut each replica into as many segments as it takes to occupy the grid, and
     # give every block one contiguous run. Striping every replica across every
     # block instead would refill the copy pipeline once per replica, which costs
-    # more than it saves once a projection is small - as the MXFP8 scales are.
+    # more than it saves once a member is small - as the MXFP8 scales are.
     segments = tl.maximum(NUM_SMS // tl.maximum(active, 1), 1)
     for unit in tl.range(block, active * segments, NUM_SMS, num_stages=1):
         # Vary the replica fastest. Consecutive replicas have different
@@ -673,6 +696,8 @@ def _push_projection(
 def _replica_weight_push_kernel(
     fc1_bases,
     fc2_bases,
+    fc1_scale_bases,
+    fc2_scale_bases,
     peer_bases,
     signal_bases,
     plan,
@@ -681,86 +706,63 @@ def _replica_weight_push_kernel(
     rank,
     FC1_BYTES: tl.constexpr,
     FC2_BYTES: tl.constexpr,
-    FC1_ARENA_BYTES: tl.constexpr,
-    FC2_ARENA_BYTES: tl.constexpr,
+    FC1_SCALE_BYTES: tl.constexpr,
+    FC2_SCALE_BYTES: tl.constexpr,
     TILE_BYTES: tl.constexpr,
+    SCALE_TILE_BYTES: tl.constexpr,
     NUM_LOCAL_EXPERTS: tl.constexpr,
     WORLD: tl.constexpr,
     WORLD_POW2: tl.constexpr,
     PLAN_POW2: tl.constexpr,
     NUM_SMS: tl.constexpr,
     THREADS: tl.constexpr,
-    BARRIER: tl.constexpr,
 ):
-    """Push one component of every owner-local expert into its replica slots.
+    """Push every owner-local expert into its replica slots and rendezvous.
 
     ``plan`` holds the destination-major ``[world, num_local_experts]`` table of
     globally numbered experts the planner wants materialized, so the entries this
-    rank owns are a sparse subset of it.  Compacting them into a dense ordinal
+    rank owns are a sparse subset of it. Compacting them into a dense ordinal
     keeps the sweep free of idle iterations even when a rank owns 8 of 512 slots,
     and recovering each plan entry with one masked reduction avoids staging the
-    compacted table through memory.
+    compacted table through memory. The arena holds ``fc1 data, fc1 scales, fc2
+    data, fc2 scales``, each section ``NUM_LOCAL_EXPERTS`` members long; the two
+    scale sections are empty for BF16 weights.
     """
+    FC1_SCALE_ARENA: tl.constexpr = NUM_LOCAL_EXPERTS * FC1_BYTES
+    FC2_ARENA: tl.constexpr = FC1_SCALE_ARENA + NUM_LOCAL_EXPERTS * FC1_SCALE_BYTES
+    FC2_SCALE_ARENA: tl.constexpr = FC2_ARENA + NUM_LOCAL_EXPERTS * FC2_BYTES
     entry = tl.arange(0, PLAN_POW2)
     planned = entry < WORLD * NUM_LOCAL_EXPERTS
     owner_expert = tl.load(plan + entry, mask=planned, other=-1) - rank * NUM_LOCAL_EXPERTS
     mine = planned & (owner_expert >= 0) & (owner_expert < NUM_LOCAL_EXPERTS)
     ordinal = tl.cumsum(mine.to(tl.int32), 0) - 1
     active = tl.sum(mine.to(tl.int32), 0)
-
     block = tl.program_id(0)
-    _push_projection(
-        fc1_bases,
-        plan,
-        peer_bases,
-        entry,
-        mine,
-        ordinal,
-        active,
-        block,
-        rank,
-        FC1_BYTES,
-        FC1_ARENA_BYTES,
-        TILE_BYTES,
-        NUM_LOCAL_EXPERTS,
-        NUM_SMS,
-    )
-    _push_projection(
-        fc2_bases,
-        plan,
-        peer_bases,
-        entry,
-        mine,
-        ordinal,
-        active,
-        block,
-        rank,
-        FC2_BYTES,
-        FC2_ARENA_BYTES,
-        TILE_BYTES,
-        NUM_LOCAL_EXPERTS,
-        NUM_SMS,
-    )
 
-    if BARRIER:
-        _cross_rank_barrier(
-            signal_bases, grid_barrier, dummy_signal, rank, WORLD, WORLD_POW2, NUM_SMS, THREADS
+    # One bulk-copy engine per block serves every component, so the much smaller
+    # scale transfers follow the data rather than competing with it.
+    # fmt: off
+    _push_projection(
+        fc1_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
+        FC1_BYTES, 0, TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
+    )
+    _push_projection(
+        fc2_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
+        FC2_BYTES, FC2_ARENA, TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
+    )
+    if FC1_SCALE_BYTES > 0:
+        _push_projection(
+            fc1_scale_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
+            FC1_SCALE_BYTES, FC1_SCALE_ARENA, SCALE_TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
         )
-
-
-# The reduction holds a whole tile in registers, so the tile is bounded by the
-# register file rather than by the pipeline's shared-memory budget. Measured on
-# GB300 at 32 SMs: 32 KiB over four stages sustains the peer read bandwidth, and
-# three stages give up 20% of it.
-_MAX_GRAD_TILE_BYTES = 32768
-_GRAD_NUM_WARPS = 8
-_GRAD_STAGES = tl.constexpr(4)
-# Transport the tiles in several passes over disjoint ranges. The cross-rank
-# barrier closing a pass proves every owner has read that range, so the next
-# pass can zero the local slots behind it while it waits on the wire, and only
-# the trailing range stays exposed. More passes shrink that range but shorten
-# the sweep each one pipelines; three is the measured optimum.
-_TRANSPORT_PASSES = tl.constexpr(3)
+        _push_projection(
+            fc2_scale_bases, plan, peer_bases, entry, mine, ordinal, active, block, rank,
+            FC2_SCALE_BYTES, FC2_SCALE_ARENA, SCALE_TILE_BYTES, NUM_LOCAL_EXPERTS, NUM_SMS,
+        )
+    # fmt: on
+    _cross_rank_barrier(
+        signal_bases, grid_barrier, dummy_signal, rank, WORLD, WORLD_POW2, NUM_SMS, THREADS
+    )
 
 
 @triton.jit
@@ -784,38 +786,6 @@ def _member_row(
 
 
 @triton.jit
-def _retire_tile(
-    arena,
-    hosted,
-    ordinal,
-    slot,
-    low,
-    high,
-    index,
-    retiring,
-    FC1_ROWS: tl.constexpr,
-    FC2_ROWS: tl.constexpr,
-    FC2_BASE_ROW: tl.constexpr,
-    TILE_ROWS: tl.constexpr,
-):
-    """Zero item ``index`` of the tile range ``[low, high)`` of every hosted slot.
-
-    Ordinary vector stores rather than a bulk copy: this runs beside the peer
-    loads, and a bulk store would queue behind them on the same asynchronous
-    copy engine. Being plain stores is also what lets the zero fill hide, since
-    it is issued from the transport loop and drains while the next tile is on
-    the wire - which is also why ``retiring`` masks the store instead of guarding
-    the call: a block-wide reduction inside a conditional would stop the
-    pipeliner from prefetching anything else in the loop.
-    """
-    tiles = tl.maximum(high - low, 1)
-    member = tl.sum(tl.where(hosted & (ordinal == index // tiles), slot, 0), 0)
-    row = _member_row(member, low + index % tiles, FC1_ROWS, FC2_ROWS, FC2_BASE_ROW, TILE_ROWS)
-    offset = (row + tl.arange(0, TILE_ROWS)[:, None]).to(tl.int64) * _ROW + tl.arange(0, _ROW)
-    tl.store(arena + offset, tl.zeros([TILE_ROWS, _ROW], arena.dtype.element_ty), mask=retiring)
-
-
-@triton.jit
 def _staging_pointer(arena, address, ELEMENT_BYTES: tl.constexpr):
     """Return one native wgrad base as a pointer whose alignment Triton knows.
 
@@ -827,12 +797,6 @@ def _staging_pointer(arena, address, ELEMENT_BYTES: tl.constexpr):
     """
     offset = (tl.load(address) - arena.to(tl.int64)) // ELEMENT_BYTES
     return arena + tl.multiple_of(offset, 16 // ELEMENT_BYTES)
-
-
-@triton.jit
-def _tile_offset(TILE_ROWS: tl.constexpr):
-    """Offsets of one transport tile, shaped like a tile the descriptor returns."""
-    return tl.arange(0, TILE_ROWS)[None, :, None].to(tl.int64) * _ROW + tl.arange(0, _ROW)
 
 
 @triton.jit
@@ -872,8 +836,6 @@ def _symmetric_window(
     )
 
 
-# ``rank`` must not be specialized: Triton would otherwise compile a separate
-# kernel per rank value, and the ahead-of-time warmup could not cover them all.
 @triton.jit(do_not_specialize=["rank"])
 def _replica_grad_reduce_kernel(
     arena,
@@ -891,7 +853,6 @@ def _replica_grad_reduce_kernel(
     TILE_ROWS: tl.constexpr,
     ELEMENT_BYTES: tl.constexpr,
     NUM_LOCAL_EXPERTS: tl.constexpr,
-    LOCAL_POW2: tl.constexpr,
     WORLD: tl.constexpr,
     WORLD_POW2: tl.constexpr,
     PLAN_POW2: tl.constexpr,
@@ -903,12 +864,14 @@ def _replica_grad_reduce_kernel(
     ``plan`` holds the destination-major ``[world, num_local_experts]`` table of
     globally numbered experts the planner materialized, so the sources of one
     owner-local expert are the entries naming it, one per peer that hosts it.
-    Every block sweeps every expert but only its own contiguous slice of the
-    tiles, which splits the payload evenly however sparse the plan is, and each
-    block starts at a different expert so the blocks running at any instant are
-    spread over the peers instead of queued behind one of them. The slots this
-    rank hosts for its peers are zeroed from the same sweep, one tile at a time,
-    a whole transport pass behind the barrier that proved they had been read.
+    Every block sweeps every replicated expert but only its own contiguous slice
+    of the tiles, which splits the payload evenly however sparse the plan is,
+    and each block starts at a different expert so the blocks running at any
+    instant are spread over the peers instead of queued behind one of them.
+
+    The entry rendezvous proves every peer's wgrad GEMM has finished writing;
+    the exit rendezvous proves every owner has read, so a peer may rewrite its
+    slots on the next backward.
     """
     FC1_TILES: tl.constexpr = FC1_ROWS // TILE_ROWS
     TILES: tl.constexpr = FC1_TILES + FC2_ROWS // TILE_ROWS
@@ -921,21 +884,13 @@ def _replica_grad_reduce_kernel(
     owner_expert = tl.load(plan + entry, mask=planned, other=-1) - rank * NUM_LOCAL_EXPERTS
     mine = planned & (owner_expert >= 0) & (owner_expert < NUM_LOCAL_EXPERTS)
 
-    # Slots this rank hosts for a peer; they are retired behind the transport.
-    slot = tl.arange(0, LOCAL_POW2)
-    local = slot < NUM_LOCAL_EXPERTS
-    hosted = local & (tl.load(plan + rank * NUM_LOCAL_EXPERTS + slot, mask=local, other=-1) >= 0)
-    hosted_ordinal = tl.cumsum(hosted.to(tl.int32), 0) - 1
-    active = tl.sum(hosted.to(tl.int32), 0)
-
     # Compact the experts some peer replicated, and each of their sources, into
-    # a table the transport reads with scalar loads. Compacting also keeps the
-    # sweep below, which hands block ``b`` the expert ``step + b``, from leaving
-    # every block on the same expert - and so on the same peer - whenever the
-    # plan is sparse. Recovering a source inside the transport with a masked
-    # reduction instead costs 6% of the wire, because the reduction is block
-    # wide and its two barriers land in the middle of the pipelined loop. The
-    # grid synchronizing inside the rendezvous below publishes the table.
+    # a table the transport reads with scalar loads. Recovering a source inside
+    # the transport with a masked reduction instead costs 6% of the wire,
+    # because the reduction is block wide and its two barriers land in the
+    # middle of the pipelined loop. Compacting the experts as well keeps a
+    # sparse plan from starting every block on the same peer. The grid sync
+    # inside the rendezvous below publishes the table.
     replicas = sources + NUM_LOCAL_EXPERTS * WORLD
     if block == 0:
         found = 0
@@ -956,106 +911,56 @@ def _replica_grad_reduce_kernel(
     )
     replicated = tl.load(replicas + NUM_LOCAL_EXPERTS)
 
-    # One pass beyond the transport ranges retires the trailing range, which no
-    # barrier has covered yet; it is the same loop body with nothing to move.
-    for transport_pass in tl.static_range(_TRANSPORT_PASSES + 1):
-        first = TILES * transport_pass // _TRANSPORT_PASSES
-        last = TILES * min(transport_pass + 1, _TRANSPORT_PASSES) // _TRANSPORT_PASSES
-        retired = TILES * max(transport_pass - 1, 0) // _TRANSPORT_PASSES
-        low = first + block * (last - first) // NUM_SMS
-        high = first + (block + 1) * (last - first) // NUM_SMS
-        clear_low = retired + block * (first - retired) // NUM_SMS
-        clear_high = retired + (block + 1) * (first - retired) // NUM_SMS
-        pending = active * (clear_high - clear_low)
-        done = 0
-        for step in tl.range(0, replicated, num_stages=1):
-            expert = tl.load(replicas + (step + block) % tl.maximum(replicated, 1))
-            count = tl.sum((mine & (owner_expert == expert)).to(tl.int32), 0)
-            fc1 = _staging_pointer(arena, fc1_bases + expert, ELEMENT_BYTES)
-            fc2 = _staging_pointer(arena, fc2_bases + expert, ELEMENT_BYTES)
-            partial = tl.zeros([1, TILE_ROWS, _ROW], tl.float32)
-            for work in tl.range(0, (high - low) * count, num_stages=_GRAD_STAGES):
-                tile = low + work // count
-                index = work - (tile - low) * count
-                # Retire one tile of the previous pass per tile transported,
-                # ahead of the peer read so the stores drain while that tile is
-                # on the wire. That ordering is worth 4% of the bandwidth, and
-                # it is the only overlap available without warp specialization.
-                _retire_tile(
-                    arena,
-                    hosted,
-                    hosted_ordinal,
-                    slot,
-                    clear_low,
-                    clear_high,
-                    done + work,
-                    done + work < pending,
-                    FC1_ROWS,
-                    FC2_ROWS,
-                    FC2_BASE_ROW,
-                    TILE_ROWS,
-                )
-                chosen = tl.load(sources + expert * WORLD + index)
-                destination = chosen // NUM_LOCAL_EXPERTS
-                row = _member_row(
-                    chosen - destination * NUM_LOCAL_EXPERTS,
-                    tile,
-                    FC1_ROWS,
-                    FC2_ROWS,
-                    FC2_BASE_ROW,
-                    TILE_ROWS,
-                )
-                second = tile >= FC1_TILES
-                native = (
-                    tl.where(second, fc2, fc1)
-                    + (tile - tl.where(second, FC1_TILES, 0)) * TILE_ROWS * _ROW
-                )
-                # Peer traffic and persistent storage stay in the gradient
-                # dtype while the partials are summed in FP32, so a BF16
-                # gradient rounds once, on the last source. The staging is read
-                # on every source and written only on the last: a load inside a
-                # conditional is one the pipeliner will not prefetch, and
-                # seeding the accumulator with it keeps the summation order the
-                # one every caller has always seen.
-                offset = _tile_offset(TILE_ROWS)
-                staged = tl.load(native + offset).to(tl.float32)
-                partial = tl.where(index == 0, staged, partial) + window.load(
-                    [destination, row, 0]
-                ).to(tl.float32)
-                tl.store(
-                    native + offset, partial.to(arena.dtype.element_ty), mask=index == count - 1
-                )
-            done += (high - low) * count
-        # A rank that hosts more slots than it owns replicas runs out of
-        # transport to hide behind before the range is retired.
-        for index in tl.range(done, pending, num_stages=1):
-            _retire_tile(
-                arena,
-                hosted,
-                hosted_ordinal,
-                slot,
-                clear_low,
-                clear_high,
-                index,
-                True,
+    low = block * TILES // NUM_SMS
+    high = (block + 1) * TILES // NUM_SMS
+    for step in tl.range(0, replicated, num_stages=1):
+        expert = tl.load(replicas + (step + block) % tl.maximum(replicated, 1))
+        count = tl.sum((mine & (owner_expert == expert)).to(tl.int32), 0)
+        fc1 = _staging_pointer(arena, fc1_bases + expert, ELEMENT_BYTES)
+        fc2 = _staging_pointer(arena, fc2_bases + expert, ELEMENT_BYTES)
+        partial = tl.zeros([1, TILE_ROWS, _ROW], tl.float32)
+        for work in tl.range(0, (high - low) * count, num_stages=_NUM_STAGES):
+            tile = low + work // count
+            index = work - (tile - low) * count
+            chosen = tl.load(sources + expert * WORLD + index)
+            destination = chosen // NUM_LOCAL_EXPERTS
+            row = _member_row(
+                chosen - destination * NUM_LOCAL_EXPERTS,
+                tile,
                 FC1_ROWS,
                 FC2_ROWS,
                 FC2_BASE_ROW,
                 TILE_ROWS,
             )
-        if transport_pass < _TRANSPORT_PASSES:
-            _cross_rank_barrier(
-                signal_bases, grid_barrier, dummy_signal, rank, WORLD, WORLD_POW2, NUM_SMS, THREADS
+            second = tile >= FC1_TILES
+            native = (
+                tl.where(second, fc2, fc1)
+                + (tile - tl.where(second, FC1_TILES, 0)) * TILE_ROWS * _ROW
             )
+            # Peer traffic and persistent storage stay in the gradient dtype
+            # while the partials are summed in FP32, so a BF16 gradient rounds
+            # once, on the last source. The staging is read on every source and
+            # written only on the last: a load inside a conditional is one the
+            # pipeliner will not prefetch, and seeding the accumulator with it
+            # keeps the summation order ``native + s0 + s1 + ...``.
+            offset = tl.arange(0, TILE_ROWS)[None, :, None].to(tl.int64) * _ROW + tl.arange(0, _ROW)
+            staged = tl.load(native + offset).to(tl.float32)
+            partial = tl.where(index == 0, staged, partial) + window.load([destination, row, 0]).to(
+                tl.float32
+            )
+            tl.store(native + offset, partial.to(arena.dtype.element_ty), mask=index == count - 1)
+    _cross_rank_barrier(
+        signal_bases, grid_barrier, dummy_signal, rank, WORLD, WORLD_POW2, NUM_SMS, THREADS
+    )
 
 
-def _tile_bytes(limit: int, *component_bytes: int) -> int:
-    """Return the largest transport tile that divides every component."""
-    tile = functools.reduce(math.gcd, component_bytes, limit)
+def _transport_tile(limit: int, *components: int) -> int:
+    """Return the largest transport tile (in the components' unit) dividing every component."""
+    tile = functools.reduce(math.gcd, components, limit)
     if tile % _ROW.value:
         raise ValueError(
-            f"Replica weight components must share a {_ROW.value}-byte aligned "
-            f"transport tile, got {component_bytes} yielding {tile}."
+            f"Replica transport components must share a {_ROW.value}-aligned tile, "
+            f"got {components} yielding {tile}."
         )
     return tile
 
@@ -1074,22 +979,27 @@ def _validate_transport_shape(world_size: int, num_local_experts: int, num_sms: 
         )
 
 
-def _validate_scale_shape(
-    member_numels: tuple[int, int], scale_numels: tuple[int, int], orientation: str
-) -> None:
-    """Validate the aligned native MXFP8 byte layout the push kernel assumes."""
-    for projection, (member_numel, scale_numel) in enumerate(zip(member_numels, scale_numels)):
-        if scale_numel <= 0 or scale_numel % 2:
-            raise ValueError(
-                "Replica MXFP8 scales must contain a positive even number of bytes; "
-                f"{orientation} projection {projection} has {scale_numel}."
-            )
-        if scale_numel * 32 != member_numel:
-            raise ValueError(
-                "Replica MXFP8 requires one E8M0 scale byte per 32 weight bytes; "
-                f"{orientation} projection {projection} has weight_bytes={member_numel}, "
-                f"scale_bytes={scale_numel}."
-            )
+def _validate_grad_dtype(grad_dtype: torch.dtype) -> None:
+    if grad_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(
+            f"Replica gradients must use torch.float32 or torch.bfloat16, got {grad_dtype}."
+        )
+
+
+def _pointer_table(table: torch.Tensor, num_local_experts: int) -> torch.Tensor:
+    """Validate one stable ``int64`` device table holding one base address per expert."""
+    if (
+        table.dtype != torch.int64
+        or table.device.type != "cuda"
+        or table.ndim != 1
+        or table.numel() != num_local_experts
+        or not table.is_contiguous()
+    ):
+        raise ValueError(
+            "Replica pointer tables must be contiguous CUDA int64 tensors "
+            f"with {num_local_experts} entries."
+        )
+    return table
 
 
 @functools.lru_cache(maxsize=None)
@@ -1135,7 +1045,7 @@ class _DescriptorAllocator:
     def _allocate(self, size: int, alignment: int, stream) -> torch.Tensor:
         if size > self._scratch.numel():
             raise RuntimeError(
-                f"Replica weight push needs {size} descriptor bytes but only "
+                f"Replica transport needs {size} descriptor bytes but only "
                 f"{self._scratch.numel()} are reserved."
             )
         return self._scratch[:size]
@@ -1150,246 +1060,41 @@ class _DescriptorAllocator:
         triton.set_allocator(self._previous)
 
 
-def as_pointer_table(
-    tensor: torch.Tensor, num_local_experts: int, *, dtype: torch.dtype
-) -> torch.Tensor:
-    """Return a stable device table containing one data pointer per local expert.
-
-    The public kernel helpers historically accepted one contiguous ``[expert, ...]``
-    tensor.  Replica bridges can now pass an ``int64`` pointer table instead, which
-    also represents TE's independently allocated ``weight0..weightN`` parameters.
-    """
-    if tensor.dtype == torch.int64:
-        if (
-            tensor.device.type != "cuda"
-            or tensor.ndim != 1
-            or tensor.numel() != num_local_experts
-            or not tensor.is_contiguous()
-        ):
-            raise ValueError(
-                "Replica pointer tables must be contiguous CUDA int64 tensors "
-                f"with {num_local_experts} entries."
-            )
-        return tensor
-    if (
-        tensor.device.type != "cuda"
-        or tensor.dtype != dtype
-        or tensor.ndim < 2
-        or tensor.shape[0] != num_local_experts
-        or not tensor.is_contiguous()
-    ):
-        raise ValueError(
-            "Replica sources and native grads must be contiguous CUDA tensors "
-            f"with shape [{num_local_experts}, ...] and dtype {dtype}."
-        )
-    return torch.tensor(
-        [tensor[index].data_ptr() for index in range(num_local_experts)],
-        dtype=torch.int64,
-        device=tensor.device,
-    )
-
-
-def _address(table: torch.Tensor | int) -> int:
-    """Return the device address of a peer or signal table.
-
-    Symmetric-memory handles expose ``buffer_ptrs_dev`` and ``signal_pad_ptrs_dev``
-    as raw device addresses rather than tensors, so both forms are accepted.
-    """
-    return table.data_ptr() if isinstance(table, torch.Tensor) else int(table)
-
-
-def _push_components(
-    member_bytes: tuple[int, int], scale_bytes: tuple[int, int] | None
-) -> list[dict]:
-    """Describe each transport phase and where its arena section starts.
-
-    The arena interleaves the sections as ``fc1 data, fc1 scales, fc2 data,
-    fc2 scales``, so a phase only needs the byte offset of each projection.
-    """
-    fc1_scale, fc2_scale = scale_bytes if scale_bytes is not None else (0, 0)
-    phases = [
-        {
-            "member_bytes": member_bytes,
-            "arena_bytes": (0, member_bytes[0] + fc1_scale),
-            "tile_bytes": _tile_bytes(_MAX_TILE_BYTES, *member_bytes),
-        }
-    ]
-    if scale_bytes is not None:
-        phases.append(
-            {
-                "member_bytes": scale_bytes,
-                "arena_bytes": (member_bytes[0], member_bytes[0] + fc1_scale + member_bytes[1]),
-                "tile_bytes": _tile_bytes(_MAX_SCALE_TILE_BYTES, *scale_bytes),
-            }
-        )
-    return phases
-
-
-def _launch_arguments(
-    phase: dict, *, world_size: int, num_local_experts: int, num_sms: int
+def _push_arguments(
+    member_numels: tuple[int, int],
+    *,
+    mxfp8: bool,
+    world_size: int,
+    num_local_experts: int,
+    num_sms: int,
 ) -> dict:
+    """Return the push specialization for BF16 or native MXFP8 weights.
+
+    MXFP8 members are one byte per element plus one E8M0 scale byte per 32
+    elements in either orientation, so the arena layout depends only on the
+    member shapes.
+    """
+    member_bytes = tuple(numel if mxfp8 else 2 * numel for numel in member_numels)
+    scale_bytes = tuple(numel // 32 for numel in member_numels) if mxfp8 else (0, 0)
     return dict(
-        FC1_BYTES=phase["member_bytes"][0],
-        FC2_BYTES=phase["member_bytes"][1],
-        FC1_ARENA_BYTES=num_local_experts * phase["arena_bytes"][0],
-        FC2_ARENA_BYTES=num_local_experts * phase["arena_bytes"][1],
-        TILE_BYTES=phase["tile_bytes"],
+        FC1_BYTES=member_bytes[0],
+        FC2_BYTES=member_bytes[1],
+        FC1_SCALE_BYTES=scale_bytes[0],
+        FC2_SCALE_BYTES=scale_bytes[1],
+        TILE_BYTES=_transport_tile(_MAX_TILE_BYTES, *member_bytes),
+        SCALE_TILE_BYTES=_transport_tile(_MAX_SCALE_TILE_BYTES, *scale_bytes) if mxfp8 else 0,
         NUM_LOCAL_EXPERTS=num_local_experts,
         WORLD=world_size,
         WORLD_POW2=triton.next_power_of_2(world_size),
         PLAN_POW2=triton.next_power_of_2(world_size * num_local_experts),
         NUM_SMS=num_sms,
-        THREADS=_THREADS,
-        num_warps=_NUM_WARPS,
+        THREADS=32 * _PUSH_NUM_WARPS,
+        num_warps=_PUSH_NUM_WARPS,
+        launch_cooperative_grid=True,
     )
 
 
-def compile_replica_weight_push(
-    *,
-    world_size: int,
-    num_local_experts: int,
-    member_numels: tuple[int, int],
-    num_sms: int,
-    device_index: int,
-    rowwise_scale_numels: tuple[int, int] | None = None,
-    columnwise_scale_numels: tuple[int, int] | None = None,
-) -> None:
-    """Compile every push specialization the configured weight format can launch.
-
-    Compiling ahead of the first transport keeps a cold Triton cache out of the
-    device-side rendezvous, where one slow rank would stall every peer.
-    """
-    _validate_transport_shape(world_size, num_local_experts, num_sms)
-    if rowwise_scale_numels is None and columnwise_scale_numels is None:
-        formats = [(tuple(2 * numel for numel in member_numels), None)]
-    elif rowwise_scale_numels is None or columnwise_scale_numels is None:
-        raise ValueError("MXFP8 compilation requires both rowwise and columnwise scale shapes.")
-    else:
-        _validate_scale_shape(member_numels, rowwise_scale_numels, "rowwise")
-        _validate_scale_shape(member_numels, columnwise_scale_numels, "columnwise")
-        formats = [(member_numels, rowwise_scale_numels), (member_numels, columnwise_scale_numels)]
-    with _DescriptorAllocator(device_index), torch.cuda.device(device_index):
-        placeholder_i64 = torch.zeros(world_size, dtype=torch.int64, device="cuda")
-        placeholder_i32 = torch.zeros(
-            world_size * num_local_experts, dtype=torch.int32, device="cuda"
-        )
-        address = placeholder_i64.data_ptr()
-        for member_bytes, scale_bytes in formats:
-            phases = _push_components(member_bytes, scale_bytes)
-            for index, phase in enumerate(phases):
-                _replica_weight_push_kernel.warmup(
-                    placeholder_i64,
-                    placeholder_i64,
-                    address,
-                    address,
-                    placeholder_i32,
-                    placeholder_i32,
-                    placeholder_i32,
-                    0,
-                    BARRIER=index == len(phases) - 1,
-                    grid=(num_sms,),
-                    **_launch_arguments(
-                        phase,
-                        world_size=world_size,
-                        num_local_experts=num_local_experts,
-                        num_sms=num_sms,
-                    ),
-                )
-
-
-def launch_replica_weight_prefetch(
-    *,
-    sources: tuple[torch.Tensor, torch.Tensor],
-    arena: torch.Tensor,
-    peer_bases: torch.Tensor,
-    signal_bases: torch.Tensor,
-    experts_to_copy: torch.Tensor,
-    grid_barrier: torch.Tensor,
-    rank: int,
-    world_size: int,
-    num_local_experts: int,
-    member_numels: tuple[int, int],
-    num_sms: int,
-    scale_sources: tuple[torch.Tensor, torch.Tensor] | None = None,
-    rowwise_scale_numels: tuple[int, int] | None = None,
-    columnwise_scale_numels: tuple[int, int] | None = None,
-    orientation: str | None = None,
-) -> None:
-    """Launch a BF16 or MXFP8 owner-push into destination virtual slots."""
-    device_index = arena.device.index
-    if device_index is None:
-        raise ValueError("Replica weight arena must be a CUDA tensor.")
-    _validate_transport_shape(world_size, num_local_experts, num_sms)
-    if scale_sources is None:
-        if any(
-            value is not None
-            for value in (rowwise_scale_numels, columnwise_scale_numels, orientation)
-        ):
-            raise ValueError("BF16 prefetch does not accept MXFP8 scale metadata.")
-        if arena.dtype != torch.bfloat16:
-            raise ValueError(f"Replica BF16 arena must use torch.bfloat16, got {arena.dtype}.")
-        member_bytes = tuple(2 * numel for numel in member_numels)
-        scale_bytes = None
-        source_dtype = torch.bfloat16
-    else:
-        if rowwise_scale_numels is None or columnwise_scale_numels is None:
-            raise ValueError("MXFP8 prefetch requires rowwise and columnwise scale shapes.")
-        if orientation not in ("rowwise", "columnwise"):
-            raise ValueError(
-                "Replica MXFP8 orientation must be 'rowwise' or 'columnwise', "
-                f"got {orientation!r}."
-            )
-        if arena.dtype != torch.uint8:
-            raise ValueError(f"Replica MXFP8 arena must use torch.uint8, got {arena.dtype}.")
-        member_bytes = member_numels
-        scale_bytes = rowwise_scale_numels if orientation == "rowwise" else columnwise_scale_numels
-        _validate_scale_shape(member_bytes, scale_bytes, orientation)
-        source_dtype = torch.uint8
-
-    tables = [as_pointer_table(source, num_local_experts, dtype=source_dtype) for source in sources]
-    if scale_sources is not None:
-        tables += [
-            as_pointer_table(source, num_local_experts, dtype=torch.uint8)
-            for source in scale_sources
-        ]
-    phases = _push_components(member_bytes, scale_bytes)
-    dummy_signal = _barrier_scratch(device_index)
-    # One bulk-copy engine per CTA serves both phases, so the much smaller scale
-    # transfer follows the data rather than competing with it, and only the final
-    # phase closes the cross-rank rendezvous.
-    with _DescriptorAllocator(device_index):
-        for index, phase in enumerate(phases):
-            _replica_weight_push_kernel[(num_sms,)](
-                tables[2 * index],
-                tables[2 * index + 1],
-                _address(peer_bases),
-                _address(signal_bases),
-                experts_to_copy,
-                grid_barrier,
-                dummy_signal,
-                rank,
-                BARRIER=index == len(phases) - 1,
-                **_launch_arguments(
-                    phase,
-                    world_size=world_size,
-                    num_local_experts=num_local_experts,
-                    num_sms=num_sms,
-                ),
-            )
-
-
-def _grad_tile_elements(member_numels: tuple[int, int], element_bytes: int) -> int:
-    """Return the largest gradient transport tile that divides both projections."""
-    tile = functools.reduce(math.gcd, member_numels, _MAX_GRAD_TILE_BYTES // element_bytes)
-    if tile % _ROW.value:
-        raise ValueError(
-            f"Replica gradient projections must share a {_ROW.value}-element aligned "
-            f"transport tile, got {member_numels} yielding {tile}."
-        )
-    return tile
-
-
-def _grad_launch_arguments(
+def _grad_arguments(
     member_numels: tuple[int, int],
     grad_dtype: torch.dtype,
     *,
@@ -1397,28 +1102,21 @@ def _grad_launch_arguments(
     num_local_experts: int,
     num_sms: int,
 ) -> dict:
-    tile = _grad_tile_elements(member_numels, grad_dtype.itemsize)
+    tile = _transport_tile(_MAX_TILE_BYTES // grad_dtype.itemsize, *member_numels)
     return dict(
         FC1_ROWS=member_numels[0] // _ROW.value,
         FC2_ROWS=member_numels[1] // _ROW.value,
         TILE_ROWS=tile // _ROW.value,
         ELEMENT_BYTES=grad_dtype.itemsize,
         NUM_LOCAL_EXPERTS=num_local_experts,
-        LOCAL_POW2=triton.next_power_of_2(num_local_experts),
         WORLD=world_size,
         WORLD_POW2=triton.next_power_of_2(world_size),
         PLAN_POW2=triton.next_power_of_2(world_size * num_local_experts),
         NUM_SMS=num_sms,
         THREADS=32 * _GRAD_NUM_WARPS,
         num_warps=_GRAD_NUM_WARPS,
+        launch_cooperative_grid=True,
     )
-
-
-def _validate_grad_dtype(grad_dtype: torch.dtype) -> None:
-    if grad_dtype not in (torch.float32, torch.bfloat16):
-        raise ValueError(
-            "Replica gradients must use torch.float32 or torch.bfloat16, " f"got {grad_dtype}."
-        )
 
 
 def compile_replica_weight_kernels(
@@ -1429,54 +1127,105 @@ def compile_replica_weight_kernels(
     num_sms: int,
     device_index: int,
     grad_dtype: torch.dtype = torch.float32,
-    rowwise_scale_numels: tuple[int, int] | None = None,
-    columnwise_scale_numels: tuple[int, int] | None = None,
+    mxfp8: bool = False,
 ) -> None:
-    """Compile the shared gradient reduction and every format-specific push."""
+    """Compile the push and the gradient reduction for one weight layout.
+
+    Compiling ahead of the first transport keeps a cold Triton cache out of the
+    device-side rendezvous, where one slow rank would stall every peer.
+    """
     _validate_transport_shape(world_size, num_local_experts, num_sms)
     _validate_grad_dtype(grad_dtype)
+    shape = dict(world_size=world_size, num_local_experts=num_local_experts, num_sms=num_sms)
     with _DescriptorAllocator(device_index), torch.cuda.device(device_index):
-        placeholder_i64 = torch.zeros(world_size, dtype=torch.int64, device="cuda")
-        placeholder_i32 = torch.zeros(
-            world_size * num_local_experts, dtype=torch.int32, device="cuda"
+        table = torch.zeros(world_size * num_local_experts, dtype=torch.int64, device="cuda")
+        plan = torch.zeros(world_size * num_local_experts, dtype=torch.int32, device="cuda")
+        _replica_weight_push_kernel.warmup(
+            table,
+            table,
+            table,
+            table,
+            table.data_ptr(),
+            table.data_ptr(),
+            plan,
+            plan,
+            plan,
+            0,
+            grid=(num_sms,),
+            **_push_arguments(member_numels, mxfp8=mxfp8, **shape),
         )
         _replica_grad_reduce_kernel.warmup(
             torch.zeros(1, dtype=grad_dtype, device="cuda"),
-            placeholder_i64,
-            placeholder_i64,
-            placeholder_i64.data_ptr(),
-            placeholder_i64.data_ptr(),
-            placeholder_i32,
-            placeholder_i32,
-            placeholder_i32,
-            placeholder_i32,
+            table,
+            table,
+            table.data_ptr(),
+            table.data_ptr(),
+            plan,
+            plan,
+            plan,
+            plan,
             0,
             grid=(num_sms,),
-            **_grad_launch_arguments(
+            **_grad_arguments(member_numels, grad_dtype, **shape),
+        )
+
+
+def launch_replica_weight_prefetch(
+    *,
+    sources: tuple[torch.Tensor, torch.Tensor],
+    arena: torch.Tensor,
+    peer_bases: int,
+    signal_bases: int,
+    experts_to_copy: torch.Tensor,
+    grid_barrier: torch.Tensor,
+    rank: int,
+    world_size: int,
+    num_local_experts: int,
+    member_numels: tuple[int, int],
+    num_sms: int,
+    scale_sources: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> None:
+    """Push BF16 or native MXFP8 owner weights into destination virtual slots.
+
+    ``sources`` and ``scale_sources`` are ``int64`` pointer tables with one FC1
+    or FC2 member base per local expert; ``peer_bases`` and ``signal_bases`` are
+    the raw device addresses a symmetric-memory handle exposes. A ``uint8``
+    arena selects the MXFP8 layout and requires the matching orientation's
+    scale tables.
+    """
+    _validate_transport_shape(world_size, num_local_experts, num_sms)
+    mxfp8 = arena.dtype == torch.uint8
+    if not mxfp8 and arena.dtype != torch.bfloat16:
+        raise ValueError(f"Replica weight arena must be uint8 or bfloat16, got {arena.dtype}.")
+    if mxfp8 != (scale_sources is not None):
+        raise ValueError("Replica MXFP8 weights require scale tables; BF16 weights forbid them.")
+    tables = [_pointer_table(table, num_local_experts) for table in sources]
+    tables += [_pointer_table(table, num_local_experts) for table in scale_sources or tables]
+    with _DescriptorAllocator(arena.device.index):
+        _replica_weight_push_kernel[(num_sms,)](
+            *tables,
+            int(peer_bases),
+            int(signal_bases),
+            experts_to_copy,
+            grid_barrier,
+            _barrier_scratch(arena.device.index),
+            rank,
+            **_push_arguments(
                 member_numels,
-                grad_dtype,
+                mxfp8=mxfp8,
                 world_size=world_size,
                 num_local_experts=num_local_experts,
                 num_sms=num_sms,
             ),
         )
-    compile_replica_weight_push(
-        world_size=world_size,
-        num_local_experts=num_local_experts,
-        member_numels=member_numels,
-        num_sms=num_sms,
-        device_index=device_index,
-        rowwise_scale_numels=rowwise_scale_numels,
-        columnwise_scale_numels=columnwise_scale_numels,
-    )
 
 
 def launch_replica_grad_reduce(
     *,
     arena: torch.Tensor,
     native_grads: tuple[torch.Tensor, torch.Tensor],
-    peer_bases: torch.Tensor,
-    signal_bases: torch.Tensor,
+    peer_bases: int,
+    signal_bases: int,
     experts_to_copy: torch.Tensor,
     grid_barrier: torch.Tensor,
     rank: int,
@@ -1485,29 +1234,27 @@ def launch_replica_grad_reduce(
     member_numels: tuple[int, int],
     num_sms: int,
 ) -> None:
-    """Accumulate virtual gradients into native wgrad staging and clear used slots."""
-    device_index = arena.device.index
-    if device_index is None:
-        raise ValueError("Replica gradient arena must be a CUDA tensor.")
+    """Accumulate every peer's replica gradients into native wgrad staging.
+
+    ``native_grads`` are ``int64`` pointer tables with one FC1 or FC2 staging
+    base per local expert. Used replica slots are left holding their partials;
+    the next wgrad GEMM overwrites them.
+    """
     _validate_transport_shape(world_size, num_local_experts, num_sms)
     _validate_grad_dtype(arena.dtype)
-    tables = [
-        as_pointer_table(native_grad, num_local_experts, dtype=arena.dtype)
-        for native_grad in native_grads
-    ]
+    device_index = arena.device.index
     with _DescriptorAllocator(device_index):
         _replica_grad_reduce_kernel[(num_sms,)](
             arena,
-            tables[0],
-            tables[1],
-            _address(peer_bases),
-            _address(signal_bases),
+            *(_pointer_table(table, num_local_experts) for table in native_grads),
+            int(peer_bases),
+            int(signal_bases),
             experts_to_copy,
             _source_scratch(device_index, (world_size + 1) * num_local_experts + 1),
             grid_barrier,
             _barrier_scratch(device_index),
             rank,
-            **_grad_launch_arguments(
+            **_grad_arguments(
                 member_numels,
                 arena.dtype,
                 world_size=world_size,

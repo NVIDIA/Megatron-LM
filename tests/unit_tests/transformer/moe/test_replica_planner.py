@@ -12,11 +12,11 @@ import torch.nn.functional as F
 from megatron.core.activations import squared_relu
 from megatron.core.transformer.moe import fused_a2a
 from megatron.core.transformer.moe.replica_planner import (
-    ReplicaCuTeDSLWeightBridge,
     ReplicaPlan,
+    ReplicaWeightBridge,
     _collect_replica_projection_specs,
-    _CuTeDSLReplicaProjection,
     _DirectionalBinding,
+    _ReplicaProjection,
     _WeightDirection,
     map_replica_plan_to_hybridep,
     start_replica_grad_reduce_after_expert_backward,
@@ -45,7 +45,7 @@ def test_replica_hybridep_rank_layout_requires_equal_shapes(monkeypatch):
 @pytest.mark.parametrize(
     ("grad_reduce_in_bf16", "expected_grad_dtype"), [(False, torch.float32), (True, torch.bfloat16)]
 )
-def test_replica_hybridep_binds_the_cutedsl_bridge(
+def test_replica_hybridep_binds_the_weight_bridge(
     monkeypatch, grad_reduce_in_bf16, expected_grad_dtype
 ):
     from megatron.core.transformer.moe import token_dispatcher
@@ -62,7 +62,7 @@ def test_replica_hybridep_binds_the_cutedsl_bridge(
         def set_replica_weight_bridge(self, value):
             self.bound_bridge = value
 
-    monkeypatch.setattr(token_dispatcher, "ReplicaCuTeDSLWeightBridge", fake_bridge)
+    monkeypatch.setattr(token_dispatcher, "ReplicaWeightBridge", fake_bridge)
     manager = _ReplicaHybridEPManager.__new__(_ReplicaHybridEPManager)
     manager.group = object()
     manager.semantic_num_experts = 8
@@ -84,6 +84,7 @@ def test_replica_hybridep_binds_the_cutedsl_bridge(
     assert captured["grad_dtype"] == expected_grad_dtype
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_replica_hybridep_metadata_uses_routing_map_for_zero_probability_routes():
     """A selected zero-probability expert must not be replaced by a tied zero."""
     from megatron.core.transformer.moe.token_dispatcher import _ReplicaHybridEPManager
@@ -91,14 +92,20 @@ def test_replica_hybridep_metadata_uses_routing_map_for_zero_probability_routes(
     manager = _ReplicaHybridEPManager.__new__(_ReplicaHybridEPManager)
     manager.semantic_num_experts = 4
     manager.router_topk = 2
-    routing_map = torch.tensor([[False, True, False, True], [True, False, True, False]])
-    probs = torch.tensor([[0.0, 0.75, 0.0, 0.0], [0.6, 0.0, 0.4, 0.0]], requires_grad=True)
+    routing_map = torch.tensor(
+        [[False, True, False, True], [True, False, True, False]], device="cuda"
+    )
+    probs = torch.tensor(
+        [[0.0, 0.75, 0.0, 0.0], [0.6, 0.0, 0.4, 0.0]], device="cuda", requires_grad=True
+    )
 
     manager.setup_metadata(routing_map, probs)
 
     actual_routes = [set(row) for row in manager.semantic_token_indices.tolist()]
     assert actual_routes == [{1, 3}, {0, 2}]
-    torch.testing.assert_close(manager.semantic_token_probs.sum(dim=-1), torch.tensor([0.75, 1.0]))
+    torch.testing.assert_close(
+        manager.semantic_token_probs.sum(dim=-1), torch.tensor([0.75, 1.0], device="cuda")
+    )
     manager.semantic_token_probs.sum().backward()
     torch.testing.assert_close(probs.grad, routing_map.to(probs.dtype))
 
@@ -138,7 +145,7 @@ def test_replica_weight_bridge_rejects_single_grouped_source_weights():
 
     with pytest.raises(ValueError, match="moe_single_grouped_weight must be False"):
         _collect_replica_projection_specs(
-            experts, num_local_experts=2, backend_name="Replica-CuTeDSL"
+            experts, num_local_experts=2, backend_name="Replica-HybridEP"
         )
 
 
@@ -147,10 +154,7 @@ def test_replica_async_collectives_span_transport_backward():
     plan = object()
 
     class FakeBridge:
-        source_parameters = (
-            torch.nn.Parameter(torch.ones(())),
-            torch.nn.Parameter(torch.ones(())),
-        )
+        source_parameters = (torch.nn.Parameter(torch.ones(())), torch.nn.Parameter(torch.ones(())))
 
         def __init__(self):
             self.source_grads = tuple(
@@ -252,8 +256,7 @@ def test_replica_planner_slots_preserve_two_outstanding_forwards(monkeypatch):
                 (kwargs["num_tokens"], kwargs["router_topk"]), dtype=torch.int64
             ),
             experts_to_copy=torch.empty(
-                (kwargs["ep_size"], kwargs["num_experts"] // kwargs["ep_size"]),
-                dtype=torch.int32,
+                (kwargs["ep_size"], kwargs["num_experts"] // kwargs["ep_size"]), dtype=torch.int32
             ),
         )
         allocated.append(workspace)
@@ -296,7 +299,6 @@ def test_replica_planner_slots_preserve_two_outstanding_forwards(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
     manager = _ReplicaHybridEPManager.__new__(_ReplicaHybridEPManager)
-    manager._replica_backend_name = "Replica-HybridEP"
     manager.semantic_num_experts = 2
     manager.semantic_token_indices = torch.zeros((2, 1), dtype=torch.int32)
     manager.semantic_tokens_per_expert = torch.tensor([2, 0], dtype=torch.int32)
@@ -331,9 +333,7 @@ def test_replica_planner_slots_preserve_two_outstanding_forwards(monkeypatch):
     torch.stack(retained_outputs).sum().backward()
 
     assert not any(slot.in_use for slot in manager._replica_plan_slots)
-    assert {id(plan) for plan in manager._bridge.reduced} == {
-        id(plan) for plan in retained_plans
-    }
+    assert {id(plan) for plan in manager._bridge.reduced} == {id(plan) for plan in retained_plans}
 
 
 def _set_main_grad(parameter, dtype=torch.float32):
@@ -345,11 +345,7 @@ def _set_main_grad(parameter, dtype=torch.float32):
 def _test_directional_binding(device, num_experts, components=0):
     return _DirectionalBinding(
         torch.empty(num_experts, dtype=torch.int64, device=device),
-        (
-            torch.empty(num_experts, dtype=torch.int64, device=device)
-            if components == 2
-            else None
-        ),
+        (torch.empty(num_experts, dtype=torch.int64, device=device) if components == 2 else None),
         host_pointer_table=(
             torch.empty((components, num_experts), dtype=torch.int64, pin_memory=True)
             if components
@@ -376,11 +372,9 @@ def _test_projection(
     native_grad = (
         gtp_native_grad
         if gtp_native_grad is not None
-        else torch.empty(
-            (len(parameters), *member_shape), dtype=virtual_grad.dtype, device=device
-        )
+        else torch.empty((len(parameters), *member_shape), dtype=virtual_grad.dtype, device=device)
     )
-    return _CuTeDSLReplicaProjection(
+    return _ReplicaProjection(
         name="test projection",
         device=device,
         weight_format=weight_format,
@@ -391,14 +385,12 @@ def _test_projection(
         backward=backward,
         native_grad_bases=torch.empty(len(parameters), dtype=torch.int64, device=device),
         member_shape=member_shape,
-        member_numel=member_shape[0] * member_shape[1],
         rowwise_scale_shape=scale_shape,
         columnwise_scale_shape=scale_shape,
         virtual_weight=virtual_weight,
         virtual_grad=virtual_grad,
         native_grad=native_grad,
         runtime_parameters=runtime_parameters,
-        runtime_bound=runtime_parameters is not None,
     )
 
 
@@ -448,7 +440,7 @@ def test_replica_native_grad_table_ignores_transient_gtp_buffers_during_capture(
         backward=backward,
         runtime_parameters=tuple(runtime_parameters),
     )
-    bridge = ReplicaCuTeDSLWeightBridge.__new__(ReplicaCuTeDSLWeightBridge)
+    bridge = ReplicaWeightBridge.__new__(ReplicaWeightBridge)
     bridge.device = device
     bridge.num_local_experts = num_local_experts
     bridge.projections = [projection]
@@ -459,9 +451,7 @@ def test_replica_native_grad_table_ignores_transient_gtp_buffers_during_capture(
     assert projection.native_grad_ptrs == stable_ptrs
     # Model the eager/captured GTP buffers that previously replaced the stable
     # destination table. The bridge must not consult them during forward capture.
-    projection.gtp_leader.gtp_wgrad_tensors = tuple(
-        torch.empty_like(grad) for grad in native_grad
-    )
+    projection.gtp_leader.gtp_wgrad_tensors = tuple(torch.empty_like(grad) for grad in native_grad)
     capture_probe = torch.zeros(1, dtype=torch.int32, device=device)
     torch.cuda.synchronize(device)
     graph = torch.cuda.CUDAGraph()
@@ -509,9 +499,7 @@ def test_replica_gtp_bf16_weights_bind_directional_stable_buffers():
         forward=forward,
         backward=backward,
         virtual_weight=(),
-        virtual_grad=torch.empty(
-            (0, *member_shape), dtype=torch.float32, device=device
-        ),
+        virtual_grad=torch.empty((0, *member_shape), dtype=torch.float32, device=device),
         runtime_parameters=runtime_parameters,
     )
 
@@ -542,9 +530,7 @@ def test_replica_gtp_bf16_weights_bind_directional_stable_buffers():
     replacement = list(forward_weights)
     replacement[0] = torch.empty_like(replacement[0])
     with pytest.raises(RuntimeError, match="forward all-gather storage changed"):
-        projection.bind_materialized_weights(
-            tuple(replacement), _WeightDirection.FORWARD
-        )
+        projection.bind_materialized_weights(tuple(replacement), _WeightDirection.FORWARD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Replica weights require CUDA")
@@ -576,7 +562,7 @@ def test_replica_bf16_runtime_over_64_experts_remains_discrete():
         forward=binding,
         backward=binding,
     )
-    bridge = ReplicaCuTeDSLWeightBridge.__new__(ReplicaCuTeDSLWeightBridge)
+    bridge = ReplicaWeightBridge.__new__(ReplicaWeightBridge)
     bridge.device = device
     bridge.num_local_experts = num_local_experts
     bridge.num_runtime_experts = 2 * num_local_experts
@@ -626,9 +612,7 @@ def test_replica_gtp_mxfp8_weights_bind_directly_during_capture():
         parameters=destinations,
         source_tensors=destinations,
         virtual_weight=(),
-        virtual_grad=torch.empty(
-            (0, *member_shape), dtype=torch.float32, device=device
-        ),
+        virtual_grad=torch.empty((0, *member_shape), dtype=torch.float32, device=device),
         member_shape=member_shape,
         forward=forward,
         backward=backward,
@@ -672,9 +656,7 @@ def test_replica_gtp_mxfp8_weights_bind_directly_during_capture():
     replacement = list(materialized)
     replacement[0] = make_weight()
     with pytest.raises(RuntimeError, match="all-gather storage changed"):
-        projection.bind_materialized_weights(
-            tuple(replacement), _WeightDirection.FORWARD
-        )
+        projection.bind_materialized_weights(tuple(replacement), _WeightDirection.FORWARD)
 
 
 def _set_main_grads(layer, dtype=torch.float32):
@@ -883,7 +865,9 @@ def _run_replica_hybridep_full_layer_parity(
                 assert bridge.workspace.weight_handle is not None
                 for projection in bridge.projections:
                     for virtual in projection.virtual_weight:
-                        assert virtual._rowwise_data.data_ptr() == virtual._columnwise_data.data_ptr()
+                        assert (
+                            virtual._rowwise_data.data_ptr() == virtual._columnwise_data.data_ptr()
+                        )
             if gtp and mxfp8:
                 # GTP gather outputs replace these aliases before execution; no
                 # second full native row/column staging allocation is retained.
@@ -1032,14 +1016,6 @@ def _run_replica_hybridep_full_layer_parity(
             active_replica = torch.any(bridge.last_plan.experts_to_copy >= 0).to(torch.int32)
             torch.distributed.all_reduce(active_replica, op=torch.distributed.ReduceOp.MAX)
             assert active_replica.item(), "HybridEP parity must exercise an active replica"
-        if backend.startswith("replica_") and not mxfp8:
-            for projection in bridge.projections:
-                torch.testing.assert_close(
-                    projection.virtual_grad,
-                    torch.zeros_like(projection.virtual_grad),
-                    rtol=0,
-                    atol=0,
-                )
         value_names = ["output", "input grad", "router grad", "FC1 main_grad", "FC2 main_grad"]
         if moe_latent_size is not None:
             value_names.extend(["latent FC1 main_grad", "latent FC2 main_grad"])
@@ -1151,11 +1127,6 @@ def _run_replica_hybridep_full_layer_parity(
             # rank has validated the old contents before any rank starts the refresh.
             torch.distributed.barrier(group=bridge.group)
             plan_snapshot = plan.experts_to_copy.clone()
-            # The normal training path may cache this exact plan in the shared
-            # workspace.  Evict that cache here so this check exercises an
-            # actual refresh from the modified optimizer-owned weights.
-            bridge.workspace.resident_bridge = None
-            bridge.workspace.resident_plan = None
             bridge.start_prefetch(plan)
             bridge.wait_prefetch(plan)
             torch.testing.assert_close(
@@ -1230,9 +1201,7 @@ def _run_replica_hybridep_repeated_mtp_parity(monkeypatch):
     monkeypatch.setenv("NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP", "1")
     monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "0")
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        expert_model_parallel_size=4,
-        expert_tensor_parallel_size=1,
+        tensor_model_parallel_size=1, expert_model_parallel_size=4, expert_tensor_parallel_size=1
     )
     model_parallel_cuda_manual_seed(1234)
     torch.manual_seed(1234)
@@ -1269,18 +1238,12 @@ def _run_replica_hybridep_repeated_mtp_parity(monkeypatch):
         "calculate_per_token_loss": True,
     }
     reference_config = TransformerConfig(
-        **common,
-        moe_token_dispatcher_type="flex",
-        moe_flex_dispatcher_backend="hybridep",
+        **common, moe_token_dispatcher_type="flex", moe_flex_dispatcher_backend="hybridep"
     )
     replica_config = TransformerConfig(
-        **common,
-        moe_token_dispatcher_type="flex",
-        moe_flex_dispatcher_backend="replica_hybridep",
+        **common, moe_token_dispatcher_type="flex", moe_flex_dispatcher_backend="replica_hybridep"
     )
-    layer_spec = get_gpt_layer_with_transformer_engine_spec(
-        num_experts=4, moe_grouped_gemm=True
-    )
+    layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=4, moe_grouped_gemm=True)
 
     def build_model(config):
         return GPTModel(
@@ -1291,9 +1254,7 @@ def _run_replica_hybridep_repeated_mtp_parity(monkeypatch):
             pre_process=True,
             post_process=True,
             share_embeddings_and_output_weights=False,
-            mtp_block_spec=get_gpt_mtp_block_spec(
-                config, layer_spec, use_transformer_engine=True
-            ),
+            mtp_block_spec=get_gpt_mtp_block_spec(config, layer_spec, use_transformer_engine=True),
         ).cuda()
 
     def initialize_main_grads(model):
@@ -1309,9 +1270,7 @@ def _run_replica_hybridep_repeated_mtp_parity(monkeypatch):
     def snapshot_gradients(model):
         snapshot = {}
         for name, parameter in model.named_parameters():
-            accumulated_in_main_grad = bool(
-                getattr(parameter, "grad_added_to_main_grad", False)
-            )
+            accumulated_in_main_grad = bool(getattr(parameter, "grad_added_to_main_grad", False))
             snapshot[name] = (
                 (
                     parameter.grad.detach().clone()
@@ -1326,9 +1285,7 @@ def _run_replica_hybridep_repeated_mtp_parity(monkeypatch):
     batch = 2
     sequence = 8
     generator = torch.Generator(device="cuda").manual_seed(5678)
-    input_ids = torch.randint(
-        0, 128, (batch, sequence), generator=generator, device="cuda"
-    )
+    input_ids = torch.randint(0, 128, (batch, sequence), generator=generator, device="cuda")
     labels = torch.randint(0, 128, (batch, sequence), generator=generator, device="cuda")
     position_ids = torch.arange(sequence, device="cuda").unsqueeze(0).expand(batch, -1)
     loss_mask = torch.ones((batch, sequence), device="cuda")
@@ -1345,11 +1302,7 @@ def _run_replica_hybridep_repeated_mtp_parity(monkeypatch):
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             reference_loss = reference_model(
-                input_ids,
-                position_ids,
-                attention_mask=None,
-                labels=labels,
-                loss_mask=loss_mask,
+                input_ids, position_ids, attention_mask=None, labels=labels, loss_mask=loss_mask
             )
         reference_loss.sum().backward()
         reference_gradients = snapshot_gradients(reference_model)
@@ -1363,11 +1316,7 @@ def _run_replica_hybridep_repeated_mtp_parity(monkeypatch):
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             replica_loss = replica_model(
-                input_ids,
-                position_ids,
-                attention_mask=None,
-                labels=labels,
-                loss_mask=loss_mask,
+                input_ids, position_ids, attention_mask=None, labels=labels, loss_mask=loss_mask
             )
 
         mtp_moe_layers = [
@@ -1380,8 +1329,7 @@ def _run_replica_hybridep_repeated_mtp_parity(monkeypatch):
         assert len(manager._replica_plan_slots) == 2
         assert all(slot.in_use and slot.plan is not None for slot in manager._replica_plan_slots)
         assert (
-            manager._replica_plan_slots[0].workspace
-            is not manager._replica_plan_slots[1].workspace
+            manager._replica_plan_slots[0].workspace is not manager._replica_plan_slots[1].workspace
         )
         assert (
             manager._replica_plan_slots[0].plan.virtual_experts.data_ptr()
