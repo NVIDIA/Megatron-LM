@@ -232,11 +232,7 @@ def test_from_local_reuses_required_local_buffer(distributed_setup):
     local_buffer = replicated_buffer.local_buffer.narrow(0, offset, local_numel)
 
     sharded_buffer = DBuffer.from_local(
-        local_buffer,
-        mesh,
-        iter([Flat()]),
-        replicated_buffer.layout.tensor_shapes,
-        allocation_stream=replicated_buffer.allocation_stream,
+        local_buffer, mesh, [Flat()], replicated_buffer.layout.tensor_shapes
     )
 
     assert sharded_buffer.placements == (Flat(),)
@@ -392,10 +388,7 @@ def test_partial_allreduce(distributed_setup):
         torch.full((5, 3), scale_sum, dtype=torch.float32, device=distributed_setup.device),
         torch.full((4,), scale_sum * 10, dtype=torch.float32, device=distributed_setup.device),
     ]
-    assert (
-        replicated_buffer.local_buffer.untyped_storage().data_ptr()
-        == partial_buffer.local_buffer.untyped_storage().data_ptr()
-    )
+    assert replicated_buffer.local_buffer.data_ptr() == partial_buffer.local_buffer.data_ptr()
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
 
 
@@ -446,8 +439,8 @@ def test_partial_reduce_scatter_to_flat(distributed_setup):
     assert sharded_buffer.placements == (Flat(),)
     assert sharded_buffer.layout == layout
     assert (
-        sharded_buffer.local_buffer.untyped_storage().data_ptr()
-        == partial_buffer.local_buffer.untyped_storage().data_ptr()
+        sharded_buffer.local_buffer.untyped_storage()
+        is partial_buffer.local_buffer.untyped_storage()
     )
     assert replicated_buffer.layout == layout
     scale_sum = float(distributed_setup.world_size * (distributed_setup.world_size + 1) // 2)
