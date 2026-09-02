@@ -209,6 +209,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_hybridep_num_sms_preprocessing": 108,
     "moe_hybridep_num_blocks_permute": None,
     "moe_hybridep_num_blocks_unpermute": None,
+    "moe_hybridep_routing_map_mode": "indices",
     "moe_input_jitter_eps": None,
     "moe_latent_size": None,
     "moe_layer_freq": 1,
