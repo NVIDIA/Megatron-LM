@@ -86,13 +86,13 @@ except ImportError:
         HAVE_TE = False
 
 def _get_te_linear_attention() -> type[torch.nn.Module] | None:
-    """Return TE's LinearAttention (Gated DeltaNet) module, if available."""
+    """Return TE's GatedDeltaNetAttention (Gated DeltaNet) module, if available."""
     if not HAVE_TE:
         return None
     try:
         te_pytorch = importlib.import_module("transformer_engine.pytorch")
         importlib.import_module("transformer_engine.pytorch.attention.linear_attention.gdn")
-        return te_pytorch.LinearAttention
+        return te_pytorch.GatedDeltaNetAttention
     except (AttributeError, ImportError):
         return None
 
@@ -2088,7 +2088,7 @@ class TERowParallelLinear(TELinear):
 
 
 class TEGatedDeltaNetAttention(torch.nn.Module):
-    """Adapt Megatron GDN kernel inputs to Transformer Engine's LinearAttention."""
+    """Adapt Megatron GDN kernel inputs to Transformer Engine's GatedDeltaNetAttention."""
 
     def __init__(
         self,
@@ -2099,7 +2099,7 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
     ) -> None:
         super().__init__()
         if not HAVE_TE_GDN:
-            raise ImportError("Transformer Engine LinearAttention (GDN) is not available.")
+            raise ImportError("Transformer Engine GatedDeltaNetAttention (GDN) is not available.")
         assert _TE_LINEAR_ATTENTION is not None
         self.value_head_dim = value_head_dim
         self.te_attention = _TE_LINEAR_ATTENTION(

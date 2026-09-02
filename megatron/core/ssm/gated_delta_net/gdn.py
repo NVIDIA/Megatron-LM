@@ -88,7 +88,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         if not HAVE_TE_GDN:
             raise ImportError(
                 "gdn_kernel_backend='transformer_engine' requires TransformerEngine's "
-                "LinearAttention (GDN) support."
+                "GatedDeltaNetAttention (GDN) support."
             )
 
         # Q/K are expanded to the value-head count by

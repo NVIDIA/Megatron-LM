@@ -530,7 +530,7 @@ class _GDNBase(MegatronModule):
                 )
             elif name == "core_attention":
                 # The TE backend adds a parameter-free TEGatedDeltaNetAttention wrapper around
-                # LinearAttention solely as a kernel adapter. Its TE runtime/extra state is
+                # GatedDeltaNetAttention solely as a kernel adapter. Its TE runtime/extra state is
                 # not part of the learned GDN state and has no FLA counterpart, so omit it to
                 # keep checkpoints portable between the TransformerEngine and FLA backends.
                 continue

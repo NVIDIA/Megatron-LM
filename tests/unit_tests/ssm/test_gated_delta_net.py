@@ -106,12 +106,12 @@ def test_gdn_rejects_unavailable_explicit_te_backend(monkeypatch):
     monkeypatch.setattr(gdn_module, "HAVE_TE_GDN", False)
     gdn = _make_gdn_variant_stub("transformer_engine")
 
-    with pytest.raises(ImportError, match="requires TransformerEngine's LinearAttention"):
+    with pytest.raises(ImportError, match="requires TransformerEngine's GatedDeltaNetAttention"):
         GatedDeltaNet._setup_variant_attrs(gdn)
 
 
 def test_gdn_selects_te_backend(monkeypatch):
-    """An explicit TE selection constructs the LinearAttention (GDN) adapter."""
+    """An explicit TE selection constructs the GatedDeltaNetAttention (GDN) adapter."""
 
     class FakeTEGatedDeltaNetAttention:
         def __init__(self, **kwargs):
