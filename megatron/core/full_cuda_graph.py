@@ -1,13 +1,15 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Full iteration CUDA graph for training."""
 
 import gc
 import logging
+from contextlib import nullcontext
 
 import torch
 
 from megatron.core.tensor_parallel.random import get_all_rng_states
+from megatron.core.utils import get_model_config
 
 logger = logging.getLogger(__name__)
 
@@ -240,15 +242,26 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
-            with torch.cuda.graph(
-                FullCudaGraphWrapper.cuda_graph[training_str],
-                stream=capture_stream,
-                pool=get_graph_pool(self.use_single_mempool),
-                capture_error_mode="thread_local",
-            ):
-                FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
-                    *args, **kwargs
+            capture_scope = nullcontext()
+            config = get_model_config(model[0] if isinstance(model, list) else model)
+            if getattr(config, 'fine_grained_activation_offloading', False):
+                from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                    FineGrainedActivationOffloadingInterface as off_interface,
                 )
+
+                # Forward and backward are captured into one graph, so every
+                # max-inflight dependency inside this body is capture-local.
+                capture_scope = off_interface.cuda_graph_capture_scope(may_cross_graphs=False)
+            with capture_scope:
+                with torch.cuda.graph(
+                    FullCudaGraphWrapper.cuda_graph[training_str],
+                    stream=capture_stream,
+                    pool=get_graph_pool(self.use_single_mempool),
+                    capture_error_mode="thread_local",
+                ):
+                    FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
+                        *args, **kwargs
+                    )
             torch.cuda.synchronize()
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')

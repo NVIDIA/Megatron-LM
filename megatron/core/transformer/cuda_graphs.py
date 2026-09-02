@@ -964,12 +964,20 @@ class _CudaGraphRunner(torch.nn.Module):
                 if FREEZE_GC:
                     gc.freeze()
 
-                with torch.cuda.graph(
-                    self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
-                ):
-                    fwd_graph_outputs = self.func(
-                        *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
+                capture_scope = nullcontext()
+                if self.base_module.config.fine_grained_activation_offloading:
+                    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                        FineGrainedActivationOffloadingInterface as off_interface,
                     )
+
+                    capture_scope = off_interface.cuda_graph_capture_scope(may_cross_graphs=True)
+                with capture_scope:
+                    with torch.cuda.graph(
+                        self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                    ):
+                        fwd_graph_outputs = self.func(
+                            *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
+                        )
 
                 # Unfreeze GC.
                 if FREEZE_GC:

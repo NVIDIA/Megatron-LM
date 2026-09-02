@@ -437,6 +437,16 @@ class GraphableMegatronModule(MegatronModule):
             if not self.cuda_graphs:
                 # Do CUDA Graphs capture.
                 cuda_graph_func = self._te_cuda_graph_capture
+                if self.config.fine_grained_activation_offloading:
+                    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                        FineGrainedActivationOffloadingInterface as off_interface,
+                    )
+
+                    # Each top-level TE callable is captured independently. Nested
+                    # graphable modules reuse this owner rather than pretending to
+                    # be a separate graph.
+                    with off_interface.cuda_graph_capture_scope(may_cross_graphs=True):
+                        return cuda_graph_func(*args, **kwargs)
             else:
                 # Do CUDA Graphs replay.
                 cuda_graph_func = self._te_cuda_graph_replay
