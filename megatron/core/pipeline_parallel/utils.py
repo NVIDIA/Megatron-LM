@@ -226,7 +226,7 @@ class ScheduleNode:
         lifetime_inputs = (
             self.get_lifetime_inputs(inputs) if self.lifetime_manager is not None else inputs
         )
-        with self.stream_acquire_context(node_name) as acquire_token:
+        with self.stream_acquire_context(node_name):
             self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
             for i, input in enumerate(self.inputs):
                 if input is not None:
@@ -248,7 +248,6 @@ class ScheduleNode:
             self.output = data
 
         if self.lifetime_manager is not None:
-            assert acquire_token.completion_generation is not None
             if self.free_input:
                 self.lifetime_manager.retire_and_publish(
                     lifetime_inputs,
@@ -256,15 +255,10 @@ class ScheduleNode:
                     action=ReleaseAction.EMPTY_STORAGE,
                     producer_stream=self.stream,
                     consumer_stream=self.stream,
-                    consumer_generation=acquire_token.completion_generation,
                     node=node_name,
                 )
             else:
-                # These inputs remain protected by the node's autograd state, so only
-                # transfer their leases to the outputs; do not retire their storage.
-                self.lifetime_manager.consume_and_publish(
-                    lifetime_inputs, self.output, producer_stream=self.stream, node=node_name
-                )
+                self.lifetime_manager.publish(lifetime_inputs, self.output, self.stream)
         elif self.free_input:
             # Immediately frees input tensors after they are used for nodes
             # where inputs are no longer needed after computation.
@@ -300,7 +294,7 @@ class ScheduleNode:
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
         node_name = self.backward_nvtx_name
-        with self.stream_acquire_context(node_name) as acquire_token:
+        with self.stream_acquire_context(node_name):
             outputs = self.output
             if not isinstance(outputs, tuple):
                 outputs = (outputs,)
@@ -309,20 +303,16 @@ class ScheduleNode:
                 f"{len(output_grad)} of {type(output_grad[0])}"
             )
             consumed_grads = self.backward_func(outputs, output_grad)
-            if self.lifetime_manager is not None:
-                self.lifetime_manager.publish_dirty_detached_grads(self.stream, node_name)
 
         grads = self.get_grad()
 
         if self.lifetime_manager is not None:
-            assert acquire_token.completion_generation is not None
             self.lifetime_manager.retire_and_publish(
                 consumed_grads,
                 grads,
                 action=ReleaseAction.DROP_REFERENCE,
                 producer_stream=self.stream,
                 consumer_stream=self.stream,
-                consumer_generation=acquire_token.completion_generation,
                 node=node_name,
             )
         elif consumed_grads:
@@ -356,23 +346,20 @@ class ScheduleNode:
         Args:
             name: Optional name for NVTX range profiling
         """
-        acquire_token = None
-        if self.lifetime_manager is not None:
-            acquire_token = self.lifetime_manager.acquire(self.stream, name or self.name)
-        else:
-            self.event.wait(self.stream)
+        self.event.wait(self.stream)
         if name:
             nvtx_range_push(name)
         try:
             with torch.cuda.stream(self.stream):
-                yield acquire_token
+                # The wait above transfers every previously consumed tensor owned by
+                # this plan back to its creation stream before storage becomes reusable.
+                if self.lifetime_manager is not None:
+                    self.lifetime_manager.drain(self.stream, name or self.name)
+                yield
         finally:
             if name:
                 nvtx_range_pop(name)
-            if self.lifetime_manager is not None:
-                self.lifetime_manager.record(self.stream, acquire_token)
-            else:
-                self.event.record(self.stream)
+            self.event.record(self.stream)
 
     def _release_state(self):
         """Clear the state of the node"""

@@ -191,7 +191,6 @@ class TestPartialCudaGraphedA2AOverlap:
             TransformerModelChunkSchedulePlan,
         )
         from megatron.core.pipeline_parallel.schedules import set_current_microbatch
-        from megatron.core.pipeline_parallel.tensor_lifetime import register_external_tensor
 
         schedule_plans = []
         losses = []
@@ -221,16 +220,10 @@ class TestPartialCudaGraphedA2AOverlap:
                 if b_schedule_plan is not None:
                     gpt_model[0].zero_grad_buffer()
                     optimizer.zero_grad()
-                b_grad = torch.ones_like(output) if fwd_mb_idx > 0 else None
-                if (
-                    b_grad is not None
-                    and gpt_model[0].config.ep_overlap_use_scheduled_tensor_lifetime
-                ):
-                    register_external_tensor(
-                        b_grad, torch.cuda.current_stream(), "CUDA graph test gradient"
-                    )
                 output = TransformerModelChunkSchedulePlan.run(
-                    f_schedule_plan, b_schedule_plan, b_grad=b_grad
+                    f_schedule_plan,
+                    b_schedule_plan,
+                    b_grad=torch.ones_like(output) if fwd_mb_idx > 0 else None,
                 )
             # Check output shapes
             if fwd_mb_idx < num_iters:
