@@ -70,6 +70,10 @@ class Router(ABC, MegatronModule):
             )
         else:
             self.bias = None
+        if self.config.moe_router_skip_muon:
+            setattr(self.weight, 'use_muon', False)
+            if self.bias is not None:
+                setattr(self.bias, 'use_muon', False)
         # If calculate per token loss, we need to scale up moe aux loss by the number of tokens.
         # So we need to know if the model is configured to calculate per token loss.
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
@@ -645,9 +649,9 @@ class TopKRouter(Router):
 
         Args:
             logits (torch.Tensor): The logits of the router.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape in [num_tokens]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                                   Shape [num_tokens]. True = padding,
+                                                   False = valid. Defaults to None.
 
         Returns:
             torch.Tensor: The logits after applying the z-loss.
@@ -678,6 +682,8 @@ class TopKRouter(Router):
             else:
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
 
+            # TODO: repeated-MTP z_loss is scaled after MoEAuxLossAutoScaler.apply(), so this
+            # adjusts logging only; move the scaling above the attach point if z_loss is used.
             # When using repeated MTP layers, the same MTP layer is called mtp_num_layers times.
             # To avoid accumulating the z_loss multiple times, we scale it by 1/mtp_num_layers
             # so the total loss is correct.
@@ -738,7 +744,7 @@ class TopKRouter(Router):
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
                 if padding_mask is not None:
-                    routing_map = routing_map & (~padding_mask)
+                    routing_map = routing_map & (~padding_mask).unsqueeze(-1)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
@@ -746,9 +752,9 @@ class TopKRouter(Router):
 
         Args:
             logits (torch.Tensor): Logits tensor after gating.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                                   Shape [seq_length, bsz]. True = padding,
+                                                   False = valid. Defaults to None.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -846,9 +852,9 @@ class TopKRouter(Router):
 
         Args:
             input (torch.Tensor): Input tensor.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                                   Shape [seq_length, bsz]. True = padding,
+                                                   False = valid. Defaults to None.
         """
         self._maintain_float32_expert_bias()
 
