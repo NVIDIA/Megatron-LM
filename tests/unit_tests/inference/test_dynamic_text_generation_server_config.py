@@ -33,7 +33,7 @@ class _CapturingClient:
     def __init__(self):
         self.sampling_params = []
 
-    async def add_request(self, prompt_tokens, sampling_params, *, multi_modal_data=None):
+    def add_request_with_id(self, prompt_tokens, sampling_params, *, multi_modal_data=None):
         del prompt_tokens, multi_modal_data
         self.sampling_params.append(sampling_params)
         raise RuntimeError("stop after request submission")
@@ -128,17 +128,10 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         def getsockname(self):
             return ("127.0.0.1", 4321)
 
-        def setblocking(self, blocking):
-            captured["blocking"] = blocking
-
-        def set_inheritable(self, inheritable):
-            captured["inheritable"] = inheritable
-
-        def fileno(self):
-            return 17
+        def close(self):
+            captured["socket_closed"] = True
 
     monkeypatch.setattr(server, "_SERVER_PROCESSES", [])
-    monkeypatch.setattr(server, "_SHARED_SOCKET", None)
     monkeypatch.setattr(server.mp, "Process", FakeProcess)
     monkeypatch.setattr(server, "_run_text_gen_server", fake_run_text_gen_server)
     monkeypatch.setattr(server.asyncio, "set_event_loop", lambda loop: None)
@@ -163,6 +156,8 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         eval_mode=True,
     )
 
+    # The port is taken from the socket; no fd is handed to the replica, which
+    # binds its own listener on that port.
     assert captured["run_args"] == (
         "tcp://coord:5555",
         tokenizer,
@@ -170,7 +165,6 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         4321,
         ["json"],
         True,
-        17,
         "127.0.0.1",
         "template",
         multimodal_prompt_config,
@@ -179,8 +173,7 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         5,
         True,
     )
-    assert captured["blocking"] is False
-    assert captured["inheritable"] is True
+    assert captured["socket_closed"] is True
     assert server._SERVER_PROCESSES[0].daemon is True
     assert server._SERVER_PROCESSES[0].started is True
 
@@ -207,9 +200,19 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
         captured["app"] = app
         captured["hypercorn_config"] = config
 
+    class FakeListener:
+        def fileno(self):
+            return 23
+
+        def close(self):
+            captured["listener_closed"] = True
+
     monkeypatch.setattr(server, "InferenceClient", FakeInferenceClient)
     monkeypatch.setattr(server, "serve", fake_serve)
     monkeypatch.setattr(server.endpoints, "__all__", [])
+    # Each replica binds its own listener, so leaving this unpatched would make the
+    # test take a real port and fail on whatever already holds it.
+    monkeypatch.setattr(server, "_bind_reuseport_socket", lambda _port, _host: FakeListener())
 
     tokenizer = object()
     multimodal_prompt_config = object()
@@ -242,7 +245,8 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
     assert app_config["default_top_p"] == 0.8
     assert app_config["default_top_k"] == 5
     assert app_config["eval_mode"] is True
-    assert captured["hypercorn_config"].bind == ["127.0.0.1:4321"]
+    assert captured["hypercorn_config"].bind == ["fd://23"]
+    assert captured["listener_closed"] is True
 
 
 @pytest.mark.asyncio

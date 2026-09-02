@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 
@@ -48,6 +49,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.vlm_
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer  # noqa: E402
 from megatron.core.utils import (  # noqa: E402
     configure_nvtx_profiling,
+    get_pg_size,
     trace_async_exceptions,
 )
 from megatron.inference.utils import (  # noqa: E402
@@ -81,6 +83,26 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
         nargs="+",
         default=[],
         help="Parsers to use for parsing the response",
+    )
+    parser.add_argument(
+        "--frontend-replicas",
+        type=int,
+        default=-1,
+        help="Number of HTTP frontend processes spawned per hosting rank. "
+        "-1 (default) uses max(data parallel size, 4), or a flat 4 with "
+        "--frontend-on-all-ranks, where capacity already scales with the "
+        "number of ranks hosting a frontend.",
+    )
+    parser.add_argument(
+        "--frontend-on-all-ranks",
+        action="store_true",
+        help="Run HTTP frontends on every rank instead of only rank 0, and "
+        "return every rank's URL for the caller to spread requests over. "
+        "Frontend work (chat template, detokenize, parsers, JSON) is "
+        "CPU-bound and otherwise confined to the hosting rank's CPU "
+        "allocation, which leaves the rest of the job's cores unused. "
+        "Ranks still share one DP coordinator; only the HTTP tier is "
+        "replicated.",
     )
     # NOTE: --chat-template is already declared by upstream's TrainingConfig
     # (megatron/training/config/training_config.py); we don't re-register it.
@@ -149,9 +171,9 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
     # Grow inference_config.max_sequence_length to accommodate the worst-case
     # image-expanded prompt, matching vlm_server.py's pre-engine bookkeeping.
     args.num_img_embeddings_per_tile = 0
-    if hasattr(args, "patch_dim"):
-        dynamic_res = getattr(args, "dynamic_resolution", False) and not getattr(
-            args, "use_tiling", False
+    if hasattr(args, 'patch_dim'):
+        dynamic_res = getattr(args, 'dynamic_resolution', False) and not getattr(
+            args, 'use_tiling', False
         )
         if dynamic_res:
             max_patches = getattr(args, "dynamic_resolution_max_patches", 128)
@@ -163,9 +185,7 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
                 max_img_embeddings + args.num_tokens_to_generate + 512,
             )
         else:
-            from megatron.core.models.vision.clip_vit_model import (
-                get_num_image_embeddings,
-            )
+            from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 
             args.num_img_embeddings_per_tile = get_num_image_embeddings(
                 args.img_h,
@@ -190,23 +210,19 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
 
     inference_config.image_preprocessing_config = ImageProcessingConfig(
         patch_dim=args.patch_dim,
-        dynamic_resolution=getattr(args, "dynamic_resolution", False),
-        use_tiling=getattr(args, "use_tiling", False),
-        pixel_shuffle=getattr(args, "pixel_shuffle", False),
-        spatial_merge_size=getattr(args, "spatial_merge_size", 1),
-        dynamic_resolution_min_patches=getattr(
-            args, "dynamic_resolution_min_patches", 1
-        ),
-        dynamic_resolution_max_patches=getattr(
-            args, "dynamic_resolution_max_patches", 128
-        ),
-        vision_model_type=getattr(args, "vision_model_type", "radio"),
-        pixel_mean=getattr(args, "pixel_mean", None),
-        pixel_std=getattr(args, "pixel_std", None),
-        img_h=getattr(args, "img_h", None),
-        img_w=getattr(args, "img_w", None),
-        max_num_tiles=getattr(args, "max_num_tiles", 1),
-        use_thumbnail=getattr(args, "use_thumbnail", False),
+        dynamic_resolution=getattr(args, 'dynamic_resolution', False),
+        use_tiling=getattr(args, 'use_tiling', False),
+        pixel_shuffle=getattr(args, 'pixel_shuffle', False),
+        spatial_merge_size=getattr(args, 'spatial_merge_size', 1),
+        dynamic_resolution_min_patches=getattr(args, 'dynamic_resolution_min_patches', 1),
+        dynamic_resolution_max_patches=getattr(args, 'dynamic_resolution_max_patches', 128),
+        vision_model_type=getattr(args, 'vision_model_type', 'radio'),
+        pixel_mean=getattr(args, 'pixel_mean', None),
+        pixel_std=getattr(args, 'pixel_std', None),
+        img_h=getattr(args, 'img_h', None),
+        img_w=getattr(args, 'img_w', None),
+        max_num_tiles=getattr(args, 'max_num_tiles', 1),
+        use_thumbnail=getattr(args, 'use_thumbnail', False),
         num_img_embeddings_per_tile=args.num_img_embeddings_per_tile,
     )
     inference_config.video_preprocessing_config = VideoProcessingConfig(
@@ -257,6 +273,7 @@ async def run_text_generation_server(
         eval_mode (bool): Whether to use evaluation response defaults.
     """
 
+    args = get_args()
     rank = torch.distributed.get_rank()
 
     coordinator_addr = await engine.start_listening_to_data_parallel_coordinator(
@@ -265,15 +282,41 @@ async def run_text_generation_server(
         hostname=hostname,
     )
 
+    num_replicas = getattr(args, 'frontend_replicas', -1)
+    if num_replicas < 0:
+        if getattr(args, 'frontend_on_all_ranks', False):
+            # Capacity now scales with the number of ranks, so the per-rank
+            # replica count stays flat rather than tracking DP size on top of it.
+            num_replicas = 4
+        else:
+            # Each replica is a single event loop, so frontend capacity has to scale with
+            # the number of engines it feeds. The floor of 4 preserves the previous default
+            # for small deployments.
+            num_replicas = max(get_pg_size(engine.pg_collection.dp), 4)
+    if rank == 0:
+        logging.info("Starting %d HTTP frontend replica(s) per hosting rank.", num_replicas)
+
+    if getattr(args, 'frontend_on_all_ranks', False):
+        # Only the DP coordinator rank learns the coordinator's address: the
+        # engine broadcasts it over the DP group, which is a singleton when data
+        # parallel size is 1. Every rank needs it here, since every rank's
+        # frontend opens its own client.
+        address = [coordinator_addr]
+        torch.distributed.broadcast_object_list(address, src=0)
+        coordinator_addr = address[0]
+        assert coordinator_addr is not None, "no rank published a DP coordinator address"
+
     try:
-        if rank == 0:
-            start_text_gen_server(
+        url = None
+        if getattr(args, 'frontend_on_all_ranks', False) or rank == 0:
+            url = start_text_gen_server(
                 coordinator_addr=coordinator_addr,
                 tokenizer=engine.controller.tokenizer,
                 parsers=parsers or [],
                 rank=rank,
-                server_port=server_port,
+                server_port=0 if getattr(args, 'frontend_on_all_ranks', False) else server_port,
                 verbose=verbose,
+                num_replicas=num_replicas,
                 hostname=hostname,
                 chat_template=chat_template,
                 multimodal_prompt_config=(
@@ -285,13 +328,24 @@ async def run_text_generation_server(
                 eval_mode=eval_mode,
             )
 
+        if getattr(args, 'frontend_on_all_ranks', False):
+            # Unlike callers that already collect a URL per worker, this entry
+            # point has to gather them itself before it can report the set.
+            urls = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(urls, url)
+            if rank == 0:
+                for entry in [u for u in urls if u]:
+                    logging.info("Frontend: %s", entry)
+        elif rank == 0:
+            logging.info("Frontend: %s", url)
+
         # Await the engine loop directly since the server is running in a separate process
         await engine.engine_loop_task
 
     finally:
-        # Guarantee that the separate process is terminated when the engine loop stops or is interrupted
-        if rank == 0:
-            stop_text_gen_server()
+        # Guarantee that the separate processes are terminated when the engine loop
+        # stops or is interrupted. Every rank may now own frontend processes.
+        stop_text_gen_server()
 
 
 def main(

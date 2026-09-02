@@ -139,3 +139,84 @@ async def test_add_request_with_kv_handoff_returns_future():
     assert payload[4] == {"agent": "prefill"}
     assert payload[5] == [10, 11]
     future.cancel()
+
+
+async def test_add_request_with_id_returns_the_id_abort_needs():
+    """The id handed back is the one that reaches the coordinator as ABORT_REQUEST.
+
+    A non-streaming HTTP response writes nothing to the socket while it
+    generates, so a client that disconnects mid-generation is never discovered
+    as a broken pipe. The handler has to abort explicitly, and abort_request
+    takes an id -- with only the future in hand there is nothing to name, and
+    cancelling the future alone leaves the engine generating. add_request keeps
+    returning the future alone, delegating here for the id sequence.
+    """
+    client, _, fake_socket = _make_client()
+
+    delegated = client.add_request("a", SamplingParams())
+    request_id, future = client.add_request_with_id("hello", SamplingParams())
+
+    assert isinstance(future, asyncio.Future)
+    assert request_id == 1, "add_request must consume an id from the same counter"
+    assert client.completion_futures == {0: delegated, request_id: future}
+    submitted = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
+    assert submitted[0] == Headers.SUBMIT_REQUEST.value
+    assert submitted[1] == request_id
+
+    client.abort_request(request_id)
+
+    aborted = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
+    assert aborted == [Headers.ABORT_REQUEST.value, request_id]
+    # The abort has to drop local state too, or the handler leaks a future that
+    # nothing will ever resolve.
+    assert request_id not in client.completion_futures
+    assert request_id in client.aborted_request_ids
+
+    delegated.cancel()
+
+
+def _consume_reply_for_a_completed_request(client):
+    """Submit, then stand in for _recv_task delivering the final reply."""
+    request_id, future = client.add_request_with_id("hello", SamplingParams())
+    # _recv_task pops the future from completion_futures immediately before
+    # resolving it.
+    client.completion_futures.pop(request_id)
+    future.set_result({"tokens": [1]})
+    return request_id
+
+
+def _consume_reply_for_a_finished_stream(client):
+    """Same, for the streaming path, whose AsyncStream aborts on close."""
+    stream = client.add_request_streaming("hello", SamplingParams())
+    # _recv_task pops the stream before delivering the final frame.
+    client.streams.pop(stream.request_id)
+    return stream.request_id
+
+
+@pytest.mark.parametrize(
+    "finish_request",
+    [_consume_reply_for_a_completed_request, _consume_reply_for_a_finished_stream],
+    ids=["completed_future", "finished_stream"],
+)
+async def test_abort_request_ignores_a_request_with_no_local_state(finish_request):
+    """A completed request must not be recorded in aborted_request_ids.
+
+    That set is pruned in exactly one place -- _recv_task, when an ENGINE_REPLY
+    arrives for the id. Once the reply has been consumed no further reply will
+    ever arrive, so recording the id there leaks an entry for the lifetime of
+    the process: the same unbounded growth this abort path exists to prevent,
+    moved from the engine's batch into the client. The new callers hit this
+    routinely -- gather propagates on the first failure while siblings that
+    already succeeded are aborted after completion.
+    """
+    client, _, fake_socket = _make_client()
+
+    request_id = finish_request(client)
+    fake_socket.send.reset_mock()
+
+    client.abort_request(request_id)
+
+    assert request_id not in client.aborted_request_ids
+    # The coordinator has already dropped its mapping for a finished request,
+    # so the ABORT_REQUEST send would be wasted too.
+    fake_socket.send.assert_not_called()

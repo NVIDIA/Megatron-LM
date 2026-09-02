@@ -368,16 +368,17 @@ class TestMoELayerRecompute:
         )
 
         # Create padding mask if needed: shape [batch_size, sequence_length]
+        # Convention: True = padding (exclude), False = valid (include)
         padding_mask = None
         if with_padding_mask:
-            padding_mask = torch.ones(
+            padding_mask = torch.zeros(
                 micro_batch_size,
                 sequence_length,
                 device=torch.cuda.current_device(),
                 dtype=torch.bool,
             )
             # Mark last 4 tokens as padding for each batch
-            padding_mask[:, -4:] = False
+            padding_mask[:, -4:] = True
 
         output, _ = moe_layer(hidden_states, padding_mask=padding_mask)
 
