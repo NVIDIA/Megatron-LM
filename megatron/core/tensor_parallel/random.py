@@ -61,6 +61,22 @@ void share_storage(at::Tensor dst, at::Tensor src) {
 
 _share_storage_ext = None
 
+# Set on the output StorageImpl wrapper used by CheckpointWithoutOutput.  The
+# storage-level marker is visible through aliases/views of the output tensor.
+_CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR = "_mcore_checkpoint_without_output"
+
+
+def _mark_checkpoint_without_output_tensor(tensor: torch.Tensor) -> None:
+    """Mark a tensor's storage as owned by CheckpointWithoutOutput."""
+    setattr(tensor.untyped_storage(), _CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR, True)
+
+
+def is_checkpoint_without_output_tensor(tensor: torch.Tensor) -> bool:
+    """Return whether a tensor aliases a CheckpointWithoutOutput output storage."""
+    return bool(
+        getattr(tensor.untyped_storage(), _CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR, False)
+    )
+
 
 def _get_share_storage():
     """Lazily compile & cache the share_storage extension."""
@@ -1059,6 +1075,12 @@ class CheckpointWithoutOutput(object):
             if len(self.outputs) != 1:
                 raise ValueError("mHC arena slots currently support one checkpoint output")
             self.output_slot.validate_output(self.outputs[0])
+
+        # Offload group commits can run before discard_output_and_register_recompute().
+        # Mark the output storages now so activation offload does not copy or release
+        # memory that this checkpoint owns and regenerates itself.
+        for output in self.outputs:
+            _mark_checkpoint_without_output_tensor(output)
 
         # Auto-register to manager if provided
         if self.ckpt_manager is not None:

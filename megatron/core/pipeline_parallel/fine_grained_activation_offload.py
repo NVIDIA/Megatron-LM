@@ -7,6 +7,8 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from torch.autograd.graph import saved_tensors_hooks
 
+from megatron.core.tensor_parallel.random import is_checkpoint_without_output_tensor
+
 # CPU offload implementation for pipeline parallelism
 DEBUG = False
 DEBUG_RANK = 0
@@ -987,6 +989,8 @@ class ChunkOffloadHandler:
         """Check if the tensor needs to be offloaded."""
         debug_rank("tensor_need_offloading_checker")
         if not self._can_manage_tensor_for_offload(tensor):
+            return False
+        if is_checkpoint_without_output_tensor(tensor):
             return False
         if _te_do_not_offload(tensor):
             return False
