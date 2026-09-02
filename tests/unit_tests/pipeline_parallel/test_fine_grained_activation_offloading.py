@@ -2,7 +2,6 @@
 
 import gc
 import os
-from contextlib import nullcontext
 from typing import Dict, List, Optional, Tuple
 
 import pytest

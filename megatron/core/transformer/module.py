@@ -2,6 +2,7 @@
 
 """Megatron Module."""
 
+from contextlib import nullcontext
 from functools import partial
 from typing import Optional, Tuple
 
@@ -436,11 +437,20 @@ class GraphableMegatronModule(MegatronModule):
         elif self._should_call_te_cudagraph(*args, **kwargs):
             if not self.cuda_graphs:
                 # Do CUDA Graphs capture.
-                cuda_graph_func = self._te_cuda_graph_capture
-            else:
-                # Do CUDA Graphs replay.
-                cuda_graph_func = self._te_cuda_graph_replay
-            return cuda_graph_func(*args, **kwargs)
+                capture_scope = nullcontext()
+                if self.config.fine_grained_activation_offloading:
+                    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                        FineGrainedActivationOffloadingInterface as off_interface,
+                    )
+
+                    # Each top-level TE callable is captured independently. Nested
+                    # graphable modules reuse this owner rather than pretending to
+                    # be a separate graph.
+                    capture_scope = off_interface.cuda_graph_capture_scope(may_cross_graphs=True)
+                with capture_scope:
+                    return self._te_cuda_graph_capture(*args, **kwargs)
+            # Do CUDA Graphs replay without entering a context manager on the hot path.
+            return self._te_cuda_graph_replay(*args, **kwargs)
         return super().__call__(*args, **kwargs)
 
 
