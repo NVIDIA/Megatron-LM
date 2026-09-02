@@ -81,6 +81,24 @@ def test_optimizer_checkpoint_roundtrips_rank_local_state(tmp_path) -> None:
     _assert_state_equal(optimizer.state_dict(), expected)
 
 
+def test_optimizer_checkpoint_load_uses_mmap(monkeypatch, tmp_path) -> None:
+    model = torch.nn.Linear(4, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    dcp._save_optimizer_checkpoint(optimizer, str(tmp_path))
+    original_load = dcp.torch.load
+    load_kwargs = {}
+
+    def observed_load(*args, **kwargs):
+        load_kwargs.update(kwargs)
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(dcp.torch, "load", observed_load)
+
+    dcp._load_optimizer_checkpoint(optimizer, str(tmp_path))
+
+    assert load_kwargs["mmap"] is True
+
+
 class FakeDistOpt:
     def __init__(self):
         self.save_model_sd = None

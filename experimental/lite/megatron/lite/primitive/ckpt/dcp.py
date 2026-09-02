@@ -250,7 +250,9 @@ def _load_optimizer_checkpoint(optimizer, path: str) -> None:
     load_state_dict_fn = getattr(optimizer, "load_state_dict", None)
     if not callable(load_state_dict_fn):
         raise TypeError(f"Optimizer {type(optimizer).__name__} does not provide load_state_dict().")
-    state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state = torch.load(
+        ckpt_path, map_location="cpu", weights_only=False, mmap=True
+    )
     load_state_dict_fn(state)
 
 
