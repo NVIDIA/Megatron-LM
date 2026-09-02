@@ -17,7 +17,7 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
-from .tensor_lifetime import ReleaseAction, ScheduleTensorLifetimeManager
+from .tensor_lifetime import ScheduleTensorLifetimeManager
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +161,8 @@ class ScheduleNode:
         forward_nvtx_name: Optional[str] = None,
         backward_nvtx_name: Optional[str] = None,
         lifetime_manager: Optional[ScheduleTensorLifetimeManager] = None,
+        input_owner_stream: Optional[torch.cuda.Stream] = None,
+        backward_input_owner_stream: Optional[torch.cuda.Stream] = None,
     ):
         """Initialize a schedule node.
 
@@ -183,6 +185,12 @@ class ScheduleNode:
             lifetime_manager (ScheduleTensorLifetimeManager, optional): Schedule-aware
                 owner for cross-stream tensor retirement. ``None`` preserves the
                 allocator ``record_stream`` behavior.
+            input_owner_stream (torch.cuda.Stream, optional): Statically known stream
+                that produced this node's forward input. Only required for nodes with
+                ``free_input=True`` when schedule-aware retirement is enabled.
+            backward_input_owner_stream (torch.cuda.Stream, optional): Statically known
+                stream that produced this node's incoming backward gradient. ``None``
+                keeps the allocator ``record_stream`` fallback for external boundaries.
         """
         self.name = name
         self.forward_nvtx_name = forward_nvtx_name or f"{name} forward"
@@ -193,6 +201,8 @@ class ScheduleNode:
         self.event = event
         self.free_input = free_input
         self.lifetime_manager = lifetime_manager
+        self.input_owner_stream = input_owner_stream
+        self.backward_input_owner_stream = backward_input_owner_stream
         self.inputs = None
         self.outputs = None
         # When True, the forward runs under torch.no_grad() so no autograd graph is
@@ -223,9 +233,6 @@ class ScheduleNode:
         if isinstance(self.stream, Callable):
             self.stream = self.stream()
         node_name = self.forward_nvtx_name
-        lifetime_inputs = (
-            self.get_lifetime_inputs(inputs) if self.lifetime_manager is not None else inputs
-        )
         with self.stream_acquire_context(node_name):
             self.inputs = [make_viewless(e).detach() if e is not None else None for e in inputs]
             for i, input in enumerate(self.inputs):
@@ -247,37 +254,25 @@ class ScheduleNode:
 
             self.output = data
 
-        if self.lifetime_manager is not None:
-            if self.free_input:
-                self.lifetime_manager.retire_and_publish(
-                    lifetime_inputs,
-                    self.output,
-                    action=ReleaseAction.EMPTY_STORAGE,
-                    producer_stream=self.stream,
+        if self.free_input:
+            if self.lifetime_manager is not None and self.input_owner_stream is not None:
+                if isinstance(self.input_owner_stream, Callable):
+                    self.input_owner_stream = self.input_owner_stream()
+                self.lifetime_manager.retire_forward_inputs(
+                    inputs,
+                    owner_stream=self.input_owner_stream,
                     consumer_stream=self.stream,
                     node=node_name,
                 )
             else:
-                self.lifetime_manager.publish(lifetime_inputs, self.output, self.stream)
-        elif self.free_input:
-            # Immediately frees input tensors after they are used for nodes
-            # where inputs are no longer needed after computation.
-            for input in inputs:
-                if input is not None:
-                    input.record_stream(self.stream)
-                    input.untyped_storage().resize_(0)
+                # Preserve the allocator fallback when the producer is external or
+                # otherwise not encoded by the layer-node topology.
+                for input in inputs:
+                    if input is not None:
+                        input.record_stream(self.stream)
+                        input.untyped_storage().resize_(0)
 
         return self.output
-
-    def get_lifetime_inputs(self, inputs):
-        """Return explicit or implicit tensors consumed by this node.
-
-        Most nodes consume their positional inputs.  Nodes such as pipeline
-        preprocessing may override this method to expose state-backed inputs to the
-        lifetime manager without changing their forward API.
-        """
-
-        return inputs
 
     def get_output(self):
         """Get the forward output"""
@@ -307,13 +302,19 @@ class ScheduleNode:
         grads = self.get_grad()
 
         if self.lifetime_manager is not None:
-            self.lifetime_manager.retire_and_publish(
-                consumed_grads,
-                grads,
-                action=ReleaseAction.DROP_REFERENCE,
-                producer_stream=self.stream,
+            if isinstance(self.backward_input_owner_stream, Callable):
+                self.backward_input_owner_stream = self.backward_input_owner_stream()
+            fallback_grads = (
+                consumed_grads[len(output_grad) :]
+                if isinstance(consumed_grads, tuple)
+                else consumed_grads
+            )
+            self.lifetime_manager.retire_backward_inputs(
+                output_grad,
+                owner_stream=self.backward_input_owner_stream,
                 consumer_stream=self.stream,
                 node=node_name,
+                fallback_consumed=fallback_grads,
             )
         elif consumed_grads:
             # Gradients may have been produced on another stream.
