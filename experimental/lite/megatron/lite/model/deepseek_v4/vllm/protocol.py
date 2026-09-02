@@ -127,14 +127,6 @@ def _post_optimizer_step(model: nn.Module) -> None:
 
 
 def _post_dist_opt_model_load(model: nn.Module) -> None:
-    """Invalidate checkpoint packing metadata after dist-opt wraps parameters.
-
-    DistributedOptimizer is constructed before HF loading. With parameter
-    offload, its visible storage can differ from the parameter that received
-    checkpoint source-scale metadata, so the actor and first rollout pack the
-    same loaded value through different paths. Re-establish the normal
-    post-update invariant once loading has completed.
-    """
     invalidate_bound_source_scales(model)
     for module in model.modules():
         clear_cache = getattr(module, "clear_deployment_weight_cache", None)

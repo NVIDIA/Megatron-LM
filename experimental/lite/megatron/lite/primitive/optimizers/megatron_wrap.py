@@ -86,12 +86,6 @@ def build_dist_opt_optimizer_config(
         "params_dtype": torch.bfloat16,
     }
     if offload > 0:
-        # DistributedOptimizer replaces the original parameters with shard
-        # views. The legacy HybridDeviceOptimizer CPU-update path attempts to
-        # rebuild itself from those non-leaf views and is therefore not a
-        # valid dist-opt backend. MCore's chunked state offloader is attached
-        # after shard construction and owns the corresponding master/state
-        # lifecycle directly.
         args["chunked_optimizer_state_offload"] = True
         args["optimizer_state_offload_fraction"] = offload
         args["optimizer_state_offload_chunk_size_mb"] = 256
