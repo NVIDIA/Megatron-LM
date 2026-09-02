@@ -1930,24 +1930,32 @@ class TestAsyncSchedulePairwiseParallel(_AsyncPairwiseHarness):
             Utils.destroy_model_parallel()
 
 
-def test_async_compaction_preserves_all_request_metadata():
+@pytest.mark.parametrize(
+    ("survivor_idxs", "expected_token_rows"),
+    [
+        pytest.param([0, 2], [0, 1, 4, 5], id="monotonic-with-gap"),
+        pytest.param([3, 1, 2], [6, 7, 2, 3, 4, 5], id="nonmonotonic"),
+    ],
+)
+def test_async_compaction_preserves_all_request_metadata(survivor_idxs, expected_token_rows):
     """Middle-row completion compacts every metadata field into survivor order."""
     controller = TextGenerationController.__new__(TextGenerationController)
     controller.num_speculative_tokens = 1
     controller._enable_cuda_graph = False
-    controller._all_logits_cuda = torch.arange(24).reshape(1, 6, 4)
+    original_logits = torch.arange(32).reshape(1, 8, 4)
+    controller._all_logits_cuda = original_logits.clone()
     controller._async_sched_logits = AsyncScheduleLogitsState()
-    controller._async_sched_logits.set_pending(3, torch.arange(6))
+    controller._async_sched_logits.set_pending(4, torch.arange(8))
 
     metadata = {
-        "temperature": torch.tensor([0.5, 0.7, 0.9]),
-        "top_k": torch.tensor([2, 4, 8]),
-        "top_p": torch.tensor([0.1, 0.2, 0.3]),
-        "termination_id": torch.tensor([90, 91, 92]),
-        "return_log_probs": torch.tensor([True, False, True]),
-        "skip_prompt_log_probs": torch.tensor([False, True, True]),
-        "top_n_logprobs": torch.tensor([2, 0, 5]),
-        "custom_metadata": torch.tensor([101, 202, 303]),
+        "temperature": torch.tensor([0.5, 0.7, 0.9, 1.1]),
+        "top_k": torch.tensor([2, 4, 8, 16]),
+        "top_p": torch.tensor([0.1, 0.2, 0.3, 0.4]),
+        "termination_id": torch.tensor([90, 91, 92, 93]),
+        "return_log_probs": torch.tensor([True, False, True, False]),
+        "skip_prompt_log_probs": torch.tensor([False, True, False, True]),
+        "top_n_logprobs": torch.tensor([2, 0, 5, 1]),
+        "custom_metadata": torch.tensor([101, 202, 303, 404]),
     }
     gpu_view = SimpleNamespace(
         temperature=metadata["temperature"].clone(),
@@ -1956,19 +1964,21 @@ def test_async_compaction_preserves_all_request_metadata():
     )
     context = SimpleNamespace(active_request_metadata=metadata, gpu_view=gpu_view)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
-    expected = {label: values[[0, 2]].clone() for label, values in metadata.items()}
+    expected = {label: values[survivor_idxs].clone() for label, values in metadata.items()}
 
-    controller._compact_async_sched_logits(torch.tensor([0, 2]))
+    controller._compact_async_sched_logits(torch.tensor(survivor_idxs))
 
     for label, values in expected.items():
-        assert torch.equal(context.active_request_metadata[label][:2], values), label
-    assert torch.equal(gpu_view.temperature[:2], expected["temperature"])
-    assert torch.equal(gpu_view.top_k[:2], expected["top_k"])
-    assert torch.equal(gpu_view.top_p[:2], expected["top_p"])
+        assert torch.equal(
+            context.active_request_metadata[label][: len(survivor_idxs)], values
+        ), label
+    assert torch.equal(gpu_view.temperature[: len(survivor_idxs)], expected["temperature"])
+    assert torch.equal(gpu_view.top_k[: len(survivor_idxs)], expected["top_k"])
+    assert torch.equal(gpu_view.top_p[: len(survivor_idxs)], expected["top_p"])
+    assert torch.equal(controller._all_logits_cuda, original_logits[:, expected_token_rows])
     assert torch.equal(
-        controller._all_logits_cuda, torch.arange(24).reshape(1, 6, 4)[:, [0, 1, 4, 5]]
+        controller._async_sched_logits.token_row_indices, torch.tensor(expected_token_rows)
     )
-    assert torch.equal(controller._async_sched_logits.token_row_indices, torch.tensor([0, 1, 4, 5]))
 
 
 def test_async_negative_routing_replay():
