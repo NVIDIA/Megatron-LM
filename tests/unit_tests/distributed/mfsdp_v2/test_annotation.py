@@ -9,9 +9,9 @@ import pytest
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    Flat,
     Placements,
     fully_shard,
     fully_shard_context,
@@ -64,7 +64,7 @@ class TiedLM(nn.Module):
 
 
 def _flat_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+    return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
 def _setup_nvtx_recording(monkeypatch: pytest.MonkeyPatch, events: list[NvtxEvent]) -> None:
