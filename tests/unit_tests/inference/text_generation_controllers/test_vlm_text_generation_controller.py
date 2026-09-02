@@ -5,6 +5,7 @@ import random
 import string
 import time
 from collections import OrderedDict
+from types import SimpleNamespace
 from typing import Dict, List
 from unittest import mock
 
@@ -13,6 +14,13 @@ import torch
 
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status, VLMInferenceRequest
+from megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper import (
+    NemotronOmniInferenceWrapper,
+)
+from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
+    dynamic_media_embedding_counts,
+    dynamic_media_replacement_counts,
+)
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
 )
@@ -30,6 +38,210 @@ from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.internal
+def test_vlm_wrapper_builds_preexpanded_media_token_mask():
+    wrapper = object.__new__(VLMInferenceWrapper)
+    wrapper.model = SimpleNamespace(image_token_index=-200)
+
+    mask = wrapper.build_preexpanded_media_token_mask(torch.tensor([10, -200, -200, 20]), "image")
+
+    assert mask.tolist() == [-1, 0, 1, -1]
+
+
+@pytest.mark.internal
+def test_vlm_wrapper_resolves_media_id_from_tokenizer_not_model_sentinel():
+    wrapper = object.__new__(VLMInferenceWrapper)
+    wrapper.model = SimpleNamespace(image_token_index=-200)
+    tokenizer = SimpleNamespace(
+        convert_tokens_to_ids=lambda token: 99 if token == "<image>" else 0, unk_token_id=0
+    )
+
+    assert wrapper.multimodal_prompt_config.image_spec.model_token == "<image>"
+    assert wrapper.resolve_media_token_id(tokenizer, "image") == 99
+
+
+@pytest.mark.internal
+def test_vlm_wrapper_resolves_media_id_with_encode_fallback():
+    wrapper = object.__new__(VLMInferenceWrapper)
+    wrapper.model = SimpleNamespace(image_token_index=-200)
+    tokenizer = SimpleNamespace(encode=lambda token, add_special_tokens: [99])
+
+    assert wrapper.resolve_media_token_id(tokenizer, "image") == 99
+
+
+@pytest.mark.internal
+def test_vlm_dynamic_forward_sanitizes_preexpanded_media_sentinel():
+    embedding = mock.Mock(return_value=torch.zeros(3, 1, 4))
+    model = SimpleNamespace(
+        image_token_index=-200,
+        language_model=SimpleNamespace(embedding=embedding),
+        forward_lm_only=mock.Mock(return_value=torch.zeros(1, 3, 8)),
+    )
+    wrapper = object.__new__(VLMInferenceWrapper)
+    wrapper.model = model
+    wrapper.pp_group = mock.Mock()
+    wrapper._recv_only_vision_embeds = False
+    wrapper.inference_context = None
+
+    with mock.patch(
+        "megatron.core.inference.model_inference_wrappers.multimodal."
+        "vlm_inference_wrapper.is_pipeline_first_stage",
+        return_value=True,
+    ):
+        wrapper._forward_dynamic(
+            {
+                "tokens": torch.tensor([[10, -200, -200]]),
+                "position_ids": torch.tensor([[0, 1, 2]]),
+                "image_token_mask": torch.tensor([[-1, 0, 1]]),
+                "image_embeddings": torch.zeros(2, 1, 4),
+                "attention_mask": None,
+            }
+        )
+
+    assert torch.equal(embedding.call_args.kwargs["input_ids"], torch.tensor([[10, 0, 0]]))
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("is_video", [False, True])
+def test_vlm_vision_forward_casts_images_and_passes_tensor_input_ids(is_video):
+    module = SimpleNamespace(
+        image_token_index=-200,
+        vision_model=SimpleNamespace(config=SimpleNamespace(params_dtype=torch.bfloat16)),
+        dynamic_resolution=False,
+        add_decoder=True,
+    )
+
+    class WrappedVisionModel:
+        def __init__(self):
+            self.module = module
+            self.call_args = None
+
+        def __call__(self, *args, **kwargs):
+            self.call_args = (args, kwargs)
+            return torch.zeros(2, 1, 4, dtype=torch.bfloat16), None
+
+    model = WrappedVisionModel()
+    wrapper = object.__new__(VLMInferenceWrapper)
+    wrapper.model = model
+    wrapper.inference_context = None
+
+    output = wrapper._forward_vision_encoder(
+        torch.ones(1, 3, 2, 2, dtype=torch.float32),
+        num_image_tiles=torch.tensor([1]),
+        num_frames=torch.tensor([1]) if is_video else None,
+    )
+
+    args, _ = model.call_args
+    assert args[0].dtype == torch.bfloat16
+    assert isinstance(args[1], torch.Tensor)
+    assert args[1].shape == (1, 0)
+    assert args[1].device == args[0].device
+    assert module.add_decoder is True
+    assert output.dtype == torch.bfloat16
+
+
+@pytest.mark.internal
+def test_dynamic_video_embedding_counts_group_one_placeholder_per_video():
+    frame_counts = dynamic_media_embedding_counts(
+        torch.tensor([[448, 576]] * 4), patch_dim=16, pixel_shuffle=True
+    )
+    assert frame_counts == [252] * 4
+
+    assert dynamic_media_replacement_counts(
+        frame_counts, num_frames=torch.tensor(4), temporal_patch_size=2
+    ) == [504]
+
+
+@pytest.mark.internal
+def test_dynamic_video_embedding_counts_reject_misaligned_frames():
+    with pytest.raises(ValueError, match="must partition"):
+        dynamic_media_replacement_counts(
+            [252] * 4, num_frames=torch.tensor([3]), temporal_patch_size=2
+        )
+
+
+@pytest.mark.internal
+def test_vlm_wrapper_expands_one_video_marker_to_all_tubelet_embeddings():
+    wrapper = object.__new__(VLMInferenceWrapper)
+    wrapper.model = SimpleNamespace()
+    wrapper.model.module = SimpleNamespace(
+        image_token_index=-200,
+        dynamic_resolution=True,
+        patch_dim=16,
+        _pixel_shuffle=True,
+        _conv_merging=False,
+        _drop_vision_class_token=True,
+        temporal_patch_dim=2,
+    )
+
+    expanded, masks = wrapper.expand_image_tokens(
+        [[11, 99, 12]],
+        imgs_sizes=torch.tensor([[448, 576]] * 4),
+        num_frames=torch.tensor([4]),
+        image_token_id=99,
+    )
+
+    assert expanded == [[11] + [-1] * 504 + [12]]
+    assert masks[0][0] is None
+    assert masks[0][1:-1] == list(range(504))
+    assert masks[0][-1] is None
+
+
+@pytest.mark.internal
+def test_vlm_wrapper_rejects_multiple_compact_markers_for_one_video():
+    wrapper = object.__new__(VLMInferenceWrapper)
+    wrapper.model = SimpleNamespace()
+    wrapper.model.module = SimpleNamespace(
+        image_token_index=-200,
+        dynamic_resolution=True,
+        patch_dim=16,
+        _pixel_shuffle=True,
+        _conv_merging=False,
+        _drop_vision_class_token=True,
+        temporal_patch_dim=2,
+    )
+
+    with pytest.raises(ValueError, match="one compact placeholder per video"):
+        wrapper.expand_image_tokens(
+            [[11, 99, 99, 12]],
+            imgs_sizes=torch.tensor([[448, 576]] * 4),
+            num_frames=torch.tensor([4]),
+            image_token_id=99,
+        )
+
+
+@pytest.mark.internal
+def test_vlm_and_omni_wrappers_expand_video_markers_consistently():
+    model = SimpleNamespace(
+        image_token_index=-200,
+        dynamic_resolution=True,
+        patch_dim=16,
+        _pixel_shuffle=True,
+        _conv_merging=False,
+        _drop_vision_class_token=True,
+        temporal_patch_dim=2,
+    )
+    model.vision_model = SimpleNamespace(temporal_patch_dim=2)
+
+    vlm_wrapper = object.__new__(VLMInferenceWrapper)
+    vlm_wrapper.model = SimpleNamespace(module=model)
+    omni_wrapper = object.__new__(NemotronOmniInferenceWrapper)
+    omni_wrapper.model = model
+
+    kwargs = {
+        "imgs_sizes": torch.tensor([[448, 576]] * 4),
+        "num_frames": torch.tensor([4]),
+        "image_token_id": 99,
+    }
+    vlm_expanded, vlm_masks = vlm_wrapper.expand_image_tokens([[11, 99, 12]], **kwargs)
+    omni_expanded, omni_masks = omni_wrapper.expand_image_tokens([[11, 99, 12]], **kwargs)
+
+    assert vlm_expanded == [[11] + [-1] * 504 + [12]]
+    assert omni_expanded == [[11] + [-1] * 504 + [12]]
+    assert vlm_masks == omni_masks
+    assert vlm_masks[0][1:-1] == list(range(504))
 
 
 class TestVLMTextGenerationController:

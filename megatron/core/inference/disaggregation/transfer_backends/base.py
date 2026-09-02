@@ -109,20 +109,28 @@ def compute_buffer_geometry(
     )
 
     shape = list(memory_buffer.shape)
-    candidates = [i for i, dim in enumerate(shape) if dim == expected_num_blocks]
-    if not candidates:
-        raise RuntimeError(
-            f"{backend_name}: no axis in memory_buffer shape {shape} matches "
-            f"expected_num_blocks={expected_num_blocks}. Layout is unrecognized; "
-            "bug in caller or new Megatron tensor shape."
-        )
-    if len(candidates) > 1:
-        raise RuntimeError(
-            f"{backend_name}: ambiguous blocks axis in shape {shape} "
-            f"(expected_num_blocks={expected_num_blocks} matches multiple axes "
-            f"{candidates}). Caller must pass a more distinctive value."
-        )
-    blocks_axis = candidates[0]
+    if ssm_layout is not None:
+        blocks_axis = 1
+        if len(shape) <= blocks_axis or shape[blocks_axis] != expected_num_blocks:
+            raise RuntimeError(
+                f"{backend_name}: SSM state shape {shape} does not have "
+                f"expected_num_blocks={expected_num_blocks} on slot axis 1"
+            )
+    else:
+        candidates = [i for i, dim in enumerate(shape) if dim == expected_num_blocks]
+        if not candidates:
+            raise RuntimeError(
+                f"{backend_name}: no axis in memory_buffer shape {shape} matches "
+                f"expected_num_blocks={expected_num_blocks}. Layout is unrecognized; "
+                "bug in caller or new Megatron tensor shape."
+            )
+        if len(candidates) > 1:
+            raise RuntimeError(
+                f"{backend_name}: ambiguous blocks axis in shape {shape} "
+                f"(expected_num_blocks={expected_num_blocks} matches multiple axes "
+                f"{candidates}). Caller must pass a more distinctive value."
+            )
+        blocks_axis = candidates[0]
 
     elements_per_slice = 1
     for dim in shape[blocks_axis + 1 :]:

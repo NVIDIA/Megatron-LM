@@ -9,7 +9,7 @@ import inspect
 import logging
 import math
 from dataclasses import dataclass, replace
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -18,20 +18,21 @@ import torch.nn.functional as F
 from megatron.core import parallel_state
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
-    tensor_get_slice_after,
     tensor_masked_update,
-    tensor_merge,
 )
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.ops.batch_invariant_decode import MambaBatchInvariantDecode
-from megatron.core.ssm.ops.causal_conv1d_triton import causal_conv1d_update
-from megatron.core.ssm.ops.intermediate_extraction import (
+from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
+from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
+from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_carry_states
+from megatron.core.ssm.ops.common.intermediate_extraction import (
     scatter_intermediate_conv,
     scatter_intermediate_ssm,
 )
-from megatron.core.ssm.ops.mamba_ssm import selective_state_update
+from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
+from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
+from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
@@ -47,7 +48,6 @@ from megatron.core.utils import (
     deprecate_inference_params,
     is_causal_conv1d_min_version,
     is_mamba_min_version,
-    is_using_quantization_scales,
     log_single_rank,
     make_tp_sharded_tensor_for_checkpoint,
 )
@@ -62,7 +62,6 @@ from .mamba_context_parallel import MambaContextParallel
 try:
     from causal_conv1d import causal_conv1d_fn
     from causal_conv1d import causal_conv1d_update as causal_conv1d_update_cuda
-    from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
 
 except ImportError:
     causal_conv1d_fn = None
@@ -82,7 +81,7 @@ except ImportError:
     HAVE_MAMBA_SSM = False
 
 try:
-    from megatron.core.ssm.ops.ssd_combined import mamba_chunk_scan_combined_varlen
+    from megatron.core.ssm.ops.mamba2.ssd_combined import mamba_chunk_scan_combined_varlen
 
     HAVE_SSM_OPS_VARLEN = True
 except ImportError:
@@ -141,7 +140,7 @@ class MambaMixerSubmodules:
     out_proj: Union[ModuleSpec, type] = None
 
 
-class MambaMixer(MegatronModule):
+class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
     """
     Args:
         config: The config of the model.
@@ -226,6 +225,10 @@ class MambaMixer(MegatronModule):
         self.cached_batch_size = None
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
+        if self.config.linear_cp_mode == "chunkwise" and self.pg_collection.cp.size() > 1:
+            raise NotImplementedError(
+                "This branch supports linear_cp_mode='chunkwise' only for FLA GDP mixers."
+            )
         self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
         self.mamba_training_ssm_states_dtype = (
             config.mamba_training_ssm_states_dtype or config.params_dtype
@@ -291,6 +294,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + f".in_proj") if name is not None else None,
         )
         # in_proj packs [z, x, B, C, dt] into one ColumnParallelLinear.  Each
@@ -306,6 +310,7 @@ class MambaMixer(MegatronModule):
             self.nheads_local_tp,  # dt
         ]
         setattr(self.in_proj.weight, "partition_sizes", in_proj_partition_sizes)
+        setattr(self.in_proj.weight, "use_muon", False)
 
         if not self.use_mem_eff_path:
             log_single_rank(
@@ -366,6 +371,9 @@ class MambaMixer(MegatronModule):
                     nn.init.uniform_(self.conv1d_weight, -self.conv_init, self.conv_init)
                 else:
                     nn.init.kaiming_uniform_(self.conv1d_weight, a=math.sqrt(5))
+
+        # Both of this mixer's conv layouts need it; see assert_causal_conv1d_deterministic.
+        assert_causal_conv1d_deterministic(config.deterministic_mode)
 
         self.activation = "silu"
         self.act = nn.SiLU()
@@ -442,6 +450,7 @@ class MambaMixer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + f".out_proj") if name is not None else None,
         )
 
@@ -463,6 +472,7 @@ class MambaMixer(MegatronModule):
             A_log_cp1=self.A_log,
             D_cp1=self.D,
             D_has_hdim=self.D_has_hdim,
+            sequence_is_contiguous=self.config.linear_cp_layout == "contiguous",
         )
         self.tp_group = pg_collection.tp
 
@@ -488,7 +498,7 @@ class MambaMixer(MegatronModule):
 
         if in_inference_mode and inference_context is not None:
             if inference_context.is_dynamic_batching():
-                return self._dynamic_inference(hidden_states, inference_context)
+                return self.ssm_dynamic_inference(hidden_states, inference_context)
             else:
                 assert inference_context.is_static_batching()
                 assert not self.config.batch_invariant_mode, (
@@ -499,7 +509,7 @@ class MambaMixer(MegatronModule):
                 conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
                 if inference_context.seqlen_offset > 0:
                     # The states are updated inplace
-                    out, out_bias = self._decode(hidden_states, conv_state, ssm_state)
+                    out, out_bias = self._static_decode(hidden_states, conv_state, ssm_state)
                     return out, out_bias
 
         zxBCdt, _ = self.in_proj(hidden_states)
@@ -512,7 +522,7 @@ class MambaMixer(MegatronModule):
                 "Training with packed sequences is not supported "
                 "in the non-memory-efficient code path."
             )
-            y = self._ssm_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+            y = self._static_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
         else:
             assert ssm_state is None
             y = self._ssm_training(zxBCdt, packed_seq_params)
@@ -521,215 +531,155 @@ class MambaMixer(MegatronModule):
 
         return out, out_bias
 
-    def _dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):
-        """
-        Executes dynamic inference by separating decode and prefill requests and
-        running them independently.
-        """
-        sequence_packing_available, reason_for_no_sequence_packing = (
-            _check_mamba_sequence_packing_support(for_inference_not_training=True)
-        )
-        assert sequence_packing_available, reason_for_no_sequence_packing
-
-        # Grab standard states
-        conv_state, ssm_state = context.mamba_states_cache(self.layer_number - self.pp_layer_offset)
-
-        # Fetch intermediate states for speculative decoding
-        # (just buffers, existing data is overwritten)
-        int_conv_state = None
-        int_ssm_state = None
-        if context.num_speculative_tokens > 0:
-            int_conv_state, int_ssm_state = context.mamba_states_cache(
-                self.layer_number - self.pp_layer_offset, intermediate=True
-            )
-
-        padded_dims = context.padded_batch_dimensions
-        token_count = padded_dims.token_count
-        decode_req_count = padded_dims.decode_req_count
-        prefill_req_count = padded_dims.prefill_req_count
-
-        # Input projection
-        zxBCdt, _ = self.in_proj(hidden_states)
-
-        y_decode = None
-        y_prefill = None
-
-        # Decode
-        if decode_req_count > 0:
-            # For mixed batch, the decode tokens are at the start of zxBCdt
-            seq_len = 1 + context.num_speculative_tokens
-            decode_token_count = decode_req_count * seq_len
-
-            zxBCdt_decode = zxBCdt[:decode_token_count] if prefill_req_count > 0 else zxBCdt
-
-            # Reshape from [N*S, 1, d] to [N, S, d] for the 3D Triton kernels
-            zxBCdt_decode = zxBCdt_decode.squeeze(1).view(decode_req_count, seq_len, -1)
-
-            y_decode = self._ssm_decode(
-                zxBCdt_decode,
-                conv_state,
-                ssm_state,
-                batch_indices=context.mamba_metadata.batch_indices_decode,
-                intermediate_conv_state=int_conv_state,
-                intermediate_ssm_state=int_ssm_state,
-            )
-
-            # Flatten back to [N*S, 1, d] to match merge logic
-            y_decode = y_decode.view(decode_token_count, 1, -1)
-
-        # Prefill
-        if prefill_req_count > 0:
-            if decode_req_count > 0:
-                # If mixed, slice the prefill portion out of zxBCdt
-                zxBCdt_prefill = torch.empty_like(zxBCdt)
-                tensor_get_slice_after(
-                    zxBCdt,
-                    zxBCdt_prefill,
-                    context.mamba_metadata.device_decode_prefill,
-                    check_bounds=False,
-                )
-            else:
-                zxBCdt_prefill = zxBCdt
-
-            mamba_layer_idx = context.layer_map[self.layer_number - self.pp_layer_offset - 1]
-            y_prefill = self._dynamic_inference_prefill(
-                zxBCdt_prefill, context, conv_state, ssm_state, mamba_layer_idx=mamba_layer_idx
-            )
-
-        # Merge decode and prefill results if necessary
-        if y_decode is not None and y_prefill is not None:
-            y = torch.empty(
-                [token_count, 1, y_prefill.shape[-1]],
-                dtype=y_prefill.dtype,
-                device=y_prefill.device,
-            )
-            tensor_merge(
-                y_decode, y_prefill, context.mamba_metadata.device_decode_prefill, output_tensor=y
-            )
-        elif y_decode is not None:
-            y = y_decode
-        elif y_prefill is not None:
-            y = y_prefill
-        else:
-            raise RuntimeError("Dynamic inference called with 0 decode and 0 prefill requests")
-
-        # Clear the outputs for padding tokens when using quantization scales
-        # to avoid corrupting amax calculations
-        if is_using_quantization_scales(self.config):
-            y[context.padding_slice] = 0.0
-
-        # Output projection
-        out, out_bias = self.out_proj(y)
-
-        return out, out_bias
-
-    def _dynamic_inference_prefill(
-        self,
-        zxBCdt: torch.Tensor,
-        context: DynamicInferenceContext,
-        conv_state: torch.Tensor,
-        ssm_state: torch.Tensor,
-        mamba_layer_idx: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Helper to run dynamic inference prefill.
-
-        All prefill requests (including chunked prefill) are processed together
-        through the unified varlen path. Uses precomputed metadata from
-        MambaMetadata.update() to avoid .item() calls and data-dependent
-        control flow, enabling CUDA graph compatibility.
-
-        When padded_prefill_count > 0 but real_prefill_count == 0 (e.g. a
-        decode-only rank in expert parallelism that must match a mixed CUDA
-        graph), this function still executes the full kernel path.
-        The metadata reflects zero-length sequences (cu_seqlens all equal,
-        batch_indices all -1) so kernels produce a zero output tensor of the
-        correct padded shape, which is required by the merge logic in
-        _dynamic_inference.
-
-        Intermediate state extraction (for Mamba prefix caching) is performed
-        inside _ssm_prefill via pre-allocated output buffers, making it fully
-        CUDA graph compatible.
-        """
-        metadata = context.mamba_metadata
-
-        # Use precomputed metadata (no .item() calls, no stripping).
-        cu_seqlens = metadata.cu_seqlens
-        batch_indices = metadata.batch_indices_prefill
-        real_token_count = metadata.real_prefill_token_count
-        seq_idx = metadata.seq_idx
-
-        # Pass full padded tensor — SSM kernel uses cu_chunk_seqlens for
-        # boundaries and never accesses tokens beyond the last boundary.
-        # Output y is initialized to zeros in _ssm_prefill so padding
-        # positions remain zero (safe for RMSNorm and downstream ops).
-
-        # Prepare intermediate extraction buffers (always passed, CUDA graph compat)
-        slot_allocator = context.mamba_slot_allocator
-        intermediate_chunk_indices = metadata.intermediate_chunk_indices
-        intermediate_abs_positions = metadata.intermediate_abs_positions
-        intermediate_real_count = metadata.intermediate_real_count
-        intermediate_ssm_out = None
-        intermediate_conv_out = None
-        if slot_allocator is not None and mamba_layer_idx is not None:
-            intermediate_ssm_out = slot_allocator.intermediate_ssm_out[mamba_layer_idx]
-            intermediate_conv_out = slot_allocator.intermediate_conv_out[mamba_layer_idx]
-
-        y_prefill = self._ssm_prefill(
-            zxBCdt,
-            conv_state=conv_state,
-            ssm_state=ssm_state,
-            seq_idx=seq_idx,
-            cu_seqlens=cu_seqlens,
-            batch_indices=batch_indices,
-            intermediate_chunk_indices=intermediate_chunk_indices,
-            intermediate_abs_positions=intermediate_abs_positions,
-            intermediate_real_count=intermediate_real_count,
-            intermediate_ssm_out=intermediate_ssm_out,
-            intermediate_conv_out=intermediate_conv_out,
-            cu_chunk_seqlens=metadata.cu_chunk_seqlens,
-            last_chunk_indices=metadata.last_chunk_indices,
-            seq_idx_for_varlen=metadata.seq_idx_for_varlen,
-            cu_seqlens_list=metadata.cu_seqlens_list,
-            real_token_count=real_token_count,
-            conv_seq_idx=metadata.conv_seq_idx,
-            conv_seq_start=metadata.conv_seq_start,
-        )
-
-        return y_prefill
-
-    def _decode(
-        self, hidden_states, conv_state, ssm_state, batch_indices: Optional[torch.Tensor] = None
+    # ==================================================================
+    # Static / eager inference
+    #
+    # These methods implement legacy static-batching inference (and the
+    # non-memory-efficient training prefill fallback). They are deliberately
+    # kept separate from the dynamic inference hooks (`ssm_decode` /
+    # `ssm_prefill`) so that static-batching bookkeeping does not pollute the
+    # dynamic inference interface defined by `SSMDynamicInferenceMixin`.
+    # ==================================================================
+    def _static_decode(
+        self, hidden_states, conv_state, ssm_state
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Performs inference step for decoding."""
+        """Single-token static-batching decode step (updates state in place)."""
         # assert self.ngroups_local_tp == 1, "Only support ngroups=1 for inference for now"
-        is_dynamic_batching = batch_indices is not None
-
-        if not is_dynamic_batching:
-            assert (
-                hidden_states.shape[0] == 1
-            ), "Only support decoding with 1 token at a time for now"
+        assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
 
         # (1, b, d_model) -> (1, b, proj_dim)
         zxBCdt, _ = self.in_proj(hidden_states)
 
-        # Make batch size leading dimension since that is 1
-        if is_dynamic_batching:
-            zxBCdt = zxBCdt.transpose(0, 1)
+        assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inference decode"
 
-        assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inferenece decode"
-
-        y = self._ssm_decode(
-            zxBCdt, conv_state=conv_state, ssm_state=ssm_state, batch_indices=batch_indices
-        )
-
-        # Restore sequence length as first dimension
-        if is_dynamic_batching:
-            y = y.transpose(0, 1)
+        # Static batching has no slot remapping, so batch_indices is None.
+        y = self.ssm_decode(zxBCdt, conv_state=conv_state, ssm_state=ssm_state, batch_indices=None)
 
         # y has shape (1, b, d_inner), which is what out_proj expects
         out, out_bias = self.out_proj(y)
 
         return out, out_bias
+
+    def _static_prefill(
+        self,
+        zxBCdt: torch.Tensor,
+        conv_state: Optional[torch.Tensor],
+        ssm_state: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Performs single-sequence SSM prefill for static-batching inference and the
+        non-memory-efficient (`use_mem_eff_path=False`) training fallback.
+
+        `conv_state` / `ssm_state` are `None` for the training fallback and
+        non-`None` for static-batching inference (updated in place).
+
+        Args:
+            zxBCdt: The input tensor of shape (l, b, d), a concatenation of
+                z, x, B, C, and dt projections.
+            conv_state: The convolution state tensor, or `None` for training.
+            ssm_state: The selective scan state tensor, or `None` for training.
+
+        Returns:
+            Output tensor of shape (l, b, d).
+        """
+        # transpose: l b pd --> b l pd
+        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+
+        # (nheads_local_tpcp)
+        A = -torch.exp(self.cp.get_A_log().float())
+
+        z, xBC, dt = torch.split(
+            zxBCdt,
+            [
+                self.cp.d_inner_local_tpcp,
+                self.cp.d_inner_local_tpcp + 2 * self.cp.ngroups_local_tpcp * self.d_state,
+                self.cp.nheads_local_tpcp,
+            ],
+            dim=-1,
+        )
+
+        # Compute short convolution (single-sequence / non-varlen).
+        xBC = rearrange(xBC, "b l d -> b d l").contiguous()
+        if conv_state is not None:
+            # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+            # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+            conv_state.copy_(F.pad(xBC, (self.d_conv - xBC.shape[-1], 0)))  # Update state (B D W)
+
+        seqlen = xBC.size(2)
+        if causal_conv1d_fn is None:
+            xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
+        else:
+            assert self.activation in ["silu", "swish"]
+            xBC = causal_conv1d_fn(
+                x=xBC,
+                weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                bias=self.cp.get_conv1d_bias(),
+                activation=self.activation,
+            )
+        xBC = rearrange(xBC, "b d l -> b l d").contiguous()
+
+        x, B, C = torch.split(
+            xBC,
+            [
+                self.cp.d_inner_local_tpcp,
+                self.cp.ngroups_local_tpcp * self.d_state,
+                self.cp.ngroups_local_tpcp * self.d_state,
+            ],
+            dim=-1,
+        )
+
+        # TODO Vijay: fuse most of the transposes with the GEMMS
+        x = rearrange(x, "b l (h p) -> b l h p", p=self.headdim).contiguous()
+        dt = dt.contiguous()
+        B = rearrange(B, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+        C = rearrange(C, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+        z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
+
+        # If `rmsnorm == False`, then the norm inside `mamba_chunk_scan_combined` will be used.
+        # In this case, if `cp_size > 1` then that norm could be performed on less heads than if
+        # `cp_size == 1` (groups of heads can be sharded across CP ranks), which would be
+        # mathematically incorrect, and potentially arithmetically unstable.
+        assert (
+            self.cp.cp_size == 1 or self.rmsnorm
+        ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
+
+        initial_ssm_state = None
+        state_dtype_kwarg = (
+            {"state_dtype": self.mamba_training_ssm_states_dtype} if MAMBA_HAS_STATE_DTYPE else {}
+        )
+        y = mamba_chunk_scan_combined(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            self.chunk_size,
+            D=(
+                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+                if self.D_has_hdim
+                else self.cp.get_D()
+            ),
+            z=z if not self.rmsnorm else None,
+            dt_bias=self.cp.get_dt_bias().float(),
+            dt_softplus=True,
+            return_final_states=ssm_state is not None,
+            initial_states=initial_ssm_state,
+            **state_dtype_kwarg,
+        )
+
+        if ssm_state is not None:
+            y, last_state = y
+            ssm_state.copy_(last_state)
+
+        y = rearrange(y, "b l h p -> l b (h p)").contiguous()
+        y = self.cp.post_conv_ssm(y)
+
+        if self.rmsnorm:
+            z = rearrange(z, "b l h p -> l b (h p)").contiguous()
+            z = self.cp.post_conv_ssm(z)
+            y = self.norm(y, z)
+
+        return y
 
     def _ssm_training(
         self, zxBCdt: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
@@ -787,63 +737,70 @@ class MambaMixer(MegatronModule):
 
         return y
 
-    def _ssm_prefill(
+    def ssm_prefill(
         self,
         zxBCdt: torch.Tensor,
-        conv_state: Optional[torch.Tensor],
-        ssm_state: Optional[torch.Tensor],
-        seq_idx: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[torch.Tensor] = None,
-        batch_indices: Optional[torch.Tensor] = None,
-        intermediate_chunk_indices: Optional[torch.Tensor] = None,
-        intermediate_abs_positions: Optional[torch.Tensor] = None,
-        intermediate_real_count: Optional[torch.Tensor] = None,
-        intermediate_ssm_out: Optional[torch.Tensor] = None,
-        intermediate_conv_out: Optional[torch.Tensor] = None,
-        cu_chunk_seqlens: Optional[torch.Tensor] = None,
-        last_chunk_indices: Optional[torch.Tensor] = None,
-        seq_idx_for_varlen: Optional[torch.Tensor] = None,
-        cu_seqlens_list: Optional[List[int]] = None,
-        real_token_count: Optional[int] = None,
-        conv_seq_idx: Optional[torch.Tensor] = None,
-        conv_seq_start: Optional[torch.Tensor] = None,
+        conv_state: torch.Tensor,
+        ssm_state: torch.Tensor,
+        context: DynamicInferenceContext,
     ) -> torch.Tensor:
         """
-        Performs SSM computation for inference prefill step.
+        Performs the variable-length SSM prefill for all dynamic-batching prefill requests.
+
+        All varlen metadata (cu_seqlens, seq_idx, batch_indices, chunk boundaries,
+        intermediate extraction buffers, etc.) is read directly from
+        `context.mamba_metadata` / `context.mamba_slot_allocator` -- there is no
+        intermediate layer that unpacks the metadata into a long argument list. All
+        prefill requests (including chunked prefill) are processed together through a
+        single varlen kernel call; the precomputed metadata avoids `.item()` calls
+        and data-dependent control flow, enabling CUDA graph compatibility.
+        Intermediate state extraction (for Mamba prefix caching) is performed via
+        pre-allocated output buffers, also CUDA graph compatible.
+
+        When padded_prefill_count > 0 but real_prefill_count == 0 (e.g. a decode-only
+        rank in expert parallelism that must match a mixed CUDA graph), the full kernel
+        path still runs; the metadata reflects zero-length sequences (cu_seqlens all
+        equal, batch_indices all -1) so the kernels produce a correctly-shaped zero
+        output tensor, which is required by the merge logic in `ssm_dynamic_inference`.
 
         Args:
             zxBCdt: The input tensor of shape (l, b, d), which is a concatenation of
                 z, x, B, C, and dt projections.
             conv_state: The convolution state tensor for inference.
             ssm_state: The selective scan state tensor for inference.
-            seq_idx: A map from token index to request index for variable-length sequences.
-            cu_seqlens: Cumulative sequence lengths for variable-length sequences.
-            batch_indices: A map from batch id to position in the Mamba state tensors for
-                dynamic inference.
-            intermediate_chunk_indices: Pre-allocated tensor of chunk indices for
-                intermediate state extraction (fixed size, padded with 0).
-            intermediate_abs_positions: Pre-allocated tensor of absolute token
-                positions for conv state extraction (fixed size, padded with d_conv).
-            intermediate_real_count: int32[1] GPU tensor holding the number of
-                meaningful entries in the intermediate buffers this step. Read
-                inside the Triton scatter kernels so padded slots cost nothing.
-            intermediate_ssm_out: Output buffer for extracted SSM states
-                [max_intermediate_count, *ssm_shape].
-            intermediate_conv_out: Output buffer for extracted conv states
-                [max_intermediate_count, *conv_shape].
-            cu_chunk_seqlens: Precomputed chunk boundaries from MambaMetadata.
-            last_chunk_indices: Precomputed last chunk index per sequence.
-            seq_idx_for_varlen: Precomputed request ID per chunk.
-            cu_seqlens_list: Python list of cumulative sequence lengths (avoids .item()).
-            real_token_count: Number of real (non-padding) tokens.
-            conv_seq_idx: Precomputed per-token request ID for Triton conv1d.
-            conv_seq_start: Precomputed per-token request start for Triton conv1d.
+            context: The dynamic inference context supplying all varlen metadata.
 
         Returns:
-            Output tensor of shape (l, b, d). Intermediate states (if any) are
-            written directly to intermediate_ssm_out and intermediate_conv_out.
+            Output tensor of shape (l, b, d). Intermediate states (if any) are written
+            directly into the slot-allocator buffers held by `context`.
         """
-        is_dynamic_batching = seq_idx is not None
+        assert (
+            self.cp.cp_size == 1
+        ), "Context parallel is not supported for MambaMixer dynamic inference prefill"
+
+        metadata = context.mamba_metadata
+        slot_allocator = context.mamba_slot_allocator
+
+        seq_idx = metadata.seq_idx
+        cu_seqlens = metadata.cu_seqlens
+        batch_indices = metadata.batch_indices_prefill
+        intermediate_chunk_indices = metadata.intermediate_chunk_indices
+        intermediate_abs_positions = metadata.intermediate_abs_positions
+        intermediate_real_count = metadata.intermediate_real_count
+        cu_chunk_seqlens = metadata.cu_chunk_seqlens
+        last_chunk_indices = metadata.last_chunk_indices
+        seq_idx_for_varlen = metadata.seq_idx_for_varlen
+        conv_seq_idx = metadata.conv_seq_idx
+        conv_seq_start = metadata.conv_seq_start
+
+        # Wire the per-layer intermediate extraction buffers (prefix caching) when a
+        # slot allocator is present; otherwise extraction is disabled below.
+        intermediate_ssm_out = None
+        intermediate_conv_out = None
+        if slot_allocator is not None:
+            mamba_layer_idx = context.layer_map[self.layer_number - self.pp_layer_offset - 1]
+            intermediate_ssm_out = slot_allocator.intermediate_ssm_out[mamba_layer_idx]
+            intermediate_conv_out = slot_allocator.intermediate_conv_out[mamba_layer_idx]
 
         # transpose: l b pd --> b l pd
         zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
@@ -861,74 +818,53 @@ class MambaMixer(MegatronModule):
             dim=-1,
         )
 
-        # Compute short convolution
-        xBC_pre_conv = None
-        if conv_state is not None and is_dynamic_batching:
-            assert batch_indices is not None
+        # Compute short convolution (unified varlen path over all prefill requests).
+        assert batch_indices is not None
 
-            # Extract initial conv states BEFORE saving new ones.
-            # causal_conv1d_varlen_states computes the final conv state from the
-            # input sequence and tensor_masked_update writes it into the conv_state
-            # buffer. If we read initial_conv_states after this write, restored
-            # requests see their own newly-computed states instead of the cached
-            # initial states from a previous request, corrupting the conv output.
-            initial_conv_states = conv_state[batch_indices, :, 1:]
+        # Extract initial conv states BEFORE saving new ones.
+        # The state write below overwrites these rows, so reading after it would
+        # hand a restored request its own freshly-computed state instead of the
+        # cached one it must continue from, corrupting the conv output.
+        # A `-1` padding row indexes the last cache slot rather than erroring. The
+        # gathered values are never used: a padding request is zero-length, so the
+        # carry below reproduces the state it read, `tensor_masked_update` skips the
+        # `-1` rows on the write back, and the conv/scan kernels emit zeros for them.
+        previous_conv_states = conv_state[batch_indices]
+        initial_conv_states = previous_conv_states[:, :, 1:]
 
-            # Save final conv states from the input sequence
-            conv_varlen_states = causal_conv1d_varlen_states(
-                xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
-            )
-            tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
+        # Fold this step's slice into each request's conv state. `cu_seqlens`
+        # describes only the slice scheduled this step, so a request whose slice
+        # is shorter than d_conv keeps the columns it arrived with; see
+        # `causal_conv1d_varlen_carry_states` for the column-by-column rule.
+        conv_varlen_states = causal_conv1d_varlen_carry_states(
+            xBC.squeeze(0), cu_seqlens, previous_conv_states
+        )
+        tensor_masked_update(conv_state, batch_indices, conv_varlen_states)
 
-            # Conv state dtype might differ from params dtype, so cast xBC and weight / bias
-            # tensors to the conv state dtype for causal_conv1d_varlen_fn and then cast xBC
-            # back to the original dtype
-            xBC_dtype = xBC.dtype
-            conv_state_dtype = conv_state.dtype
+        # Conv state dtype might differ from params dtype, so cast xBC and weight / bias
+        # tensors to the conv state dtype for causal_conv1d_varlen_fn and then cast xBC
+        # back to the original dtype
+        xBC_dtype = xBC.dtype
+        conv_state_dtype = conv_state.dtype
 
-            xBC = xBC.to(conv_state_dtype)
-            conv_weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w").to(
-                conv_state_dtype
-            )
-            conv_bias = self.cp.get_conv1d_bias().to(conv_state_dtype)
+        xBC = xBC.to(conv_state_dtype)
+        conv_weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w").to(conv_state_dtype)
+        conv_bias = self.cp.get_conv1d_bias().to(conv_state_dtype)
 
-            xBC_pre_conv = xBC if intermediate_conv_out is not None else None
-            from megatron.core.ssm.ops.causal_conv1d_varlen import causal_conv1d_varlen_fn
+        xBC_pre_conv = xBC if intermediate_conv_out is not None else None
+        from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
 
-            xBC_out = causal_conv1d_varlen_fn(
-                x=xBC.squeeze(0).contiguous(),
-                weight=conv_weight,
-                bias=conv_bias,
-                cu_seqlens=cu_seqlens,
-                initial_states=initial_conv_states,
-                activation=self.activation,
-                precomputed_seq_idx=conv_seq_idx,
-                precomputed_seq_start=conv_seq_start,
-            )
-            xBC = xBC_out.to(xBC_dtype).unsqueeze(0)
-        else:
-            # Non-dynamic-batching path (static batching / training fallback)
-            xBC = rearrange(xBC, "b l d -> b d l").contiguous()
-            if conv_state is not None:
-                # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-                conv_state.copy_(
-                    F.pad(xBC, (self.d_conv - xBC.shape[-1], 0))
-                )  # Update state (B D W)
-
-            seqlen = xBC.size(2)
-            if causal_conv1d_fn is None:
-                xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
-            else:
-                assert self.activation in ["silu", "swish"]
-                xBC = causal_conv1d_fn(
-                    x=xBC,
-                    weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                    bias=self.cp.get_conv1d_bias(),
-                    activation=self.activation,
-                    seq_idx=seq_idx,
-                )
-            xBC = rearrange(xBC, "b d l -> b l d").contiguous()
+        xBC_out = causal_conv1d_varlen_fn(
+            x=xBC.squeeze(0).contiguous(),
+            weight=conv_weight,
+            bias=conv_bias,
+            cu_seqlens=cu_seqlens,
+            initial_states=initial_conv_states,
+            activation=self.activation,
+            precomputed_seq_idx=conv_seq_idx,
+            precomputed_seq_start=conv_seq_start,
+        )
+        xBC = xBC_out.to(xBC_dtype).unsqueeze(0)
 
         x, B, C = torch.split(
             xBC,
@@ -955,173 +891,141 @@ class MambaMixer(MegatronModule):
             self.cp.cp_size == 1 or self.rmsnorm
         ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
 
-        if is_dynamic_batching:
-            # Unified varlen SSM path: all prefill requests through single kernel call
-            initial_ssm_state = ssm_state[batch_indices]
+        # Unified varlen SSM path: all prefill requests through single kernel call
+        initial_ssm_state = ssm_state[batch_indices]
 
-            x = x.squeeze(0)
-            dt = dt.squeeze(0)
-            A = A.squeeze(0)
-            B = B.squeeze(0)
-            C = C.squeeze(0)
-            z = z.squeeze(0)
-            # Initialize with zeros so padding positions (beyond cu_chunk_seqlens
-            # boundaries) remain zero, which is safe for RMSNorm and downstream ops.
-            y = torch.zeros_like(x)
+        x = x.squeeze(0)
+        dt = dt.squeeze(0)
+        A = A.squeeze(0)
+        B = B.squeeze(0)
+        C = C.squeeze(0)
+        z = z.squeeze(0)
+        # Initialize with zeros so padding positions (beyond cu_chunk_seqlens
+        # boundaries) remain zero, which is safe for RMSNorm and downstream ops.
+        y = torch.zeros_like(x)
 
-            if cu_chunk_seqlens is not None:
-                # Use precomputed chunk metadata (CUDA graph compatible, no .item())
-                pass
-            else:
-                # Fallback: build chunk metadata from cu_seqlens (non-precomputed)
-                chunk_boundaries = [0]
-                last_chunk_indices_list = []
-                num_seqs = cu_seqlens.numel() - 1
-                for i in range(num_seqs):
-                    start = cu_seqlens[i].item()
-                    end = cu_seqlens[i + 1].item()
-                    pos = start + self.chunk_size
-                    while pos < end:
-                        chunk_boundaries.append(pos)
-                        pos += self.chunk_size
-                    chunk_boundaries.append(end)
-                    last_chunk_indices_list.append(len(chunk_boundaries) - 2)
-
-                cu_chunk_seqlens = cu_seqlens.new_tensor(chunk_boundaries)
-                last_chunk_indices = cu_seqlens.new_tensor(last_chunk_indices_list)
-
-                seq_idx_for_varlen = None
-                if seq_idx is not None:
-                    chunk_starts = cu_chunk_seqlens[:-1]
-                    seq_idx_for_varlen = seq_idx[0, chunk_starts].contiguous()
-
-            # Batch-invariant decode replays the partial prefill tail, so keep
-            # the cached SSM state at the last complete chunk boundary.
-            if self.config.batch_invariant_mode:
-                prefill_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
-                tail_lens = prefill_lens % self.chunk_size
-                has_boundary = prefill_lens >= self.chunk_size
-                # A partial tail uses the preceding full chunk's state.
-                boundary_chunk_indices = (
-                    last_chunk_indices.to(torch.long) - (tail_lens > 0).to(torch.long)
-                ).clamp(min=0)
-
-            # Extraction is enabled when the slot allocator wired buffers in via
-            # the caller. When enabled, the chunk scan returns its raw states so
-            # our Triton kernels do a fused gather+conditional-scatter directly,
-            # skipping the dense intermediate tensor and the padded-slot writes.
-            extract_intermediates = (
-                not self.config.batch_invariant_mode
-                and intermediate_chunk_indices is not None
-                and intermediate_ssm_out is not None
-            )
-            ssm_varlen_result = mamba_chunk_scan_combined_varlen(
-                x=x,
-                dt=dt,
-                A=A,
-                B=B,
-                C=C,
-                chunk_size=self.chunk_size,
-                cu_chunk_seqlens=cu_chunk_seqlens,
-                last_chunk_indices=last_chunk_indices,
-                seq_idx=seq_idx_for_varlen,
-                out=y,
-                D=(
-                    rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-                    if self.D_has_hdim
-                    else self.cp.get_D()
-                ),
-                z=z if (self.config.batch_invariant_mode or not self.rmsnorm) else None,
-                dt_bias=self.cp.get_dt_bias().float(),
-                initial_states=initial_ssm_state,
-                return_raw_states=self.config.batch_invariant_mode or extract_intermediates,
-                dt_softplus=True,
-                dt_limit=(0.0, float("inf")),
-                state_dtype=ssm_state.dtype,
-            )
-
-            if self.config.batch_invariant_mode or extract_intermediates:
-                ssm_varlen_states, raw_ssm_states = ssm_varlen_result
-            else:
-                ssm_varlen_states = ssm_varlen_result
-                raw_ssm_states = None
-
-            y = y.unsqueeze(0)
-            z = z.unsqueeze(0)
-
-            if self.config.batch_invariant_mode:
-                boundary_mask = has_boundary.view(-1, 1, 1, 1)
-                cache_states = torch.where(
-                    boundary_mask, raw_ssm_states[boundary_chunk_indices], initial_ssm_state
-                )
-            else:
-                cache_states = ssm_varlen_states
-
-            tensor_masked_update(ssm_state, batch_indices, cache_states)
-            if self.config.batch_invariant_mode:
-                self._get_batch_invariant_decoder().seed(
-                    x,
-                    z.squeeze(0),
-                    dt,
-                    B,
-                    C,
-                    cu_seqlens,
-                    batch_indices,
-                    max_requests=ssm_state.shape[0],
-                )
-
-            if extract_intermediates:
-                # Fused gather+conditional-scatter for SSM: read row
-                # raw_ssm_states[chunk_indices[i]] into intermediate_ssm_out[i],
-                # only for i < real_count.
-                scatter_intermediate_ssm(
-                    raw_ssm_states,
-                    intermediate_chunk_indices,
-                    intermediate_real_count,
-                    intermediate_ssm_out,
-                )
-                # Same pattern for conv: gather a length-d_conv window ending at
-                # abs_positions[i] (clamped into the valid token range) from
-                # xBC_pre_conv and scatter (transposed) into intermediate_conv_out[i],
-                # only for i < real_count.
-                scatter_intermediate_conv(
-                    xBC_pre_conv,
-                    intermediate_abs_positions,
-                    intermediate_real_count,
-                    intermediate_conv_out,
-                    d_conv=intermediate_conv_out.shape[-1],
-                )
+        if cu_chunk_seqlens is not None:
+            # Use precomputed chunk metadata (CUDA graph compatible, no .item())
+            pass
         else:
-            # Non-dynamic-batching path (static batching)
-            initial_ssm_state = None
-            state_dtype_kwarg = (
-                {"state_dtype": self.mamba_training_ssm_states_dtype}
-                if MAMBA_HAS_STATE_DTYPE
-                else {}
+            # Fallback: build chunk metadata from cu_seqlens (non-precomputed)
+            chunk_boundaries = [0]
+            last_chunk_indices_list = []
+            num_seqs = cu_seqlens.numel() - 1
+            for i in range(num_seqs):
+                start = cu_seqlens[i].item()
+                end = cu_seqlens[i + 1].item()
+                pos = start + self.chunk_size
+                while pos < end:
+                    chunk_boundaries.append(pos)
+                    pos += self.chunk_size
+                chunk_boundaries.append(end)
+                last_chunk_indices_list.append(len(chunk_boundaries) - 2)
+
+            cu_chunk_seqlens = cu_seqlens.new_tensor(chunk_boundaries)
+            last_chunk_indices = cu_seqlens.new_tensor(last_chunk_indices_list)
+
+            seq_idx_for_varlen = None
+            if seq_idx is not None:
+                chunk_starts = cu_chunk_seqlens[:-1]
+                seq_idx_for_varlen = seq_idx[0, chunk_starts].contiguous()
+
+        # Batch-invariant decode replays the partial prefill tail, so keep
+        # the cached SSM state at the last complete chunk boundary.
+        if self.config.batch_invariant_mode:
+            prefill_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
+            tail_lens = prefill_lens % self.chunk_size
+            has_boundary = prefill_lens >= self.chunk_size
+            # A partial tail uses the preceding full chunk's state.
+            boundary_chunk_indices = (
+                last_chunk_indices.to(torch.long) - (tail_lens > 0).to(torch.long)
+            ).clamp(min=0)
+
+        # Extraction is enabled when the slot allocator wired buffers in via
+        # the caller. When enabled, the chunk scan returns its raw states so
+        # our Triton kernels do a fused gather+conditional-scatter directly,
+        # skipping the dense intermediate tensor and the padded-slot writes.
+        extract_intermediates = (
+            not self.config.batch_invariant_mode
+            and intermediate_chunk_indices is not None
+            and intermediate_ssm_out is not None
+        )
+        ssm_varlen_result = mamba_chunk_scan_combined_varlen(
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            chunk_size=self.chunk_size,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            last_chunk_indices=last_chunk_indices,
+            seq_idx=seq_idx_for_varlen,
+            out=y,
+            D=(
+                rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+                if self.D_has_hdim
+                else self.cp.get_D()
+            ),
+            z=z if (self.config.batch_invariant_mode or not self.rmsnorm) else None,
+            dt_bias=self.cp.get_dt_bias().float(),
+            initial_states=initial_ssm_state,
+            return_raw_states=self.config.batch_invariant_mode or extract_intermediates,
+            dt_softplus=True,
+            dt_limit=(0.0, float("inf")),
+            state_dtype=ssm_state.dtype,
+        )
+
+        if self.config.batch_invariant_mode or extract_intermediates:
+            ssm_varlen_states, raw_ssm_states = ssm_varlen_result
+        else:
+            ssm_varlen_states = ssm_varlen_result
+            raw_ssm_states = None
+
+        y = y.unsqueeze(0)
+        z = z.unsqueeze(0)
+
+        if self.config.batch_invariant_mode:
+            boundary_mask = has_boundary.view(-1, 1, 1, 1)
+            cache_states = torch.where(
+                boundary_mask, raw_ssm_states[boundary_chunk_indices], initial_ssm_state
             )
-            y = mamba_chunk_scan_combined(
+        else:
+            cache_states = ssm_varlen_states
+
+        tensor_masked_update(ssm_state, batch_indices, cache_states)
+        if self.config.batch_invariant_mode:
+            self._get_batch_invariant_decoder().seed(
                 x,
+                z.squeeze(0),
                 dt,
-                A,
                 B,
                 C,
-                self.chunk_size,
-                D=(
-                    rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
-                    if self.D_has_hdim
-                    else self.cp.get_D()
-                ),
-                z=z if not self.rmsnorm else None,
-                dt_bias=self.cp.get_dt_bias().float(),
-                dt_softplus=True,
-                return_final_states=ssm_state is not None,
-                initial_states=initial_ssm_state,
-                **state_dtype_kwarg,
+                cu_seqlens,
+                batch_indices,
+                max_requests=ssm_state.shape[0],
             )
 
-            if ssm_state is not None:
-                y, last_state = y
-                ssm_state.copy_(last_state)
+        if extract_intermediates:
+            # Fused gather+conditional-scatter for SSM: read row
+            # raw_ssm_states[chunk_indices[i]] into intermediate_ssm_out[i],
+            # only for i < real_count.
+            scatter_intermediate_ssm(
+                raw_ssm_states,
+                intermediate_chunk_indices,
+                intermediate_real_count,
+                intermediate_ssm_out,
+            )
+            # Same pattern for conv: gather a length-d_conv window ending at
+            # abs_positions[i] (clamped into the valid token range) from
+            # xBC_pre_conv and scatter (transposed) into intermediate_conv_out[i],
+            # only for i < real_count.
+            scatter_intermediate_conv(
+                xBC_pre_conv,
+                intermediate_abs_positions,
+                intermediate_real_count,
+                intermediate_conv_out,
+                d_conv=intermediate_conv_out.shape[-1],
+            )
 
         y = rearrange(y, "b l h p -> l b (h p)").contiguous()
         y = self.cp.post_conv_ssm(y)
@@ -1132,6 +1036,12 @@ class MambaMixer(MegatronModule):
             y = self.norm(y, None if self.config.batch_invariant_mode else z)
 
         return y
+
+    @torch.no_grad()
+    def refresh_cache(self) -> None:
+        """Refresh the existing decode-cache storage from the current ``A_log``."""
+        self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
+        self._A_neg_exp_cache_stale = False
 
     def _get_decode_A_neg_exp(self) -> torch.Tensor:
         """Cached ``-exp(A_log.float())`` pre-expanded to ``(nheads, headdim, dstate)``.
@@ -1146,9 +1056,7 @@ class MambaMixer(MegatronModule):
             return base.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
         # Inference path. Refill when stale
         if self._A_neg_exp_cache_stale:
-            with torch.no_grad():
-                self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
-            self._A_neg_exp_cache_stale = False
+            self.refresh_cache()
         return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
 
     def _get_batch_invariant_decoder(self) -> MambaBatchInvariantDecode:
@@ -1158,14 +1066,15 @@ class MambaMixer(MegatronModule):
         return self._batch_invariant_decoder
 
     def train(self, mode: bool = True):
-        """Mark the decode cache stale; weights may have updated."""
+        """Mark the decode cache stale in training and refresh it for evaluation."""
         if mode:
-            # only mark stale when switching to training mode.
-            # otherwise retain the staleness state.
             self._A_neg_exp_cache_stale = True
+        elif self._A_neg_exp_cache_stale:
+            # CUDA graph replay bypasses the Python lazy-refresh path.
+            self.refresh_cache()
         return super().train(mode)
 
-    def _ssm_decode(
+    def ssm_decode(
         self,
         zxBCdt: torch.Tensor,
         conv_state: torch.Tensor,
@@ -1368,6 +1277,17 @@ class MambaMixer(MegatronModule):
         conv_states_shape = (self.conv1d_weight.shape[0], self.d_conv)
         ssm_states_shape = (self.nheads_local_tp, self.headdim, self.d_state)
         return (conv_states_shape, ssm_states_shape)
+
+    @property
+    def ssm_inference_chunk_size(self) -> int:
+        """Chunk length the dynamic-inference prefill kernels actually run at.
+
+        The Mamba2 SSD kernels run at the same chunk size for training and
+        inference, so this is just `chunk_size`. It exists so callers that need
+        a chunk-aligned boundary can ask every SSM mixer the same question --
+        Gated Delta Product answers 64 regardless of its `chunk_size`.
+        """
+        return self.chunk_size
 
     def _get_states_from_cache(self, inference_context, batch_size, *, inference_params=None):
         """Initializes or retrieves the SSM state tensors from the cache.

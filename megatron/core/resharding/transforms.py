@@ -5,14 +5,20 @@ from __future__ import annotations
 Reshard transforms for custom send/recv/writeback during weight transfer.
 
 - ReshardTransform: base class for pluggable format conversion hooks.
-- MXFP8ReshardTransform: writes received BF16 data into persistent FlashInfer
+- MXFP8ReshardTransform: writes received BF16 data into persistent
   MXFP8Tensor buffers so CUDA-graph device-pointer captures remain valid.
 """
 
 import torch
 
-from megatron.core.fp8_utils import dequantize_fp8_tensor, is_mxfp8tensor
-from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.fp8_utils import dequantize_fp8_tensor, is_float8tensor, is_mxfp8tensor
+from megatron.core.inference.quantization.mxfp8_tensor import (
+    MXFP8Backend,
+    MXFP8Tensor,
+    ensure_mxfp8_scale_dtype,
+    validate_mxfp8_tensor,
+)
+from megatron.core.tensor_parallel import gtp_api
 
 
 class ReshardTransform:
@@ -105,6 +111,12 @@ def _ensure_sendable(param: torch.Tensor) -> torch.Tensor:
     dequantized to their original precision (usually BF16).  Standard
     parameters are returned via ``.data`` (unwrapped from autograd).
     """
+    if gtp_api.HAVE_GTP and gtp_api.is_gtp_param(param) and is_float8tensor(param):
+        # Native quantized GTP parameters use a dynamic GTP_<QuantizedTensor>
+        # subclass. Transformer Engine dispatches dequantization on the exact
+        # base class, so use GTP's temporary reclassification helper. Despite
+        # its name, the helper handles both native FP8 and NVFP4 parameters.
+        return gtp_api.dequantize_gtp_native_fp8(param)
     if is_mxfp8tensor(param):
         return dequantize_fp8_tensor(param)
     return param.data
@@ -152,6 +164,9 @@ class MXFP8ReshardTransform(ReshardTransform):
         convert_on_send: if True, convert BF16 → MXFP8 on the sender and
             transmit two tensors (data + scale).  If False (default),
             transmit BF16 and convert on the receiver in ``finalize_recv``.
+        backend: backend used for conversion. It is inferred from persistent
+            buffers on the receiver. A sender with no persistent buffers must
+            provide it explicitly.
     """
 
     def __init__(
@@ -160,13 +175,25 @@ class MXFP8ReshardTransform(ReshardTransform):
         persistent_buffers: dict,
         buffer_key_prefix: str = "",
         convert_on_send: bool = False,
+        backend: MXFP8Backend | None = None,
     ):
         self.convertible_params = convertible_params
         self.persistent_buffers = persistent_buffers
         self.buffer_key_prefix = buffer_key_prefix
         self.convert_on_send = convert_on_send
+        self.backend = backend
+        if self.backend is None and self.persistent_buffers:
+            self.backend = next(iter(self.persistent_buffers.values())).backend
+        if self.convert_on_send:
+            assert self.backend is not None, "backend is required for sender-side conversion"
+        for name, buffer in self.persistent_buffers.items():
+            validate_mxfp8_tensor(
+                buffer,
+                expected_backend=self.backend,
+                tensor_name=f"persistent refit buffer {name!r}",
+            )
         # Accumulation buffers for 1D-scale params that arrive in partial slices.
-        # The 1D swizzled FlashInfer scale can't be updated partially; we collect
+        # A 1D swizzled scale can't be updated partially; we collect
         # all BF16 slices here and quantize the full weight once it's assembled.
         # Maps buf_key -> (full-size BF16 accumulation tensor, elements written so far).
         self._pending_1d: dict = {}
@@ -179,9 +206,8 @@ class MXFP8ReshardTransform(ReshardTransform):
     def prepare_send(self, param_name, src_slice, src_param):
         src_data = _ensure_sendable(src_param)
         if self.convert_on_send:
-
             bf16_data = src_data[src_slice].contiguous().to(torch.bfloat16)
-            mxfp8 = MXFP8Tensor.from_bf16(bf16_data)
+            mxfp8 = MXFP8Tensor.from_bf16(bf16_data, backend=self.backend)
             return [mxfp8.data.contiguous(), mxfp8.scale.contiguous()]
         else:
             # BF16 on the wire — same as the default reshard path.
@@ -235,9 +261,11 @@ class MXFP8ReshardTransform(ReshardTransform):
             # (1D scale is rejected at prepare_recv time, so only 2D reaches here.)
             buf.data[dst_slice].copy_(recv_buffers[0])
             scale_slice = _scale_slice_from_data_slice(dst_slice)
-            buf.scale[scale_slice].copy_(recv_buffers[1])
+            # copy_ is not implemented for float8_e8m0fnu, so copy its raw bytes.
+            recv_scale = ensure_mxfp8_scale_dtype(recv_buffers[1]).view(torch.uint8)
+            buf.scale[scale_slice].view(torch.uint8).copy_(recv_scale)
         elif buf.scale.ndim == 1:
-            # 1D swizzled scale (FlashInfer format) encodes scale values across the
+            # A 1D swizzled scale encodes scale values across the
             # full weight tensor; partial updates would corrupt the swizzle layout.
             # Accumulate BF16 slices and quantize once all slices are assembled.
             if buf_key not in self._pending_1d:
@@ -259,16 +287,14 @@ class MXFP8ReshardTransform(ReshardTransform):
                         f"1D-scale param {param_name!r}: received {written} elements, "
                         f"expected {buf.data.numel()} (duplicate or missing slices?)"
                     )
-                mxfp8 = MXFP8Tensor.from_bf16(accum)
-                buf.data.copy_(mxfp8.data)
-                buf.scale.copy_(mxfp8.scale)
+                buf.copy_(accum)
                 del self._pending_1d[buf_key]
             else:
                 self._pending_1d[buf_key][1] = written
         else:
             # 2D scale: each scale row covers exactly one data row, so partial
             # row-wise updates are independent and can be applied immediately.
-            mxfp8 = MXFP8Tensor.from_bf16(recv_buffers[0])
+            mxfp8 = MXFP8Tensor.from_bf16(recv_buffers[0], backend=buf.backend)
             buf.data[dst_slice].copy_(mxfp8.data)
             scale_slice = _scale_slice_from_data_slice(dst_slice)
-            buf.scale[scale_slice].copy_(mxfp8.scale)
+            buf.scale[scale_slice].view(torch.uint8).copy_(mxfp8.scale.view(torch.uint8))

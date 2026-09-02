@@ -261,6 +261,7 @@ class TestGPTModelConfigInitialization:
         assert config.should_pad_vocab is False
         assert config.seq_length == 1024
         assert config.fp16_lm_cross_entropy is False
+        assert config.logit_dtype is None
         assert config.parallel_output is True
         assert config.share_embeddings_and_output_weights is False
         assert config.position_embedding_type == "learned_absolute"
@@ -279,6 +280,7 @@ class TestGPTModelConfigInitialization:
             transformer=_make_transformer(),
             seq_length=4096,
             fp16_lm_cross_entropy=True,
+            logit_dtype=torch.float32,
             parallel_output=False,
             share_embeddings_and_output_weights=True,
             position_embedding_type="rope",
@@ -287,6 +289,7 @@ class TestGPTModelConfigInitialization:
         )
         assert config.seq_length == 4096
         assert config.fp16_lm_cross_entropy is True
+        assert config.logit_dtype == torch.float32
         assert config.parallel_output is False
         assert config.share_embeddings_and_output_weights is True
         assert config.position_embedding_type == "rope"
@@ -659,11 +662,11 @@ class TestGPTModelBuilderBuildModel:
         mock_mtp = patches[-1]
         mtp_spec = ModuleSpec(module=object)
         mock_mtp.return_value = mtp_spec
+        self.pg.pp.rank.return_value = 1
 
         self.builder.build_model(self.pg, pre_process=True, post_process=True, vp_stage=1)
 
-        # mtp_block_spec is called with (config, transformer_layer_spec, vp_stage=vp_stage)
-        mock_mtp.assert_called_once_with(self.config, self._default_spec, vp_stage=1)
+        mock_mtp.assert_called_once_with(self.config, self._default_spec, vp_stage=1, pp_rank=1)
         assert mock_model.call_args.kwargs["mtp_block_spec"] is mtp_spec
 
     @patch("megatron.training.models.gpt.mtp_block_spec", return_value=None)
@@ -678,6 +681,7 @@ class TestGPTModelBuilderBuildModel:
             vocab_size=32000,
             seq_length=4096,
             fp16_lm_cross_entropy=True,
+            logit_dtype=torch.float32,
             parallel_output=False,
             share_embeddings_and_output_weights=True,
             position_embedding_type="rope",
@@ -699,6 +703,7 @@ class TestGPTModelBuilderBuildModel:
         assert kw["vocab_size"] == 32000
         assert kw["max_sequence_length"] == 4096
         assert kw["fp16_lm_cross_entropy"] is True
+        assert kw["logit_dtype"] == torch.float32
         assert kw["parallel_output"] is False
         assert kw["share_embeddings_and_output_weights"] is True
         assert kw["position_embedding_type"] == "rope"
@@ -879,11 +884,12 @@ class TestMtpBlockSpec:
             "megatron.training.models.gpt.get_gpt_decoder_layer_specs"
         ) as mock_decoder_specs:
             mock_decoder_specs.return_value = [Mock(), Mock()]
-            mtp_block_spec(config, spec, vp_stage=3)
+            mtp_block_spec(config, spec, vp_stage=3, pp_rank=7)
 
         call_kwargs = mock_get_mtp.call_args.kwargs
         assert call_kwargs["use_transformer_engine"] is True
         assert call_kwargs["vp_stage"] == 3
+        assert call_kwargs["pp_rank"] == 7
 
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
     def test_use_transformer_engine_false_when_impl_not_te(self, mock_get_mtp):

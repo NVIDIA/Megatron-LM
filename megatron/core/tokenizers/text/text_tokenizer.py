@@ -31,7 +31,6 @@ class MegatronTokenizerText(MegatronTokenizerBase):
                 library (str): tokenizer library.
                 class_name (str): name of tokenizer class.
                 class_path (str): path to tokenizer class.
-                model_type (str): type of the model to be used with tokenizer.
                 chat_template (str): tokenizer chat template.
         """
 
@@ -145,6 +144,27 @@ class MegatronTokenizerText(MegatronTokenizerBase):
             )
         else:
             raise NotImplementedError("This method is supported only for SFTTokenizer.")
+
+    def tokenize_files(self, paths: str | list[str], field: str = "text") -> "ak.Array":
+        """
+        Tokenizes whole jsonl files with gigatoken.
+        Only supported for `huggingface` and `megatron` libraries.
+
+        Args:
+            paths (str | list[str]): path to the jsonl file(s).
+            field (str): field name to extract text from jsonl file(s).
+        Returns:
+            ak.Array: an array of tokenized documents.
+        """
+
+        if self.library in ["huggingface", "megatron"]:
+            if isinstance(paths, str):
+                paths = [paths]
+            return self._tokenizer.encode_files(paths, field=field)
+        else:
+            raise NotImplementedError(
+                "This method is supported only for `huggingface` and `megatron` libraries."
+            )
 
     def save_pretrained(self, path: str) -> None:
         """

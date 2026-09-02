@@ -17,6 +17,7 @@ CHECK_THRESHOLDS = {
     "mem-max-allocated-bytes": [common.ApproximateTest(atol=0, rtol=0.05)],
     "lm loss": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
     "mtp_1 loss": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
+    "mtp_2 loss": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
     "num-zeros": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.20)],
     "generated_tokens": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],
     "logprobs": [common.DeterministicTest(), common.ApproximateTest(atol=0, rtol=0.05)],

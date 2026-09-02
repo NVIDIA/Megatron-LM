@@ -5,7 +5,7 @@ import concurrent
 import copy
 import functools
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import numpy as np
@@ -29,6 +29,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import (
+    InferenceMode,
     get_attention_mask,
     set_decode_expert_padding,
     set_moe_metadata_sync,
@@ -175,6 +176,9 @@ class _AsyncScheduleRequestResult:
     survivor_idxs: Optional[Tensor] = None
     newly_paused_request_ids: Optional[Tensor] = None
     evict_request_ids: Optional[Tensor] = None
+    finished_handoff_block_ids: Dict[int, List[int]] = field(default_factory=dict)
+    finished_handoff_ssm_slots: Dict[int, int] = field(default_factory=dict)
+    finished_handoff_decode_tokens: Dict[int, List[int]] = field(default_factory=dict)
 
 
 @dataclass
@@ -817,15 +821,50 @@ class TextGenerationController:
             position_ids (Tensor): The position IDs.
         """
         context = self.inference_wrapped_model.inference_context
+        token_capacity = self.model_config.inference_flashinfer_mxfp8_token_capacity
+        decode_token_upper_bound = (
+            context.max_requests
+            * (self.num_speculative_tokens + 1)
+            * self.model_config.expert_model_parallel_size
+        )
+        InferenceMode.set_bounded_mxfp8_rows(
+            context.is_decode_only()
+            and token_capacity is not None
+            and decode_token_upper_bound <= token_capacity
+        )
         if context.config.materialize_only_last_token_logits:
             logits_seq_len = context.num_last_token_logits
         else:
             logits_seq_len = context.padded_active_token_count
 
-        with torch.inference_mode():
-            logits = self.inference_wrapped_model.run_one_forward_step(
-                {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
+        # Check for VLM image data in the context. Skip the helpers entirely
+        # on text-only workloads so the decode critical path doesn't call
+        # them once per step (both would return None but still take an
+        # attribute-access hop).
+        if context.has_vlm_data:
+            image_token_mask = context.current_image_token_mask()
+            image_embeddings = context.current_image_embeddings()
+            has_images = (
+                image_token_mask is not None
+                and image_embeddings is not None
+                and (image_token_mask >= 0).any()
             )
+        else:
+            image_token_mask = None
+            image_embeddings = None
+            has_images = False
+
+        inference_input = {
+            "tokens": input_ids,
+            "position_ids": position_ids,
+            "attention_mask": None,
+        }
+        if has_images:
+            inference_input["image_token_mask"] = image_token_mask
+            inference_input["image_embeddings"] = image_embeddings
+
+        with torch.inference_mode():
+            logits = self.inference_wrapped_model.run_one_forward_step(inference_input)
             # logits shape: [1, seq_len, vocab_size]
 
         if not context.config.materialize_only_last_token_logits:
@@ -978,6 +1017,17 @@ class TextGenerationController:
         if has_mtp:
             # Get decoder hidden states at last accepted positions.
             hidden_states = context.mtp_decoder_hidden_states
+
+            # Block-scope CUDA graphs write into a persistent max_tokens-sized
+            # buffer. Only the prefix for this step is valid. Slice each rank's
+            # local SP shard before gathering; gathering the oversized buffer
+            # would place rank 0's stale tail between the valid rank shards.
+            if context.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                local_token_count = context.padded_active_token_count
+                if self._sp_enabled:
+                    assert local_token_count % self._tp_size == 0
+                    local_token_count //= self._tp_size
+                hidden_states = hidden_states[:local_token_count]
 
             # When SP is active the decoder output is in scattered format
             # [S/TP, B, H], but _last_accepted_seq_indices are indices into
@@ -1888,6 +1938,49 @@ class TextGenerationController:
             if request_id in stop_word_finished_ids:
                 active_request_mask[idx] = 0
 
+    def _collect_finished_handoff_state(
+        self,
+        finished_idxs: Tensor,
+        sampled_tokens_cpu: Tensor,
+        sampled_mtp_tokens_cpu: Optional[Tensor],
+    ) -> Tuple[Dict[int, List[int]], Dict[int, int], Dict[int, List[int]]]:
+        """Preserve completed prompt state and capture tokens needed to resume decode."""
+
+        context = self.inference_wrapped_model.inference_context
+        allocator = context.kv_block_allocator
+        finished_block_ids: Dict[int, List[int]] = {}
+        finished_ssm_slots: Dict[int, int] = {}
+        decode_tokens_by_request: Dict[int, List[int]] = {}
+        if not allocator.enable_handoff_pinning or finished_idxs.numel() == 0:
+            return finished_block_ids, finished_ssm_slots, decode_tokens_by_request
+
+        for finished_idx in finished_idxs.tolist():
+            request_id = int(context.request_ids[finished_idx].item())
+            blocks = context.request_to_kv_block_ids[finished_idx]
+            valid_blocks = [int(block) for block in blocks.tolist() if block != -1]
+            if valid_blocks:
+                finished_block_ids[request_id] = valid_blocks
+                # Retain across context cleanup. For an exclusively owned block:
+                # active=1, retain=2, request cleanup=1, coordinator RELEASE_KV=0.
+                allocator.retain_memory_blocks(valid_blocks)
+                if context.is_hybrid_model:
+                    # Transfer ownership out of the finished request before normal
+                    # cleanup; the slot stays absent from the free-slot stack until
+                    # the prefill engine receives RELEASE_KV.
+                    finished_ssm_slots[request_id] = context.mamba_metadata.detach_state_slot(
+                        finished_idx
+                    )
+
+            active_idx = finished_idx - context.paused_request_count
+            decode_tokens = [int(sampled_tokens_cpu[active_idx].item())]
+            if sampled_mtp_tokens_cpu is not None:
+                decode_tokens.extend(
+                    int(token) for token in sampled_mtp_tokens_cpu[:, active_idx].tolist()
+                )
+            decode_tokens_by_request[request_id] = decode_tokens
+
+        return finished_block_ids, finished_ssm_slots, decode_tokens_by_request
+
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
@@ -1940,6 +2033,12 @@ class TextGenerationController:
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
+        chunked_prefill_idx = context.get_index_of_chunked_prefill_request(safe=True)
+        if chunked_prefill_idx >= 0:
+            # The provisional length mask can mark a partial prefill chunk as
+            # finished. update_requests() keeps it active; keep completion-side
+            # routing and handoff bookkeeping consistent with that decision.
+            finished_idxs = finished_idxs[finished_idxs != chunked_prefill_idx]
         finished_request_ids = context.request_ids[finished_idxs]
 
         # Save block IDs for finished requests before update_requests releases them.
@@ -1952,6 +2051,14 @@ class TextGenerationController:
                 valid = blocks[blocks >= 0].tolist()
                 if valid:
                     finished_routing_block_ids[req_id] = valid
+
+        # Retain finished prefill blocks before request cleanup releases them;
+        # the handoff path owns this reference until the decode transfer completes.
+        finished_handoff_block_ids, finished_handoff_ssm_slots, finished_handoff_decode_tokens = (
+            self._collect_finished_handoff_state(
+                finished_idxs, sampled_tokens_cpu, sampled_mtp_tokens_cpu
+            )
+        )
 
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused buffer.
@@ -1973,6 +2080,9 @@ class TextGenerationController:
             # D2H sync when the engine later calls sample.tolist().
             "sample": sampled_tokens_cpu,
             "finished_routing_block_ids": finished_routing_block_ids,
+            "finished_handoff_block_ids": finished_handoff_block_ids,
+            "finished_handoff_ssm_slots": finished_handoff_ssm_slots,
+            "finished_handoff_decode_tokens": finished_handoff_decode_tokens,
             **(update_result or {}),
         }
 
@@ -2178,10 +2288,14 @@ class TextGenerationController:
             chunked_prefill_rows = torch.nonzero(
                 active_request_ids == context.chunked_prefill_request_id, as_tuple=True
             )[0]
+            # Under memory pressure, the next chunk may not be admitted, so the
+            # chunked-prefill request can remain hidden for a step while active decode
+            # requests use overlap. Zero matches is valid; multiple matches are not.
             assert (
-                chunked_prefill_rows.numel() == 1
-            ), "The active chunked-prefill request must have exactly one row."
-            active_request_mask[chunked_prefill_rows[0]] = 1
+                chunked_prefill_rows.numel() <= 1
+            ), "The chunked-prefill request must have at most one active row."
+            if chunked_prefill_rows.numel() == 1:
+                active_request_mask[chunked_prefill_rows[0]] = 1
 
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
@@ -2678,6 +2792,15 @@ class TextGenerationController:
         )
         range_pop()
 
+        finished_idxs = (
+            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
+        )
+        finished_handoff_block_ids, finished_handoff_ssm_slots, finished_handoff_decode_tokens = (
+            self._collect_finished_handoff_state(
+                finished_idxs, sampled_tokens_cpu, sample_result.sampled_mtp_tokens_cpu_view
+            )
+        )
+
         # Resolve CPU request lifecycle state.
         range_push("resolve_requests")
         resolved_finished_request_ids, survivor_idxs = context.resolve_requests(active_request_mask)
@@ -2695,6 +2818,9 @@ class TextGenerationController:
             active_request_ids=active_request_ids,
             finished_request_ids=finished_request_ids,
             survivor_idxs=survivor_idxs,
+            finished_handoff_block_ids=finished_handoff_block_ids,
+            finished_handoff_ssm_slots=finished_handoff_ssm_slots,
+            finished_handoff_decode_tokens=finished_handoff_decode_tokens,
         )
 
     def _run_async_sched_update_requests(
@@ -2722,6 +2848,15 @@ class TextGenerationController:
             self._build_async_sched_request_state(sampled_tokens_cpu, resolved_sequence_lengths)
         )
 
+        finished_idxs = (
+            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
+        )
+        finished_handoff_block_ids, finished_handoff_ssm_slots, finished_handoff_decode_tokens = (
+            self._collect_finished_handoff_state(
+                finished_idxs, sampled_tokens_cpu, sample_result.sampled_mtp_tokens_cpu_view
+            )
+        )
+
         mutable_sampled_tokens_cpu = sampled_tokens_cpu.clone()
         mutable_sampled_mtp_tokens_cpu = (
             sample_result.sampled_mtp_tokens_cpu_view.clone()
@@ -2743,6 +2878,9 @@ class TextGenerationController:
             finished_request_ids=finished_request_ids,
             newly_paused_request_ids=update_result.get("newly_paused_request_ids"),
             evict_request_ids=update_result.get("evict_request_ids"),
+            finished_handoff_block_ids=finished_handoff_block_ids,
+            finished_handoff_ssm_slots=finished_handoff_ssm_slots,
+            finished_handoff_decode_tokens=finished_handoff_decode_tokens,
         )
 
     def _build_async_sched_step_result(
@@ -2784,6 +2922,9 @@ class TextGenerationController:
                 "finished_request_ids": request_result.finished_request_ids,
                 "sample": request_result.sampled_tokens_cpu,
                 "finished_routing_block_ids": {},
+                "finished_handoff_block_ids": request_result.finished_handoff_block_ids,
+                "finished_handoff_ssm_slots": request_result.finished_handoff_ssm_slots,
+                "finished_handoff_decode_tokens": request_result.finished_handoff_decode_tokens,
                 "newly_paused_request_ids": request_result.newly_paused_request_ids,
                 "evict_request_ids": request_result.evict_request_ids,
                 "accepted_tokens": request_result.accepted_tokens_cpu,
@@ -2870,7 +3011,10 @@ class TextGenerationController:
 
         decode_only = DecodeOnly(consumed=consumed_decode_only, launched=launched_decode_only)
         if not had_pending_forward:
-            assert active_request_count > 0, "Async no-overlap admission did not add a request."
+            if active_request_count == 0:
+                # An admission callback may resolve queued work without adding
+                # anything that requires a model forward.
+                return DynamicBatchControllerStepResult(decode_only=decode_only)
             return DynamicBatchControllerStepResult(decode_only=decode_only, primer_only=True)
 
         if log_probs_transfer is not None:
@@ -3261,11 +3405,15 @@ class TextGenerationController:
         self._validate_async_sched_support_for_step(run_async_overlap)
 
         active_request_count = context.total_request_count - context.paused_request_count
-        if context.active_token_count == 0 and active_request_count == 0 and run_async_overlap:
+        if context.active_token_count == 0 and active_request_count == 0:
+            # A lifecycle reset such as RECOMPUTE suspend/resume can remove every
+            # request represented by a pending forward. Discard those stale logits
+            # before the no-overlap path admits and primes the restored requests.
             self._async_sched_logits.clear()
-            return DynamicBatchControllerStepResult(
-                decode_only=DecodeOnly(consumed=None, launched=None)
-            )
+            if run_async_overlap:
+                return DynamicBatchControllerStepResult(
+                    decode_only=DecodeOnly(consumed=None, launched=None)
+                )
 
         if not run_async_overlap or not self._async_sched_logits.is_valid:
             return await self._run_async_sched_step_no_overlap(
@@ -3639,7 +3787,7 @@ class TextGenerationController:
                 if sampling_params.num_tokens_to_generate > 0:
                     # Check end of generation status for each tensor
                     # and update generated sequence lengths
-                    (is_generation_done_tensor, generated_sequence_lengths) = (
+                    is_generation_done_tensor, generated_sequence_lengths = (
                         self.update_generation_status(
                             updated_prompts_tokens=batch_prompt_tokens,
                             generation_started=generation_started,

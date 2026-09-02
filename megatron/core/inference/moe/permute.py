@@ -13,6 +13,11 @@ from unittest.mock import MagicMock
 
 import torch
 
+from megatron.core.inference.quantization.mxfp8_quantize import (
+    MXFP8_BLOCK_SIZE,
+    MXFP8_SCALE_COL_BLOCK,
+    MXFP8_SCALE_ROW_BLOCK,
+)
 from megatron.core.utils import null_decorator
 
 from . import batch_invariant
@@ -299,6 +304,7 @@ def permute_tokens(
     valid_tokens: torch.Tensor,
     alignment: int = 1,
     return_batch_invariant_inverse_map: bool = False,
+    row_alignment: int = 1,
 ) -> tuple:
     """Permute tokens into expert-grouped order.
 
@@ -317,6 +323,7 @@ def permute_tokens(
         alignment: per-expert token alignment (default 1).
         return_batch_invariant_inverse_map: if True, also return the map used by
             batch-invariant unpermute.
+        row_alignment: alignment for the fixed output-buffer row count (default 1).
 
     Returns:
         By default, returns the original 4-tuple:
@@ -349,7 +356,10 @@ def permute_tokens(
         tokens_per_expert, alignment=alignment
     )
     # Output sized at max to keep allocations fixed across steps (CUDA graph compatible).
-    output_size = max_tokens * min(topk, num_local_experts) + alignment * num_local_experts
+    unaligned_output_size = (
+        max_tokens * min(topk, num_local_experts) + alignment * num_local_experts
+    )
+    output_size = _ceil_div(unaligned_output_size, row_alignment) * row_alignment
 
     permuted_hidden = torch.empty(
         output_size, hidden_dim, dtype=hidden_states.dtype, device=hidden_states.device
@@ -660,7 +670,7 @@ def permute_and_quantize_mxfp8(
 
     max_tokens, K = hidden_states.shape
     topk = probs.shape[1]
-    assert K % 32 == 0
+    assert K % MXFP8_BLOCK_SIZE == 0
 
     # Count how many (token, topk) pairs are routed to each local expert.
     # Rows beyond valid_tokens are ignored.
@@ -674,12 +684,16 @@ def permute_and_quantize_mxfp8(
         tokens_per_expert, alignment=alignment
     )
     # Output sized at max to keep allocations fixed across steps (CUDA graph compatible).
-    output_size = max_tokens * min(topk, num_local_experts) + alignment * num_local_experts
+    unaligned_output_size = (
+        max_tokens * min(topk, num_local_experts) + alignment * num_local_experts
+    )
+    # Keep data rows consistent with the swizzled scale layout's fixed row block.
+    output_size = _ceil_div(unaligned_output_size, MXFP8_SCALE_ROW_BLOCK) * MXFP8_SCALE_ROW_BLOCK
 
-    scale_cols = K // 32
-    n_row_blocks = _ceil_div(output_size, 128)
-    n_col_blocks = _ceil_div(scale_cols, 4)
-    total_scale_bytes = n_row_blocks * n_col_blocks * 512
+    scale_cols = K // MXFP8_BLOCK_SIZE
+    n_row_blocks = _ceil_div(output_size, MXFP8_SCALE_ROW_BLOCK)
+    n_col_blocks = _ceil_div(scale_cols, MXFP8_SCALE_COL_BLOCK)
+    total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
 
     out_fp8 = torch.empty(output_size, K, dtype=torch.float8_e4m3fn, device=hidden_states.device)
     out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=hidden_states.device)
@@ -688,7 +702,7 @@ def permute_and_quantize_mxfp8(
     init_permutation_map(permutation_map, inclusive_expert_offsets[-1:])
 
     BLOCK_K = triton.next_power_of_2(K)
-    BLOCK_GROUPS = BLOCK_K // 32
+    BLOCK_GROUPS = BLOCK_K // MXFP8_BLOCK_SIZE
     max_pairs = max_tokens * topk
     NUM_BLOCKS = min(max_pairs, 512)
     _permute_quantize_mxfp8_kernel[(NUM_BLOCKS,)](
@@ -714,6 +728,9 @@ def permute_and_quantize_mxfp8(
     )
 
     permuted_mxfp8 = MXFP8Tensor(
-        data=out_fp8, scale=out_scale.view(torch.float8_e8m0fnu), backend="triton"
+        data=out_fp8,
+        scale=out_scale.view(torch.float8_e8m0fnu),
+        dtype=hidden_states.dtype,
+        backend="triton",
     )
     return permuted_mxfp8, permuted_probs, permutation_map, inclusive_expert_offsets

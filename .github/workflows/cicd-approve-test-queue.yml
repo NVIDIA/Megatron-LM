@@ -17,7 +17,15 @@ name: Approve Test Queue
 on:
   schedule:
     - cron: "*/5 * * * *" # Runs every 5 minutes
+  # Scheduled events can be delayed, so refill released queue slots immediately.
+  workflow_run:
+    workflows: ["CICD Megatron-LM"]
+    types: [completed]
   workflow_dispatch: # Allows manual triggering
+
+concurrency:
+  group: approve-test-queue
+  cancel-in-progress: false
 
 jobs:
   approve-queue:
@@ -26,8 +34,16 @@ jobs:
     if: github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       matrix:
-        branch: [main, dev, others]
-        contributor_type: [internal, external]
+        include:
+          - branch: main
+            contributor_type: internal
+          - branch: dev
+            contributor_type: internal
+          - branch: others
+            contributor_type: internal
+          # External contributors share one global queue across all target branches.
+          - branch: all
+            contributor_type: external
     steps:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -71,6 +87,7 @@ jobs:
           GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
           REPO = os.environ["GITHUB_REPOSITORY"]
           CONTRIBUTOR_TYPE = os.environ["CONTRIBUTOR_TYPE"]
+          INTERNAL_SERVICE_ACCOUNTS = {"svcnemo-autobot"}
           if CONTRIBUTOR_TYPE == "external":
               # Global limit across all branches — no division needed since we count globally.
               MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY_EXTERNAL"])
@@ -123,10 +140,12 @@ jobs:
               return None
 
           def is_internal_contributor(pr_info):
-              """Return True if the PR author is a member of NVIDIA or NVIDIA-NeMo org (is_org_member)."""
+              """Return True for internal service accounts or NVIDIA organization members."""
               login = pr_info.get("user", {}).get("login", "")
               org_roles = sso_users.get(login, {}).get("org_roles", [])
-              return any(role in ("NVIDIA:Member", "NVIDIA-NeMo:Member") for role in org_roles)
+              return login in INTERNAL_SERVICE_ACCOUNTS or any(
+                  role in ("NVIDIA:Member", "NVIDIA-NeMo:Member") for role in org_roles
+              )
 
           def get_pr_base_branch(workflow_run):
               """
@@ -231,8 +250,12 @@ jobs:
               exit(1)
           pending_workflows = waiting_resp.get("workflow_runs", [])
           print("Pending workflows:", len(pending_workflows))
-          pending_workflows = [run for run in pending_workflows
-                              if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+          if CONTRIBUTOR_TYPE == "external":
+              pending_workflows = [run for run in pending_workflows
+                                  if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+          else:
+              pending_workflows = [run for run in pending_workflows
+                                  if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
 
           # Sort deployments by creation date (oldest first)
           print("Sorting workflows...")

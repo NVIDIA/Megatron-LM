@@ -94,6 +94,7 @@ class TestLocalCheckpointingReplication:
         Utils.initialize_model_parallel(tp, pp)
 
         mock_args = parse_args(ignore_unknown_args=True)
+        mock_args.save_tokenizer_assets = False
         with (
             mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
             mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),

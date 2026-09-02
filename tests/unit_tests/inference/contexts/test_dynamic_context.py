@@ -1941,7 +1941,7 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_pipeline_parallel_uneven_layers(self):
         """
-        Test that DynamicInferenceContext synchronizes the total block count across
+        Test that DynamicInferenceContext synchronizes cache capacities across
         pipeline stages when they have unequal layer counts.
         """
         pp_size = 2
@@ -1986,28 +1986,59 @@ class TestDynamicContext:
                 block_size_tokens=16,
                 max_tokens=1024,
                 unified_memory_level=0,
+                enable_prefix_caching=True,
+                prefix_caching_mamba_gb=0.05,
+                mamba_inference_state_config=mamba_inference_state_config,
             ),
         )
 
-        # Collect the total block counts on each rank (CUDA needed for NCCL all_gather)
-        local_total_blocks = torch.tensor(
-            [context.kv_block_allocator.pool_size], device='cuda', dtype=torch.long
+        # Collect cache capacities on each rank (CUDA needed for NCCL all_gather).
+        local_capacities = torch.tensor(
+            [context.kv_block_allocator.pool_size, context.mamba_slot_allocator.max_slots],
+            device='cuda',
+            dtype=torch.long,
         )
-        gathered_block_counts = [torch.zeros_like(local_total_blocks) for _ in range(pp_size)]
+        gathered_capacities = [torch.zeros_like(local_capacities) for _ in range(pp_size)]
         torch.distributed.all_gather(
-            gathered_block_counts,
-            local_total_blocks,
+            gathered_capacities,
+            local_capacities,
             group=parallel_state.get_pipeline_model_parallel_group(),
         )
-        all_counts = [t.item() for t in gathered_block_counts]
+        all_capacities = [tuple(t.tolist()) for t in gathered_capacities]
 
-        # Verify that there is only 1 unique value across all ranks
-        unique_counts = set(all_counts)
+        # Both allocators must remain mirrored across pipeline stages.
+        unique_capacities = set(all_capacities)
         assert (
-            len(unique_counts) == 1
-        ), f"Block counts were not synchronized across ranks. Gathered: {all_counts}"
+            len(unique_capacities) == 1
+        ), f"Cache capacities were not synchronized across ranks. Gathered: {all_capacities}"
 
         self._restore_model_parallel()
+
+    @pytest.mark.internal
+    def test_mamba_cache_error_identifies_limiting_pipeline_stage(self):
+        context = object.__new__(DynamicInferenceContext)
+        context.mamba_conv_states_shape = (1,)
+        context.mamba_ssm_states_shape = (1,)
+        context.mamba_conv_states_dtype = torch.float32
+        context.mamba_ssm_states_dtype = torch.float32
+        context.num_mamba_layers = 1
+        context.max_mamba_intermediate_states_per_step = 1
+        context.pipeline_parallel_group = object()
+
+        def reduce_to_remote_capacity(tensor, **_kwargs):
+            tensor.fill_(0)
+
+        get_pg_size = "megatron.core.inference.contexts.dynamic_context.get_pg_size"
+        with (
+            mock.patch(get_pg_size, return_value=2),
+            mock.patch.object(
+                torch.distributed, "all_reduce", side_effect=reduce_to_remote_capacity
+            ),
+            pytest.raises(ValueError, match="another stage has room for fewer than one") as error,
+        ):
+            context._allocate_mamba_cache(32 / 1024**3)
+
+        assert "room for 3 durable slots on this pipeline stage" in str(error.value)
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -3330,7 +3361,7 @@ class TestDynamicContext:
         prefix_skip = 2 * bs - 1
         eff_chunk = chunk_length - prefix_skip
 
-        (_, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, chunk_length)
+        _, _, _, _, prefix_skip, eff_chunk = ctx._compute_prefix_match(req2, chunk_length)
         expected_active = tokens_before_chunk_2 + eff_chunk
         assert ctx.active_token_count == expected_active
 

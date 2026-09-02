@@ -19,12 +19,11 @@ from megatron.core.enums import ModelType
 from megatron.core.parallel_state import destroy_model_parallel
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import report_current_memory_info, to_empty_if_meta
 from megatron.training import get_args
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.checkpointing import save_checkpoint
+from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import print_rank_0
 from model_provider import model_provider
@@ -39,7 +38,10 @@ def add_convert_args(parser):
     """Add additional arguments for ModelOpt checkpoint convertion."""
     group = parser.add_argument_group(title='ModelOpt MCore checkpoint convertion')
     group.add_argument(
-        "--pretrained-model-path", type=str, default=None, help="HuggingFace pretrained model"
+        "--pretrained-model-path",
+        type=str,
+        default=None,
+        help="Deprecated: Hugging Face pretrained model. Use Megatron-Bridge to import checkpoints.",
     )
     group.add_argument(
         "--extra-model-path", type=str, default=None, help="Extra module weights to load"
@@ -133,6 +135,14 @@ if __name__ == "__main__":
     unwrapped_model = unwrap_model(model)[0]
 
     if args.pretrained_model_path is not None:
+        warnings.warn(
+            "Importing Hugging Face checkpoints with --pretrained-model-path is deprecated. "
+            "Use Megatron-Bridge to create a Megatron-Core checkpoint, then load it with --load. "
+            "For Hugging Face quantization workflows, see "
+            "https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/examples/quantization.",
+            FutureWarning,
+            stacklevel=2,
+        )
         import_dtype = torch.float16 if args.fp16 else torch.bfloat16
         unwrapped_model = unwrap_model(model)[0]
         workspace_dir = os.environ.get("MLM_WORK_DIR", "/tmp")
@@ -149,7 +159,7 @@ if __name__ == "__main__":
             unwrapped_model, args.pretrained_model_path, workspace_dir, **import_kwargs
         )
     elif args.load is not None:
-        _ = load_modelopt_checkpoint(model)
+        load_checkpoint(model, None, None)
 
     if args.algorithm == "eagle3":
         mtsp_config = ALGO_TO_CONFIG[args.algorithm]

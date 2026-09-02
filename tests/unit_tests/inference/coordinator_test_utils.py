@@ -3,11 +3,14 @@
 """Shared test fixtures and helpers for inference tests."""
 
 import itertools
-from collections import deque
+from collections import OrderedDict, deque
 
 import numpy as np
 
-from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.config import (
+    MediaCacheCoordinatorPolicy,
+    PrefixCachingCoordinatorPolicy,
+)
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
@@ -21,6 +24,8 @@ def make_coordinator_direct(
     prefix_caching_routing_alpha=0.5,
     max_requests=10,
     policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+    media_policy=MediaCacheCoordinatorPolicy.AFFINITY,
+    vision_embedding_cache_enabled=True,
     tokenizer=None,
     rank_name_template="rank_{}",
 ):
@@ -36,6 +41,8 @@ def make_coordinator_direct(
         prefix_caching_routing_alpha: Alpha for prefix-aware scoring.
         max_requests: Max requests per rank (None disables vectorized scoring).
         policy: Prefix caching coordinator routing policy.
+        media_policy: Media-cache coordinator routing policy.
+        vision_embedding_cache_enabled: Whether projected media embeddings are cached.
         tokenizer: Optional tokenizer instance (set on the coordinator).
         rank_name_template: Format string for rank names, e.g. ``"rank_{}"``
             or ``"rank-{}"``.  The integer rank index is substituted.
@@ -47,6 +54,9 @@ def make_coordinator_direct(
     coordinator.enable_prefix_caching = enable_prefix_caching
     coordinator.prefix_caching_coordinator_policy = policy
     coordinator.prefix_caching_routing_alpha = prefix_caching_routing_alpha
+    coordinator.media_cache_coordinator_policy = media_policy
+    coordinator.media_cache_routing_weight = 1.0
+    coordinator.vision_embedding_cache_enabled = vision_embedding_cache_enabled
     coordinator.max_requests = max_requests
 
     # Create fake rank identities.
@@ -65,6 +75,8 @@ def make_coordinator_direct(
     n_ranks = data_parallel_size
     coordinator._hash_table = {}
     coordinator._hash_assignment_counter = 0
+    coordinator._media_cache_affinity = OrderedDict()
+    coordinator._media_cache_affinity_max_entries = 65536
 
     sorted_identities = sorted(coordinator.identities_of_data_parallel_ranks)
     coordinator.identity_to_rank_index = {

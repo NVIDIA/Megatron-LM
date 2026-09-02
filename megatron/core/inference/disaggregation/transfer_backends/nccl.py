@@ -162,6 +162,11 @@ class NcclTransferBackend:
             list(memory_buffer.shape),
         )
 
+    def new_registered_buffer(self, **kwargs) -> "NcclTransferBackend":
+        """Create a transfer backend for another state buffer."""
+
+        return type(self)(**kwargs)
+
     def export_meta(self) -> Dict[str, Any]:
         """The shared geometry schema plus this rank's NCCL address."""
         meta = export_geometry_meta(self._geometry, self._ssm_layout)

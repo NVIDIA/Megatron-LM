@@ -15,9 +15,13 @@ import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.pipeline_parallel.multimodule_communicator import MultiModulePipelineCommunicator
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+)
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.transformer.cuda_graphs import (
     convert_schedule_table_to_order,
@@ -26,6 +30,28 @@ from megatron.core.transformer.cuda_graphs import (
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+def test_reset_activation_offload_uses_language_model_group(mocker):
+    reset = mocker.patch.object(schedule.off_interface, "reset")
+    language_group = object()
+    collection = MultiModuleProcessGroupCollection(
+        module_pgs={
+            "encoder_1": object(),
+            "encoder_2": object(),
+            "llm": SimpleNamespace(tp_dp_cp=language_group),
+        },
+        language_model_module_name="llm",
+    )
+    schedule._reset_activation_offload(collection)
+    reset.assert_called_once_with(process_group=language_group)
+
+    reset.reset_mock()
+    collection = MultiModuleProcessGroupCollection(
+        module_pgs={"encoder_1": object(), "encoder_2": object()}
+    )
+    schedule._reset_activation_offload(collection)
+    reset.assert_not_called()
 
 
 def _populate_embedding_and_position_groups(pp_group):
@@ -567,6 +593,125 @@ def test_forward_backward_func_without_pipeline_parallel(mocker):
     for i, j in zip(losses_reduced, loss_reduced_expected):
         assert i['loss_reduced'] == j['loss_reduced']
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    "communicator_base,module_first_stage,pipeline_stages",
+    [
+        (P2PCommunicator, None, 1),
+        (MultiModulePipelineCommunicator, True, 1),
+        (MultiModulePipelineCommunicator, True, 2),
+    ],
+)
+def test_schedule_enables_grad_sync_on_first_stage(
+    monkeypatch, communicator_base, module_first_stage, pipeline_stages
+):
+    events = []
+
+    @contextmanager
+    def no_sync():
+        events.append("enter_no_sync")
+        try:
+            yield
+        finally:
+            events.append("exit_no_sync")
+
+    config = SimpleNamespace(
+        overlap_p2p_comm=False,
+        variable_seq_lengths=True,
+        finalize_model_grads_func=None,
+        timers=None,
+        no_sync_func=no_sync,
+        num_microbatches_with_partial_activation_checkpoints=None,
+        deallocate_pipeline_outputs=False,
+        grad_sync_func=lambda _parameters: events.append("grad_sync"),
+        calculate_per_token_loss=False,
+    )
+    model = SimpleNamespace(config=config, parameters=lambda: [])
+
+    is_multimodule = communicator_base is MultiModulePipelineCommunicator
+
+    class FakeCommunicator(communicator_base):
+        total_stages = pipeline_stages
+        current_stage = 0
+        is_pp_first_stage = not is_multimodule
+        is_pp_last_stage = True
+
+        def __init__(self):
+            self.config = config
+            if is_multimodule:
+                self.rank_module_map = {"llm": SimpleNamespace()}
+
+        def is_module_pp_first_stage(self, _module_name):
+            return module_first_stage
+
+        @staticmethod
+        def recv_forward(*_args):
+            return {"llm": None} if is_multimodule else None
+
+        @staticmethod
+        def send_forward_recv_backward(*_args):
+            return None
+
+        @staticmethod
+        def send_forward(*_args):
+            return None
+
+        @staticmethod
+        def recv_backward(*_args):
+            return None
+
+        @staticmethod
+        def send_backward(*_args):
+            return None
+
+    monkeypatch.setattr(
+        schedule,
+        "forward_step",
+        lambda *_args, **_kwargs: (
+            {"llm": torch.tensor(1.0)} if is_multimodule else torch.tensor(1.0),
+            torch.tensor(0),
+        ),
+    )
+    monkeypatch.setattr(
+        schedule, "backward_step", lambda *_args, **_kwargs: events.append("backward") or None
+    )
+    monkeypatch.setattr(
+        schedule,
+        "backward_step_multimodule",
+        lambda *_args, **_kwargs: events.append("backward") or {"llm": None},
+    )
+    monkeypatch.setattr(schedule, "deallocate_output_tensor", lambda *_args: None)
+    real_zeros = torch.zeros
+    monkeypatch.setattr(
+        schedule.torch,
+        "zeros",
+        lambda *args, **kwargs: real_zeros(
+            *args, **{key: value for key, value in kwargs.items() if key != "device"}
+        ),
+    )
+
+    if is_multimodule:
+        pg_collection = SimpleNamespace(
+            has_language_model=lambda: False, language_model_module_name=None
+        )
+    else:
+        pg_collection = ProcessGroupCollection()
+        pg_collection.tp = SimpleNamespace(size=lambda: 1)
+        pg_collection.cp = SimpleNamespace(size=lambda: 1)
+
+    schedule.forward_backward_pipelining_without_interleaving(
+        forward_step_func=None,
+        data_iterator=None,
+        model=model,
+        num_microbatches=1,
+        seq_length=1,
+        micro_batch_size=1,
+        p2p_communicator=FakeCommunicator(),
+        pg_collection=pg_collection,
+    )
+
+    assert events == ["enter_no_sync", "exit_no_sync", "backward"]
 
 
 def test_forward_backward_func_with_pipeline_parallel(mocker):

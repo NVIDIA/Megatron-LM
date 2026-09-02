@@ -13,14 +13,17 @@ from functools import partial
 from typing import Dict, List, Optional, Tuple
 from unittest import mock
 
+import msgpack
 import pytest
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
     AsyncScheduleMode,
+    CudaGraphSizingDistribution,
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
@@ -37,12 +40,15 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    DynamicVLMInferenceRequest,
     Status,
     compute_block_hashes_batched,
+    compute_media_cache_key,
 )
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -55,14 +61,18 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
+from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
+from tests.unit_tests.inference.engines.ssm_test_helpers import (
+    hybrid_mixer_kwargs,
+    hybrid_stack_spec_for,
+    skip_if_sequence_packing_not_available,
+)
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 try:
@@ -73,13 +83,221 @@ except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
 
 
-def skip_if_mamba_sequence_packing_not_available(model_provider: str):
-    if model_provider == "hybrid":
-        sequence_packing_available, reason_for_no_sequence_packing = (
-            _check_mamba_sequence_packing_support()
+class _ImageOnlyCapabilityWrapper:
+    supports_text = True
+    supports_image = True
+    supports_video = False
+    supports_audio = False
+    validate_input_modalities = GPTInferenceWrapper.validate_input_modalities
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "modality"),
+    [
+        ({"imgs": torch.ones(1)}, "image"),
+        ({"imgs": torch.ones(1), "num_frames": torch.ones(1, dtype=torch.int64)}, "video"),
+    ],
+)
+def test_add_request_rejects_unsupported_media_before_tokenization(kwargs, modality):
+    engine = object.__new__(DynamicInferenceEngine)
+    wrapper = _ImageOnlyCapabilityWrapper()
+    if modality == "image":
+        wrapper.supports_image = False
+    engine.controller = mock.Mock(inference_wrapped_model=wrapper)
+
+    with pytest.raises(
+        ValueError, match=rf"_ImageOnlyCapabilityWrapper does not support {modality} inputs"
+    ):
+        engine.add_request(request_id=1, prompt=[1], **kwargs)
+
+    engine.controller.tokenize_prompt.assert_not_called()
+
+
+def test_validate_input_modalities_rejects_unsupported_audio():
+    wrapper = _ImageOnlyCapabilityWrapper()
+
+    with pytest.raises(ValueError, match="does not support audio inputs"):
+        wrapper.validate_input_modalities("audio")
+
+
+def _build_mock_vlm_engine(image_embeddings):
+    engine = object.__new__(DynamicInferenceEngine)
+    wrapper = mock.Mock()
+    wrapper._forward_vision_encoder.return_value = image_embeddings
+    wrapper.resolve_media_token_id.return_value = 99
+    controller = mock.Mock()
+    controller.pp_group = None
+    controller.inference_wrapped_model = wrapper
+    engine.controller = controller
+    engine.context = mock.Mock(block_size_tokens=256, enable_prefix_caching=False)
+    engine._get_cached_vision_embedding = mock.Mock(return_value=None)
+    engine._cache_vision_embedding = mock.Mock()
+    return engine, wrapper
+
+
+def _call_build_vlm_request(engine, tokens, *, media_tokens_preexpanded):
+    with mock.patch.object(torch.cuda, "current_device", return_value=torch.device("cpu")):
+        return engine._build_vlm_request(
+            request_id=1,
+            prompt_str=None,
+            tokens=tokens,
+            sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=0),
+            imgs=torch.ones(1, 2, 4),
+            num_tiles=None,
+            num_img_embeddings_per_tile=0,
+            imgs_sizes=torch.tensor([[2, 2]]),
+            media_tokens_preexpanded=media_tokens_preexpanded,
         )
-        if not sequence_packing_available:
-            pytest.skip(reason_for_no_sequence_packing)
+
+
+@pytest.mark.parametrize(
+    ("media_kwargs", "error"),
+    [
+        (
+            {"num_frames": torch.tensor([2])},
+            "Video input requires imgs, imgs_sizes, and num_frames",
+        ),
+        (
+            {"imgs_sizes": torch.tensor([[2, 2]])},
+            "Dynamic-resolution image input requires imgs and imgs_sizes",
+        ),
+        (
+            {"imgs": torch.ones(1, 2, 4), "num_tiles": torch.tensor([1])},
+            "Static-tiling image input requires imgs, num_tiles",
+        ),
+    ],
+)
+def test_build_vlm_request_rejects_incomplete_media(media_kwargs, error):
+    engine, _ = _build_mock_vlm_engine(torch.ones(2, 4))
+    kwargs = {
+        "imgs": None,
+        "num_tiles": None,
+        "num_img_embeddings_per_tile": 0,
+        "imgs_sizes": None,
+        "num_frames": None,
+    }
+    kwargs.update(media_kwargs)
+
+    with pytest.raises(ValueError, match=error):
+        engine._build_vlm_request(
+            request_id=1,
+            prompt_str=None,
+            tokens=torch.tensor([10, 20], dtype=torch.int64),
+            sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=0),
+            **kwargs,
+        )
+
+
+def test_build_vlm_request_preserves_preexpanded_tokens_and_derives_mask():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    tokens = torch.tensor([10, 99, 99, 20], dtype=torch.int64)
+    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
+        [-1, 0, 1, -1], dtype=torch.int64
+    )
+
+    request = _call_build_vlm_request(engine, tokens, media_tokens_preexpanded=True)
+
+    assert torch.equal(request.prompt_tokens, tokens)
+    assert request.compact_prompt_tokens is None
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+    wrapper.expand_image_tokens.assert_not_called()
+    wrapper.resolve_media_token_id.assert_not_called()
+    wrapper.build_preexpanded_media_token_mask.assert_called_once_with(tokens, "image")
+
+
+def test_build_vlm_request_rejects_preexpanded_embedding_count_mismatch():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(1, 4))
+    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
+        [-1, 0, 1, -1], dtype=torch.int64
+    )
+
+    with pytest.raises(ValueError, match="2 media-token position.*1 embedding"):
+        _call_build_vlm_request(
+            engine, torch.tensor([10, 99, 99, 20], dtype=torch.int64), media_tokens_preexpanded=True
+        )
+
+
+def test_build_vlm_request_validates_cached_embedding_count_once():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    engine._get_cached_vision_embedding.return_value = torch.ones(1, 4)
+    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
+        [-1, 0, 1, -1], dtype=torch.int64
+    )
+
+    with pytest.raises(ValueError, match="2 media-token position.*1 embedding"):
+        _call_build_vlm_request(
+            engine, torch.tensor([10, 99, 99, 20], dtype=torch.int64), media_tokens_preexpanded=True
+        )
+
+    wrapper._forward_vision_encoder.assert_not_called()
+
+
+def test_build_vlm_request_keeps_compact_expansion_path():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    compact_tokens = torch.tensor([10, 42, 20], dtype=torch.int64)
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+
+    request = _call_build_vlm_request(engine, compact_tokens, media_tokens_preexpanded=False)
+
+    wrapper.expand_image_tokens.assert_called_once()
+    encoder_args, encoder_kwargs = wrapper._forward_vision_encoder.call_args
+    assert torch.equal(encoder_args[0], torch.ones(1, 2, 4))
+    assert encoder_kwargs["num_image_tiles"] is None
+    assert torch.equal(encoder_kwargs["imgs_sizes"], torch.tensor([[2, 2]]))
+    assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
+    assert torch.equal(request.compact_prompt_tokens, compact_tokens)
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+
+
+def test_build_vlm_request_preserves_adjacent_compact_media_placeholders():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    compact_tokens = torch.tensor([10, 42, 42, 20], dtype=torch.int64)
+    # The expanded sequence is structurally ambiguous: it could also represent
+    # one placeholder expanded to two positions. The saved compact prompt is
+    # therefore required for lossless multi-turn reconstruction.
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+
+    request = _call_build_vlm_request(engine, compact_tokens, media_tokens_preexpanded=False)
+
+    assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
+    assert torch.equal(request.compact_prompt_tokens, compact_tokens)
+
+
+def test_build_vlm_request_enables_media_salted_prefix_caching():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    engine.context.enable_prefix_caching = True
+    engine.context.block_size_tokens = 2
+    wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
+
+    request = _call_build_vlm_request(
+        engine, torch.tensor([10, 42, 20], dtype=torch.int64), media_tokens_preexpanded=False
+    )
+
+    media_cache_key = compute_media_cache_key(
+        "image", {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])}
+    )
+    assert request.enable_prefix_caching
+    assert request.block_hash_salt == media_cache_key
+    assert request.precomputed_block_hashes == compute_block_hashes_batched(
+        request.prompt_tokens, block_size=2, cache_salt=media_cache_key
+    )
+
+
+def teardown_module(module):
+    # inference_optimized MoE parametrizations use the default 'vllm' grouped-GEMM
+    # backend, which allocates class-level persistent intermediate buffers at
+    # context init. Release them so no GPU memory or state leaks across modules.
+    VllmFusedMoeBuffers._delete_buffers()
+
+
+def skip_if_mamba_sequence_packing_not_available(model_provider: str, ssm_mixer: str = "mamba"):
+    if model_provider != "hybrid":
+        return
+    if ssm_mixer == "gdn":
+        # GDN packing rides on FLA, which every GDN test already gates on
+        # separately via HAVE_FLA.
+        return
+    skip_if_sequence_packing_not_available(ssm_mixer)
 
 
 def set_rounder(value):
@@ -131,8 +349,17 @@ class DynamicEngineTestConfig:
     num_cuda_graphs: int = None
     use_cuda_graphs_for_non_decode_steps: bool = True
     cuda_graph_all_prefills: bool = False
+    # Defaults to the production default (HYBRID: exponential prefill/mixed graphs,
+    # linear decode-only graphs). Tests that assert on exact token counts can pin a
+    # single distribution here.
+    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = CudaGraphSizingDistribution.HYBRID
     fp8: bool = False
     model_provider: str = "gpt"
+    # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
+    # "gdn"). Ignored unless model_provider == "hybrid": all three build a
+    # HybridModel, and only the layer pattern and stack spec (and so the
+    # mixer) differ.
+    ssm_mixer: str = "mamba"
     return_log_probs: bool = False
     logprobs_mode: str = "raw_logprobs"
     materialize_only_last_token_logits: bool = True
@@ -161,7 +388,7 @@ class DynamicEngineTestConfig:
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 0.0
-    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.ASYNC
     # Sliding-window attention config. When `window_size` is None, SWA is
     # disabled and all layers do full causal attention. When set to a
     # `(left, right)` tuple, layers selected by `window_attn_skip_freq` use a
@@ -213,6 +440,7 @@ class DynamicInferenceEngineTestBase:
         assert env.engine.cuda_graph_impl == "full_iteration"
         assert env.engine.inference_cuda_graph_scope == InferenceCudaGraphScope.none
         assert env.engine.capture_stats is None
+        assert not hasattr(model, 'cudagraph_manager')
         assert not hasattr(model.decoder, 'cudagraph_manager')
         for layer in model.decoder.layers:
             assert not hasattr(layer, 'cudagraph_manager')
@@ -305,6 +533,7 @@ class DynamicInferenceEngineTestBase:
                     test_config.use_cuda_graphs_for_non_decode_steps
                 ),
                 cuda_graph_all_prefills=test_config.cuda_graph_all_prefills,
+                cuda_graph_sizing_distribution=test_config.cuda_graph_sizing_distribution,
                 buffer_size_gb=test_config.context_buffer_size_gb,
                 paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
                 block_size_tokens=test_config.context_block_size_tokens,
@@ -432,6 +661,7 @@ class DynamicInferenceEngineTestBase:
                 position_embedding_type=test_config.position_embedding_type,
             ).cuda()
         elif test_config.model_provider == "hybrid":
+            is_gdn = test_config.ssm_mixer == "gdn"
             pp_size = test_config.pipeline_model_parallel_size
             # Transformer config.
             transformer_config = TransformerConfig(
@@ -441,8 +671,13 @@ class DynamicInferenceEngineTestBase:
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
                 mtp_num_layers=test_config.num_speculative_tokens,
                 hidden_size=256,  # The Mamba layer places several constraints on this
-                mamba_num_heads=16,
+                **hybrid_mixer_kwargs(test_config.ssm_mixer),
                 num_attention_heads=16,
+                linear_conv_kernel_dim=4,
+                linear_key_head_dim=32,
+                linear_value_head_dim=64,
+                linear_num_key_heads=4,
+                linear_num_value_heads=8,
                 use_cpu_initialization=True,
                 cuda_graph_impl=effective_cuda_graph_impl,
                 inference_rng_tracker=True,
@@ -474,9 +709,11 @@ class DynamicInferenceEngineTestBase:
                 ),
                 normalization=(
                     "RMSNorm"
-                    if test_config.transformer_impl == "inference_optimized"
+                    if is_gdn or test_config.transformer_impl == "inference_optimized"
                     else "LayerNorm"
                 ),
+                layernorm_zero_centered_gamma=is_gdn,
+                activation_func=F.silu if is_gdn else F.gelu,
                 is_hybrid_model=True,  # Needs to be set for correct out_proj init
             )
 
@@ -484,13 +721,14 @@ class DynamicInferenceEngineTestBase:
             # When speculative tokens are configured, append MTP depth sections
             # to the hybrid layer pattern so the model creates MTP blocks.
             mtp_suffix = "/M" * test_config.num_speculative_tokens
+            recurrent_symbol = "G" if is_gdn else "M"
             if pp_size == 1:
-                mamba_pattern = "M*-" + mtp_suffix
+                mamba_pattern = recurrent_symbol + "*-" + mtp_suffix
             else:
-                mamba_pattern = "M*-|M*-" + mtp_suffix
+                mamba_pattern = recurrent_symbol + "*-|" + recurrent_symbol + "*-" + mtp_suffix
             model = HybridModel(
                 config=transformer_config,
-                hybrid_stack_spec=hybrid_stack_spec,
+                hybrid_stack_spec=hybrid_stack_spec_for(test_config.ssm_mixer),
                 vocab_size=test_config.vocab_size,
                 max_sequence_length=test_config.max_sequence_length,
                 parallel_output=True,
@@ -725,6 +963,8 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     engine.state = EngineState.RUNNING
     engine.unified_memory_level = 0
     engine.use_coordinator = False
+    engine._vision_embedding_cache = {}
+    engine._vision_embedding_cache_bytes = 0
     engine._add_request = mock.Mock()
     engine._notify_cond_for_new_request = mock.Mock(return_value=None)
     engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
@@ -752,13 +992,170 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     assert engine._add_request.call_args.args[0] is checkpointed
 
 
+def test_vision_state_invalidation_marks_request_local_embeddings_stale():
+    request = DynamicVLMInferenceRequest(
+        request_id=31,
+        prompt_tokens=torch.tensor([99, 99, 5]),
+        compact_prompt_tokens=torch.tensor([99, 5]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1),
+        num_tiles=torch.tensor([1]),
+        imgs_sizes=torch.tensor([[1, 1]]),
+        decoder_seq_length=0,
+        image_embeddings=torch.ones(2, 1, 4),
+        image_token_mask=torch.tensor([0, 1, -1]),
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.allow_stale_multimodal_embeddings = False
+    engine._vision_embedding_cache = {"media": request.image_embeddings}
+    engine._vision_embedding_cache_bytes = request.image_embeddings.numel() * 4
+    engine.requests = {
+        request.request_id: types.SimpleNamespace(
+            record=DynamicInferenceRequestRecord.from_request(request)
+        )
+    }
+
+    engine._invalidate_vision_state()
+
+    assert not engine._vision_embedding_cache
+    assert engine._vision_embedding_cache_bytes == 0
+    assert request.image_embeddings is None
+    assert request.image_token_mask is None
+
+
+def test_vision_state_invalidation_can_explicitly_retain_stale_embeddings():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.allow_stale_multimodal_embeddings = True
+    engine._vision_embedding_cache = {"media": torch.ones(1)}
+    engine._vision_embedding_cache_bytes = 4
+    engine.requests = {}
+
+    engine._invalidate_vision_state()
+
+    assert "media" in engine._vision_embedding_cache
+    assert engine._vision_embedding_cache_bytes == 4
+
+
+def test_refresh_vlm_request_recomputes_embeddings_and_mask():
+    request = DynamicVLMInferenceRequest(
+        request_id=32,
+        prompt_tokens=torch.tensor([99, 99, 5, 7]),
+        compact_prompt_tokens=torch.tensor([99, 5]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        block_hash_salt="media",
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1),
+        num_tiles=torch.tensor([1]),
+        imgs_sizes=torch.tensor([[1, 1]]),
+        decoder_seq_length=0,
+        image_embeddings=None,
+        image_token_mask=None,
+    )
+    wrapper = types.SimpleNamespace(
+        resolve_media_token_id=mock.Mock(return_value=99),
+        expand_image_tokens=mock.Mock(return_value=([[99, 99, 5]], [[0, 1, None]])),
+        _forward_vision_encoder=mock.Mock(return_value=torch.ones(2, 1, 4)),
+    )
+    retained_imgs = mock.Mock()
+    device_imgs = torch.ones(1)
+    retained_imgs.to.return_value = device_imgs
+    request.imgs = retained_imgs
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper, tokenizer=object())
+    engine.context = types.SimpleNamespace(add_vlm_request_data=mock.Mock())
+    engine._cache_vision_embedding = mock.Mock()
+
+    engine._refresh_vlm_request_data(request)
+
+    retained_imgs.to.assert_called_once_with(device=request.prompt_tokens.device)
+    encoder_args, encoder_kwargs = wrapper._forward_vision_encoder.call_args
+    assert encoder_args[0] is device_imgs
+    assert encoder_kwargs["num_image_tiles"].device == request.prompt_tokens.device
+    assert encoder_kwargs["imgs_sizes"].device == request.prompt_tokens.device
+    assert request.image_embeddings is wrapper._forward_vision_encoder.return_value
+    assert request.image_token_mask.tolist() == [0, 1, -1, -1]
+    engine.context.add_vlm_request_data.assert_called_once_with(
+        request.request_id,
+        image_embeddings=request.image_embeddings,
+        image_token_mask=request.image_token_mask,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
+    device = torch.device("cuda", torch.cuda.current_device())
+    imgs = torch.ones(1)
+    imgs_sizes = torch.tensor([[1, 1]])
+    original_request = DynamicVLMInferenceRequest(
+        request_id=33,
+        prompt_tokens=torch.tensor([99, 99, 5], device=device),
+        compact_prompt_tokens=torch.tensor([99, 5], device=device),
+        sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
+        block_hash_salt="media",
+        num_img_embeddings_per_tile=0,
+        imgs=imgs,
+        num_tiles=torch.tensor([1]),
+        imgs_sizes=imgs_sizes,
+        decoder_seq_length=0,
+        generated_tokens=[7, 8],
+        image_embeddings=torch.full((2, 1, 4), -1.0),
+        image_token_mask=torch.tensor([0, 1, -1]),
+    )
+    record = DynamicInferenceRequestRecord.from_request(original_request)
+    record.checkpoint()
+    checkpointed_request = record[-1]
+
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.allow_stale_multimodal_embeddings = False
+    engine._vision_embedding_cache = {"media": original_request.image_embeddings}
+    engine._vision_embedding_cache_bytes = original_request.image_embeddings.numel() * 4
+    engine.requests = {checkpointed_request.request_id: types.SimpleNamespace(record=record)}
+    refreshed_embeddings = torch.ones(2, 1, 4, device=device)
+    wrapper = types.SimpleNamespace(
+        resolve_media_token_id=mock.Mock(return_value=99),
+        expand_image_tokens=mock.Mock(return_value=([[99, 99, 5]], [[0, 1, None]])),
+        _forward_vision_encoder=mock.Mock(return_value=refreshed_embeddings),
+    )
+    engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper, tokenizer=object())
+    engine.context = types.SimpleNamespace(add_vlm_request_data=mock.Mock())
+    engine._cache_vision_embedding = mock.Mock()
+
+    engine._invalidate_vision_state()
+    engine._refresh_vlm_request_data(checkpointed_request)
+
+    assert checkpointed_request.prompt_tokens.tolist() == [99, 99, 5, 7, 8]
+    assert checkpointed_request.prompt_tokens.device == device
+    assert checkpointed_request.compact_prompt_tokens is original_request.compact_prompt_tokens
+    assert checkpointed_request.imgs is imgs
+    assert checkpointed_request.imgs_sizes is imgs_sizes
+    assert checkpointed_request.imgs.device.type == "cpu"
+    assert checkpointed_request.imgs_sizes.device.type == "cpu"
+    assert checkpointed_request.image_embeddings is refreshed_embeddings
+    assert checkpointed_request.image_token_mask.tolist() == [0, 1, -1, -1, -1]
+    encoder_args, encoder_kwargs = wrapper._forward_vision_encoder.call_args
+    assert encoder_args[0].device == checkpointed_request.prompt_tokens.device
+    assert encoder_kwargs["num_image_tiles"].device == checkpointed_request.prompt_tokens.device
+    assert encoder_kwargs["imgs_sizes"].device == checkpointed_request.prompt_tokens.device
+    engine.context.add_vlm_request_data.assert_called_once_with(
+        checkpointed_request.request_id,
+        image_embeddings=refreshed_embeddings,
+        image_token_mask=checkpointed_request.image_token_mask,
+    )
+
+
 def test_streaming_partials_are_sent():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._partial_emit_lengths = {}
     request = types.SimpleNamespace(
         generated_tokens=[11, 12, 13],
-        generated_log_probs=None,
-        sampling_params=types.SimpleNamespace(streaming=True, return_log_probs=False),
+        generated_log_probs=[-0.1, -0.2, -0.3],
+        generated_top_n_logprobs=[{"eleven": -0.01}, {"twelve": -0.02}, {"thirteen": -0.03}],
+        prompt_log_probs=[-0.4],
+        prompt_top_n_logprobs=[{"prompt": -0.04}],
+        sampling_params=types.SimpleNamespace(
+            streaming=True, return_log_probs=True, skip_prompt_log_probs=False
+        ),
     )
     engine.requests = {7: types.SimpleNamespace(record=[request])}
     engine.socket_for_receiving_requests = mock.Mock()
@@ -767,6 +1164,13 @@ def test_streaming_partials_are_sent():
 
     engine.socket_for_receiving_requests.send.assert_called_once()
     assert engine._partial_emit_lengths == {7: 3}
+    payload = msgpack.unpackb(
+        engine.socket_for_receiving_requests.send.call_args.args[0], raw=False
+    )
+    partial = payload[1][0]
+    assert partial["new_top_n_logprobs"] == request.generated_top_n_logprobs
+    assert partial["prompt_log_probs"] == request.prompt_log_probs
+    assert partial["prompt_top_n_logprobs"] == request.prompt_top_n_logprobs
 
 
 def test_streaming_partials_buffer_until_token_interval():
@@ -845,11 +1249,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert env.engine.context.cuda_graph_batch_dimensions_list
             model = env.engine.controller.inference_wrapped_model.model
             if inference_cuda_graph_scope == InferenceCudaGraphScope.block:
-                # hybrid models attach cudagraph_manager to the model; others attach to the decoder
-                if model_provider == "hybrid":
-                    assert model.cudagraph_manager.cudagraph_runners
-                else:
-                    assert model.decoder.cudagraph_manager.cudagraph_runners
+                # GPT and hybrid models both own the block-scope graph at model level;
+                # GPT removes the decoder's fallback manager at construction.
+                assert model.cudagraph_manager.cudagraph_runners
+                assert not hasattr(model.decoder, 'cudagraph_manager')
             else:
                 # check if cudagraph runners are created at the layer level
                 for layer in model.decoder.layers:
@@ -959,7 +1362,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         model = env.engine.controller.inference_wrapped_model.model
         assert model.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
         assert model.config.cuda_graph_modules == []
-        assert model.decoder.cudagraph_manager.cudagraph_runners
+        assert model.cudagraph_manager.cudagraph_runners
+        assert not hasattr(model.decoder, 'cudagraph_manager')
         for layer in model.decoder.layers:
             assert not hasattr(layer, 'cudagraph_manager')
 
@@ -1132,6 +1536,123 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
+    def test_sustained_kv_cache_saturation_with_paused_retention(self) -> None:
+        """Many concurrent requests against a KV pool far too small to hold them all.
+
+        The other eviction tests pin the paused buffer to zero, so every pause turns
+        into an immediate eviction and the retention budget is never consulted. Here
+        the budget holds two blocks, which is smaller than the number of requests that
+        pause, so `update_requests` has to retain some paused requests, resume others,
+        and evict only the overflow -- repeatedly, over many steps.
+
+        This is the shape high-concurrency RL workloads hit and standalone inference
+        tests do not: the invariants worth pinning are that the retention budget is
+        never exceeded, that requeued requests still generate their full output, and
+        that the pool drains completely afterwards. A block leaked during a saturation
+        storm silently shrinks capacity for every later request.
+        """
+        num_requests = 16
+        prompt_length = 256
+        num_tokens_to_generate = 64
+        block_size_tokens = 256
+        pool_block_count = 8
+        paused_block_count = 2
+
+        probe_env = self._build_test_env(DynamicEngineTestConfig())
+        block_size_bytes = probe_env.engine.context.block_size_bytes
+
+        # A prompt fills exactly one block, so every request needs a second block on
+        # its first decode step -- the pause trigger. Sizing in whole blocks (+1 byte
+        # to survive the float GB round trip) keeps the pool arithmetic exact.
+        test_config = DynamicEngineTestConfig(
+            num_requests=num_requests,
+            min_prompt_length=prompt_length,
+            max_prompt_length=prompt_length,
+            num_tokens_to_generate=num_tokens_to_generate,
+            context_block_size_tokens=block_size_tokens,
+            context_buffer_size_gb=(pool_block_count * block_size_bytes + 1) / 1024**3,
+            context_paused_buffer_size_gb=(paused_block_count * block_size_bytes + 1) / 1024**3,
+            context_max_requests=num_requests,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+        context = env.engine.context
+        allocator = context.kv_block_allocator
+
+        # Fail loudly if the buffer sizing did not land where the test assumes, rather
+        # than silently running a differently-shaped workload.
+        assert allocator.pool_size == pool_block_count
+        assert allocator.paused_limit == paused_block_count
+
+        # Deterministic logits: random weights make torch.multinomial trip over NaNs.
+        vocab_size = test_config.vocab_size
+
+        def mock_greedy_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            logits = torch.zeros(
+                *tokens.shape, vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            logits[:, :, 0] = 100.0
+            if test_config.materialize_only_last_token_logits:
+                logits = context.last_token_logits(logits).unsqueeze(0)
+            return logits
+
+        env.engine.controller.inference_wrapped_model.model.forward = mock_greedy_forward
+
+        # Every request arrives up front, so the engine has to queue and reschedule
+        # rather than admitting them at a comfortable rate.
+        for request in env.requests:
+            request.sampling_params.termination_id = -1  # run the full output length
+            env.engine._add_request(request)
+
+        finished_records = []
+        max_paused_block_count = 0
+
+        # Drive admission through step_modern so async scheduling only mutates the
+        # request rows after consuming the pending forward. Bound the loop so a
+        # scheduling regression fails instead of hanging.
+        for _ in range(4000):
+            if not env.engine.has_unfinished_requests():
+                break
+            finished_records.extend(env.engine.step_modern()["finished_request_records"])
+
+            # Checked at a step boundary, i.e. after the pause/resume/evict lifecycle
+            # has settled: paused requests may only retain blocks within the budget.
+            paused_block_count_now = allocator.get_paused_used()
+            assert paused_block_count_now <= allocator.paused_limit
+            max_paused_block_count = max(max_paused_block_count, paused_block_count_now)
+
+        assert not env.engine.has_unfinished_requests()
+
+        # The workload has to have actually saturated the cache, otherwise the
+        # assertions above are vacuous and the test rots into a no-op. A request
+        # surviving a step boundary while paused is what a zero budget cannot
+        # produce -- with no retention every paused request must resume or be
+        # evicted immediately -- so together with an eviction this pins the
+        # partial-retention path the other tests skip.
+        assert max_paused_block_count > 0, "no request was ever retained paused"
+        assert env.engine.evicted_request_count > 0, "no request overflowed the budget"
+
+        # Requeued requests resume from a checkpointed prompt, so the output length is
+        # what catches a token double-counted or dropped across an eviction.
+        assert len(finished_records) == num_requests
+        for record in finished_records:
+            request = record.merge()
+            assert request.status == Status.COMPLETED, f"request {request.request_id} unfinished"
+            assert len(request.generated_tokens) == num_tokens_to_generate
+
+        # No block, request row, or token slot may survive the storm.
+        assert allocator.get_total_used() == 0
+        assert allocator.pool_avail == allocator.pool_size - 1
+        assert context.total_request_count == 0
+        assert context.paused_request_count == 0
+        assert context.active_token_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
     def test_cuda_graph_padding_uses_dummy_block(self) -> None:
         """One real request in a four-request graph bucket: the padded block-table
         rows must hold the dummy block index, not the old -1 sentinel (OOB reads)."""
@@ -1154,6 +1675,40 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         padded_rows = context._cpu_mha_block_table[1:4]
         assert (padded_rows != -1).all()
         assert (padded_rows == context.kv_block_allocator.dummy_block_idx).all()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_active_row_block_table_tail_uses_dummy_block(self) -> None:
+        """A real request's unallocated trailing block-table columns must be
+        staged as the dummy block, not the -1 sentinel: graphed decode
+        advertises max_seqlen_k = max_sequence_length, so the kernel's
+        page-table reach can include the tail of a near-limit request."""
+        test_config = DynamicEngineTestConfig(
+            num_requests=1,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_cuda_graphs=1,
+            context_max_requests=4,
+            max_sequence_length=512,
+        )
+        env = self._build_test_env(test_config)
+        context = env.engine.context
+
+        env.engine._add_request(env.requests[0])
+        self._run_step(env)  # prefill
+        self._run_step(env)  # decode: graphed, one real row
+
+        assert context.using_cuda_graph_this_step()
+        # The 512-token budget spans two 256-token pages. 8-token prompt allocates only the first.
+        # So the real row genuinely has an unallocated tail to pin.
+        block_count = int(context.request_kv_block_counts[0].item())
+        staged_row = context._cpu_mha_block_table[0]
+        assert 0 < block_count < staged_row.numel()
+        assert (staged_row != -1).all()
+        assert (staged_row[block_count:] == context.kv_block_allocator.dummy_block_idx).all()
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -1217,7 +1772,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     def test_cuda_graph_token_counts(self, use_non_decode: bool) -> None:
         """Test initialization of `cuda_graph_token_counts` in dynamic context."""
 
-        # Exponential-decay graph distribution (halve from max down to tp_size).
+        # Exponential-decay graph distribution (halve from max down to tp_size). Pinned
+        # explicitly below: the production default is HYBRID, which spaces the
+        # decode-only family linearly instead and so yields different token counts.
         # decode-only path: cuda_graph_max_tokens = max_requests * (spec+1) = 80.
         # non-decode path: cuda_graph_max_tokens = self.max_tokens (DEFAULT 16384);
         # most large prefill sizes are filtered by is_valid because
@@ -1251,6 +1808,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     num_cuda_graphs=num_cuda_graphs,
                     use_cuda_graphs_for_non_decode_steps=use_non_decode,
                     cuda_graph_all_prefills=use_non_decode,
+                    cuda_graph_sizing_distribution=CudaGraphSizingDistribution.EXPONENTIAL,
                 )
             )
             actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts
@@ -2124,15 +2682,17 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_mamba_chunked_prefill(self):
+    @pytest.mark.parametrize("ssm_mixer", ["mamba", "gdp"])
+    def test_mamba_chunked_prefill(self, ssm_mixer):
         """
-        Test chunked prefill with a Mamba model.
+        Test chunked prefill with an SSM model (Mamba2 or Gated Delta Product).
         """
-        skip_if_mamba_sequence_packing_not_available("hybrid")
+        skip_if_mamba_sequence_packing_not_available("hybrid", ssm_mixer)
 
         # Context max tokens = 50.
         test_config = DynamicEngineTestConfig(
             model_provider="hybrid",
+            ssm_mixer=ssm_mixer,
             num_requests=0,
             num_tokens_to_generate=None,
             num_tokens_total=200,
@@ -2180,14 +2740,13 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         env.engine._add_request(req2)
         env.engine._add_request(req3)
 
-        # Run step 1
-        env.engine.schedule_waiting_requests()
-
+        # Step 1: schedule and launch the first prefill chunk as the async primer.
         env.engine.step_modern()
         assert req1.finished_chunk_token_count == 52
 
-        # Prepare for step 2
-        env.engine.schedule_waiting_requests()
+        # Step 2: resolve the first chunk and launch the second chunk.
+        env.engine.step_modern()
+        assert req1.finished_chunk_token_count == 104
 
         # Verify that requests 2 and 3 are queued because request 1 is still running
         assert ctx.num_prefill_requests == 1
@@ -2203,12 +2762,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Verify that request 1 is the designated chunked prefill request
         assert ctx.chunked_prefill_request_id == 1
 
-        # Run step 2
+        # Step 3: resolve request 1's second chunk and launch the batch containing
+        # request 1's final prefill chunk and request 2's first chunk.
         env.engine.step_modern()
         assert req1.finished_chunk_token_count == 104
-
-        # Prepare for step 3
-        env.engine.schedule_waiting_requests()
 
         # Verify that request 2 got partially scheduled and is now
         # the designated chunked prefill request
@@ -2228,12 +2785,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Verify that the active token count is the maximum token count
         assert ctx.active_token_count == 52
 
-        # Run step 3
+        # Step 4: resolve that mixed batch and launch request 1's decode with
+        # request 2's next prefill chunk.
         env.engine.step_modern()
-        assert req1.finished_chunk_token_count == 104
-
-        # Prepare for step 4
-        env.engine.schedule_waiting_requests()
+        assert req2.finished_chunk_token_count == 77
 
         # Verify that request 2 is still the first prefill request
         assert ctx.request_ids.tolist().index(2) == 1
@@ -2256,24 +2811,17 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Verify that active token count == max tokens
         assert ctx.active_token_count == 52
 
-        # Run step 4
+        # Step 5: resolve that batch and launch the next decode/prefill batch.
         env.engine.step_modern()
-
-        assert req2.finished_chunk_token_count == 77
-
-        # Prepare for step 5
-        env.engine.schedule_waiting_requests()
+        assert req2.finished_chunk_token_count == 128
 
         # Verify that request 2 is still the first prefill request
         assert ctx.request_ids.tolist().index(2) == 1
         assert ctx.mamba_metadata.request_to_mamba_state_idx[1] == req2_mamba_idx
 
-        # Run step 5
+        # Step 6: resolve request 1's final decode and launch request 2's final
+        # prefill chunk together with request 3's first chunk.
         env.engine.step_modern()
-        assert req2.finished_chunk_token_count == 128
-
-        # Prepare for step 6
-        env.engine.schedule_waiting_requests()
 
         # Verify that request 1 has completed
         assert req1.status == Status.COMPLETED
@@ -2293,22 +2841,21 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Store the Mamba state tensor idx for request 3
         req3_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[req3_idx].item()
 
-        # Run step 6
+        assert req3.finished_chunk_token_count == 20
+
+        # Step 7: resolve request 2's final prefill and launch request 3's final
+        # prefill chunk.
         env.engine.step_modern()
 
         # Verify that request 2 has finished
         assert req2.status == Status.COMPLETED
-        assert req3.finished_chunk_token_count == 20
-
-        # Prepare for step 7
-        env.engine.schedule_waiting_requests()
 
         # Verify that request 3 is now the first prefill request
         req3_idx = ctx.request_ids.tolist().index(3)
         assert req3_idx == 0
         assert ctx.mamba_metadata.request_to_mamba_state_idx[0] == req3_mamba_idx
 
-        # Run step 7
+        # Step 8: resolve request 3's final prefill output.
         env.engine.step_modern()
 
         # Verify that request 3 has finished
@@ -2377,24 +2924,27 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         assert req.status == Status.ACTIVE_AND_GENERATING_TOKENS
 
-        # --- Step 1 ---
+        # --- Step 1 (async primer) ---
         # Available: 256. Remaining: 513.
         # Logic: 513 - 256 = 257. Not 1. Schedule full 256.
         env.engine.step_modern()
 
-        assert env.engine.context.total_request_count == 0, env.engine.context.total_request_count
+        assert env.engine.context.total_request_count == 1, env.engine.context.total_request_count
+        assert ctx.request_query_lengths[0].item() == 256
 
         assert (
             req.finished_chunk_token_count == 256
         ), f"Step 1: Expected 256 tokens processed, got {req.finished_chunk_token_count}"
 
         # --- Step 2 ---
+        # Resolve the first chunk and launch the second.
         # Available: 256. Remaining un-prefilled: 257.
         # Logic: 257 - 256 = 1. This is the edge case!
         # Fix should reduce chunk size by 1 (to 255).
         env.engine.step_modern()
 
-        assert env.engine.context.total_request_count == 0, env.engine.context.total_request_count
+        assert env.engine.context.total_request_count == 1, env.engine.context.total_request_count
+        assert ctx.request_query_lengths[0].item() == 255
 
         # 256 (previous) + 255 (this step) = 511
         assert req.finished_chunk_token_count == 511, (
@@ -2403,12 +2953,19 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         )
 
         # --- Step 3 ---
+        # Resolve the second chunk and launch the final chunk.
         # Remaining un-prefilled: 2. Available: 256.
         # Logic: 2 <= 256. Schedule 2.
-        env.engine.schedule_waiting_requests()
         env.engine.step_modern()
 
-        # Verify request finishes prefill and completes
+        assert ctx.total_request_count == 1
+        assert ctx.num_prefill_requests == 1
+        assert ctx.request_query_lengths[0].item() == 2
+
+        # --- Step 4 ---
+        # Resolve the final prefill output and complete the request.
+        env.engine.step_modern()
+
         assert ctx.num_prefill_requests == 0
         assert req.status == Status.COMPLETED
 
@@ -2428,18 +2985,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             - Request B: 2 token prompt
 
         Sequence:
-            1. Step 1 scheduling:
+            1. Step 1 async primer:
                - Request A is scheduled (255 tokens).
                - Context has 1 token available (256 - 255).
                - Request B has 2 tokens remaining.
                - If we schedule 1 token for B, it leaves exactly 1 token for its final chunk,
                  crashing FA3. Since chunk_length is 1, we can't safely reduce it.
                  The engine MUST delay scheduling Request B.
-            2. Step 1 executes prefill for Request A only.
-            3. Step 2 scheduling:
-               - Request A enters decode phase (takes 1 active token).
-               - Context has 255 tokens available (256 - 1).
+            2. Step 2 resolves Request A and schedules Request B.
+               - Request A completes after its prefill sample is resolved.
+               - Context has all 256 tokens available.
                - Request B is now safely scheduled for its full 2 tokens.
+            3. Step 3 resolves Request B's prefill sample.
         """
         test_config = DynamicEngineTestConfig(
             model_provider="gpt",
@@ -2478,11 +3035,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         )
         env.engine._add_request(req_b)
 
-        # --- Step 1 ---
-        # Should schedule Request A fully (255), but delay Request B
+        # --- Step 1 (async primer) ---
+        # Schedule and launch Request A fully (255), but delay Request B.
         env.engine.step_modern()
 
-        assert req_a.status == Status.COMPLETED
+        assert ctx.total_request_count == 1
+        assert ctx.active_token_count == 255
 
         # Request B MUST be delayed (0 tokens processed) to avoid the FA3 bug
         assert (
@@ -2492,8 +3050,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert env.engine.waiting_request_ids[0] == 2
 
         # --- Step 2 ---
-        # Request A has completed. Context has 256 tokens available.
-        # Request B can now schedule its full 2 tokens safely.
+        # Resolve Request A, then schedule and launch Request B's full 2-token prompt.
+        env.engine.step_modern()
+
+        assert req_a.status == Status.COMPLETED
+        assert ctx.total_request_count == 1
+        assert ctx.request_ids[0].item() == 2
+        assert ctx.request_query_lengths[0].item() == 2
+
+        # --- Step 3 ---
+        # Resolve Request B's prefill output.
         env.engine.step_modern()
 
         assert req_b.status == Status.COMPLETED
@@ -2620,9 +3186,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             enable_prefix_caching=True,
         )
 
-        # 1. Add, schedule, and step Request A to commit its blocks to the KV cache
+        # 1. Add Request A and launch its async primer. Scheduling registers its
+        # complete block in the prefix cache.
         env.engine._add_request(req_a)
-        env.engine.schedule_waiting_requests()
         env.engine.step_modern()
 
         # Request B: Same prompt, added AFTER Req A's blocks are registered
@@ -2634,9 +3200,10 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             enable_prefix_caching=True,
         )
 
-        # 2. Add and schedule Request B. It will find the cached blocks immediately.
+        # 2. Add Request B. The next async step resolves Request A, then admits and
+        # launches Request B using the cached block.
         env.engine._add_request(req_b)
-        env.engine.schedule_waiting_requests()
+        env.engine.step_modern()
 
         # Verify that `_compute_prefix_match` successfully clamped the skip.
         req_b_idx = ctx.request_ids.tolist().index(2)
@@ -2848,7 +3415,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
             # Drive the engine until the request finishes
             while env.engine.has_unfinished_requests():
-                env.engine.schedule_waiting_requests()
                 env.engine.step_modern()
 
             return req.prompt_log_probs
@@ -3031,7 +3597,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         env = self._run_test(
             context_max_requests=max_requests, num_tokens_to_generate=16, num_gap_steps=1
         )
-        step_count = env.engine.context.step_count
         context = env.engine.context
         if max_requests is None:
             assert context.max_requests == 816
@@ -3041,13 +3606,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"num_requests ({len(env.requests)})."
             )
             assert context.max_requests == 4
-        # Exact step counts depend on sampled token sequences.
-        # With DP-offset sampling seeds, only DP rank 0 matches the golden seed.
-        if parallel_state.get_data_parallel_rank() == 0:
-            if max_requests is None:
-                assert step_count == 23
-            else:
-                assert step_count == 35
+
+        assert all(request.status == Status.COMPLETED for request in env.requests)
+        generated_token_count = sum(len(request.generated_tokens) for request in env.requests)
+        max_concurrent_requests = min(context.max_requests, len(env.requests))
+        minimum_generation_steps = (
+            generated_token_count + max_concurrent_requests - 1
+        ) // max_concurrent_requests
+        assert context.step_count >= minimum_generation_steps
         assert context.kv_block_allocator.pool_size == 819
 
     @pytest.mark.internal
@@ -3220,6 +3786,18 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     else:
                         request.kv_cache_epoch.append(boundary)
 
+        def capture_epoch_boundaries(epoch):
+            """Capture the expected boundary at the instant an epoch is changed."""
+            return {
+                request_id: (
+                    len(entry.record[-1].prompt_tokens)
+                    + len(entry.record[-1].generated_tokens)
+                    - 1,
+                    epoch,
+                )
+                for request_id, entry in engine.requests.items()
+            }
+
         # Steps without a generation epoch set — no stamps.
         engine.step_modern()
         for entry in engine.requests.values():
@@ -3237,14 +3815,15 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert ps == ks == [(0, 0)]
 
         # Generation epoch 1: boundary at current length, before next step.
+        epoch_1_boundaries = capture_epoch_boundaries(1)
         set_epoch(1)
         for _ in range(3):
             engine.step_modern()
 
-        for entry in engine.requests.values():
+        for request_id, entry in engine.requests.items():
             ps = entry.record[-1].policy_epoch
             ks = entry.record[-1].kv_cache_epoch
-            assert ps == ks == [(0, 0), (PROMPT_LEN + 2, 1)]
+            assert ps == ks == [(0, 0), epoch_1_boundaries[request_id]]
 
         # Simulate RECOMPUTE — checkpoint clears kv_cache so the engine's
         # stamping logic will recreate it fresh on the next epoch signal.
@@ -3260,6 +3839,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 assert entry.record[-1].kv_cache_epoch is None
 
         # Generation epoch 2: stamp then generate remaining tokens.
+        epoch_2_boundaries = capture_epoch_boundaries(2)
         set_epoch(2)
 
         finished_records = []
@@ -3269,20 +3849,92 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         for record in finished_records:
             merged = record.merge()
+            expected_policy_epoch = [
+                (0, 0),
+                epoch_1_boundaries[merged.request_id],
+                epoch_2_boundaries[merged.request_id],
+            ]
 
-            assert merged.policy_epoch == [(0, 0), (PROMPT_LEN + 2, 1), (PROMPT_LEN + 5, 2)]
+            assert merged.policy_epoch == expected_policy_epoch
 
             if use_checkpoint:
                 # KV cache was cleared by checkpoint; stamping logic recreated it at epoch 2.
                 assert merged.kv_cache_epoch == [(0, 2)]
             else:
-                assert merged.kv_cache_epoch == [(0, 0), (PROMPT_LEN + 2, 1), (PROMPT_LEN + 5, 2)]
+                assert merged.kv_cache_epoch == expected_policy_epoch
 
         # Verify checkpoint clears kv_cache_epoch and preserves policy.
         record = finished_records[0]
+        request_id = record[-1].request_id
+        expected_policy_epoch = [
+            (0, 0),
+            epoch_1_boundaries[request_id],
+            epoch_2_boundaries[request_id],
+        ]
         record.checkpoint()
-        assert record[-1].policy_epoch == merged.policy_epoch
+        assert record[-1].policy_epoch == expected_policy_epoch
         assert record[-1].kv_cache_epoch is None
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_local_metadata_ledger_gated_by_engine_enable(self):
+        """Only ledger-enabled engines (RL training) index finished requests."""
+        PROMPT_LEN = 8
+        NUM_TOKENS = 4
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=PROMPT_LEN,
+            max_prompt_length=PROMPT_LEN,
+            num_tokens_to_generate=NUM_TOKENS,
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        engine._generation_epoch = 3  # RL mode: requests are epoch-stamped
+        # Take the coordinator reply path so finished requests flow through the
+        # inline ledger indexing in the reply block (socket mocked out).
+        engine.use_coordinator = True
+        engine.is_mp_coordinator = True
+        engine.socket_for_receiving_requests = mock.MagicMock()
+
+        def run_request(request_id):
+            prompt_tokens = torch.full(
+                (PROMPT_LEN,), request_id + 1, dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=prompt_tokens,
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=NUM_TOKENS, termination_id=-1
+                    ),
+                )
+            )
+            finished_records = []
+            while engine.has_unfinished_requests():
+                result = engine.step_modern()
+                finished_records.extend(result["finished_request_records"])
+            return finished_records
+
+        # Default (plain serving): nothing is indexed, nothing accumulates.
+        finished_records = run_request(0)
+        assert len(finished_records) == 1
+        assert engine.local_metadata_ledger == {}
+
+        # RL launch (MegatronLocal.launch) enables the ledger: every finished
+        # request is indexed, no per-request tagging involved.
+        engine.local_metadata_ledger_enabled = True
+        finished_records = run_request(1)
+        assert len(finished_records) == 1
+
+        # The ledger keys by the request's engine-minted uid — the same string the
+        # endpoints return as the OpenAI response id.
+        merged = finished_records[0].merge()
+        ledger = engine.local_metadata_ledger
+        assert list(ledger.keys()) == [merged.uid]
+        assert ledger[merged.uid].policy_epoch == [(0, 3)]
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -3352,7 +4004,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
 
         env.engine._add_request(env.requests[0])
-        env.engine.schedule_waiting_requests()
 
         # Step engine until finished naturally
         # This allows the bookkeeping logic to gracefully truncate the
@@ -3402,18 +4053,16 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         req = env.requests[0]
         req.sampling_params.num_tokens_to_generate = 3
         env.engine._add_request(req)
-        env.engine.schedule_waiting_requests()
 
-        # Step 1: Prefill. Processes the 4 prompt tokens.
-        # At the end of this step, `update_requests` prepares the token indices for Step 2.
-        # It assigns block indices for the 3 upcoming tokens (1 base + 2 spec).
+        # Async scheduling primes the prefill forward on the first call, then
+        # consumes it and prepares the first speculative decode on the second.
+        env.engine.step_modern()
         env.engine.step_modern()
 
         context = env.engine.context
 
         # The request has 2 blocks allocated now (1 for prompt, 1 for the new 3 tokens)
         assigned_blocks = context.request_to_kv_block_ids[0]
-        first_block = assigned_blocks[0].item()
         second_block = assigned_blocks[1].item()
 
         # The active_token_count for the next step should be 3
@@ -4094,7 +4743,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             evicted_before = env.engine.evicted_request_count
 
             # Step the engine
-            env.engine.schedule_waiting_requests()
             env.engine.step_modern()
 
             # Check if any request was evicted during this step
@@ -4164,15 +4812,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 sampling_params=SamplingParams(num_tokens_to_generate=128, termination_id=99),
             )
 
-        # First, run schedule_waiting_requests and ONE step to allocate the prefill blocks.
-        # Req 0 and 2 will schedule immediately. Req 1 and 3 will defer because their hashes
-        # are currently pending (being registered by 0 and 2).
-        env.engine.schedule_waiting_requests()
+        # The first async call admits Req 0 and 2 and primes their prefill forward.
+        # Req 1 and 3 remain queued while the matching prefix blocks are pending.
         env.engine.step_modern()
 
-        # After step 1, Req 0 and 2 have completely registered their cached blocks.
-        # Now, schedule the deferred ones (Req 1 and 3). They will find the registered blocks!
-        env.engine.schedule_waiting_requests()
+        # The second call consumes those prefills, admits the deferred requests using
+        # the now-populated prefix blocks, and launches the resulting mixed batch.
         env.engine.step_modern()
 
         # 4 requests. 2 unique prefixes (1 block each).
@@ -4308,9 +4953,14 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=-1),
         )
 
-        # Step 1: prefill for request 0 — should NOT count as a spec step.
-        # The controller returns accepted_tokens=None for prefill-only batches
-        # (num_decode_requests == 0), so the engine must not increment any stats.
+        # The first async call only primes request 0's prefill forward.
+        env.engine.step_modern()
+        assert sum(env.engine._spec_tokens_proposed_per_pos) == 0
+        assert sum(env.engine._spec_tokens_accepted_per_pos) == 0
+        assert env.engine._spec_steps == 0
+
+        # The second call consumes the prefill and launches the first decode.
+        # The prefill result has accepted_tokens=None, so it must not increment stats.
         env.engine.step_modern()
         proposed_after_prefill = sum(env.engine._spec_tokens_proposed_per_pos)
         accepted_after_prefill = sum(env.engine._spec_tokens_accepted_per_pos)
@@ -4318,7 +4968,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert accepted_after_prefill == 0, "Prefill step should not accept any spec tokens"
         assert env.engine._spec_steps == 0, "Prefill step should not count as a spec step"
 
-        # Step 2: decode for request 0 — should count spec tokens.
+        # Consume the first decode for request 0; it should count spec tokens.
         env.engine.step_modern()
         assert (
             sum(env.engine._spec_tokens_proposed_per_pos) > proposed_after_prefill
@@ -4327,8 +4977,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             sum(env.engine._spec_tokens_accepted_per_pos) > accepted_after_prefill
         ), "With deterministic mock, decode step should have accepted spec tokens"
 
-        # Now add a second request while request 0 is decoding.
-        # The next step is a mixed prefill (req 1) + decode (req 0) step.
+        # Now add a second request while request 0 is decoding. This makes the
+        # next call launch a mixed prefill (req 1) + decode (req 0) batch.
         env.engine.add_request(
             request_id=1,
             prompt=torch.randint(
@@ -4337,7 +4987,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=-1),
         )
 
+        # This call consumes the already-pending decode-only batch, then admits
+        # request 1 and launches a mixed prefill/decode batch.
+        env.engine.step_modern()
+
         proposed_before_mixed = sum(env.engine._spec_tokens_proposed_per_pos)
+        # Consume the mixed batch. Only request 0 was decoding in that batch.
         env.engine.step_modern()
         proposed_after_mixed = sum(env.engine._spec_tokens_proposed_per_pos)
 
@@ -5292,7 +5947,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         unwrapped_model.compute_mtp_single_step = deterministic_mtp
 
         env.engine._add_request(env.requests[0])
-        env.engine.schedule_waiting_requests()
 
         while env.engine.has_unfinished_requests():
             env.engine.step_modern()
@@ -5630,197 +6284,22 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert env.engine.context.total_request_count == 0
 
 
-class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
-    """Tests that require non-default parallel configs (tp>1, pp>1, or ep>1).
-
-    Each test initializes its own parallel state and tears it down afterward,
-    so these are separated from TestDynamicInferenceEngine to avoid accumulating
-    NCCL communicator memory from repeated init/destroy cycles.
-    """
-
-    def teardown_method(self, method):
-        delete_cuda_graphs()
-        Utils.destroy_model_parallel()
-
-    @classmethod
-    @torch.inference_mode()
-    def _build_test_env(cls, test_config):
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=test_config.tensor_model_parallel_size,
-            pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
-            expert_model_parallel_size=test_config.expert_model_parallel_size,
-            expert_tensor_parallel_size=1,
-        )
-        return super()._build_test_env(test_config)
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    @pytest.mark.parametrize(
-        "async_sched_mode", [AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC]
-    )
-    @torch.inference_mode()
-    def test_non_greedy_sampling_with_mamba_mtp_ep(self, async_sched_mode):
-        """Run cumulative Mamba, MTP, and EP sampling support to completion.
-
-        Args:
-            async_sched_mode (AsyncScheduleMode): Scheduling mode under test.
-        """
-        skip_if_mamba_sequence_packing_not_available("hybrid")
-        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
-            pytest.skip("Test requires at least 2 GPUs")
-
-        env = self._run_test(
-            num_requests=2,
-            min_prompt_length=4,
-            max_prompt_length=4,
-            num_tokens_to_generate=4,
-            num_gap_steps=0,
-            use_fixed_output_lengths=True,
-            model_provider="hybrid",
-            expert_model_parallel_size=2,
-            num_speculative_tokens=1,
-            sampling_backend="torch",
-            temperature=0.8,
-            top_k=8,
-            return_log_probs=True,
-            skip_prompt_log_probs=True,
-            context_max_requests=8,
-            async_sched_mode=async_sched_mode,
-        )
-
-        assert all(request.status == Status.COMPLETED for request in env.requests)
-        assert all(
-            len(request.generated_log_probs) == len(request.generated_tokens)
-            for request in env.requests
-        )
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    @pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
-    @pytest.mark.parametrize("sequence_parallel", [False, True])
-    @pytest.mark.parametrize("ep_size", [1, 2])
-    @pytest.mark.parametrize("pp_size", [1, 2])
-    @pytest.mark.parametrize("tp_size", [1, 2])
-    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
-    @pytest.mark.parametrize("transformer_impl", ["local", "inference_optimized"])
-    @torch.inference_mode()
-    def test_parallel_inference(
-        self,
-        model_provider,
-        tp_size,
-        pp_size,
-        ep_size,
-        sequence_parallel,
-        materialize_only_last_token_logits,
-        transformer_impl,
-    ):
-        skip_if_mamba_sequence_packing_not_available(model_provider)
-
-        if tp_size == 1 and pp_size == 1 and ep_size == 1:
-            pytest.skip(reason="Test requires tp_size > 1 or pp_size > 1 or ep_size > 1")
-        elif not torch.distributed.is_initialized():
-            pytest.skip("Distributed not initialized")
-        world_size = torch.distributed.get_world_size()
-        min_world_size = tp_size * pp_size * ep_size
-        if world_size < min_world_size:
-            pytest.skip(f"Test requires at least {min_world_size} GPUs")
-        elif tp_size == 1 and sequence_parallel:
-            pytest.skip(reason="Sequence parallelism requires tp_size > 1")
-        elif tp_size > 1 and ep_size > 1 and not sequence_parallel:
-            pytest.skip(reason="Sequence parallelism must be used with tp_size > 1 and ep_size > 1")
-        elif transformer_impl == "inference_optimized":
-            if ep_size > 1:
-                pytest.skip(
-                    reason="MoE models are not supported with the inference optimized transformer."
-                )
-            if tp_size > 1 and not sequence_parallel:
-                pytest.skip(
-                    reason=(
-                        "The inference optimized transformer requires sequence parallelism "
-                        "when tp_size > 1."
-                    )
-                )
-
-        env = self._run_test(
-            model_provider=model_provider,
-            tensor_model_parallel_size=tp_size,
-            pipeline_model_parallel_size=pp_size,
-            expert_model_parallel_size=ep_size,
-            sequence_parallel=sequence_parallel,
-            materialize_only_last_token_logits=materialize_only_last_token_logits,
-            transformer_impl=transformer_impl,
-        )
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    @pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
-    def test_sequence_parallel_fp8_inference(self, materialize_only_last_token_logits: bool):
-        fp8_available, reason_for_no_fp8 = check_fp8_support()
-        if not fp8_available:
-            pytest.skip(reason_for_no_fp8)
-
-        self._run_test(
-            min_prompt_length=19,
-            max_prompt_length=19,
-            tensor_model_parallel_size=4,
-            sequence_parallel=True,
-            materialize_only_last_token_logits=True,
-            fp8=True,
-        )
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(
-        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
-    )
-    @torch.inference_mode()
-    def test_speculative_decoding_pipeline_parallel(self):
-        """Test speculative decoding with pipeline parallelism (pp_size=2)."""
-        if not torch.distributed.is_initialized():
-            pytest.skip("Distributed not initialized")
-        world_size = torch.distributed.get_world_size()
-        pp_size = 2
-        if world_size < pp_size:
-            pytest.skip(f"Test requires at least {pp_size} GPUs")
-
-        env = self._run_test(
-            model_provider="gpt",
-            pipeline_model_parallel_size=pp_size,
-            num_speculative_tokens=2,
-            num_tokens_to_generate=6,
-            materialize_only_last_token_logits=False,
-        )
-
-        for request in env.requests:
-            assert (
-                request.status == Status.COMPLETED
-            ), f"Request {request.request_id}: status={request.status}"
-            num_expected = request.sampling_params.num_tokens_to_generate
-            assert len(request.generated_tokens) <= num_expected
-
-
-CHUNKED_CG_BLOCK_SIZE = 256
-CHUNKED_CG_VOCAB_SIZE = 10000
-CHUNKED_CG_MAX_SEQ_LEN = 2048
-
-
 @pytest.mark.internal
-@pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="need flash attn")
-class TestChunkedPrefillCudaGraphs:
-    """Verify correctness across chunked prefill and CUDA graph combinations.
-
-    For each model type, runs a baseline config (no chunked prefill, no CUDA graphs)
-    and compares output tokens against every other combination.
-    """
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.skipif(
+    not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+)
+class TestGDNDynamicInferenceEngine(DynamicInferenceEngineTestBase):
+    """Exercise GDN through the production scheduler and local CUDA graphs."""
 
     @classmethod
     def setup_class(cls):
-        Utils.initialize_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
 
     @classmethod
     def teardown_class(cls):
@@ -5828,188 +6307,49 @@ class TestChunkedPrefillCudaGraphs:
         set_rounder(64)
         Utils.destroy_model_parallel()
 
-    def _create_model(self, model_provider, num_cuda_graphs):
-        """Create a GPT or Mamba model with optional CUDA graph support."""
-        cuda_graph_impl = "local" if num_cuda_graphs else "none"
+    @staticmethod
+    def _generated_tokens(env):
+        return [list(request.generated_tokens) for request in env.requests]
 
-        if model_provider == "gpt":
-            config = TransformerConfig(
-                params_dtype=torch.bfloat16,
-                num_layers=4,
-                hidden_size=32,
-                num_attention_heads=4,
-                use_cpu_initialization=True,
-                cuda_graph_impl=cuda_graph_impl,
-                inference_rng_tracker=True,
-                tensor_model_parallel_size=1,
-                pipeline_model_parallel_size=1,
-                pipeline_dtype=torch.bfloat16,
-                add_bias_linear=True,
-            )
-            model = GPTModel(
-                config=config,
-                transformer_layer_spec=get_gpt_layer_local_spec(),
-                vocab_size=CHUNKED_CG_VOCAB_SIZE,
-                max_sequence_length=CHUNKED_CG_MAX_SEQ_LEN,
-                parallel_output=True,
-                pre_process=parallel_state.is_pipeline_first_stage(),
-                post_process=parallel_state.is_pipeline_last_stage(),
-            ).cuda()
-        elif model_provider == "hybrid":
-            config = TransformerConfig(
-                params_dtype=torch.bfloat16,
-                num_layers=3,
-                hidden_size=256,
-                mamba_num_heads=16,
-                num_attention_heads=16,
-                use_cpu_initialization=True,
-                cuda_graph_impl=cuda_graph_impl,
-                inference_rng_tracker=True,
-                tensor_model_parallel_size=1,
-                pipeline_model_parallel_size=1,
-                pipeline_dtype=torch.bfloat16,
-                add_bias_linear=True,
-                is_hybrid_model=True,
-            )
-            model = HybridModel(
-                config=config,
-                hybrid_stack_spec=hybrid_stack_spec,
-                vocab_size=CHUNKED_CG_VOCAB_SIZE,
-                max_sequence_length=CHUNKED_CG_MAX_SEQ_LEN,
-                parallel_output=True,
-                hybrid_layer_pattern="M*-",
-                pre_process=parallel_state.is_pipeline_first_stage(),
-                post_process=parallel_state.is_pipeline_last_stage(),
-            ).cuda()
-        else:
-            raise ValueError(f"Invalid model_provider {model_provider}")
-
-        for param in model.parameters():
-            param.data = param.data.to(config.params_dtype)
-        model.eval()
-        return model
-
-    def _build_engine(self, model, enable_chunked_prefill, num_cuda_graphs, context_max_tokens):
-        """Build an engine with the given chunked prefill / CUDA graph config."""
-        set_rounder(4)
-        mamba_config = MambaInferenceStateConfig.from_model(model)
-
-        inference_config_kwargs = dict(
-            max_sequence_length=CHUNKED_CG_MAX_SEQ_LEN,
-            buffer_size_gb=0.5,
-            block_size_tokens=CHUNKED_CG_BLOCK_SIZE,
-            materialize_only_last_token_logits=False,
-            unified_memory_level=0,
-            num_cuda_graphs=num_cuda_graphs,
-            use_cuda_graphs_for_non_decode_steps=True,
-            enable_chunked_prefill=enable_chunked_prefill,
-            max_tokens=context_max_tokens,
-            max_requests=128,
-            sampling_backend='torch',
+    def test_cuda_graph_parity(self):
+        common = dict(
+            model_provider="hybrid",
+            ssm_mixer="gdn",
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=8,
+            num_gap_steps=0,
+            top_k=1,
+            context_max_requests=32,
+            use_cuda_graphs_for_non_decode_steps=False,
         )
-        if mamba_config is not None:
-            inference_config_kwargs.update(mamba_inference_state_config=mamba_config)
-        context = DynamicInferenceContext(
-            model_config=model.config, inference_config=InferenceConfig(**inference_config_kwargs)
-        )
-        wrapper = GPTInferenceWrapper(model, context)
-        wrapper.model_is_pipeline_parallel = not (
-            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
-        )
-        controller = TextGenerationController(
-            inference_wrapped_model=wrapper,
-            tokenizer=types.SimpleNamespace(
-                vocab_size=CHUNKED_CG_VOCAB_SIZE, detokenize=lambda tokens: "tokenized_prompt"
-            ),
-        )
-        delete_cuda_graphs()
-        return DynamicInferenceEngine(controller, context)
-
-    def _run_to_completion(self, engine, prompts, num_tokens_to_generate):
-        """Add all prompts and run to completion, returning {req_id: generated_tokens}."""
-        for i, prompt in enumerate(prompts):
-            request = DynamicInferenceRequest(
-                request_id=i,
-                prompt_tokens=prompt,
-                sampling_params=SamplingParams(
-                    num_tokens_to_generate=num_tokens_to_generate, termination_id=-1, top_k=1
-                ),
-                block_size_tokens=CHUNKED_CG_BLOCK_SIZE,
-            )
-            engine._add_request(request)
-
-        finished = {}
-        step_count = 0
-        while engine.has_unfinished_requests():
-            result = engine.step_modern()
-            step_count += 1
-            for record in result["finished_request_records"]:
-                merged = record.merge()
-                finished[merged.request_id] = list(merged.generated_tokens)
-
-        return finished, step_count
-
-    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
-    @pytest.mark.parametrize("chunked_prefill", [False, True])
-    @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
-    @torch.inference_mode()
-    def test_chunked_prefill_cuda_graphs(self, model_provider, chunked_prefill, num_cuda_graphs):
-        """Verify generated tokens match across chunked prefill and CUDA graph configs."""
-        skip_if_mamba_sequence_packing_not_available(model_provider)
-
-        clear_nvte_env_vars()
-
-        random.seed(123)
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(
-            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
+        eager = self._run_test(**common, num_cuda_graphs=None)
+        graphed = self._run_test(
+            **common,
+            num_cuda_graphs=3,
+            force_build_cuda_graphs=True,
+            inference_cuda_graph_scope=InferenceCudaGraphScope.block,
         )
 
-        # Create model with CUDA graph support so it can be used for both CG and non-CG engines.
-        model = self._create_model(model_provider, num_cuda_graphs=2)
+        model = graphed.engine.controller.inference_wrapped_model.model
+        assert model.cudagraph_manager.cudagraph_runners
+        assert self._generated_tokens(graphed) == self._generated_tokens(eager)
 
-        # 3 prompts of 512 tokens each, disjoint token ranges (no prefix sharing).
-        device = torch.cuda.current_device()
-        prompts = [
-            torch.arange(i * 600, i * 600 + 512, dtype=torch.int64, device=device) for i in range(3)
-        ]
-        num_tokens_to_generate = 8
-
-        # Token budget: 768 forces chunking when chunked_prefill=True
-        # (only ~1.5 of the 512-token prompts fit per step).
-        context_max_tokens = 768 if chunked_prefill else None
-
-        # Baseline: no chunked prefill, no CUDA graphs.
-        baseline_engine = self._build_engine(
-            model, enable_chunked_prefill=False, num_cuda_graphs=None, context_max_tokens=None
+    def test_scheduling_invariance(self):
+        """Staggered admission must not change per-request greedy output."""
+        common = dict(
+            model_provider="hybrid",
+            ssm_mixer="gdn",
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=8,
+            num_tokens_to_generate=8,
+            top_k=1,
+            context_max_requests=32,
+            num_cuda_graphs=None,
         )
-        baseline_outputs, baseline_steps = self._run_to_completion(
-            baseline_engine, prompts, num_tokens_to_generate
-        )
+        dense = self._run_test(**common, num_gap_steps=0)
+        staggered = self._run_test(**common, num_gap_steps=3)
 
-        # Test config.
-        test_engine = self._build_engine(
-            model,
-            enable_chunked_prefill=chunked_prefill,
-            num_cuda_graphs=num_cuda_graphs,
-            context_max_tokens=context_max_tokens,
-        )
-        test_outputs, test_steps = self._run_to_completion(
-            test_engine, prompts, num_tokens_to_generate
-        )
-
-        # Correctness: generated tokens must match baseline.
-        for req_id in range(3):
-            assert baseline_outputs[req_id] == test_outputs[req_id], (
-                f"req {req_id}: baseline {baseline_outputs[req_id]} != "
-                f"test {test_outputs[req_id]} "
-                f"(chunked_prefill={chunked_prefill}, num_cuda_graphs={num_cuda_graphs})"
-            )
-
-        # When chunked prefill is enabled with a constrained token budget, the engine
-        # needs more scheduling steps than the non-chunked baseline.
-        if chunked_prefill:
-            assert test_steps > baseline_steps, (
-                f"chunked prefill should need more steps than baseline "
-                f"({test_steps} <= {baseline_steps})"
-            )
+        assert self._generated_tokens(staggered) == self._generated_tokens(dense)

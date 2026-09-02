@@ -3,6 +3,7 @@
 from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
 from megatron.core.inference.apis.llm import MegatronLLM
 from megatron.core.inference.apis.serve_config import ServeConfig
+from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -14,6 +15,8 @@ __all__ = [
     "DynamicInferenceRequestRecord",
     "MegatronAsyncLLM",
     "MegatronLLM",
+    "MediaPromptSpec",
+    "MultimodalPromptConfig",
     "SamplingParams",
     "ServeConfig",
 ]

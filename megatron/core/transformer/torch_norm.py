@@ -11,6 +11,8 @@ from megatron.core.utils import is_torch_min_version
 class LayerNormInterface(Protocol):
     """Interface that all LayerNorm implementations should follow."""
 
+    returns_residual: bool
+
     def forward(self, x: torch.Tensor, /) -> torch.Tensor:
         """Forward method for a LayerNorm implementation."""
         ...
@@ -66,7 +68,9 @@ class WrappedTorchNorm:
         else:
             raise Exception("Only LayerNorm, RMSNorm and L2Norm are currently supported")
 
-        return norm_cls(normalized_shape=hidden_size, eps=eps)
+        instance = norm_cls(normalized_shape=hidden_size, eps=eps)
+        instance.returns_residual = False
+        return instance
 
 
 class L2Norm(torch.nn.Module, LayerNormInterface):

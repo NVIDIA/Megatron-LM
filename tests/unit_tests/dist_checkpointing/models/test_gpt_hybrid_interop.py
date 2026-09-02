@@ -657,6 +657,7 @@ def _run_gpt_to_hybrid_optimizer_load(
     )
     with TempNamedDir(tmp_path_dist_ckpt / 'gpt_hybrid_opt_interop') as ckpt_dir:
         mock_args = parse_args(ignore_unknown_args=True)
+        mock_args.save_tokenizer_assets = False
         with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
             # Build a GPT model + distributed optimizer whose Adam moments are
             # seeded to random values, then save a full checkpoint.

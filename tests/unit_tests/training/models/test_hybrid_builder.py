@@ -3,6 +3,7 @@
 from unittest.mock import Mock, call, patch
 
 import pytest
+import torch
 
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -39,6 +40,7 @@ class TestHybridModelConfigInitialization:
     def test_default_values(self):
         config = HybridModelConfig(transformer=_make_transformer())
         assert config.fp16_lm_cross_entropy is False
+        assert config.logit_dtype is None
         assert config.parallel_output is True
         assert config.share_embeddings_and_output_weights is False
         assert config.hybrid_layer_pattern is None
@@ -55,6 +57,7 @@ class TestHybridModelConfigInitialization:
         config = HybridModelConfig(
             transformer=_make_transformer(),
             fp16_lm_cross_entropy=True,
+            logit_dtype=torch.float32,
             parallel_output=False,
             hybrid_attention_ratio=0.25,
             hybrid_mlp_ratio=0.1,
@@ -63,6 +66,7 @@ class TestHybridModelConfigInitialization:
             vocab_size=50000,
         )
         assert config.fp16_lm_cross_entropy is True
+        assert config.logit_dtype == torch.float32
         assert config.parallel_output is False
         assert config.hybrid_attention_ratio == 0.25
         assert config.hybrid_mlp_ratio == 0.1
@@ -329,6 +333,7 @@ class TestHybridModelBuilderBuildModel:
             seq_length=4096,
             hybrid_layer_pattern="M-A-",
             fp16_lm_cross_entropy=True,
+            logit_dtype=torch.float32,
             parallel_output=False,
             share_embeddings_and_output_weights=True,
             position_embedding_type="rope",
@@ -345,6 +350,7 @@ class TestHybridModelBuilderBuildModel:
         assert kw["max_sequence_length"] == 4096
         assert kw["hybrid_layer_pattern"] == "M-A-"
         assert kw["fp16_lm_cross_entropy"] is True
+        assert kw["logit_dtype"] == torch.float32
         assert kw["parallel_output"] is False
         assert kw["share_embeddings_and_output_weights"] is True
         assert kw["position_embedding_type"] == "rope"

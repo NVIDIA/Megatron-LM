@@ -3,10 +3,13 @@
 import pytest
 import torch
 
+from megatron.core.extensions import transformer_engine as transformer_engine_module
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.moe import moe_layer as moe_layer_module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -15,9 +18,145 @@ from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
 
+class _RecordingLinear(torch.nn.Module):
+    calls = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.parallel_mode = None
+        self._tp_group = None
+        self.register_parameter("weight", torch.nn.Parameter(torch.empty(1, 1)))
+        self.calls.append((args, kwargs))
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        return transformer_engine_module.TELinear.sharded_state_dict(
+            self, prefix=prefix, sharded_offsets=sharded_offsets, metadata=metadata
+        )
+
+
+class _RecordingInferenceLinear(torch.nn.Module):
+    calls = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.calls.append((args, kwargs))
+
+
+class _DummyDispatcher(torch.nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+
+class _FakeProcessGroup:
+    def rank(self):
+        return 0
+
+    def size(self):
+        return 1
+
+
+def _build_dummy_module(*args, **kwargs):
+    return torch.nn.Module()
+
+
+def _record_checkpoint_call(checkpoint_calls, state_dict, prefix, *args, **kwargs):
+    checkpoint_calls[prefix] = (state_dict, kwargs)
+    return {}
+
+
+def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch):
+    """Latent projections use the owning TP group only for checkpoint metadata."""
+    tp_group = _FakeProcessGroup()
+    ep_group = _FakeProcessGroup()
+    gtp_remat_group = _FakeProcessGroup()
+    gtp_replica_group = _FakeProcessGroup()
+    checkpoint_dp_cp_group = _FakeProcessGroup()
+    pg_collection = ProcessGroupCollection(
+        tp=tp_group, ep=ep_group, dp_cp=gtp_replica_group, gtp_remat=gtp_remat_group
+    )
+    checkpoint_calls = {}
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_moe_experts=1,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_token_dispatcher_type="allgather",
+        moe_ffn_hidden_size=16,
+        moe_latent_size=4,
+        use_cpu_initialization=True,
+        add_bias_linear=False,
+        gtp_remat_opt_in_modules=["moe_latent_proj"],
+    )
+    submodules = MoESubmodules(experts=_build_dummy_module, router=_build_dummy_module)
+
+    _RecordingLinear.calls.clear()
+    monkeypatch.setattr(moe_layer_module, "HAVE_TE", True)
+    monkeypatch.setattr(moe_layer_module, "TELinear", _RecordingLinear)
+    monkeypatch.setattr(moe_layer_module, "MoEAllGatherTokenDispatcher", _DummyDispatcher)
+    monkeypatch.setattr(
+        transformer_engine_module,
+        "make_sharded_tensors_for_checkpoint",
+        lambda state_dict, prefix, *args, **kwargs: _record_checkpoint_call(
+            checkpoint_calls, state_dict, prefix, *args, **kwargs
+        ),
+    )
+
+    layer = MoELayer(config, submodules, pg_collection=pg_collection)
+
+    assert len(_RecordingLinear.calls) == 2
+    assert all(kwargs["parallel_mode"] == "duplicated" for _, kwargs in _RecordingLinear.calls)
+    assert all("tp_group" not in kwargs for _, kwargs in _RecordingLinear.calls)
+    assert all(kwargs["gtp_remat_group"] is gtp_remat_group for _, kwargs in _RecordingLinear.calls)
+    assert all(
+        kwargs["gtp_replica_group"] is gtp_replica_group for _, kwargs in _RecordingLinear.calls
+    )
+    assert layer.fc1_latent_proj._tp_group is tp_group
+    assert layer.fc2_latent_proj._tp_group is tp_group
+
+    layer.sharded_state_dict(prefix="moe.", metadata={"dp_cp_group": checkpoint_dp_cp_group})
+
+    for name in ("fc1_latent_proj", "fc2_latent_proj"):
+        state_dict, checkpoint_kwargs = checkpoint_calls[f"moe.{name}."]
+        assert set(state_dict) == {"weight"}
+        assert checkpoint_kwargs["tp_group"] is tp_group
+        assert checkpoint_kwargs["dp_cp_group"] is checkpoint_dp_cp_group
+
+    layer.fc1_latent_proj.parallel_mode = "column"
+    with pytest.raises(
+        AssertionError, match="TELinear sharded_state_dict can only be used with duplicated"
+    ):
+        layer.sharded_state_dict(prefix="moe.", metadata={"dp_cp_group": checkpoint_dp_cp_group})
+
+    from megatron.core.tensor_parallel import inference_layers as inference_layers_module
+
+    _RecordingInferenceLinear.calls.clear()
+    monkeypatch.setattr(inference_layers_module, "InferenceLinear", _RecordingInferenceLinear)
+    config.transformer_impl = "inference_optimized"
+    MoELayer(config, submodules, pg_collection=pg_collection)
+
+    assert len(_RecordingInferenceLinear.calls) == 2
+    assert all(
+        "gtp_remat_group" not in kwargs and "gtp_replica_group" not in kwargs
+        for _, kwargs in _RecordingInferenceLinear.calls
+    )
+
+
 class TestLatentMoELayer:
     def setup_method(self, method):
         pass
+
+    def test_norm_before_up_proj_requires_latent_moe(self):
+        with pytest.raises(
+            ValueError, match="moe_use_norm_before_up_proj requires moe_latent_size"
+        ):
+            TransformerConfig(
+                num_layers=1,
+                hidden_size=32,
+                num_attention_heads=4,
+                moe_use_norm_before_up_proj=True,
+            )
 
     @pytest.mark.skipif(
         not is_te_min_version("1.7.0.dev0"),
@@ -63,6 +202,8 @@ class TestLatentMoELayer:
         moe_layer.cuda()
         config = moe_layer.config
 
+        assert not hasattr(moe_layer, "fc2_norm")
+
         assert (
             moe_layer.shared_experts.linear_fc1.weight.shape[1] == config.hidden_size
         ), "Shared expert computation has to happen in hidden dimension."
@@ -98,4 +239,57 @@ class TestLatentMoELayer:
         output, _ = moe_layer(hidden_states)
         assert output.shape[2] == config.hidden_size
 
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not is_te_min_version("1.7.0.dev0"),
+        reason="Expert with TE Linear is only supported in TE 1.7.0 and later.",
+    )
+    def test_norm_before_latent_up_projection(self):
+        Utils.initialize_model_parallel(1, 1)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            use_cpu_initialization=True,
+            moe_token_dispatcher_type="alltoall",
+            moe_router_topk=2,
+            moe_aux_loss_coeff=0.01,
+            moe_grouped_gemm=True,
+            moe_ffn_hidden_size=128,
+            activation_func=torch.nn.functional.silu,
+            gated_linear_unit=True,
+            add_bias_linear=False,
+            moe_latent_size=8,
+            moe_use_norm_before_up_proj=True,
+        )
+        transformer_layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
+            num_experts=config.num_moe_experts, moe_grouped_gemm=True
+        )
+        submodules = get_submodules(transformer_layer_submodules.mlp)
+        assert isinstance(submodules, MoESubmodules)
+        moe_layer = MoELayer(config, submodules).cuda()
+
+        assert moe_layer.fc2_norm.weight.shape == (config.moe_latent_size,)
+        norm_output = []
+        fc2_input = []
+        moe_layer.fc2_norm.register_forward_hook(
+            lambda _module, _inputs, output: norm_output.append(output.detach())
+        )
+        moe_layer.fc2_latent_proj.register_forward_pre_hook(
+            lambda _module, inputs: fc2_input.append(inputs[0].detach())
+        )
+
+        hidden_states = torch.randn(32, 2, config.hidden_size, device="cuda")
+        output, _ = moe_layer(hidden_states)
+
+        assert output.shape == hidden_states.shape
+        assert len(norm_output) == 1
+        assert len(fc2_input) == 1
+        torch.testing.assert_close(fc2_input[0], norm_output[0])
+
+        output.sum().backward()
+        assert moe_layer.fc2_norm.weight.grad is not None
         Utils.destroy_model_parallel()

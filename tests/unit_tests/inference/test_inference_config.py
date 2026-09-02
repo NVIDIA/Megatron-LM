@@ -5,14 +5,72 @@ from argparse import ArgumentParser
 from types import SimpleNamespace
 
 import pytest
+import torch
 
-from megatron.core.inference.config import AsyncScheduleMode, InferenceConfig
+from megatron.core.inference.config import (
+    AsyncScheduleMode,
+    ImageProcessingConfig,
+    InferenceConfig,
+    MambaInferenceStateConfig,
+    MediaCacheCoordinatorPolicy,
+    MediaPromptSpec,
+    MultimodalPromptConfig,
+    VideoProcessingConfig,
+)
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+from megatron.core.ssm.mamba_mixer import MambaMixer
+from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import _add_inference_args
 from megatron.training.config.inference_config import InferenceSetupConfig
 
 
 class TestInferenceConfig:
+    @pytest.mark.parametrize(
+        ("grouped_gemm_backend", "expected_backend"),
+        [
+            ("torch", "triton"),
+            (InferenceGroupedGemmBackend.TORCH, "triton"),
+            ("flashinfer", "triton"),
+            (InferenceGroupedGemmBackend.FLASHINFER, "triton"),
+        ],
+    )
+    def test_resolve_mxfp8_backend(self, grouped_gemm_backend, expected_backend):
+        assert resolve_mxfp8_backend(grouped_gemm_backend) == expected_backend
+
+    @pytest.mark.parametrize("grouped_gemm_backend", ["vllm", InferenceGroupedGemmBackend.VLLM])
+    def test_resolve_mxfp8_backend_rejects_unsupported_backend(self, grouped_gemm_backend):
+        with pytest.raises(ValueError, match="does not support inference_grouped_gemm_backend"):
+            resolve_mxfp8_backend(grouped_gemm_backend)
+
+    @staticmethod
+    def _hybrid_model(layer_type_list, experimental_attention_variant="gdn"):
+        return SimpleNamespace(
+            config=SimpleNamespace(
+                params_dtype=torch.bfloat16,
+                batch_invariant_mode=False,
+                experimental_attention_variant=experimental_attention_variant,
+            ),
+            decoder=SimpleNamespace(layer_type_list=layer_type_list, layers=[]),
+        )
+
+    def test_mamba_inference_state_config_rejects_mixed_recurrent_layers(self):
+        """Mamba and GDN cannot share one state shape and prefill chunk size."""
+        model = self._hybrid_model([Symbols.MAMBA, Symbols.GDN])
+
+        with pytest.raises(ValueError, match="mixing Mamba and GDN"):
+            MambaInferenceStateConfig.from_model(model)
+
+    def test_mamba_inference_state_config_rejects_gdn2(self):
+        """GDN2 should fail explicitly instead of missing the GDN inference hooks."""
+        model = self._hybrid_model([Symbols.GDN], experimental_attention_variant="gdn2")
+
+        with pytest.raises(NotImplementedError, match="GDN2"):
+            MambaInferenceStateConfig.from_model(model)
+
     def test_mutual_exclusivity_with_transformer_config(self):
         """
         Ensure mutual exclusivity between fields in `InferenceConfig` and
@@ -25,7 +83,7 @@ class TestInferenceConfig:
     @pytest.mark.parametrize(
         "async_sched_mode, expected",
         [
-            (None, AsyncScheduleMode.LEGACY),
+            (None, AsyncScheduleMode.ASYNC),
             ("legacy", AsyncScheduleMode.LEGACY),
             (AsyncScheduleMode.LEGACY, AsyncScheduleMode.LEGACY),
             ("async", AsyncScheduleMode.ASYNC),
@@ -33,7 +91,7 @@ class TestInferenceConfig:
         ],
     )
     def test_async_sched_mode_default_and_coercion(self, async_sched_mode, expected):
-        """Ensure async scheduling mode defaults to legacy and accepts strings."""
+        """Ensure async scheduling mode defaults to async and accepts strings."""
         kwargs = {} if async_sched_mode is None else {"async_sched_mode": async_sched_mode}
         assert InferenceConfig(**kwargs).async_sched_mode == expected
 
@@ -43,11 +101,76 @@ class TestInferenceConfig:
         with pytest.raises(ValueError):
             InferenceConfig(async_sched_mode=invalid_mode)
 
-    def test_async_sched_argparse_plumbing(self):
-        """Ensure the CLI exposes async scheduling mode."""
+    def test_media_cache_routing_weight_must_be_non_negative(self):
+        with pytest.raises(ValueError, match="media_cache_routing_weight"):
+            InferenceConfig(media_cache_routing_weight=-1.0)
+
+    def test_media_cache_coordinator_policy_defaults_to_affinity(self):
+        assert (
+            InferenceConfig().media_cache_coordinator_policy == MediaCacheCoordinatorPolicy.AFFINITY
+        )
+
+    def test_multimodal_prompt_config_builds_independent_specs_from_dict(self):
+        config = MultimodalPromptConfig.from_dict(
+            {
+                "image_spec": {"model_token": "<image>", "prefix": "<img>"},
+                "video_spec": {"model_token": "<video>", "suffix": "</video>"},
+            }
+        )
+
+        assert config.get_spec("image") == MediaPromptSpec(model_token="<image>", prefix="<img>")
+        assert config.get_spec("video") == MediaPromptSpec(model_token="<video>", suffix="</video>")
+        with pytest.raises(ValueError, match="Unsupported media modality"):
+            config.get_spec("audio")
+
+    def test_video_processing_config_preserves_image_contract_and_defaults(self):
+        image_config = ImageProcessingConfig(
+            patch_dim=14, dynamic_resolution=True, pixel_shuffle=True
+        )
+
+        video_config = VideoProcessingConfig(image_config=image_config)
+
+        assert video_config.image_config is image_config
+        assert video_config.num_frames == 8
+        assert video_config.temporal_patch_size == 1
+        assert video_config.video_maintain_aspect_ratio is True
+        assert video_config.frame_manifest_magic is None
+
+    @pytest.mark.parametrize(
+        "cli_args, expected",
+        [
+            ([], "async"),
+            (["--inference-dynamic-batching-async-sched-mode", "async"], "async"),
+            (["--inference-dynamic-batching-async-sched-mode", "legacy"], "legacy"),
+        ],
+    )
+    def test_async_sched_argparse_plumbing(self, cli_args, expected):
+        """Ensure the CLI defaults to async and supports an explicit legacy opt-out."""
         parser = _add_inference_args(ArgumentParser())
-        args = parser.parse_args(["--inference-dynamic-batching-async-sched-mode", "async"])
+        args = parser.parse_args(cli_args)
+        assert args.inference_dynamic_batching_async_sched_mode == expected
+
+    def test_multimodal_argparse_plumbing(self):
+        """Ensure the CLI exposes multimodal inference settings."""
+        parser = _add_inference_args(ArgumentParser())
+        args = parser.parse_args(
+            [
+                "--inference-dynamic-batching-async-sched-mode",
+                "async",
+                "--inference-dynamic-batching-media-cache-coordinator-policy",
+                "load_balanced",
+                "--inference-dynamic-batching-media-cache-routing-weight",
+                "2.5",
+                "--inference-dynamic-batching-vision-embedding-cache-max-bytes",
+                "1048576",
+                "--inference-dynamic-batching-allow-stale-multimodal-embeddings",
+            ]
+        )
         assert args.inference_dynamic_batching_async_sched_mode == "async"
+        assert args.inference_dynamic_batching_media_cache_coordinator_policy == "load_balanced"
+        assert args.inference_dynamic_batching_media_cache_routing_weight == 2.5
+        assert args.inference_dynamic_batching_vision_embedding_cache_max_bytes == 1048576
+        assert args.inference_dynamic_batching_allow_stale_multimodal_embeddings is True
 
     @pytest.mark.parametrize("invalid_mode", ["serial", "overlap"])
     def test_async_sched_argparse_rejects_removed_modes(self, invalid_mode):
@@ -56,7 +179,15 @@ class TestInferenceConfig:
         with pytest.raises(SystemExit):
             parser.parse_args(["--inference-dynamic-batching-async-sched-mode", invalid_mode])
 
-    def test_inference_setup_config_maps_async_sched_mode(self):
+    @pytest.mark.parametrize(
+        "setup_mode, expected",
+        [
+            (None, AsyncScheduleMode.ASYNC),
+            ("async", AsyncScheduleMode.ASYNC),
+            ("legacy", AsyncScheduleMode.LEGACY),
+        ],
+    )
+    def test_inference_setup_config_maps_async_sched_mode(self, setup_mode, expected):
         """Ensure declarative inference config maps async scheduling mode to runtime config."""
         model = SimpleNamespace(
             position_embedding_type="rope",
@@ -64,7 +195,38 @@ class TestInferenceConfig:
             pg_collection="pg",
             decoder=SimpleNamespace(layer_type_list=None),
         )
-        setup_config = InferenceSetupConfig(inference_dynamic_batching_async_sched_mode="async")
+        kwargs = (
+            {}
+            if setup_mode is None
+            else {"inference_dynamic_batching_async_sched_mode": setup_mode}
+        )
+        setup_config = InferenceSetupConfig(**kwargs)
+
+        inference_config = setup_config.to_inference_config(
+            model=model,
+            kv_cache_management_mode="persist",
+            static_kv_memory_pointers=False,
+            enable_cuda_graphs=False,
+            verbose=False,
+        )
+
+        assert inference_config.async_sched_mode == expected
+
+    def test_inference_setup_config_maps_multimodal_fields(self):
+        """Ensure declarative inference config maps multimodal fields to runtime config."""
+        model = SimpleNamespace(
+            position_embedding_type="rope",
+            max_sequence_length=4096,
+            pg_collection="pg",
+            decoder=SimpleNamespace(layer_type_list=None),
+        )
+        setup_config = InferenceSetupConfig(
+            inference_dynamic_batching_async_sched_mode="async",
+            inference_dynamic_batching_media_cache_coordinator_policy="load_balanced",
+            inference_dynamic_batching_media_cache_routing_weight=2.5,
+            inference_dynamic_batching_vision_embedding_cache_max_bytes=1048576,
+            inference_dynamic_batching_allow_stale_multimodal_embeddings=True,
+        )
 
         inference_config = setup_config.to_inference_config(
             model=model,
@@ -75,6 +237,13 @@ class TestInferenceConfig:
         )
 
         assert inference_config.async_sched_mode == AsyncScheduleMode.ASYNC
+        assert (
+            inference_config.media_cache_coordinator_policy
+            == MediaCacheCoordinatorPolicy.LOAD_BALANCED
+        )
+        assert inference_config.media_cache_routing_weight == 2.5
+        assert inference_config.vision_embedding_cache_max_bytes == 1048576
+        assert inference_config.allow_stale_multimodal_embeddings is True
 
     def test_offset_sampling_seed_argparse_plumbing(self):
         """Ensure the CLI can select a shared sampling seed across DP ranks."""
@@ -104,3 +273,119 @@ class TestInferenceConfig:
         )
 
         assert inference_config.offset_sampling_seed_by_dp_rank is False
+
+
+def _ssm_model(mixers):
+    """A stand-in model exposing only what `MambaInferenceStateConfig.from_model` reads."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    decoder = SimpleNamespace(
+        layer_type_list=[Symbols.MAMBA] * len(mixers),
+        layers=[SimpleNamespace(mixer=mixer) for mixer in mixers],
+        mamba_state_shapes_per_request=lambda: ((16, 4), (2, 8, 16)),
+    )
+    return SimpleNamespace(
+        decoder=decoder,
+        config=SimpleNamespace(params_dtype=torch.bfloat16, batch_invariant_mode=False),
+    )
+
+
+def _mamba_mixer(chunk_size=128):
+    return SimpleNamespace(chunk_size=chunk_size, ssm_inference_chunk_size=chunk_size)
+
+
+def _gdp_mixer(chunk_size=128, num_householder=2):
+    return SimpleNamespace(
+        chunk_size=chunk_size,
+        ssm_inference_chunk_size=GDP_CHUNK_SIZE,
+        num_householder=num_householder,
+    )
+
+
+class TestSSMChunkAlignment:
+    """The chunk-alignment quantum threaded through `MambaInferenceStateConfig`.
+
+    A mixer's `chunk_size` is not always the chunk length its inference kernels
+    run at: the forked Gated Delta Product prefill kernels chunk at a fixed 64
+    whatever `chunk_size` says. Scheduling decisions that must land on a chunk
+    boundary read `ssm_chunk_alignment`, so this is the seam where a wrong answer
+    turns into silently unrecordable state boundaries.
+    """
+
+    @pytest.mark.internal
+    def test_mixer_classes_expose_the_inference_chunk_size(self):
+        """Both mixers answer the same question, so `from_model` can ask uniformly."""
+        assert isinstance(MambaMixer.ssm_inference_chunk_size, property)
+        assert isinstance(GatedDeltaProductMixer.ssm_inference_chunk_size, property)
+        # GDP's answer is a constant, so it can be read without an instance.
+        assert GatedDeltaProductMixer.ssm_inference_chunk_size.fget(None) == GDP_CHUNK_SIZE
+        assert GDP_CHUNK_SIZE == 64
+
+    @pytest.mark.internal
+    def test_mamba_only_model_aligns_to_the_mamba_chunk_size(self):
+        config = MambaInferenceStateConfig.from_model(_ssm_model([_mamba_mixer(128)] * 3))
+        assert config.mamba_chunk_size == 128
+        assert config.ssm_chunk_alignment == 128
+        assert config.gdp_num_householder == 0
+
+    @pytest.mark.internal
+    def test_gdp_only_model_aligns_to_the_gdp_kernel_chunk_size(self):
+        """The training-path `chunk_size` of 128 must not be mistaken for the real one."""
+        config = MambaInferenceStateConfig.from_model(_ssm_model([_gdp_mixer(chunk_size=128)] * 3))
+        assert config.ssm_chunk_alignment == GDP_CHUNK_SIZE
+        assert config.gdp_num_householder == 2
+        # mamba_chunk_size keeps its old meaning -- it sizes the Mamba2 chunk
+        # metadata buffers, which a GDP-only model never reads.
+        assert config.mamba_chunk_size == 128
+
+    @pytest.mark.internal
+    def test_stack_without_a_recurrent_layer_reports_no_chunking(self):
+        """A pipeline stage of pure attention/MLP layers has nothing to report."""
+        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+        from megatron.core.ssm.ssm_inference import ssm_chunking
+
+        layer_types = [Symbols.ATTENTION, Symbols.MLP]
+        assert ssm_chunking(layer_types, [SimpleNamespace(), SimpleNamespace()]) is None
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "mixers",
+        [
+            pytest.param([_mamba_mixer(128), _gdp_mixer()], id="mamba-then-gdp"),
+            pytest.param([_gdp_mixer(), _mamba_mixer(128)], id="gdp-then-mamba"),
+            pytest.param([_mamba_mixer(128), _mamba_mixer(64)], id="differing-chunk-size"),
+            pytest.param(
+                [_gdp_mixer(num_householder=2), _gdp_mixer(num_householder=3)],
+                id="differing-householder",
+            ),
+        ],
+    )
+    def test_heterogeneous_stack_is_rejected(self, mixers):
+        """The SSM stack is assumed homogeneous; a mixed one must fail loudly.
+
+        Nothing downstream models a per-mixer alignment quantum or per-mixer
+        chunk descriptors, so silently applying the first layer's answer to every
+        other layer would mis-align boundaries rather than error.
+        """
+        with pytest.raises(AssertionError, match="every SSM layer must share one chunking"):
+            MambaInferenceStateConfig.from_model(_ssm_model(mixers))
+
+    @pytest.mark.internal
+    def test_heterogeneous_stack_names_the_offending_layers(self):
+        """The message must point at a layer, not just at two tuples of numbers."""
+        mixers = [_mamba_mixer(128), _mamba_mixer(128), _gdp_mixer()]
+        with pytest.raises(AssertionError, match=r"layer 0 has .* but layer 2 has"):
+            MambaInferenceStateConfig.from_model(_ssm_model(mixers))
+
+    @pytest.mark.internal
+    def test_alignment_defaults_to_the_mamba_chunk_size(self):
+        """Hand-built configs that predate the field keep their old behaviour."""
+        config = MambaInferenceStateConfig(
+            layer_type_list=["M"],
+            conv_states_shape=(16, 4),
+            ssm_states_shape=(2, 8, 16),
+            conv_states_dtype=torch.bfloat16,
+            ssm_states_dtype=torch.bfloat16,
+            mamba_chunk_size=64,
+        )
+        assert config.ssm_chunk_alignment == 64

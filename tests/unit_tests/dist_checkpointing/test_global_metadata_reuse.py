@@ -33,6 +33,7 @@ class TestGlobalMetadataReuse:
         opt_param_scheduler = None
 
         mock_args = parse_args(ignore_unknown_args=True)
+        mock_args.save_tokenizer_assets = False
         with (
             TempNamedDir(
                 tmp_path_dist_ckpt / "test_global_metadata_reuse"
@@ -105,6 +106,7 @@ class TestGlobalMetadataReuse:
         opt_param_scheduler = None
 
         mock_args = parse_args(ignore_unknown_args=True)
+        mock_args.save_tokenizer_assets = False
         with (
             TempNamedDir(
                 tmp_path_dist_ckpt / "test_global_metadata_reuse"

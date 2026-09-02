@@ -15,19 +15,28 @@ from megatron.core.ssm.gated_delta_net.common import (
     l2norm,
     tensor_a2a_cp2hp,
     tensor_a2a_hp2cp,
-    torch_chunk_gated_delta_rule,
 )
-from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet
+from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet, torch_chunk_gated_delta_rule
+from megatron.core.ssm.gated_delta_net.gdn2 import (
+    HAVE_FLA_GDN2,
+    GatedDeltaNet2,
+    chunk_gdn2,
+    torch_chunk_gdn2,
+)
 
 __all__ = [
     "HAVE_FLA",
+    "HAVE_FLA_GDN2",
     "GatedDeltaNet",
+    "GatedDeltaNet2",
     "GatedDeltaNetSubmodules",
     "causal_conv1d",
     "chunk_gated_delta_rule",
+    "chunk_gdn2",
     "get_parameter_local_cp",
     "l2norm",
     "tensor_a2a_cp2hp",
     "tensor_a2a_hp2cp",
     "torch_chunk_gated_delta_rule",
+    "torch_chunk_gdn2",
 ]

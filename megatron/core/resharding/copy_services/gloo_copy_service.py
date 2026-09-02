@@ -18,6 +18,8 @@ class GlooCopyService(CopyService):
     process group instead of NCCL.
     """
 
+    supports_multiple_runs_per_plan = True
+
     def __init__(self, group=None):
         super().__init__(group=group)
         if group is not None:
