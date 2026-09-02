@@ -53,9 +53,9 @@ from megatron.core.transformer.moe.replica_planner import (
     extract_semantic_routes,
     map_replica_plan_to_hybridep,
     plan_replica_routes,
-    start_replica_grad_reduce_after_expert_backward,
+    start_replica_grad_reduce_after_dispatch_backward,
     start_replica_weight_prefetch_before_layer_backward,
-    wait_replica_grad_reduce_after_dispatch_backward,
+    wait_replica_grad_reduce_at_layer_input,
     wait_replica_weight_prefetch_before_expert_backward,
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
@@ -130,6 +130,10 @@ class MoETokenDispatcher:
     def dispatch_plan(self, hidden_states: torch.Tensor) -> None:
         """Start backend work that depends only on routing, right after preprocessing."""
         del hidden_states
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Attach backend work that must run after the whole layer's backward to its input."""
+        return hidden_states
 
     def finalize_output(self, output: torch.Tensor) -> torch.Tensor:
         """Attach backward-side backend work to the MoE layer output."""
@@ -1266,23 +1270,23 @@ class _HybridEPManager(_DispatchManager):
 
 
 class _ReplicaPlanLifetime(torch.autograd.Function):
-    """Retain a replica plan until the activation-dispatch backward completes.
+    """Release a replica plan's slot once the layer's backward has passed its input.
 
-    The router probabilities and source parameters are inputs only so that the
-    output requires grad, and the slot is therefore released in backward,
-    whenever any consumer of the plan will run a backward.
+    The source parameters are inputs only so that the output requires grad, and
+    the slot is therefore released in backward, whenever the experts will run a
+    backward. ``context.slot`` is filled in after routing.
     """
 
     @staticmethod
-    def forward(ctx, hidden_states, token_probs, *args):
-        ctx.manager, ctx.slot = args[-2:]
+    def forward(ctx, hidden_states, *args):
+        ctx.manager, ctx.context = args[-2:]
         ctx.num_source_parameters = len(args) - 2
         return hidden_states
 
     @staticmethod
     def backward(ctx, grad_hidden_states):
-        ctx.manager._release_replica_plan_slot(ctx.slot)
-        return grad_hidden_states, None, *([None] * (ctx.num_source_parameters + 2))
+        ctx.manager._release_replica_plan_slot(ctx.context.slot)
+        return grad_hidden_states, *([None] * (ctx.num_source_parameters + 2))
 
 
 @dataclass
@@ -1292,6 +1296,14 @@ class _ReplicaPlanSlot:
     workspace: ReplicaPlannerWorkspace
     plan: Optional[ReplicaPlan] = None
     in_use: bool = False
+
+
+@dataclass
+class _ReplicaLayerContext:
+    """What one layer forward hands to the backward hooks on its input tensor."""
+
+    plan: Optional[ReplicaPlan] = None
+    slot: Optional[_ReplicaPlanSlot] = None
     lifetime_tracked: bool = False
 
 
@@ -1363,6 +1375,7 @@ class _ReplicaHybridEPManager(_HybridEPManager):
         self._plan: Optional[ReplicaPlan] = None
         self._plan_awaits_dispatch = False
         self._combined_plan: Optional[ReplicaPlan] = None
+        self._layer_context: Optional[_ReplicaLayerContext] = None
 
     def bind_experts(self, experts) -> None:
         """Bind the dispatcher-independent runtime weights to the expert MLP."""
@@ -1409,7 +1422,6 @@ class _ReplicaHybridEPManager(_HybridEPManager):
         for slot in self._replica_plan_slots:
             if not slot.in_use:
                 slot.in_use = True
-                slot.lifetime_tracked = False
                 return slot
 
         if torch.cuda.is_current_stream_capturing():
@@ -1437,7 +1449,6 @@ class _ReplicaHybridEPManager(_HybridEPManager):
             raise RuntimeError("Replica-HybridEP planner slot was released twice.")
         slot.plan = None
         slot.in_use = False
-        slot.lifetime_tracked = False
 
     def _prepare_replica_plan(self, hidden_states: torch.Tensor) -> ReplicaPlan:
         if self._active_replica_plan_slot is not None or self._plan is not None:
@@ -1446,6 +1457,8 @@ class _ReplicaHybridEPManager(_HybridEPManager):
             )
         if self.semantic_token_indices is None or self.semantic_tokens_per_expert is None:
             raise RuntimeError("Replica-HybridEP routing metadata was not initialized.")
+        if torch.is_grad_enabled() and self._layer_context is None:
+            raise RuntimeError("Replica-HybridEP planning requires wrap_layer_input to run first.")
         self._ensure_replica_planner_shape(hidden_states)
         slot = self._acquire_replica_plan_slot()
         self._active_replica_plan_slot = slot
@@ -1462,7 +1475,27 @@ class _ReplicaHybridEPManager(_HybridEPManager):
             self._release_replica_plan_slot(slot)
             raise
         slot.plan = self._plan
+        if self._layer_context is not None:
+            self._layer_context.plan = self._plan
+            self._layer_context.slot = slot
         return self._plan
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Put the slot release and the gradient-reduction wait on the layer input.
+
+        Their backward runs once every consumer of the layer input (router, shared
+        experts, latent projection) has run its own backward.
+        """
+        if self._layer_context is not None:
+            raise RuntimeError("Replica-HybridEP layer input wrapped twice without a combine.")
+        if not torch.is_grad_enabled():
+            return hidden_states
+        context = self._layer_context = _ReplicaLayerContext()
+        hidden_states = _ReplicaPlanLifetime.apply(
+            hidden_states, *self._bridge.source_parameters, self, context
+        )
+        context.lifetime_tracked = hidden_states.requires_grad
+        return wait_replica_grad_reduce_at_layer_input(hidden_states, self._bridge, context)
 
     def _wrap_replica_dispatch_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if not torch.is_grad_enabled():
@@ -1470,11 +1503,9 @@ class _ReplicaHybridEPManager(_HybridEPManager):
         slot = self._active_replica_plan_slot
         if slot is None or slot.plan is not self._plan:
             raise RuntimeError("Replica-HybridEP lost its active planner slot.")
-        hidden_states = _ReplicaPlanLifetime.apply(
-            hidden_states, self.semantic_token_probs, *self._bridge.source_parameters, self, slot
-        )
-        slot.lifetime_tracked = hidden_states.requires_grad
-        return wait_replica_grad_reduce_after_dispatch_backward(
+        # Start the FC1 reduction once the dispatch-backward all-to-all has finished;
+        # FC2's started from the expert backward.
+        return start_replica_grad_reduce_after_dispatch_backward(
             hidden_states, self._bridge, self._plan
         )
 
@@ -1482,9 +1513,11 @@ class _ReplicaHybridEPManager(_HybridEPManager):
         slot = self._active_replica_plan_slot
         if slot is None or slot.plan is not self._plan:
             raise RuntimeError("Replica-HybridEP combine lost its planner slot.")
+        context = self._layer_context
+        self._layer_context = None
         self._active_replica_plan_slot = None
         self._plan = None
-        if not slot.lifetime_tracked:
+        if context is None or not context.lifetime_tracked:
             self._release_replica_plan_slot(slot)
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
@@ -1531,13 +1564,10 @@ class _ReplicaHybridEPManager(_HybridEPManager):
             alignment=self._quantization_alignment(),
         )
         hidden_states = self._wrap_replica_dispatch_input(hidden_states)
-        dispatched_hidden = super().dispatch(
+        return super().dispatch(
             hidden_states,
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
-        )
-        return start_replica_grad_reduce_after_expert_backward(
-            dispatched_hidden, self._bridge, plan
         )
 
     def combine(
@@ -2246,6 +2276,10 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
     def finalize_output(self, output: torch.Tensor) -> torch.Tensor:
         finalize = getattr(self._comm_manager, "finalize_output", None)
         return output if finalize is None else finalize(output)
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        wrap = getattr(self._comm_manager, "wrap_layer_input", None)
+        return hidden_states if wrap is None else wrap(hidden_states)
 
     def get_expert_zero_copy_buffers(self):
         """NCCL-EP zero-copy: ``(output_buffer, grad_input_buffer)`` — the shared symm buffers the
