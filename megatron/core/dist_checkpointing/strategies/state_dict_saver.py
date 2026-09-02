@@ -15,8 +15,8 @@ from torch.distributed.checkpoint.planner import SavePlan, SavePlanner
 from torch.distributed.checkpoint.utils import _DistWrapper, _get_failure_dict
 
 if TYPE_CHECKING:
-    from .filesystem_async import FileSystemWriterAsync
     from .torch import MCoreSavePlanner
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import FileSystemWriterAsync  # pylint: disable=line-too-long
 
 
 logger = getLogger(__name__)
