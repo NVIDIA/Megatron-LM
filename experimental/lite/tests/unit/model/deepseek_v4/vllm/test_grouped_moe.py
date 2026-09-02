@@ -275,7 +275,9 @@ def test_grouped_moe_preserves_clamped_forward_and_bf16_master_vjp(
 def test_te_grouped_bf16_backward_matches_reference_bitwise(monkeypatch) -> None:
     torch.manual_seed(17)
     counts = (64, 32)
-    limit = 10.0
+    # Keep the limit below the generated FC1 range so both gate and up clamp
+    # derivatives are covered by the exact-gradient comparison.
+    limit = 1.0
     hidden = (
         torch.randn(sum(counts), 128, device="cuda", dtype=torch.bfloat16) * 2
     ).requires_grad_(True)

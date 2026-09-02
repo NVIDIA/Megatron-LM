@@ -226,6 +226,23 @@ _compiled_clamped_swiglu_vjp = torch.compile(
     dynamic=False,
 )
 
+_compiled_dynamic_clamped_swiglu_vjp = torch.compile(
+    _clamped_swiglu_vjp,
+    fullgraph=True,
+    dynamic=True,
+)
+
+
+def dynamic_clamped_swiglu_vjp(
+    grad_output: torch.Tensor,
+    value: torch.Tensor,
+    limit: float,
+) -> torch.Tensor:
+    """Evaluate the VJP for dynamic routed-token shapes without an autograd graph."""
+    if not value.is_cuda:
+        return _clamped_swiglu_vjp(grad_output, value, limit)
+    return _compiled_dynamic_clamped_swiglu_vjp(grad_output, value, limit)
+
 
 class _ClampedSwiGLUVJP(torch.autograd.Function):
     @staticmethod
