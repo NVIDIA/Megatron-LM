@@ -133,6 +133,22 @@ def _plan_replica_placement_kernel(
     routes_before_source = tl.sum(
         tl.where(ranks[:, None] < source_rank, source_counts, 0), axis=0
     ).to(tl.int32)
+    # Every rank must contribute exactly RANK_ROUTE_CAPACITY routes: the
+    # capacity math and the compaction's slot count both assume router_topk
+    # selections per token. This kernel runs eagerly, so the trap always fires.
+    source_total = tl.sum(
+        tl.load(
+            gathered_tokens_per_expert + rank * NUM_EXPERTS + tl.arange(0, BLOCK_NUM_EXPERTS),
+            mask=tl.arange(0, BLOCK_NUM_EXPERTS) < NUM_EXPERTS,
+            other=0,
+        ),
+        axis=0,
+    )
+    if source_total != RANK_ROUTE_CAPACITY:
+        tl.device_print(
+            "replica planner: a rank's route count differs from tokens * topk on rank", rank
+        )
+        _emit_on_every_thread("trap; mov.u32 $0, 0;", THREADS=1)
     tl.store(
         rank_load_balance + rank, tl.sum(native_totals, axis=0).to(tl.int32) - RANK_ROUTE_CAPACITY
     )
@@ -384,7 +400,12 @@ def _map_virtual_experts_kernel(
         tl.store(virtual_experts + route_positions, virtual, mask=valid_routes)
 
 
-@triton.jit
+# ``debug=True`` keeps the device assert below alive for eager launches, and a
+# device assert is the only trap torch.compile can analyze: the flex dispatcher's
+# preprocess launches this kernel under torch.compile, where Inductor re-emits
+# the kernel without the flag. The placement kernel's route-total check covers
+# that path.
+@triton.jit(debug=True)
 def _compact_routing_map_kernel(
     routing_map,
     token_indices,
@@ -412,6 +433,14 @@ def _compact_routing_map_kernel(
             routing_map + tokens[:, None] * NUM_EXPERTS + experts[None, :], mask=valid, other=0
         ).to(tl.int32)
         slots = tl.cumsum(selected, axis=1) - selected
+        # The planner sizes every rank's capacity from ROUTER_TOPK routes per token
+        # and fills exactly that many slots; a token with a different count would
+        # silently misroute or drop routes downstream, so fail loudly instead.
+        selections = tl.sum(selected, axis=1)
+        tl.device_assert(
+            (selections == ROUTER_TOPK) | (tokens >= program_end),
+            "replica planner requires exactly router_topk routes per token",
+        )
         tl.store(
             token_indices + tokens[:, None] * ROUTER_TOPK + slots,
             tl.broadcast_to(experts[None, :], (BLOCK_TOKENS, BLOCK_NUM_EXPERTS)),
