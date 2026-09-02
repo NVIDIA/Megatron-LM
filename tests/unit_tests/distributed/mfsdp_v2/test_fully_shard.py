@@ -367,16 +367,7 @@ def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_
 @pytest.mark.parametrize("set_to_none", [True, False])
 @pytest.mark.parametrize("num_microbatches", [1, 3])
 def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_none):
-    """HFSDP (optimizer sharded across DP-outer too) training should match single-rank SGD.
-
-    Like HSDP, gradients reduce-scatter within DP-inner every backward and
-    accumulate into main_grad. Unlike HSDP, the last-microbatch DP-outer reduction
-    is a reduce-scatter (not an all-reduce) that finalizes main_grad to the
-    optimizer's [Shard(0), Shard(0)] placement, shrinking the buffer; the next step's reset
-    therefore allocates a fresh [Partial, Shard(0)] accumulation buffer. Every rank
-    sees identical data, so the averaged gradient equals the single-rank gradient
-    and losses must match. Both ``zero_grad`` modes are covered.
-    """
+    """HFSDP (optimizer sharded across DP-outer too) training should match single-rank SGD."""
     rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
@@ -717,6 +708,26 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
 
     with pytest.raises(AssertionError):
         torch.testing.assert_close(second_loss, first_loss)
+
+
+def test_rejects_optimizer_placements_larger_than_model_weight_placements(distributed_setup):
+    """Optimizer placements must fit within the model-weight placements."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16).to(device)
+    placements = Placements(
+        dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Replicate()]
+    )
+    with pytest.raises(ValueError, match="DBuffer.view"):
+        with fully_shard_context(device=device):
+            fully_shard(
+                model,
+                mesh=mesh,
+                placements=placements,
+                mixed_precision_policy=MixedPrecisionPolicy(main_params_dtype=torch.float32),
+            )
 
 
 def test_optimizer_post_step_syncs_once_per_parameter_group(distributed_setup, monkeypatch):
