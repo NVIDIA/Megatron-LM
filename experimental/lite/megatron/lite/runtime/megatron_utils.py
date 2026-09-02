@@ -120,6 +120,19 @@ def _reshard_fsdp2_modules(model_chunk: Any) -> None:
             module.reshard()
 
 
+def _pinned_cpu_copy(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy CUDA data directly into its final pinned CPU allocation."""
+    cpu_tensor = torch.empty(
+        tensor.size(),
+        dtype=tensor.dtype,
+        layout=tensor.layout,
+        device="cpu",
+        pin_memory=True,
+    )
+    cpu_tensor.copy_(tensor, non_blocking=False)
+    return cpu_tensor
+
+
 def offload_model_to_cpu(model_list: list) -> None:
     """Offload DDP model to CPU via buffer-resize (zero-copy on GPU side)."""
     for model_chunk in model_list:
@@ -128,8 +141,17 @@ def offload_model_to_cpu(model_list: list) -> None:
             for buffers in all_buffers:
                 for buffer in buffers:
                     if buffer.param_data.storage().size() > 0:
-                        buffer.param_data.cpu_data = buffer.param_data.data.cpu().pin_memory()
-                        buffer.param_data_size = buffer.param_data.storage().size()
+                        param_data_size = buffer.param_data.storage().size()
+                        cpu_data = getattr(buffer.param_data, "cpu_data", None)
+                        if (
+                            cpu_data is not None
+                            and cpu_data.storage().size() == param_data_size
+                        ):
+                            cpu_data.copy_(buffer.param_data.data, non_blocking=False)
+                        else:
+                            cpu_data = _pinned_cpu_copy(buffer.param_data.data)
+                            buffer.param_data.cpu_data = cpu_data
+                        buffer.param_data_size = param_data_size
                         buffer.param_data.storage().resize_(0)
 
                     if buffer.grad_data.storage().size() > 0:

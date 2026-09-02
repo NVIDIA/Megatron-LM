@@ -3,19 +3,40 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 from collections.abc import Callable, Iterable, MutableMapping
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from types import MethodType
 from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.distributed.checkpoint.filesystem import (
+    DEFAULT_SUFFIX,
+    SerializationFormat,
+    _write_item,
+)
+from torch.distributed.checkpoint.planner import SavePlan, SavePlanner, WriteItemType
 
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
-from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
+from megatron.core.dist_checkpointing.strategies.filesystem_async import (
+    FileSystemWriterAsync,
+    get_write_results_queue,
+)
+from megatron.core.dist_checkpointing.strategies.state_dict_saver import (
+    save_state_dict_async_plan,
+)
+from megatron.core.dist_checkpointing.strategies.torch import (
+    MCoreSavePlanner,
+    TorchDistSaveShardedStrategy,
+    _replace_state_dict_keys_with_sharded_keys,
+    mcore_to_pyt_state_dict,
+)
+from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.lite.primitive.ckpt.local_stage import (
     NodeLocalStagingFileSystem,
     allocate_stage_path,
@@ -30,7 +51,7 @@ from megatron.lite.primitive.protocols import (
 )
 
 _DISTOPT_METADATA = {
-    "distrib_optim_sharding_type": "fully_reshardable",
+    "distrib_optim_sharding_type": "dp_reshardable",
     "distrib_optim_fully_reshardable_mem_efficient": False,
     "chained_optim_avoid_prefix": True,
 }
@@ -95,7 +116,7 @@ def save_dist_opt_checkpoint(
     save_strategy = (
         _NodeLocalDistSaveStrategy(local_stage_root)
         if local_stage_root is not None
-        else None
+        else _MemoryEfficientDistSaveStrategy()
     )
     dist_checkpointing.save(
         state_dict,
@@ -106,7 +127,138 @@ def save_dist_opt_checkpoint(
     )
 
 
-class _NodeLocalDistSaveStrategy(TorchDistSaveShardedStrategy):
+class _BoundedMemoryFileSystemWriter(FileSystemWriterAsync):
+    """Synchronous MLite writer with at most one tensor staging allocation."""
+
+    def __init__(self, path, *args, **kwargs):
+        kwargs["thread_count"] = 1
+        super().__init__(path, *args, **kwargs)
+
+    def prepare_write_data(self, plan: SavePlan, planner: SavePlanner) -> None:
+        storage_plan = plan.storage_data
+        file_name = f"{storage_plan.prefix}0{DEFAULT_SUFFIX}"
+        bytes_data = []
+        tensor_data = []
+        for item in plan.items:
+            data = planner.resolve_data(item)
+            if item.type == WriteItemType.BYTE_IO:
+                bytes_data.append((item, data))
+            else:
+                # Keep the original tensor/view here.  Cloning every view during
+                # planning retains a second full checkpoint payload until I/O ends.
+                tensor_data.append((item, data.detach()))
+        if bytes_data or tensor_data:
+            self.write_buckets = [
+                (
+                    os.path.join(self.checkpoint_dir, file_name),
+                    file_name,
+                    (bytes_data, tensor_data),
+                )
+            ]
+            self.results_queue = get_write_results_queue()
+        else:
+            self.write_buckets = []
+            self.results_queue = None
+
+    def get_save_function_and_args(self):
+        if not self.write_buckets:
+            return None, None, []
+        transforms = [self.transforms] if hasattr(self, "transforms") else []
+        return (
+            partial(self._write_bounded, transforms, self.use_msc),
+            None,
+            [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
+        )
+
+    @staticmethod
+    def _write_bounded(transforms, use_msc, _rank, write_buckets, results_queue) -> None:
+        results = {}
+        serialization_kwargs = {}
+        if "serialization_format" in inspect.signature(_write_item).parameters:
+            serialization_kwargs["serialization_format"] = SerializationFormat.TORCH_SAVE
+        try:
+            for bucket_index, (file_name, storage_key, payload) in enumerate(write_buckets):
+                bytes_data, tensor_data = payload
+                local_results = []
+                open_file = open
+                if use_msc:
+                    import multistorageclient as msc
+
+                    open_file = msc.open
+                with open_file(file_name, "wb") as stream:
+                    for write_item, data in bytes_data:
+                        local_results.append(
+                            _write_item(
+                                *transforms,
+                                stream,
+                                data,
+                                write_item,
+                                storage_key,
+                                **serialization_kwargs,
+                            )
+                        )
+                    for write_item, source in tensor_data:
+                        tensor = source.detach()
+                        if tensor.device.type != "cpu":
+                            if (
+                                tensor.device.type == "cuda"
+                                and "dequantize" in type(tensor).__dict__
+                            ):
+                                tensor = tensor.dequantize()
+                            tensor = tensor.to("cpu")
+                        elif tensor.untyped_storage().nbytes() != tensor.numel() * tensor.itemsize:
+                            tensor = tensor.clone()
+                        local_results.append(
+                            _write_item(
+                                *transforms,
+                                stream,
+                                tensor,
+                                write_item,
+                                storage_key,
+                                **serialization_kwargs,
+                            )
+                        )
+                        del tensor
+                    if use_msc:
+                        stream.fsync()
+                    else:
+                        os.fsync(stream.fileno())
+                results[bucket_index] = local_results
+        except Exception as error:
+            results = error
+        results_queue.put(results)
+
+
+class _MemoryEfficientDistSaveStrategy(TorchDistSaveShardedStrategy):
+    """MCore-compatible synchronous strategy using bounded tensor staging."""
+
+    def async_save(self, sharded_state_dict, checkpoint_dir, async_strategy="mcore"):
+        if async_strategy != "mcore":
+            raise ValueError("MLite bounded-memory checkpointing supports synchronous mcore saves")
+        sharded_state_dict, _, _ = _replace_state_dict_keys_with_sharded_keys(
+            sharded_state_dict, self.keep_only_main_replica
+        )
+        pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
+        writer = _BoundedMemoryFileSystemWriter(
+            checkpoint_dir,
+            thread_count=1,
+            use_msc=MultiStorageClientFeature.is_enabled(),
+        )
+        save_state_dict_ret = save_state_dict_async_plan(
+            pyt_state_dict,
+            writer,
+            None,
+            0,
+            planner=MCoreSavePlanner(
+                dedup_replicated_tensors=not self.keep_only_main_replica,
+                flatten_state_dict=False,
+                flatten_sharded_tensors=False,
+            ),
+        )[0]
+        return self._get_save_and_finalize_callbacks(writer, save_state_dict_ret, async_strategy)
+
+
+class _NodeLocalDistSaveStrategy(_MemoryEfficientDistSaveStrategy):
     def __init__(self, stage_root: Path):
         super().__init__()
         self._stage_root = stage_root

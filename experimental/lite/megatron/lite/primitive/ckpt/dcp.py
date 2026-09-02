@@ -24,9 +24,11 @@ from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImp
 
 from megatron.lite.primitive.ckpt.local_stage import (
     NodeLocalStagingFileSystem as _NodeLocalStagingFileSystem,
-    local_stage_root,
-    publish_staged_file as _publish_staged_file,
 )
+from megatron.lite.primitive.ckpt.local_stage import (
+    local_stage_root,
+)
+from megatron.lite.primitive.ckpt.local_stage import publish_staged_file as _publish_staged_file
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
@@ -248,10 +250,12 @@ def _optimizer_checkpoint_path(path: str) -> str:
 
 
 def _staged_dcp_writer(checkpoint_path: str):
+    # One writer bounds D2H staging to one tensor.  More writer threads trade
+    # host-memory peak for throughput, which is undesirable for colocated RL.
+    writer = dcp.FileSystemWriter(checkpoint_path, thread_count=1)
     filesystem = _local_staging_filesystem()
     if filesystem is None:
-        return None
-    writer = dcp.FileSystemWriter(checkpoint_path)
+        return writer
     writer.fs = filesystem
     return writer
 

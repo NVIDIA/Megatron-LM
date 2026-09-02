@@ -15,9 +15,10 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 )
 from megatron.lite.primitive.ckpt import dcp
 from megatron.lite.primitive.ckpt.distckpt import (
-    _NodeLocalDistSaveStrategy,
     _dist_opt_checkpoint_metadata,
+    _MemoryEfficientDistSaveStrategy,
     _model_sharded_state_dict,
+    _NodeLocalDistSaveStrategy,
     _rank_offsets_and_replica_id,
     _single_or_all_model_state,
     _synchronize_native_optimizer_steps,
@@ -128,13 +129,18 @@ def test_dcp_local_stage_does_not_publish_failed_write(tmp_path) -> None:
     assert not list(stage_root.rglob("*.stage"))
 
 
-def test_dcp_local_stage_writer_is_opt_in(monkeypatch, tmp_path) -> None:
+def test_fsdp2_dcp_writer_is_single_threaded_and_local_stage_is_opt_in(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.delenv("MLITE_DCP_LOCAL_STAGE_DIR", raising=False)
-    assert dcp._staged_dcp_writer(str(tmp_path / "checkpoint")) is None
+    writer = dcp._staged_dcp_writer(str(tmp_path / "checkpoint"))
+    assert writer.thread_count == 1
+    assert not isinstance(writer.fs, dcp._NodeLocalStagingFileSystem)
 
     monkeypatch.setenv("MLITE_DCP_LOCAL_STAGE_DIR", str(tmp_path / "stage"))
     writer = dcp._staged_dcp_writer(str(tmp_path / "checkpoint"))
 
+    assert writer.thread_count == 1
     assert isinstance(writer.fs, dcp._NodeLocalStagingFileSystem)
 
 
@@ -201,7 +207,7 @@ class FakeWrapper(torch.nn.Module):
 
 
 DISTOPT_METADATA = {
-    "distrib_optim_sharding_type": "fully_reshardable",
+    "distrib_optim_sharding_type": "dp_reshardable",
     "distrib_optim_fully_reshardable_mem_efficient": False,
     "chained_optim_avoid_prefix": True,
 }
@@ -232,7 +238,7 @@ def test_dist_opt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path)
     assert saved["checkpoint_dir"] == str(tmp_path / "step_5")
     assert saved["kwargs"]["validate_access_integrity"] is False
     assert saved["kwargs"]["content_metadata"] == DISTOPT_METADATA
-    assert saved["kwargs"]["sharded_strategy"] is None
+    assert isinstance(saved["kwargs"]["sharded_strategy"], _MemoryEfficientDistSaveStrategy)
     assert not (tmp_path / "step_5" / "optimizer_rank_0.pt").exists()
 
 
