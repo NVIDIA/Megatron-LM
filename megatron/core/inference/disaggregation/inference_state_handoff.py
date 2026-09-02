@@ -235,6 +235,16 @@ class InferenceStateHandoffMixin:
             "KV handoff requires prefix caching on both prefill and decode "
             "engines (--inference-dynamic-batching-prefix-caching)."
         )
+        # TODO: support bounded-staleness leases under disaggregation. The lease
+        # epoch is local to one engine, so a prefill engine can hand off blocks
+        # that the decode engine considers fresh (or expire blocks mid-handoff
+        # while the peer is still reading them); expiry would have to be
+        # coordinated across the pair and ordered against handoff pinning.
+        assert not allocator.lease_enabled, (
+            "KV handoff does not support prefix cache leases yet; leave "
+            "--inference-dynamic-batching-prefix-caching-lease-epochs unset (a lease of 0 "
+            "does not disable leasing, it tolerates no staleness at all)."
+        )
         allocator.enable_handoff_pinning = role == "prefill"
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0

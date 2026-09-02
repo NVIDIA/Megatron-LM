@@ -27,6 +27,8 @@ class KVBlockAllocator:
         pool_size (int): Number of blocks in the pool, including the dummy block.
         paused_limit (int): Paused-request block retention limit. Must leave at
             least one non-dummy block outside the limit.
+        prefix_caching_lease_epochs (Optional[int]): Epochs of staleness a cached
+            entry may carry; None disables lease-based eviction entirely.
     """
 
     def __init__(
@@ -38,11 +40,28 @@ class KVBlockAllocator:
         prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
             PrefixCachingEvictionPolicy.REF_ZERO
         ),
+        prefix_caching_lease_epochs: Optional[int] = None,
     ):
 
         self.context = context
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
+        assert (
+            prefix_caching_lease_epochs is None or prefix_caching_lease_epochs >= 0
+        ), "prefix cache lease length must be non-negative"
+        # Lease-based (bounded staleness) eviction is opt-in; None leaves every
+        # code path below untouched, including the extra per-block bookkeeping.
+        # A lease of 0 is meaningful and distinct: it tolerates no staleness, so
+        # entries are dropped at the very next epoch.
+        self.prefix_caching_lease_epochs = (
+            prefix_caching_lease_epochs if enable_prefix_caching else None
+        )
+        self.lease_enabled = self.prefix_caching_lease_epochs is not None
+        # Prefix-chain bookkeeping is needed by LRU's leaf peel and by lease
+        # expiry's subtree closure, so either feature turns it on.
+        self.track_prefix_chain = (
+            prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU or self.lease_enabled
+        ) and enable_prefix_caching
         self.on_blocks_deregistered: Optional[Callable] = None
         self._blocks_deregistered_observers: list[BlocksDeregisteredObserver] = []
 
@@ -81,10 +100,12 @@ class KVBlockAllocator:
                     (self.pool_size,), dtype=torch.int64, device='cpu'
                 )
 
-                # Persisted prefix-chain bookkeeping for LRU eviction, maintained
-                # incrementally on register/deregister. Block hashes are
-                # parent-chained: a cached block that is another cached block's
-                # parent must not be evicted before its child (see evict_lru_blocks).
+            if self.track_prefix_chain:
+                # Persisted prefix-chain bookkeeping, maintained incrementally on
+                # register/deregister. Block hashes are parent-chained: a cached
+                # block that is another cached block's parent must not be evicted
+                # before its child (see evict_lru_blocks), and expiring a block
+                # must expire its whole cached subtree (see expire_leased_blocks).
                 #
                 # block_parent_id[b] = block id of b's parent in the prefix chain,
                 #   or -1 when b is a root block or its parent is not registered.
@@ -98,6 +119,30 @@ class KVBlockAllocator:
                 self.block_child_count = torch.zeros(
                     (self.pool_size,), dtype=torch.int64, device='cpu'
                 )
+
+            # block_epoch[b] = generation epoch during which b was registered in
+            # the prefix cache; -1 when b is not registered. This is the epoch
+            # whose model weights produced b's contents, so it serves two
+            # purposes and is therefore maintained for all prefix caching, not
+            # only when a lease is configured:
+            #
+            #   - It dates a cache hit. A request that matches b is served KV
+            #     produced by epoch block_epoch[b], not by the current epoch,
+            #     which is what `kv_cache_epoch` / `policy_epoch` must report
+            #     (see DynamicInferenceContext.stamp_cached_prefix_epochs).
+            #   - It bounds staleness. Recording the birth epoch is equivalent
+            #     to the "decrement every block each epoch, evict at zero"
+            #     formulation, without touching the whole pool per epoch: b's
+            #     remaining lease is
+            #       lease_epochs - (current_epoch - block_epoch[b]).
+            self.block_epoch = torch.full((self.pool_size,), -1, dtype=torch.int64, device='cpu')
+
+            if self.lease_enabled:
+                # Lower bound on the oldest registered block's birth epoch, used to
+                # skip the sweep entirely when nothing can have expired yet. Only
+                # lowered by registration and recomputed exactly after each sweep,
+                # so it never hides an expired block.
+                self._min_lease_epoch: Optional[int] = None
 
         # Per-block MoE routing storage (populated when routing replay is enabled)
         self.block_routing: Dict[int, np.ndarray] = {}
@@ -302,8 +347,12 @@ class KVBlockAllocator:
             self.block_ref_counts.fill_(0)
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.block_timestamps.fill_(0)
+            if self.track_prefix_chain:
                 self.block_parent_id.fill_(-1)
                 self.block_child_count.fill_(0)
+            self.block_epoch.fill_(-1)
+            if self.lease_enabled:
+                self._min_lease_epoch = None
 
         # Clear per-block routing storage
         self.block_routing.clear()
@@ -317,7 +366,7 @@ class KVBlockAllocator:
         block_ids: list[int],
         block_hashes: list[int],
         parent_hashes: Optional[list[int]] = None,
-    ) -> None:
+    ) -> bool:
         """Register blocks in the hash-to-block mapping for discovery (batch).
 
         Registration is idempotent: a block that already carries the hash being
@@ -344,9 +393,16 @@ class KVBlockAllocator:
                 length as block_ids); 0 marks a root block with no parent. Used
                 by LRU eviction to avoid evicting a parent before its children.
                 If None, parents default to 0.
+
+        Returns:
+            True if every block in the batch is cached on return (registered
+            here or already registered), False if the batch was rejected
+            wholesale because its prefix is no longer cached. Callers that
+            advertise cached blocks to the outside world — the Dynamo
+            ``kv_stored`` event, which steers routing — must not do so on False.
         """
         if not block_ids:
-            return
+            return True
         if parent_hashes is not None:
             assert len(parent_hashes) == len(block_ids)
         # Tensor views of the batch, used to index the per-block state arrays.
@@ -374,7 +430,7 @@ class KVBlockAllocator:
             # hash-map update and the child-count bumps all see the same subset.
             keep = torch.nonzero(~already_registered, as_tuple=True)[0]
             if keep.numel() == 0:
-                return
+                return True
             keep_list = keep.tolist()
             block_ids = [block_ids[i] for i in keep_list]
             block_hashes = [block_hashes[i] for i in keep_list]
@@ -383,13 +439,47 @@ class KVBlockAllocator:
             id_tensor = id_tensor[keep]
             hash_tensor = hash_tensor[keep]
 
+        if (
+            self.lease_enabled
+            and parent_hashes is not None
+            and parent_hashes[0] != 0
+            and parent_hashes[0] not in self.kv_hash_to_block_id
+        ):
+            # The batch hangs off a prefix that is no longer cached, so none of it
+            # is registrable: _find_kv_match_count resolves a match by walking
+            # every ancestor hash back to the root, and a block whose ancestors
+            # are missing would match but fail to resolve. Checking the head is
+            # enough because entries arrive in chain order (block k's parent is
+            # block k-1), so every later parent resolves against its predecessor
+            # in this same batch.
+            #
+            # Normally the head resolves: it is a matched block or a block from an
+            # earlier chunk of this request, both pinned by a live reference. Lease
+            # expiry is what breaks that, since it unregisters stale blocks in
+            # place while a request still holds them, and a later chunk of that
+            # same request then arrives parented to one of them. That is why this
+            # is gated on `lease_enabled`: no other path unregisters a block that
+            # a live request still holds.
+            return False
+
         self.block_hashes[id_tensor] = hash_tensor
         # Add the new blocks to the hash map first so that a block whose parent is
         # elsewhere in this same batch (block k's parent is block k-1) resolves.
         # Skipped blocks are already in the map, so they resolve as parents too.
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
 
-        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+        # Date the blocks by the epoch whose weights produced them, and start any
+        # bounded-staleness lease there. Blocks are stamped on registration
+        # rather than on allocation because that is when their contents become
+        # visible to other requests.
+        epoch = self.context.prefix_cache_epoch
+        self.block_epoch[id_tensor] = epoch
+        if self.lease_enabled:
+            self._min_lease_epoch = (
+                epoch if self._min_lease_epoch is None else min(self._min_lease_epoch, epoch)
+            )
+
+        if self.track_prefix_chain:
             # Persist the resolved parent block id and bump each parent's child count.
             # Parents are earlier in the prefix chain and already registered
             # (a matched block or a prior chunk / earlier entry in this batch),
@@ -413,6 +503,8 @@ class KVBlockAllocator:
                     torch.ones(int(has_parent.sum()), dtype=torch.int64),
                 )
 
+        return True
+
     def add_blocks_deregistered_observer(self, observer: BlocksDeregisteredObserver) -> None:
         """Register a callback invoked when cached blocks are deregistered.
 
@@ -420,18 +512,23 @@ class KVBlockAllocator:
         """
         self._blocks_deregistered_observers.append(observer)
 
-    def _deregister_blocks(self, block_ids: Tensor) -> None:
-        """Remove blocks from prefix caching state and return to free pool.
+    def _unregister_blocks(self, block_ids: Tensor) -> tuple[list, set]:
+        """Drop blocks from the prefix cache without touching pool ownership.
 
-        Shared cleanup logic for both LRU eviction and RZ proactive eviction.
+        Clears the hash entries and the prefix-chain bookkeeping so the blocks
+        can no longer be matched, but leaves reference counts and the free pool
+        alone. Callers own the memory decision: `_deregister_blocks` returns
+        ref-zero blocks to the pool, while lease expiry uses this directly on
+        blocks that a live request still holds (they return to the pool through
+        `release_memory_blocks` once that request finishes).
 
         Args:
-            block_ids: Tensor of block IDs to deregister.
-        """
-        num_blocks = block_ids.numel()
-        if num_blocks == 0:
-            return
+            block_ids: Tensor of block IDs to unregister.
 
+        Returns:
+            Tuple of (block id list, set of hashes removed from the map), for
+            passing on to the deregistration observers.
+        """
         # Gather hashes via batched tensor indexing
         block_ids_i64 = block_ids.to(torch.int64)
         block_ids_list = block_ids.tolist()
@@ -445,7 +542,7 @@ class KVBlockAllocator:
         )
 
         # Reset block state (batched tensor ops)
-        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
+        if self.track_prefix_chain:
             # Drop these blocks from their parents' child counts before clearing
             # their own bookkeeping, keeping block_child_count in sync so a parent
             # becomes an evictable leaf once its last child is deregistered.
@@ -459,20 +556,45 @@ class KVBlockAllocator:
                 )
             self.block_parent_id[block_ids] = -1
             self.block_child_count[block_ids] = 0
+        if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
             self.block_timestamps[block_ids] = 0
+        self.block_epoch[block_ids] = -1
         self.block_hashes[block_ids] = -1
+
+        return block_ids_list, keys_to_delete
+
+    def _notify_blocks_deregistered(self, block_ids_list: list, keys_to_delete: set) -> None:
+        """Notify dependent allocators and external observers of deregistration.
+
+        Called only after this allocator's own bookkeeping commits, so a failing
+        callback cannot leave the allocator in a partial state.
+        """
+        if self.on_blocks_deregistered is not None:
+            self.on_blocks_deregistered(block_ids_list, keys_to_delete)
+        for observer in tuple(self._blocks_deregistered_observers):
+            observer(block_ids_list, keys_to_delete)
+
+    def _deregister_blocks(self, block_ids: Tensor) -> None:
+        """Remove blocks from prefix caching state and return to free pool.
+
+        Shared cleanup logic for LRU eviction, RZ proactive eviction, and the
+        ref-zero portion of lease expiry.
+
+        Args:
+            block_ids: Tensor of block IDs to deregister.
+        """
+        num_blocks = block_ids.numel()
+        if num_blocks == 0:
+            return
+
+        block_ids_list, keys_to_delete = self._unregister_blocks(block_ids)
         self.block_ref_counts[block_ids] = 0
 
         # Return blocks to free pool
         self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = block_ids
         self.pool_avail += num_blocks
 
-        # Notify dependent allocators and external observers only after KV allocator
-        # bookkeeping commits, so callback failures cannot leave this allocator partial.
-        if self.on_blocks_deregistered is not None:
-            self.on_blocks_deregistered(block_ids_list, keys_to_delete)
-        for observer in tuple(self._blocks_deregistered_observers):
-            observer(block_ids_list, keys_to_delete)
+        self._notify_blocks_deregistered(block_ids_list, keys_to_delete)
 
     def update_timestamps(self, block_ids: Tensor) -> None:
         """Update LRU timestamps for accessed blocks. No-op in RZ mode.
@@ -619,6 +741,140 @@ class KVBlockAllocator:
         self._deregister_blocks(blocks_to_evict)
 
         return True
+
+    # =========================================================================
+    # Block epochs and bounded staleness (lease) eviction
+    # =========================================================================
+
+    def get_block_epochs(self, block_ids: list[int]) -> list[int]:
+        """Generation epoch whose weights produced each block's cached contents.
+
+        Args:
+            block_ids: Block IDs to query; each must be registered in the
+                prefix cache.
+
+        Returns:
+            One epoch per block, in the order given.
+        """
+        assert self.enable_prefix_caching, "block epochs are only tracked for prefix caching"
+        epochs = self.block_epoch[torch.tensor(block_ids, dtype=torch.int64)].tolist()
+        assert all(epoch >= 0 for epoch in epochs), (
+            "block epoch requested for an unregistered block: "
+            f"{[b for b, e in zip(block_ids, epochs) if e < 0]}"
+        )
+        return epochs
+
+    def get_block_remaining_lease(self, block_id: int) -> Optional[int]:
+        """Further epochs a cached block may survive, or None if it has no lease.
+
+        Counts down from `prefix_caching_lease_epochs` at registration. At 0 the
+        block is still usable, having reached the oldest staleness the lease
+        tolerates; the next epoch evicts it.
+
+        Args:
+            block_id: The block ID to query.
+
+        Returns:
+            Remaining tolerated staleness in epochs, or None when leasing is
+            disabled or the block is not registered in the prefix cache.
+        """
+        if not self.lease_enabled:
+            return None
+        birth_epoch = int(self.block_epoch[block_id])
+        if birth_epoch < 0:
+            return None
+        age = self.context.prefix_cache_epoch - birth_epoch
+        return max(0, self.prefix_caching_lease_epochs - age)
+
+    def expire_leased_blocks(self) -> int:
+        """Evict cached blocks whose bounded-staleness lease has run out.
+
+        A block registered in epoch `e` stays usable while the current epoch is
+        at most `e + prefix_caching_lease_epochs`, and expires past that: the KV
+        (and, through the deregistration callback, Mamba) state it holds was
+        produced by model weights more updates ago than the lease tolerates, so
+        it is no longer a valid substitute for recomputing that prefix.
+
+        Expiry propagates down the prefix chain. Hashes are parent-chained and
+        `_find_kv_match_count` relies on a cached block always having all of its
+        ancestors cached, so dropping a block requires dropping its registered
+        descendants too. They are stale regardless: each one extends a prefix
+        whose state is stale. Descendants are registered no earlier than their
+        parents, so under a uniform lease they would otherwise outlive them.
+
+        Blocks a live request still references cannot go back to the free pool
+        here. They are unregistered in place, which stops new requests from
+        matching stale state immediately, and the memory is reclaimed by
+        `release_memory_blocks` when the owning request finishes.
+
+        Returns:
+            Number of blocks expired.
+        """
+        if not self.lease_enabled:
+            return 0
+
+        epoch = self.context.prefix_cache_epoch
+        # Nothing registered, or even the oldest block is still within its lease.
+        if (
+            self._min_lease_epoch is None
+            or epoch - self._min_lease_epoch <= self.prefix_caching_lease_epochs
+        ):
+            return 0
+
+        # An entry survives while its age is within the tolerated lag, so a lease
+        # of N covers ages 0..N and eviction starts at N + 1.
+        registered_mask = self.block_epoch >= 0
+        expired_mask = registered_mask & (
+            (epoch - self.block_epoch) > self.prefix_caching_lease_epochs
+        )
+
+        # Children of each registered block, so the sweep can walk from expired
+        # roots down to their registered descendants. Restricting to registered
+        # blocks keeps stale parent pointers on unregistered ids out of the walk.
+        registered_ids = torch.nonzero(registered_mask, as_tuple=True)[0].tolist()
+        parent_ids = self.block_parent_id[registered_mask].tolist()
+        children_of: Dict[int, list] = {}
+        for block_id, parent_id in zip(registered_ids, parent_ids):
+            if parent_id >= 0:
+                children_of.setdefault(parent_id, []).append(block_id)
+
+        # Subtree closure over the expired roots.
+        stack = torch.nonzero(expired_mask, as_tuple=True)[0].tolist()
+        expired = set(stack)
+        while stack:
+            block_id = stack.pop()
+            for child_id in children_of.get(block_id, ()):
+                if child_id not in expired:
+                    expired.add(child_id)
+                    stack.append(child_id)
+
+        expired_ids = torch.tensor(
+            sorted(expired), dtype=torch.int64, device=self.block_hashes.device
+        )
+        ref_counts = self.block_ref_counts[expired_ids]
+        live_ids = expired_ids[ref_counts > 0]
+        free_ids = expired_ids[ref_counts == 0]
+
+        if live_ids.numel() > 0:
+            block_ids_list, keys_to_delete = self._unregister_blocks(live_ids)
+            self._notify_blocks_deregistered(block_ids_list, keys_to_delete)
+        self._deregister_blocks(free_ids)
+
+        # Re-zero the expired blocks' own child counts. Each unregistration
+        # decrements its parent's count, which is what a surviving parent losing
+        # an expired child needs, but within the expired set those decrements can
+        # land on a block whose count was already cleared -- a ref-zero block may
+        # sit under a still-live parent (one request holds the shared prefix while
+        # another's tail blocks go ref-zero), so the two batches above cannot be
+        # ordered to avoid it. Driving a count negative would later mark a block
+        # with children as an evictable leaf.
+        self.block_child_count[expired_ids] = 0
+
+        # Recompute the skip bound exactly over what survived.
+        surviving = self.block_epoch[self.block_epoch >= 0]
+        self._min_lease_epoch = int(surviving.min()) if surviving.numel() > 0 else None
+
+        return len(expired)
 
     # =========================================================================
     # Per-block routing storage methods (for MoE routing replay)

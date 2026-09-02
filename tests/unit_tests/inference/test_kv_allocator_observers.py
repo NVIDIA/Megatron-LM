@@ -10,7 +10,8 @@ from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
 
 
 def test_allocator_notifies_observer_without_replacing_legacy_callback():
-    context = Mock()
+    # prefix_cache_epoch dates each registered block; the real context always has it.
+    context = Mock(prefix_cache_epoch=0)
     allocator = KVBlockAllocator(
         context,
         8,
@@ -32,7 +33,8 @@ def test_allocator_notifies_observer_without_replacing_legacy_callback():
 
 
 def test_listener_failure_does_not_interrupt_block_deregistration():
-    context = Mock()
+    # prefix_cache_epoch dates each registered block; the real context always has it.
+    context = Mock(prefix_cache_epoch=0)
     allocator = KVBlockAllocator(
         context,
         8,

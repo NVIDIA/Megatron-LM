@@ -20,6 +20,7 @@ def _make_context(
     request_kv_block_counts=None,
     request_to_kv_block_ids=None,
     prefix_cache_lru_clock=0,
+    prefix_cache_epoch=0,
 ):
     """Build a minimal DynamicInferenceContext-like fake for the allocator."""
     if request_kv_block_counts is None:
@@ -32,6 +33,7 @@ def _make_context(
         request_kv_block_counts=request_kv_block_counts,
         request_to_kv_block_ids=request_to_kv_block_ids,
         prefix_cache_lru_clock=prefix_cache_lru_clock,
+        prefix_cache_epoch=prefix_cache_epoch,
     )
 
 
@@ -654,11 +656,17 @@ def test_evict_lru_asserts_on_cyclic_parent_graph():
     a cycle exposes no leaf, so the peel cannot collect enough blocks; this is a
     bug and must fail loudly rather than silently under-evict."""
     a = _lru_allocator()
-    # 2-cycle: block 0's parent hash is 20 (block 1) and block 1's parent hash is
-    # 10 (block 0). register_kv_block_hashes never produces this — we seed it
-    # directly to model the pathological collision case.
-    _seed_cached_chain(a, block_ids=[0, 1], hashes=[10, 20], parents=[20, 10], timestamps=[1, 2])
+    # Register a normal chain first, then close a 2-cycle in the parent graph by
+    # hand: block 0's parent becomes block 1, which already has block 0 as its
+    # parent. register_kv_block_hashes never produces this, and it now rejects a
+    # batch whose head parent is unregistered, so the pathological collision has
+    # to be written straight into the parent bookkeeping the peel reads.
+    _seed_cached_chain(a, block_ids=[0, 1], hashes=[10, 20], parents=[0, 10], timestamps=[1, 2])
     assert int(a.get_evictable_block_count()) == 2
+    a.block_parent_id[0] = 1
+    # With each block a parent of the other, neither is a leaf, so the peel finds
+    # no starting point and cannot collect the block it was asked for.
+    a.block_child_count[1] = 1
 
     with pytest.raises(AssertionError):
         a.evict_lru_blocks(1)
@@ -761,3 +769,494 @@ def test_evict_lru_preserves_invariant_under_random_chains():
         assert retained == set(block_ids) - expected_evicted
         assert len(retained) == n - k_evict
         _assert_prefix_invariant(a)
+
+
+# ---------------------------------------------------------------------------
+# Bounded staleness: lease-based eviction
+# ---------------------------------------------------------------------------
+
+
+def _leased_allocator(lease_epochs, policy=PrefixCachingEvictionPolicy.LRU, pool_size=16):
+    """Prefix-caching allocator with a bounded-staleness lease, over a fake
+    context whose epoch the test drives directly."""
+    ctx = _make_context()
+    a = KVBlockAllocator(
+        ctx,
+        pool_size=pool_size,
+        paused_limit=1,
+        enable_prefix_caching=True,
+        prefix_caching_eviction_policy=policy,
+        prefix_caching_lease_epochs=lease_epochs,
+    )
+    return ctx, a
+
+
+def test_lease_of_zero_tolerates_no_staleness():
+    """A lease of 0 is meaningful and distinct from leasing being disabled: it
+    tolerates no staleness at all, so an entry never outlives the weights that
+    produced it and is dropped at the very next epoch."""
+    ctx, a = _leased_allocator(lease_epochs=0)
+    assert a.lease_enabled is True
+
+    block = int(a.allocate_memory_blocks(1)[0])
+    a.register_kv_block_hashes(block_ids=[block], block_hashes=[11], parent_hashes=[0])
+    a.release_memory_blocks(torch.tensor([block], dtype=torch.int32))
+    assert a.get_block_remaining_lease(block) == 0
+
+    # Usable within the epoch that created it.
+    assert a.expire_leased_blocks() == 0
+    assert a.kv_hash_to_block_id == {11: block}
+
+    # Gone at the first weight update.
+    ctx.prefix_cache_epoch = 1
+    assert a.expire_leased_blocks() == 1
+    assert a.kv_hash_to_block_id == {}
+
+
+@pytest.mark.parametrize(
+    "policy", [PrefixCachingEvictionPolicy.REF_ZERO, PrefixCachingEvictionPolicy.LRU]
+)
+def test_lease_disabled_by_default(policy):
+    """With no lease configured (the default is None, not 0), cached blocks
+    survive arbitrarily many epochs -- but they are still dated, since that is
+    what a cache hit reports as its `kv_cache_epoch`."""
+    ctx = _make_context()
+    a = KVBlockAllocator(
+        ctx,
+        pool_size=16,
+        paused_limit=1,
+        enable_prefix_caching=True,
+        prefix_caching_eviction_policy=policy,
+    )
+    assert a.lease_enabled is False
+
+    ctx.prefix_cache_epoch = 7
+    block = int(a.allocate_memory_blocks(1)[0])
+    a.register_kv_block_hashes(block_ids=[block], block_hashes=[11], parent_hashes=[0])
+    assert a.get_block_epochs([block]) == [7]
+
+    ctx.prefix_cache_epoch = 10_000
+    assert a.expire_leased_blocks() == 0
+    assert a.kv_hash_to_block_id == {11: block}
+    assert a.get_block_remaining_lease(block) is None
+    # Dated by the epoch that produced it, not by the current one.
+    assert a.get_block_epochs([block]) == [7]
+
+
+def test_registration_reports_whether_the_batch_is_cached():
+    """`register_kv_block_hashes` reports whether the batch ended up cached.
+
+    A batch parented to a prefix that expired out from under it is rejected
+    wholesale, and the caller must not then advertise those blocks as stored.
+    """
+    ctx, a = _leased_allocator(lease_epochs=0)
+
+    parent = int(a.allocate_memory_blocks(1)[0])
+    assert a.register_kv_block_hashes([parent], [11], [0]) is True
+    # Re-offering an already registered block is still "cached on return".
+    assert a.register_kv_block_hashes([parent], [11], [0]) is True
+
+    # The parent expires while its request still holds it, so the next chunk of
+    # that request arrives parented to a block that is no longer cached.
+    ctx.prefix_cache_epoch = 1
+    assert a.expire_leased_blocks() == 1
+    child = int(a.allocate_memory_blocks(1)[0])
+    assert a.register_kv_block_hashes([child], [22], [11]) is False
+    assert a.kv_hash_to_block_id == {}
+    assert a.block_epoch[child].item() == -1
+
+
+def test_lease_expires_block_exactly_at_end_of_lease():
+    """A block cached in epoch e survives through epoch e + lease - 1 and is
+    evicted once the epoch reaches e + lease, returning to the free pool."""
+    ctx, a = _leased_allocator(lease_epochs=2)
+
+    block = int(a.allocate_memory_blocks(1)[0])
+    a.register_kv_block_hashes(block_ids=[block], block_hashes=[11], parent_hashes=[0])
+    a.release_memory_blocks(torch.tensor([block], dtype=torch.int32))
+    avail_cached = a.pool_avail
+    assert a.get_block_remaining_lease(block) == 2
+
+    # A lease of 2 tolerates ages 0, 1 and 2: still a valid cache entry.
+    assert a.expire_leased_blocks() == 0
+    ctx.prefix_cache_epoch = 1
+    assert a.expire_leased_blocks() == 0
+    assert a.kv_hash_to_block_id == {11: block}
+    assert a.get_block_remaining_lease(block) == 1
+    ctx.prefix_cache_epoch = 2
+    assert a.expire_leased_blocks() == 0
+    assert a.get_block_remaining_lease(block) == 0
+
+    # Past the tolerated staleness: dropped, and the memory comes back.
+    ctx.prefix_cache_epoch = 3
+    assert a.expire_leased_blocks() == 1
+    assert a.kv_hash_to_block_id == {}
+    assert a.block_hashes[block].item() == -1
+    assert a.block_epoch[block].item() == -1
+    assert a.pool_avail == avail_cached + 1
+    assert a.get_block_remaining_lease(block) is None
+    # Nothing registered: a further epoch is a cheap no-op.
+    ctx.prefix_cache_epoch = 4
+    assert a.expire_leased_blocks() == 0
+
+
+def test_lease_expiry_takes_the_whole_stale_subtree():
+    """Descendants are registered no earlier than their parents, so a uniform
+    lease would expire a parent first. Expiring it must take the descendants
+    too, or _find_kv_match_count would match a child and then fail to resolve
+    its ancestors."""
+    ctx, a = _leased_allocator(lease_epochs=2)
+
+    # Parent cached in epoch 0.
+    parent = int(a.allocate_memory_blocks(1)[0])
+    a.register_kv_block_hashes(block_ids=[parent], block_hashes=[11], parent_hashes=[0])
+    a.release_memory_blocks(torch.tensor([parent], dtype=torch.int32))
+
+    # Child cached in epoch 1, so its own lease still has an epoch to run.
+    ctx.prefix_cache_epoch = 1
+    child = int(a.allocate_memory_blocks(1)[0])
+    a.register_kv_block_hashes(block_ids=[child], block_hashes=[22], parent_hashes=[11])
+    a.release_memory_blocks(torch.tensor([child], dtype=torch.int32))
+    grandchild = int(a.allocate_memory_blocks(1)[0])
+    a.register_kv_block_hashes(block_ids=[grandchild], block_hashes=[33], parent_hashes=[22])
+    a.release_memory_blocks(torch.tensor([grandchild], dtype=torch.int32))
+    avail_cached = a.pool_avail
+    assert a.get_block_remaining_lease(parent) == 1
+    assert a.get_block_remaining_lease(child) == 2
+
+    # Epoch 3 puts the parent past its lease; the child and grandchild extend a
+    # stale prefix, so they go with it even though their own leases (registered
+    # an epoch later) still have room.
+    ctx.prefix_cache_epoch = 3
+    assert a.expire_leased_blocks() == 3
+    assert a.kv_hash_to_block_id == {}
+    assert a.pool_avail == avail_cached + 3
+    _assert_prefix_invariant(a)
+    # Chain bookkeeping is left clean for the next tenant of these blocks.
+    for block in (parent, child, grandchild):
+        assert a.block_parent_id[block].item() == -1
+        assert a.block_child_count[block].item() == 0
+
+
+def test_lease_expiry_unregisters_live_blocks_and_reclaims_them_on_release():
+    """A block a live request still holds cannot go back to the free pool, but
+    it must stop being matchable immediately. The memory is reclaimed when the
+    owning request releases it."""
+    ctx, a = _leased_allocator(lease_epochs=1)
+
+    live = int(a.allocate_memory_blocks(1)[0])  # ref_count == 1
+    a.register_kv_block_hashes(block_ids=[live], block_hashes=[11], parent_hashes=[0])
+    avail_held = a.pool_avail
+
+    ctx.prefix_cache_epoch = 2
+    assert a.expire_leased_blocks() == 1
+    # Unmatchable right away, but still owned by its request.
+    assert a.kv_hash_to_block_id == {}
+    assert a.block_hashes[live].item() == -1
+    assert a.block_ref_counts[live].item() == 1
+    assert a.pool_avail == avail_held
+
+    # The owner finishing hands the block back to the pool.
+    a.release_memory_blocks(torch.tensor([live], dtype=torch.int32))
+    assert a.block_ref_counts[live].item() == 0
+    assert a.pool_avail == avail_held + 1
+
+
+def test_lease_expiry_notifies_deregistration_observers():
+    """Expiry must fire the deregistration callbacks, which is how the Mamba
+    slot allocator drops the cached conv/SSM state hanging off these blocks."""
+    ctx, a = _leased_allocator(lease_epochs=1)
+    seen = []
+    a.on_blocks_deregistered = lambda ids, hashes: seen.append(("mamba", set(ids), hashes))
+    a.add_blocks_deregistered_observer(
+        lambda ids, hashes: seen.append(("observer", set(ids), hashes))
+    )
+
+    cached = int(a.allocate_memory_blocks(1)[0])
+    a.register_kv_block_hashes(block_ids=[cached], block_hashes=[11], parent_hashes=[0])
+    a.release_memory_blocks(torch.tensor([cached], dtype=torch.int32))
+    live = int(a.allocate_memory_blocks(1)[0])
+    a.register_kv_block_hashes(block_ids=[live], block_hashes=[22], parent_hashes=[0])
+
+    ctx.prefix_cache_epoch = 2
+    assert a.expire_leased_blocks() == 2
+
+    # Both the pool-returned and the still-held block are reported, so their
+    # Mamba slots are freed either way.
+    reported_ids = set()
+    reported_hashes = set()
+    for _, ids, hashes in seen:
+        reported_ids |= ids
+        reported_hashes |= hashes
+    assert reported_ids == {cached, live}
+    assert reported_hashes == {11, 22}
+    assert {kind for kind, _, _ in seen} == {"mamba", "observer"}
+
+
+def test_lease_applies_under_ref_zero_policy():
+    """REF_ZERO keeps only live blocks registered, but those are matchable by
+    other requests, so the lease must still unregister them when it runs out."""
+    ctx, a = _leased_allocator(lease_epochs=1, policy=PrefixCachingEvictionPolicy.REF_ZERO)
+    # Chain tracking is on despite REF_ZERO, since subtree closure needs it.
+    assert a.track_prefix_chain is True
+
+    blocks = a.allocate_memory_blocks(2).tolist()
+    parent, child = int(blocks[0]), int(blocks[1])
+    a.register_kv_block_hashes(
+        block_ids=[parent, child], block_hashes=[11, 22], parent_hashes=[0, 11]
+    )
+
+    ctx.prefix_cache_epoch = 2
+    assert a.expire_leased_blocks() == 2
+    assert a.kv_hash_to_block_id == {}
+    # Still held by their request; REF_ZERO returns them on release as usual.
+    a.release_memory_blocks(torch.tensor([parent, child], dtype=torch.int32))
+    assert a.pool_avail == a.pool_size - 1
+
+
+def test_lease_reset_clears_bookkeeping():
+    """reset() drops the lease stamps along with the rest of the cache state."""
+    ctx, a = _leased_allocator(lease_epochs=2)
+    block = int(a.allocate_memory_blocks(1)[0])
+    a.register_kv_block_hashes(block_ids=[block], block_hashes=[11], parent_hashes=[0])
+
+    a.reset()
+    assert a.block_epoch[block].item() == -1
+    assert a._min_lease_epoch is None
+    ctx.prefix_cache_epoch = 100
+    assert a.expire_leased_blocks() == 0
+
+
+def test_lease_expiry_keeps_child_counts_non_negative_with_live_parent():
+    """A ref-zero block can sit under a still-live parent: one request holds the
+    shared prefix while another request's tail blocks fall to ref zero. Expiring
+    both must not drive the parent's child count negative, which would later let
+    LRU treat a block that still has children as an evictable leaf."""
+    ctx, a = _leased_allocator(lease_epochs=1)
+
+    blocks = a.allocate_memory_blocks(2).tolist()
+    parent, child = int(blocks[0]), int(blocks[1])
+    a.register_kv_block_hashes(
+        block_ids=[parent, child], block_hashes=[11, 22], parent_hashes=[0, 11]
+    )
+    # Parent stays pinned by a live request; the child's only owner finishes.
+    a.release_memory_blocks(torch.tensor([child], dtype=torch.int32))
+    assert a.block_ref_counts[parent].item() == 1
+    assert a.block_ref_counts[child].item() == 0
+    assert a.block_child_count[parent].item() == 1
+
+    ctx.prefix_cache_epoch = 2
+    assert a.expire_leased_blocks() == 2
+    assert a.block_child_count[parent].item() == 0
+    assert a.block_child_count[child].item() == 0
+    assert (a.block_child_count >= 0).all().item()
+    assert a.kv_hash_to_block_id == {}
+
+
+def _seed_leased_forest(a, ctx, parent, birth, live):
+    """Register a forest through the real allocation path.
+
+    Args:
+        parent: parent[i] is an earlier index or -1 for a root.
+        birth: epoch to register each block under.
+        live: whether the block keeps a reference after registration.
+
+    Returns the allocated block id per index.
+    """
+    n = len(parent)
+    ids = [int(b) for b in a.allocate_memory_blocks(n).tolist()]
+    hashes = [100 + i for i in range(n)]
+    # Index order is chain order, so each parent is registered before its child.
+    for i in range(n):
+        ctx.prefix_cache_epoch = birth[i]
+        a.register_kv_block_hashes(
+            block_ids=[ids[i]],
+            block_hashes=[hashes[i]],
+            parent_hashes=[hashes[parent[i]] if parent[i] >= 0 else 0],
+        )
+    released = [ids[i] for i in range(n) if not live[i]]
+    if released:
+        a.release_memory_blocks(torch.tensor(released, dtype=torch.int32))
+    return ids, hashes
+
+
+def _reference_expiry_closure(parent, birth, epoch, lease):
+    """Independent model of which blocks expiry must remove: every block past
+    its lease, plus every descendant of one."""
+    n = len(parent)
+    children = {i: [] for i in range(n)}
+    for i in range(n):
+        if parent[i] >= 0:
+            children[parent[i]].append(i)
+    closure = set()
+    stack = [i for i in range(n) if epoch - birth[i] > lease]
+    closure.update(stack)
+    while stack:
+        i = stack.pop()
+        for child in children[i]:
+            if child not in closure:
+                closure.add(child)
+                stack.append(child)
+    return closure
+
+
+def test_lease_expiry_subtree_closure_under_random_forests():
+    """Property test over randomized forests: expiry must remove exactly the
+    expired blocks plus all of their descendants, keep the parent-chain
+    invariant intact, return only the unreferenced ones to the pool, and leave
+    child counts consistent with what survived.
+
+    Birth epochs increase down each chain and the referenced set is ancestor
+    closed, matching what the allocator can actually reach: a block is
+    registered no earlier than its parent, and an in-use block keeps all of its
+    ancestors in use.
+    """
+    torch.manual_seed(0)
+    for trial in range(50):
+        n = int(torch.randint(2, 10, (1,)).item())
+        lease = int(torch.randint(1, 4, (1,)).item())
+        ctx = _make_context()
+        a = KVBlockAllocator(
+            ctx,
+            pool_size=n + 4,
+            paused_limit=1,
+            enable_prefix_caching=True,
+            prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+            prefix_caching_lease_epochs=lease,
+        )
+
+        parent, birth, live = [], [], []
+        for i in range(n):
+            if i == 0 or int(torch.randint(0, 2, (1,)).item()) == 0:
+                parent.append(-1)
+                birth.append(int(torch.randint(0, 4, (1,)).item()))
+                live.append(int(torch.randint(0, 2, (1,)).item()) == 1)
+            else:
+                p = int(torch.randint(0, i, (1,)).item())
+                parent.append(p)
+                # Registered no earlier than its parent.
+                birth.append(birth[p] + int(torch.randint(0, 3, (1,)).item()))
+                # In use only if its parent is in use.
+                live.append(live[p] and int(torch.randint(0, 2, (1,)).item()) == 1)
+
+        ids, _ = _seed_leased_forest(a, ctx, parent, birth, live)
+        pool_avail_before = a.pool_avail
+
+        epoch = max(birth) + int(torch.randint(0, 6, (1,)).item())
+        ctx.prefix_cache_epoch = epoch
+        expected = _reference_expiry_closure(parent, birth, epoch, lease)
+        survivors = set(range(n)) - expected
+
+        assert a.expire_leased_blocks() == len(expected), f"trial {trial}"
+
+        # Exactly the closure is gone from the cache.
+        assert set(a.kv_hash_to_block_id.values()) == {ids[i] for i in survivors}, f"trial {trial}"
+        _assert_prefix_invariant(a)
+
+        for i in expected:
+            assert a.block_hashes[ids[i]].item() == -1
+            assert a.block_epoch[ids[i]].item() == -1
+            assert a.block_parent_id[ids[i]].item() == -1
+            assert a.block_child_count[ids[i]].item() == 0
+
+        # Referenced blocks stay out of the pool until their owner releases them;
+        # unreferenced ones are reclaimed immediately.
+        free_region = a.block_bag[: a.pool_avail].tolist()
+        assert len(set(free_region)) == len(free_region), f"trial {trial}: duplicate free id"
+        reclaimed = {i for i in expected if not live[i]}
+        for i in expected:
+            if live[i]:
+                assert a.block_ref_counts[ids[i]].item() == 1
+                assert ids[i] not in free_region
+            else:
+                assert ids[i] in free_region
+        assert a.pool_avail == pool_avail_before + len(reclaimed), f"trial {trial}"
+
+        # Child counts must describe what actually survived, and must never have
+        # been driven negative by a decrement landing on an expired parent.
+        assert (a.block_child_count >= 0).all().item(), f"trial {trial}"
+        for i in survivors:
+            expected_children = sum(1 for j in survivors if parent[j] == i)
+            assert (
+                a.block_child_count[ids[i]].item() == expected_children
+            ), f"trial {trial}: block {i}"
+
+        # The surviving forest is still well formed for LRU: draining every
+        # unreferenced survivor by leaf peel must succeed, which is where a
+        # corrupted child count would surface as a non-leaf being evicted before
+        # its children. Referenced survivors are not evictable, and since the
+        # referenced set is ancestor closed they are exactly the roots the
+        # remaining cached blocks hang off.
+        cached_survivors = {i for i in survivors if not live[i]}
+        if cached_survivors:
+            assert a.evict_lru_blocks(len(cached_survivors)) is True, f"trial {trial}"
+            assert set(a.kv_hash_to_block_id.values()) == {
+                ids[i] for i in survivors if live[i]
+            }, f"trial {trial}"
+            _assert_prefix_invariant(a)
+
+
+def test_lease_expiry_then_lru_drains_a_partially_expired_forest():
+    """Behavioural counterpart to the child-count check: a chain whose lower half
+    expires while a referenced parent stays behind must still be fully evictable
+    by LRU afterwards, in leaf-to-root order."""
+    ctx, a = _leased_allocator(lease_epochs=2, pool_size=16)
+
+    # Referenced root registered early, its ref-zero children registered later.
+    ids = [int(b) for b in a.allocate_memory_blocks(3).tolist()]
+    root, mid, leaf = ids
+    a.register_kv_block_hashes(block_ids=[root], block_hashes=[11], parent_hashes=[0])
+    ctx.prefix_cache_epoch = 1
+    a.register_kv_block_hashes(block_ids=[mid], block_hashes=[22], parent_hashes=[11])
+    a.register_kv_block_hashes(block_ids=[leaf], block_hashes=[33], parent_hashes=[22])
+    a.release_memory_blocks(torch.tensor([mid, leaf], dtype=torch.int32))
+    assert a.block_child_count[root].item() == 1
+
+    # Epoch 3 puts the root (registered at 0) past its lease; mid and leaf go
+    # with it even though their own leases still have room.
+    ctx.prefix_cache_epoch = 3
+    assert a.expire_leased_blocks() == 3
+    assert a.kv_hash_to_block_id == {}
+    assert (a.block_child_count >= 0).all().item()
+    # The root was referenced, so only mid and leaf went back to the pool.
+    assert a.block_ref_counts[root].item() == 1
+
+    # A fresh chain can now be registered and drained by LRU without tripping
+    # over bookkeeping left behind by the expiry.
+    new_ids = [int(b) for b in a.allocate_memory_blocks(2).tolist()]
+    a.register_kv_block_hashes(block_ids=new_ids, block_hashes=[44, 55], parent_hashes=[0, 44])
+    a.release_memory_blocks(torch.tensor(new_ids, dtype=torch.int32))
+    assert a.evict_lru_blocks(2) is True
+    assert a.kv_hash_to_block_id == {}
+    _assert_prefix_invariant(a)
+
+
+def test_registration_refuses_a_chain_whose_ancestors_expired():
+    """Chunked prefill registers a request's blocks across several batches. If a
+    lease expires the earlier batch in place (the request still holds it), the
+    later batch must not register: its hashes would be matchable while their
+    ancestors are gone, and _find_kv_match_count would fail to resolve them."""
+    ctx, a = _leased_allocator(lease_epochs=1, pool_size=16)
+
+    # Chunk 1: blocks stay referenced by the in-flight request.
+    first = [int(b) for b in a.allocate_memory_blocks(2).tolist()]
+    a.register_kv_block_hashes(block_ids=first, block_hashes=[11, 22], parent_hashes=[0, 11])
+
+    # Enough weight updates to pass the lease expire them in place while the
+    # request is still running.
+    ctx.prefix_cache_epoch = 2
+    assert a.expire_leased_blocks() == 2
+    assert a.kv_hash_to_block_id == {}
+
+    # Chunk 2 arrives parented to the now-unregistered block 22.
+    second = [int(b) for b in a.allocate_memory_blocks(2).tolist()]
+    a.register_kv_block_hashes(block_ids=second, block_hashes=[33, 44], parent_hashes=[22, 33])
+    assert a.kv_hash_to_block_id == {}, "registered a chain whose ancestors are gone"
+    assert a.block_hashes[second[0]].item() == -1
+    assert a.block_hashes[second[1]].item() == -1
+
+    # A chain that starts from a root is unaffected.
+    third = [int(b) for b in a.allocate_memory_blocks(2).tolist()]
+    a.register_kv_block_hashes(block_ids=third, block_hashes=[55, 66], parent_hashes=[0, 55])
+    assert set(a.kv_hash_to_block_id) == {55, 66}
+    _assert_prefix_invariant(a)

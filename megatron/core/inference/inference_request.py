@@ -361,6 +361,56 @@ class Status(Enum):
 # =========================================================================
 
 
+def overwrite_epoch_span(
+    boundaries: List[Tuple[int, int]], start: int, end: int, epoch: int
+) -> List[Tuple[int, int]]:
+    """Rewrite the epoch covering tokens ``[start, end)`` in a boundary list.
+
+    `DynamicInferenceRequest.policy_epoch` and `.kv_cache_epoch` store a step
+    function over token positions as a sorted, coalesced list of
+    ``(first_token_index, epoch)`` boundaries: a token's epoch is the epoch of
+    the last boundary at or before it. Epochs outside the rewritten span are
+    preserved, including the one that resumes at `end`.
+
+    Args:
+        boundaries: Existing boundary list; must be non-empty and start at 0.
+        start: First token of the span (inclusive).
+        end: Last token of the span (exclusive).
+        epoch: Epoch to attribute the span to.
+
+    Returns:
+        The rewritten boundary list.
+    """
+    assert boundaries and boundaries[0][0] == 0, f"malformed epoch boundaries: {boundaries}"
+    if end <= start:
+        return boundaries
+
+    # Epoch that resumes after the span, i.e. the value the step function takes
+    # at `end` today.
+    tail_epoch = boundaries[0][1]
+    for position, value in boundaries:
+        if position > end:
+            break
+        tail_epoch = value
+
+    rewritten = [(position, value) for position, value in boundaries if position < start]
+    rewritten.append((start, epoch))
+    rewritten.append((end, tail_epoch))
+    rewritten.extend((position, value) for position, value in boundaries if position > end)
+
+    # Coalesce: drop boundaries that repeat the running epoch, and later
+    # boundaries that land on a position already emitted.
+    coalesced: List[Tuple[int, int]] = []
+    for position, value in rewritten:
+        if coalesced and position == coalesced[-1][0]:
+            coalesced[-1] = (position, value)
+            continue
+        if coalesced and value == coalesced[-1][1]:
+            continue
+        coalesced.append((position, value))
+    return coalesced
+
+
 def compute_block_hashes_batched(
     prompt_tokens: torch.Tensor, block_size: int, cache_salt: Optional[str] = None
 ) -> List[int]:
@@ -659,6 +709,12 @@ class DynamicInferenceRequest(InferenceRequest):
     remaining_prompt_tokens: Optional[torch.Tensor] = None
     policy_epoch: Optional[list[tuple[int, int]]] = None
     kv_cache_epoch: Optional[list[tuple[int, int]]] = None
+    # Token spans this request was served out of the prefix cache, as
+    # (start_token, end_token, epoch) with the epoch whose weights produced the
+    # cached state. Recorded by the context on every match and replayed into the
+    # two epoch fields above, which are otherwise stamped with the current epoch
+    # and would therefore overstate the freshness of a cache hit.
+    cached_prefix_epochs: list[tuple[int, int, int]] = field(default_factory=list)
     latency: Optional[float] = None
     # routing_indices is reconstructed from per-block storage when a request finishes.
     routing_indices: Optional[np.ndarray] = None
@@ -718,6 +774,46 @@ class DynamicInferenceRequest(InferenceRequest):
         Get the length of the remaining prompt tokens.
         """
         return len(self.remaining_prompt_tokens)
+
+    def record_cached_prefix_epoch(self, start_token: int, end_token: int, epoch: int) -> None:
+        """Attribute tokens `[start_token, end_token)` to the epoch that produced them.
+
+        Called by the context whenever a chunk of this request is served from
+        the prefix cache. The span is remembered so that a later (re-)stamp of
+        the epoch fields — after a checkpoint, say — reproduces it, and applied
+        immediately to whichever of the two fields is already populated.
+
+        Args:
+            start_token: First token of the cached span (inclusive).
+            end_token: Last token of the cached span (exclusive).
+            epoch: Generation epoch whose weights produced the cached state.
+        """
+        self.cached_prefix_epochs.append((start_token, end_token, epoch))
+        if self.policy_epoch is not None:
+            self.policy_epoch = overwrite_epoch_span(
+                self.policy_epoch, start_token, end_token, epoch
+            )
+        if self.kv_cache_epoch is not None:
+            self.kv_cache_epoch = overwrite_epoch_span(
+                self.kv_cache_epoch, start_token, end_token, epoch
+            )
+
+    def epoch_boundaries(self, epoch: int) -> list[tuple[int, int]]:
+        """Fresh epoch-boundary list for a request being stamped with `epoch`.
+
+        Every token is attributed to `epoch` except the spans this request was
+        served out of the prefix cache, which keep the epoch that produced them.
+
+        Args:
+            epoch: The current generation epoch.
+
+        Returns:
+            Sorted, coalesced list of (first_token_index, epoch) boundaries.
+        """
+        boundaries = [(0, epoch)]
+        for start_token, end_token, cached_epoch in self.cached_prefix_epochs:
+            boundaries = overwrite_epoch_span(boundaries, start_token, end_token, cached_epoch)
+        return boundaries
 
     ttft: Optional[float] = None
     events: List[DynamicInferenceEvent] = field(default_factory=list)
@@ -1063,6 +1159,7 @@ class DynamicInferenceRequestRecord:
 
         policy_epoch = self.requests[-1].policy_epoch
         kv_cache_epoch = self.requests[-1].kv_cache_epoch
+        cached_prefix_epochs = self.requests[-1].cached_prefix_epochs
         # Preserve KV handoff metadata when merging request segments.
         disaggregated_params = self.requests[-1].disaggregated_params
 
@@ -1083,6 +1180,7 @@ class DynamicInferenceRequestRecord:
             sampling_params=self.requests[0].sampling_params,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
+            cached_prefix_epochs=cached_prefix_epochs,
             ttft=self.requests[0].ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,

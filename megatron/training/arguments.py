@@ -2252,6 +2252,17 @@ def _add_inference_args(parser):
                        '"ref_zero" (default) immediately returns blocks to the '
                        'free pool when ref_count hits 0. "lru" keeps blocks '
                        'cached and evicts via LRU only when space is needed.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-lease-epochs',
+                       type=int, default=None,
+                       dest='inference_dynamic_batching_prefix_caching_lease_epochs',
+                       help='Epochs of staleness tolerated by cached KV blocks and '
+                       'Mamba states, where an epoch is one model-weight update in an '
+                       'RL post-training loop (signalled by the trainer, or counted as '
+                       'one suspend/resume cycle). An entry cached during epoch e stays '
+                       'usable while the epoch is at most e + lease and is evicted '
+                       'beyond that, so 2 keeps it across two weight updates and drops '
+                       'it on the third, and 0 tolerates no staleness at all. Unset '
+                       '(default) disables lease-based eviction.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-coordinator-policy',
                        type=str, default='load_balanced',
                        choices=['longest_prefix', 'first_prefix_block', 'load_balanced'],

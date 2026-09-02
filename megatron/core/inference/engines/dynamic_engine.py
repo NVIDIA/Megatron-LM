@@ -1186,6 +1186,14 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             alloc_time = time.time() - alloc_time
 
+            # Expire stale prefix-cache entries before any request is re-added
+            # below, so none of them match state produced by the pre-suspend
+            # weights. Engines driven by a coordinator get their epochs from
+            # SET_GENERATION_EPOCH instead; only count the resume when that
+            # signal is not in play, so a cycle is never counted twice.
+            if self._generation_epoch is None:
+                self.context.advance_prefix_cache_epoch()
+
             capture_time = time.time()
             if (
                 self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
@@ -1408,11 +1416,12 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             request.add_event_add_engine()  # Record when request enters engine
 
-            # Stamp new request with the current generation epoch.
+            # Stamp new request with the current generation epoch, except for
+            # any span it is already known to be serving from the prefix cache.
             if self._generation_epoch is not None:
                 epoch = self._generation_epoch
-                request.policy_epoch = [(0, epoch)]
-                request.kv_cache_epoch = [(0, epoch)]
+                request.policy_epoch = request.epoch_boundaries(epoch)
+                request.kv_cache_epoch = request.epoch_boundaries(epoch)
 
         if request.status is None:
             request.status = Status.ACTIVE_AND_GENERATING_TOKENS
@@ -2314,12 +2323,14 @@ class DynamicInferenceEngine(AbstractEngine):
             self.schedule_non_chunked_prefill()
         waiting_after = set(self.waiting_request_ids)
 
-        # Re-stamp kv_cache_epoch on requests that were just scheduled.
+        # Re-stamp kv_cache_epoch on requests that were just scheduled. Scheduling
+        # is also where a request discovers its prefix-cache hits, so this runs
+        # after it and picks up the spans that were served from cache.
         if self._generation_epoch is not None:
             for request_id in waiting_before - waiting_after:
                 req = self.get_request(request_id)
                 if req.kv_cache_epoch is None:
-                    req.kv_cache_epoch = [(0, self._generation_epoch)]
+                    req.kv_cache_epoch = req.epoch_boundaries(self._generation_epoch)
 
     def _can_schedule_non_chunked_prefill(self, req, *, record_cg_wait: bool) -> bool:
         """Return whether the queue-head request can be admitted now.
@@ -3320,6 +3331,20 @@ class DynamicInferenceEngine(AbstractEngine):
 
         nvtx_range_pop("drain_zmq_socket")
 
+        return self.process_messages(all_messages)
+
+    def process_messages(self, all_messages: list[bytes]) -> int:
+        """Apply one batch of already-drained messages to the engine.
+
+        Split out of `schedule_requests` so that a batch every rank already
+        agrees on can be applied directly, without a socket round trip.
+
+        Args:
+            all_messages: msgpack-encoded messages, in arrival order.
+
+        Returns:
+            int: The number of messages processed.
+        """
         # First pass: add requests.
         # Control signals are queued for the second pass.
         new_generation_epoch = None
@@ -3442,6 +3467,9 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.kv_cache_epoch = [(0, new_generation_epoch)]
                     else:
                         request.kv_cache_epoch.append(boundary)
+            # New weights invalidate cached state produced by the old ones; drop
+            # whatever has now outlived its bounded-staleness lease.
+            self.context.set_prefix_cache_epoch(new_generation_epoch)
 
         # Second pass: apply at most one control signal (the engine loop
         # processes one state transition per iteration).

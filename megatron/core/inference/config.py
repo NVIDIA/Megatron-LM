@@ -477,6 +477,27 @@ class InferenceConfig:
     Only applies when enable_prefix_caching is True.
     """
 
+    prefix_caching_lease_epochs: Optional[int] = None
+    """How many epochs of staleness a cached KV block or Mamba state may carry.
+
+    An epoch is one model-weight update in an RL post-training loop. Epochs come
+    from the trainer's `SET_GENERATION_EPOCH` control signal, falling back to
+    counting suspend/resume cycles on engines that never receive it. An entry
+    cached during epoch `e` stays usable while the current epoch is at most
+    `e + prefix_caching_lease_epochs`, and is evicted beyond that, because its
+    contents were produced by weights that are by then too many updates stale.
+
+    So the value is the tolerated lag: `2` keeps an entry across two weight
+    updates and drops it on the third. `0` tolerates no staleness at all, so no
+    cache entry outlives the weights that produced it.
+
+    `None` (default) disables lease-based eviction entirely, leaving cached
+    entries to the configured eviction policy.
+
+    Only applies when enable_prefix_caching is True. Not supported alongside
+    disaggregated KV handoff.
+    """
+
     prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
         PrefixCachingCoordinatorPolicy.LOAD_BALANCED
     )
@@ -627,6 +648,12 @@ class InferenceConfig:
             raise ValueError(
                 "media_cache_routing_weight must be non-negative, "
                 f"got {self.media_cache_routing_weight}"
+            )
+
+        if self.prefix_caching_lease_epochs is not None and self.prefix_caching_lease_epochs < 0:
+            raise ValueError(
+                f"prefix_caching_lease_epochs must be non-negative (0 tolerates no staleness, "
+                f"None disables lease-based eviction), got {self.prefix_caching_lease_epochs}"
             )
 
         if self.logprobs_mode not in ("raw_logprobs", "processed_logprobs"):

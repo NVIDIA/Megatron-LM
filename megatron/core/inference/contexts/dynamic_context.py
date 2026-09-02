@@ -347,6 +347,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         # counter is not overloaded with cache-eviction semantics.
         self.prefix_cache_lru_clock = 0
 
+        # Epochs of staleness tolerated by cached KV blocks and the Mamba states
+        # hanging off them. None disables lease-based eviction.
+        self.prefix_caching_lease_epochs = inference_config.prefix_caching_lease_epochs
+
+        # Generation epoch the prefix cache is currently registering blocks
+        # under. One epoch is one model-weight update: it comes from the
+        # trainer's SET_GENERATION_EPOCH signal, or, on engines that never
+        # receive it, from counting suspend/resume cycles (an RL trainer
+        # suspends the engine precisely to update the weights). Cache entries
+        # stamped with an older epoch hold state produced by weights that many
+        # updates out of date, which is what both the staleness lease and the
+        # per-request `kv_cache_epoch` reporting are about.
+        self.prefix_cache_epoch = 0
+
         # Prefix caching hit tracking (accumulated, reset by engine after logging).
         self.prefix_cache_hits = 0  # requests that matched at least one cached block
         self.prefix_cache_blocks_matched = 0  # total matched blocks across all requests
@@ -653,6 +667,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_limit=paused_block_count,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
+            prefix_caching_lease_epochs=self.prefix_caching_lease_epochs,
         )
         self.dynamo_helper = DynamoHelper()
         self.kv_block_allocator.add_blocks_deregistered_observer(
@@ -2975,6 +2990,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not preserve_counters:
             self.step_count = 0
             self.prefix_cache_lru_clock = 0
+            # `prefix_cache_epoch` is deliberately not rewound with the other
+            # counters. It names an external event (a weight update), it is what
+            # every cached block is dated by, and requests report those dates as
+            # `kv_cache_epoch`; restarting it at 0 while the trainer is on epoch
+            # N would date fresh blocks to an epoch that has long passed.
 
         # Reset Mamba cache state.
         if not preserve_prefix_cache and self.mamba_slot_allocator is not None:
@@ -3265,6 +3285,91 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         return request_can_be_added, request_tokens_can_be_added, kv_cache_available
 
+    def set_prefix_cache_epoch(self, epoch: int) -> int:
+        """Move the prefix cache to `epoch` and evict entries whose lease ran out.
+
+        Driven by the engine from the trainer's `SET_GENERATION_EPOCH` control
+        signal, which is the authoritative "the weights just changed" event in
+        an RL post-training loop. Engines that never receive that signal fall
+        back to counting suspend/resume cycles (see `advance_prefix_cache_epoch`).
+
+        Args:
+            epoch: The new generation epoch. Absolute, in whatever units the
+                trainer supplies, so `prefix_caching_lease_epochs` is measured
+                in those same units.
+
+        Returns:
+            Number of blocks expired by the epoch change (0 when leasing is off).
+        """
+        if epoch == self.prefix_cache_epoch:
+            return 0
+        self.prefix_cache_epoch = epoch
+        if not self.enable_prefix_caching:
+            return 0
+        num_expired = self.kv_block_allocator.expire_leased_blocks()
+        if num_expired:
+            logging.info(
+                "Prefix cache: epoch %d expired %d block(s) past their %d-epoch staleness lease.",
+                epoch,
+                num_expired,
+                self.prefix_caching_lease_epochs,
+            )
+        return num_expired
+
+    def advance_prefix_cache_epoch(self) -> int:
+        """Step the prefix cache forward one epoch and evict expired entries.
+
+        Fallback driver for engines that are suspended and resumed directly
+        rather than through a coordinator, so they never receive
+        `SET_GENERATION_EPOCH`. One suspend/resume cycle is treated as one
+        weight update, since that is why an RL trainer suspends the engine.
+
+        Returns:
+            Number of blocks expired by the new epoch (0 when leasing is off).
+        """
+        return self.set_prefix_cache_epoch(self.prefix_cache_epoch + 1)
+
+    def stamp_cached_prefix_epochs(
+        self, req: DynamicInferenceRequest, matched_block_ids: list[int], start_block: int
+    ) -> None:
+        """Attribute a prefix-cache hit to the epoch that actually produced it.
+
+        `req.kv_cache_epoch` and `req.policy_epoch` are stamped with the current
+        generation epoch when the request is admitted, which is only true for
+        tokens this engine computes now. A prefix-cache hit serves KV that was
+        computed — and, for a multi-turn rollout, tokens that were sampled —
+        under whatever weights were live when those blocks were registered. The
+        block's epoch stamp is that epoch, so the matched span is rewritten to
+        it and an RL trainer sees the real staleness of the state it is
+        importance-weighting against.
+
+        The spans are also remembered on the request, so that a field the engine
+        stamps later — `kv_cache_epoch` is reset to None across a checkpoint and
+        re-stamped once the request is rescheduled — is built from them too
+        rather than reverting to the current epoch.
+
+        Args:
+            req: Request whose chunk just matched cached blocks.
+            matched_block_ids: Matched block IDs, in prefix-chain order.
+            start_block: Index within the request's own block sequence of the
+                first matched block.
+        """
+        block_epochs = self.kv_block_allocator.get_block_epochs(matched_block_ids)
+
+        # Coalesce runs of equally-dated blocks into token spans, so a prefix
+        # served entirely out of one epoch costs one boundary rather than one
+        # per block.
+        run_start = 0
+        for i in range(1, len(block_epochs) + 1):
+            if i < len(block_epochs) and block_epochs[i] == block_epochs[run_start]:
+                continue
+            req.record_cached_prefix_epoch(
+                (start_block + run_start) * self.block_size_tokens,
+                (start_block + i) * self.block_size_tokens,
+                block_epochs[run_start],
+            )
+            run_start = i
+
     def _find_kv_match_count(
         self, req: DynamicInferenceRequest, start_block: int, end_block: int
     ) -> tuple[list[int], int]:
@@ -3359,6 +3464,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.prefix_cache_hits += 1
             self.prefix_cache_blocks_matched += num_matched_blocks
             req.num_cached_tokens += num_matched_blocks * self.block_size_tokens
+            # The matched blocks' KV is reused as-is (this chunk's overlapping
+            # writes are redirected to the dummy block below), so the epoch that
+            # produced them, not the current one, is what these tokens carry.
+            self.stamp_cached_prefix_epochs(req, matched_block_ids, already_allocated_blocks)
 
         # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:prefill_chunk_length]
@@ -3552,9 +3661,15 @@ class DynamicInferenceContext(BaseInferenceContext):
                 parent_hashes_slice = [
                     req.precomputed_block_hashes[k - 1] if k > 0 else 0 for k in range(start, end)
                 ]
-                self.kv_block_allocator.register_kv_block_hashes(
+                registered = self.kv_block_allocator.register_kv_block_hashes(
                     block_ids_to_hash, block_hashes_slice, parent_hashes_slice
                 )
+                if not registered:
+                    # The allocator refused the batch (its prefix expired out
+                    # from under this request). Announcing a kv_stored event for
+                    # blocks that are not in the cache would steer every request
+                    # sharing this prefix to an engine that cannot serve it.
+                    return
                 if self.dynamo_helper.has_kv_event_listeners:
                     token_start = start * self.block_size_tokens
                     token_end = end * self.block_size_tokens
