@@ -7,6 +7,10 @@ import torch
 
 from ..utils import is_torch_min_version
 
+# Sharding strategy names, ordered as the ZeRO ladder: each level shards one more
+# buffer than the last. Both data-parallel axes take a value from this set.
+_SHARDING_STRATEGIES = ("no_shard", "optim", "optim_grads", "optim_grads_params")
+
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -103,6 +107,10 @@ class DistributedDataParallelConfig:
     data_parallel_sharding_strategy: str = 'no_shard'
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
       'optim_grads', 'optim_grads_params'."""
+
+    expert_data_parallel_sharding_strategy: str | None = None
+    """Optional expert-parameter sharding strategy for MFSDP v2. When unset, experts use
+      ``data_parallel_sharding_strategy``."""
 
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
@@ -249,6 +257,13 @@ class DistributedDataParallelConfig:
     FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
     """
 
+    hfsdp_param_gather_overlap: bool = False
+    """If true, pipeline HFSDP parameter gathers across the DP-Outer and DP-Inner
+    communication domains. DP-Inner retains its size-based prefetch policy, while
+    DP-Outer is prefetched one additional FSDP unit beyond the DP-Inner frontier.
+    Only effective with ``outer_dp_sharding_strategy='optim'``.
+    """
+
     @property
     def param_sync_via_bucket_group(self) -> bool:
         """Whether DP parameter synchronization is dispatched through DDP bucket groups.
@@ -281,6 +296,12 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        for name in ("data_parallel_sharding_strategy", "outer_dp_sharding_strategy"):
+            value = getattr(self, name)
+            if value not in _SHARDING_STRATEGIES:
+                raise ValueError(
+                    f"{name} must be one of {list(_SHARDING_STRATEGIES)}, got {value!r}."
+                )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
 

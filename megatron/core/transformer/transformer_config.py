@@ -3,12 +3,14 @@
 import logging
 import math
 import warnings
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Callable, List, Literal, Optional, Tuple, Union
+from typing import Callable, List, Literal, Optional, Self, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import squared_relu
 from megatron.core.context_parallel import CPLayout
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
@@ -1070,6 +1072,9 @@ class TransformerConfig(ModelParallelConfig):
     and P2P communications in high-level CP groups (e.g., via IBLink).
     """
 
+    linear_cp_mode: Literal["headwise", "chunkwise"] = "headwise"
+    """Context-parallel algorithm for recurrent and linear-attention layers."""
+
     linear_cp_layout: CPLayout = "zigzag"
     """CP layout for linear-attention layers."""
 
@@ -1288,7 +1293,10 @@ class TransformerConfig(ModelParallelConfig):
     inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm'] = "vllm"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
-    - 'flashinfer': Uses FlashInfer cutlass_fused_moe. Not compatible with MXFP8.
+    - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and TRT-LLM routed
+      block-scale MoE for MXFP8. The MXFP8 path retains canonical expert weights
+      for refit and also stores a padded TRT-LLM Major-K copy, increasing
+      expert-weight memory relative to the torch backend.
     - 'torch': Uses torch.nn.functional.grouped_mm (mcore_fused_moe with Triton kernels).
       Supports both BF16 and MXFP8.
     - 'vllm': Uses vLLM's Triton fused MoE kernel (BF16). Avoids physical token
@@ -1300,6 +1308,15 @@ class TransformerConfig(ModelParallelConfig):
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when
     fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
     launches (useful for debugging)."""
+
+    inference_flashinfer_mxfp8_token_capacity: int | None = None
+    """Optional fixed token-row capacity for FlashInfer routed MXFP8 MoE.
+
+    Decode-only dynamic-inference graphs use this fixed prefix when their
+    host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
+    and oversized decode graphs retain the full dispatcher buffer. Requires
+    the NVLS inference dispatcher and EP > 1.
+    """
 
     inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
     """Token dispatcher to use for MoE expert parallelism during inference.
@@ -1447,18 +1464,28 @@ class TransformerConfig(ModelParallelConfig):
     insert these joins. This feature is particularly useful when using with full-iteration CUDA
     graphs"""
 
+    @classmethod
+    def from_config(cls, config: "TransformerConfig") -> Self:
+        """Create this config type from an existing normalized transformer config.
+
+        The source config's complete instance state is deep-copied without invoking
+        the target class's initializer or ``__post_init__``. This preserves normalized
+        values and dynamically added attributes while producing an independent config.
+
+        Args:
+            config: The transformer config to copy.
+
+        Returns:
+            An independent copy of ``config`` whose type is ``cls``.
+        """
+        new_config = cls.__new__(cls)
+        new_config.__dict__ = deepcopy(config.__dict__, {id(config): new_config})
+        return new_config
+
     def _validate_cp_layouts(self) -> None:
         """Validate context-parallel layout settings."""
-        if self.linear_cp_layout not in ("contiguous", "zigzag"):
-            raise ValueError(
-                "linear_cp_layout must be either 'contiguous' or 'zigzag', "
-                f"got {self.linear_cp_layout!r}"
-            )
-        if self.attention_cp_layout not in ("contiguous", "zigzag"):
-            raise ValueError(
-                "attention_cp_layout must be either 'contiguous' or 'zigzag', "
-                f"got {self.attention_cp_layout!r}"
-            )
+        if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
+            raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
         if self.context_parallel_size > 1 and self.attention_cp_layout == "contiguous":
             raise ValueError(
                 "attention_cp_layout='contiguous' is not yet supported with context parallelism."
@@ -1703,6 +1730,7 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 
         if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
+            mxfp8_enabled = bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8
             if self.expert_tensor_parallel_size > 1:
                 raise ValueError(
                     "Inference-optimized MoE layers does not support expert tensor parallelism."
@@ -1732,7 +1760,7 @@ class TransformerConfig(ModelParallelConfig):
                     f"got '{self.inference_grouped_gemm_backend}'."
                 )
 
-            if self.fp8 == "mxfp8":
+            if mxfp8_enabled:
                 if not self.fp8_param:
                     raise ValueError(
                         "fp8_param must be enabled when using "
@@ -1751,22 +1779,44 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if (
-                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
-                and self.fp8 == "mxfp8"
-            ):
-                raise ValueError(
-                    "FlashInfer is not compatible with MXFP8 quantization. "
-                    "Set inference_grouped_gemm_backend to 'torch'."
-                )
-
-            if (
                 self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
-                and self.fp8 == "mxfp8"
+                and mxfp8_enabled
             ):
                 raise ValueError(
                     "vLLM Triton fused MoE only supports BF16. "
                     "Set inference_grouped_gemm_backend to 'torch' for MXFP8."
                 )
+
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                and mxfp8_enabled
+                and (self.gated_linear_unit or self.activation_func != squared_relu)
+            ):
+                raise ValueError(
+                    "FlashInfer routed MXFP8 MoE currently supports only non-gated "
+                    "squared-ReLU experts. Set activation_func=squared_relu and "
+                    "gated_linear_unit=False, or select inference_grouped_gemm_backend='torch'."
+                )
+
+            if self.inference_flashinfer_mxfp8_token_capacity is not None:
+                if self.inference_flashinfer_mxfp8_token_capacity <= 0:
+                    raise ValueError(
+                        "inference_flashinfer_mxfp8_token_capacity must be > 0, got "
+                        f"{self.inference_flashinfer_mxfp8_token_capacity}"
+                    )
+                if (
+                    self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
+                    or not mxfp8_enabled
+                    or self.inference_moe_token_dispatcher_type != "nvls"
+                    or self.expert_model_parallel_size <= 1
+                ):
+                    raise ValueError(
+                        "inference_flashinfer_mxfp8_token_capacity requires "
+                        "inference_grouped_gemm_backend='flashinfer', FP8 enabled with "
+                        "fp8_recipe='mxfp8', "
+                        "inference_moe_token_dispatcher_type='nvls' and "
+                        "expert_model_parallel_size > 1"
+                    )
 
             if self.batch_invariant_mode:
                 if self.inference_grouped_gemm_backend not in (
