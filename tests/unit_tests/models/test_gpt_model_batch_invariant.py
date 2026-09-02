@@ -352,3 +352,151 @@ class TestGPTModelBatchInvariant:
             assert r1.generated_tokens == r2.generated_tokens
             assert r1.prompt_log_probs == r2.prompt_log_probs
             assert r1.generated_log_probs == r2.generated_log_probs
+
+    def test_dynamic_engine_is_batch_invariant_under_kv_cache_saturation(self):
+        """Saturating the KV cache must not change what requests generate.
+
+        Under memory pressure the engine queues requests it cannot admit, pauses
+        active ones when the block pool cannot grow them, and evicts whatever
+        overflows the paused-retention budget. An evicted request is requeued and
+        re-prefilled from a checkpoint of the tokens it had already produced. That
+        reshuffles which requests share a step, how wide each decode batch is, and
+        whether a step is pure-decode or mixed with a prefill -- so it leaves the
+        output untouched only if the model is genuinely batch invariant.
+
+        The other KV-pressure tests assert bookkeeping: budgets respected, blocks
+        returned, output lengths correct. A request that resumes from a corrupted
+        KV history passes every one of those and still generates the wrong text.
+        This pins the property the bookkeeping is a proxy for -- the same requests,
+        run once with room to spare and once against a pool far too small to hold
+        them, produce identical tokens and identical logprobs.
+
+        The comparison is not vacuous: run with this exact schedule but without
+        batch-invariant kernels, one of these eight requests diverges from the
+        reference partway through its output.
+        """
+        _configure_flash_attention_env()
+        seq_len = 1024
+        vocab_size = 96
+        # FlashAttention's paged KV cache requires a block size divisible by 256, so
+        # this cannot be shrunk the way the non-paged tests above shrink theirs.
+        block_size_tokens = 256
+        num_requests = 8
+        num_tokens_to_generate = 64
+
+        base_model = _build_flash_attn_bik_model(seq_len, vocab_size)
+        inference_model = Float16Module(base_model.config, base_model).cuda().eval()
+        tokenizer = DummyTokenizer(vocab_size=vocab_size, bos=None, eod=vocab_size - 1, pad=0)
+
+        # A request only pauses when it needs a *fresh* block while the pool is full,
+        # so every prompt is sized to land just below a block boundary: each one fits
+        # its prompt exactly, then crosses into a new block a few decode steps in.
+        # Lengths are uneven so they cross on different steps rather than in lockstep.
+        # Prompts comfortably inside their last block never pause at all, however
+        # small the pool -- the engine simply admits fewer of them at a time.
+        lengths = [250, 500, 250, 754, 500, 246, 760, 252]
+        prompts = [
+            [(3 + 12 * request_index + i) % (vocab_size - 1) for i in range(length)]
+            for request_index, length in enumerate(lengths)
+        ]
+
+        # termination_id=-1 runs every request to its full output length, so requests
+        # keep contending for the pool instead of retiring early and relieving it.
+        sampling_params = SamplingParams(
+            num_tokens_to_generate=num_tokens_to_generate,
+            temperature=1.0,
+            top_k=1,
+            top_p=0.0,
+            add_BOS=False,
+            return_log_probs=True,
+            termination_id=-1,
+        )
+
+        def _build_context(buffer_size_gb, paused_buffer_size_gb):
+            return DynamicInferenceContext(
+                model_config=base_model.config,
+                inference_config=InferenceConfig(
+                    max_sequence_length=seq_len,
+                    buffer_size_gb=buffer_size_gb,
+                    paused_buffer_size_gb=paused_buffer_size_gb,
+                    block_size_tokens=block_size_tokens,
+                    max_requests=num_requests,
+                    num_cuda_graphs=None,
+                    materialize_only_last_token_logits=False,
+                    use_cuda_graphs_for_non_decode_steps=False,
+                    unified_memory_level=0,
+                ),
+            )
+
+        def _run(ctx):
+            wrapper = GPTInferenceWrapper(inference_model, ctx)
+            controller = TextGenerationController(wrapper, tokenizer)
+            engine = DynamicInferenceEngine(controller=controller, context=ctx)
+            allocator = ctx.kv_block_allocator
+
+            finished_by_id = {}
+            max_paused_blocks = 0
+            with set_batch_invariant_mode(True):
+                for request_id, prompt in enumerate(prompts, start=1):
+                    engine.add_request(request_id, prompt, sampling_params)
+                # Bounded so a scheduling regression fails the test instead of hanging.
+                for _ in range(2000):
+                    if not engine.has_unfinished_requests():
+                        break
+                    result = engine.step_modern()
+                    # Sampled at a step boundary, after the pause/resume/evict
+                    # lifecycle for this step has settled.
+                    max_paused_blocks = max(max_paused_blocks, allocator.get_paused_used())
+                    for record in result["finished_request_records"]:
+                        req = record.merge(engine.controller.tokenizer)
+                        finished_by_id[req.request_id] = req
+
+            assert not engine.has_unfinished_requests(), "engine did not drain"
+            assert len(finished_by_id) == num_requests
+            # No block may be leaked, in either regime.
+            assert allocator.get_total_used() == 0
+            return finished_by_id, max_paused_blocks, engine.evicted_request_count
+
+        # Reference: a pool with room for every request at once, so nothing ever
+        # queues, pauses, or is evicted. This is the regime every other dynamic
+        # inference test runs in.
+        roomy_ctx = _build_context(buffer_size_gb=0.125, paused_buffer_size_gb=None)
+        block_size_bytes = roomy_ctx.block_size_bytes
+        reference, roomy_paused_blocks, roomy_evictions = _run(roomy_ctx)
+
+        # Sizing in whole blocks (+1 byte to survive the float GB round trip) keeps
+        # the pool arithmetic exact. Holding every request resident to completion
+        # needs 22 blocks; 10 forces sustained queuing and pausing, while still being
+        # wider than the 4 blocks the longest single request needs, so no request can
+        # deadlock waiting for capacity that will never exist. The 3-block paused
+        # budget is smaller than what the paused set wants, so some requests are
+        # retained paused and the overflow is evicted and requeued.
+        saturated_ctx = _build_context(
+            buffer_size_gb=(10 * block_size_bytes + 1) / 1024**3,
+            paused_buffer_size_gb=(3 * block_size_bytes + 1) / 1024**3,
+        )
+        assert saturated_ctx.kv_block_allocator.pool_size == 10
+        assert saturated_ctx.kv_block_allocator.paused_limit == 3
+        saturated, saturated_paused_blocks, saturated_evictions = _run(saturated_ctx)
+
+        # Pin the contrast, so neither half can silently drift into the other's
+        # regime and make the comparison below vacuous.
+        assert roomy_paused_blocks == 0 and roomy_evictions == 0, (
+            "the reference run was supposed to have room to spare, but it paused "
+            f"({roomy_paused_blocks} blocks) or evicted ({roomy_evictions} requests)"
+        )
+        assert saturated_paused_blocks > 0, "no request was ever retained paused"
+        assert saturated_evictions > 0, "no request overflowed the paused budget"
+
+        # The actual claim: pause, evict and requeue are transparent to the output.
+        assert set(reference) == set(saturated)
+        for request_id, expected in reference.items():
+            actual = saturated[request_id]
+            assert actual.prompt_tokens.tolist() == expected.prompt_tokens.tolist()
+            assert (
+                actual.generated_tokens == expected.generated_tokens
+            ), f"request {request_id} generated different tokens once the KV cache saturated"
+            assert actual.prompt_log_probs == expected.prompt_log_probs
+            assert (
+                actual.generated_log_probs == expected.generated_log_probs
+            ), f"request {request_id} generated different logprobs once the KV cache saturated"

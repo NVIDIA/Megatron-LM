@@ -3,6 +3,7 @@
 import pytest
 
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 
 
 def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
@@ -45,6 +46,44 @@ def test_batch_invariant_backend_rejects_unknown_value_at_construction():
         )
 
 
+def test_mhc_fused_backend_defaults_to_auto():
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+
+    assert config.mhc_fused_backend == "auto"
+
+
+@pytest.mark.parametrize("backend", ["native", "triton", "cutile"])
+def test_mhc_fused_backend_accepts_explicit_policy(backend: str):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        enable_mhc_connections=True,
+        use_fused_mhc=True,
+        mhc_fused_backend=backend,
+    )
+
+    assert config.mhc_fused_backend == backend
+
+
+def test_mhc_fused_backend_rejects_unknown_value_at_construction():
+    with pytest.raises(ValueError, match="Unknown mhc_fused_backend"):
+        TransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=4, mhc_fused_backend="cuda"
+        )
+
+
+def test_explicit_mhc_fused_backend_requires_fused_mhc():
+    with pytest.raises(ValueError, match="requires use_fused_mhc"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            mhc_fused_backend="native",
+        )
+
+
 def test_gdp_num_householder_defaults_to_three():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 
@@ -57,6 +96,32 @@ def test_gdp_num_householder_accepts_positive_values():
     )
 
     assert config.gdp_num_householder == 5
+
+
+def test_from_config_creates_independent_target_config_without_reinitializing():
+    class LayerConfig(TransformerConfig):
+
+        def __post_init__(self):
+            raise AssertionError("from_config must not reinitialize the target config")
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    config.dynamic_value = {"items": []}
+    config.dynamic_alias = config.dynamic_value
+    config.self_reference = config
+    config.state_reference = config.__dict__
+
+    layer_config = LayerConfig.from_config(config)
+
+    assert type(layer_config) is LayerConfig
+    assert vars(layer_config).keys() == vars(config).keys()
+    assert layer_config.dynamic_value == config.dynamic_value
+    assert layer_config.dynamic_value is not config.dynamic_value
+    assert layer_config.dynamic_alias is layer_config.dynamic_value
+    assert layer_config.self_reference is layer_config
+    assert layer_config.state_reference is layer_config.__dict__
+
+    layer_config.dynamic_value["items"].append("changed")
+    assert config.dynamic_value == {"items": []}
 
 
 @pytest.mark.parametrize("num_householder", [0, -1])
@@ -122,3 +187,53 @@ def test_mxfp8_wire_dtypes_reject_non_ncclep_dispatcher(overrides):
 def test_mxfp8_wire_dtypes_require_op_fuser_grouped_gemm(overrides):
     with pytest.raises(ValueError, match="require BOTH"):
         _make_mxfp8_wire_config(**overrides)
+
+
+requires_te_2_9 = pytest.mark.skipif(
+    not is_te_min_version("2.9.0"), reason="sequence packing requires Transformer Engine >= 2.9.0"
+)
+
+
+def _make_packing_config(**kwargs) -> TransformerConfig:
+    defaults = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=4096,
+    )
+    defaults.update(kwargs)
+    return TransformerConfig(**defaults)
+
+
+@requires_te_2_9
+def test_sequence_packing_dense_config_passes():
+    # Dense models have no MoE dispatcher; the (unused) allgather default
+    # must not fail sequence-packing validation.
+    config = _make_packing_config()
+    assert config.variable_seq_lengths is True
+
+
+@requires_te_2_9
+def test_sequence_packing_moe_requires_alltoall_dispatcher():
+    # The general allgather-vs-variable_seq_lengths check fires first, since
+    # sequence packing derives variable_seq_lengths=True.
+    with pytest.raises(ValueError, match="alltoall"):
+        _make_packing_config(num_moe_experts=2, moe_token_dispatcher_type="allgather")
+
+
+@requires_te_2_9
+def test_sequence_packing_moe_alltoall_dispatcher_passes():
+    config = _make_packing_config(num_moe_experts=2, moe_token_dispatcher_type="alltoall")
+    assert config.variable_seq_lengths is True
+
+
+def test_sequence_packing_rejects_unknown_scheduler():
+    # Raised by ModelParallelConfig.__post_init__ before any TE check runs.
+    with pytest.raises(ValueError, match="Unsupported scheduler"):
+        _make_packing_config(sequence_packing_scheduler="bogus")
+
+
+def test_sequence_packing_requires_max_seqlen_per_dp_cp_rank():
+    with pytest.raises(ValueError, match="max_seqlen_per_dp_cp_rank"):
+        _make_packing_config(max_seqlen_per_dp_cp_rank=None)
