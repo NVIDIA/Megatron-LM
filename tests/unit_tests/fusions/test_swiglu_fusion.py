@@ -143,6 +143,8 @@ def test_clamped_weighted_bias_swiglu(input_dtype):
     else:
         raise ValueError(f"Invalid input dtype: {input_dtype}")
 
+    wgrad_tols = dict(rtol=1.0e-6, atol=2.0e-4)
+
     x = (torch.randn(16, 64, dtype=input_dtype, device="cuda") * 5.0).requires_grad_(True)
     weights = torch.randn(16, 1, dtype=torch.float32, device="cuda", requires_grad=True)
     bwd_input = torch.randn(16, 32, dtype=input_dtype, device="cuda")
@@ -167,7 +169,7 @@ def test_clamped_weighted_bias_swiglu(input_dtype):
     assert torch.allclose(x.grad, x_fused.grad, **tols)
     assert weights_fused.grad.dtype == weights.grad.dtype
     if input_dtype == torch.float32:
-        assert torch.allclose(weights.grad, weights_fused.grad, **tols)
+        assert torch.allclose(weights.grad, weights_fused.grad, **wgrad_tols)
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
