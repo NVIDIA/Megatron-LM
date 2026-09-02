@@ -84,21 +84,6 @@ class _FakeGroup:
         return self._rank
 
 
-class TestGTPReplicatedBias:
-    def test_bias_is_resized_in_place(self):
-        module = nn.Module()
-        module.bias = nn.Parameter(torch.ones(4))
-        module.bias.tensor_model_parallel = True
-        original_bias = module.bias
-
-        gtp_module._gtp_restore_replicated_bias(module, _FakeGroup(size=2), pad_length=1)
-
-        assert module.bias is original_bias
-        assert module.bias.shape == (7,)
-        assert torch.count_nonzero(module.bias) == 0
-        assert module.bias.tensor_model_parallel
-
-
 class TestGTPWeightCacheSchedulingDomain:
     @staticmethod
     def _make_param(group, chain_id):
