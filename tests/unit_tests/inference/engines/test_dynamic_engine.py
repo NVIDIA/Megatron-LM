@@ -28,6 +28,7 @@ from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
+    PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
@@ -354,8 +355,9 @@ class DynamicEngineTestConfig:
     # linear decode-only graphs). Tests that assert on exact token counts can pin a
     # single distribution here.
     cuda_graph_sizing_distribution: CudaGraphSizingDistribution = CudaGraphSizingDistribution.HYBRID
+    cuda_graph_mixed_prefill_count: Optional[int] = 16
+    cuda_graph_max_tokens: int = 512
     fp8: bool = False
-    hidden_size: Optional[int] = None
     model_provider: str = "gpt"
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
     # "gdn"). Ignored unless model_provider == "hybrid": all three build a
@@ -368,6 +370,9 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     enable_prefix_caching: bool = False
+    prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
+        PrefixCachingEvictionPolicy.REF_ZERO
+    )
     cuda_graph_modules: List[CudaGraphModule] = field(default_factory=list)
     inference_cuda_graph_scope: InferenceCudaGraphScope = InferenceCudaGraphScope.block
     cuda_graph_impl: Optional[str] = None
@@ -390,8 +395,8 @@ class DynamicEngineTestConfig:
     temperature: float = 1.0
     top_k: int = 0
     top_p: float = 0.0
+    offset_sampling_seed_by_dp_rank: bool = True
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.ASYNC
-    inference_config_overrides: Dict[str, object] = field(default_factory=dict)
     # Sliding-window attention config. When `window_size` is None, SWA is
     # disabled and all layers do full causal attention. When set to a
     # `(left, right)` tuple, layers selected by `window_attn_skip_freq` use a
@@ -526,43 +531,43 @@ class DynamicInferenceEngineTestBase:
     ):
         """The inference context manages the KV cache and other inference state."""
 
-        inference_config_kwargs = dict(
-            max_sequence_length=test_config.max_sequence_length,
-            num_cuda_graphs=test_config.num_cuda_graphs,
-            use_cuda_graphs_for_non_decode_steps=(test_config.use_cuda_graphs_for_non_decode_steps),
-            cuda_graph_all_prefills=test_config.cuda_graph_all_prefills,
-            cuda_graph_sizing_distribution=test_config.cuda_graph_sizing_distribution,
-            buffer_size_gb=test_config.context_buffer_size_gb,
-            paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
-            block_size_tokens=test_config.context_block_size_tokens,
-            max_requests=test_config.context_max_requests,
-            max_tokens=test_config.context_max_tokens,
-            mamba_inference_state_config=mamba_inference_state_config,
-            materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
-            kv_cache_management_mode=KVCacheManagementMode(test_config.kv_cache_management_mode),
-            static_kv_memory_pointers=test_config.static_kv_memory_pointers,
-            enable_chunked_prefill=test_config.enable_chunked_prefill,
-            enable_prefix_caching=test_config.enable_prefix_caching,
-            use_flashinfer_fused_rope=None,  # default to using flash-infer if available
-            # this is for compatibility with the LTS environment
-            unified_memory_level=0,  # unit tests currently broken with UVM
-            track_generated_token_events=test_config.track_generated_token_events,
-            num_speculative_tokens=test_config.num_speculative_tokens,
-            sampling_backend=test_config.sampling_backend,
-            async_sched_mode=test_config.async_sched_mode,
-            logprobs_mode=test_config.logprobs_mode,
-        )
-        unknown_overrides = set(test_config.inference_config_overrides) - set(
-            InferenceConfig.__annotations__
-        )
-        if unknown_overrides:
-            raise ValueError(f"Unknown InferenceConfig overrides: {sorted(unknown_overrides)}")
-        inference_config_kwargs.update(test_config.inference_config_overrides)
-
         # Inference context.
         context = DynamicInferenceContext(
             model_config=transformer_config,
-            inference_config=InferenceConfig(**inference_config_kwargs),
+            inference_config=InferenceConfig(
+                max_sequence_length=test_config.max_sequence_length,
+                num_cuda_graphs=test_config.num_cuda_graphs,
+                cuda_graph_mixed_prefill_count=test_config.cuda_graph_mixed_prefill_count,
+                cuda_graph_sizing_distribution=test_config.cuda_graph_sizing_distribution,
+                cuda_graph_max_tokens=test_config.cuda_graph_max_tokens,
+                use_cuda_graphs_for_non_decode_steps=(
+                    test_config.use_cuda_graphs_for_non_decode_steps
+                ),
+                cuda_graph_all_prefills=test_config.cuda_graph_all_prefills,
+                buffer_size_gb=test_config.context_buffer_size_gb,
+                paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
+                block_size_tokens=test_config.context_block_size_tokens,
+                max_requests=test_config.context_max_requests,
+                max_tokens=test_config.context_max_tokens,
+                mamba_inference_state_config=mamba_inference_state_config,
+                materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
+                kv_cache_management_mode=KVCacheManagementMode(
+                    test_config.kv_cache_management_mode
+                ),
+                static_kv_memory_pointers=test_config.static_kv_memory_pointers,
+                enable_chunked_prefill=test_config.enable_chunked_prefill,
+                enable_prefix_caching=test_config.enable_prefix_caching,
+                prefix_caching_eviction_policy=test_config.prefix_caching_eviction_policy,
+                use_flashinfer_fused_rope=None,  # default to using flash-infer if available
+                # this is for compatibility with the LTS environment
+                unified_memory_level=0,  # unit tests currently broken with UVM
+                track_generated_token_events=test_config.track_generated_token_events,
+                num_speculative_tokens=test_config.num_speculative_tokens,
+                sampling_backend=test_config.sampling_backend,
+                offset_sampling_seed_by_dp_rank=test_config.offset_sampling_seed_by_dp_rank,
+                async_sched_mode=test_config.async_sched_mode,
+                logprobs_mode=test_config.logprobs_mode,
+            ),
         )
 
         return context
@@ -599,11 +604,7 @@ class DynamicInferenceEngineTestBase:
                 params_dtype=torch.bfloat16,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
-                hidden_size=(
-                    test_config.hidden_size
-                    if test_config.hidden_size is not None
-                    else (128 if test_config.fp8 else 32)
-                ),
+                hidden_size=128 if test_config.fp8 else 32,
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 cuda_graph_impl=effective_cuda_graph_impl,
