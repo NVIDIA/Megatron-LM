@@ -801,7 +801,9 @@ class _CudagraphGlobalRecord:
         if has_te_modules:
             te_set_capture_end()
 
-        torch.cuda.set_stream(torch.cuda.default_stream())
+        default_stream = torch.cuda.default_stream()
+        default_stream.wait_stream(torch.cuda.current_stream())
+        torch.cuda.set_stream(default_stream)
 
         # Return capture time and memory usage.
         return capture_stats
