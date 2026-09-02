@@ -1432,6 +1432,11 @@ def run_fused_qk_topk_with_loss(
             use_local_indexer_varlen, packed_seq_params, single_packed_thd_sequence, cp_size
         )
     )
+    # The kpool indexer path (index_kpool > 1) computes weights in fp32 for
+    # numerical accuracy, but the cuDNN bf16 indexer kernel requires bfloat16.
+    # Cast to match q's dtype (always bf16 under get_fp8_disabled_context).
+    if weights.dtype != q.dtype:
+        weights = weights.to(dtype=q.dtype)
     return FusedQKTopKWithSparseLossFunc.apply(
         q.contiguous(),
         k.contiguous(),
