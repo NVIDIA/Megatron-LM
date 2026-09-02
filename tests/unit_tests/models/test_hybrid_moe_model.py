@@ -33,6 +33,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "activation_func": "megatron.core.activations.squared_relu",
     "activation_func_clamp_value": None,
     "activation_func_fp8_input_store": False,
+    "activation_func_linear_clamp_scale": None,
+    "activation_func_tanh_clamp_scale": None,
     "add_bias_linear": False,
     "add_qkv_bias": False,
     "apply_query_key_layer_scaling": False,
