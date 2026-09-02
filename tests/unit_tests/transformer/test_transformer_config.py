@@ -93,6 +93,12 @@ def test_replica_hybridep_allows_moe_cuda_graph_without_drop_padding():
     assert config.grad_reduce_in_bf16 is False
 
 
+@pytest.mark.parametrize("scope", ["moe_router", "moe_preprocess"])
+def test_replica_hybridep_rejects_partial_moe_cuda_graph_scopes(scope):
+    with pytest.raises(AssertionError, match="moe CUDA graph scope only"):
+        _make_replica_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=[scope])
+
+
 def test_replica_hybridep_rejects_single_grouped_weight():
     with pytest.raises(ValueError, match="moe_single_grouped_weight=False"):
         _make_replica_hybridep_config(moe_single_grouped_weight=True)
