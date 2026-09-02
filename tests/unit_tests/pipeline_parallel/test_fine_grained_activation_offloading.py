@@ -16,6 +16,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
+    is_checkpoint_without_output_tensor,
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.enums import AttnBackend
@@ -77,6 +78,47 @@ def test_chunk_offload_handler_respects_tensor_opt_out_flags():
 
     tensor._TE_do_not_offload = True
     assert not handler.tensor_need_offloading_checker(tensor)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_chunk_offload_handler_handles_storage_less_tensor_wrapper():
+    """TE-style wrapper tensors must reach their opt-out without requiring storage."""
+
+    data_tensor = torch.empty(1, device="cuda")
+    data_tensor._TE_do_not_offload = True
+
+    class StorageLessTensor(torch.Tensor):
+        """Minimal TE-style tensor wrapper without backing storage."""
+
+        @staticmethod
+        def __new__(cls):
+            return torch.Tensor._make_wrapper_subclass(
+                cls,
+                (1024,),
+                strides=(1,),
+                storage_offset=0,
+                dtype=torch.float32,
+                layout=torch.strided,
+                device="cuda",
+                requires_grad=False,
+            )
+
+        @classmethod
+        def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+            raise NotImplementedError
+
+        def get_data_tensors(self):
+            """Return the backing tensor inspected by TE's offload opt-out."""
+            return [data_tensor]
+
+        def untyped_storage(self):
+            raise RuntimeError("StorageLessTensor has no backing storage")
+
+    handler = _make_chunk_handler_for_offload_checker()
+    tensor = StorageLessTensor()
+
+    assert not handler.tensor_need_offloading_checker(tensor)
+    assert not is_checkpoint_without_output_tensor(tensor)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")

@@ -66,15 +66,28 @@ _share_storage_ext = None
 _CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR = "_mcore_checkpoint_without_output"
 
 
+def _get_checkpoint_without_output_storage(
+    tensor: torch.Tensor,
+) -> torch.UntypedStorage | None:
+    """Return a tensor's storage, or None for storage-less tensor subclasses."""
+    try:
+        return tensor.untyped_storage()
+    except (AttributeError, NotImplementedError, RuntimeError):
+        return None
+
+
 def _mark_checkpoint_without_output_tensor(tensor: torch.Tensor) -> None:
     """Mark a tensor's storage as owned by CheckpointWithoutOutput."""
-    setattr(tensor.untyped_storage(), _CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR, True)
+    storage = _get_checkpoint_without_output_storage(tensor)
+    if storage is not None:
+        setattr(storage, _CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR, True)
 
 
 def is_checkpoint_without_output_tensor(tensor: torch.Tensor) -> bool:
     """Return whether a tensor aliases a CheckpointWithoutOutput output storage."""
-    return bool(
-        getattr(tensor.untyped_storage(), _CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR, False)
+    storage = _get_checkpoint_without_output_storage(tensor)
+    return storage is not None and bool(
+        getattr(storage, _CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR, False)
     )
 
 
