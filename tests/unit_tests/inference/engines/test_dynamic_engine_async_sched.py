@@ -1441,6 +1441,8 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
                     env.engine.controller._async_sched_logits.is_valid
                 )
                 env.engine.resume()
+                for request_id in env.engine.resume_request_ids:
+                    env.requests[request_id] = env.engine.get_request(request_id)
                 runtime["pending-after-resume"] += int(
                     env.engine.controller._async_sched_logits.is_valid
                 )
@@ -1978,6 +1980,8 @@ def test_async_reset_clears_pending_logits():
     engine.controller = _controller_with_pending_logits()
     engine.num_speculative_tokens = 1
     engine._loop = None
+    engine._vision_embedding_cache = {}
+    engine._vision_embedding_cache_bytes = 0
 
     with (
         mock.patch(
@@ -2018,6 +2022,8 @@ def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
     engine.waiting_request_ids = deque()
     engine.requests = {}
     engine.use_coordinator = False
+    engine._vision_embedding_cache = {}
+    engine._vision_embedding_cache_bytes = 0
 
     with (
         mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
