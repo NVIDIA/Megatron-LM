@@ -1236,12 +1236,12 @@ class _ReplicaWaitGradReduce(torch.autograd.Function):
         return grad_hidden_states, *autograd_grads, None, None
 
 
-def start_replica_weight_prefetch_before_combine_backward(
-    combined_hidden: torch.Tensor, bridge: ReplicaWeightBridge, plan: ReplicaPlan
+def start_replica_weight_prefetch_before_layer_backward(
+    layer_output: torch.Tensor, bridge: ReplicaWeightBridge, plan: ReplicaPlan
 ) -> torch.Tensor:
-    """Start weight communication before transport-combine backward."""
+    """Start weight communication as soon as the MoE layer's backward begins."""
     return _ReplicaBackwardHook.apply(
-        combined_hidden, functools.partial(bridge.start_prefetch, plan, _WeightDirection.BACKWARD)
+        layer_output, functools.partial(bridge.start_prefetch, plan, _WeightDirection.BACKWARD)
     )
 
 

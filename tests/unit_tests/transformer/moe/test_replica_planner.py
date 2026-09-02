@@ -20,7 +20,7 @@ from megatron.core.transformer.moe.replica_planner import (
     _WeightDirection,
     map_replica_plan_to_hybridep,
     start_replica_grad_reduce_after_expert_backward,
-    start_replica_weight_prefetch_before_combine_backward,
+    start_replica_weight_prefetch_before_layer_backward,
     wait_replica_grad_reduce_after_dispatch_backward,
     wait_replica_weight_prefetch_before_expert_backward,
 )
@@ -198,11 +198,13 @@ def test_replica_async_collectives_span_transport_backward():
     hidden = BackwardMarker.apply(hidden, "expert_backward")
     hidden = wait_replica_weight_prefetch_before_expert_backward(hidden, bridge, plan)
     hidden = BackwardMarker.apply(hidden, "combine_backward")
-    hidden = start_replica_weight_prefetch_before_combine_backward(hidden, bridge, plan)
+    hidden = BackwardMarker.apply(hidden, "latent_up_projection_backward")
+    hidden = start_replica_weight_prefetch_before_layer_backward(hidden, bridge, plan)
     hidden.backward()
 
     assert events == [
         "start_prefetch",
+        "latent_up_projection_backward",
         "combine_backward",
         "wait_prefetch",
         "expert_backward",
