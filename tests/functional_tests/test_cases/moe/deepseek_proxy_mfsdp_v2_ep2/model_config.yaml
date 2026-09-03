@@ -1,12 +1,12 @@
 # DeepSeek-style proxy: 8 layers — 3 dense, Rest MoE with expert parallelism 2.
 # Used for functional testing of dense+MoE hybrid and EP on Megatron-FSDP v2.
 ENV_VARS:
-  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  # Golden values come from Megatron-FSDP v1, a different implementation, so
+  # they're only approximately equal to v2's output.
   NON_DETERMINSTIC_RESULTS: 1
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   NCCL_NVLS_ENABLE: 0
   NCCL_DEBUG: VERSION
-  NCCL_ALGO: Ring
 MODEL_ARGS:
   # Precision
   --bf16: true
