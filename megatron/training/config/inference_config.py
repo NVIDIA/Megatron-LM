@@ -138,9 +138,8 @@ class InferenceSetupConfig:
     "torch" with a warning if the flashinfer package is not installed."""
 
     offset_sampling_seed_by_dp_rank: bool = True
-    """Offset the inference sampling seed by the data-parallel replica rank so each replica gets
-    a unique generation seed. MoE models use the expert-data-parallel rank so expert shards stay
-    synchronized. Disable with --use-same-sampling-seed-across-dp-ranks. Also forced off when
+    """Offset the inference sampling seed by the data-parallel rank so each DP rank gets a unique
+    generation seed. Disable with --use-same-sampling-seed-across-dp-ranks. Also forced off when
     --deterministic-mode is enabled."""
 
     inference_dynamic_batching_async_sched_mode: Literal["async", "legacy"] = "async"

@@ -1838,18 +1838,6 @@ class _AsyncPairwiseHarness(_DynamicInferenceEngineTestBase):
         if "moe" in signals:
             assert model_config.num_moe_experts is not None
             assert context._nccl_ep_dispatcher
-            expert_dp_group = parallel_state.get_expert_data_parallel_group()
-            expected_seed = model_config.inference_sampling_seed + torch.distributed.get_rank(
-                group=expert_dp_group
-            )
-            assert controller.sampling_rng.initial_seed() == expected_seed
-            seed = torch.tensor(expected_seed, dtype=torch.int64, device="cuda")
-            ep_group = parallel_state.get_expert_model_parallel_group()
-            ep_seeds = [
-                torch.empty_like(seed) for _ in range(torch.distributed.get_world_size(ep_group))
-            ]
-            torch.distributed.all_gather(ep_seeds, seed, group=ep_group)
-            assert all(peer.item() == expected_seed for peer in ep_seeds)
             # Inference MoE may dispatch through split execution helpers that
             # bypass nn.Module forward hooks. The live dispatcher calls below
             # are the feature-owning runtime boundary.

@@ -247,9 +247,9 @@ class TextGenerationController:
         else:
             self.vocab_size = unwrapped_model.vocab_size
 
-        # Build and seed sampling RNG. Optionally offset by replica rank so each replica gets
-        # a unique generation seed (avoids identical samples when the same prompt is assigned
-        # to multiple replicas, which can corrupt RL training). Controlled by
+        # Build and seed sampling RNG. Optionally offset by DP rank so each rank gets a
+        # unique generation seed (avoids identical samples when the same prompt is
+        # assigned to multiple DP ranks, which can corrupt RL training). Controlled by
         # InferenceConfig.offset_sampling_seed_by_dp_rank, but deactivated when enabling
         # --deterministic-mode (model_config.deterministic_mode).
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
@@ -259,18 +259,7 @@ class TextGenerationController:
             and not self.model_config.deterministic_mode
         )
         if offset_by_dp:
-            sampling_dp_group = self.dp_group
-            if self.model_config.expert_model_parallel_size > 1:
-                # Dense DP folds EP shards into its rank space. Expert DP instead gives every
-                # shard of one MoE replica the same rank, so they sample the same token.
-                sampling_dp_group = (
-                    pg_collection.expt_dp
-                    if pg_collection is not None
-                    # MPU compatibility path for callers without a process-group collection.
-                    else parallel_state.get_expert_data_parallel_group()
-                )
-                assert sampling_dp_group is not None, "MoE sampling requires an expert DP group."
-            seed += torch.distributed.get_rank(group=sampling_dp_group)
+            seed += torch.distributed.get_rank(group=self.dp_group)
         self.sampling_rng.manual_seed(seed)
 
         if not self.num_speculative_tokens:
