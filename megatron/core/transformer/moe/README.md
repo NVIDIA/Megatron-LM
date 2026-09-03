@@ -513,14 +513,14 @@ gradient_accumulation_fusion: true
 moe_shared_expert_intermediate_size: 3072
 moe_megakernel_backend: mok
 moe_megakernel_backend_config:
-  mok_fwd_num_comm_sms: 40
-  mok_bwd_num_comm_sms: 28
+  fwd_num_comm_sms: 40
+  bwd_num_comm_sms: 28
 ```
 
 The equivalent backend-specific CLI value is a JSON object:
 
 ```bash
---moe-megakernel-backend mok --moe-megakernel-backend-config '{"mok_fwd_num_comm_sms": 40, "mok_bwd_num_comm_sms": 28}'
+--moe-megakernel-backend mok --moe-megakernel-backend-config '{"fwd_num_comm_sms": 40, "bwd_num_comm_sms": 28}'
 ```
 
 This integration targets the

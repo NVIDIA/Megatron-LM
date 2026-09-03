@@ -809,8 +809,8 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_megakernel_backend_config: Optional[dict] = None
     """Backend options for moe_megakernel_backend.
-    Every key must use the selected backend's prefix, for example,
-    mok_fwd_num_comm_sms for the MOK backend.
+
+    For example, ``fwd_num_comm_sms`` is a valid MOK backend option.
     """
 
     moe_layer_freq: Union[int, List[int]] = 1
