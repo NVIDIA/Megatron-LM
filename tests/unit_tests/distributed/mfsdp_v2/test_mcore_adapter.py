@@ -8,12 +8,20 @@ from dataclasses import replace
 
 import pytest
 import torch
+import transformer_engine.pytorch as te
+from torch.distributed import DeviceMesh
 from torch.distributed.distributed_c10d import _world
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
+import megatron.core.models.common.fine_grained_mfsdp_scheduler as mfsdp_scheduler
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    Placements,
+    fully_shard,
+    fully_shard_context,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -180,6 +188,207 @@ class TestMcoreAdapterDense:
         assert child_parameter_names
         assert root_parameter_names == {"1.weight", "1.bias"}
 
+    def test_fine_grained_hooks_run_for_direct_submodule(self, monkeypatch):
+        """Fine-grained hooks gather and finalize the owning FSDP unit once."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        mesh = DeviceMesh.from_group(
+            self.pg_collection.dp_cp, device_type=device.type, mesh_dim_names=("dp",)
+        )
+        placements = Placements(
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        )
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False)).to(device)
+        module_names = tuple(name for name, _ in model.named_modules())
+
+        with fully_shard_context(device=device, custom_schedule=True):
+            fully_shard(model, mesh=mesh, placements=placements)
+
+        mfsdp_scheduler.setup_combined_1f1b_hooks(model)
+        assert mfsdp_scheduler._get_owning_fsdp_module(model[0]) is model
+        assert tuple(name for name, _ in model.named_modules()) == module_names
+
+        # Reconstructing a schedule plan must not accumulate hooks.
+        hook_counts = tuple(
+            (len(module._forward_pre_hooks), len(module._backward_pre_hooks))
+            for module in model.modules()
+        )
+        mfsdp_scheduler.setup_combined_1f1b_hooks(model)
+        assert (
+            tuple(
+                (len(module._forward_pre_hooks), len(module._backward_pre_hooks))
+                for module in model.modules()
+            )
+            == hook_counts
+        )
+
+        unshard_calls = []
+        original_unshard = model.unshard
+
+        def record_unshard(prefetch="none"):
+            unshard_calls.append(prefetch)
+            original_unshard(prefetch=prefetch)
+
+        post_backward_calls = []
+        original_post_backward = model.post_backward
+
+        def record_post_backward():
+            post_backward_calls.append(None)
+            original_post_backward()
+
+        monkeypatch.setattr(model, "unshard", record_unshard)
+        monkeypatch.setattr(model, "post_backward", record_post_backward)
+
+        inputs = torch.randn(2, 4, device=device, requires_grad=True)
+        output = model[0](inputs)
+        assert unshard_calls == ["none"]
+
+        mfsdp_scheduler.reshard_fsdp_module(model)
+        output.sum().backward()
+        assert unshard_calls == ["none", "none"]
+        assert post_backward_calls == [None]
+        assert model._unshard_event is None
+
+    def test_fine_grained_hook_does_not_prefetch_static_sibling(self, monkeypatch):
+        """A custom-schedule demand gather must not launch static lookahead."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        mesh = DeviceMesh.from_group(
+            self.pg_collection.dp_cp, device_type=device.type, mesh_dim_names=("dp",)
+        )
+        placements = Placements(
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        )
+        model = torch.nn.Sequential(
+            torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False)),
+            torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False)),
+        ).to(device)
+
+        with fully_shard_context(device=device, custom_schedule=True):
+            fully_shard(model[0], mesh=mesh, placements=placements)
+            fully_shard(model[1], mesh=mesh, placements=placements)
+
+        mfsdp_scheduler.setup_combined_1f1b_hooks(model)
+        assert mfsdp_scheduler._get_owning_fsdp_module(model[0][0]) is model[0]
+        assert mfsdp_scheduler._get_owning_fsdp_module(model[1][0]) is model[1]
+
+        sibling_unshards = []
+        original_sibling_unshard = model[1]._unshard_parameter_groups
+
+        def record_sibling_unshard():
+            sibling_unshards.append(None)
+            original_sibling_unshard()
+
+        monkeypatch.setattr(model[1], "_unshard_parameter_groups", record_sibling_unshard)
+
+        mfsdp_scheduler._unshard_before_submodule_forward(model[0][0], (), {})
+
+        assert model[0]._unshard_event is not None
+        assert sibling_unshards == []
+        mfsdp_scheduler.reshard_fsdp_module(model[0])
+
+    def test_delayed_wgrad_hook_finalizes_only_its_fsdp_unit(self):
+        """An outer completion hook must not finalize a delayed-wgrad child."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        mesh = DeviceMesh.from_group(
+            self.pg_collection.dp_cp, device_type=device.type, mesh_dim_names=("dp",)
+        )
+        placements = Placements(
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        )
+        delayed_linear = te.Linear(
+            16,
+            16,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            device=device,
+            delay_wgrad_compute=True,
+            fuse_wgrad_accumulation=False,
+        )
+        model = torch.nn.Sequential(delayed_linear)
+
+        with fully_shard_context(device=device, custom_schedule=True):
+            fully_shard(delayed_linear, mesh=mesh, placements=placements)
+            fully_shard(model, mesh=mesh, placements=placements)
+
+        mfsdp_scheduler.setup_combined_1f1b_hooks(model)
+
+        inputs = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
+        model(inputs).float().square().mean().backward()
+
+        assert delayed_linear.weight.grad is None
+        assert delayed_linear._unshard_event is not None
+
+        delayed_linear.backward_dw()
+
+        assert delayed_linear.weight.grad is not None
+        assert delayed_linear._unshard_event is None
+
+    def test_overlap_setup_tracks_nearest_fsdp_owner_once(self):
+        """Setup records nearest owners without registering duplicate hooks."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        mesh = DeviceMesh.from_group(
+            self.pg_collection.dp_cp, device_type=device.type, mesh_dim_names=("dp",)
+        )
+        placements = Placements(
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        )
+        model = torch.nn.Sequential(
+            torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False)),
+            torch.nn.Linear(4, 4, bias=False),
+        ).to(device)
+
+        with fully_shard_context(device=device, custom_schedule=True):
+            fully_shard(model[0][0], mesh=mesh, placements=placements)
+            fully_shard(model[0], mesh=mesh, placements=placements)
+            fully_shard(model, mesh=mesh, placements=placements)
+
+        mfsdp_scheduler.setup_combined_1f1b_hooks(model)
+
+        assert mfsdp_scheduler._get_owning_fsdp_module(model[0][0]) is model[0][0]
+        assert mfsdp_scheduler._get_owning_fsdp_module(model[1]) is model
+
+        hook_counts = tuple(
+            (len(module._forward_pre_hooks), len(module._backward_pre_hooks))
+            for module in model.modules()
+        )
+        mfsdp_scheduler.setup_combined_1f1b_hooks(model)
+        assert (
+            tuple(
+                (len(module._forward_pre_hooks), len(module._backward_pre_hooks))
+                for module in model.modules()
+            )
+            == hook_counts
+        )
+
+    def test_finish_grad_sync_waits_for_reduce_scatter(self):
+        """Gradient consumers should wait for the final asynchronous reduce-scatter."""
+
+        class RecordingStream:
+            def __init__(self) -> None:
+                self.waited_streams = []
+
+            def wait_stream(self, stream) -> None:
+                self.waited_streams.append(stream)
+
+        current_stream = RecordingStream()
+        reduce_scatter_stream = object()
+
+        class Context:
+            def __init__(self) -> None:
+                self.reduce_scatter_stream = reduce_scatter_stream
+
+            def current_stream(self):
+                return current_stream
+
+        module = torch.nn.Module()
+        module.context = Context()
+        adapter = object.__new__(mcore_fsdp_adapter.FullyShardedDataParallelV2)
+        torch.nn.Module.__init__(adapter)
+        adapter.module = module
+
+        adapter.finish_grad_sync()
+
+        assert current_stream.waited_streams == [reduce_scatter_stream]
+
     def test_nccl_ub_enables_symmetric_memory(self, monkeypatch):
         config = TransformerConfig(
             num_layers=1,
@@ -213,6 +422,43 @@ class TestMcoreAdapterDense:
         )
 
         assert fully_shard_context_calls == [True]
+
+    @pytest.mark.parametrize("overlap", [False, True], ids=["native", "custom"])
+    def test_overlap_selects_custom_schedule(self, monkeypatch, overlap):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            ffn_hidden_size=32,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
+        # Full overlap validation requires MoE modules; this focused adapter test
+        # verifies propagation after TransformerConfig validation.
+        config.overlap_moe_expert_parallel_comm = overlap
+        model = torch.nn.Linear(config.hidden_size, config.hidden_size).to(
+            device="cuda", dtype=config.params_dtype
+        )
+        custom_schedule_calls = []
+        original_fully_shard_context = mcore_fsdp_adapter.fully_shard_context
+
+        def record_fully_shard_context(*args, **kwargs):
+            custom_schedule_calls.append(kwargs["custom_schedule"])
+            return original_fully_shard_context(*args, **kwargs)
+
+        monkeypatch.setattr(mcore_fsdp_adapter, "fully_shard_context", record_fully_shard_context)
+        FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+
+        assert custom_schedule_calls == [overlap]
 
     @pytest.mark.parametrize("optimizer_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
     def test_build_train_and_step(self, optimizer_cuda_graph):

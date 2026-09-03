@@ -14,6 +14,7 @@
 
 import logging
 import random
+from contextlib import contextmanager
 from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 
 __all__ = ["FullyShardedDataParallel"]
@@ -612,6 +613,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             gradient=[expert_axis.gradient],
             optimizer=[expert_axis.optimizer],
         )
+        overlap_moe_expert_parallel = config.overlap_moe_expert_parallel_comm
 
         if has_outer_dp_axis := ddp_config.num_distributed_optimizer_instances > 1:
             # Dense parameters get an outer DP axis. There is no HSDP/HFSDP special case:
@@ -643,7 +645,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
-        with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
+        with fully_shard_context(
+            device=device,
+            use_symmetric_memory=ddp_config.nccl_ub,
+            # Combined 1F1B executes FSDP units in a dynamic order that does not
+            # match the static module order. Demand gathers remain enabled, but
+            # static lookahead could re-gather a unit whose backward already ended.
+            custom_schedule=overlap_moe_expert_parallel,
+        ):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
                 # Their gradients need the EP divisor because the same expert receives
@@ -656,8 +665,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             submodule.experts,
                             mesh=expert_dp_mesh,
                             placements=expert_placements,
-                            mixed_precision_policy=self.mp_policy,
                             grad_divisor=config.expert_model_parallel_size,
+                            mixed_precision_policy=self.mp_policy,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -791,8 +800,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 requires symmetric registration when nccl_ub is enabled.")
         if ddp_config.fsdp_manual_registration:
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
-        if ddp_config.delay_wgrad_compute:
-            raise ValueError("MFSDP v2 does not support delay_wgrad_compute.")
+        if ddp_config.delay_wgrad_compute and not config.overlap_moe_expert_parallel_comm:
+            raise ValueError(
+                "MFSDP v2 only supports delay_wgrad_compute with "
+                "overlap_moe_expert_parallel_comm."
+            )
         if ddp_config.suggested_communication_unit_size is not None:
             raise ValueError("MFSDP v2 does not support suggested_communication_unit_size.")
         if ddp_config.num_buckets is not None:
@@ -806,6 +818,24 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if ddp_config.megatron_fsdp_max_pool_double_buffer:
             raise ValueError("MFSDP v2 does not support megatron_fsdp_max_pool_double_buffer.")
 
+    @contextmanager
+    def no_sync(self):
+        """Suppress gradient finalization for non-final microbatches.
+
+        Toggles ``is_last_microbatch`` on this model's ``FsdpContext`` so gradient
+        reduce-scatters accumulate between microbatches rather than finalizing
+        on every backward. Called by the training loop via
+        ``config.no_sync_func`` and the 1F1B overlap schedule.
+        """
+        self.module.context.ensure_finalized()
+        context = self.module.context
+        previous_state = context.is_last_microbatch
+        context.is_last_microbatch = False
+        try:
+            yield
+        finally:
+            context.is_last_microbatch = previous_state
+
     def start_param_sync(self, *unused, **unused_kwargs) -> None:
         """No-op: MFSDP v2 gathers parameters from its forward pre-hooks."""
 
@@ -813,7 +843,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """MFSDP v2 reduces gradients during backward."""
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
-        """MFSDP v2 gradient reduction is complete when backward returns."""
+        """Wait for backward reduce-scatters before gradient consumers run."""
+        context = self.module.context
+        context.current_stream().wait_stream(context.reduce_scatter_stream)
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""
