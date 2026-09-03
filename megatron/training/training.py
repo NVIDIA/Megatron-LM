@@ -3309,6 +3309,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         )
     return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
 
+def _should_reset_logging_interval(is_first_iteration: bool, log_interval: int) -> bool:
+    """Return whether logging accumulators should be reset after this iteration."""
+    if log_interval == 1:
+        # Every iteration is a complete logging window, including the startup iteration.
+        should_reset = True
+    else:
+        # Keep the startup iteration in the first regular logging window.
+        should_reset = not is_first_iteration
+    return should_reset
 
 def training_log(
     loss_dict,
@@ -3335,9 +3344,7 @@ def training_log(
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
 
-    # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate. When logging every iteration, reset immediately so the
-    # second iteration does not include statistics from the first iteration.
-    should_reset = not is_first_iteration or args.log_interval == 1
+    should_reset = _should_reset_logging_interval(is_first_iteration, args.log_interval)
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
