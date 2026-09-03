@@ -88,6 +88,7 @@ jobs:
           REPO = os.environ["GITHUB_REPOSITORY"]
           CONTRIBUTOR_TYPE = os.environ["CONTRIBUTOR_TYPE"]
           INTERNAL_SERVICE_ACCOUNTS = {"svcnemo-autobot"}
+          FUNCTIONAL_TEST_LABEL = "Run functional tests"
           if CONTRIBUTOR_TYPE == "external":
               # Global limit across all branches — no division needed since we count globally.
               MAX_CONCURRENCY = int(os.environ["MAX_CONCURRENCY_EXTERNAL"])
@@ -170,6 +171,19 @@ jobs:
               base_branch = pr_info.get("base", {}).get("ref")
               return base_branch, pr_info
 
+          def has_functional_test_label(workflow_run):
+              """Return whether a PR workflow has opted into functional tests."""
+              head_branch = workflow_run.get("head_branch", "")
+              if not re.match(r"pull-request/(\d+)", head_branch):
+                  return False
+              _, pr_info = get_pr_base_branch(workflow_run)
+              if pr_info is None:
+                  raise RuntimeError(f"Failed to inspect labels for {head_branch}")
+              return any(
+                  label.get("name") == FUNCTIONAL_TEST_LABEL
+                  for label in pr_info.get("labels", [])
+              )
+
           def matches_contributor(workflow_run, contributor_type):
               """Return True if the workflow run matches the contributor type (ignores branch)."""
               _, pr_info = get_pr_base_branch(workflow_run)
@@ -203,16 +217,22 @@ jobs:
 
           # Get current running and queued workflows
           print("Fetching workflow runs...")
-          queued_resp = make_request("actions/runs?status=queued")
+          queued_resp = make_request("actions/workflows/cicd-main.yml/runs?status=queued&per_page=100")
           if queued_resp is None:
               print("Failed to fetch queued workflow runs after retries, exiting")
               exit(1)
           queued_workflow_runs = queued_resp.get("workflow_runs", [])
-          in_progress_resp = make_request("actions/runs?status=in_progress")
+          in_progress_resp = make_request("actions/workflows/cicd-main.yml/runs?status=in_progress&per_page=100")
           if in_progress_resp is None:
               print("Failed to fetch in-progress workflow runs after retries, exiting")
               exit(1)
           in_progress_workflow_runs = in_progress_resp.get("workflow_runs", [])
+
+          # The functional-test slot is global across all branch/contributor queues.
+          functional_test_workflow_running = any(
+              has_functional_test_label(run)
+              for run in queued_workflow_runs + in_progress_workflow_runs
+          )
 
           # For external contributors, enforce a single global concurrency limit across ALL branches.
           # For internal contributors, enforce per-branch limits as before.
@@ -270,6 +290,14 @@ jobs:
 
               workflow_id = workflow["id"]
               workflow_name = workflow["display_title"]
+              runs_functional_tests = has_functional_test_label(workflow)
+              if runs_functional_tests and functional_test_workflow_running:
+                  print(
+                      f"Skipping functional-test workflow {workflow_name} with Run Id: {workflow_id}; "
+                      "another functional-test workflow is active"
+                  )
+                  continue
+
               print(f"Approving workflow {workflow_name} with Run Id: {workflow_id}")
 
               deployment_url = f"actions/runs/{workflow_id}/pending_deployments"
@@ -290,6 +318,8 @@ jobs:
 
               if result:
                   total_workflows += 1
+                  if runs_functional_tests:
+                      functional_test_workflow_running = True
               else:
                   print(f"Failed to approve deployment {deployment['id']}")
                   exit(1)
