@@ -17,13 +17,13 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
 )
 
-_NVTX_LABEL_PATTERN = re.compile(r"MFSDP (.+) (forward|backward)")
+_NVTX_LABEL_PATTERN = re.compile(r"MFSDP (.+) (forward|backward|unshard|reshard|gradient_reduce)")
 
 
 class NvtxEvent(NamedTuple):
     kind: Literal["push", "pop"]
     name: str
-    phase: str
+    operation: str
 
 
 class NestedLinearModel(nn.Module):
@@ -76,16 +76,50 @@ def _setup_nvtx_recording(monkeypatch: pytest.MonkeyPatch, events: list[NvtxEven
         return match.groups()
 
     def record_push(label: str) -> None:
-        name, phase = parse_nvtx_label(label)
-        label_stack.append((name, phase))
-        events.append(NvtxEvent("push", name, phase))
+        name, operation = parse_nvtx_label(label)
+        label_stack.append((name, operation))
+        events.append(NvtxEvent("push", name, operation))
 
     def record_pop() -> None:
-        name, phase = label_stack.pop()
-        events.append(NvtxEvent("pop", name, phase))
+        name, operation = label_stack.pop()
+        events.append(NvtxEvent("pop", name, operation))
 
     monkeypatch.setattr(torch.cuda.nvtx, "range_push", record_push)
     monkeypatch.setattr(torch.cuda.nvtx, "range_pop", record_pop)
+
+
+def _lifecycle_events(events: list[NvtxEvent]) -> list[NvtxEvent]:
+    """Return the forward/backward ranges asserted by the lifecycle tests."""
+    return [event for event in events if event.operation in ("forward", "backward")]
+
+
+def test_fsdp_training_hooks_emit_operation_nvtx_ranges(distributed_setup, monkeypatch):
+    """A training step should annotate each FSDP lifecycle operation."""
+    events: list[NvtxEvent] = []
+    _setup_nvtx_recording(monkeypatch, events)
+    model = nn.Linear(4, 4, bias=False).to(distributed_setup.device)
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    with fully_shard_context(device=distributed_setup.device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
+
+    assert events == [
+        NvtxEvent("push", "<root>", "forward"),
+        NvtxEvent("push", "<root>", "unshard"),
+        NvtxEvent("pop", "<root>", "unshard"),
+        NvtxEvent("push", "<root>", "reshard"),
+        NvtxEvent("pop", "<root>", "reshard"),
+        NvtxEvent("pop", "<root>", "forward"),
+        NvtxEvent("push", "<root>", "backward"),
+        NvtxEvent("push", "<root>", "unshard"),
+        NvtxEvent("pop", "<root>", "unshard"),
+        NvtxEvent("push", "<root>", "reshard"),
+        NvtxEvent("pop", "<root>", "reshard"),
+        NvtxEvent("push", "<root>", "gradient_reduce"),
+        NvtxEvent("pop", "<root>", "gradient_reduce"),
+        NvtxEvent("pop", "<root>", "backward"),
+    ]
 
 
 def test_fsdp_sibling_roots_emit_root_nvtx_ranges_after_training_step(
@@ -102,7 +136,7 @@ def test_fsdp_sibling_roots_emit_root_nvtx_ranges_after_training_step(
 
     model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
 
-    assert [(event.kind, event.name, event.phase) for event in events] == [
+    assert _lifecycle_events(events) == [
         ("push", "<root>", "forward"),
         ("pop", "<root>", "forward"),
         ("push", "<root>", "forward"),
@@ -127,7 +161,7 @@ def test_fsdp_training_hooks_emit_stacked_nvtx_ranges(distributed_setup, monkeyp
 
     model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
 
-    assert [(event.kind, event.name, event.phase) for event in events] == [
+    assert _lifecycle_events(events) == [
         ("push", "<root>", "forward"),
         ("push", "layers.0", "forward"),
         ("pop", "layers.0", "forward"),
@@ -157,7 +191,7 @@ def test_fsdp_frozen_parameters_emit_balanced_backward_nvtx_range(distributed_se
     x = torch.ones(2, 4, device=distributed_setup.device, requires_grad=True)
     model(x).sum().backward()
 
-    assert [(event.kind, event.name, event.phase) for event in events] == [
+    assert _lifecycle_events(events) == [
         ("push", "<root>", "forward"),
         ("pop", "<root>", "forward"),
         ("push", "<root>", "backward"),
@@ -182,7 +216,7 @@ def test_fsdp_frozen_child_without_grad_inputs_skips_backward_nvtx_range(
 
     model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
 
-    assert [(event.kind, event.name, event.phase) for event in events] == [
+    assert _lifecycle_events(events) == [
         ("push", "<root>", "forward"),
         ("push", "layers.0", "forward"),
         ("pop", "layers.0", "forward"),
@@ -210,7 +244,7 @@ def test_tied_child_parameters_complete_backward_once_per_cycle(distributed_setu
         model.zero_grad(set_to_none=True)
         model(token_ids).backward()
 
-    assert [(event.kind, event.name, event.phase) for event in events] == [
+    assert _lifecycle_events(events) == [
         ("push", "<root>", "forward"),
         ("pop", "<root>", "forward"),
         ("push", "<root>", "backward"),
