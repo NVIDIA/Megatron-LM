@@ -436,6 +436,11 @@ class TransformerConfig(ModelParallelConfig):
     """Fuse GatedDeltaNet output RMSNorm and SiLU gating. Unsupported configurations and
     layouts raise on every forward; see docs/developer/gdn_ew_fusion.md for requirements."""
 
+    gated_delta_net_separate_grad_norm: bool = False
+    """If True, exclude GatedDeltaNet input-projection gradients from the global gradient norm
+    and clip them against their own norm. This prevents an oversized input-projection gradient
+    from shrinking every other parameter's update. Default is False."""
+
     ####################
     # initialization
     ####################
