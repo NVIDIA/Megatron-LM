@@ -739,8 +739,18 @@ class TestGDNCuSeqlensResolve:
         (2, True, 2),  # TP w/ SP + CP
     ],
 )
-@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
+@pytest.mark.parametrize(
+    "gdn_kernel_backend",
+    ["fla", pytest.param("transformer_engine", marks=pytest.mark.internal)],
+)
+def test_parallel_gated_delta_net_correctness(
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, gdn_kernel_backend
+):
+    if gdn_kernel_backend == "fla" and not HAVE_FLA:
+        pytest.skip("FLA is not installed.")
+    if gdn_kernel_backend == "transformer_engine" and not HAVE_TE_GDN:
+        pytest.skip("TransformerEngine GDN is not available.")
+
     transformer_config = TransformerConfig(
         hidden_size=128,
         linear_conv_kernel_dim=2,
@@ -756,7 +766,7 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         activation_func=F.silu,
         bf16=True,
         experimental_attention_variant="gated_delta_net",
-        gdn_kernel_backend="fla",
+        gdn_kernel_backend=gdn_kernel_backend,
         linear_attention_freq=[1],
         transformer_impl="transformer_engine",
     )
