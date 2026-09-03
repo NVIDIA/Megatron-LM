@@ -235,11 +235,6 @@ class TEGroupedMLP(MegatronModule):
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
 
-        if self.config.moe_flex_dispatcher_backend == "replica_hybridep":
-            # The replica bridge owns the runtime grouped weights and uses the registered
-            # weight parameters' main_grad buffers as its source of truth for optimizer state.
-            os.environ.setdefault("NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP", "1")
-
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
         if self.config.gated_linear_unit:

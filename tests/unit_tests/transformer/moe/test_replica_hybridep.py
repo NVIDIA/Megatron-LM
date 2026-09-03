@@ -166,7 +166,6 @@ def _run_full_layer_parity(
     from tests.unit_tests.test_utilities import Utils
 
     monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
-    monkeypatch.setenv("NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP", "1")
     monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "0")
     expert_model_parallel_size = 2 if gtp else 4
     Utils.initialize_model_parallel(
@@ -400,7 +399,6 @@ def _run_repeated_mtp_parity(monkeypatch):
     from tests.unit_tests.test_utilities import Utils
 
     monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
-    monkeypatch.setenv("NVTE_DISABLE_CUTEDSL_WGRAD_FUSED_GROUPED_MLP", "1")
     monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "0")
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1, expert_model_parallel_size=4, expert_tensor_parallel_size=1
