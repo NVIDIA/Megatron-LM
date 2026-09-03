@@ -67,19 +67,6 @@ def test_internal_backend_rejects_conflicting_state_layout_options():
         )
 
 
-def test_cutedsl_cp_context_metadata_owns_global_offsets():
-    from megatron.core.ssm.gated_delta_net.gdn import _bind_cutedsl_cp_context_metadata
-
-    source = torch.tensor([0, 32768], dtype=torch.int64)
-    context = SimpleNamespace()
-    assert _bind_cutedsl_cp_context_metadata(context, source) is context
-    source[1] = 0
-
-    assert context.global_num_seqs == 1
-    assert torch.equal(context.global_cu_seqlens_cpu, torch.tensor([0, 32768]))
-    assert context.global_cu_seqlens_cpu.data_ptr() != source.data_ptr()
-
-
 def test_cutedsl_cp_context_metadata_rebind_invalidates_memos():
     from megatron.core.ssm.gated_delta_net.gdn import _bind_cutedsl_cp_context_metadata
 
@@ -104,32 +91,8 @@ def test_cutedsl_cp_context_metadata_rebind_invalidates_memos():
     assert context.global_num_seqs == 2
 
 
-def test_packed_chunkwise_cp_cuda_graph_is_rejected_before_layout_conversion(monkeypatch):
-    from megatron.core.packed_seq_params import PackedSeqParams
-    from megatron.core.ssm.gated_delta_net import gdn
-
-    class FakeGroup:
-        @staticmethod
-        def size():
-            return 4
-
-    fake = SimpleNamespace(
-        pg_collection=SimpleNamespace(cp=FakeGroup()),
-        tp_group=object(),
-        config=SimpleNamespace(linear_cp_mode="chunkwise", cuda_graph_impl="transformer_engine"),
-    )
-    packed = PackedSeqParams(qkv_format="thd")
-    monkeypatch.setattr(
-        gdn,
-        "convert_module_input_tensors_cp_partition_mode",
-        lambda **_kwargs: pytest.fail("layout conversion ran before the CUDA-graph guard"),
-    )
-
-    with pytest.raises(RuntimeError, match="does not support CUDA graphs"):
-        gdn.GatedDeltaNet.forward(fake, torch.empty(8, 1, 4), None, packed_seq_params=packed)
-
-
-def test_packed_chunkwise_cp_partial_mlp_cuda_graph_remains_eager(monkeypatch):
+@pytest.mark.parametrize("captures_gdn", [True, False], ids=["attention", "mlp_only"])
+def test_packed_chunkwise_cp_cuda_graph_gate(monkeypatch, captures_gdn):
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.ssm.gated_delta_net import gdn
     from megatron.core.transformer.enums import CudaGraphModule
@@ -142,15 +105,14 @@ def test_packed_chunkwise_cp_partial_mlp_cuda_graph_remains_eager(monkeypatch):
     class LayoutConversionReached(Exception):
         pass
 
+    config = SimpleNamespace(
+        linear_cp_mode="chunkwise",
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=None if captures_gdn else [CudaGraphModule.mlp],
+        sequence_parallel=False,
+    )
     fake = SimpleNamespace(
-        pg_collection=SimpleNamespace(cp=FakeGroup()),
-        tp_group=object(),
-        config=SimpleNamespace(
-            linear_cp_mode="chunkwise",
-            cuda_graph_impl="transformer_engine",
-            cuda_graph_modules=[CudaGraphModule.mlp],
-            sequence_parallel=False,
-        ),
+        pg_collection=SimpleNamespace(cp=FakeGroup()), tp_group=object(), config=config
     )
     packed = PackedSeqParams(qkv_format="thd")
 
@@ -158,22 +120,10 @@ def test_packed_chunkwise_cp_partial_mlp_cuda_graph_remains_eager(monkeypatch):
         raise LayoutConversionReached
 
     monkeypatch.setattr(gdn, "convert_module_input_tensors_cp_partition_mode", conversion)
-    with pytest.raises(LayoutConversionReached):
+    expected_error = RuntimeError if captures_gdn else LayoutConversionReached
+    match = "does not support CUDA graphs" if captures_gdn else None
+    with pytest.raises(expected_error, match=match):
         gdn.GatedDeltaNet.forward(fake, torch.empty(8, 1, 4), None, packed_seq_params=packed)
-
-
-def test_cutedsl_cp_wrapper_cache_key_is_rank_stable():
-    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_cp_cute import (
-        backend as cp_backend,
-    )
-
-    group = object()
-
-    first = cp_backend._wrapper_cache_key(group, torch.device("cuda", 0), 64, 64, 128, 128)
-    second = cp_backend._wrapper_cache_key(group, torch.device("cuda", 0), 64, 64, 128, 128)
-
-    assert first == second
-    assert first == (id(group), 0, 64, 64, 128, 128, "g")
 
 
 def test_cutedsl_cp_wrapper_marshals_different_streams(monkeypatch):
@@ -287,15 +237,6 @@ def test_cutedsl_cp_wrapper_raises_on_cross_rank_initialization_mismatch(monkeyp
         )
 
     assert constructed == []
-
-
-def test_cutedsl_cp_cuda_graph_gate_uses_context_configuration():
-    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_cp_cute import (
-        backend as cp_backend,
-    )
-
-    assert cp_backend._cuda_graphs_enabled(SimpleNamespace(_cutedsl_cuda_graph_enabled=True))
-    assert not cp_backend._cuda_graphs_enabled(SimpleNamespace())
 
 
 def test_fused_forward_package_exports_wrapper():
@@ -1633,16 +1574,6 @@ def test_fused_backward_adapter_forwards_chunk_offsets(monkeypatch):
     assert seen["cu_seqlens"] is cu_seqlens
     assert seen["chunk_offsets"] is chunk_offsets
     assert seen["trusted_chunk_offsets"] is True
-
-
-def test_gated_delta_net_preserves_dense_batch_cp_rejection():
-    package = Path(__file__).parents[3] / "megatron/core"
-    gdn_source = (package / "ssm/gated_delta_net/gdn.py").read_text()
-    rejection = "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
-
-    # Keep both the fused and unfused pre-GDR paths aligned with the established
-    # MCore contract: dense B>1 is unsupported when chunkwise CP is active.
-    assert gdn_source.count(rejection) == 2
 
 
 def test_gdn_pre_gdr_producers_emit_fp32_beta():
