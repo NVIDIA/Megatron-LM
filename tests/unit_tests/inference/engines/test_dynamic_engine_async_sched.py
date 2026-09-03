@@ -1174,7 +1174,7 @@ def _instrument_scenario_runtime(env, scenario, runtime):
             from megatron.core.inference.sampling import flashinfer_sampling
 
             flashinfer_kernels = {
-                "sampling_from_probs": (),
+                "sampling_from_logits": (),
                 "top_k_sampling_from_probs": ("top-k-filter",),
                 "top_p_sampling_from_probs": ("top-p-filter",),
                 "top_k_top_p_sampling_from_logits": ("top-k-filter", "top-p-filter"),
