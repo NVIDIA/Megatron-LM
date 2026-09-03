@@ -18,6 +18,22 @@ from megatron.core.inference.sampling_params import (
 )
 
 
+def _greedy_batch_flags(context) -> tuple[bool, bool]:
+    """Return whether any/all active requests use greedy sampling.
+
+    Sampling parameters have a pinned CPU source of truth, so these checks add
+    no GPU synchronization to the sampling path.
+    """
+    active_count = context.total_request_count - context.paused_request_count
+    if active_count == 0:
+        return False, False
+    metadata = context.active_request_metadata
+    top_k = metadata["top_k"][:active_count]
+    top_p = metadata["top_p"][:active_count]
+    greedy = (top_k == 1) & is_no_op_top_p(top_p)
+    return bool(greedy.any()), bool(greedy.all())
+
+
 class FlashInferSampling(Sampling):
     """FlashInfer sampling with per-step unfiltered / top-p-only / top-k-only / joint dispatch.
 
@@ -102,6 +118,23 @@ class FlashInferSampling(Sampling):
             scaled = logits[gather_indices[:n], :] / temperature.unsqueeze(1)
         assert scaled.dtype == torch.float32, f"sampling math must be fp32, got {scaled.dtype}"
 
+        # SamplingParams defines top_k=1 as greedy, matching the torch backend's
+        # argmax fast path. FlashInfer's top-k kernels can retain multiple tokens
+        # when logits tie at the kth threshold and then sample among them. Besides
+        # violating greedy semantics, that makes output depend on unrelated RNG
+        # consumption (for example, a different prefix-cache graph shape).
+        # The common unconstrained path already tells us top-k is absent. Avoid
+        # adding either CPU metadata scans or GPU pointwise work to that path.
+        has_greedy_rows, all_greedy_rows = (
+            (False, False) if no_top_k else _greedy_batch_flags(context)
+        )
+        if all_greedy_rows:
+            sampled_tokens = torch.argmax(scaled, dim=-1)
+            if output is None:
+                return sampled_tokens
+            output.copy_(sampled_tokens)
+            return output
+
         # `no_top_k` / `no_top_p` are the caller-supplied batch-level dispatch flags:
         # a filter is absent only when NO active request uses it. Per-row sentinels
         # disable a filter for a row (top_k=vocab keeps all tokens, top_p=1.0 keeps
@@ -134,6 +167,12 @@ class FlashInferSampling(Sampling):
             sampled_tokens = flashinfer.sampling.top_k_top_p_sampling_from_logits(
                 scaled, top_k_safe, top_p_safe, deterministic=True, generator=self._rng
             ).long()
+
+        # Mixed batches still use FlashInfer for stochastic rows, then repair
+        # greedy rows with deterministic first-argmax tie breaking.
+        if has_greedy_rows:
+            greedy_mask = (top_k == 1) & is_no_op_top_p(top_p)
+            sampled_tokens = torch.where(greedy_mask, torch.argmax(scaled, dim=-1), sampled_tokens)
 
         if output is None:
             return sampled_tokens
@@ -169,10 +208,19 @@ class FlashInferSampling(Sampling):
         temperature = temperature.clamp(min=MIN_SAMPLING_TEMPERATURE)
         scaled = logits / temperature.unsqueeze(1)
 
-        # Batch-level no-op check.
+        # Batch-level no-op check. This is also the overwhelmingly common
+        # production path, so return before checking for greedy rows.
         no_top_k_batch, no_top_p_batch = context.active_sampling_filter_flags()
         if no_top_k_batch and no_top_p_batch:
             return torch.log_softmax(scaled, dim=-1)
+
+        has_greedy_rows, all_greedy_rows = (
+            (False, False) if no_top_k_batch else _greedy_batch_flags(context)
+        )
+        if all_greedy_rows:
+            greedy_log_probs = torch.full_like(scaled, float("-inf"))
+            greedy_log_probs.scatter_(1, torch.argmax(scaled, dim=-1, keepdim=True), 0.0)
+            return greedy_log_probs
 
         # Sentinel / no-op values disable filtering:
         # top_k=vocab_size keeps all tokens, top_p=1.0 keeps the full probability mass.
@@ -186,8 +234,14 @@ class FlashInferSampling(Sampling):
         renormed = flashinfer.sampling.top_k_renorm_probs(probs, top_k_safe)
         renormed = flashinfer.sampling.top_p_renorm_probs(renormed, top_p_safe)
         # Unfiltered rows of a mixed batch bypass the renorm rounding entirely.
-        return torch.where(
+        log_probs = torch.where(
             (no_top_k & no_top_p).unsqueeze(1),
             torch.log_softmax(scaled, dim=-1),
             torch.log(renormed),
         )
+        if has_greedy_rows:
+            greedy_mask = (top_k == 1) & is_no_op_top_p(top_p)
+            greedy_log_probs = torch.full_like(scaled, float("-inf"))
+            greedy_log_probs.scatter_(1, torch.argmax(scaled, dim=-1, keepdim=True), 0.0)
+            log_probs = torch.where(greedy_mask.unsqueeze(1), greedy_log_probs, log_probs)
+        return log_probs

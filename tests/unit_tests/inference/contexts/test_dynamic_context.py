@@ -4230,6 +4230,7 @@ class TestDynamicContext:
     [
         ([0, 0, 0], [0.0, 1.0, 1.0], [None, None, None]),  # all no-op: fast path
         ([4, 0], [0.0, 1.0], [4, None]),  # mixed batch: per-row repair
+        ([1], [1.0], [1]),  # greedy: exactly one finite argmax, even on a tie
     ],
 )
 def test_flashinfer_no_op_filter_rows_get_exact_log_softmax(top_k, top_p, finite_counts):
@@ -4255,6 +4256,8 @@ def test_flashinfer_no_op_filter_rows_get_exact_log_softmax(top_k, top_p, finite
     )
 
     backend = FlashInferSampling(64, torch.Generator(device="cuda"))
+    if top_k.tolist() == [1]:
+        logits[0, 0] = logits[0, 1] = logits.max()
     log_probs = backend.log_probs_kernel(logits, context)
     expected = torch.log_softmax(logits, dim=-1)
     for row, finite_count in enumerate(finite_counts):
@@ -4262,6 +4265,8 @@ def test_flashinfer_no_op_filter_rows_get_exact_log_softmax(top_k, top_p, finite
             assert torch.equal(log_probs[row], expected[row])
         else:
             assert int(torch.isfinite(log_probs[row]).sum()) == finite_count
+    if top_k.tolist() == [1]:
+        assert log_probs[0, 0].item() == 0.0
 
 
 @pytest.mark.parametrize(
@@ -4300,7 +4305,13 @@ def test_flashinfer_sample_kernel_dispatch(
             temperature=torch.ones(n),
             top_k=torch.tensor(top_k, dtype=torch.int32),
             top_p=torch.tensor(top_p),
-        )
+        ),
+        active_request_metadata={
+            "top_k": torch.tensor(top_k, dtype=torch.int32),
+            "top_p": torch.tensor(top_p),
+        },
+        total_request_count=n,
+        paused_request_count=0,
     )
     rng = torch.Generator()
     backend = FlashInferSampling(vocab_size, rng)
@@ -4332,3 +4343,52 @@ def test_flashinfer_sample_kernel_dispatch(
     }
     for safe_arg, expected in zip(args[1:], expected_safe.get(expected_kernel, [])):
         assert torch.equal(safe_arg, expected)
+
+
+def test_flashinfer_top_k_one_ties_use_deterministic_argmax(monkeypatch):
+    """top_k=1 is greedy even when several logits tie for the maximum."""
+    fake = mock.MagicMock()
+    fake.sampling.top_k_sampling_from_probs.return_value = torch.tensor([3, 1])
+    monkeypatch.setattr("megatron.core.inference.sampling.flashinfer_sampling.flashinfer", fake)
+
+    logits = torch.tensor([[0.0, 3.0, 1.0, 3.0], [2.0, 2.0, 1.0, 0.0]])
+    n, vocab_size = logits.shape
+    top_k = torch.ones(n, dtype=torch.int32)
+    top_p = torch.ones(n)
+    context = SimpleNamespace(
+        gpu_view=SimpleNamespace(temperature=torch.ones(n), top_k=top_k, top_p=top_p),
+        active_request_metadata={"top_k": top_k, "top_p": top_p},
+        total_request_count=n,
+        paused_request_count=0,
+    )
+
+    backend = FlashInferSampling(vocab_size, torch.Generator())
+    sampled = backend.sample_kernel(logits, n, context, no_top_k=False, no_top_p=True)
+
+    assert torch.equal(sampled, torch.tensor([1, 0]))
+    fake.sampling.top_k_sampling_from_probs.assert_not_called()
+
+
+def test_flashinfer_mixed_batch_repairs_greedy_ties(monkeypatch):
+    """Greedy rows remain deterministic alongside stochastic top-k rows."""
+    fake = mock.MagicMock()
+    fake.sampling.top_k_sampling_from_probs.return_value = torch.tensor(
+        [3, 2], dtype=torch.int32
+    )
+    monkeypatch.setattr("megatron.core.inference.sampling.flashinfer_sampling.flashinfer", fake)
+
+    logits = torch.tensor([[0.0, 3.0, 1.0, 3.0], [2.0, 2.0, 1.0, 0.0]])
+    top_k = torch.tensor([1, 2], dtype=torch.int32)
+    top_p = torch.ones(2)
+    context = SimpleNamespace(
+        gpu_view=SimpleNamespace(temperature=torch.ones(2), top_k=top_k, top_p=top_p),
+        active_request_metadata={"top_k": top_k, "top_p": top_p},
+        total_request_count=2,
+        paused_request_count=0,
+    )
+
+    backend = FlashInferSampling(logits.size(1), torch.Generator())
+    sampled = backend.sample_kernel(logits, 2, context, no_top_k=False, no_top_p=True)
+
+    assert torch.equal(sampled, torch.tensor([1, 2]))
+    fake.sampling.top_k_sampling_from_probs.assert_called_once()
