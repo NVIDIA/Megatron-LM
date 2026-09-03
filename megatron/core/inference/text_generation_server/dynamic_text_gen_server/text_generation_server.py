@@ -1,9 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import copy
 import logging
 import multiprocessing as mp
 import socket
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import List, Optional
 
@@ -17,7 +19,7 @@ except ImportError as e:
     HAS_BACKEND = False
 
 import megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints as endpoints
-from megatron.core.inference.config import MultimodalPromptConfig
+from megatron.core.inference.config import MultimodalPromptConfig, PrefixCachingCoordinatorPolicy
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.utils import trace_async_exceptions
 
@@ -25,7 +27,6 @@ logger = logging.getLogger(__name__)
 
 # Global reference to manage the background server processes
 _SERVER_PROCESSES: List[mp.Process] = []
-_SHARED_SOCKET = None
 
 
 @contextmanager
@@ -48,7 +49,6 @@ async def _run_text_gen_server(
     server_port: int,
     parsers: Optional[List[str]] = None,
     verbose: bool = False,
-    fd: Optional[int] = None,
     hostname: Optional[str] = None,
     chat_template: Optional[str] = None,
     multimodal_prompt_config: Optional[MultimodalPromptConfig] = None,
@@ -56,6 +56,8 @@ async def _run_text_gen_server(
     default_top_p: float = 1.0,
     default_top_k: int = 0,
     eval_mode: bool = False,
+    block_size_tokens: Optional[int] = None,
+    prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
@@ -65,11 +67,23 @@ async def _run_text_gen_server(
         raise RuntimeError(f"Web backend framework (Quart) not available")
 
     # Create and start the client locally inside this process
-    inference_client = InferenceClient(coordinator_addr, deserialize=False)
+    # The client hashes prompts for prefix-affinity routing so the coordinator
+    # does not have to on its single serial loop. It is the only place holding
+    # both the tokens and, for multimodal, the media key that salts them.
+    inference_client = InferenceClient(
+        coordinator_addr,
+        deserialize=False,
+        block_size_tokens=block_size_tokens,
+        prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
+    )
     inference_client.start()
     logger.info(f"Rank {rank}: InferenceClient connected.")
 
     try:
+        # Bind what the caller asked for -- None means every interface, which is
+        # not the single address gethostname() resolves to. The resolved name is
+        # for the log line only.
+        bind_host = hostname
         if hostname is None:
             try:
                 hostname = socket.gethostname()
@@ -96,6 +110,15 @@ async def _run_text_gen_server(
         app.config['default_top_k'] = default_top_k
         app.config['eval_mode'] = eval_mode
 
+        # Applying the chat template is synchronous and O(prompt); on the event loop it
+        # stalls every other request this replica owns, including delivery of responses
+        # that already finished. One worker is enough - the point is the yield, not
+        # throughput. The copy is required: HF tokenizers are not thread-safe.
+        app.config['tokenize_executor'] = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="tokenize"
+        )
+        app.config['tokenizer_copy'] = copy.deepcopy(tokenizer)
+
         # Register all blueprints from the 'endpoints' package
         for endpoint in endpoints.__all__:
             app.register_blueprint(endpoint)
@@ -107,10 +130,9 @@ async def _run_text_gen_server(
             2**14
         )  # Allow many concurrent streams for HTTP/2 clients.
 
-        if fd is not None:
-            config.bind = [f"fd://{fd}"]
-        else:
-            config.bind = [f"{hostname}:{server_port}"]
+        # Held for this worker's lifetime; closing it would drop the listener.
+        own_socket = _bind_reuseport_socket(server_port, bind_host)
+        config.bind = [f"fd://{own_socket.fileno()}"]
 
         with temp_log_level(logging.INFO, logger):
             logger.info(f"Starting text generation server on http://{hostname}:{server_port}")
@@ -122,8 +144,11 @@ async def _run_text_gen_server(
             )
             logger.info(f"Evaluation mode: {eval_mode}")
 
-        # Quart is natively ASGI, so we can serve the app directly
-        await serve(app, config)
+        try:
+            # Quart is natively ASGI, so we can serve the app directly
+            await serve(app, config)
+        finally:
+            own_socket.close()
 
     finally:
         # Gracefully shut down the client when the server stops
@@ -138,7 +163,6 @@ def _server_process_worker(
     server_port: int,
     parsers: Optional[List[str]] = None,
     verbose: bool = False,
-    fd: Optional[int] = None,
     hostname: Optional[str] = None,
     chat_template: Optional[str] = None,
     multimodal_prompt_config: Optional[MultimodalPromptConfig] = None,
@@ -146,6 +170,8 @@ def _server_process_worker(
     default_top_p: float = 1.0,
     default_top_k: int = 0,
     eval_mode: bool = False,
+    block_size_tokens: Optional[int] = None,
+    prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -159,7 +185,6 @@ def _server_process_worker(
                 server_port,
                 parsers,
                 verbose,
-                fd,
                 hostname,
                 chat_template,
                 multimodal_prompt_config,
@@ -167,6 +192,8 @@ def _server_process_worker(
                 default_top_p,
                 default_top_k,
                 eval_mode,
+                block_size_tokens,
+                prefix_caching_coordinator_policy,
             )
         )
     except KeyboardInterrupt:
@@ -178,6 +205,38 @@ def _server_process_worker(
         if pending:
             loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
         loop.close()
+
+
+def _bind_reuseport_socket(server_port: int, hostname: Optional[str]) -> socket.socket:
+    """Bind this worker's own socket on the shared port, with SO_REUSEPORT.
+
+    Unlike inheriting one fd, this gives every worker its own accept queue and
+    lets the kernel hash each connection's 4-tuple across them. It is a large
+    improvement on sharing (measured 604x -> 2x spread at 32 replicas) but is
+    still hashing, not balancing: it cannot see that a replica is already busy,
+    so the spread is statistical rather than exact.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Required on every socket sharing the port; without it the second bind fails.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    sock.bind((hostname if hostname is not None else "0.0.0.0", server_port))
+    sock.setblocking(False)
+    return sock
+
+
+def _reserve_port(hostname: Optional[str]) -> int:
+    """Pick a free port for the replicas to bind individually.
+
+    Replicas each bind the port themselves, so the parent cannot hold the socket
+    and hand out its fd; it binds only long enough to learn a free port. The gap
+    before the replicas bind is a small race with unrelated processes, which is
+    why an explicit port is preferred when one is available.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind((hostname if hostname is not None else "0.0.0.0", 0))
+        return probe.getsockname()[1]
 
 
 def start_text_gen_server(
@@ -196,41 +255,53 @@ def start_text_gen_server(
     default_top_p: float = 1.0,
     default_top_k: int = 0,
     eval_mode: bool = False,
-):
-    """Start the text generation server."""
+    block_size_tokens: Optional[int] = None,
+    prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+) -> Optional[str]:
+    """Start the text generation server.
+
+    Every replica binds its own socket on ``server_port`` with SO_REUSEPORT, so
+    each gets its own accept queue and the kernel spreads connections across
+    them. Sharing one inherited socket does not balance -- replicas race to
+    accept from a single queue and whichever is already running keeps winning,
+    which concentrates most traffic on a handful of them as replica count grows.
+
+    Call this on every rank that should host a frontend. Frontend work (chat
+    template, detokenize, parsers, JSON) is CPU-bound, so hosting on a single
+    rank confines it to that rank's CPU allocation and leaves the rest of the
+    job's cores unused. Each caller gets its own URL back; collecting them and
+    spreading requests over the result is the caller's business.
+
+    Args:
+        server_port: Port to listen on. Overridden by ``sock`` when given; 0
+            asks the OS to choose a free one.
+        sock: A socket the caller already bound, used only to fix the port.
+            Replicas bind that port themselves, so it is closed here rather than
+            shared with them.
+        chat_template: Chat template to apply, as a file path or an inline
+            template string. None falls back to the tokenizer's own template.
+
+    Returns:
+        The base URL this rank serves on, or None if the server was already
+        running.
+    """
     global _SERVER_PROCESSES
-    global _SHARED_SOCKET
 
     if _SERVER_PROCESSES:
         logger.warning("Text gen server processes are already running.")
-        return
+        return None
 
-    # The caller may pass in a socket it has already bound ahead of time.
     if sock is not None:
-        bound_port = sock.getsockname()[1]
-        if bound_port == 0:
+        # Take the port and release the socket: replicas each bind their own with
+        # SO_REUSEPORT, which one shared socket cannot provide.
+        server_port = sock.getsockname()[1]
+        if server_port == 0:
             raise ValueError(
                 "socket must be bound to a real port before being passed to start_text_gen_server"
             )
-        _SHARED_SOCKET = sock
-        server_port = bound_port
-        _SHARED_SOCKET.setblocking(False)
-    else:
-        _SHARED_SOCKET = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        _SHARED_SOCKET.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        if hasattr(socket, 'SO_REUSEPORT'):
-            try:
-                _SHARED_SOCKET.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except OSError:
-                pass
-
-        bind_address = hostname if hostname is not None else "0.0.0.0"
-        _SHARED_SOCKET.bind((bind_address, server_port))
-        _SHARED_SOCKET.setblocking(False)
-
-    _SHARED_SOCKET.set_inheritable(True)
-    fd = _SHARED_SOCKET.fileno()
+        sock.close()
+    elif server_port == 0:
+        server_port = _reserve_port(hostname)
 
     for i in range(num_replicas):
         p = mp.Process(
@@ -242,7 +313,6 @@ def start_text_gen_server(
                 server_port,
                 parsers,
                 verbose,
-                fd,
                 hostname,
                 chat_template,
                 multimodal_prompt_config,
@@ -250,38 +320,43 @@ def start_text_gen_server(
                 default_top_p,
                 default_top_k,
                 eval_mode,
+                block_size_tokens,
+                prefix_caching_coordinator_policy,
             ),
             daemon=True,
         )
         p.start()
         _SERVER_PROCESSES.append(p)
-        logger.info(f"Started text gen frontend replica {i+1}/{num_replicas} (PID: {p.pid})")
+        logger.info(
+            f"Started text gen frontend replica {i+1}/{num_replicas} "
+            f"on port {server_port} (PID: {p.pid})"
+        )
+
+    return f"http://{hostname or socket.gethostname()}:{server_port}"
 
 
-def stop_text_gen_server():
-    """Stop the text generation server."""
-    global _SERVER_PROCESSES
-    global _SHARED_SOCKET
-
-    if not _SERVER_PROCESSES:
+def _terminate(processes: List[mp.Process], what: str):
+    """Terminate a group of worker processes, escalating to kill if needed."""
+    if not processes:
         return
-
-    logger.info(f"Terminating {len(_SERVER_PROCESSES)} Text Gen frontend processes...")
-
-    for p in _SERVER_PROCESSES:
+    logger.info(f"Terminating {len(processes)} {what} processes...")
+    for p in processes:
         if p.is_alive():
             p.terminate()
-
-    for p in _SERVER_PROCESSES:
+    for p in processes:
         p.join(timeout=3)
         if p.is_alive():
             p.kill()
             p.join()
 
-    # Clean up the master socket
-    if _SHARED_SOCKET is not None:
-        _SHARED_SOCKET.close()
-        _SHARED_SOCKET = None
 
+def stop_text_gen_server():
+    """Stop this rank's frontend replica processes."""
+    global _SERVER_PROCESSES
+
+    if not _SERVER_PROCESSES:
+        return
+
+    _terminate(_SERVER_PROCESSES, "Text Gen frontend")
     _SERVER_PROCESSES = []
     logger.info("All text gen frontend processes terminated.")
