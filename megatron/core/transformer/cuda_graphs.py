@@ -2024,6 +2024,7 @@ class TECudaGraphHelper:
         sample_kwargs = [None] * (len(self.flattened_callables) * self.num_microbatches)
 
         rotary_pos_emb_cache = {}
+        warned_rotary_sample_contracts = set()
 
         def _get_layer_static_inputs(layer, chunk_of_the_layer):
             """
@@ -2034,6 +2035,11 @@ class TECudaGraphHelper:
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
+                # The TE sample builder currently materializes only the regular RoPE
+                # contract. Yarn and mRoPE need different runtime inputs, while packed
+                # THD with CP>1 needs a full (not CP-sliced) RoPE table. Keep the legacy
+                # sample behavior unchanged here and warn below when one of those
+                # unsupported contracts is actually captured.
                 if (
                     transformer_module.position_embedding_type == 'rope'
                     and not self.config.multi_latent_attention
@@ -2075,6 +2081,55 @@ class TECudaGraphHelper:
                     or CudaGraphModule.attn in self.config.cuda_graph_modules
                 )
             )
+
+            position_embedding_type = getattr(chunk_of_the_layer, 'position_embedding_type', None)
+            if contains_self_attn and not self.config.multi_latent_attention:
+                is_thd = 'cu_seqlens_q' in static_inputs
+                context_parallel_size = getattr(self.config, 'context_parallel_size', 1)
+                unsupported_reasons = []
+                if position_embedding_type == 'yarn':
+                    unsupported_reasons.append(
+                        'Yarn rotary embeddings are not represented in the capture sample inputs'
+                    )
+                elif position_embedding_type == 'mrope':
+                    unsupported_reasons.append(
+                        'mRoPE rotary embeddings are not represented in the capture sample inputs'
+                    )
+                if position_embedding_type == 'rope' and is_thd and context_parallel_size > 1:
+                    unsupported_reasons.append(
+                        'THD with context parallelism captures a CP-sliced RoPE table, while '
+                        'runtime packed sequences use the full table'
+                    )
+
+                warning_key = (
+                    position_embedding_type,
+                    is_thd,
+                    context_parallel_size,
+                    tuple(unsupported_reasons),
+                )
+                if unsupported_reasons and warning_key not in warned_rotary_sample_contracts:
+                    warned_rotary_sample_contracts.add(warning_key)
+                    reasons = '; '.join(unsupported_reasons)
+                    if position_embedding_type == 'mrope':
+                        affected_models = 'GPTModel'
+                    else:
+                        affected_models = 'GPTModel and HybridModel'
+                    log_on_each_pipeline_stage(
+                        logger=logger,
+                        tp_group=self.tp_group,
+                        dp_cp_group=self.dp_cp_group,
+                        level=logging.WARNING,
+                        msg='TE CUDA Graph self-attention capture does not preserve the runtime '
+                        f'rotary embedding contract for position_embedding_type='
+                        f'{position_embedding_type!r}, input_format='
+                        f'{"THD" if is_thd else "SBHD"}, context_parallel_size='
+                        f'{context_parallel_size}: {reasons}. CUDA Graph replay may omit or '
+                        'mis-shape rotary_pos_emb, so numerical results are not reliable. '
+                        'This is a pre-existing limitation in the sample-input path affecting '
+                        f'{affected_models}. Disable TE attention capture, or use regular '
+                        'RoPE with SBHD (any supported CP) or THD with CP=1, until the shared '
+                        'sample-input path is fixed.',
+                    )
 
             _sample_kwargs = {}
             if is_te_min_version("1.10.0"):

@@ -1839,6 +1839,48 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return super().__call__(*args, **kwargs)
 
+    def offload_scope_in_cuda_graph(self, *, require_concrete_modules: bool = False) -> bool:
+        """Return whether this layer's CUDA Graph scope contains an offload boundary.
+
+        Args:
+            require_concrete_modules: When ``True``, ignore configured scopes whose branch is an
+                ``IdentityOp``. HybridStack uses this mode because it represents attention and
+                MLP/MoE branches as separate ``TransformerLayer`` instances that share one config.
+                The default preserves the regular GPT ``TransformerLayer`` scope semantics.
+
+        An empty ``cuda_graph_modules`` list means whole-layer capture, but the legacy
+        fine-grained-offload integration does not install a per-module event boundary for that
+        scope. ``TransformerConfig`` warns about that shared GPT/Hybrid limitation; keep returning
+        ``False`` here until whole-layer attention, norm, and expert boundaries are handled
+        together.
+        """
+        if not self.config.fine_grained_activation_offloading:
+            return False
+
+        cuda_graph_modules = self.config.cuda_graph_modules
+        if not cuda_graph_modules:
+            return False
+
+        if CudaGraphModule.attn in cuda_graph_modules and (
+            self.offload_core_attn or self.offload_attn_proj or self.offload_qkv_linear
+        ):
+            has_attention = not (
+                isinstance(self.self_attention, IdentityOp)
+                and isinstance(self.cross_attention, IdentityOp)
+            )
+            if not require_concrete_modules or has_attention:
+                return True
+
+        if (
+            not self.is_moe_layer
+            and CudaGraphModule.mlp in cuda_graph_modules
+            and self.offload_mlp_norm
+        ):
+            if not require_concrete_modules or not isinstance(self.mlp, IdentityOp):
+                return True
+
+        return False
+
     def _set_offload_modules(self):
         """Set the offload modules for the transformer layer."""
         if self.config.fine_grained_activation_offloading:
@@ -1898,13 +1940,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     "Disabling mlp_norm offloading.",
                 )
         # Set the offload module in cuda graph flag.
-        self.offload_module_in_cuda_graph = False
-        if CudaGraphModule.attn in self.config.cuda_graph_modules:
-            if self.offload_core_attn or self.offload_attn_proj or self.offload_qkv_linear:
-                self.offload_module_in_cuda_graph = True
-        if not self.is_moe_layer and CudaGraphModule.mlp in self.config.cuda_graph_modules:
-            if self.offload_mlp_norm:
-                self.offload_module_in_cuda_graph = True
+        self.offload_module_in_cuda_graph = self.offload_scope_in_cuda_graph()
         if self.offload_module_in_cuda_graph:
             assert is_torch_min_version(
                 "2.9.0a0"

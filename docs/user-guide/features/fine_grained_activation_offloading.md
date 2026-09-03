@@ -94,7 +94,8 @@ from all configured offload modules after those filters.
 Fine-grained offloading is compatible with CUDA graphs. When CUDA graph is enabled, the following constraints apply:
 
 - `attn_norm` and `mlp_norm` **cannot** be offloaded (they cross CUDA graph boundaries).
-- `cuda_graph_scope` must include `attn` and `moe_router`.
+- Use an explicit scope containing each captured offloaded region: `attn` for attention-side offload, and add `moe_router` for the recommended partial-MoE delayed-expert setup.
+- Empty `cuda_graph_modules` (TE whole-layer capture) is not yet integrated with the offload event boundary and emits a warning; use explicit partial scopes.
 - `cuda_graph_impl` must be `transformer_engine`.
 - Requires `torch >= 2.9.0` and `transformer_engine >= 2.14.0`.
 
@@ -107,17 +108,19 @@ Fine-grained offloading is compatible with CUDA graphs. When CUDA graph is enabl
 
 **Inside vs outside `cuda_graph_scope`.** Offload boundaries that lie **inside** the captured `cuda_graph_scope` (for example `qkv_linear`, `core_attn`, and `attn_proj` when `attn` is in scope) are part of CUDA graph **capture and replay**. Their offload-related work is replayed with the graph rather than re-driven from Python each step, so they do **not** incur the same per-step CPU launch overhead as a purely eager path.
 
-Boundaries that run **outside** the captured region still execute as normal eager PyTorch each forward—for the recommended MoE setup, that includes expert compute after a graphed `moe_router` (e.g. offloading `expert_fc1` / `moe_act`). For those groups, each `group_offload` would otherwise submit D2H work from the host as soon as the forward hits the commit point.
+Boundaries that run **outside** the captured region still execute as normal eager PyTorch each forward—for the recommended MoE setup, that includes expert compute after a graphed `moe_router` (e.g. offloading `expert_fc1`, `moe_act`, or `fused_group_mlp`). For those groups, each `group_offload` would otherwise submit D2H work from the host as soon as the forward hits the commit point.
 
-**What this flag does.** It only affects offload commits that are explicitly wired with **delayed** group commit (currently the MoE expert path: `expert_fc1`, `moe_act`). Around each layer’s `TransformerEngine` CUDA graph replay, the offload manager enters **replay mode**; delayed commits **enqueue** `(callback, group name, forced tensors)` instead of launching D2H immediately, then **flush_delayed_groups** runs **after** that graph replay returns and issues the queued D2H copies in forward order, without changing the offload/reload semantics.
+**What this flag does.** It only affects offload commits that are explicitly wired with **delayed** group commit (currently the MoE expert path: `expert_fc1`, `moe_act`, and `fused_group_mlp`). Around each layer’s `TransformerEngine` CUDA graph replay, the offload manager enters **replay mode**; delayed commits **enqueue** `(callback, group name, forced tensors)` instead of launching D2H immediately, then **flush_delayed_groups** runs **after** that graph replay returns and issues the queued D2H copies in forward order, without changing the offload/reload semantics.
 
 **When this actually buys time (EP A2A after replay).** The benefit assumes a **real CPU/GPU synchronization gap right after graph replay**—in the usual MoE training layout, **expert parallel (EP) all-to-all** and related dispatch follows the graphed `moe_router` region. That A2A path typically needs the host to coordinate collectives and to **sync with the GPU** (e.g. wait for graph work to finish or for communication staging), so the CPU is not fully overlapped with useful launch work during that interval. Scheduling `flush_delayed_groups` **immediately after** `cudaGraphLaunch` returns uses that window to issue D2H copies from the host: the enqueue cost is largely **hidden** in slack that EP A2A would already incur. If there were no such post-replay sync (or expert work were fully captured inside the graph with no host-visible gap), deferring commits would not provide the same “free” host time.
 
 **Behavioral notes**
 
 - Does **not** replace or “delay” attention-side offloads inside the graphed `attn` region; those are not on the delayed path in the implementation.
+- HybridModel mHC wrappers currently leave their eager expert continuation outside this delayed replay lifecycle. They warn when delayed `expert_fc1`, `moe_act`, or `fused_group_mlp` offload is requested and commit those groups immediately until an explicit end-of-iteration drain is implemented.
 - Warmup and non-replay forwards still commit delayed-eligible groups immediately (no replay-mode deferral).
-- Must be used together with **fine-grained activation offloading** and **CUDA graph** under the same rules as this section (TE `cuda_graph_impl`, scope including `attn` and `moe_router`, etc.).
+- Must be used together with **fine-grained activation offloading** and **CUDA graph** under the same rules as this section (TE `cuda_graph_impl` and an explicit scope containing the relevant captured region—typically `moe_router`, plus `attn` when attention is also captured/offloaded).
+- The current lifecycle flushes delayed groups only at a later graph replay. The final eager expert group can therefore remain queued and be discarded by pipeline reset without a D2H copy, reducing the intended memory saving. A configuration warning is emitted until an explicit end-of-iteration drain is implemented.
 - Stream ordering between the graph compute path and `d2h_stream` still uses the existing events (`forward_record` / `backward_record`); this option only changes **when** eligible D2H work is submitted from the host.
 
 ### Combining with Fine-Grained Recomputation
