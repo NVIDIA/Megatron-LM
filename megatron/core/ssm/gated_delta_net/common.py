@@ -450,8 +450,14 @@ class _GDNBase(MegatronModule):
             # signature of this step alone.
             _pre_l2 = query_key.contiguous()
             if self.config.deterministic_mode:
+                # Mirror fla's formula, not just its result: it computes rsqrt(sum + eps) with
+                # eps=1e-6, NOT rsqrt(max(sum, eps)). The two agree bitwise at normal magnitudes
+                # but diverge sharply once the row norm approaches eps -- measured on H100/fp32,
+                # a clamp(min=1e-12) version drifts 56% at input scale 1e-4 while the additive
+                # form stays at float noise (~1e-7) across every scale tested. deterministic_mode
+                # is supposed to swap the kernel, not the function.
                 _f = _pre_l2.float()
-                query_key = (_f * torch.rsqrt(_f.pow(2).sum(-1, keepdim=True).clamp(min=1e-12))).to(
+                query_key = (_f * torch.rsqrt(_f.pow(2).sum(-1, keepdim=True) + 1e-6)).to(
                     _pre_l2.dtype
                 )
             else:

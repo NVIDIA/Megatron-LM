@@ -863,8 +863,18 @@ def test_deterministic_mode_covers_every_nondeterministic_kernel():
 
     src = inspect.getsource(GatedDeltaNet._prepare_input_for_gated_delta_rule)
     assert "l2norm(" in src, "test is stale: the q/k L2 norm call moved or was renamed"
-    assert "deterministic_mode" in src, (
+
+    # Strip comments before asserting: a bare `"deterministic_mode" in src` is satisfied by the
+    # explanatory comment above the branch, so deleting the branch itself would still pass.
+    code = "\n".join(ln.split("#", 1)[0] for ln in src.splitlines())
+    assert "deterministic_mode" in code, (
         "the q/k L2 norm no longer consults deterministic_mode: fla's Triton l2norm is back on "
         "the deterministic path, which makes training irreproducible while every "
         "validate_deterministic() check still passes"
+    )
+    # And pin WHICH side calls fla: every l2norm( call must sit after the deterministic_mode
+    # branch opens, i.e. on the else. A call before it would run unconditionally again.
+    assert code.index("deterministic_mode") < code.index("l2norm("), (
+        "an l2norm( call now precedes the deterministic_mode check, so the Triton kernel runs "
+        "unconditionally"
     )
