@@ -55,6 +55,10 @@ try:
         fully_shard,
         fully_shard_context,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
+        all_sharding_strategies_in,
+        any_sharding_strategy_in,
+    )
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -137,9 +141,8 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> Tuple[Type[nn.Module], ...]:
         """Module classes needing ``parameters(recurse=True)`` for fine-grained hooks."""
-        if (
-            config.overlap_moe_expert_parallel_comm
-            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        if config.overlap_moe_expert_parallel_comm and any_sharding_strategy_in(
+            ddp_config, ["optim_grads_params"]
         ):
             # Lazy import to avoid circular chain.
             from megatron.core.transformer.moe.experts import TEGroupedMLP
@@ -205,7 +208,9 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
             # "optim": Reduce-scatter communication groups on the final microbatch.
             # "optim_grads": Additionally, RS communication groups on all microbatches.
             # "optim_grads_params": RS & AG communication groups on all microbatches.
-            if self.ddp_config.data_parallel_sharding_strategy != "no_shard":
+            # Units are worth forming if either parameter class shards anything, so both
+            # strategies have to be consulted.
+            if not all_sharding_strategies_in(self.ddp_config, ["no_shard"]):
                 self.fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
             else:
                 self.fsdp_unit_modules = []
@@ -224,9 +229,8 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 "(cuda_graph_impl='none')."
             )
 
-        if (
-            config.overlap_moe_expert_parallel_comm
-            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        if config.overlap_moe_expert_parallel_comm and any_sharding_strategy_in(
+            ddp_config, ["optim_grads_params"]
         ):
             supported_fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
             assert self.fsdp_unit_modules and all(
@@ -263,7 +267,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 ),
                 enable_fine_grained_param_gather_backward_hook=(
                     config.overlap_moe_expert_parallel_comm
-                    and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+                    and any_sharding_strategy_in(ddp_config, ["optim_grads_params"])
                 ),
                 fine_grained_recurse_module_types=self._fine_grained_recurse_module_types(
                     config, ddp_config
