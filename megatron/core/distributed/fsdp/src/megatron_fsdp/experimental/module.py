@@ -30,6 +30,7 @@ from .indexed_order import IndexedOrder
 from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import Flat
+from .schedule import SchedulePolicy
 
 
 def _is_in_backward() -> bool:
@@ -159,6 +160,8 @@ class FsdpModule:
     _context: FsdpContext
     _trainable_parameter_countdown: Countdown
     _is_root: bool
+    _num_trainable_parameters: int
+    _schedule_policy: SchedulePolicy
     # Event recorded after this FsdpModule's full parameters are materialized.
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
     # already prefetched this module.
@@ -178,6 +181,7 @@ class FsdpModule:
         main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
+        schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
@@ -186,6 +190,7 @@ class FsdpModule:
         self._name = None
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
+        self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
@@ -363,9 +368,25 @@ class FsdpModule:
         # prefetch the next module in forward order: its backward may already
         # be complete, so no later backward hook would reshard it.
         if not is_recomputing:
-            next_module = context.forward_order.next_item(self)
+            self._prefetch_parameter_groups(
+                context.forward_order, self._schedule_policy.forward_prefetch_size
+            )
+
+    def _prefetch_parameter_groups(
+        self, order: IndexedOrder["FsdpModule"], prefetch_size: int | None
+    ) -> None:
+        """Prefetch successors from ``order`` according to this module's budget."""
+        next_module = order.next_item(self)
+        if prefetch_size is None:
             if next_module is not None:
                 next_module._unshard_parameter_groups()
+            return
+
+        prefetched_size = 0
+        while next_module is not None and prefetched_size < prefetch_size:
+            next_module._unshard_parameter_groups()
+            prefetched_size += next_module.num_parameter_elements
+            next_module = order.next_item(next_module)
 
     def _unshard_parameter_groups(self) -> None:
         """Unshard this FsdpModule's parameter groups on the all-gather stream.
@@ -435,9 +456,9 @@ class FsdpModule:
         assert self._unshard_event is not None
         current_stream.wait_event(self._unshard_event)
 
-        next_module = context.backward_order.next_item(self)
-        if next_module is not None:
-            next_module._unshard_parameter_groups()
+        self._prefetch_parameter_groups(
+            context.backward_order, self._schedule_policy.backward_prefetch_size
+        )
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
@@ -470,6 +491,15 @@ class FsdpModule:
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
         """Parameter groups owned by this FsdpModule."""
         return self._parameter_groups
+
+    @property
+    def num_parameter_elements(self) -> int:
+        """Return the number of unsharded parameter elements owned by this module."""
+        return sum(
+            parameter.unsharded.numel()
+            for group in self._parameter_groups
+            for parameter in group.fsdp_parameters
+        )
 
     def _nvtx_label(self, phase: Literal["forward", "backward"]) -> str:
         name = self.name if self.name else "<root>"
