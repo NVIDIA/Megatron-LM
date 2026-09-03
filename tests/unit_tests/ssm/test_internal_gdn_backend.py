@@ -260,6 +260,21 @@ def _implementation():
     return implementation
 
 
+def test_fla_compat_drops_unsupported_use_exp2_without_rescaling_gate():
+    implementation = _implementation()
+    gate = torch.tensor([implementation.RCP_LN2], dtype=torch.float32)
+    seen = {}
+
+    def primitive(g):
+        seen["g"] = g
+        return g
+
+    result = implementation._call_fla_compat(primitive, g=gate, use_exp2=True)
+
+    assert result is gate
+    assert seen["g"] is gate
+
+
 def test_fla_mode_bypasses_cutedsl_capability_checks(monkeypatch):
     implementation = _implementation()
     expected = (torch.empty(1), None)
