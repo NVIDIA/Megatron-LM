@@ -142,8 +142,11 @@ class _ToyInferenceService:
         self.engine.vision_embedding_cache_max_bytes = 1 << 20
         self.engine._vision_embedding_cache = OrderedDict()
         self.engine._vision_embedding_cache_bytes = 0
+        # alpha is the load penalty, not a blend weight: at 1.0 a single request
+        # of imbalance across two ranks exactly cancels the media hit and the
+        # vision encoder would re-run. The default keeps the hit decisive.
         self.coordinator = make_coordinator_direct(
-            enable_prefix_caching=False, prefix_caching_routing_alpha=1.0
+            enable_prefix_caching=False, prefix_caching_routing_alpha=0.5
         )
         self.selected_ranks = []
         self._request_id = 0

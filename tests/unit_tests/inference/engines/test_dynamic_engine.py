@@ -39,6 +39,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -345,6 +346,9 @@ class DynamicEngineTestConfig:
     tensor_model_parallel_size: int = 1
     pipeline_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
+    # EP process groups can also exercise dense models; build MoE layers only
+    # when a test explicitly owns that model behavior.
+    use_moe_layer_spec: bool = False
     sequence_parallel: bool = False
 
     use_fixed_output_lengths: bool = False
@@ -358,7 +362,7 @@ class DynamicEngineTestConfig:
     cuda_graph_mixed_prefill_count: Optional[int] = 16
     cuda_graph_max_tokens: int = 512
     fp8: bool = False
-    hidden_size: int = 32
+    hidden_size: Optional[int] = None
     model_provider: str = "gpt"
     # Which linear-attention mixer a hybrid stack uses ("mamba", "gdp", or
     # "gdn"). Ignored unless model_provider == "hybrid": all three build a
@@ -606,7 +610,11 @@ class DynamicInferenceEngineTestBase:
                 params_dtype=torch.bfloat16,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
-                hidden_size=test_config.hidden_size,
+                hidden_size=(
+                    test_config.hidden_size
+                    if test_config.hidden_size is not None
+                    else (128 if test_config.fp8 else 32)
+                ),
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 cuda_graph_impl=effective_cuda_graph_impl,
@@ -660,19 +668,16 @@ class DynamicInferenceEngineTestBase:
                 window_attn_skip_freq=test_config.window_attn_skip_freq,
             )
             # Layer-spec factories do not receive TransformerConfig. Forward num_moe_experts
-            # explicitly so MoE test cases build MoE layers instead of a dense MLP.
+            # explicitly for MoE test cases so they build MoE layers instead of a dense MLP.
+            num_experts = (
+                transformer_config.num_moe_experts if test_config.use_moe_layer_spec else None
+            )
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
-                layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                    num_experts=transformer_config.num_moe_experts
-                )
+                layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=num_experts)
             elif test_config.transformer_impl == "local":
-                layer_spec = get_gpt_layer_local_spec(
-                    num_experts=transformer_config.num_moe_experts
-                )
+                layer_spec = get_gpt_layer_local_spec(num_experts=num_experts)
             elif test_config.transformer_impl == "inference_optimized":
-                layer_spec = get_gpt_layer_with_inference_spec(
-                    num_experts=transformer_config.num_moe_experts
-                )
+                layer_spec = get_gpt_layer_with_inference_spec(num_experts=num_experts)
 
             # MTP block spec (needed for speculative decoding).
             mtp_block_spec = None
@@ -1198,12 +1203,14 @@ def test_streaming_partials_are_sent():
 
     engine._try_send_streaming_partials()
 
-    engine.socket_for_receiving_requests.send.assert_called_once()
+    # Partials go out as [metadata, body] frames: the metadata names the request
+    # ids so the coordinator can route without decoding the bodies.
+    engine.socket_for_receiving_requests.send_multipart.assert_called_once()
+    frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
+    assert msgpack.unpackb(frames[0], raw=False) == [Headers.ENGINE_REPLY_PARTIAL.value, [7]]
+    assert msgpack.unpackb(frames[1], raw=False)["new_tokens"] == [11, 12, 13]
     assert engine._partial_emit_lengths == {7: 3}
-    payload = msgpack.unpackb(
-        engine.socket_for_receiving_requests.send.call_args.args[0], raw=False
-    )
-    partial = payload[1][0]
+    partial = msgpack.unpackb(frames[1], raw=False)
     assert partial["new_top_n_logprobs"] == request.generated_top_n_logprobs
     assert partial["prompt_log_probs"] == request.prompt_log_probs
     assert partial["prompt_top_n_logprobs"] == request.prompt_top_n_logprobs
@@ -1224,13 +1231,13 @@ def test_streaming_partials_buffer_until_token_interval():
 
     engine._try_send_streaming_partials()
 
-    engine.socket_for_receiving_requests.send.assert_not_called()
+    engine.socket_for_receiving_requests.send_multipart.assert_not_called()
     assert engine._partial_emit_lengths == {}
 
     request.generated_tokens.append(13)
     engine._try_send_streaming_partials()
 
-    engine.socket_for_receiving_requests.send.assert_called_once()
+    engine.socket_for_receiving_requests.send_multipart.assert_called_once()
     assert engine._partial_emit_lengths == {7: 3}
 
 

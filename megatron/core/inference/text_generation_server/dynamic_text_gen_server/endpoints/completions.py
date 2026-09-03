@@ -9,7 +9,7 @@ from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
-from ..openai_streaming import openai_stream
+from ..openai_streaming import json_safe_logprobs, json_safe_top_n_logprobs, openai_stream
 from .common import abort_requests
 
 logger = logging.getLogger(__name__)
@@ -305,18 +305,23 @@ try:
             if num_tokens_requested is None or len(generated_tokens) < num_tokens_requested:
                 finish_reason = "stop"
 
+            # Clamped: processed logprobs can be -inf, which JSON cannot carry.
+            generated_log_probs = json_safe_logprobs(result.get('generated_log_probs') or [])
+
             logprobs_data = None
             if sampling_params.return_log_probs:
-                # Get prompt tokens and logprobs
                 prompt_tokens_list = result["prompt_tokens"] or []
 
-                prompt_log_probs = result.get('prompt_log_probs') or []
-                prompt_top_n_logprobs = result.get('prompt_top_n_logprobs') or []
+                prompt_log_probs = json_safe_logprobs(result.get('prompt_log_probs') or [])
+                prompt_top_n_logprobs = json_safe_top_n_logprobs(
+                    result.get('prompt_top_n_logprobs') or []
+                )
 
                 # Get generated tokens and logprobs
                 generated_tokens_list = result["generated_tokens"] or []
-                generated_log_probs = result.get('generated_log_probs') or []
-                generated_top_n_logprobs = result.get('generated_top_n_logprobs') or []
+                generated_top_n_logprobs = json_safe_top_n_logprobs(
+                    result.get('generated_top_n_logprobs') or []
+                )
 
                 if echo:
                     # When echo=True, include prompt tokens and their logprobs
@@ -375,7 +380,7 @@ try:
                 "finish_reason": finish_reason,
                 "prompt_token_ids": result["prompt_tokens"],
                 "generation_token_ids": result["generated_tokens"],
-                "generation_log_probs": result.get("generated_log_probs", []),
+                "generation_log_probs": generated_log_probs,
             }
 
             if result["routing_indices"] is not None:

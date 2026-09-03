@@ -782,6 +782,7 @@ _ASYNC_PARALLEL_SCENARIOS = (
         "interaction:moe-ep-ordering",
         config={
             "expert_model_parallel_size": 2,
+            "use_moe_layer_spec": True,
             "inference_moe_token_dispatcher_type": "nccl",
             "transformer_impl": "inference_optimized",
         },
