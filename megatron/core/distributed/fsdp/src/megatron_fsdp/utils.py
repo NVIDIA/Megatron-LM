@@ -107,19 +107,30 @@ def is_submodule(module, parent_module, strict=True):
 
 
 def find_megatron_fsdp(model):
-    """Walk the model wrapper chain to find a MegatronFSDP instance, if any."""
+    """Walk the model wrapper chain to find a Megatron-FSDP wrapper, if any."""
     # Lazy import to avoid a circular import: megatron_fsdp.py transitively imports
     # this module during its own initialization, so a top-level import of
     # MegatronFSDP here would fail with a partially-initialized module error.
     try:
         from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
     except (ImportError, ModuleNotFoundError):
-        return None
+        MegatronFSDP = None
+    try:
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+    except (ImportError, ModuleNotFoundError):
+        FsdpModule = None
     m = model
     while m is not None:
-        if isinstance(m, MegatronFSDP):
+        if MegatronFSDP is not None and isinstance(m, MegatronFSDP):
             return m
-        m = getattr(m, 'module', None)
+        wrapped_module = getattr(m, 'module', None)
+        if (
+            FsdpModule is not None
+            and isinstance(wrapped_module, FsdpModule)
+            and hasattr(m, "ddp_config")
+        ):
+            return m
+        m = wrapped_module
     return None
 
 

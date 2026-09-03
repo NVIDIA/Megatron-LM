@@ -14,7 +14,10 @@
 
 import logging
 import random
-from typing import Dict, List, NamedTuple, Optional, Tuple, Type
+from contextlib import contextmanager
+from functools import partial
+from typing import Dict, List, NamedTuple, Optional, Tuple, Type, cast
+from weakref import ref
 
 __all__ = ["FullyShardedDataParallel"]
 
@@ -55,6 +58,7 @@ try:
         fully_shard,
         fully_shard_context,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
@@ -62,6 +66,68 @@ except ImportError as import_megatron_fsdp_error:
     HAVE_MEGATRON_FSDP = False
 
 logger = logging.getLogger(__name__)
+
+_FSDP_PARENT_MODULE_REF_ATTR = "_fsdp_parent_module_ref"
+
+
+def _find_fsdp_target(submodule: nn.Module) -> FsdpModule | None:
+    """Return the nearest parent FsdpModule for a fine-grained schedule module."""
+    if isinstance(submodule, FsdpModule):
+        return submodule
+    parent_ref = getattr(submodule, _FSDP_PARENT_MODULE_REF_ATTR, None)
+    return parent_ref() if parent_ref is not None else None
+
+
+def _fine_grained_pre_forward_hook(submodule: nn.Module, _args, _kwargs) -> None:
+    """Materialize the owning FSDP unit before a schedule sub-module runs."""
+    target = _find_fsdp_target(submodule)
+    if target is None:
+        return
+    if not target.training:
+        # Evaluation uses the conventional forward-only schedule, not combined 1F1B.
+        # Keep its parameter lifetime independent of the training execution trace.
+        target.unshard_parameters_for_forward_only()
+        return
+    # The combined schedule bypasses FsdpModule.pre_forward(). Use the public
+    # fine-grained entry point so the shared execution runner observes the real
+    # consume order and owns both static and trace-replay prefetch decisions.
+    target.unshard_parameters("rowwise")
+
+
+def _fine_grained_post_forward_only_hook(module: nn.Module, _args, _kwargs, output):
+    """Release every unit after one conventional forward-only model invocation."""
+    if module.training:
+        return output
+    for submodule in reversed(list(module.modules())):
+        if isinstance(submodule, FsdpModule):
+            submodule._release_unsharded_parameter_groups()
+    return output
+
+
+def _fine_grained_pre_backward_hook(submodule: nn.Module, _grad_output) -> None:
+    """Enter the owning FSDP unit's backward lifecycle before sub-module backward."""
+    target = _find_fsdp_target(submodule)
+    if target is not None and target.phase is FsdpModule.Phase.RESTING:
+        target.pre_backward(register_final_callback=False)
+
+
+def _register_fine_grained_hooks(module: FsdpModule) -> None:
+    """Install the sub-module hooks required by MCore combined 1F1B."""
+
+    def register_hooks(submodule: nn.Module, owner: FsdpModule) -> None:
+        """Register hooks recursively while preserving the nearest FSDP owner."""
+        if isinstance(submodule, FsdpModule):
+            owner = submodule
+        object.__setattr__(submodule, _FSDP_PARENT_MODULE_REF_ATTR, ref(owner))
+        submodule.register_forward_pre_hook(
+            _fine_grained_pre_forward_hook, prepend=True, with_kwargs=True
+        )
+        submodule.register_full_backward_pre_hook(_fine_grained_pre_backward_hook)
+        for child in submodule.children():
+            register_hooks(child, owner)
+
+    register_hooks(module, module)
+    module.register_forward_hook(_fine_grained_post_forward_only_hook, with_kwargs=True)
 
 
 def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> None:
@@ -545,8 +611,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
                 unspecified, transformer, MoE transformer, and Mamba layers are used.
-            disable_bucketing: Compatibility argument that must remain ``False`` for
-                MFSDP v2.
+            disable_bucketing: Compatibility argument accepted from the common data-parallel
+                wrapping path. MFSDP v2 manages parameter groups independently and ignores it.
             device: Device whose type is used to construct the data-parallel mesh.
                 Defaults to CUDA.
             pg_collection: Explicit process groups. The ``dp_cp`` group defines the
@@ -561,9 +627,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise IMPORT_MEGATRON_FSDP_ERROR
         if pg_collection is None:
             raise ValueError("MFSDP v2 requires an explicit ProcessGroupCollection.")
-        FullyShardedDataParallelV2._validate_config(
-            config, ddp_config, module, pg_collection, disable_bucketing
-        )
+        FullyShardedDataParallelV2._validate_config(config, ddp_config, module, pg_collection)
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -590,7 +654,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
 
         device_type = device.type if device is not None else "cuda"
-
         # Expert parameters use a single mesh over the whole expert-DP domain and never
         # take an outer axis. Dense parameters are the ones that go hybrid below.
         expert_dp_mesh = None
@@ -607,6 +670,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             parameter=[expert_axis.parameter],
             gradient=[expert_axis.gradient],
             optimizer=[expert_axis.optimizer],
+        )
+        overlap_moe_expert_parallel = config.overlap_moe_expert_parallel_comm
+        common_fully_shard_kwargs = dict(
+            mixed_precision_policy=self.mp_policy,
+            skip_forward_backward_hooks=overlap_moe_expert_parallel,
         )
 
         if has_outer_dp_axis := ddp_config.num_distributed_optimizer_instances > 1:
@@ -639,7 +707,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
-        with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
+        # The combined-1F1B EP overlap schedule does not follow the static
+        # forward/backward orders, so enable trace-and-replay prefetch. Join an
+        # ambient context when VPP chunks are wrapped together.
+        with fully_shard_context(
+            device=device,
+            reuse_existing=True,
+            use_trace_replay=overlap_moe_expert_parallel,
+            use_symmetric_memory=ddp_config.nccl_ub,
+        ):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
                 # Their gradients need the EP divisor because the same expert receives
@@ -652,8 +728,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             submodule.experts,
                             mesh=expert_dp_mesh,
                             placements=expert_placements,
-                            mixed_precision_policy=self.mp_policy,
                             grad_divisor=config.expert_model_parallel_size,
+                            **common_fully_shard_kwargs,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -667,17 +743,67 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         submodule,
                         mesh=dp_mesh,
                         placements=dense_placements,
-                        mixed_precision_policy=self.mp_policy,
+                        **common_fully_shard_kwargs,
                     )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
             fully_shard(
-                module,
-                mesh=dp_mesh,
-                placements=dense_placements,
-                mixed_precision_policy=self.mp_policy,
+                module, mesh=dp_mesh, placements=dense_placements, **common_fully_shard_kwargs
             )
         super().__init__(config=config, module=module)
+        if overlap_moe_expert_parallel:
+            self._setup_1f1b_overlap_interface()
+
+    def _setup_1f1b_overlap_interface(self) -> None:
+        """Expose the parameter lifecycle callbacks used by combined 1F1B.
+
+        All callbacks live on the adapter rather than on ``FsdpModule`` so the
+        experimental module API stays schedule-agnostic; the schedule-facing
+        surface is assembled here.
+        """
+
+        def _require_fsdp_module(module: torch.nn.Module) -> FsdpModule:
+            if not isinstance(module, FsdpModule):
+                raise TypeError(
+                    "MFSDP v2 combined 1F1B callbacks require an experimental FsdpModule, "
+                    f"got {type(module).__name__}."
+                )
+            return module
+
+        def finalize_backward(module: torch.nn.Module) -> None:
+            """Finalize one schedule unit and any nested FSDP units exactly once."""
+            module = _require_fsdp_module(module)
+            for fsdp_module in reversed(list(cast(nn.Module, module).modules())):
+                if not isinstance(fsdp_module, FsdpModule):
+                    continue
+                if fsdp_module.phase is not FsdpModule.Phase.BACKWARD:
+                    continue
+                fsdp_module.post_backward()
+
+        def release_module(module: torch.nn.Module, *, reduce_grad: bool) -> None:
+            module = _require_fsdp_module(module)
+            if reduce_grad:
+                finalize_backward(module)
+            else:
+                module._reshard_parameter_groups()
+
+        def _replace_param_with_raw_if_needed() -> None:
+            """Initialize the root context before a fine-grained schedule runs.
+
+            The experimental API stores raw tensors backed by DBuffer at all
+            times, so no parameter swap is needed, but finalizing the context
+            here ensures a child FSDP unit cannot mistake itself for the root
+            when it executes first.
+            """
+            self.module.context.ensure_finalized()
+
+        self._replace_param_with_raw_if_needed = _replace_param_with_raw_if_needed
+        self.post_forward_release_module = partial(release_module, reduce_grad=False)
+        self.post_backward_release_module = partial(release_module, reduce_grad=True)
+        self.pre_backward = partial(self.module.pre_backward, register_final_callback=False)
+        self.post_backward = partial(finalize_backward, self.module)
+
+        _register_fine_grained_hooks(self.module)
 
     @staticmethod
     def _validate_config(
@@ -685,7 +811,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
         pg_collection: ProcessGroupCollection,
-        disable_bucketing: bool,
     ) -> None:
         """Validate that the model and configuration are supported by MFSDP v2.
 
@@ -695,15 +820,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             module: Model whose parameters are checked for expert parallelism.
             pg_collection: Materialized process groups whose topology must match the
                 supported MFSDP v2 topology.
-            disable_bucketing: Whether parameter bucketing is disabled.
 
         Raises:
             ValueError: If a required process group is missing or the model,
                 topology, or data-parallel configuration uses an unsupported feature.
         """
-        if disable_bucketing:
-            raise ValueError("MFSDP v2 does not support disabling bucketing.")
-        if not hasattr(pg_collection, 'dp_cp'):
+        if pg_collection.dp_cp is None:
             raise ValueError("MFSDP v2 requires an explicit dp_cp process group.")
 
         if config.mtp_detach_heads:
@@ -715,11 +837,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             # silently inflated norm.
             raise ValueError("MFSDP v2 does not currently support mtp_detach_heads.")
 
-        unsupported_parallelisms = [
-            "tensor_model_parallel_size",
-            "pipeline_model_parallel_size",
-            "context_parallel_size",
-        ]
+        unsupported_parallelisms = ["tensor_model_parallel_size", "context_parallel_size"]
         if any(getattr(config, parallelism) != 1 for parallelism in unsupported_parallelisms):
             raise ValueError(
                 "MFSDP v2 does not currently support: "
@@ -731,7 +849,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         # The config validates the requested topology, while these checks validate the
         # materialized topology supplied by the caller's process-group collection.
-        for group_name in ("tp", "pp", "cp"):
+        for group_name in ("tp", "cp"):
             group = getattr(pg_collection, group_name, None)
             if group is not None and group.size() != 1:
                 raise ValueError(
@@ -787,20 +905,37 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 requires symmetric registration when nccl_ub is enabled.")
         if ddp_config.fsdp_manual_registration:
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
-        if ddp_config.delay_wgrad_compute:
-            raise ValueError("MFSDP v2 does not support delay_wgrad_compute.")
+        if ddp_config.delay_wgrad_compute and not config.overlap_moe_expert_parallel_comm:
+            raise ValueError(
+                "MFSDP v2 only supports delay_wgrad_compute with "
+                "overlap_moe_expert_parallel_comm."
+            )
         if ddp_config.suggested_communication_unit_size is not None:
             raise ValueError("MFSDP v2 does not support suggested_communication_unit_size.")
         if ddp_config.num_buckets is not None:
             raise ValueError("MFSDP v2 does not support num_buckets.")
         if ddp_config.megatron_fsdp_use_decoupled_grad:
             raise ValueError("MFSDP v2 does not support megatron_fsdp_use_decoupled_grad.")
-        if ddp_config.megatron_fsdp_enable_fine_grained_param_gather:
-            raise ValueError(
-                "MFSDP v2 does not support megatron_fsdp_enable_fine_grained_param_gather."
-            )
         if ddp_config.megatron_fsdp_max_pool_double_buffer:
             raise ValueError("MFSDP v2 does not support megatron_fsdp_max_pool_double_buffer.")
+
+    @contextmanager
+    def no_sync(self):
+        """Suppress gradient finalization for non-final microbatches.
+
+        Toggles ``is_last_microbatch`` on all roots in this model's shared
+        ``FsdpContext`` so gradient reduce-scatters accumulate between microbatches
+        rather than finalizing on every backward. Called by the training loop via
+        ``config.no_sync_func`` and the 1F1B overlap schedule.
+        """
+        self.module.context.ensure_finalized()
+        context = self.module.context
+        previous_state = context.is_last_microbatch
+        context.is_last_microbatch = False
+        try:
+            yield
+        finally:
+            context.is_last_microbatch = previous_state
 
     def start_param_sync(self, *unused, **unused_kwargs) -> None:
         """No-op: MFSDP v2 gathers parameters from its forward pre-hooks."""
@@ -809,7 +944,19 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """MFSDP v2 reduces gradients during backward."""
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
-        """MFSDP v2 gradient reduction is complete when backward returns."""
+        """Wait for backward reduce-scatters before gradient consumers run."""
+        context = self.module.context
+        context.current_stream().wait_stream(context.reduce_scatter_stream)
+
+    def complete_fsdp_trace(self) -> None:
+        """Mark the global-batch boundary for the execution-order runner.
+
+        Called by the optimizer immediately before each parameter update so the runner
+        compiles the traced fine-grained consume cycle and, from the second
+        global batch, replays it to prefetch the true next consumer under the
+        combined-1F1B + VPP schedule.
+        """
+        self.module.context.runner.complete_trace()
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""

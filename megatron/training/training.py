@@ -40,9 +40,10 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 # measurement (kept for backwards compatibility).
 _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
+from megatron.core import mpu, nccl_allocator, tensor_parallel
+
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core import mpu, nccl_allocator, tensor_parallel
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
@@ -50,11 +51,13 @@ from megatron.core.distributed import (
     TorchFullyShardedDataParallelConfig,
     finalize_model_grads,
 )
+from megatron.core.distributed.finalize_model_grads import sync_mfsdp_v2_shared_embedding_weights
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel,
     FullyShardedDataParallelV1,
     FullyShardedDataParallelV2,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
@@ -312,10 +315,10 @@ def set_startup_timestamps(
 
 # OTel: module-level helpers imported once at startup.
 try:
-    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
     from nemo.lens.helpers import managed_span as _otel_managed_span
     from nemo.lens.helpers import safe_set_span_attributes as _otel_safe_set_attrs
     from nemo.lens.helpers import trace_fn as _otel_trace_fn
+    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
 except ImportError:
     from megatron.core.telemetry.fallbacks import is_span_group_enabled as _otel_sg_enabled
     from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
@@ -429,9 +432,10 @@ def _start_otel_job_spans(model_type, program_start):
     if not _otel_sg_enabled('job'):
         return
 
-    from opentelemetry import context as _otel_ctx, trace as _otel_trace
-    from opentelemetry.context import Context as _OtelContext
     from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+    from opentelemetry import context as _otel_ctx
+    from opentelemetry import trace as _otel_trace
+    from opentelemetry.context import Context as _OtelContext
 
     _otel_ctx_module = _otel_ctx
     _otel_tracer = get_telemetry().tracer
@@ -585,7 +589,8 @@ def _reroot_otel_interval():
     global _otel_interval_span, _otel_interval_ctx_token
     if get_telemetry() is None or not _otel_sg_enabled('job'):
         return
-    from opentelemetry import context as _octx, trace as _otr
+    from opentelemetry import context as _octx
+    from opentelemetry import trace as _otr
     from opentelemetry.context import Context
     from opentelemetry.trace import Link
     prev = _otel_interval_span
@@ -2332,25 +2337,50 @@ def wrap_model_chunks_with_ddp(
                 )
 
     # Wrap each chunk.
-    wrapped = []
-    for chunk, layout, disable_bucketing in zip(
-        model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
-    ):
-        chunk_kwargs = {}
-        # TorchFSDP takes process_group, not pg_collection.
-        if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
-            chunk_kwargs["pg_collection"] = pg_collection
-        if layout is not None:
-            chunk_kwargs["full_param_layout"] = layout
-        wrapped.append(
-            DP(
-                config=config,
-                ddp_config=ddp_config,
-                module=chunk,
-                disable_bucketing=disable_bucketing,
-                **chunk_kwargs,
-            )
+    # MFSDP v2 chunks must share one FsdpContext so cross-chunk prefetch
+    # orders and communication streams coordinate under VPP and the
+    # combined-1F1B overlap schedule. The adapter joins an ambient
+    # fully_shard_context when present (reuse_existing=True). The training
+    # path passes the FullyShardedDataParallel factory (which resolves to V2
+    # from ddp_config.megatron_fsdp_version), not the V2 class itself.
+    #
+    # The ambient context must be created with trace-replay enabled when the
+    # combined-1F1B EP-overlap schedule is active: the adapter requests
+    # use_trace_replay=fine_grained but a reuse_existing join yields THIS
+    # context as-is, so its flags win. Creating it without trace-replay
+    # silently disabled the runner for every VPP + overlap run.
+    wrap_v2_shared_context = (
+        DP is FullyShardedDataParallelV2
+        or (DP is FullyShardedDataParallel and ddp_config.megatron_fsdp_version == 2)
+    ) and len(model_chunks) > 1
+    if wrap_v2_shared_context:
+        fsdp_context_cm = fully_shard_context(
+            use_trace_replay=config.overlap_moe_expert_parallel_comm,
+            use_symmetric_memory=ddp_config.nccl_ub,
         )
+    else:
+        fsdp_context_cm = nullcontext()
+
+    wrapped = []
+    with fsdp_context_cm:
+        for chunk, layout, disable_bucketing in zip(
+            model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
+        ):
+            chunk_kwargs = {}
+            # TorchFSDP takes process_group, not pg_collection.
+            if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
+                chunk_kwargs["pg_collection"] = pg_collection
+            if layout is not None:
+                chunk_kwargs["full_param_layout"] = layout
+            wrapped.append(
+                DP(
+                    config=config,
+                    ddp_config=ddp_config,
+                    module=chunk,
+                    disable_bucketing=disable_bucketing,
+                    **chunk_kwargs,
+                )
+            )
     return wrapped
 
 
@@ -2766,6 +2796,22 @@ def setup_model_and_optimizer(
             register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=True))
 
     model = _build_model_wrapper(wrap_with_ddp)
+    model_config = get_model_config(model[0])
+    if (
+        model_config.init_model_with_meta_device
+        and all(isinstance(model_chunk, FullyShardedDataParallelV2) for model_chunk in model)
+    ):
+        sync_pg_collection = (
+            pg_collection
+            if pg_collection is not None
+            else ProcessGroupCollection.use_mpu_process_groups()
+        )
+        sync_mfsdp_v2_shared_embedding_weights(
+            model,
+            model_config,
+            embd_group=sync_pg_collection.embd,
+            pp_group=sync_pg_collection.pp,
+        )
     unwrapped_model = unwrap_model(model)
 
     # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
@@ -3045,7 +3091,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # OTel: set up per-step sub-span support.
     _otel_step_tracer = None
     if _otel_sg_enabled('forward_backward') or _otel_sg_enabled('optimizer'):
-        from nemo.lens.helpers import span_cm, safe_set_span_attributes as _otel_set_attrs
+        from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+        from nemo.lens.helpers import span_cm
         _otel_step_tracer = get_telemetry().tracer
 
     rerun_state_machine = get_rerun_state_machine()
@@ -3871,7 +3918,8 @@ def save_checkpoint_and_time(
     _exposed_save_span = None
     _exposed_save_token = None
     if _otel_sg_enabled('checkpoint'):
-        from opentelemetry import context as _octx, trace as _otr
+        from opentelemetry import context as _octx
+        from opentelemetry import trace as _otr
         _exposed_save_span = get_telemetry().tracer.start_span('megatron.checkpoint.exposed_save')
         _otel_mark_goodput(_exposed_save_span)
         _exposed_save_span.set_attribute('megatron.iteration', iteration)
@@ -4911,7 +4959,8 @@ def train(
         _report_span = None
         _report_token = None
         if _otel_sg_enabled('step'):
-            from opentelemetry import context as _octx, trace as _otr
+            from opentelemetry import context as _octx
+            from opentelemetry import trace as _otr
             _report_span = get_telemetry().tracer.start_span('megatron.train.iteration_report')
             _otel_mark_goodput(_report_span)
             _report_token = _octx.attach(_otr.set_span_in_context(_report_span))

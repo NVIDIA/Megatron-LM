@@ -62,6 +62,8 @@ class Placements:
 def fully_shard_context(
     device: torch.device | None = None,
     *,
+    reuse_existing: bool = False,
+    use_trace_replay: bool = False,
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
 ) -> Iterator[FsdpContext]:
@@ -70,24 +72,66 @@ def fully_shard_context(
     Independent roots are ordered by their root-level ``fully_shard`` calls.
     Construction must finish before any of the registered modules run forward.
 
+    When ``reuse_existing`` is set and a context is already active on the same
+    device, that context is yielded instead of creating a new one. This lets
+    callers that open a context internally (e.g. per-model-chunk adapters)
+    join an outer construction scope, so every module in a multi-chunk model
+    (VPP) shares one set of streams and one cross-root prefetch order. The
+    context is finalized only by the outermost scope.
+
     Args:
         device: CUDA device on which to create communication streams. Defaults to
             the current CUDA device.
+        reuse_existing: Join an already-active context on ``device`` instead of
+            creating a new one. Defaults to False, which rejects nesting.
+        use_trace_replay: Enable trace-and-replay prefetch, which records the
+            actual fine-grained consume order during the first global batch
+            and replays it from the second batch. Required for complex
+            schedules (VPP + combined 1F1B) whose execution does not follow
+            the static forward/backward orders. Defaults to False (normal
+            forward/backward execution with static-order prefetch and
+            activation-recompute support).
         use_symmetric_memory: Allocate communication staging buffers from PyTorch's
             NCCL symmetric-memory pool.
         unify_communication_stream: Whether all-gathers and reduce-scatters share one
             communication stream to reduce peak transient memory. See
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
     """
-    if _FSDP_CONTEXT.get() is not None:
-        raise RuntimeError("fully_shard_context does not support nesting.")
+    requested_device = device or torch.device("cuda", torch.cuda.current_device())
+    if requested_device.type == "cuda" and requested_device.index is None:
+        requested_device = torch.device("cuda", torch.cuda.current_device())
+    existing = _FSDP_CONTEXT.get()
+    if existing is not None:
+        if not reuse_existing:
+            raise RuntimeError("fully_shard_context does not support nesting.")
+        if existing.device != requested_device:
+            raise ValueError(
+                "Cannot reuse a fully_shard_context on a different device: "
+                f"existing={existing.device}, requested={requested_device}."
+            )
+        mismatched_options = []
+        if existing.runner.use_trace_replay != use_trace_replay:
+            mismatched_options.append("use_trace_replay")
+        if existing.use_symmetric_memory != use_symmetric_memory:
+            mismatched_options.append("use_symmetric_memory")
+        if existing.unify_communication_stream != unify_communication_stream:
+            mismatched_options.append("unify_communication_stream")
+        if mismatched_options:
+            raise ValueError(
+                "Cannot reuse a fully_shard_context with different options: "
+                + ", ".join(mismatched_options)
+                + "."
+            )
+        yield existing
+        return
 
-    device = device or torch.device("cuda", torch.cuda.current_device())
+    device = requested_device
     if device.type != "cuda":
         raise ValueError(f"fully_shard_context requires a CUDA device, got {device}.")
 
     context = FsdpContext(
         device=device,
+        use_trace_replay=use_trace_replay,
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
     )
@@ -107,6 +151,7 @@ def fully_shard(
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
+    skip_forward_backward_hooks: bool = False,
     grad_divisor: int = 1,
 ) -> None:
     """Apply FSDP to a module in place.
@@ -120,6 +165,10 @@ def fully_shard(
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
+        skip_forward_backward_hooks: Skip the standard module-level forward/backward
+            hooks and per-parameter backward-completion callbacks. Integrations that
+            drive the full FSDP lifecycle through another hook or explicit callback
+            interface use this to avoid registering two lifecycle paths.
         grad_divisor: Additional divisor applied to the reduced gradient, on top of the
             averaging the mesh already performs. Defaults to 1, which is correct whenever
             each mesh rank contributes exactly one term to the gradient.
@@ -158,6 +207,7 @@ def fully_shard(
             main_grad_placements=tuple(placements.gradient),
             main_weight_placements=tuple(placements.optimizer),
             mixed_precision_policy=mixed_precision_policy,
+            skip_forward_backward_hooks=skip_forward_backward_hooks,
             grad_divisor=grad_divisor,
             use_symmetric_memory=context.use_symmetric_memory,
         )

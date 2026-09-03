@@ -8,12 +8,18 @@ from dataclasses import replace
 
 import pytest
 import torch
+from torch.distributed import DeviceMesh
 from torch.distributed.distributed_c10d import _world
 from torch.distributed.tensor import DTensor, Replicate, Shard
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    Placements,
+    fully_shard,
+    fully_shard_context,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -23,6 +29,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
+from megatron.core.optimizer.optimizer import MixedPrecisionOptimizer
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -132,7 +139,7 @@ class TestMcoreAdapterDense:
                 msg=f"{name} was not initialized to 0.25",
             )
 
-    def test_wraps_fsdp_unit_modules_before_root(self):
+    def test_wraps_fsdp_unit_modules_before_root(self, monkeypatch):
         config = TransformerConfig(
             num_layers=1,
             hidden_size=16,
@@ -157,11 +164,14 @@ class TestMcoreAdapterDense:
             ),
             module=model,
             fsdp_unit_modules=[TransformerLayer],
-            pg_collection=self.pg_collection,
+            pg_collection=ProcessGroupCollection(dp_cp=self.pg_collection.dp_cp),
         )
 
         assert isinstance(wrapped.module, FsdpModule)
         assert isinstance(wrapped.module[0], FsdpModule)
+        assert all(
+            getattr(parameter, "__fsdp_param__", False) for parameter in wrapped.parameters()
+        )
 
         # Post-order wrapping gives the selected TransformerLayer its own parameter group;
         # the root FSDP unit should own only the parameters of the remaining Linear module.
@@ -179,6 +189,260 @@ class TestMcoreAdapterDense:
         }
         assert child_parameter_names
         assert root_parameter_names == {"1.weight", "1.bias"}
+
+    def test_fine_grained_hooks_run_for_direct_submodule(self, monkeypatch):
+        """MCore-owned hooks materialize an FSDP unit called below its root."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        mesh = DeviceMesh.from_group(
+            self.pg_collection.dp_cp, device_type=device.type, mesh_dim_names=("dp",)
+        )
+        placements = Placements(
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        )
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False)).to(device)
+        module_names = tuple(name for name, _ in model.named_modules())
+
+        with fully_shard_context(device=device):
+            fully_shard(model, mesh=mesh, placements=placements, skip_forward_backward_hooks=True)
+            assert isinstance(model, FsdpModule)
+            mcore_fsdp_adapter._register_fine_grained_hooks(model)
+
+        assert tuple(name for name, _ in model.named_modules()) == module_names
+
+        unshard_calls = []
+        original_unshard = model._unshard_parameter_groups
+
+        def record_unshard(orientation="rowwise"):
+            unshard_calls.append(orientation)
+            original_unshard(orientation)
+
+        pre_backward_calls = []
+        original_pre_backward = model.pre_backward
+
+        def record_pre_backward(register_final_callback=True):
+            pre_backward_calls.append(register_final_callback)
+            original_pre_backward(register_final_callback=register_final_callback)
+
+        monkeypatch.setattr(model, "_unshard_parameter_groups", record_unshard)
+        monkeypatch.setattr(model, "pre_backward", record_pre_backward)
+
+        inputs = torch.randn(2, 4, device=device, requires_grad=True)
+        output = model[0](inputs)
+        assert unshard_calls == ["rowwise"]
+
+        output.sum().backward()
+        assert pre_backward_calls == [False]
+        assert unshard_calls == ["rowwise", "colwise"]
+        assert model.phase is FsdpModule.Phase.BACKWARD
+
+        model.post_backward()
+        assert model.phase is FsdpModule.Phase.RESTING
+
+    def test_forward_only_eval_preserves_training_trace_and_releases_weights(self):
+        """A train-eval-train transition must preserve replay and free eval weights."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        mesh = DeviceMesh.from_group(
+            self.pg_collection.dp_cp, device_type=device.type, mesh_dim_names=("dp",)
+        )
+        placements = Placements(
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        )
+        model = torch.nn.Sequential(torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))).to(
+            device
+        )
+
+        with fully_shard_context(device=device, use_trace_replay=True):
+            fully_shard(
+                model[0], mesh=mesh, placements=placements, skip_forward_backward_hooks=True
+            )
+            fully_shard(model, mesh=mesh, placements=placements, skip_forward_backward_hooks=True)
+
+        adapter = object.__new__(mcore_fsdp_adapter.FullyShardedDataParallelV2)
+        torch.nn.Module.__init__(adapter)
+        adapter.module = model
+        adapter._setup_1f1b_overlap_interface()
+        fsdp_modules = [
+            submodule for submodule in model.modules() if isinstance(submodule, FsdpModule)
+        ]
+        inputs = torch.randn(2, 4, device=device)
+
+        def run_training_forward_and_release():
+            model.train()
+            with torch.no_grad():
+                model(inputs)
+            for submodule in reversed(fsdp_modules):
+                submodule._reshard_parameter_groups()
+
+        run_training_forward_and_release()
+        runner = model.context.runner
+        runner.complete_trace()
+        training_trace = tuple(runner._trace)
+        assert training_trace
+
+        model.eval()
+        with torch.no_grad():
+            model(inputs)
+
+        assert tuple(runner._trace) == training_trace
+        assert runner._replay_index == 0
+        assert all(submodule._unshard_event is None for submodule in fsdp_modules)
+
+        run_training_forward_and_release()
+        assert runner._replay_index == len(training_trace)
+        assert runner._divergences == 0
+
+    def test_overlap_release_finalizes_nested_fsdp_units_once(self, monkeypatch):
+        """Adapter release recursively finalizes a schedule unit and is idempotent."""
+        device = torch.device("cuda", torch.cuda.current_device())
+        mesh = DeviceMesh.from_group(
+            self.pg_collection.dp_cp, device_type=device.type, mesh_dim_names=("dp",)
+        )
+        placements = Placements(
+            dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)]
+        )
+        model = torch.nn.Sequential(
+            torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False)),
+            torch.nn.Linear(4, 4, bias=False),
+        ).to(device)
+
+        with fully_shard_context(device=device):
+            fully_shard(
+                model[0][0], mesh=mesh, placements=placements, skip_forward_backward_hooks=True
+            )
+            fully_shard(
+                model[0], mesh=mesh, placements=placements, skip_forward_backward_hooks=True
+            )
+            fully_shard(model, mesh=mesh, placements=placements, skip_forward_backward_hooks=True)
+
+        adapter = object.__new__(mcore_fsdp_adapter.FullyShardedDataParallelV2)
+        torch.nn.Module.__init__(adapter)
+        adapter.module = model
+        adapter._setup_1f1b_overlap_interface()
+
+        # Leaving a nested FSDP subtree must restore the parent owner for later siblings.
+        assert mcore_fsdp_adapter._find_fsdp_target(model[0][0]) is model[0][0]
+        assert mcore_fsdp_adapter._find_fsdp_target(model[1]) is model
+
+        model.pre_backward(register_final_callback=False)
+        model[0].pre_backward(register_final_callback=False)
+        model[0][0].pre_backward(register_final_callback=False)
+
+        calls = []
+        named_modules = (("root", model), ("layer", model[0]), ("expert", model[0][0]))
+        for name, module in named_modules:
+            monkeypatch.setattr(
+                module,
+                "_reshard_parameter_groups",
+                lambda name=name: calls.append((name, "reshard")),
+            )
+            monkeypatch.setattr(
+                module, "_reduce_gradient_groups", lambda name=name: calls.append((name, "reduce"))
+            )
+
+        # The layer callback releases the nested expert first. The final root sweep
+        # releases only the root and safely revisits the already-resting layer subtree.
+        adapter.post_backward_release_module(model[0])
+        adapter.post_backward()
+        adapter.post_backward()
+
+        assert calls == [
+            ("expert", "reshard"),
+            ("expert", "reduce"),
+            ("layer", "reshard"),
+            ("layer", "reduce"),
+            ("root", "reshard"),
+            ("root", "reduce"),
+        ]
+        for _, module in named_modules:
+            assert module.phase is FsdpModule.Phase.RESTING
+
+    def test_finish_grad_sync_waits_for_reduce_scatter(self):
+        """Gradient consumers should wait for the final asynchronous reduce-scatter."""
+
+        class RecordingStream:
+            def __init__(self) -> None:
+                self.waited_streams = []
+
+            def wait_stream(self, stream) -> None:
+                self.waited_streams.append(stream)
+
+        current_stream = RecordingStream()
+        reduce_scatter_stream = object()
+
+        class Context:
+            def __init__(self) -> None:
+                self.reduce_scatter_stream = reduce_scatter_stream
+
+            def current_stream(self):
+                return current_stream
+
+        module = torch.nn.Module()
+        module.context = Context()
+        adapter = object.__new__(mcore_fsdp_adapter.FullyShardedDataParallelV2)
+        torch.nn.Module.__init__(adapter)
+        adapter.module = module
+
+        adapter.finish_grad_sync()
+
+        assert current_stream.waited_streams == [reduce_scatter_stream]
+
+    def test_optimizer_completes_each_shared_context_trace_once(self, monkeypatch):
+        """One optimizer boundary should complete each unique VPP context once."""
+
+        class Runner:
+            def __init__(self) -> None:
+                self.complete_calls = 0
+
+            def complete_trace(self) -> None:
+                self.complete_calls += 1
+
+        class Context:
+            def __init__(self) -> None:
+                self.runner = Runner()
+
+        class Chunk:
+            def __init__(self, context) -> None:
+                self.module = torch.nn.Module()
+                self.module.context = context
+
+            def complete_fsdp_trace(self) -> None:
+                self.module.context.runner.complete_trace()
+
+        shared_context = Context()
+        other_context = Context()
+        optimizer = object.__new__(FullyShardedOptimizer)
+        optimizer.model_chunks = [
+            Chunk(shared_context),
+            Chunk(shared_context),
+            Chunk(other_context),
+        ]
+        call_order = []
+
+        def record_optimizer_step(_optimizer):
+            call_order.append("optimizer")
+            return expected_result
+
+        expected_result = (True, None, None)
+        monkeypatch.setattr(MixedPrecisionOptimizer, "step", record_optimizer_step)
+
+        original_shared_complete = shared_context.runner.complete_trace
+        original_other_complete = other_context.runner.complete_trace
+
+        def record_shared_complete():
+            call_order.append("shared_trace")
+            original_shared_complete()
+
+        def record_other_complete():
+            call_order.append("other_trace")
+            original_other_complete()
+
+        shared_context.runner.complete_trace = record_shared_complete
+        other_context.runner.complete_trace = record_other_complete
+
+        assert optimizer.step() is expected_result
+        assert shared_context.runner.complete_calls == 1
+        assert other_context.runner.complete_calls == 1
+        assert call_order == ["shared_trace", "other_trace", "optimizer"]
 
     def test_nccl_ub_enables_symmetric_memory(self, monkeypatch):
         config = TransformerConfig(
@@ -215,7 +479,7 @@ class TestMcoreAdapterDense:
         assert fully_shard_context_calls == [True]
 
     @pytest.mark.parametrize("optimizer_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
-    def test_build_train_and_step(self, optimizer_cuda_graph):
+    def test_build_train_and_step(self, optimizer_cuda_graph, monkeypatch):
         config = TransformerConfig(
             num_layers=2,
             hidden_size=16,
@@ -281,6 +545,23 @@ class TestMcoreAdapterDense:
         optimizer.reload_model_params()
         if optimizer_cuda_graph:
             optimizer.step = OptimizerCudaGraphWrapper(optimizer.step, cuda_graph_warmup_steps=1)
+
+        parameter_groups = [
+            parameter_group
+            for module in model.modules()
+            if isinstance(module, FsdpModule)
+            for parameter_group in module.parameter_groups
+        ]
+        assert parameter_groups
+        sync_counts = {parameter_group: 0 for parameter_group in parameter_groups}
+        for parameter_group in parameter_groups:
+            sync_model_weight = parameter_group.sync_model_weight_from_main_weight
+
+            def count_sync(parameter_group=parameter_group, sync_model_weight=sync_model_weight):
+                sync_counts[parameter_group] += 1
+                sync_model_weight()
+
+            monkeypatch.setattr(parameter_group, "sync_model_weight_from_main_weight", count_sync)
 
         steps = [
             [

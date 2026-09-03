@@ -202,17 +202,6 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
 
     set_streams(high_priority=config.high_priority_a2a_comm_stream)
 
-    # Interleaved pipeline with FSDP(optim_grads_params) is not yet supported:
-    # _replace_param_with_raw_if_needed() and root pre/post_backward() are not
-    # handled for multi-chunk models in this path.
-    if isinstance(model, (list, tuple)):
-        for m in model:
-            assert find_megatron_fsdp(m) is None, (
-                "EP overlap 1F1B with FSDP is not supported for interleaved "
-                "pipeline parallelism (virtual_pipeline_model_parallel_size > 1). "
-                "Use pipeline_model_parallel_size=1 or disable FSDP."
-            )
-
     # forward prepare
     f_model_chunk_id = None
     f_microbatch_id = None
@@ -234,6 +223,16 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
         b_input_tensor, b_output_tensor, b_output_tensor_grad = backward_step_helper_preprocess(
             b_virtual_microbatch_id, b_model_chunk_id
         )
+
+    forward_fsdp_wrapper = (
+        find_megatron_fsdp(model[f_model_chunk_id]) if f_model_chunk_id is not None else None
+    )
+    if forward_fsdp_wrapper is not None:
+        forward_fsdp_wrapper._replace_param_with_raw_if_needed()
+    backward_fsdp_wrapper = (
+        find_megatron_fsdp(model[b_model_chunk_id]) if b_model_chunk_id is not None else None
+    )
+
     # Call combined forward and backward step to overlap the communication and computation
     output_tensor, num_tokens, input_tensor_grad = combined_forward_backward_step(
         forward_step_func,
@@ -260,6 +259,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
             else None
         ),
         current_microbatch=f_microbatch_id,
+        fsdp_wrapper=backward_fsdp_wrapper,
     )
     # forward post process
     if f_model_chunk_id is not None:
