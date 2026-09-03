@@ -134,6 +134,7 @@ class RecipeConfig:
     def __init__(self, matchers: List[Matcher], config_dict: Dict[str, Dict]):
         self.configs = config_dict
         self.matchers = matchers
+        self._summary_logged = False
 
     @staticmethod
     def _build_matchers(matchers_dict: Dict | None) -> List[Matcher]:
@@ -196,11 +197,32 @@ class RecipeConfig:
 
         return RecipeConfig(matchers, config_dict)
 
+    def _log_summary_once(self) -> None:
+        """Report the recipe in use, the first time it is consulted.
+
+        from_yaml_file reads the file while building a TransformerConfig, before the
+        training script has set a logging level, so anything it logs is dropped at
+        log_single_rank's isEnabledFor check. Matching happens later, during model
+        construction, which is late enough for the message to survive. A recipe whose
+        matchers are all disabled, or whose patterns name nothing, would otherwise say
+        nothing at all now that misses log at debug.
+        """
+        if self._summary_logged:
+            return
+        self._summary_logged = True
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Quantization recipe in use: {len(self.matchers)} enabled matcher(s), "
+            f"configs {sorted(self.configs)}",
+        )
+
     def match_to_config_key(self, operator_context: MatchContext) -> str | None:
         """
         Gives an operator's context, return a configuration key if
         necessary, or sentinel (None) denoting no matchers matched.
         """
+        self._log_summary_once()
         for matcher in self.matchers:
             config_key = matcher.match(operator_context)
             if config_key is not None:
@@ -210,8 +232,12 @@ class RecipeConfig:
                     f'Context ({operator_context}) matched to quant config "{config_key}"',
                 )
                 return config_key
+        # Every module the recipe does not name reaches here, so at INFO the misses bury
+        # the matches: a five-layer model logged 36 of these against 18 matches, and it
+        # scales with the model. A module that matched nothing keeps the global settings,
+        # which is the uninteresting case.
         log_single_rank(
-            logger, logging.INFO, f"No config key match found for Context ({operator_context})"
+            logger, logging.DEBUG, f"No config key match found for Context ({operator_context})"
         )
         return None
 

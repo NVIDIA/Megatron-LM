@@ -2137,6 +2137,9 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--te-precision-config-file', default=None,
                        help='Configuration file to select per-module precision overrides. '
                        'See TransformerEngineMixedPrecision.md')
+    group.add_argument('--log-quantization-types', action='store_true',
+                       help='Log the quantization each layer and linear resolves to, and how '
+                       'each weight is stored, once on the first training step.')
     return parser
 
 def _add_inference_args(parser):
