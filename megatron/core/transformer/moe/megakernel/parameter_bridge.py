@@ -8,11 +8,13 @@ from torch import nn
 
 
 def dummy_weight_gradient(param: nn.Parameter) -> torch.Tensor:
-    """Return a storage-free gradient sentinel that triggers MCore DDP hooks.
+    """Return a zero-allocation gradient sentinel that triggers MCore DDP hooks.
 
-    A megakernel has already accumulated the numerical gradient into main_grad.
-    Autograd only needs to invoke the post-accumulate hook; that hook does not
-    read this value after grad_added_to_main_grad is set.
+    The detached tensor intentionally aliases the parameter storage; callers must
+    never read or mutate its values. This is safe only after the megakernel writes
+    the numerical gradient to ``main_grad`` and sets
+    ``grad_added_to_main_grad=True``. MCore's DDP hook then clears ``.grad``
+    without reading or accumulating this sentinel.
     """
     return param.detach()
 

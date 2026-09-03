@@ -2229,15 +2229,31 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "MOK currently requires gradient_accumulation_fusion=True"
                 )
-            mok_bf16 = self.fp8 is None and not self.fp8_param
+            if not self.moe_grouped_gemm:
+                raise ValueError("MOK currently requires moe_grouped_gemm=True")
+            mok_bf16 = (
+                self.bf16
+                and not self.fp16
+                and self.fp8 is None
+                and not self.fp8_param
+                and self.fp4 is None
+                and not self.fp4_param
+            )
             mok_mxfp8 = (
                 self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
             )
             if not (mok_bf16 or mok_mxfp8):
                 raise ValueError(
-                    "MOK routed experts require either BF16 parameters or MXFP8 with "
-                    "fp8_param=True"
+                    "MOK routed experts require either bf16=True with no FP8/FP4 mode, "
+                    "or MXFP8 with fp8_param=True; FP32, FP16, and FP4 are not supported"
                 )
+            if self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "MOK does not support overlap_moe_expert_parallel_comm; the megakernel "
+                    "replaces MCore's dispatcher/expert/combine schedule"
+                )
+            if self.delay_wgrad_compute:
+                raise ValueError("MOK does not support delay_wgrad_compute")
             if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
                 raise ValueError("MOK currently requires TP=1 and expert TP=1")
             if self.expert_model_parallel_size not in (1, 4, 8, 16, 32, 64):
@@ -2248,6 +2264,17 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("MOK does not support the MCore shared-expert gate/overlap")
             if self.moe_latent_size is not None:
                 raise ValueError("MOK does not support latent MoE")
+            if self.recompute_modules and "shared_experts" in self.recompute_modules:
+                raise ValueError(
+                    "MOK does not support recompute_modules=['shared_experts']; shared-expert "
+                    "computation is fused into the megakernel. Use whole-MoE recompute "
+                    "instead."
+                )
+            if self.log_moe_overload_factor:
+                raise ValueError(
+                    "MOK does not support log_moe_overload_factor because it bypasses the "
+                    "native token-dispatcher accounting path"
+                )
             if not self.gated_linear_unit or self.activation_func != F.silu:
                 raise ValueError("MOK currently requires SwiGLU")
 

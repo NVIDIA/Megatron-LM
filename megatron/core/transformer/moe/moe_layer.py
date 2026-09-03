@@ -308,32 +308,34 @@ class MoELayer(BaseMoELayer):
                 name=(name + ".fc2_latent_proj") if name is not None else None,
             )
 
-        # Initialize token dispatcher
-        if config.moe_token_dispatcher_type == "allgather":
-            self.token_dispatcher = MoEAllGatherTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
-                config=self.config,
-                pg_collection=pg_collection,
-            )
-        elif config.moe_token_dispatcher_type == "alltoall":
-            self.token_dispatcher = MoEAlltoAllTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
-                config=self.config,
-                pg_collection=pg_collection,
-            )
-        elif config.moe_token_dispatcher_type == "flex":
-            self.token_dispatcher = MoEFlexTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
-                config=self.config,
-                pg_collection=pg_collection,
-            )
-        else:
-            raise ValueError(
-                f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
-            )
+        # Megakernel backends replace native dispatch, expert compute, and combine,
+        # so only construct a token dispatcher for the native MoE path.
+        if config.moe_megakernel_backend is None:
+            if config.moe_token_dispatcher_type == "allgather":
+                self.token_dispatcher = MoEAllGatherTokenDispatcher(
+                    self.num_local_experts,
+                    self.local_expert_indices,
+                    config=self.config,
+                    pg_collection=pg_collection,
+                )
+            elif config.moe_token_dispatcher_type == "alltoall":
+                self.token_dispatcher = MoEAlltoAllTokenDispatcher(
+                    self.num_local_experts,
+                    self.local_expert_indices,
+                    config=self.config,
+                    pg_collection=pg_collection,
+                )
+            elif config.moe_token_dispatcher_type == "flex":
+                self.token_dispatcher = MoEFlexTokenDispatcher(
+                    self.num_local_experts,
+                    self.local_expert_indices,
+                    config=self.config,
+                    pg_collection=pg_collection,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}"
+                )
 
         # Initialize experts
         self.experts = self.submodules.experts(
@@ -365,6 +367,7 @@ class MoELayer(BaseMoELayer):
                         name=(name + ".shared_experts") if name is not None else None,
                     )
             if self.shared_expert_overlap:
+                assert self.token_dispatcher is not None
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
         # Native expert modules remain the authoritative parameter, optimizer,
@@ -378,7 +381,6 @@ class MoELayer(BaseMoELayer):
                 shared_experts=self.shared_experts,
                 num_local_experts=self.num_local_experts,
             )
-            self.token_dispatcher = None
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":

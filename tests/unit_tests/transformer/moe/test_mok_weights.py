@@ -17,6 +17,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 def _mok_transformer_config(**overrides):
     values = {
         "num_layers": 2,
+        "bf16": True,
+        "moe_grouped_gemm": True,
         "hidden_size": 128,
         "num_attention_heads": 4,
         "num_moe_experts": 8,
@@ -86,6 +88,39 @@ def test_mok_backend_accepts_bf16_routed_parameters():
     assert config.moe_megakernel_backend == "mok"
     assert config.fp8 is None
     assert not config.fp8_param
+
+
+@pytest.mark.parametrize(
+    "overrides", [{"bf16": False}, {"bf16": False, "fp16": True}, {"fp4": "e2m1"}]
+)
+def test_mok_backend_rejects_unsupported_routed_precision(overrides):
+    with pytest.raises(ValueError, match="FP32, FP16, and FP4 are not supported"):
+        _mok_transformer_config(**overrides)
+
+
+def test_mok_backend_requires_grouped_mlp():
+    with pytest.raises(ValueError, match="moe_grouped_gemm=True"):
+        _mok_transformer_config(moe_grouped_gemm=False)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        (
+            {"overlap_moe_expert_parallel_comm": True},
+            "does not support overlap_moe_expert_parallel_comm",
+        ),
+        ({"delay_wgrad_compute": True}, "does not support delay_wgrad_compute"),
+        (
+            {"recompute_granularity": "selective", "recompute_modules": ["shared_experts"]},
+            "does not support recompute_modules",
+        ),
+        ({"log_moe_overload_factor": True}, "does not support log_moe_overload_factor"),
+    ],
+)
+def test_mok_backend_rejects_bypassed_native_moe_features(overrides, error):
+    with pytest.raises(ValueError, match=error):
+        _mok_transformer_config(**overrides)
 
 
 @pytest.mark.parametrize("single_grouped", [False, True])
