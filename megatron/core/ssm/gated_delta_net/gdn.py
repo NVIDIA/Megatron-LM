@@ -29,13 +29,10 @@ from megatron.core.ssm.gated_delta_net.common import (
 )
 from megatron.core.ssm.gated_delta_net.internal_gdn_backend.chunk import (
     chunk_gated_delta_rule as internal_chunk_gated_delta_rule,
-    get_trusted_cp_cu_seqlens_cpu as get_internal_gdr_cp_cu_seqlens_cpu,
-    make_dense_cp_cu_seqlens_cpu as make_internal_gdr_dense_cp_cu_seqlens_cpu,
     prepare_cp_context_metadata as prepare_internal_gdr_cp_context_metadata,
     prepare_validated_chunk_metadata as prepare_internal_gdr_chunk_metadata,
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
-
 
 
 class GatedDeltaNet(_GDNBase):
@@ -200,7 +197,7 @@ class GatedDeltaNet(_GDNBase):
                 "conversion must be handled before calling GatedDeltaNet."
             )
 
-        trusted_global_cu_seqlens_cpu = None
+        internal_gdr_global_num_sequences = None
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
             assert (
@@ -218,9 +215,7 @@ class GatedDeltaNet(_GDNBase):
                 else packed_seq_params.cu_seqlens_kv
             )
             if cp_size_chunkwise > 1:
-                trusted_global_cu_seqlens_cpu = get_internal_gdr_cp_cu_seqlens_cpu(
-                    packed_seq_params, cu_seqlens_q, total_tokens=seq_len_global
-                )
+                internal_gdr_global_num_sequences = 1 if cu_seqlens_q.numel() == 2 else None
             else:
                 cu_seqlens_q = self._resolve_cu_seqlens(
                     None, cu_seqlens_q, seq_len_global, "cu_seqlens_q", cp_size=cp_size_runtime
@@ -257,24 +252,22 @@ class GatedDeltaNet(_GDNBase):
                         group=cp_group_chunkwise,
                         conv1d_kernel_size=self.conv_kernel_dim,
                     )
-                    global_cu_seqlens_cpu = make_internal_gdr_dense_cp_cu_seqlens_cpu(
-                        batch, total_tokens_per_sequence=seq_len_global
-                    )
-                    cached = (cached_cu_seqlens, cached_ctx, global_cu_seqlens_cpu)
+                    cached = (cached_cu_seqlens, cached_ctx)
                     self._chunkwise_cp_context_cache[cache_key] = cached
-                cu_seqlens_q, chunkwise_cp_context, global_cu_seqlens_cpu = cached
+                cu_seqlens_q, chunkwise_cp_context = cached
                 prepare_internal_gdr_cp_context_metadata(
-                    chunkwise_cp_context, global_cu_seqlens_cpu, config=self.config
+                    chunkwise_cp_context, config=self.config, global_num_sequences=batch
                 )
             else:
                 chunkwise_cp_context = build_cp_context(
                     cu_seqlens=cu_seqlens_q,
                     group=cp_group_chunkwise,
                     conv1d_kernel_size=self.conv_kernel_dim,
-                    cu_seqlens_cpu=trusted_global_cu_seqlens_cpu,
                 )
                 prepare_internal_gdr_cp_context_metadata(
-                    chunkwise_cp_context, trusted_global_cu_seqlens_cpu, config=self.config
+                    chunkwise_cp_context,
+                    config=self.config,
+                    global_num_sequences=internal_gdr_global_num_sequences,
                 )
         else:
             chunkwise_cp_context = None
