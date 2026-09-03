@@ -156,6 +156,8 @@ def resolve_nemo_audio_configs_from_args(
     left_context = getattr(args, "nemo_transformer_audio_left_context", None)
     if left_context is not None:
         encoder_cfg.left_context = None if left_context < 0 else left_context
+    # ``checkpoint`` is the no-override setting: preserve ``causal_mask`` from
+    # the resolved .nemo or JSON config rather than inferring it from weights.
     causal_mode = getattr(args, "nemo_transformer_audio_causal_mode", "checkpoint")
     if causal_mode not in ("checkpoint", "causal", "offline"):
         raise ValueError(
