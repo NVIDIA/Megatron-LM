@@ -667,9 +667,9 @@ class TorchDistSaveShardedStrategy:
         """
         if HAVE_NVRX:
             # Import needed nvrx modules
-            from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+            from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (  # pylint: disable=line-too-long
                 FileSystemWriterAsync,
-            )  # pylint: disable=line-too-long
+            )
             from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
                 CheckpointMetadataCache,
                 save_state_dict_async_plan,
@@ -777,9 +777,9 @@ def _get_filesystem_reader(
         return msc.torch.MultiStorageFileSystemReader(checkpoint_dir, thread_count=2)
 
     if cache_metadata:
-        from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
+        from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
             CachedMetadataFileSystemReader,
-        )  # pylint: disable=line-too-long
+        )
 
         return CachedMetadataFileSystemReader(checkpoint_dir, cache_metadata=cache_metadata)
 
