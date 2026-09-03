@@ -6,9 +6,7 @@ from unittest import mock
 
 import torch
 
-from megatron.core.dist_checkpointing.strategies.cached_metadata_filesystem_reader import (
-    CachedMetadataFileSystemReader,
-)
+from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -21,6 +19,16 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.training import get_model
+
+try:
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
+        CachedMetadataFileSystemReader,
+    )
+
+    HAVE_NVRX = True
+except ModuleNotFoundError:
+    HAVE_NVRX = False
+
 
 NUM_LAYERS = 8
 HIDDEN_SIZE = 16
@@ -173,7 +181,10 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.phase_transition_iterations = None
     # Clear the metadata cache to avoid contamination between tests
 
-    CachedMetadataFileSystemReader.clear_metadata_cache()
+    if HAVE_NVRX:
+        CachedMetadataFileSystemReader.clear_metadata_cache()
+    else:
+        raise ModuleNotFoundError('`nvidia-resiliency-ext` should be installed to run this test.')
 
 
 def setup_model_and_optimizer(
@@ -306,7 +317,10 @@ def setup_model_and_optimizer(
     # DistributedOptimizer intentionally does not implement this legacy copy.
     if not use_megatron_fsdp:
         optimizer.reload_model_params()
-    CachedMetadataFileSystemReader.clear_metadata_cache()
+    if HAVE_NVRX:
+        CachedMetadataFileSystemReader.clear_metadata_cache()
+    else:
+        raise ModuleNotFoundError('`nvidia-resiliency-ext` should be installed to run this test.')
     return unwrap_model(model), optimizer
 
 
@@ -414,5 +428,8 @@ def setup_moe_model_and_optimizer(
                         opt.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
 
     optimizer.reload_model_params()
-    CachedMetadataFileSystemReader.clear_metadata_cache()
+    if HAVE_NVRX:
+        CachedMetadataFileSystemReader.clear_metadata_cache()
+    else:
+        raise ModuleNotFoundError('`nvidia-resiliency-ext` should be installed to run this test.')
     return unwrap_model(model), optimizer
