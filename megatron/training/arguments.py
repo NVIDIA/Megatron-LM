@@ -2492,12 +2492,18 @@ def _add_network_size_args(parser):
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
         "expert_gtp_weight_remat_size",
-        "max_seqlen_per_dp_cp_rank",
-        "hybrid_context_parallel",
-        "sequence_packing_scheduler",
+        # Parsed manually as a JSON object below.
+        "moe_megakernel_backend_config",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
+    transformer_group.add_argument(
+        '--moe-megakernel-backend-config',
+        type=json.loads,
+        default=None,
+        metavar='JSON',
+        help='Backend-specific MoE megakernel options as a JSON object.',
+    )
 
     group = parser.add_argument_group(title='network size')
 
