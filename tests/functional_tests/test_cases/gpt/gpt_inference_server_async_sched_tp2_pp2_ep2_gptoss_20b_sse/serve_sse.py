@@ -192,6 +192,7 @@ def _cleaned_env() -> dict[str, str]:
     env["NCCL_ALGO"] = "Ring"
     env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
     env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    env["HF_HUB_CACHE"] = "/mnt/artifacts/hf_home/hub"
     return env
 
 
