@@ -1,12 +1,12 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Exercise GPTOSS completion streaming with legacy and asynchronous scheduling.
+"""Exercise completion streaming with legacy and asynchronous scheduling.
 
 The test launches the real OpenAI-compatible inference server twice against the
-GPTOSS-20B checkpoint, once per scheduling mode. Each launch receives a burst
-of concurrent requests, including a streaming request that uses the Hugging
-Face fast-tokenizer incremental-detokenization path. The responses must satisfy
-the SSE protocol invariants and agree across scheduling modes.
+Qwen3-8B checkpoint, once per scheduling mode. Each launch receives a burst of
+concurrent requests, including a streaming request that uses the Hugging Face
+fast-tokenizer incremental-detokenization path. The responses must satisfy the
+SSE protocol invariants and agree across scheduling modes.
 """
 
 import argparse
@@ -55,7 +55,7 @@ def _build_server_cmd(
         "--max-tokens-to-oom",
         "3600000",
         "--inference-max-seq-length",
-        "4096",
+        "1024",
         "--attention-backend",
         "flash",
         "--micro-batch-size",
@@ -72,90 +72,54 @@ def _build_server_cmd(
         "2",
         "--pipeline-model-parallel-size",
         "2",
-        "--expert-model-parallel-size",
-        "2",
-        "--expert-tensor-parallel-size",
-        "1",
-        "--moe-token-dispatcher-type",
-        "alltoall",
-        "--moe-grouped-gemm",
         "--deterministic-mode",
         "--ckpt-format",
         "torch_dist",
         "--bf16",
         # The converted checkpoint stores weights but not the model arguments.
-        # Keep this architecture aligned with the canonical GPTOSS functional test.
+        # Keep this architecture aligned with the existing Qwen3-8B functional tests.
         "--num-layers",
-        "24",
+        "36",
         "--hidden-size",
-        "2880",
+        "4096",
         "--ffn-hidden-size",
-        "2880",
+        "12288",
         "--num-attention-heads",
-        "64",
+        "32",
         "--group-query-attention",
         "--num-query-groups",
         "8",
         "--kv-channels",
-        "64",
-        "--num-experts",
-        "32",
-        "--moe-ffn-hidden-size",
-        "2880",
-        "--moe-router-topk",
-        "4",
-        "--moe-router-dtype",
-        "fp32",
-        "--moe-router-score-function",
-        "softmax",
-        "--moe-router-load-balancing-type",
-        "aux_loss",
-        "--moe-aux-loss-coeff",
-        "0.0",
+        "128",
         "--untie-embeddings-and-output-weights",
         "--disable-bias-linear",
         "--normalization",
         "RMSNorm",
+        "--norm-epsilon",
+        "0.000001",
+        "--qk-layernorm",
         "--position-embedding-type",
-        "yarn",
+        "rope",
         "--rotary-base",
-        "150000",
+        "1000000",
         "--rotary-percent",
         "1.0",
-        "--rotary-scaling-factor",
-        "32.0",
-        "--yarn-original-max-position-embeddings",
-        "4096",
-        "--yarn-beta-fast",
-        "32.0",
-        "--yarn-beta-slow",
-        "1.0",
-        "--mscale",
-        "1.0",
-        "--mscale-all-dim",
+        "--use-rotary-position-embeddings",
+        "--swiglu",
+        "--attention-dropout",
         "0.0",
-        "--no-yarn-correction-range-round-to-int",
-        "--quick-geglu",
-        "--glu-linear-offset",
-        "1.0",
-        "--activation-func-clamp-value",
-        "7.0",
-        "--softmax-type",
-        "learnable",
-        "--window-size",
-        "127,0",
-        "--window-attn-skip-freq",
-        "2",
-        "--padded-vocab-size",
-        "201088",
+        "--hidden-dropout",
+        "0.0",
+        "--attention-softmax-in-fp32",
+        "--vocab-size",
+        "151936",
         "--make-vocab-size-divisible-by",
         "128",
         "--max-position-embeddings",
-        "40960",
-        "--no-rope-fusion",
+        "1024",
         "--no-masked-softmax-fusion",
         "--seq-length",
-        "4096",
+        "1024",
         "--inference-dynamic-batching-buffer-size-gb",
         "20",
         "--inference-dynamic-batching-max-requests",
@@ -192,7 +156,6 @@ def _cleaned_env() -> dict[str, str]:
     env["NCCL_ALGO"] = "Ring"
     env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
     env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-    env["HF_HUB_CACHE"] = "/mnt/artifacts/hf_home/hub"
     return env
 
 

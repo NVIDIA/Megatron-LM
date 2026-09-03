@@ -45,13 +45,13 @@ spec:
     cd /opt/megatron-lm
 
     PYTHONPATH=/opt/megatron-lm python \
-      tests/functional_tests/test_cases/gpt/gpt_inference_server_async_sched_tp2_pp2_ep2_gptoss_20b_sse/serve_sse.py \
-      --checkpoint-dir /mnt/artifacts/model/openai_gpt-oss-20b/v1 \
-      --tokenizer-model unsloth/gpt-oss-20b-BF16 \
+      tests/functional_tests/test_cases/gpt/gpt_inference_server_async_sched_tp2_pp2_dp2_qwen3_8b_sse/serve_sse.py \
+      --checkpoint-dir /mnt/artifacts/model/qwen3-8b-dist \
+      --tokenizer-model /mnt/artifacts/model/qwen3-8b-dist/tokenizer \
       --server-log-dir {assets_dir}/logs
 
 products:
-  - test_case: [gpt_inference_server_async_sched_tp2_pp2_ep2_gptoss_20b_sse]
+  - test_case: [gpt_inference_server_async_sched_tp2_pp2_dp2_qwen3_8b_sse]
     products:
       - environment: [dev]
         scope: [mr, mr-github]
