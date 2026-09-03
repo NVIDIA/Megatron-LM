@@ -2,27 +2,19 @@
 
 """Triton kernels for replica planning and intra-node replica transport.
 
-The planner kernels recover compact semantic routes, compute deterministic
-replica placement, and map routes to native or replica runtime experts. They
-share the cooperative-grid synchronization used by the weight transport.
+The planner kernels compact semantic routes, compute deterministic replica placement
+and map routes to native or replica runtime experts. The transport kernels move only
+weights and gradients: owners push weights straight into their peers' replica slots
+in symmetric memory and pull the replica gradients back into native wgrad staging.
+Both are pure wire movement, and within the reserved SM budget only TMA saturates
+NVLink, so they are built on ``tl.make_tensor_descriptor`` over runtime peer addresses
+plus Triton's loop pipeliner.
 
-Only virtual weights and gradients occupy PyTorch native symmetric memory. Source
-weights remain in parameter or GTP-gather storage: each owner pushes them directly
-into the destination virtual slots of its peers, and pulls the resulting replica
-gradients back into native wgrad staging. No activation transport is involved.
-
-Both directions are pure wire movement, so they are bound by NVLink bandwidth
-rather than by arithmetic, and within the reserved SM budget only the TMA unit can
-saturate the link. ``tl.make_tensor_descriptor`` reaches that bandwidth from a peer
-base address resolved at runtime, and Triton's loop pipeliner supplies the
-multi-stage schedule that the transfer needs.
-
-Ordering between the transport and the expert GEMMs that read or write the
-symmetric arenas is stream order on each rank plus the collectives already in
-the layer: the planner's histogram all-gather precedes every owner push, and the
-reduction's device-side rendezvous brackets every gradient exchange. The
-replica gradient slots are never cleared; the runtime parameters carry
-``overwrite_main_grad`` so TE's wgrad GEMM rewrites them on every backward.
+Ordering against the expert GEMMs is stream order plus the collectives already in the
+layer: the planner's histogram all-gather precedes every push, and the reduction's
+device-side rendezvous brackets every gradient exchange. Replica gradient slots are
+never cleared; the runtime parameters carry ``overwrite_main_grad`` so TE's wgrad GEMM
+rewrites them on every backward.
 """
 
 import functools
@@ -35,33 +27,25 @@ import triton.language as tl
 MAX_REPLICA_WEIGHT_SMS = 32
 MAX_REPLICA_EP_RANKS = 64
 
-# Constants a kernel reads must be ``tl.constexpr`` objects; ``.value`` recovers
-# the plain integer for host-side arithmetic.
-#
-# A tiled TMA descriptor caps its innermost box dimension at 256 elements, so a
-# flat stream is addressed as ``[rows, _ROW]``. Every transport offset is a
-# multiple of the tile size and therefore already row aligned. The push moves
-# opaque bytes and so views a row as 256 bytes; the reduction has to do
-# arithmetic and views it as 256 gradient elements.
+# Constants a kernel reads must be ``tl.constexpr`` objects (``.value`` on the host).
+# A tiled TMA descriptor caps its innermost box at 256 elements, so a flat stream is
+# addressed as ``[rows, _ROW]``: bytes for the push, gradient elements for the reduction.
 _ROW = tl.constexpr(256)
-# Measured on GB300 at 32 SMs: 32 KiB tiles over four pipeline stages sustain the
-# peer bandwidth in both directions. Halving the tile or moving to three stages
-# costs 3-20%, and eight stages exceed the shared-memory budget.
+# Measured on GB300 at 32 SMs: 32 KiB tiles over four pipeline stages sustain the peer
+# bandwidth both ways; smaller tiles or three stages cost 3-20%, eight stages exceed SMEM.
 _MAX_TILE_BYTES = 32768
 _MAX_SCALE_TILE_BYTES = 8192
 _NUM_STAGES = tl.constexpr(4)
 _PUSH_NUM_WARPS = 4
 _GRAD_NUM_WARPS = 8
 
-# Toggling one high bit lets a block detect completion from its own pre-arrival
-# value, so the barrier resets itself and needs no separate clearing pass.
+# The grid barrier toggles one high bit, so a block detects completion from its own
+# pre-arrival value and the barrier resets itself.
 _GRID_SYNC_TAG = tl.constexpr(0x40000000)
 # One int32 word per ordered rank pair inside the symmetric-memory signal pad.
 _SIGNAL_STRIDE = tl.constexpr(4)
 _BARRIER_TIMEOUT_NS = tl.constexpr(100_000_000_000)
-
-# Persistent planner grids must remain fully resident at their cooperative
-# barrier. This width is safe on the validated GB300 workloads.
+# Persistent planner grids must stay fully resident at their cooperative barrier.
 _MAX_PLANNER_PROGRAMS = 128
 
 
@@ -1001,16 +985,14 @@ def _transport_tile(limit: int, *components: int) -> int:
 
 
 def _validate_transport_shape(world_size: int, num_local_experts: int, num_sms: int) -> None:
-    if world_size <= 0 or num_local_experts <= 0 or num_sms <= 0:
-        raise ValueError("Replica weight launch dimensions must be positive.")
-    if num_sms > MAX_REPLICA_WEIGHT_SMS:
+    if not 0 < num_sms <= MAX_REPLICA_WEIGHT_SMS:
         raise ValueError(
             f"Replica weight kernels are limited to {MAX_REPLICA_WEIGHT_SMS} SMs, got {num_sms}."
         )
-    if world_size > MAX_REPLICA_EP_RANKS:
+    if not 0 < world_size <= MAX_REPLICA_EP_RANKS or num_local_experts <= 0:
         raise ValueError(
-            f"Replica transport supports at most {MAX_REPLICA_EP_RANKS} EP ranks, "
-            f"got {world_size}."
+            f"Replica transport supports 1..{MAX_REPLICA_EP_RANKS} EP ranks with a positive "
+            f"expert count, got world_size={world_size}, num_local_experts={num_local_experts}."
         )
 
 
@@ -1022,12 +1004,11 @@ def _validate_grad_dtype(grad_dtype: torch.dtype) -> None:
 
 
 def _pointer_table(table: torch.Tensor, num_local_experts: int) -> torch.Tensor:
-    """Validate one stable ``int64`` device table holding one base address per expert."""
+    """Validate one ``int64`` device table holding one base address per local expert."""
     if (
         table.dtype != torch.int64
         or table.device.type != "cuda"
-        or table.ndim != 1
-        or table.numel() != num_local_experts
+        or tuple(table.shape) != (num_local_experts,)
         or not table.is_contiguous()
     ):
         raise ValueError(
@@ -1037,52 +1018,48 @@ def _pointer_table(table: torch.Tensor, num_local_experts: int) -> torch.Tensor:
     return table
 
 
+def _plan_table(experts_to_copy: torch.Tensor, world_size: int, num_local_experts: int):
+    if (
+        experts_to_copy.dtype != torch.int32
+        or tuple(experts_to_copy.shape) != (world_size, num_local_experts)
+        or not experts_to_copy.is_contiguous()
+    ):
+        raise ValueError(
+            f"Replica plans must be contiguous int32 [{world_size}, {num_local_experts}] tensors."
+        )
+    return experts_to_copy
+
+
 @functools.lru_cache(maxsize=None)
 def _barrier_scratch(device_index: int) -> torch.Tensor:
-    """Return the inert word that retargets peer lanes which already signalled."""
+    """The inert word that retargets peer lanes which already signalled."""
     return torch.zeros(1, dtype=torch.int32, device=torch.device("cuda", device_index))
 
 
 @functools.lru_cache(maxsize=None)
 def _source_scratch(device_index: int, entries: int) -> torch.Tensor:
-    """Return the table the reduction compacts each expert's sources into.
-
-    One buffer per device and shape, so its address is stable enough to be
-    captured into a CUDA graph. The kernel fills it before its own rendezvous,
-    which is what keeps concurrent launches on the same device from reading a
-    table another launch is still writing.
-    """
+    """The table the reduction compacts each expert's sources into; one per device and
+    shape so its address is stable under CUDA-graph capture. The kernel fills it before
+    its own rendezvous, so concurrent launches on one device never read a half-written table."""
     return torch.empty(entries, dtype=torch.int32, device=torch.device("cuda", device_index))
 
 
 @functools.lru_cache(maxsize=None)
 def _descriptor_scratch(device_index: int) -> torch.Tensor:
-    """Return the global buffer Triton fills with device-built TMA descriptors.
-
-    One persistent buffer per device keeps the descriptors at a stable address,
-    which is what lets the launch be captured into a CUDA graph and replayed.
-    """
+    """The buffer Triton fills with device-built TMA descriptors; persistent per device so
+    captured launches replay against a stable address."""
     return torch.empty(1 << 20, dtype=torch.int8, device=torch.device("cuda", device_index))
 
 
 class _DescriptorAllocator:
-    """Scope Triton's process-wide workspace allocator to one launch.
-
-    ``triton.set_allocator`` writes a process-global ``ContextVar`` that any other
-    Triton user shares, so the previous allocator is restored on the way out
-    rather than left overwritten.
-    """
+    """Scope Triton's process-wide workspace allocator (a shared ``ContextVar``) to one launch."""
 
     def __init__(self, device_index: int) -> None:
         self._scratch = _descriptor_scratch(device_index)
-        self._previous = None
 
     def _allocate(self, size: int, alignment: int, stream) -> torch.Tensor:
         if size > self._scratch.numel():
-            raise RuntimeError(
-                f"Replica transport needs {size} descriptor bytes but only "
-                f"{self._scratch.numel()} are reserved."
-            )
+            raise RuntimeError(f"Replica transport needs {size} descriptor bytes; reserved less.")
         return self._scratch[:size]
 
     def __enter__(self) -> None:
@@ -1252,7 +1229,7 @@ def launch_replica_weight_prefetch(
             *tables,
             int(peer_bases),
             int(signal_bases),
-            experts_to_copy,
+            _plan_table(experts_to_copy, world_size, num_local_experts),
             grid_barrier,
             _barrier_scratch(arena.device.index),
             rank,
@@ -1297,7 +1274,7 @@ def launch_replica_grad_reduce(
             *(_pointer_table(table, num_local_experts) for table in native_grads),
             int(peer_bases),
             int(signal_bases),
-            experts_to_copy,
+            _plan_table(experts_to_copy, world_size, num_local_experts),
             _source_scratch(device_index, (world_size + 1) * num_local_experts + 1),
             grid_barrier,
             _barrier_scratch(device_index),

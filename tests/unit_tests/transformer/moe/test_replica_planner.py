@@ -12,6 +12,7 @@ Cross-rank transport lives in ``test_replica_weight_triton.py`` and end-to-end
 gradient parity in ``test_replica_hybridep.py``.
 """
 
+import functools
 from types import SimpleNamespace
 
 import pytest
@@ -19,19 +20,16 @@ import torch
 
 from megatron.core.transformer.moe.experts import _ReplicaFC2WgradStore
 from megatron.core.transformer.moe.replica_planner import (
+    BACKWARD,
+    FORWARD,
     ReplicaPlan,
     ReplicaPlannerWorkspace,
     ReplicaWeightBridge,
-    _collect_replica_projection_specs,
-    _DirectionalBinding,
+    _ReplicaBackwardHook,
     _ReplicaProjection,
-    _WeightDirection,
+    _ReplicaWaitGradReduce,
     extract_semantic_routes,
     map_replica_plan_to_hybridep,
-    start_replica_grad_reduce_after_dispatch_backward,
-    start_replica_weight_prefetch_before_layer_backward,
-    wait_replica_grad_reduce_at_layer_input,
-    wait_replica_weight_prefetch_before_expert_backward,
 )
 from megatron.core.transformer.moe.replica_weight_triton import (
     launch_replica_placement,
@@ -288,7 +286,7 @@ def test_replica_rank_capacity_includes_per_expert_padding():
 
 
 def test_replica_backward_hooks_span_the_transport_window():
-    """Order the four transport hooks across one layer's backward."""
+    """Order the four transport hooks across one layer's backward, as the dispatcher places them."""
     events = []
     plan = object()
 
@@ -301,8 +299,8 @@ def test_replica_backward_hooks_span_the_transport_window():
                 for index, parameter in enumerate(self.source_parameters)
             )
 
-        def start_prefetch(self, current_plan, direction=_WeightDirection.FORWARD):
-            assert current_plan is plan and direction is _WeightDirection.BACKWARD
+        def start_prefetch(self, current_plan, direction=FORWARD):
+            assert current_plan is plan and direction == BACKWARD
             events.append("start_prefetch")
 
         def wait_prefetch_for_backward(self, current_plan):
@@ -331,15 +329,23 @@ def test_replica_backward_hooks_span_the_transport_window():
 
     bridge = FakeBridge()
     hidden = torch.ones((), requires_grad=True)
-    hidden = wait_replica_grad_reduce_at_layer_input(hidden, bridge, SimpleNamespace(plan=plan))
+    hidden = _ReplicaWaitGradReduce.apply(
+        hidden, *bridge.source_parameters, bridge, SimpleNamespace(plan=plan)
+    )
     hidden = BackwardMarker.apply(hidden, "router_and_shared_expert_backward")
-    hidden = start_replica_grad_reduce_after_dispatch_backward(hidden, bridge, plan)
+    hidden = _ReplicaBackwardHook.apply(
+        hidden, functools.partial(bridge.start_pending_grad_reduces, plan)
+    )
     hidden = BackwardMarker.apply(hidden, "dispatch_backward")
     hidden = BackwardMarker.apply(hidden, "expert_backward")
-    hidden = wait_replica_weight_prefetch_before_expert_backward(hidden, bridge, plan)
+    hidden = _ReplicaBackwardHook.apply(
+        hidden, functools.partial(bridge.wait_prefetch_for_backward, plan)
+    )
     hidden = BackwardMarker.apply(hidden, "combine_backward")
     hidden = BackwardMarker.apply(hidden, "latent_up_projection_backward")
-    hidden = start_replica_weight_prefetch_before_layer_backward(hidden, bridge, plan)
+    hidden = _ReplicaBackwardHook.apply(
+        hidden, functools.partial(bridge.start_prefetch, plan, BACKWARD)
+    )
     hidden.backward()
 
     assert events == [
@@ -353,8 +359,7 @@ def test_replica_backward_hooks_span_the_transport_window():
         "router_and_shared_expert_backward",
         "wait_grad_reduce",
     ]
-    # The reduction's output is accumulated into the optimizer parameters
-    # rather than aliased into them.
+    # Without fused accumulation the reduction's output is copied, never aliased.
     for index, parameter in enumerate(bridge.source_parameters):
         torch.testing.assert_close(
             parameter.grad, torch.full_like(parameter, index + 1), rtol=0, atol=0
@@ -367,15 +372,12 @@ def test_replica_fc2_reduction_starts_from_the_wgrad_store_and_fc1_after_dispatc
     plan = object()
     started = []
     bridge = ReplicaWeightBridge.__new__(ReplicaWeightBridge)
-    bridge._grad_reduce_plan = None
-    bridge._grad_reduce_started = set()
     bridge._backward_plan = plan
+    bridge._reduced = set()
 
-    def record(current_plan, projection):
-        assert current_plan is plan
+    def record(projection):
         started.append(projection)
-        bridge._grad_reduce_plan = current_plan
-        bridge._grad_reduce_started.add(projection)
+        bridge._reduced.add(projection)
 
     bridge.start_grad_reduce = record
 
@@ -390,6 +392,8 @@ def test_replica_fc2_reduction_starts_from_the_wgrad_store_and_fc1_after_dispatc
 
     bridge.start_pending_grad_reduces(plan)
     assert started == [1, 0]
+    with pytest.raises(RuntimeError, match="another plan"):
+        bridge.start_pending_grad_reduces(object())
 
 
 @requires_cuda
@@ -411,8 +415,8 @@ def test_replica_fused_wgrad_handoff_preserves_fp32():
             return (external_wgrad,)
 
     hidden = torch.ones((), device=device, requires_grad=True)
-    wait_replica_grad_reduce_at_layer_input(
-        hidden, FakeBridge(), SimpleNamespace(plan=plan)
+    _ReplicaWaitGradReduce.apply(
+        hidden, parameter, FakeBridge(), SimpleNamespace(plan=plan)
     ).backward()
 
     torch.testing.assert_close(parameter.main_grad, external_wgrad, rtol=0, atol=0)
@@ -420,192 +424,109 @@ def test_replica_fused_wgrad_handoff_preserves_fp32():
     assert parameter.grad.dtype == torch.bfloat16
 
 
-MEMBER_SHAPE = (4, 4)
-SCALE_SHAPE = (2, 2)
+MEMBER_SHAPE = (128, 128)
 
 
-def _mxfp8_member(device):
-    """Build one MXFP8 weight carrier with the four component tensors TE exposes."""
-    return SimpleNamespace(
-        shape=MEMBER_SHAPE,
-        device=device,
-        _rowwise_data=torch.empty(MEMBER_SHAPE, dtype=torch.uint8, device=device),
-        _rowwise_scale_inv=torch.empty(SCALE_SHAPE, dtype=torch.uint8, device=device),
-        _columnwise_data=torch.empty(MEMBER_SHAPE, dtype=torch.uint8, device=device),
-        _columnwise_scale_inv=torch.empty(SCALE_SHAPE, dtype=torch.uint8, device=device),
-    )
+def _mxfp8(tensor):
+    """Quantize a BF16 tensor into an MXFP8 tensor holding both GEMM orientations."""
+    from transformer_engine.pytorch.constants import DType
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    return MXFP8Quantizer(DType.kFloat8E4M3)(tensor)
 
 
 def _gtp_projection(weight_format, device, num_local_experts=2):
-    """Build a GTP-sharded projection whose weights arrive from an all-gather."""
-    components = 1 if weight_format == "bf16" else 2
-    if weight_format == "bf16":
+    """Build a GTP-sharded projection whose full weights arrive from a fake all-gather."""
+    mxfp8 = weight_format == "mxfp8"
 
-        def make():
-            return torch.empty(MEMBER_SHAPE, dtype=torch.bfloat16, device=device)
+    def make():
+        weight = torch.randn(MEMBER_SHAPE, dtype=torch.bfloat16, device=device)
+        return _mxfp8(weight) if mxfp8 else weight
 
-    else:
+    gathers = {FORWARD: [make() for _ in range(num_local_experts)]}
+    gathers[BACKWARD] = [make() for _ in range(num_local_experts)]
+    leader = make()
+    leader.is_gtp_weight_remat = True
+    if mxfp8:
+        leader._gtp_gather_quantizer = leader._quantizer
+    leader.materialize_group_for_forward = lambda: gathers[FORWARD]
+    leader.materialize_group_for_backward = lambda: gathers[BACKWARD]
+    parameters = (leader, *(make() for _ in range(num_local_experts - 1)))
 
-        def make():
-            return _mxfp8_member(device)
-
-    destinations = tuple(make() for _ in range(num_local_experts))
-    parameters = (
-        tuple(torch.nn.Parameter(weight) for weight in destinations)
-        if weight_format == "bf16"
-        else destinations
+    numel = MEMBER_SHAPE[0] * MEMBER_SHAPE[1]
+    dtype = torch.uint8 if mxfp8 else torch.bfloat16
+    slots = torch.zeros((num_local_experts, *MEMBER_SHAPE), dtype=dtype, device=device)
+    scales = (
+        torch.zeros((num_local_experts, numel // 32), dtype=torch.uint8, device=device)
+        if mxfp8
+        else None
     )
-    runtime_parameters = (
-        tuple(torch.nn.Parameter(torch.empty_like(weight)) for weight in destinations)
-        if weight_format == "bf16"
-        else tuple(make() for _ in range(num_local_experts))
-    )
-    bindings = tuple(
-        _DirectionalBinding(
-            torch.empty(num_local_experts, dtype=torch.int64, device=device),
-            (
-                torch.empty(num_local_experts, dtype=torch.int64, device=device)
-                if components == 2
-                else None
-            ),
-            host_pointer_table=torch.empty(
-                (components, num_local_experts), dtype=torch.int64, pin_memory=True
-            ),
-        )
-        for _ in range(2)
-    )
-    return _ReplicaProjection(
-        name="test projection",
-        device=device,
-        weight_format=weight_format,
-        parameters=parameters,
-        gtp_leader=parameters[0],
-        source_tensors=destinations,
-        forward=bindings[0],
-        backward=bindings[1],
-        native_grad_bases=torch.empty(num_local_experts, dtype=torch.int64, device=device),
-        member_shape=MEMBER_SHAPE,
-        rowwise_scale_shape=SCALE_SHAPE,
-        columnwise_scale_shape=SCALE_SHAPE,
-        virtual_weight=(),
-        virtual_grad=torch.empty((0, *MEMBER_SHAPE), dtype=torch.float32, device=device),
-        native_grad=torch.empty(
+    workspace = SimpleNamespace(
+        mxfp8=mxfp8,
+        member_shapes=(MEMBER_SHAPE,),
+        slot_views=lambda index: (slots, scales),
+        grad_slots=lambda index: torch.zeros(
             (num_local_experts, *MEMBER_SHAPE), dtype=torch.float32, device=device
         ),
-        runtime_parameters=runtime_parameters,
-    ), tuple(make() for _ in range(num_local_experts))
+        native_grads=(
+            torch.zeros((num_local_experts, *MEMBER_SHAPE), dtype=torch.float32, device=device),
+        ),
+    )
+    return _ReplicaProjection("test projection", parameters, workspace, 0), gathers
 
 
 def _data_ptrs(weights, weight_format, direction):
-    """Return the per-expert pointers the push reads for one direction."""
+    """Return the per-expert data pointers the push reads for one direction."""
     if weight_format == "bf16":
-        return tuple(weight.data_ptr() for weight in weights)
-    field = "_rowwise_data" if direction is _WeightDirection.FORWARD else "_columnwise_data"
-    return tuple(getattr(weight, field).data_ptr() for weight in weights)
+        return [weight.data_ptr() for weight in weights]
+    field = "_rowwise_data" if direction == FORWARD else "_columnwise_data"
+    return [getattr(weight, field).data_ptr() for weight in weights]
 
 
 @requires_cuda
 @pytest.mark.parametrize("weight_format", ["bf16", "mxfp8"])
-def test_replica_projection_binds_gtp_weights_during_capture(weight_format):
-    """Bind each GTP gather's storage into the pointer tables without a payload copy."""
+def test_replica_projection_binds_gtp_gathers_into_its_pointer_tables(weight_format):
+    """Point the push tables and the runtime parameters at each direction's GTP gather."""
     device = torch.device("cuda", torch.cuda.current_device())
-    projection, backward_weights = _gtp_projection(weight_format, device)
-    forward_weights = tuple(projection.source_tensors)
-    runtime_ids = tuple(id(parameter) for parameter in projection.runtime_parameters)
+    projection, gathers = _gtp_projection(weight_format, device)
+    runtime_ids = [id(parameter) for parameter in projection.runtime_parameters]
+    natives = projection.runtime_parameters[:2]
 
-    # The first forward binds under CUDA-graph capture: it may only enqueue an
-    # async pointer-table update from pinned staging, never a device sync.
-    capture_probe = torch.zeros(1, dtype=torch.int32, device=device)
+    projection.prepare(FORWARD)
     torch.cuda.synchronize(device)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        projection.bind_materialized_weights(forward_weights, _WeightDirection.FORWARD)
-        capture_probe.add_(1)
-    graph.replay()
+    forward_ptrs = _data_ptrs(gathers[FORWARD], weight_format, FORWARD)
+    assert projection.tables[FORWARD][0].tolist() == forward_ptrs
+    assert _data_ptrs(natives, weight_format, FORWARD) == forward_ptrs
+
+    # Forward and backward hold separate gathers; binding one leaves the other's table.
+    projection.prepare(BACKWARD)
     torch.cuda.synchronize(device)
-    torch.testing.assert_close(capture_probe, torch.ones_like(capture_probe), rtol=0, atol=0)
-
-    forward_ptrs = _data_ptrs(forward_weights, weight_format, _WeightDirection.FORWARD)
-    assert tuple(projection.forward.data_bases.cpu().tolist()) == forward_ptrs
-
-    # Forward and backward hold separate gathers; binding one must not disturb
-    # the other's table.
-    projection.bind_materialized_weights(backward_weights, _WeightDirection.BACKWARD)
-    backward_ptrs = _data_ptrs(backward_weights, weight_format, _WeightDirection.BACKWARD)
-    assert tuple(projection.backward.data_bases.cpu().tolist()) == backward_ptrs
-    assert tuple(projection.forward.data_bases.cpu().tolist()) == forward_ptrs
+    assert projection.tables[BACKWARD][0].tolist() == _data_ptrs(
+        gathers[BACKWARD], weight_format, BACKWARD
+    )
+    assert projection.tables[FORWARD][0].tolist() == forward_ptrs
     if weight_format == "mxfp8":
-        assert tuple(projection.forward.scale_bases.cpu().tolist()) == tuple(
-            weight._rowwise_scale_inv.data_ptr() for weight in forward_weights
-        )
-        assert tuple(projection.backward.scale_bases.cpu().tolist()) == tuple(
-            weight._columnwise_scale_inv.data_ptr() for weight in backward_weights
-        )
+        assert projection.tables[FORWARD][1].tolist() == [
+            weight._rowwise_scale_inv.data_ptr() for weight in gathers[FORWARD]
+        ]
+        assert projection.tables[BACKWARD][1].tolist() == [
+            weight._columnwise_scale_inv.data_ptr() for weight in gathers[BACKWARD]
+        ]
+        for parameter, forward, backward in zip(natives, gathers[FORWARD], gathers[BACKWARD]):
+            assert parameter._rowwise_data is forward._rowwise_data
+            assert parameter._columnwise_data is backward._columnwise_data
 
-    # The runtime parameters TE executes against are created once and rebound in
-    # place, so a captured expert GEMM keeps observing the same wrappers.
-    assert tuple(id(parameter) for parameter in projection.runtime_parameters) == runtime_ids
-    if weight_format == "bf16":
-        assert (
-            tuple(parameter.data_ptr() for parameter in projection.runtime_parameters)
-            == backward_ptrs
-        )
-    else:
-        for runtime_parameter, source in zip(projection.runtime_parameters, backward_weights):
-            assert runtime_parameter._columnwise_data is source._columnwise_data
-            assert runtime_parameter._columnwise_scale_inv is source._columnwise_scale_inv
-
-    # Rebinding the same gather is validation-only; a moved gather is fatal
-    # because the captured push would read a freed address.
-    projection.bind_materialized_weights(forward_weights, _WeightDirection.FORWARD)
-    moved = list(forward_weights)
-    moved[0] = _gtp_projection(weight_format, device)[1][0]
-    with pytest.raises(RuntimeError, match="all-gather storage of test projection changed"):
-        projection.bind_materialized_weights(tuple(moved), _WeightDirection.FORWARD)
-
-
-@requires_cuda
-def test_replica_runtime_parameters_keep_a_stable_grad_table():
-    """Keep the reduction's destination table pinned to the native wgrad staging."""
-    device = torch.device("cuda", torch.cuda.current_device())
-    projection, _ = _gtp_projection("bf16", device)
-    projection.bind_materialized_weights(tuple(projection.source_tensors), _WeightDirection.FORWARD)
-    for runtime_parameter, grad in zip(projection.runtime_parameters, projection.native_grad):
-        runtime_parameter.main_grad = grad
-    bridge = ReplicaWeightBridge.__new__(ReplicaWeightBridge)
-    bridge.device = device
-    bridge.num_local_experts = len(projection.parameters)
-    bridge.projections = [projection]
-    bridge.workspace = SimpleNamespace(grad_dtype=torch.float32)
-
-    bridge.prepare_runtime_parameters()
-    stable_ptrs = tuple(grad.data_ptr() for grad in projection.native_grad)
-    assert projection.native_grad_ptrs == stable_ptrs
-    assert tuple(projection.native_grad_bases.cpu().tolist()) == stable_ptrs
-
-    # Every later forward re-validates rather than rebinding, and stays capture-safe.
-    capture_probe = torch.zeros(1, dtype=torch.int32, device=device)
+    # A gather landing in a new buffer rebinds; the TE ops keep the same parameter objects.
+    gathers[FORWARD][0] = _gtp_projection(weight_format, device)[1][FORWARD][0]
+    projection.prepare(FORWARD)
     torch.cuda.synchronize(device)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        bridge.prepare_runtime_parameters()
-        capture_probe.add_(1)
-    graph.replay()
-    torch.cuda.synchronize(device)
-    assert tuple(projection.native_grad_bases.cpu().tolist()) == stable_ptrs
-    torch.testing.assert_close(capture_probe, torch.ones_like(capture_probe), rtol=0, atol=0)
-
-    projection.native_grad = torch.empty_like(projection.native_grad)
-    with pytest.raises(RuntimeError, match="native-grad storage changed"):
-        bridge.prepare_runtime_parameters()
-
-
-def test_replica_bridge_rejects_single_grouped_source_weights():
-    """A packed grouped weight has no per-expert address for the push to read."""
-    packed_linear = SimpleNamespace(in_features=16, out_features=32, single_grouped_weight=True)
-    experts = SimpleNamespace(linear_fc1=packed_linear, linear_fc2=packed_linear)
-
-    with pytest.raises(ValueError, match="moe_single_grouped_weight must be False"):
-        _collect_replica_projection_specs(
-            experts, num_local_experts=2, backend_name="Replica-HybridEP"
-        )
+    assert projection.tables[FORWARD][0].tolist() == _data_ptrs(
+        gathers[FORWARD], weight_format, FORWARD
+    )
+    assert _data_ptrs(natives, weight_format, FORWARD) == _data_ptrs(
+        gathers[FORWARD], weight_format, FORWARD
+    )
+    assert [id(parameter) for parameter in projection.runtime_parameters] == runtime_ids
+    # Every runtime parameter accumulates into bridge-owned staging that TE overwrites.
+    for parameter in projection.runtime_parameters:
+        assert parameter.overwrite_main_grad and parameter.main_grad is not None

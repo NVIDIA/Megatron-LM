@@ -12,6 +12,10 @@ once on replica_hybridep -- loads identical weights, and compares the output and
 every training gradient. Planner and bridge internals are covered
 process-locally in ``test_replica_planner.py``; the transport kernels in
 ``test_replica_weight_triton.py``.
+
+A bare ``MoELayer`` carries no DDP-time GTP wrapper, so the bridge's GTP gather and
+reduce-scatter path is exercised only by the training recipe with
+``--expert-tensor-parallel-num-weight-shards > 1``, not here.
 """
 
 import os
@@ -22,7 +26,6 @@ import torch.nn.functional as F
 
 from megatron.core.activations import squared_relu
 from megatron.core.transformer.moe import fused_a2a
-from megatron.core.transformer.moe.replica_planner import _collect_replica_projection_specs
 
 MXFP8_COMPONENTS = (
     "_rowwise_data",
@@ -95,7 +98,7 @@ def _assert_mxfp8_prefetch_exact(bridge, orientation):
     for index, projection in enumerate(bridge.projections):
         for component in components:
             local = torch.stack(
-                tuple(getattr(source, component) for source in projection.source_tensors)
+                tuple(getattr(source, component) for source in projection.parameters)
             )
             gathered = [torch.empty_like(local) for _ in range(bridge.world_size)]
             torch.distributed.all_gather(gathered, local, group=bridge.group)
@@ -104,7 +107,7 @@ def _assert_mxfp8_prefetch_exact(bridge, orientation):
                     continue
                 owner, owned = divmod(expert, bridge.num_local_experts)
                 if not torch.equal(
-                    getattr(projection.virtual_weight[slot], component), gathered[owner][owned]
+                    getattr(projection.virtual_weights[slot], component), gathered[owner][owned]
                 ):
                     errors.append(f"projection={index} {component} slot={slot} expert={expert}")
     any_error = torch.tensor(int(bool(errors)), dtype=torch.int32, device=bridge.device)
@@ -117,40 +120,31 @@ def _assert_mxfp8_prefetch_exact(bridge, orientation):
 def _assert_bridge_layout(bridge, *, grad_dtype, mxfp8):
     """Check that the runtime weights and grads TE executes against alias bridge storage."""
     assert bridge.workspace.grad_arena.dtype == grad_dtype
-    assert all(projection.virtual_grad.dtype == grad_dtype for projection in bridge.projections)
-    if mxfp8:
-        assert bridge.workspace.weight_arena is not None
-        assert bridge.workspace.weight_handle is not None
-        for projection in bridge.projections:
-            for virtual in projection.virtual_weight:
-                # One arena serves both orientations; only one is live at a time.
-                assert virtual._rowwise_data.data_ptr() == virtual._columnwise_data.data_ptr()
-            if projection.gtp_leader is None:
-                # A bare MoELayer has no DDP-time GTP remat wrapper to alias.
-                continue
-            for source, virtual in zip(projection.source_tensors, projection.virtual_weight):
-                # GTP gather outputs replace these aliases before execution, so
-                # no second full native staging allocation is retained.
-                assert source is not virtual
-                assert source._rowwise_data.data_ptr() == virtual._rowwise_data.data_ptr()
-                assert source._columnwise_data.data_ptr() == virtual._columnwise_data.data_ptr()
-
-    bridge.prepare_runtime_parameters()
     for projection, runtime_weights in zip(
         bridge.projections, (bridge.runtime_fc1_weights, bridge.runtime_fc2_weights)
     ):
         assert len(runtime_weights) == bridge.num_runtime_experts
-        assert projection.native_grad is not None
-        natives = tuple(projection.native_grad)
+        assert projection.virtual_grad.dtype == grad_dtype
         for index, runtime_weight in enumerate(runtime_weights):
             if index < bridge.num_local_experts:
-                expected_weight, expected_grad = projection.source_tensors[index], natives[index]
+                # A bare MoELayer has no DDP-time GTP wrapper, so natives alias the
+                # optimizer parameters directly.
+                assert projection.gtp_leader is None
+                expected_weight = projection.parameters[index]
+                expected_grad = projection.native_grad[index]
             else:
                 slot = index - bridge.num_local_experts
-                expected_weight = projection.virtual_weight[slot]
+                expected_weight = projection.virtual_weights[slot]
                 expected_grad = projection.virtual_grad[slot]
+                if mxfp8:
+                    # One arena serves both orientations; only one is live at a time.
+                    assert (
+                        expected_weight._rowwise_data.data_ptr()
+                        == expected_weight._columnwise_data.data_ptr()
+                    )
             assert _weight_storage_ptrs(runtime_weight) == _weight_storage_ptrs(expected_weight)
             assert runtime_weight.main_grad.data_ptr() == expected_grad.data_ptr()
+            assert runtime_weight.overwrite_main_grad
 
 
 def _run_full_layer_parity(
@@ -269,21 +263,13 @@ def _run_full_layer_parity(
         if mxfp8:
             # A state_dict load does not carry the quantized component storage,
             # so mirror it explicitly before comparing the two layers.
-            reference_specs, _ = _collect_replica_projection_specs(
-                ref_layer.experts,
-                num_local_experts=bridge.num_local_experts,
-                backend_name="test-reference",
-            )
-            for reference, replica in zip(reference_specs, bridge.projections):
-                for source, destination in zip(reference.source_tensors, replica.source_tensors):
+            for linear, replica in zip(
+                (ref_layer.experts.linear_fc1, ref_layer.experts.linear_fc2), bridge.projections
+            ):
+                for index, destination in enumerate(replica.parameters):
+                    source = linear.get_parameter(f"weight{index}")
                     for component in MXFP8_COMPONENTS:
                         getattr(destination, component).copy_(getattr(source, component))
-                        torch.testing.assert_close(
-                            getattr(destination, component),
-                            getattr(source, component),
-                            rtol=0,
-                            atol=0,
-                        )
 
         torch.manual_seed(1234)
         test_input = torch.randn(2, 4, 1024, device="cuda", dtype=torch.bfloat16)
@@ -513,7 +499,6 @@ def _run_repeated_mtp_parity(monkeypatch):
         fused_a2a.reset_hybrid_ep_buffer()
         torch.distributed.barrier()
 
-        replica_loss = forward(replica_model)
         moe_layers = [
             module
             for module in replica_model.mtp.layers[0].mtp_model_layer.modules()
@@ -521,23 +506,26 @@ def _run_repeated_mtp_parity(monkeypatch):
         ]
         assert len(moe_layers) == 1, "repeated MTP must exercise one shared MoE layer"
         manager = moe_layers[0].token_dispatcher._comm_manager
-        # Two depths share one layer, so two planner slots must be live at once
-        # with disjoint workspaces; a reused workspace would corrupt the first
-        # depth's plan before its own backward runs.
-        slots = manager._replica_plan_slots
-        assert len(slots) == 2
-        assert all(slot.in_use and slot.plan is not None for slot in slots)
-        assert slots[0].workspace is not slots[1].workspace
-        assert slots[0].plan.virtual_experts.data_ptr() != slots[1].plan.virtual_experts.data_ptr()
-        active_replica = torch.stack(
-            [torch.any(slot.plan.experts_to_copy >= 0) for slot in slots]
-        ).any()
+        # Two depths share one layer, so the second plan must not clobber the first:
+        # each backward reads its own experts_to_copy.
+        plans = []
+        plan_dispatch = manager.plan_dispatch
+
+        def record_plan(hidden_states):
+            plan_dispatch(hidden_states)
+            plans.append(manager._plan)
+
+        manager.plan_dispatch = record_plan
+        replica_loss = forward(replica_model)
+        assert len(plans) == 2
+        assert plans[0].experts_to_copy.data_ptr() != plans[1].experts_to_copy.data_ptr()
+        active_replica = torch.stack([torch.any(plan.experts_to_copy >= 0) for plan in plans]).any()
         torch.distributed.all_reduce(active_replica, op=torch.distributed.ReduceOp.MAX)
         assert active_replica.item(), "repeated MTP parity must exercise an active replica"
 
         replica_loss.sum().backward()
         replica_gradients = snapshot(replica_model)
-        assert not any(slot.in_use for slot in slots)
+        assert manager._plan is None and manager._context is None
 
         torch.testing.assert_close(
             replica_loss,
