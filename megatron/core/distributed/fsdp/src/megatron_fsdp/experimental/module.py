@@ -42,8 +42,8 @@ class FsdpContext:
     allgather_stream: torch.cuda.Stream
     reduce_scatter_stream: torch.cuda.Stream
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
-    # unnecessary because it can be detected when ``model_weight``, after syncing
-    # from ``main_weight``, has placements different from ``Placements.optimizer``.
+    # unnecessary because each parameter group tracks whether model_weight is stale
+    # after syncing from main_weight.
     is_last_microbatch: bool
     use_symmetric_memory: bool
     unify_communication_stream: bool
@@ -204,8 +204,6 @@ class FsdpModule:
                         main_weight_placements, group_dtype
                     ),
                     mixed_precision_policy=mixed_precision_policy,
-                    allgather_stream=context.allgather_stream,
-                    reduce_scatter_stream=context.reduce_scatter_stream,
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
                 )

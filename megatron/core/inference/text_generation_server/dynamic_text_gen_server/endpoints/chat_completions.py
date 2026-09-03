@@ -30,7 +30,13 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
-from ..openai_streaming import StreamingChatParser, openai_stream
+from ..openai_streaming import (
+    StreamingChatParser,
+    json_safe_logprobs,
+    json_safe_top_n_logprobs,
+    openai_stream,
+)
+from .common import abort_requests
 
 logger = logging.getLogger(__name__)
 
@@ -1093,16 +1099,43 @@ try:
             response.timeout = None
             return response
 
-        tasks = [
-            client.add_request(prompt_tokens, sampling_params, multi_modal_data=multi_modal_data)
-            for _ in range(n)
-        ]
+        # add_request_with_id, not add_request: a non-streaming response writes
+        # nothing to the socket while generating, so a disconnect is never
+        # discovered as a broken pipe. Aborting needs the request ids.
+        #
+        # Submitted one at a time rather than in a comprehension so a failure on
+        # admission k -- a zmq send error, or multimodal serialization on a
+        # malformed payload -- can abort the k-1 already in flight. Left to
+        # escape they would generate to their token limit holding batch slots,
+        # the same leak the abort below the gather closes.
+        request_ids = []
+        tasks = []
+        try:
+            for _ in range(n):
+                request_id, future = client.add_request_with_id(
+                    prompt_tokens, sampling_params, multi_modal_data=multi_modal_data
+                )
+                request_ids.append(request_id)
+                tasks.append(future)
+        except Exception as e:
+            abort_requests(client, request_ids, f"submission failed: {e}")
+            logger.error(f"Error submitting request: {e}")
+            return Response(f"Error submitting request: {e}", status=500)
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()
 
         try:
             batch_results = await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            # Quart cancels this handler when the peer goes away (its ASGI
+            # connection races handle_messages against handle_request and
+            # cancels the loser). Without this the engine would keep generating
+            # for a client that is gone, holding a slot until it hit the token
+            # limit -- orphans then accumulate faster than they retire and the
+            # batch saturates.
+            abort_requests(client, request_ids, "client disconnected")
+            raise
         except Exception as e:
             logger.error(f"Error during inference: {e}")
             return Response(f"Error during inference: {e}", status=500)
@@ -1179,13 +1212,15 @@ try:
 
             logprobs_content = None
             if sampling_params.return_log_probs:
-                token_logprobs = result.get('log_probs', [])
+                token_logprobs = json_safe_logprobs(result.get('log_probs') or [])
 
                 tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
                 tokens = list(map(tokenizer.detokenize, tokens_to_decode))
 
                 # Get top_n_logprobs if available
-                generated_top_n_logprobs = result.get('generated_top_n_logprobs')
+                generated_top_n_logprobs = json_safe_top_n_logprobs(
+                    result.get('generated_top_n_logprobs') or []
+                )
 
                 logprobs_content = []
                 for i, (tok, lp) in enumerate(zip(tokens, token_logprobs)):

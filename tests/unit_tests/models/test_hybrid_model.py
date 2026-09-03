@@ -336,6 +336,9 @@ class TestHybridModel:
                 super().__init__()
                 self.mtp_input_mask = None
 
+            def prepare_cp_layout(self, **kwargs):
+                return SimpleNamespace(**kwargs)
+
             def forward(self, **kwargs):
                 self.mtp_input_mask = kwargs["mtp_input_mask"]
                 hidden_states = kwargs["hidden_states"]

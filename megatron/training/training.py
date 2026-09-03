@@ -2395,12 +2395,12 @@ def _freeze_base_model_for_mtp(model_list):
     return model_list
 
 
-def _add_model_freeze_pre_wrap_hook(model_config, args):
+def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_base_model_for_mtp):
     """Install the requested freeze hook before a config-built model is wrapped."""
     freeze_hook = None
-    if args.freeze_all_layers:
+    if freeze_all_layers:
         freeze_hook = _freeze_all_model_chunks
-    elif args.freeze_base_model_for_mtp:
+    elif freeze_base_model_for_mtp:
         freeze_hook = _freeze_base_model_for_mtp
 
     if freeze_hook is not None and freeze_hook not in model_config.pre_wrap_hooks:
@@ -2766,7 +2766,11 @@ def setup_model_and_optimizer(
 
             # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
             # gradient storage for parameters that remain trainable (matching get_model behavior).
-            _add_model_freeze_pre_wrap_hook(model_config, args)
+            _add_model_freeze_pre_wrap_hook(
+                model_config,
+                freeze_all_layers=args.freeze_all_layers,
+                freeze_base_model_for_mtp=args.freeze_base_model_for_mtp,
+            )
 
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
