@@ -76,14 +76,63 @@ def _single_grouped_mxfp8_scale_view(
     # One TE GroupedTensor is one PyTorch Parameter, but TE exposes one quantized
     # member view per expert; their scale views share expert-major backing storage.
     members = get_grouped_quantized_members(param)
-    if not members:
-        raise RuntimeError(f"MOK {name} grouped parameter has no quantized members")
-    first = getattr(members[0], member_attr, None)
-    if first is None or first.dtype != torch.uint8 or not first.is_contiguous():
-        raise RuntimeError(f"MOK {name} requires contiguous uint8 TE member storage {member_attr}")
-    expected_numel = 1
-    for dim in shape:
-        expected_numel *= dim
+    num_experts = shape[0]
+    if num_experts <= 0:
+        raise RuntimeError(f"MOK {name} grouped parameter must contain at least one expert")
+    if len(members) != num_experts:
+        raise RuntimeError(
+            f"MOK {name} grouped parameter member count mismatch: "
+            f"got {len(members)}, expected {num_experts}"
+        )
+
+    expected_member_shape = shape[1:]
+    expected_member_numel = 1
+    for dim in expected_member_shape:
+        expected_member_numel *= dim
+
+    first: torch.Tensor | None = None
+    first_storage_ptr = 0
+    first_offset = 0
+    for expert, member in enumerate(members):
+        scale = getattr(member, member_attr, None)
+        if not torch.is_tensor(scale):
+            raise RuntimeError(
+                f"MOK {name} expert {expert} is missing TE member storage {member_attr}"
+            )
+        if not scale.is_cuda or scale.dtype != torch.uint8 or not scale.is_contiguous():
+            raise RuntimeError(
+                f"MOK {name} expert {expert} requires contiguous CUDA uint8 "
+                f"TE member storage {member_attr}"
+            )
+        if tuple(scale.shape) != expected_member_shape:
+            raise RuntimeError(
+                f"MOK {name} expert {expert} scale shape mismatch: "
+                f"got {tuple(scale.shape)}, expected {expected_member_shape}"
+            )
+
+        if first is None:
+            first = scale
+            first_storage_ptr = scale.untyped_storage().data_ptr()
+            first_offset = scale.storage_offset()
+            continue
+        if scale.device != first.device:
+            raise RuntimeError(
+                f"MOK {name} expert {expert} scale device mismatch: "
+                f"got {scale.device}, expected {first.device}"
+            )
+        if scale.untyped_storage().data_ptr() != first_storage_ptr:
+            raise RuntimeError(
+                f"MOK {name} expert {expert} scale does not share grouped backing storage"
+            )
+        expected_offset = first_offset + expert * expected_member_numel
+        if scale.storage_offset() != expected_offset:
+            raise RuntimeError(
+                f"MOK {name} expert {expert} scale is not tightly packed in expert order: "
+                f"got storage_offset={scale.storage_offset()}, expected {expected_offset}"
+            )
+
+    assert first is not None
+    expected_numel = num_experts * expected_member_numel
     storage_numel = first.untyped_storage().nbytes() // first.element_size()
     available_numel = storage_numel - first.storage_offset()
     if available_numel < expected_numel:

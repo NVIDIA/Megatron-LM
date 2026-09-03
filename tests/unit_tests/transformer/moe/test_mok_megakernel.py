@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -128,6 +130,73 @@ def test_swizzle_mxfp8_scale_refreshes_existing_output_in_place():
     assert actual is output
     assert actual.data_ptr() == output_ptr
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_single_grouped_mxfp8_scale_view_validates_tightly_packed_members(monkeypatch):
+    from megatron.core import fp8_utils
+
+    num_experts = 3
+    member_shape = (4, 2)
+    backing = torch.empty(
+        (num_experts, *member_shape), device="cuda", dtype=torch.uint8
+    )
+    members = [SimpleNamespace(_rowwise_scale_inv=backing[expert]) for expert in range(num_experts)]
+    monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", lambda _: members)
+
+    actual = mok_weights._single_grouped_mxfp8_scale_view(
+        object(), "_rowwise_scale_inv", (num_experts, *member_shape), name="test rowwise"
+    )
+
+    assert actual.data_ptr() == backing.data_ptr()
+    torch.testing.assert_close(actual, backing)
+
+
+def test_single_grouped_mxfp8_scale_view_rejects_wrong_member_count(monkeypatch):
+    from megatron.core import fp8_utils
+
+    monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", lambda _: [object()])
+
+    with pytest.raises(RuntimeError, match="member count mismatch"):
+        mok_weights._single_grouped_mxfp8_scale_view(
+            object(), "_rowwise_scale_inv", (2, 4, 2), name="test rowwise"
+        )
+
+
+def test_single_grouped_mxfp8_scale_view_rejects_separate_storage(monkeypatch):
+    from megatron.core import fp8_utils
+
+    members = [
+        SimpleNamespace(_rowwise_scale_inv=torch.empty((4, 2), device="cuda", dtype=torch.uint8))
+        for _ in range(2)
+    ]
+    monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", lambda _: members)
+
+    with pytest.raises(RuntimeError, match="does not share grouped backing storage"):
+        mok_weights._single_grouped_mxfp8_scale_view(
+            object(), "_rowwise_scale_inv", (2, 4, 2), name="test rowwise"
+        )
+
+
+def test_single_grouped_mxfp8_scale_view_rejects_inter_expert_padding(monkeypatch):
+    from megatron.core import fp8_utils
+
+    member_shape = (4, 2)
+    member_numel = member_shape[0] * member_shape[1]
+    backing = torch.empty(2 * (member_numel + 1), device="cuda", dtype=torch.uint8)
+    members = [
+        SimpleNamespace(
+            _rowwise_scale_inv=torch.as_strided(
+                backing, member_shape, (member_shape[1], 1), expert * (member_numel + 1)
+            )
+        )
+        for expert in range(2)
+    ]
+    monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", lambda _: members)
+
+    with pytest.raises(RuntimeError, match="not tightly packed in expert order"):
+        mok_weights._single_grouped_mxfp8_scale_view(
+            object(), "_rowwise_scale_inv", (2, *member_shape), name="test rowwise"
+        )
 
 
 def test_single_grouped_mxfp8_view_builds_and_refreshes_scales(monkeypatch):

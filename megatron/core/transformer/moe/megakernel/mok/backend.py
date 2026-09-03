@@ -160,6 +160,13 @@ class MoKMegakernel(MegakernelBackend):
             ),
         )
 
+        if not hasattr(routed_experts, "linear_fc1") or not hasattr(
+            routed_experts, "linear_fc2"
+        ):
+            raise ValueError(
+                "MOK requires grouped routed experts exposing linear_fc1 and linear_fc2"
+            )
+
         fc1 = routed_experts.linear_fc1
         fc2 = routed_experts.linear_fc2
         actual_single_grouped = bool(getattr(fc1, "single_grouped_weight", False))
