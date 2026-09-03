@@ -31,7 +31,7 @@ from torch import Tensor
 from megatron.core.tensor_parallel.mappings import async_reduce_scatter_along_first_dim
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
-from . import thd_indexer_kernels, thd_layout_kernels
+from . import csa_indexer_loss_kernels, thd_indexer_kernels, thd_layout_kernels
 from .csa_teacher_lse import can_use_fused_csa_teacher_lse, fused_csa_teacher_lse
 
 # ---------------------------------------------------------------------------
@@ -1162,6 +1162,7 @@ def _kl_loss_from_target_predict(
     topk_indices: Tensor,
     loss_coeff: float,
     calculate_per_token_loss: bool = False,
+    loss_divisor: int | float | Tensor | None = None,
 ) -> Tensor:
     """KL(target || predict) reduced over ``(B, S_q)`` and scaled by loss_coeff.
 
@@ -1169,18 +1170,32 @@ def _kl_loss_from_target_predict(
     masking) contribute 0 to the loss — the sparse score kernels produce
     garbage for those rows, mirroring ``compute_dsa_indexer_loss``'s
     ``row_valid`` handling. The default mean is taken over all ``(B, S_q)``
-    positions. Per-token-loss mode returns a raw local sum so finalize can
-    apply the global token divisor.
+    positions. Per-token-loss mode returns a raw local sum unless
+    ``loss_divisor`` is supplied, in which case the global normalization is
+    folded into the same compiled reduction.
     """
-    eps = _CLIP_PROB_MIN
-    t = target.clamp(min=eps)
-    p = predict.clamp(min=eps)
-    kl_per_row = (t * (torch.log(t) - torch.log(p))).sum(dim=-1)  # (B, S_q)
+    return csa_indexer_loss_kernels.sparse_kl_loss(
+        target, predict, topk_indices, loss_coeff, calculate_per_token_loss, loss_divisor
+    )
 
-    row_valid = (topk_indices >= 0).any(dim=-1)  # (B, S_q)
-    kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
-    loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
-    return loss_coeff * loss
+
+def _scale_indexer_grads(grad_loss: Tensor, *grads: Tensor) -> Tuple[Tensor, ...]:
+    """Scale independent indexer gradients with one foreach launch per dtype group."""
+    if not grads:
+        return ()
+
+    grouped_grads: dict[
+        tuple[torch.device, torch.dtype, torch.layout], list[tuple[int, Tensor]]
+    ] = {}
+    for index, grad in enumerate(grads):
+        grouped_grads.setdefault((grad.device, grad.dtype, grad.layout), []).append((index, grad))
+
+    scaled_by_index: dict[int, Tensor] = {}
+    for indexed_grads in grouped_grads.values():
+        scaled_group = torch._foreach_mul([grad for _, grad in indexed_grads], grad_loss)
+        for (index, _), scaled_grad in zip(indexed_grads, scaled_group):
+            scaled_by_index[index] = scaled_grad
+    return tuple(scaled_by_index[index] for index in range(len(grads)))
 
 
 # ---------------------------------------------------------------------------
@@ -1904,9 +1919,12 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         d_sink = attn_bwd["d_sink"]
 
         # ---- 2. Scale pre-computed indexer grads by grad_loss. ---------------
-        grad_q_indexer = precomputed_grad_q_indexer * grad_loss
-        grad_k_indexer = precomputed_grad_k_indexer * grad_loss
-        grad_weights = precomputed_grad_weights * grad_loss
+        grad_q_indexer, grad_k_indexer, grad_weights = _scale_indexer_grads(
+            grad_loss,
+            precomputed_grad_q_indexer,
+            precomputed_grad_k_indexer,
+            precomputed_grad_weights,
+        )
 
         # Grads: query, kv_full, attn_sink, window_idxs, q_indexer, k_indexer,
         #   weights, indexer_topk, ratio, softmax_scale, indexer_softmax_scale,
@@ -2038,14 +2056,14 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                 qhead_per_kv_head=np_,
                 topk_indices_global=True,
             )
-            raw_local_loss = _kl_loss_from_target_predict(
+            indexer_loss = _kl_loss_from_target_predict(
                 target,
                 predict,
                 indexer_topk_idxs_for_loss,
                 loss_coeff,
                 calculate_per_token_loss=True,
+                loss_divisor=loss_divisor,
             )
-            indexer_loss = raw_local_loss / loss_divisor
             if loss_coeff > 0:
                 ig = _DSA.indexer_backward_wrapper(
                     q_indexer.view(1, total_q, idx_nh, idx_hd),
@@ -2283,10 +2301,12 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                 grad_local_compressed_kv = compressed_kv_reduce_scatter.tensor
 
         # These local branches do not consume either reduce-scatter result.
-        # Queue them before either branch-local consumer wait.
+        # Queue them before either branch-local consumer wait. K stays in the
+        # earlier scaling launch so its reduce-scatter is not delayed.
         nvtx_range_push("dsv4_cp_local_indexer_grads")
-        grad_q_indexer = saved_grad_q_indexer * grad_loss
-        grad_weights = saved_grad_weights * grad_loss
+        grad_q_indexer, grad_weights = _scale_indexer_grads(
+            grad_loss, saved_grad_q_indexer, saved_grad_weights
+        )
         nvtx_range_pop("dsv4_cp_local_indexer_grads")
 
         if cp_group is not None:

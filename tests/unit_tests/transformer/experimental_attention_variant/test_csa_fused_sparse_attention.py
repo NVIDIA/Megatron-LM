@@ -5,8 +5,8 @@
 Coverage:
 
 * Pure-Python helpers: :func:`local_to_global_flat`, :func:`build_flat_topk_idxs`,
-  :func:`_kl_loss_from_target_predict` — full correctness checks; no GPU
-  kernels required (CPU is fine).
+  :func:`_kl_loss_from_target_predict` — full correctness checks, plus CUDA
+  parity for the compiled sparse-KL path.
 * Lazy-import gates: :func:`_ensure_flash_mla`, :func:`_ensure_dsa_namespace`
   raise informative ``ImportError`` when the optional packages are missing.
 * GPU helpers: :func:`_get_topk_alignment` — runs only on CUDA.
@@ -639,6 +639,83 @@ class TestKLLossFromTargetPredict:
         )
 
         assert torch.allclose(loss_sum, loss_mean * (b * sq), rtol=1e-5, atol=1e-5)
+
+    def test_explicit_loss_divisor(self):
+        torch.manual_seed(2)
+        rows, topk = 7, 5
+        target = torch.softmax(torch.randn(rows, topk), dim=-1)
+        predict = torch.softmax(torch.randn(rows, topk), dim=-1)
+        topk_indices = torch.zeros(rows, topk, dtype=torch.int32)
+        topk_indices[0] = -1
+
+        raw_loss = _kl_loss_from_target_predict(
+            target, predict, topk_indices, loss_coeff=0.75, calculate_per_token_loss=True
+        )
+        divided_by_number = _kl_loss_from_target_predict(
+            target,
+            predict,
+            topk_indices,
+            loss_coeff=0.75,
+            calculate_per_token_loss=True,
+            loss_divisor=4,
+        )
+        divided_by_tensor = _kl_loss_from_target_predict(
+            target,
+            predict,
+            topk_indices,
+            loss_coeff=0.75,
+            calculate_per_token_loss=True,
+            loss_divisor=torch.tensor(4.0),
+        )
+
+        torch.testing.assert_close(divided_by_number, raw_loss / 4)
+        torch.testing.assert_close(divided_by_tensor, raw_loss / 4)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="compiled sparse KL requires CUDA")
+    def test_cuda_compiled_matches_cpu_eager(self):
+        torch.manual_seed(3)
+        rows, topk = 9, 7
+        target = torch.softmax(torch.randn(rows, topk), dim=-1)
+        predict = torch.softmax(torch.randn(rows, topk), dim=-1)
+        topk_indices = torch.zeros(rows, topk, dtype=torch.int32)
+        target[0] = torch.nan
+        predict[0] = torch.nan
+        topk_indices[0] = -1
+        topk_indices[4, 2:] = -1
+
+        expected = _kl_loss_from_target_predict(
+            target,
+            predict,
+            topk_indices,
+            loss_coeff=0.625,
+            calculate_per_token_loss=True,
+            loss_divisor=3,
+        )
+        actual = _kl_loss_from_target_predict(
+            target.cuda(),
+            predict.cuda(),
+            topk_indices.cuda(),
+            loss_coeff=0.625,
+            calculate_per_token_loss=True,
+            loss_divisor=3,
+        )
+
+        torch.testing.assert_close(actual.cpu(), expected, rtol=1e-5, atol=1e-6)
+
+
+def test_scale_indexer_grads_matches_individual_mul():
+    torch.manual_seed(4)
+    grad_loss = torch.tensor(0.375)
+    grads = (torch.randn(7, 3), torch.randn(5, 2), torch.randn(9))
+    original = tuple(grad.clone() for grad in grads)
+
+    actual = dk._scale_indexer_grads(grad_loss, *grads)
+
+    assert len(actual) == len(grads)
+    for scaled, reference in zip(actual, original):
+        torch.testing.assert_close(scaled, reference * grad_loss)
+    for grad, reference in zip(grads, original):
+        assert torch.equal(grad, reference)
 
 
 class TestKLLossFromDenseScores:
