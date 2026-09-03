@@ -12,7 +12,19 @@ import pickle
 import re
 import warnings
 from contextlib import contextmanager, nullcontext
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    cast,
+)
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +33,7 @@ from torch import Tensor
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
@@ -66,7 +79,6 @@ from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     is_te_min_version,
     is_torch_min_version,
-    log_single_rank,
 )
 
 try:
@@ -446,16 +458,29 @@ def _param_storage_summary(module: torch.nn.Module) -> str:
 
 
 _log_quantization_types = False
+_log_quantization_ranks: frozenset = frozenset({0})
 
 
-def set_log_quantization_types(enabled: bool) -> None:
+def set_log_quantization_types(enabled: bool, ranks: Optional[Iterable[int]] = None) -> None:
     """Turn the per-layer quantization log on or off.
 
     Set from --log-quantization-types at the start of training and cleared after the
     first step, so the log describes the model once rather than every iteration.
+
+    ``ranks`` are the global ranks that write the log, defaulting to rank 0. A model
+    whose parts sit on disjoint ranks needs one rank per part: in non-colocated MIMO
+    the vision encoder holds rank 0 and the language model starts at
+    --mimo-llm-offset, so a single rank only ever describes the encoder.
     """
-    global _log_quantization_types
+    global _log_quantization_types, _log_quantization_ranks
     _log_quantization_types = enabled
+    _log_quantization_ranks = frozenset(ranks) if ranks else frozenset({0})
+
+
+def _emit_quantization_log(message: str) -> None:
+    """Write one line of the quantization log, on the ranks that were selected."""
+    if logger.isEnabledFor(logging.INFO) and safe_get_rank() in _log_quantization_ranks:
+        logger.info(message)
 
 
 def is_log_quantization_types_enabled() -> bool:
@@ -471,7 +496,7 @@ def qtype_debug_note(text: str) -> None:
     linears are free to override, and the header would then contradict the lines beneath.
     """
     if _log_quantization_types:
-        log_single_rank(logger, logging.INFO, text)
+        _emit_quantization_log(text)
 
 
 # Lines sit under the layer header that precedes them. The indent is fixed rather than
@@ -512,10 +537,8 @@ def qtype_debug_log(module: torch.nn.Module) -> None:
             details.append(shape)
         if not HAVE_TE:
             details.append("quantization_type: none")
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"{_LINE_INDENT}{_module_label(module)} --> " + ", ".join(details),
+            _emit_quantization_log(
+                f"{_LINE_INDENT}{_module_label(module)} --> " + ", ".join(details)
             )
             return
         if not FP8GlobalStateManager.is_fp8_enabled():
@@ -534,9 +557,7 @@ def qtype_debug_log(module: torch.nn.Module) -> None:
             quantization_type = "unknown"
         details.append(f"quantization_type: {quantization_type}")
         details.append(_param_storage_summary(module))
-        log_single_rank(
-            logger, logging.INFO, f"{_LINE_INDENT}{_module_label(module)} --> " + ", ".join(details)
-        )
+        _emit_quantization_log(f"{_LINE_INDENT}{_module_label(module)} --> " + ", ".join(details))
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):

@@ -4471,8 +4471,14 @@ def train(
     # Tracking loss.
     total_loss_dict = {}
 
-    # Describes the model's quantization once on the first step; cleared below.
-    set_log_quantization_types(args.log_quantization_types)
+    # Describes the model's quantization once on the first step; cleared below. In
+    # non-colocated MIMO the vision encoder holds rank 0 and the language model starts
+    # at --mimo-llm-offset, so logging one rank would only ever describe the encoder.
+    quantization_log_ranks = {0}
+    mimo_llm_offset = getattr(args, "mimo_llm_offset", None)
+    if mimo_llm_offset:
+        quantization_log_ranks.add(mimo_llm_offset)
+    set_log_quantization_types(args.log_quantization_types, quantization_log_ranks)
 
     # Iterations.
     iteration = args.iteration
