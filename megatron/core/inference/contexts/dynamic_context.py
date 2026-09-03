@@ -26,7 +26,12 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling.base import Sampling
-from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.sampling_params import (
+    MIN_SAMPLING_TEMPERATURE,
+    SamplingParams,
+    is_no_op_top_k,
+    is_no_op_top_p,
+)
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
@@ -4717,6 +4722,25 @@ class DynamicInferenceContext(BaseInferenceContext):
             "evict_request_ids": evict_request_ids,
         }
 
+    def active_sampling_filter_flags(
+        self, active_request_count: Optional[int] = None
+    ) -> Tuple[bool, bool]:
+        """Return `(no_top_k, no_top_p)` batch-level flags for the active batch.
+
+        These are read from the pinned CPU sampling metadata, so they incur no GPU sync.
+        They are used in several places to decide whether to skip sampling-filtering work.
+        """
+        if active_request_count is None:
+            active_request_count = self.total_request_count - self.paused_request_count
+        if active_request_count <= 0:
+            return True, True
+
+        top_k = self.active_request_metadata["top_k"][:active_request_count]
+        top_p = self.active_request_metadata["top_p"][:active_request_count]
+        no_top_k = bool(is_no_op_top_k(top_k).all())
+        no_top_p = bool(is_no_op_top_p(top_p).all())
+        return no_top_k, no_top_p
+
     def _processed_log_probs(
         self,
         logits: Tensor,
@@ -4783,7 +4807,25 @@ class DynamicInferenceContext(BaseInferenceContext):
             log_probs = self._processed_log_probs(
                 active_logits, n_active, None, sampling, row_to_request
             )
-            return log_probs[seq_idx, new_tokens], log_probs
+            selected_log_probs = log_probs[seq_idx, new_tokens]
+            if self.config.logprobs_mode != "raw_logprobs" and not all(
+                self.active_sampling_filter_flags(n_active)
+            ):
+                if row_to_request is None:
+                    temperature = self.gpu_view.temperature[: len(new_tokens)]
+                else:
+                    temperature = self.gpu_view.temperature[
+                        row_to_request.to(logits.device, non_blocking=True)
+                    ]
+                scaled = active_logits / temperature.clamp(min=MIN_SAMPLING_TEMPERATURE).unsqueeze(
+                    1
+                )
+                gathered = scaled.gather(1, new_tokens.view(-1, 1).long()).squeeze(1)
+                tempered = gathered - scaled.logsumexp(dim=1)
+                selected_log_probs = torch.where(
+                    torch.isfinite(selected_log_probs), selected_log_probs, tempered
+                )
+            return selected_log_probs, log_probs
 
         logits_squeezed = logits_squeezed.float()
         active_slice = slice(self.paused_request_count, self.total_request_count)
@@ -4799,7 +4841,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             logits_squeezed, n_active, active_query_lengths_cpu, sampling
         )
         seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
-        return log_probs[seq_idx, active_token_ids], log_probs
+        selected_log_probs = log_probs[seq_idx, active_token_ids]
+        if self.config.logprobs_mode != "raw_logprobs" and not all(
+            self.active_sampling_filter_flags(n_active)
+        ):
+            # Only each request's final row is engine-sampled; prompt rows may keep -inf.
+            temperature = self.gpu_view.temperature[:n_active]
+            scaled = logits_squeezed[new_token_idx] / temperature.clamp(
+                min=MIN_SAMPLING_TEMPERATURE
+            ).unsqueeze(1)
+            gathered = scaled.gather(1, new_tokens.view(-1, 1).long()).squeeze(1)
+            tempered = gathered - scaled.logsumexp(dim=1)
+            sampled = selected_log_probs[new_token_idx]
+            selected_log_probs[new_token_idx] = torch.where(
+                torch.isfinite(sampled), sampled, tempered
+            )
+        return selected_log_probs, log_probs
 
     def calculate_log_probs(
         self,
