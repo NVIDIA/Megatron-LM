@@ -77,8 +77,6 @@ class TestAsyncSave:
         Utils.destroy_model_parallel()
     
     def test_async_no_nvrx_installed(self, tmp_path_dist_ckpt):
-        from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue
-
         Utils.initialize_model_parallel(2, 4)
 
         sharded_state_dict = {
@@ -93,15 +91,17 @@ class TestAsyncSave:
         error_msg = (
             'nvidia-resiliency-ext is not installed. Please install it to use the async save strategy.'
         )
+        module = 'nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver'
         with (
-            mock.patch.dict('sys.modules', {'nvidia_resiliency_ext.checkpointing.async_ckpt.core': None}),
-            TempNamedDir(tmp_path_dist_ckpt / 'test_equivalence_async') as async_ckpt_dir,
-            TempNamedDir(tmp_path_dist_ckpt / 'test_equivalence_sync') as sync_ckpt_dir,
+            mock.patch.dict('sys.modules', {module: None}),
+            TempNamedDir(tmp_path_dist_ckpt / 'test_no_nvrx_async') as async_ckpt_dir,
             pytest.raises(
                 ModuleNotFoundError,
                 match=error_msg,
             ),
         ):
+            from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue
+
             async_calls = AsyncCallsQueue(persistent=True)
             async_request = save(sharded_state_dict, async_ckpt_dir, async_sharded_save=True)
             async_calls.schedule_async_request(async_request)
