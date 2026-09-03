@@ -29,6 +29,9 @@ class FsdpContext:
 
     allgather_stream: torch.cuda.Stream
     reduce_scatter_stream: torch.cuda.Stream
+    # Aliases the inner reduction stream unless DP-outer overlap is enabled.
+    dp_outer_communication_stream: torch.cuda.Stream
+    overlap_dp_outer_communication: bool
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because each parameter group tracks whether model_weight is stale
     # after syncing from main_weight.
@@ -55,6 +58,7 @@ class FsdpContext:
         device: torch.device | None = None,
         runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
+        overlap_dp_outer_communication: bool = False,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -68,7 +72,16 @@ class FsdpContext:
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
+            overlap_dp_outer_communication: Run the last-microbatch DP-outer reduction
+                on a separate stream to overlap inner-DP reductions. Mutually exclusive
+                with unify_communication_stream.
         """
+        unify_communication_stream = runtime_policy.unify_communication_stream
+        if unify_communication_stream and overlap_dp_outer_communication:
+            raise ValueError(
+                "overlap_dp_outer_communication needs a separate DP-outer stream and is "
+                "incompatible with unify_communication_stream."
+            )
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         if device.type != "cuda":
@@ -78,6 +91,7 @@ class FsdpContext:
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.unify_communication_stream = runtime_policy.unify_communication_stream
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
+        self.overlap_dp_outer_communication = overlap_dp_outer_communication
         self.forward_order = ExecutionOrder()
         self.backward_order = ExecutionOrder()
         self._post_backward_hook_registered = False
@@ -97,6 +111,11 @@ class FsdpContext:
             self.reduce_scatter_stream = self.allgather_stream
         else:
             self.reduce_scatter_stream = torch.cuda.Stream(device)
+        self.dp_outer_communication_stream = (
+            torch.cuda.Stream(device)
+            if overlap_dp_outer_communication
+            else self.reduce_scatter_stream
+        )
 
     @property
     def is_finalized(self) -> bool:
@@ -178,6 +197,8 @@ class FsdpContext:
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
         self.current_stream().wait_stream(self.reduce_scatter_stream)
+        if self.overlap_dp_outer_communication:
+            self.current_stream().wait_stream(self.dp_outer_communication_stream)
 
     def post_backward(self) -> None:
         """Finish backward cleanup and automatically synchronize the last microbatch."""
