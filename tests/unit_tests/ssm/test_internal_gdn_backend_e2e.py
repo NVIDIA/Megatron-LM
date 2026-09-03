@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 pytestmark = pytest.mark.launch_on_gb200
 
-_BATCH_SIZE = 2
+_BATCH_SIZE = 1
 _SEQUENCE_LENGTH = 8192
 _HEADS = 64
 _HEAD_DIM = 128
@@ -104,14 +104,13 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
         Utils.initialize_model_parallel(context_parallel_size=cp_size)
         request.addfinalizer(Utils.destroy_model_parallel)
         global_seqlen = _SEQUENCE_LENGTH * cp_size
-        global_cu_seqlens_cpu = torch.arange(_BATCH_SIZE + 1, dtype=torch.long) * global_seqlen
-        cu_seqlens = global_cu_seqlens_cpu.to(device=device)
+        cu_seqlens = torch.arange(_BATCH_SIZE + 1, device=device, dtype=torch.int32) * global_seqlen
         cp_context = build_cp_context(
             cu_seqlens=cu_seqlens,
             group=parallel_state.get_context_parallel_group(),
             conv1d_kernel_size=4,
         )
-        prepare_cp_context_metadata(cp_context, global_cu_seqlens_cpu)
+        prepare_cp_context_metadata(cp_context, global_num_sequences=_BATCH_SIZE)
 
     inputs, grad_output = _make_inputs(device, packed=cp_context is not None)
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "fla")

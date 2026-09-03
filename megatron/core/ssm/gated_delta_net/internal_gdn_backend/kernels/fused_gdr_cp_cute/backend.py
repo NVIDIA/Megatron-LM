@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import bisect
 import importlib.util
 import os
 import threading
@@ -182,84 +181,26 @@ def _has_module(name: str) -> bool:
         return False
 
 
-def _rank_chains(global_cu_cpu, world_size: int) -> list[tuple[int, int]] | None:
-    """``(pre_num_ranks, post_num_ranks)`` for every rank, from global offsets.
-
-    Mirrors :func:`fla.ops.cp.context.get_cp_cu_seqlens` exactly, but for all
-    ranks rather than the calling one.  Pure CPU integer work on a vector every
-    rank already holds identically, so every rank computes the same list and a
-    decision made from it is rank-invariant by construction.
-
-    Returns ``None`` when the partitioning is degenerate (``total < world_size``),
-    which is also rank-invariant.
-    """
-    # .tolist() converts in one C-level pass; a Python-level
-    # [int(x) for x in tensor] costs several us on every call.
-    cu = global_cu_cpu.tolist()
-    total = cu[-1]
-    part = total // world_size
-    if part <= 0:
-        return None
-    ends, starts = cu[1:], cu[:-1]
-    chains = []
-    for r in range(world_size):
-        lo, hi = part * r, part * r + part
-        first = bisect.bisect_right(ends, lo)
-        last = bisect.bisect_left(starts, hi)
-        # first rank of this rank's FIRST local sequence -> pre_num_ranks
-        pre = r - cu[first] // part
-        # last rank of this rank's LAST local sequence -> post_num_ranks
-        post = (cu[last] - 1) // part - r
-        chains.append((pre, post))
-    return chains
-
-
 def _chain_mode(
     *, context: FLACPContext, cu_seqlens: torch.Tensor | None, T: int, rank: int, world_size: int
 ) -> str | None:
     """Classify the CP chain for this call, identically on every rank.
 
-    Memoized on the context object.  One ``FLACPContext`` is threaded to every
+    Memoized on the context object. One ``FLACPContext`` is threaded to every
     layer of the model in both directions, and the classification is a pure
     function of ``(context, T)`` -- ``rank`` and ``world_size`` come from
-    ``context.group``.  Recomputing it costs a ``.tolist()`` of the whole
-    global offsets vector plus ``W`` bisects plus four CPU-tensor scalar
-    extractions, and under THD the offsets change every step, so this is on the
-    per-step critical path at every layer.  The memo lives on the context, so a
-    fresh packing (which builds a fresh context) invalidates it for free.
+    ``context.group``.
 
-    The consistency guard below therefore runs once per ``(context, T)`` rather
-    than once per layer.  That keeps its teeth: ``build_cp_context`` clones the
-    offsets it is handed, so a context's offsets do not change after
-    construction, and the failure the guard was written for -- a caller
-    recycling one offsets buffer across steps -- produces a *new* context each
-    step and so a new memo.  It remains rank-invariant either way, since every
-    rank memoizes the same answer from the same global vector.
+    Without a host-side global offsets side channel, the only rank-invariant
+    layout this Python dispatcher can prove is one global sequence spanning the
+    full CP group. Dense ``B == 1`` and packed THD with exactly one global
+    sequence set ``context.global_num_seqs == 1`` before entering this backend.
+    Broader packed layouts fall back to the FLA/Triton CP path.
 
-    Returns ``"fused"`` when the fused kernels can run, ``"noop"`` when no rank
-    has any cross-rank state to exchange (so the whole pre-process is a no-op
-    and can be answered locally with zeros), or ``None`` to fall back.
-
-    Both fused kernels run ONE chain shape: every rank pushes its summary to
+    Both fused kernels run one chain shape: every rank pushes its summary to
     ranks ``rank+1..W-1`` and folds ranks ``0..rank-1`` (reversed in the
-    backward).  Every request in a packed batch therefore runs at the same CP
-    size, ``W``, regardless of how many ranks it actually spans -- a packed
-    batch is expressed by *suppressing halves of the summary* rather than by
-    shortening the chain.  See :func:`_emit_flags` for the rules and why they
-    reproduce the Triton path's ``pre_num_ranks``-long fold exactly.
-
-    So the only thing left to check here is that the chains are the ones
-    ``get_cp_cu_seqlens`` would produce and that they lie inside the group.
-    Since ``get_cp_cu_seqlens`` refuses an indivisible total, every chain it
-    produces is in range and this classifier accepts every packing -- measured
-    at 512/512 sampled packings for ``W`` in {2, 4, 8}.  The bound below is kept
-    as a guard rather than a filter: it is what would catch a context built by
-    some other route, and a wrong chain here is a wrong *number*, not a crash.
-
-    Checking only the *local* rank's chain would not be sufficient: partitionings
-    exist where one rank's chain is in range and another's is not, and a split
-    decision deadlocks (Triton all-gathers, the fused path uses symmetric
-    memory).  Hence the all-rank check.
+    backward). For the supported single-sequence layout that is exactly FLA's
+    full-chain CP state exchange.
     """
     if cu_seqlens is None:
         return None
@@ -291,41 +232,23 @@ def _classify_chain(
     if len(cu_cpu) - 1 != len(cu_seqlens) - 1:
         return None
 
-    global_cu = getattr(context, "global_cu_seqlens_cpu", None)
-    if global_cu is None:
-        # Older context without the global offsets: only the single-sequence
-        # case can be decided rank-invariantly from local data alone.
-        if getattr(context, "global_num_seqs", None) != 1 or len(cu_cpu) != 2:
-            return None
-        chains = [(r, world_size - r - 1) for r in range(world_size)]
-    else:
-        chains = _rank_chains(global_cu, world_size)
-        if chains is None:
-            return None
+    if getattr(context, "global_num_seqs", None) != 1 or len(cu_cpu) != 2:
+        return None
 
-    if chains[rank] != (context.pre_num_ranks, context.post_num_ranks):
-        # Reconstructing this rank's own chain from the global offsets must
-        # reproduce what the context recorded; if it does not, the context is
-        # internally inconsistent (e.g. its offsets tensor was mutated after
-        # construction).  Raise rather than fall back: falling back would be a
-        # *per-rank* decision, and one rank taking Triton's all-gather while
-        # its peers enter the symmetric-memory kernel hangs the job. A crash is
-        # recoverable; a hang is not.
+    expected_chain = (rank, world_size - rank - 1)
+    actual_chain = (context.pre_num_ranks, context.post_num_ranks)
+    if actual_chain != expected_chain:
+        # The only no-host-metadata case this backend can decide
+        # rank-invariantly is one global sequence spanning the full CP group.
+        # A mismatch means the context is not that layout, or the hint is
+        # wrong. Raise instead of letting different ranks split between the
+        # fused symmetric-memory path and FLA's all-gather path.
         raise RuntimeError(
-            "FLACPContext is inconsistent: rank {} records pre/post_num_ranks "
-            "{} but its global_cu_seqlens_cpu implies {}. The offsets tensor "
-            "was probably mutated after build_cp_context().".format(
-                rank, (context.pre_num_ranks, context.post_num_ranks), chains[rank]
+            "FLACPContext is inconsistent with a single full-chain CP sequence: "
+            "rank {} records pre/post_num_ranks {}, expected {}.".format(
+                rank, actual_chain, expected_chain
             )
         )
-    # Every chain must name ranks that exist.  Unreachable for a context built
-    # by `get_cp_cu_seqlens`, which refuses the indivisible total that was the
-    # only way to violate this; kept as a guard against a hand-built context.
-    for r, (pre, post) in enumerate(chains):
-        if not (0 <= pre <= r and 0 <= post <= world_size - r - 1):
-            return None
-    if all(pre == 0 and post == 0 for pre, post in chains):
-        return "noop"
     return "fused"
 
 

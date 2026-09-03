@@ -202,42 +202,12 @@ def build_thd_cp_partition_route(
                 f"splits={contiguous_split_sizes}, local_length={local_length}."
             )
 
-        route = ThdCpRoute(
+        return ThdCpRoute(
             zigzag_index=zigzag_index,
             zigzag_split_sizes=zigzag_split_sizes,
             contiguous_index=contiguous_index,
             contiguous_split_sizes=contiguous_split_sizes,
         )
-        # Keep trusted host metadata on the existing route object rather than
-        # widening PackedSeqParams (which is also adapted to external APIs).
-        route._cu_seqlens_owner = cu_seqlens
-        route._cu_seqlens_owner_version = cu_seqlens._version
-        route._cu_seqlens_cpu = torch.tensor(cu, dtype=torch.long)
-        route._cu_seqlens_cpu_version = route._cu_seqlens_cpu._version
-        return route
-
-
-def _get_trusted_thd_cp_cu_seqlens_cpu(
-    packed_seq_params: "PackedSeqParams", cu_seqlens: torch.Tensor
-) -> torch.Tensor:
-    """Return prevalidated host offsets without reading ``cu_seqlens`` on the hot path."""
-    route = getattr(packed_seq_params, "cp_partition_route", None)
-    if route is None:
-        raise RuntimeError(
-            "Packed THD CP requires a prebuilt cp_partition_route; call "
-            "finalize_packed_seq_params before entering the model."
-        )
-    if getattr(route, "_cu_seqlens_owner", None) is not cu_seqlens:
-        raise RuntimeError("Packed THD cu_seqlens was replaced after its CP route was built.")
-    if route._cu_seqlens_owner_version != cu_seqlens._version:
-        raise RuntimeError("Packed THD cu_seqlens was mutated after its CP route was built.")
-
-    cpu_offsets = getattr(route, "_cu_seqlens_cpu", None)
-    if cpu_offsets is None:
-        raise RuntimeError("Packed THD CP route has no trusted CPU metadata snapshot.")
-    if route._cu_seqlens_cpu_version != cpu_offsets._version:
-        raise RuntimeError("Packed THD CP route CPU snapshot was mutated after validation.")
-    return cpu_offsets
 
 
 def get_thd_cp_partition_route(
