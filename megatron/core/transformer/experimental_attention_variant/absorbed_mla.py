@@ -26,6 +26,9 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
@@ -844,6 +847,12 @@ class AbsorbedMLASelfAttention(Attention):
         # ==================================
         # Core attention computation
         # ==================================
+        core_attn_manager = off_interface(
+            self.offload_core_attention and self.training, q_absorbed, "core_attn"
+        )
+        core_consumed_v_up_projection = getattr(
+            self.core_attention, "consumes_absorbed_v_up_projection", False
+        )
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 q_absorbed,
@@ -855,34 +864,39 @@ class AbsorbedMLASelfAttention(Attention):
                 position_ids=position_ids,
                 packed_seq_params=packed_seq_params,
             )
-        else:
-            core_attn_out = self.core_attention(
-                q_absorbed,
-                kv_compressed,
-                value=None,
-                attention_mask=attention_mask,
-                x=hidden_states,
-                qr=q_compressed,
-                up_v_weight=v_up_weight,
-                position_ids=position_ids,
-                packed_seq_params=packed_seq_params,
-                attn_mask_type=self.attn_mask_type,
+            core_attn_out = _apply_absorbed_v_up_projection(
+                core_attn_out,
+                v_up_weight,
+                self.num_attention_heads_per_partition,
+                self.config.kv_lora_rank,
+                self.config.v_head_dim,
+                core_consumed_v_up_projection,
             )
-
-        # ==================================
-        # Apply V up projection
-        # ==================================
-        core_consumed_v_up_projection = getattr(
-            self.core_attention, "consumes_absorbed_v_up_projection", False
-        )
-        core_attn_out = _apply_absorbed_v_up_projection(
-            core_attn_out,
-            v_up_weight,
-            self.num_attention_heads_per_partition,
-            self.config.kv_lora_rank,
-            self.config.v_head_dim,
-            core_consumed_v_up_projection,
-        )
+        else:
+            with core_attn_manager as q_absorbed:
+                core_attn_out = self.core_attention(
+                    q_absorbed,
+                    kv_compressed,
+                    value=None,
+                    attention_mask=attention_mask,
+                    x=hidden_states,
+                    qr=q_compressed,
+                    up_v_weight=v_up_weight,
+                    position_ids=position_ids,
+                    packed_seq_params=packed_seq_params,
+                    attn_mask_type=self.attn_mask_type,
+                )
+                core_attn_out = _apply_absorbed_v_up_projection(
+                    core_attn_out,
+                    v_up_weight,
+                    self.num_attention_heads_per_partition,
+                    self.config.kv_lora_rank,
+                    self.config.v_head_dim,
+                    core_consumed_v_up_projection,
+                )
+            core_attn_out = core_attn_manager.group_offload(
+                core_attn_out, forced_released_tensors=[q_absorbed, kv_compressed]
+            )
 
         core_attn_out = _restore_packed_thd_batch_dim(
             core_attn_out, hidden_states, packed_seq_params
@@ -909,7 +923,12 @@ class AbsorbedMLASelfAttention(Attention):
         # =================
         # Output. [sq, b, h]
         # =================
-        output, bias = self.linear_proj(core_attn_out)
+        attn_proj_manager = off_interface(self.offload_attn_proj, core_attn_out, "attn_proj")
+        with attn_proj_manager as core_attn_out:
+            output, bias = self.linear_proj(core_attn_out)
+        output = attn_proj_manager.group_offload(
+            output, forced_released_tensors=[core_attn_out]
+        )
 
         return output, bias
 
