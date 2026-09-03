@@ -11,7 +11,7 @@ The legacy static engine is deprecated. New work should target the dynamic path 
 ## Table of Contents
 
 - [What Megatron Inference Is For](#what-megatron-inference-is-for)
-- [Rollout Performance](#rollout-performance)
+- [Supported Model Architectures](#supported-model-architectures)
 - [Supported Features](#supported-features)
 - [Basic Usage: The High-Level API](#basic-usage-the-high-level-api)
    - [The two classes](#the-two-classes-megatronllm-and-megatronasyncllm)
@@ -42,11 +42,13 @@ The legacy static engine is deprecated. New work should target the dynamic path 
 
 ## What Megatron Inference Is For
 
-> **Scope.** Megatron Inference is an actively developed path designed primarily
-> for RL and for workflows that require training/inference alignment. It is not
-> currently positioned as a general-purpose production-serving replacement for
-> vLLM, SGLang, or TensorRT-LLM. Performance varies by model, workload, and
-> which consistency features you enable.
+> **Scope.** Megatron Inference is an MCore-native generation capability built for
+> RL rollouts, evaluation, and debugging of MCore models. It is complementary to
+> dedicated serving engines such as vLLM, SGLang, and TensorRT-LLM: use it when you
+> want generation to run on the same MCore model, parallelism, and kernels you
+> train with, and reach for a dedicated serving engine when standalone production
+> serving is the goal. Performance varies by model, workload, and which
+> consistency features you enable.
 
 Megatron Inference is built primarily as the generation engine for
 *reinforcement learning (RL)*, not as a standalone serving engine. Its design
@@ -83,26 +85,28 @@ This focus drives the major design benefits:
 
 ---
 
-## Rollout Performance
+## Supported Model Architectures
 
-In an August 2026 Nemotron Ultra V3 SWE rollout benchmark, Megatron Inference
-delivered **12.30 rollouts/GPU-hour versus 8.47 for vLLM (45% higher
-throughput)**. It reduced mean wall-clock time by 31% and end-to-end trajectory
-latency by 20% at p50, 21% at p90, and 18% at p99, while reward remained within
-the observed run-to-run variation.
+The table below lists the architectures the dynamic inference path supports,
+along with the configurations they have been exercised in and their current
+optimization maturity. "Comparable to dedicated serving engines" means we have
+measured rollout throughput in the same range as an equivalent vLLM
+configuration on internal workloads; there is no public benchmark harness in
+this repository yet, so treat maturity as guidance rather than a published
+number, and measure on your own model and workload.
 
-The comparison used the same Ultra V3 model, SWE validation set, 60-turn agent
-limit, 64-request concurrency, and 16 GPUs per run; only the generation engine
-differed. Results are averages over five runs and 1,600 trajectories per engine.
-The batches ran six days apart on the same cluster, so node-level variation was
-not controlled.
+| Model family | Configurations exercised | Optimization maturity |
+|---|---|---|
+| Hybrid Mamba and attention (for example, Nemotron-H style) | TP, PP, EP; chunked prefill, prefix caching including Mamba state, CUDA graphs | Most mature. Rollout throughput comparable to dedicated serving engines |
+| GPT-style dense | TP, PP; chunked prefill, prefix caching, CUDA graphs, speculative decoding | Mature |
+| MoE | TP with EP (for example, a 30B-class EP4 configuration on GB200); expert router replay, full CUDA-graph support, selectable grouped-GEMM backend | Supported. Additional throughput optimizations are in active development |
+| MLA (DeepSeek-style) | `cache_mla_latents=True`, KV block size 64, `flash_mla` | Supported, with the configuration constraints in [Known Limitations](#known-limitations) |
+| Gated Delta Net and Gated Delta Product | Dynamic batching only | Supported, with the feature gaps in [Known Limitations](#known-limitations) |
+| Vision-language | Image inputs only, `PP=1` | Supported, with the feature gaps in [Known Limitations](#known-limitations) |
 
-Performance maturity varies by model family. Most optimization work to date has
-focused on hybrid models. In a representative Qwen 30B EP4 run on GB200
-(batch size 256, output sequence length 256), Megatron Core reached about
-24,000 generated tokens/s versus 34,000 tokens/s for vLLM, a gap of
-approximately 29%. Additional Qwen optimizations are under active development
-and are expected to narrow this gap as they are merged.
+Performance is highly sensitive to model, batch size, sequence length,
+parallelism layout, and which consistency features (for example,
+batch-invariant kernels) are enabled.
 
 ---
 
@@ -116,7 +120,7 @@ and are expected to narrow this gap as they are merged.
 | **CUDA graphs** | Full-model CUDA graphs for prefill, decode, and mixed batches. Prefill and mixed steps up to `cuda_graph_max_tokens` (512 by default) get a graph instead of falling back to eager |
 | **Speculative decoding** | Multi-Token Prediction (MTP)-based speculative decoding (with fused MTP bookkeeping and MTP CUDA graphs) |
 | **Serving** | OpenAI-compatible HTTP server with chat templates, tool calling, and reasoning parsers. Server-sent-event [streaming](#streaming) of partial completions, including incremental tool-call deltas, plus health and profiling endpoints and prefix-cache hit reporting |
-| **MoE** | Expert model parallelism with full CUDA-graph support, expert router replay, NVLS switch-multicast token dispatcher (notably faster than the all-to-all dispatchers other frameworks use) plus an allgatherv dispatcher optimized for multi-node NVLink, and shared-expert overlap with latent MoEs. Selectable grouped-GEMM backend (vLLM, torch, or FlashInfer) |
+| **MoE** | Expert model parallelism with full CUDA-graph support, expert router replay, NVLS switch-multicast token dispatcher plus an allgatherv dispatcher optimized for multi-node NVLink, and shared-expert overlap with latent MoEs. Selectable grouped-GEMM backend (vLLM, torch, or FlashInfer) |
 | **Parallelism** | Data-parallel coordinator with full multi-node support, tensor model parallelism with low-latency comm primitives, expert model parallelism, and pipeline parallelism |
 | **Model families** | GPT-style dense models, MoE models, MLA models (for example DeepSeek-style, with `cache_mla_latents`), Mamba and hybrid (SSM and attention) models, Gated Delta Net and Gated Delta Product models, and vision-language models for image inputs. Refer to [Known Limitations](#known-limitations) for the per-family feature gaps |
 | **Precision** | MXFP8 weight quantization through `--transformer-impl inference_optimized --fp8-recipe mxfp8`, using latency-optimized inference kernels. Configurable Mamba conv and SSM state dtypes |
