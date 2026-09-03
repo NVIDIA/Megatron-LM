@@ -12,7 +12,10 @@ from megatron.core.pipeline_parallel import tensor_lifetime
 from megatron.core.pipeline_parallel.tensor_lifetime import ScheduleTensorLifetimeManager
 from megatron.core.pipeline_parallel.utils import NoopScheduleNode
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
+    pytest.mark.launch_on_gb200,
+]
 
 
 def _publish(manager, tensor, owner, node="producer"):
