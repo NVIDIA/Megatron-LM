@@ -272,8 +272,6 @@ def _call_fla_compat(function, **kwargs):
     except (TypeError, ValueError):
         parameters = {}
     kwargs = dict(kwargs)
-    if kwargs.get("use_exp2") and "use_exp2" not in parameters and kwargs.get("g") is not None:
-        kwargs["g"] = kwargs["g"] / RCP_LN2
     if parameters:
         accepts_kwargs = any(
             parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
