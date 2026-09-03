@@ -29,6 +29,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import (
+    InferenceMode,
     get_attention_mask,
     set_decode_expert_padding,
     set_moe_metadata_sync,
@@ -820,6 +821,17 @@ class TextGenerationController:
             position_ids (Tensor): The position IDs.
         """
         context = self.inference_wrapped_model.inference_context
+        token_capacity = self.model_config.inference_flashinfer_mxfp8_token_capacity
+        decode_token_upper_bound = (
+            context.max_requests
+            * (self.num_speculative_tokens + 1)
+            * self.model_config.expert_model_parallel_size
+        )
+        InferenceMode.set_bounded_mxfp8_rows(
+            context.is_decode_only()
+            and token_capacity is not None
+            and decode_token_upper_bound <= token_capacity
+        )
         if context.config.materialize_only_last_token_logits:
             logits_seq_len = context.num_last_token_logits
         else:
@@ -966,14 +978,10 @@ class TextGenerationController:
         Returns:
             Tensor: Sampled tokens of shape [num_requests].
         """
-        no_top_k, no_top_p = self._active_requests_sampling_filter_flags()
+        context = self.inference_wrapped_model.inference_context
+        no_top_k, no_top_p = context.active_sampling_filter_flags()
         return self._sampling.sample_kernel(
-            logits_2d,
-            logits_2d.shape[0],
-            self.inference_wrapped_model.inference_context,
-            no_top_k=no_top_k,
-            no_top_p=no_top_p,
-            eager=True,
+            logits_2d, logits_2d.shape[0], context, no_top_k=no_top_k, no_top_p=no_top_p, eager=True
         )
 
     def _compute_serial_mtp_and_sample(self, base_position: Optional[Tensor] = None) -> None:
@@ -1300,7 +1308,7 @@ class TextGenerationController:
             if context.config.materialize_only_last_token_logits
             else context.gpu_view.active_request_last_token_idxs
         )
-        no_top_k, no_top_p = self._active_requests_sampling_filter_flags(active_request_count)
+        no_top_k, no_top_p = context.active_sampling_filter_flags(active_request_count)
         self._sampling.sample_kernel(
             self._all_logits_cuda.squeeze(0),
             n,
@@ -1310,31 +1318,6 @@ class TextGenerationController:
             no_top_p=no_top_p,
             output=self._sampled_tokens_cuda[:n],
         )
-
-    def _active_requests_sampling_filter_flags(
-        self, active_request_count: Optional[int] = None
-    ) -> Tuple[bool, bool]:
-        """Return ``(no_top_k, no_top_p)`` batch-level escape hatches for the active batch.
-
-        These drive the FlashInfer sampler's dispatch (top-p-only / top-k-only /
-        joint) and are read from the pinned CPU sampling metadata, so they incur no
-        GPU sync. A filter is "absent" only when NO active request uses it. Padded
-        rows carry a neutral 0 and never flip a flag.
-        """
-        context = self.inference_wrapped_model.inference_context
-        active_request_count = (
-            context.total_request_count - context.paused_request_count
-            if active_request_count is None
-            else active_request_count
-        )
-        if active_request_count <= 0:
-            return True, True
-
-        active_metadata = context.active_request_metadata
-        active_slice = slice(0, active_request_count)
-        no_top_k = bool((active_metadata["top_k"][active_slice] == 0).all())
-        no_top_p = bool((active_metadata["top_p"][active_slice] == 0.0).all())
-        return no_top_k, no_top_p
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
@@ -3393,11 +3376,15 @@ class TextGenerationController:
         self._validate_async_sched_support_for_step(run_async_overlap)
 
         active_request_count = context.total_request_count - context.paused_request_count
-        if context.active_token_count == 0 and active_request_count == 0 and run_async_overlap:
+        if context.active_token_count == 0 and active_request_count == 0:
+            # A lifecycle reset such as RECOMPUTE suspend/resume can remove every
+            # request represented by a pending forward. Discard those stale logits
+            # before the no-overlap path admits and primes the restored requests.
             self._async_sched_logits.clear()
-            return DynamicBatchControllerStepResult(
-                decode_only=DecodeOnly(consumed=None, launched=None)
-            )
+            if run_async_overlap:
+                return DynamicBatchControllerStepResult(
+                    decode_only=DecodeOnly(consumed=None, launched=None)
+                )
 
         if not run_async_overlap or not self._async_sched_logits.is_valid:
             return await self._run_async_sched_step_no_overlap(

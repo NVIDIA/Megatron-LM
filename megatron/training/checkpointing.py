@@ -2340,6 +2340,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
 
     # MoE latent projection.
     _set_arg('moe_latent_size', force=True)
+    _set_arg('moe_use_norm_before_up_proj', force=True)
 
     # Tokenizer args.
     if args.use_tokenizer_model_from_checkpoint_args:
