@@ -63,9 +63,9 @@ except ImportError:
     HAVE_TRITON = False
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
+    from megatron.core.extensions.transformer_engine import TELinear, TENorm, te_checkpoint
 else:
-    TELinear, te_checkpoint = None, None
+    TELinear, TENorm, te_checkpoint = None, None, None
 
 
 class ExpertsInterface(Protocol):
@@ -315,6 +315,12 @@ class MoELayer(BaseMoELayer):
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
             )
+            if self.config.moe_latent_output_norm:
+                self.routed_expert_norm = TENorm(
+                    config=self.config,
+                    hidden_size=self.config.moe_latent_size,
+                    eps=self.config.layernorm_epsilon,
+                )
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
@@ -656,6 +662,8 @@ class MoELayer(BaseMoELayer):
 
         output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
+            if self.config.moe_latent_output_norm:
+                output = self.routed_expert_norm(output)
             output, _ = self.fc2_latent_proj(output)
 
         if shared_expert_output is not None:
