@@ -344,6 +344,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Hyperparameter for choosing to prioritize prefix hit matches vs minimizing idle load
         self.prefix_caching_routing_alpha = inference_config.prefix_caching_routing_alpha
+        self.prefix_cache_ttl_seconds = inference_config.prefix_cache_ttl_seconds
         self.media_cache_coordinator_policy = inference_config.media_cache_coordinator_policy
         self.media_cache_routing_weight = inference_config.media_cache_routing_weight
 

@@ -193,6 +193,57 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
         )
 
 
+def split_multimodal_data(
+    serialized: Optional[Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], Any]:
+    """Split serialized media into a bounded descriptor and its payload.
+
+    The descriptor rides in the metadata frame, which the coordinator decodes and
+    repacks for every request; the payload rides in a body frame it forwards
+    untouched. Keeping them apart is what bounds that per-request cost: the
+    descriptor is a 64-character key plus two small flags, while the payload is
+    raw image or video bytes, or serialized preprocessed tensors.
+
+    Args:
+        serialized: The output of :func:`serialize_multimodal_data`, or None.
+
+    Returns:
+        ``(media_meta, payload)``, both None for a text-only request.
+    """
+    if serialized is None:
+        return None, None
+    modality = "video" if "video" in serialized else "image"
+    if modality not in serialized:
+        raise ValueError(f"Serialized multimodal data has no media payload: {sorted(serialized)}.")
+    media_meta = {key: value for key, value in serialized.items() if key != modality}
+    media_meta["modality"] = modality
+    return media_meta, serialized[modality]
+
+
+def merge_multimodal_data(
+    media_meta: Optional[Dict[str, Any]], payload: Any
+) -> Optional[Dict[str, Any]]:
+    """Rebuild serialized media from its descriptor and payload frames.
+
+    Inverse of :func:`split_multimodal_data`, returning the shape
+    :func:`resolve_multimodal_data_for_engine` consumes.
+
+    Args:
+        media_meta: The bounded descriptor from the metadata frame, or None.
+        payload: The media payload from its own body frame.
+
+    Returns:
+        The serialized multimodal dictionary, or None for a text-only request.
+    """
+    if media_meta is None:
+        return None
+    media_meta = dict(media_meta)
+    modality = media_meta.pop("modality", None)
+    if modality not in ("image", "video"):
+        raise ValueError(f"Media metadata carries an unsupported modality: {modality!r}.")
+    return {modality: payload, **media_meta}
+
+
 def resolve_multimodal_data_for_engine(
     multi_modal_data: Any,
     *,

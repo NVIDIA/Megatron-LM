@@ -48,6 +48,7 @@ from megatron.core.inference.inference_request import (
     FinishedRequestRecord,
     Status,
     compute_media_cache_key,
+    merge_multimodal_data,
     resolve_multimodal_data_for_engine,
 )
 from megatron.core.inference.sampling_params import SamplingParams
@@ -159,6 +160,63 @@ def format_mem_bytes(mem_bytes):
     return "%d bytes" % mem_bytes
 
 
+def _weight_scoped_salt(weight_epoch: int, media_cache_key: Optional[str]) -> Optional[str]:
+    """Scope a request's block hashes to the weight generation that will serve it.
+
+    Under KVCacheManagementMode.PERSIST the prefix cache survives a refit:
+    reinitialize_inference_state_buffers() only resets metadata on the RECOMPUTE
+    path, so the KV and Mamba hash tables outlive suspend/resume and a request
+    admitted afterwards can match blocks whose KV the previous weights computed.
+    Staleness is then bounded only by eviction pressure, since the engine-side
+    allocator has no TTL.
+
+    Mixing the weight generation into the salt makes chains from different
+    generations disjoint, so stale blocks become unmatchable rather than being
+    freed -- nothing is mutated at refit time, leaving live requests, chunked
+    prefill and pending Mamba restores untouched.
+
+    Composed with the media key rather than replacing it: multimodal requests
+    still need equal token placeholders backed by different media to stay
+    unmatchable. Epoch 0 returns the media key unchanged, so an engine that never
+    resumes hashes exactly as before.
+    """
+    if weight_epoch == 0:
+        return media_cache_key
+    if media_cache_key is None:
+        return f"w{weight_epoch}"
+    return f"w{weight_epoch}\x00{media_cache_key}"
+
+
+def _engine_reply_frames(finished_requests: List[dict]) -> List[bytes]:
+    """Frame finished requests as [metadata, body, body, ...] for the coordinator.
+
+    The metadata frame carries only what the coordinator needs to route each
+    reply: the request id, and whether it must detokenize into the body. Every
+    body stays a separate opaque frame so the coordinator can forward it without
+    decoding -- a finished request echoes the prompt back, so decoding it costs
+    more than the inbound submission did.
+
+    Args:
+        finished_requests: Serialized requests, in the order their frames follow.
+
+    Returns:
+        The frames to send, metadata first.
+    """
+    metadata = [
+        Headers.ENGINE_REPLY.value,
+        [
+            [
+                request["request_id"],
+                bool((request.get("sampling_params") or {}).get("detokenize_generations")),
+            ]
+            for request in finished_requests
+        ],
+    ]
+    return [msgpack.packb(metadata, use_bin_type=True)] + [
+        msgpack.packb(request, use_bin_type=True) for request in finished_requests
+    ]
+
+
 def _get_decode_only_log_state(
     mode: AsyncScheduleMode, decode_only: DecodeOnly
 ) -> Tuple[str, Optional[bool]]:
@@ -257,6 +315,12 @@ class DynamicInferenceEngine(AbstractEngine):
         EngineState.RESUMED,
         EngineState.STOPPED,
     )
+
+    # Class-level default so the attribute is always readable: engines are built
+    # without running __init__ in places (tests, and anything constructing via
+    # object.__new__), and admitting a request reads this. An int is immutable, so
+    # the += in resume() still rebinds onto the instance.
+    _weight_epoch: int = 0
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -466,6 +530,12 @@ class DynamicInferenceEngine(AbstractEngine):
         # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
         self._generation_epoch: Optional[int] = None
+        # Weight generation counter, bumped on every resume. Used only to salt
+        # block hashes so the prefix cache cannot serve KV computed by earlier
+        # weights. Deliberately separate from `_generation_epoch`, which is driven
+        # by the SET_GENERATION_EPOCH control message and stamps per-request
+        # reporting fields.
+        self._weight_epoch: int = 0
         self.local_metadata_ledger_enabled: bool = False
         self.local_metadata_ledger: dict[str, FinishedRequestRecord] = {}
         # Track requests that should stop due to stop words (detected in post_process_requests)
@@ -920,6 +990,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "enable_prefix_caching": self.context.enable_prefix_caching,
                     "prefix_caching_coordinator_policy": self.context.prefix_caching_coordinator_policy,
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
+                    "prefix_cache_ttl_seconds": self.context.prefix_cache_ttl_seconds,
                     "media_cache_coordinator_policy": getattr(
                         self.context,
                         "media_cache_coordinator_policy",
@@ -1172,6 +1243,15 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state not in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
 
+        # A suspend/resume cycle is how a weight refit is staged, so treat resume
+        # as a new weight generation and re-salt the prefix cache. Bumped while
+        # still suspended, before anything can be admitted, so there is no window
+        # in which a post-refit request is admitted under the old salt. Requests
+        # re-added below keep the salt they were constructed with, so a request
+        # that spans the refit republishes under its original generation and is
+        # unmatchable by new arrivals.
+        self._weight_epoch += 1
+
         InferenceMode.set_active()
 
         # Resume.
@@ -1269,11 +1349,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     merged.uid not in self.local_metadata_ledger
                 ), f"finished-request ledger: duplicate uid {merged.uid!r}"
                 self.local_metadata_ledger[merged.uid] = FinishedRequestRecord.from_request(merged)
-        payload = msgpack.packb(
-            [Headers.ENGINE_REPLY.value, [request.serialize() for request in merged_requests]],
-            use_bin_type=True,
+        self.socket_for_receiving_requests.send_multipart(
+            _engine_reply_frames([request.serialize() for request in merged_requests])
         )
-        self.socket_for_receiving_requests.send(payload)
 
     def _handle_failed_request(self, request_id: int):
         """Handle a failed request by sending the reply immediately.
@@ -1631,6 +1709,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 block_size_tokens=self.context.block_size_tokens,
                 enable_prefix_caching=self.context.enable_prefix_caching,
                 precomputed_block_hashes=precomputed_block_hashes or [],
+                # Text-only requests are the common case for a refit, so this is
+                # the path the weight scoping exists for. Note that hashes handed
+                # in by a caller are used as-is: __post_init__ only computes when
+                # none were supplied, so a disaggregated handoff carries the
+                # generation its sender hashed under.
+                block_hash_salt=_weight_scoped_salt(self._weight_epoch, None),
             )
 
         return self._add_request(request)
@@ -1820,7 +1904,9 @@ class DynamicInferenceEngine(AbstractEngine):
             # Recompute the block hashes for multimodal embeddings,
             # which are injected dynamically into the sequence.
             precomputed_block_hashes=[] if request_has_images else (precomputed_block_hashes or []),
-            block_hash_salt=media_cache_key if request_has_images else None,
+            block_hash_salt=_weight_scoped_salt(
+                self._weight_epoch, media_cache_key if request_has_images else None
+            ),
             num_img_embeddings_per_tile=num_img_embeddings_per_tile,
             imgs=imgs,
             num_tiles=num_tiles,
@@ -2871,9 +2957,16 @@ class DynamicInferenceEngine(AbstractEngine):
         if not partials:
             return
 
-        payload = msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, partials], use_bin_type=True)
         nvtx_range_push("coordinator_streaming")
-        self.socket_for_receiving_requests.send(payload)
+        self.socket_for_receiving_requests.send_multipart(
+            [
+                msgpack.packb(
+                    [Headers.ENGINE_REPLY_PARTIAL.value, [p["request_id"] for p in partials]],
+                    use_bin_type=True,
+                )
+            ]
+            + [msgpack.packb(p, use_bin_type=True) for p in partials]
+        )
         nvtx_range_pop("coordinator_streaming")
 
         self._partial_emit_lengths.update(emit_lengths)
@@ -3260,6 +3353,52 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return finished_request_records_list
 
+    @staticmethod
+    def _pack_tp_broadcast(messages: List[List[bytes]]) -> List[bytes]:
+        """Flatten per-message frame lists into one TP-broadcast multipart message.
+
+        A message is a list of frames -- metadata first, then any payload bodies.
+        ZMQ multipart is flat, so the frame boundaries would be lost on the wire.
+        They are carried instead in a manifest frame holding one frame count per
+        message, which lets peer ranks rebuild the grouping without any payload
+        being copied, decoded, or re-packed.
+
+        Args:
+            messages: One frame list per message, in delivery order.
+
+        Returns:
+            ``[tp_broadcast_header, manifest, *flattened frames]``.
+        """
+        manifest = msgpack.packb([len(message) for message in messages], use_bin_type=True)
+        return [bytes([Headers.TP_BROADCAST.value]), manifest] + [
+            frame for message in messages for frame in message
+        ]
+
+    @staticmethod
+    def _unpack_tp_broadcast(frames: List[bytes]) -> List[List[bytes]]:
+        """Rebuild per-message frame lists from a TP broadcast.
+
+        Inverse of :meth:`_pack_tp_broadcast`.
+
+        Args:
+            frames: The received multipart message, header frame first.
+
+        Returns:
+            One frame list per message, in the order they were packed.
+        """
+        frame_counts = msgpack.unpackb(frames[1], raw=False)
+        flat = frames[2:]
+        messages = []
+        offset = 0
+        for count in frame_counts:
+            messages.append(flat[offset : offset + count])
+            offset += count
+        assert offset == len(flat), (
+            f"TP broadcast manifest accounts for {offset} frames but {len(flat)} were received; "
+            "sender and receiver disagree on message framing"
+        )
+        return messages
+
     def schedule_requests(self) -> int:
         """Drains the ZMQ socket for a batch of requests and adds them to the engine.
 
@@ -3294,25 +3433,32 @@ class DynamicInferenceEngine(AbstractEngine):
         nvtx_range_push("drain_zmq_socket")
         all_messages = []
         if self.is_mp_coordinator:
+            # Locally-generated notifications are single-frame messages, so they
+            # are wrapped to match the frame-list shape of socket traffic.
             all_messages.extend(
-                msgpack.packb(
-                    [Headers.KV_HANDOFF_COMPLETE.value, request_id, failed], use_bin_type=True
-                )
+                [
+                    msgpack.packb(
+                        [Headers.KV_HANDOFF_COMPLETE.value, request_id, failed], use_bin_type=True
+                    )
+                ]
                 for request_id, failed in self._drain_handoff_completion_notifications()
             )
             while True:
                 try:
                     # Receive messages in a non-blocking way.
-                    all_messages.append(self.socket_for_receiving_requests.recv(flags=zmq.NOBLOCK))
+                    all_messages.append(
+                        self.socket_for_receiving_requests.recv_multipart(flags=zmq.NOBLOCK)
+                    )
                 except zmq.Again:
                     # This exception is hit as soon as the socket is empty.
                     break
             self.model_parallel_publisher_socket.send_multipart(
-                [bytes([Headers.TP_BROADCAST.value])] + all_messages
+                self._pack_tp_broadcast(all_messages)
             )
         else:
-            frames = self.model_parallel_subscriber_socket.recv_multipart()
-            all_messages = frames[1:]
+            all_messages = self._unpack_tp_broadcast(
+                self.model_parallel_subscriber_socket.recv_multipart()
+            )
 
         nvtx_range_pop("drain_zmq_socket")
 
@@ -3320,16 +3466,18 @@ class DynamicInferenceEngine(AbstractEngine):
         # Control signals are queued for the second pass.
         new_generation_epoch = None
         for message in all_messages:
-            data = msgpack.unpackb(message, raw=False)
+            data = msgpack.unpackb(message[0], raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
-                # Payload is [request_id, prompt, sampling_params, multi_modal_data].
-                fields = data[1:]
-                if len(fields) == 3:
-                    request_id, prompt, sampling_params = fields
-                    multi_modal_data = None
-                else:
-                    request_id, prompt, sampling_params, multi_modal_data = fields[:4]
+                request_id, sampling_params, media_meta = data[1:]
+                # The prompt and the media each ride in their own frame; the
+                # engine is their first consumer, so this is where they finally
+                # get decoded. The coordinator forwarded both untouched, and
+                # only the bounded media descriptor travelled in the metadata.
+                prompt = msgpack.unpackb(message[1], raw=False)
+                multi_modal_data = merge_multimodal_data(
+                    media_meta, msgpack.unpackb(message[2], raw=False)
+                )
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request")
                 # TODO(perf): media preprocessing (decode / resize / normalize /
@@ -3364,8 +3512,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._fail_submission(request_id, sampling_params, error)
                 nvtx_range_pop("add_request")
             elif header == Headers.SUBMIT_REQUEST_WITH_KV:
-                # Decode-side KV import.
-                request_id, prompt, sampling_params, kv_meta, src_block_ids = data[1:]
+                # Decode-side KV import. As on the plain path, the prompt rides
+                # in its own frame and the engine is its first consumer.
+                request_id, sampling_params, kv_meta = data[1:]
+                prompt = msgpack.unpackb(message[1], raw=False)
+                src_block_ids = msgpack.unpackb(message[2], raw=False)
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request_with_kv_handoff")
                 self.add_request_with_kv_handoff(
@@ -3443,7 +3594,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # processes one state transition per iteration).
         if self._pending_signals:
             message = self._pending_signals.popleft()
-            data = msgpack.unpackb(message, raw=False)
+            data = msgpack.unpackb(message[0], raw=False)
             header = Headers(data[0])
 
             if header == Headers.PAUSE:
