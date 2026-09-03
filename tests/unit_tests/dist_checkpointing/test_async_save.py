@@ -90,14 +90,17 @@ class TestAsyncSave:
             ),
         }
 
-        with mock.patch.dict(
-            'sys.modules', {'nvidia_resiliency_ext.checkpointing.async_ckpt.core': None}
-        ), (
+        error_msg = (
+            'nvidia-resiliency-ext is not installed. Please install it to use the async save strategy.'
+        )
+        with (
+            mock.patch.dict('sys.modules', {'nvidia_resiliency_ext.checkpointing.async_ckpt.core': None}),
             TempNamedDir(tmp_path_dist_ckpt / 'test_equivalence_async') as async_ckpt_dir,
             TempNamedDir(tmp_path_dist_ckpt / 'test_equivalence_sync') as sync_ckpt_dir,
-        ), pytest.raises(
-            ModuleNotFoundError,
-            match='nvidia-resiliency-ext is not installed. Please install it to use the async save strategy.',
+            pytest.raises(
+                ModuleNotFoundError,
+                match=error_msg,
+            ),
         ):
             async_calls = AsyncCallsQueue(persistent=True)
             async_request = save(sharded_state_dict, async_ckpt_dir, async_sharded_save=True)
