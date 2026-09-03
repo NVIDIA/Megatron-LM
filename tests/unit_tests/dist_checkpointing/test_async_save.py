@@ -100,11 +100,7 @@ class TestAsyncSave:
                 match=error_msg,
             ),
         ):
-            from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue
-
-            async_calls = AsyncCallsQueue(persistent=True)
-            async_request = save(sharded_state_dict, async_ckpt_dir, async_sharded_save=True)
-            async_calls.schedule_async_request(async_request)
+            save(sharded_state_dict, async_ckpt_dir, async_sharded_save=True)
 
         Utils.destroy_model_parallel()
 
