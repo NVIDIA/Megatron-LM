@@ -76,7 +76,7 @@ class TestAsyncSave:
 
         Utils.destroy_model_parallel()
     
-    def test_async_no_nvrx_installed(self, tmp_path_dist_ckpt, persistent, abort):
+    def test_async_no_nvrx_installed(self, tmp_path_dist_ckpt):
         from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue
 
         Utils.initialize_model_parallel(2, 4)
@@ -105,6 +105,8 @@ class TestAsyncSave:
             async_calls = AsyncCallsQueue(persistent=True)
             async_request = save(sharded_state_dict, async_ckpt_dir, async_sharded_save=True)
             async_calls.schedule_async_request(async_request)
+
+        Utils.destroy_model_parallel()
 
 
 _NVRX_SUBMODULES = [
