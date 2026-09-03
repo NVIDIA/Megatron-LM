@@ -1482,7 +1482,7 @@ class TestAdaptiveMuonOptimizerMultiRankTP:
         yield
         Utils.destroy_model_parallel()
 
-    def create_tp_model_and_optimizer(self, mode):
+    def create_tp_model_and_optimizer(self, mode, moment2_method="adamuon"):
         """Create model with TP and optimizer."""
         rank = int(os.getenv('RANK', '0'))
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -1501,6 +1501,7 @@ class TestAdaptiveMuonOptimizerMultiRankTP:
             num_ns_steps=5,
             pg_collection=pg_collection,
             tp_mode=mode,
+            moment2_method=moment2_method,
         )
 
         return model, optimizer
@@ -1541,6 +1542,23 @@ class TestAdaptiveMuonOptimizerMultiRankTP:
         assert not torch.equal(
             model.weight.data, original_weight
         ), "Weight should be updated with mode=blockwise"
+
+    @pytest.mark.parametrize("mode", ["duplicated", "distributed"])
+    def test_adaptive_muon_gated_fc1_multirank(self, mode):
+        """Test split gated linear_fc1 NS with real TP collectives."""
+        model, optimizer = self.create_tp_model_and_optimizer(mode, moment2_method="normuon")
+        model.weight.is_gated_fc1 = True
+        model.weight.partition_stride = 2
+
+        torch.manual_seed(42)
+        input_tensor = torch.randn(32, 100, dtype=torch.float32, device="cuda")
+        output = model(input_tensor)
+        output.sum().backward()
+
+        original_weight = model.weight.data.clone()
+        optimizer.step()
+
+        assert not torch.equal(model.weight.data, original_weight)
 
 
 # ===========================================================================

@@ -788,7 +788,7 @@ def _get_megatron_emerging_optimizer(
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
-    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
+    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv, is_gated_fc1).
     for model_chunk in model_chunks:
         qkv_split_shapes = None
         for name, param in model_chunk.named_parameters():
@@ -810,6 +810,16 @@ def _get_megatron_emerging_optimizer(
                         f"Emerging optimizer QKV split skipped for {name}: "
                         f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
                     )
+
+            # Standard fused gated linear_fc1 uses output-dimension
+            # partition_stride=2, so no module-tree lookup is required.
+            if (
+                model_chunk.config.gated_linear_unit
+                and len(param.shape) == 2
+                and 'linear_fc1.weight' in name
+                and getattr(param, 'partition_stride', 1) == 2
+            ):
+                param.is_gated_fc1 = True
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
     # For Muon-family optimizers, the scalar optimizer that handles non-linear/embedding

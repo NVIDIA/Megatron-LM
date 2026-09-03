@@ -182,6 +182,8 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         destination.shared = source.shared
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
+    if hasattr(source, 'is_gated_fc1'):
+        destination.is_gated_fc1 = source.is_gated_fc1
 
 
 class MegatronOptimizer(ABC):

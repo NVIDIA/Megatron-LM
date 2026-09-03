@@ -355,6 +355,66 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         """Re-append ``pad_length`` zero rows to dim 0 (no-op if ``pad_length == 0``)."""
         return torch.nn.functional.pad(t, (0, 0, 0, pad_length)) if pad_length else t
 
+    def _get_gtp_remat_group(self, p):
+        """Return the GTP-remat group associated with a parameter."""
+        if self.pg_collection is None:
+            return None
+        group_name = 'expt_gtp_remat' if getattr(p, 'expert_tp', False) else 'gtp_remat'
+        return getattr(self.pg_collection, group_name, None)
+
+    def _gather_gated_fc1_grad(self, p, grad):
+        """Gather a GTP-sharded fused FC1 gradient before splitting gate and up."""
+        if not getattr(p, 'is_gtp_weight_remat', False):
+            return grad, None
+
+        gtp_group = self._get_gtp_remat_group(p)
+        group_size = get_pg_size(gtp_group) if gtp_group is not None else 1
+        rank = get_pg_rank(gtp_group) if gtp_group is not None else 0
+        if group_size > 1:
+            grad = self._all_gather_tensor(grad, gtp_group, dim=0)
+
+        pad_length = p.pad_length
+        logical_grad = self._strip_pad(grad, pad_length)
+        return logical_grad, (rank, group_size, grad.size(0) // group_size, pad_length)
+
+    @staticmethod
+    def _restore_gated_fc1_grad(grad, restore_info):
+        """Restore GTP padding and return the original local fused-FC1 shard."""
+        if restore_info is None:
+            return grad
+        rank, group_size, shard_size, pad_length = restore_info
+        if pad_length:
+            grad = torch.nn.functional.pad(grad, (0, 0, 0, pad_length))
+        return grad[rank * shard_size : (rank + 1) * shard_size].contiguous()
+
+    def _orthogonalize_split_gated_fc1(self, p, grad, tp_group, partition_dim):
+        """Apply NS independently to the two logical matrices of fused FC1."""
+        logical_grad, restore_info = self._gather_gated_fc1_grad(p, grad)
+        gate_grad, up_grad = torch.chunk(logical_grad, 2, dim=0)
+        if restore_info is None:
+            gate_grad = self.scaled_orthogonalize_fn_with_gtp_remat(
+                p, gate_grad, tp_group, partition_dim
+            )
+            up_grad = self.scaled_orthogonalize_fn_with_gtp_remat(
+                p, up_grad, tp_group, partition_dim
+            )
+        else:
+            # GTP has already been gathered and padding removed, so invoke the base
+            # NS function directly; gathering each half again would be incorrect.
+            mode = self.tp_mode
+            if mode == 'auto' and not getattr(p, 'expert_tp', False):
+                gtp_size = restore_info[1]
+                mode = self._resolve_tp_mode(
+                    gate_grad.size(0) * gtp_size, gate_grad.size(1), gtp_size
+                )
+            gate_grad = self.scaled_orthogonalize_fn(
+                gate_grad, tp_group, partition_dim, tp_mode_this_group=mode
+            )
+            up_grad = self.scaled_orthogonalize_fn(
+                up_grad, tp_group, partition_dim, tp_mode_this_group=mode
+            )
+        return self._restore_gated_fc1_grad(torch.cat((gate_grad, up_grad), dim=0), restore_info)
+
     def _resolve_tp_mode(self, m: int, n: int, group_size: int) -> str:
         """Cached per-shape mode for tp_mode="auto", dense (GTP) weights only.
 
@@ -402,11 +462,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         """
         # TODO: Clean up code that determines if parameter is a MoE layer and which TP group to use
         is_expert = getattr(p, 'expert_tp', False)
-        gtp_remat_group = (
-            (self.pg_collection.expt_gtp_remat if is_expert else self.pg_collection.gtp_remat)
-            if self.pg_collection
-            else None
-        )
+        gtp_remat_group = self._get_gtp_remat_group(p)
 
         # Parameters with is_gtp_weight_remat=False are not sharded along the
         # GTP process group, and do not require all-gathering prior to
@@ -417,12 +473,11 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             and getattr(p, 'is_gtp_weight_remat', False)
         )
         gtp_remat_size = get_pg_size(gtp_remat_group) if gtp_active else 1
-
         mode = self.tp_mode
         if mode == "auto":
-            # Scoped to dense (GTP) weights for now; expert weights keep today's default.
+            # Use the current gradient shape. Gated FC1 handles its logical halves separately.
             mode = (
-                self._resolve_tp_mode(p.shape[0] * gtp_remat_size, p.shape[1], gtp_remat_size)
+                self._resolve_tp_mode(grad.size(0) * gtp_remat_size, grad.size(1), gtp_remat_size)
                 if gtp_active and not is_expert
                 else "duplicated"
             )
@@ -434,7 +489,6 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
         gtp_rank = get_pg_rank(gtp_remat_group)
         pad_length = getattr(p, 'pad_length', 0)
-
         if mode == "blockwise":
             # Local block NS on this rank's GTP row-shard (shape [M/gtp_remat_size, K]):
             # partition_dim=None makes scaled_orthogonalize_fn run a plain Newton-Schulz on
@@ -532,7 +586,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         if partition_dim == -1:
             partition_dim = None
 
-        if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
+        if getattr(p, "is_gated_fc1", False):
+            grad = self._orthogonalize_split_gated_fc1(p, grad, tp_group, partition_dim)
+        elif self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
             grad_shape = grad.shape
             qkv_split_shapes = getattr(p, "qkv_split_shapes", None)
             if qkv_split_shapes is None:
