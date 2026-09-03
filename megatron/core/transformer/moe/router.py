@@ -501,10 +501,14 @@ class TopKRouter(Router):
             seq_aux_loss_coeff,
             aux_loss,
             "seq_load_balancing_loss",
-            self.tp_cp_group,
-            # local_num_tokens is per-sequence (bsz folded into the expert dim above);
-            # * bsz recovers the micro-batch total, else per-token-loss scaling keeps a 1/MBS.
+            aux_loss_groups.metric_reduce_group,
+            avg_group=aux_loss_groups.metric_avg_group,
+            needs_dp_avg=aux_loss_groups.metric_needs_dp_avg,
+            # local_num_tokens is per-sequence (bsz is folded into the expert dimension);
+            # restore the micro-batch total for per-token-loss gradient scaling.
             valid_token_count=local_num_tokens * bsz,
+            aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
+            aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
         )
         return probs
 
