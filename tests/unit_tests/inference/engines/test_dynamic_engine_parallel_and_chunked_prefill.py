@@ -215,6 +215,9 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             sequence_parallel=sequence_parallel,
             materialize_only_last_token_logits=materialize_only_last_token_logits,
             transformer_impl=transformer_impl,
+            # This direct harness has no coordinator to issue dummy EP forwards after a
+            # worker finishes, so keep EP workers on the same fixed-length schedule.
+            use_fixed_output_lengths=ep_size > 1,
         )
 
     @pytest.mark.internal
