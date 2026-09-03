@@ -1135,7 +1135,7 @@ try:
         except Exception as e:
             abort_requests(client, request_ids, f"submission failed: {e}")
             logger.error(f"Error submitting request: {e}")
-            return Response(f"Error submitting request: {e}", status=500)
+            return openai_error(f"Error submitting request: {e}", 500)
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()

@@ -445,10 +445,9 @@ def _shutdown_coordinator(proc, addr):
 class FakeInferenceClient:
     """Stands in for InferenceClient so HTTP endpoints can be tested alone.
 
-    Implements the two methods the endpoints call (add_request and
-    add_request_streaming) and records what it was asked for, so tests can assert
-    on how request fields were translated into SamplingParams. Replies come from
-    the same serializer the engine uses.
+    Implements the request and abort methods the endpoints call and records what
+    it was asked for, so tests can assert on how request fields were translated
+    into SamplingParams. Replies come from the same serializer the engine uses.
     """
 
     def __init__(
@@ -468,6 +467,7 @@ class FakeInferenceClient:
         self.next_request_id = 0
         # (prompt, sampling_params) for every submitted request, in order.
         self.submissions = []
+        self.aborted_request_ids = []
         # Set to override the next reply, e.g. to simulate a failed request.
         self.reply_override = None
 
@@ -476,7 +476,9 @@ class FakeInferenceClient:
         self.next_request_id += 1
         self.submissions.append((prompt, sampling_params))
         if self.reply_override is not None:
-            return self.reply_override
+            reply = dict(self.reply_override)
+            reply.setdefault("request_id", request_id)
+            return reply
         num_tokens = sampling_params.num_tokens_to_generate or self.num_output_tokens
         generated_tokens = synthesize_generated_tokens(num_tokens, self.tokenizer)
         reply = build_engine_reply(
@@ -497,10 +499,21 @@ class FakeInferenceClient:
 
     def add_request(self, prompt, sampling_params, multi_modal_data=None):
         """Return an already-resolved future holding a canned reply."""
+        return self.add_request_with_id(prompt, sampling_params, multi_modal_data=multi_modal_data)[
+            1
+        ]
+
+    def add_request_with_id(self, prompt, sampling_params, multi_modal_data=None):
+        """Return the canned reply's request id and resolved future."""
         del multi_modal_data
         future = asyncio.get_running_loop().create_future()
-        future.set_result(self._build_reply(prompt, sampling_params))
-        return future
+        reply = self._build_reply(prompt, sampling_params)
+        future.set_result(reply)
+        return reply["request_id"], future
+
+    def abort_request(self, request_id):
+        """Record an endpoint-requested abort."""
+        self.aborted_request_ids.append(request_id)
 
     def add_request_streaming(self, prompt, sampling_params, multi_modal_data=None):
         """Return a stream that yields one partial per token, then the final reply."""

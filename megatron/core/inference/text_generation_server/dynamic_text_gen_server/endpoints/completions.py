@@ -214,7 +214,7 @@ try:
         except Exception as e:
             abort_requests(client, request_ids, f"submission failed: {e}")
             logger.error(f"Error submitting request: {e}")
-            return f"Error submitting request: {e}", 500
+            return openai_error(f"Error submitting request: {e}", 500)
 
         if stream_requested:
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
