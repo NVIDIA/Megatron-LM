@@ -415,6 +415,11 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    gated_delta_net_separate_grad_norm: bool = False
+    """If True, exclude GatedDeltaNet input-projection gradients from the global gradient norm
+    and clip them against their own norm. This prevents an oversized input-projection gradient
+    from shrinking every other parameter's update. Default is False."""
+
     ####################
     # initialization
     ####################
