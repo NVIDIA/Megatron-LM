@@ -1568,6 +1568,10 @@ def generate_state_dict(
 
     # Arguments, iteration, and model.
     state_dict = {}
+    # Persist the family of the model that actually produced the checkpoint. A custom
+    # Python provider may construct HybridModel from a config list without setting a
+    # character pattern on the training args.
+    args.checkpoint_model_is_hybrid = any(_contains_hybrid_model(module) for module in model)
     state_dict['args'] = args
     state_dict['checkpoint_version'] = 3.0
     if iteration is not None:
@@ -2366,6 +2370,40 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     return args, checkpoint_args
 
 
+def _contains_hybrid_model(module) -> bool:
+    """Return whether a model or one of its supported wrappers contains HybridModel."""
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.models.mimo.model.base import MimoModel
+
+    # Megatron-FSDP and Float16Module both retain the wrapped module under
+    # ``module`` but are intentionally not handled by the regular
+    # ``unwrap_model`` helper. Multimodal wrappers (e.g. LLaVAModel) attach
+    # the language model under ``language_model`` instead.
+    while module is not None:
+        if isinstance(module, HybridModel):
+            return True
+        if isinstance(module, MimoModel):
+            language_module = module.mimo_config.language_model_spec.module
+            if isinstance(language_module, type) and issubclass(language_module, HybridModel):
+                return True
+        inner = getattr(module, 'language_model', None)
+        if inner is not None and isinstance(inner, HybridModel):
+            return True
+        module = getattr(module, 'module', None)
+    return False
+
+
+def _checkpoint_is_hybrid_model(ckpt_args) -> bool:
+    """Read saved model-family metadata, with a fallback for legacy checkpoints."""
+    saved_model_family = getattr(ckpt_args, 'checkpoint_model_is_hybrid', None)
+    if saved_model_family is not None:
+        return bool(saved_model_family)
+    return bool(
+        getattr(ckpt_args, 'hybrid_layer_pattern', None)
+        or getattr(ckpt_args, 'hybrid_override_pattern', None)
+    )
+
+
 def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     """Detect a GPT (pure transformer) checkpoint being loaded into a HybridModel run.
 
@@ -2377,37 +2415,22 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     RuntimeError for combinations that cannot be loaded.
     """
     from megatron.core.dist_checkpointing.gpt_checkpoint_interop import gpt_compatible_layer_maps
-    from megatron.core.models.hybrid.hybrid_model import HybridModel
-    from megatron.core.models.mimo.model.base import MimoModel
-
-    def _contains_hybrid_model(module):
-        # Megatron-FSDP and Float16Module both retain the wrapped module under
-        # ``module`` but are intentionally not handled by the regular
-        # ``unwrap_model`` helper. Multimodal wrappers (e.g. LLaVAModel) attach
-        # the language model under ``language_model`` instead.
-        while module is not None:
-            if isinstance(module, HybridModel):
-                return True
-            if isinstance(module, MimoModel):
-                language_module = module.mimo_config.language_model_spec.module
-                if isinstance(language_module, type) and issubclass(language_module, HybridModel):
-                    return True
-            inner = getattr(module, 'language_model', None)
-            if inner is not None and isinstance(inner, HybridModel):
-                return True
-            module = getattr(module, 'module', None)
-        return False
-
     runtime_is_hybrid = any(_contains_hybrid_model(m) for m in model)
     ckpt_pattern = getattr(ckpt_args, 'hybrid_layer_pattern', None) or getattr(
         ckpt_args, 'hybrid_override_pattern', None
     )
-    if runtime_is_hybrid == bool(ckpt_pattern):
+    checkpoint_is_hybrid = _checkpoint_is_hybrid_model(ckpt_args)
+    if runtime_is_hybrid == checkpoint_is_hybrid:
         return None, False
     if not runtime_is_hybrid:
+        checkpoint_hybrid_source = (
+            f'hybrid layer pattern {ckpt_pattern!r}'
+            if ckpt_pattern
+            else 'explicit HybridModel metadata'
+        )
         raise RuntimeError(
-            f'The checkpoint was saved by a hybrid model run (hybrid layer pattern '
-            f'{ckpt_pattern!r}) but the current run builds a non-hybrid model. Load it '
+            f'The checkpoint was saved by a hybrid model run ({checkpoint_hybrid_source}) '
+            f'but the current run builds a non-hybrid model. Load it '
             f'with the hybrid training entrypoint instead.'
         )
 

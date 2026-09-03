@@ -6,6 +6,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from megatron.core.models.hybrid.hybrid_layer_config import (
+    ArchitectureEntry,
+    MTPSplit,
+    PipelineSplit,
+)
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import log_on_each_pipeline_stage, log_single_rank
@@ -299,6 +304,42 @@ def validate_segment_layers(segment: str, config: TransformerConfig) -> List[Tra
         layer_configs.append(layer_utils.create_layer_config(config, layer_symbol))
 
     return layer_configs
+
+
+def layer_config_list_from_hybrid_layer_pattern(
+    pattern: str, config: TransformerConfig
+) -> list[ArchitectureEntry]:
+    """Convert a legacy hybrid layer pattern into the flat architecture representation.
+
+    This is the compatibility boundary for character-based architectures. Decoder pipe
+    separators become :class:`PipelineSplit` markers. Each MTP depth starts with an
+    :class:`MTPSplit`, and every depth reuses the exact same config objects so the flat-list
+    validator can verify that all MTP heads share one template.
+
+    Args:
+        pattern: Legacy unified decoder/MTP pattern.
+        config: Normalized stack-level config copied into each layer-specific config.
+
+    Returns:
+        A flat list of layer configs and split sentinels.
+    """
+
+    parsed = parse_hybrid_pattern(pattern)
+    layer_config_list: list[ArchitectureEntry] = []
+
+    if parsed.main_pattern is not None:
+        for segment_index, segment in enumerate(parsed.main_pattern.split(Symbols.PIPE)):
+            if segment_index > 0:
+                layer_config_list.append(PipelineSplit)
+            layer_config_list.extend(validate_segment_layers(segment, config))
+
+    if parsed.mtp_pattern is not None:
+        mtp_template = validate_segment_layers(parsed.mtp_pattern, config)
+        for _ in range(parsed.mtp_num_depths):
+            layer_config_list.append(MTPSplit)
+            layer_config_list.extend(mtp_template)
+
+    return layer_config_list
 
 
 def select_pipeline_segment(

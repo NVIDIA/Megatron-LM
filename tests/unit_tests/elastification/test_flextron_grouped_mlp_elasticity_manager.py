@@ -17,6 +17,9 @@ import pytest
 import torch
 import torch.nn as nn
 
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.elastification.flextron_elasticity_hooks import (
     FlextronGroupedMLPElasticityManager,
     add_flextron_grouped_mlp_elasticity,
@@ -33,7 +36,14 @@ def _config(hidden_size=64, ffn_hidden_size=128, soft_mask=True):
         ffn_hidden_size=ffn_hidden_size,
         emb_int_list=[hidden_size, hidden_size // 2],
         mlp_int_list=[ffn_hidden_size, ffn_hidden_size // 2],
-        hybrid_layer_pattern="E",
+        flextron_layer_config_list=(
+            MoELayerConfig(
+                num_layers=1,
+                hidden_size=hidden_size,
+                num_attention_heads=1,
+                ffn_hidden_size=ffn_hidden_size,
+            ),
+        ),
         layernorm_epsilon=1e-5,
     )
 
@@ -203,9 +213,16 @@ class TestAddFlextronGroupedMLPElasticity:
 
     def test_factory_returns_manager_with_layer_idx(self):
         cfg = _config()
+        cfg.flextron_layer_config_list = (
+            MambaLayerConfig(num_layers=1, hidden_size=cfg.hidden_size, num_attention_heads=1),
+            MoELayerConfig(num_layers=1, hidden_size=cfg.hidden_size, num_attention_heads=1),
+            AttentionLayerConfig(num_layers=1, hidden_size=cfg.hidden_size, num_attention_heads=1),
+            MoELayerConfig(num_layers=1, hidden_size=cfg.hidden_size, num_attention_heads=1),
+        )
         mod = _StubGroupedMLP(cfg.hidden_size, cfg.ffn_hidden_size).cuda().to(torch.bfloat16)
-        mgr = add_flextron_grouped_mlp_elasticity(mod, cfg, layer_idx=0)
+        mgr = add_flextron_grouped_mlp_elasticity(mod, cfg, layer_idx=3)
         assert isinstance(mgr, FlextronGroupedMLPElasticityManager)
-        assert mgr.layer_idx == 0
+        assert mgr.layer_idx == 3
+        assert mgr.mlp_idx == 1
         assert len(mgr.hook_handles) == 5
         mgr.detach_hooks()

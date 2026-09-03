@@ -17,7 +17,9 @@ import torch
 
 import megatron.elastification.router.hybrid_flex_router as _router_module
 import megatron.training as _megatron_training
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.elastification.router.hybrid_flex_router import FlextronRouter
 from tests.unit_tests.test_utilities import Utils
 
@@ -34,6 +36,10 @@ def _router_config(
         num_moe_experts=num_moe_experts,
         use_cpu_initialization=True,
     )
+    flextron_layer_config_list = (
+        MambaLayerConfig.from_config(config),
+        MoELayerConfig.from_config(config),
+    )
     flex_fields = dict(
         flextron=True,
         soft_mask=True,
@@ -41,7 +47,7 @@ def _router_config(
         flex_hetero_ffn=False,
         flex_hetero_mamba=False,
         flex_hetero_moe_expert=False,
-        hybrid_layer_pattern="ME",
+        flextron_layer_config_list=flextron_layer_config_list,
         normalize_router_logits=False,
         router_inter_dim=32,
         router_std=0.1,
@@ -156,6 +162,25 @@ class TestFlextronRouter:
         # Logits have one entry per emb_int_list choice.
         assert logits.numel() == len(config.emb_int_list)
         assert choice in config.emb_int_list
+
+    def test_heterogeneous_axes_use_typed_layer_counts(self):
+        config = _router_config()
+        config.flex_hetero_ffn = True
+        config.flex_hetero_mamba = True
+        config.flex_hetero_moe_expert = True
+        config.flextron_layer_config_list = (
+            MambaLayerConfig.from_config(config),
+            MoELayerConfig.from_config(config),
+            MambaLayerConfig.from_config(config),
+            MoELayerConfig.from_config(config),
+        )
+
+        router = FlextronRouter(config).cuda()
+        mlp, _, _, mamba, moe_expert = router(1.0)
+
+        assert mlp[0].shape == (2, len(config.mlp_int_list))
+        assert mamba[0].shape == (2, len(config.mamba_int_list))
+        assert moe_expert[0].shape == (2, len(config.moe_expert_int_list))
 
     @pytest.mark.flaky_in_dev
     def test_gumbel_determinism(self):

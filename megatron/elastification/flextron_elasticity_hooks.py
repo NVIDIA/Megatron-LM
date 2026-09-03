@@ -9,13 +9,44 @@ TransformerLayer, MoELayer, TopKRouter, TEGroupedMLP, HybridStack).
 """
 
 import math
+from dataclasses import fields
 from typing import List, Optional
 
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_parallel.utils import split_tensor_along_last_dim
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.moe.moe_utils import get_capacity, group_limited_topk
+from megatron.elastification.flextron_config import FlextronConfig
+from megatron.elastification.router.flex_budget_utils import (
+    get_flextron_layer_ordinal,
+    validate_flextron_layer_config_list,
+)
+
+_FLEXTRON_RUNTIME_CONFIG_FIELDS = frozenset(field.name for field in fields(FlextronConfig)) | {
+    'flextron_layer_config_list'
+}
+
+
+class _FlextronLayerConfigView:
+    """Resolve model settings per layer while keeping Flextron settings model-wide."""
+
+    __slots__ = ('layer_config', 'root_config')
+
+    def __init__(self, layer_config, root_config):
+        self.layer_config = layer_config
+        self.root_config = root_config
+
+    def __getattr__(self, name):
+        if name in _FLEXTRON_RUNTIME_CONFIG_FIELDS:
+            return getattr(self.root_config, name)
+        try:
+            return getattr(self.layer_config, name)
+        except AttributeError:
+            return getattr(self.root_config, name)
 
 
 class _AttributeRestoreHandle:
@@ -47,6 +78,10 @@ class FlextronMambaElasticityManager:
 
         if not self.enabled:
             return
+
+        self.mamba_idx = get_flextron_layer_ordinal(
+            self.config.flextron_layer_config_list, self.layer_idx, MambaLayerConfig
+        )
 
         # Current elasticity parameters - store the full router outputs
         self.current_router_emb = None
@@ -281,11 +316,8 @@ class FlextronMambaElasticityManager:
                 if self.config.soft_mask:
                     soft_in_proj_mask = torch.zeros_like(self.in_proj_mask_list[0])
                     if self.config.flex_hetero_mamba:
-                        mamba_idx = (
-                            self.config.hybrid_layer_pattern[: self.layer_idx + 1].count('M') - 1
-                        )
                         for mask, per_logit in zip(
-                            self.in_proj_mask_list, self.current_router_mamba[0][mamba_idx]
+                            self.in_proj_mask_list, self.current_router_mamba[0][self.mamba_idx]
                         ):
                             soft_in_proj_mask.add_(mask * per_logit)
                     else:
@@ -297,11 +329,10 @@ class FlextronMambaElasticityManager:
                     xz = xz * in_proj_mask.to(device=xz.device)[None, None, :]
                 else:
                     if self.config.flex_hetero_mamba:
-                        mamba_idx = (
-                            self.config.hybrid_layer_pattern[: self.layer_idx + 1].count('M') - 1
+                        router_mamba_logits = torch.max(
+                            self.current_router_mamba[0][self.mamba_idx]
                         )
-                        router_mamba_logits = torch.max(self.current_router_mamba[0][mamba_idx])
-                        mamba_per = self.current_router_mamba[1][mamba_idx]
+                        mamba_per = self.current_router_mamba[1][self.mamba_idx]
                     else:
                         router_mamba_logits, mamba_per = (
                             torch.max(self.current_router_mamba[0]),
@@ -323,11 +354,8 @@ class FlextronMambaElasticityManager:
                 if self.config.soft_mask:
                     soft_conv1d_mask = torch.zeros_like(self.conv1d_mask_list[0])
                     if self.config.flex_hetero_mamba:
-                        mamba_idx = (
-                            self.config.hybrid_layer_pattern[: self.layer_idx + 1].count('M') - 1
-                        )
                         for mask, per_logit in zip(
-                            self.conv1d_mask_list, self.current_router_mamba[0][mamba_idx]
+                            self.conv1d_mask_list, self.current_router_mamba[0][self.mamba_idx]
                         ):
                             soft_conv1d_mask.add_(mask * per_logit)
                     else:
@@ -338,11 +366,8 @@ class FlextronMambaElasticityManager:
                     return soft_conv1d_mask
 
                 if self.config.flex_hetero_mamba:
-                    mamba_idx = (
-                        self.config.hybrid_layer_pattern[: self.layer_idx + 1].count('M') - 1
-                    )
-                    router_mamba_logits = torch.max(self.current_router_mamba[0][mamba_idx])
-                    mamba_per = self.current_router_mamba[1][mamba_idx]
+                    router_mamba_logits = torch.max(self.current_router_mamba[0][self.mamba_idx])
+                    mamba_per = self.current_router_mamba[1][self.mamba_idx]
                 else:
                     router_mamba_logits, mamba_per = (
                         torch.max(self.current_router_mamba[0]),
@@ -381,11 +406,8 @@ class FlextronMambaElasticityManager:
                 if self.config.soft_mask:
                     soft_eps = 0
                     if self.config.flex_hetero_mamba:
-                        mamba_idx = (
-                            self.config.hybrid_layer_pattern[: self.layer_idx + 1].count('M') - 1
-                        )
                         for mamba_per, per_logit in zip(
-                            mamba_effective_per_list, self.current_router_mamba[0][mamba_idx]
+                            mamba_effective_per_list, self.current_router_mamba[0][self.mamba_idx]
                         ):
                             soft_eps += self.config.layernorm_epsilon * mamba_per * per_logit
                     else:
@@ -396,10 +418,7 @@ class FlextronMambaElasticityManager:
                     module.eps = soft_eps.float().detach().item()
                 else:
                     if self.config.flex_hetero_mamba:
-                        mamba_idx = (
-                            self.config.hybrid_layer_pattern[: self.layer_idx + 1].count('M') - 1
-                        )
-                        mamba_per = self.current_router_mamba[1][mamba_idx]
+                        mamba_per = self.current_router_mamba[1][self.mamba_idx]
                     else:
                         mamba_per = self.current_router_mamba[1]
                     mamba_effective_per = mamba_per / self.mamba_mixer.nheads
@@ -416,11 +435,8 @@ class FlextronMambaElasticityManager:
                 if self.config.soft_mask:
                     soft_scaled_output = torch.zeros_like(output)
                     if self.config.flex_hetero_mamba:
-                        mamba_idx = (
-                            self.config.hybrid_layer_pattern[: self.layer_idx + 1].count('M') - 1
-                        )
                         for mamba_per, per_logit in zip(
-                            mamba_effective_per_list, self.current_router_mamba[0][mamba_idx]
+                            mamba_effective_per_list, self.current_router_mamba[0][self.mamba_idx]
                         ):
                             soft_scaled_output.add_(output * (mamba_per**0.5) * per_logit)
                     else:
@@ -431,11 +447,10 @@ class FlextronMambaElasticityManager:
                     return soft_scaled_output
                 else:
                     if self.config.flex_hetero_mamba:
-                        mamba_idx = (
-                            self.config.hybrid_layer_pattern[: self.layer_idx + 1].count('M') - 1
+                        router_mamba_logits = torch.max(
+                            self.current_router_mamba[0][self.mamba_idx]
                         )
-                        router_mamba_logits = torch.max(self.current_router_mamba[0][mamba_idx])
-                        mamba_per = self.current_router_mamba[1][mamba_idx]
+                        mamba_per = self.current_router_mamba[1][self.mamba_idx]
                     else:
                         router_mamba_logits, mamba_per = (
                             torch.max(self.current_router_mamba[0]),
@@ -825,6 +840,10 @@ class FlextronTopKRouterElasticityManager:
         if not self.enabled:
             return
 
+        self.moe_idx = get_flextron_layer_ordinal(
+            self.config.flextron_layer_config_list, self.layer_idx, MoELayerConfig
+        )
+
         # Current elasticity parameters
         self.current_router_moe_expert = None
 
@@ -846,11 +865,8 @@ class FlextronTopKRouterElasticityManager:
 
                 if self.config.soft_mask:
                     if self.config.flex_hetero_moe_expert:
-                        moe_expert_idx = (
-                            self.config.hybrid_layer_pattern[: self.layer_idx + 1].count('E') - 1
-                        )
                         current_router_moe_expert_0 = self.current_router_moe_expert[0][
-                            moe_expert_idx
+                            self.moe_idx
                         ]
                     else:
                         current_router_moe_expert_0 = self.current_router_moe_expert[0]
@@ -889,13 +905,10 @@ class FlextronTopKRouterElasticityManager:
                     return scores, routing_map
                 else:
                     if self.config.flex_hetero_moe_expert:
-                        moe_expert_idx = (
-                            self.config.hybrid_layer_pattern[: self.layer_idx + 1].count('E') - 1
-                        )
                         router_moe_expert_logits = torch.max(
-                            self.current_router_moe_expert[0][moe_expert_idx]
+                            self.current_router_moe_expert[0][self.moe_idx]
                         )
-                        router_moe_expert_per = self.current_router_moe_expert[1][moe_expert_idx]
+                        router_moe_expert_per = self.current_router_moe_expert[1][self.moe_idx]
                     else:
                         router_moe_expert_logits, router_moe_expert_per = (
                             torch.max(self.current_router_moe_expert[0]),
@@ -1063,10 +1076,13 @@ class FlextronGroupedMLPElasticityManager:
         self.config = config
         self.layer_idx = layer_idx
         self.enabled = getattr(config, 'flextron', False)
-        self.mlp_idx = self.config.hybrid_layer_pattern[: self.layer_idx + 1].count('E') - 1
 
         if not self.enabled:
             return
+
+        self.mlp_idx = get_flextron_layer_ordinal(
+            self.config.flextron_layer_config_list, self.layer_idx, MoELayerConfig
+        )
 
         self.current_router_mlp = None
         self.current_router_emb = None
@@ -1629,7 +1645,7 @@ def add_flextron_mamba_elasticity(mamba_mixer, config, layer_idx=0):
     Args:
         mamba_mixer: The MambaMixer instance to add elasticity to
         config: Configuration object with flextron settings
-        layer_idx: Index of this layer in the hybrid pattern
+        layer_idx: Index of this layer in the typed architecture list
 
     Returns:
         FlextronMambaElasticityManager: Manager object to control elasticity
@@ -1652,7 +1668,7 @@ def add_flextron_transformer_layer_elasticity(transformer_layer, config, layer_i
     Args:
         transformer_layer: The TransformerLayer instance to add elasticity to
         config: Configuration object with flextron settings
-        layer_idx: Index of this layer in the hybrid pattern
+        layer_idx: Index of this layer in the typed architecture list
 
     Returns:
         FlextronTransformerLayerElasticityManager: Manager object to control elasticity
@@ -1675,7 +1691,7 @@ def add_flextron_topk_router_elasticity(router, config, layer_idx=0):
     Args:
         router: The TopKRouter instance to add elasticity to
         config: Configuration object with flextron settings
-        layer_idx: Index of this layer in the hybrid pattern
+        layer_idx: Index of this layer in the typed architecture list
 
     Returns:
         FlextronTopKRouterElasticityManager: Manager object to control elasticity
@@ -1698,7 +1714,7 @@ def add_flextron_moe_elasticity(moe_module, config, layer_idx=0):
     Args:
         moe_module: The MoE instance to add elasticity to
         config: Configuration object with flextron settings
-        layer_idx: Index of this layer in the hybrid pattern
+        layer_idx: Index of this layer in the typed architecture list
 
     Returns:
         FlextronMoEElasticityManager: Manager object to control elasticity
@@ -1736,7 +1752,7 @@ def add_flextron_attention_elasticity(attention_module, config, layer_idx=0):
     Args:
         attention_module: The Attention instance to add elasticity to
         config: Configuration object with flextron settings
-        layer_idx: Index of this layer in the hybrid pattern
+        layer_idx: Index of this layer in the typed architecture list
 
     Returns:
         FlextronAttentionElasticityManager: Manager object to control elasticity
@@ -1776,14 +1792,13 @@ def add_flextron_stack_elasticity(stack, config):
 
 # Convenience function to apply elasticity to all modules in a model
 def apply_flextron_elasticity_to_model(model, config):
-    """Apply elasticity managers to model modules based on the hybrid pattern."""
+    """Apply elasticity managers according to the model's typed layer config list."""
     managers = []
 
-    if not hasattr(config, 'hybrid_layer_pattern') or not config.hybrid_layer_pattern:
-        # No hybrid pattern, skip elasticity setup
+    layer_config_list = getattr(config, 'flextron_layer_config_list', ())
+    if not layer_config_list:
         return managers
-
-    hybrid_pattern = config.hybrid_layer_pattern
+    layer_config_list = validate_flextron_layer_config_list(layer_config_list)
 
     # Find decoder layers
     decoder = getattr(model, 'decoder', None)
@@ -1792,19 +1807,23 @@ def apply_flextron_elasticity_to_model(model, config):
     if decoder is None or layers is None:
         return managers
 
-    # Apply elasticity per layer based on hybrid pattern
-    for layer_idx, layer_char in enumerate(hybrid_pattern):
-        if layer_idx >= len(layers):
-            break
+    if len(layer_config_list) != len(layers):
+        raise ValueError(
+            f"Flextron has {len(layer_config_list)} layer configs but the local decoder "
+            f"contains {len(layers)} layers."
+        )
 
-        layer = layers[layer_idx]
-
-        if layer_char == 'E':  # MoE layer (treated as MLP replacement)
+    # FlextronModelManager rejects PP/VPP, so list and local module indices align exactly.
+    for layer_idx, (layer_config, layer) in enumerate(zip(layer_config_list, layers, strict=True)):
+        manager_config = _FlextronLayerConfigView(layer_config, config)
+        if type(layer_config) is MoELayerConfig:
             if (
                 'MoETransformerLayer' == layer.__class__.__name__
                 or 'TransformerLayer' == layer.__class__.__name__
             ):
-                layer_manager = add_flextron_transformer_layer_elasticity(layer, config, layer_idx)
+                layer_manager = add_flextron_transformer_layer_elasticity(
+                    layer, manager_config, layer_idx
+                )
                 managers.append(layer_manager)
 
             # Find MoELayer module in this layer
@@ -1814,7 +1833,7 @@ def apply_flextron_elasticity_to_model(model, config):
                     moe_module = module
                     break
             if moe_module is not None:
-                manager = add_flextron_moe_elasticity(moe_module, config, layer_idx)
+                manager = add_flextron_moe_elasticity(moe_module, manager_config, layer_idx)
                 managers.append(manager)
 
                 # Also add router elasticity to the MoE router
@@ -1825,7 +1844,7 @@ def apply_flextron_elasticity_to_model(model, config):
                         break
                 if router_module is not None:
                     router_manager = add_flextron_topk_router_elasticity(
-                        router_module, config, layer_idx
+                        router_module, manager_config, layer_idx
                     )
                     managers.append(router_manager)
 
@@ -1836,30 +1855,32 @@ def apply_flextron_elasticity_to_model(model, config):
                     moe_module = module
                     break
             if moe_module is not None:
-                manager = add_flextron_grouped_mlp_elasticity(moe_module, config, layer_idx)
+                manager = add_flextron_grouped_mlp_elasticity(moe_module, manager_config, layer_idx)
                 managers.append(manager)
 
-        elif layer_char == 'M':  # Mamba layer
+        elif type(layer_config) is MambaLayerConfig:
             mamba_module = None
             for name, module in layer.named_modules():
                 if 'MambaMixer' == module.__class__.__name__:
                     mamba_module = module
                     break
             if mamba_module is not None:
-                manager = add_flextron_mamba_elasticity(mamba_module, config, layer_idx)
+                manager = add_flextron_mamba_elasticity(mamba_module, manager_config, layer_idx)
                 managers.append(manager)
 
-        elif layer_char == '*':  # Attention layer (TransformerLayer)
+        elif type(layer_config) is AttentionLayerConfig:
             attention_module = None
             for name, module in layer.named_modules():
                 if 'SelfAttention' == module.__class__.__name__:
                     attention_module = module
                     break
             if attention_module is not None:
-                manager = add_flextron_attention_elasticity(attention_module, config, layer_idx)
+                manager = add_flextron_attention_elasticity(
+                    attention_module, manager_config, layer_idx
+                )
                 managers.append(manager)
 
-    # Also add hooks to HybridStack if present
+    # Final norm behavior is defined by the root config rather than any individual layer.
     if hasattr(model, 'decoder') and hasattr(model.decoder, 'final_norm'):
         stack_manager = add_flextron_stack_elasticity(model.decoder, config)
         managers.append(stack_manager)

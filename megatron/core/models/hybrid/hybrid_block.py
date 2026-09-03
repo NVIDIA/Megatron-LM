@@ -81,9 +81,9 @@ class HybridStack(MegatronModule):
         layer_type_list (list[str], optional): This argument exists for backwards-compatibility
             reasons, allowing callers to construct ``HybridStack`` directly with layer symbols.
             It is immediately converted to independent per-layer configs.
-        layer_config_list (Sequence[TransformerConfig], optional): per-layer configs for this
-            pipeline segment. When provided by HybridModel, pipeline stage selection has already
-            been done via '|' separators in the pattern. Exactly one of ``layer_type_list`` or
+        layer_config_list (Sequence[TransformerConfig], optional): Per-layer configs for this
+            physical stack. When provided by HybridModel, PP/VPP selection has already produced
+            the local marker-free segment. Exactly one of ``layer_type_list`` or
             ``layer_config_list`` must be provided.
         pp_layer_offset (int, optional): the global layer offset for this pipeline
             segment. Defaults to 0.
@@ -134,12 +134,7 @@ class HybridStack(MegatronModule):
             )
             layer_config_list = validate_segment_layers(segment, config)
 
-        for layer_config in layer_config_list:
-            layer_utils.validate_tp_comm_overlap(
-                layer_config,
-                layer_utils.get_layer_symbol_from_config(layer_config),
-                has_mtp=is_mtp_layer,
-            )
+        layer_utils.validate_tp_comm_overlap(config, layer_config_list, has_mtp=is_mtp_layer)
 
         super().__init__(config=config)
         self.pre_process = pre_process

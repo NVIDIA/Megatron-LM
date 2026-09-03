@@ -20,12 +20,15 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 
 # Remove top-level import to avoid circular imports
 # from megatron.training import get_args, print_rank_0
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal
+from megatron.elastification.router.flex_budget_utils import count_flextron_layer_configs
 
 # Import TE parallel linear layers
 try:
@@ -125,9 +128,7 @@ class FlextronRouter(MegatronModule):
         # must save/restore both - otherwise the CUDA RNG leaks the deterministic
         # state we set here into other CUDA random ops elsewhere in the model.
         cpu_state = torch.get_rng_state()
-        cuda_state = (
-            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-        )
+        cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         torch.manual_seed(seed)
 
         try:
@@ -192,7 +193,9 @@ class FlextronRouter(MegatronModule):
     def add_router_for_mlp(self):
         mlp_list = self.config.mlp_int_list
         if self.config.flex_hetero_ffn:
-            num_mlp = self.config.hybrid_layer_pattern.count("E")
+            num_mlp = count_flextron_layer_configs(
+                self.config.flextron_layer_config_list, MoELayerConfig
+            )
             gate_mlp_layer_list = [
                 self._create_linear_layer(
                     self.input_dim, self.n_dim, bias=False, is_first_layer=True
@@ -229,7 +232,9 @@ class FlextronRouter(MegatronModule):
     def add_router_for_moe_expert(self):
         moe_expert_list = self.config.moe_expert_int_list
         if self.config.flex_hetero_moe_expert:
-            num_moe_expert = self.config.hybrid_layer_pattern.count("E")
+            num_moe_expert = count_flextron_layer_configs(
+                self.config.flextron_layer_config_list, MoELayerConfig
+            )
             gate_moe_expert_layer_list = [
                 self._create_linear_layer(
                     self.input_dim, self.n_dim, bias=False, is_first_layer=True
@@ -280,7 +285,9 @@ class FlextronRouter(MegatronModule):
     def add_router_for_mamba(self):
         mamba_list = self.config.mamba_int_list
         if self.config.flex_hetero_mamba:
-            num_mamba = self.config.hybrid_layer_pattern.count("M")
+            num_mamba = count_flextron_layer_configs(
+                self.config.flextron_layer_config_list, MambaLayerConfig
+            )
             gate_mamba_layer_list = [
                 self._create_linear_layer(
                     self.input_dim, self.n_dim, bias=False, is_first_layer=True
@@ -557,8 +564,7 @@ class FlextronRouter(MegatronModule):
             # to the largest configured budget. Using max() instead of [0]
             # makes this independent of budget_list ordering.
             budget_tensor = torch.nn.functional.one_hot(
-                self.budget_map[max(self.budget_map.keys())],
-                len(self.config.budget_list),
+                self.budget_map[max(self.budget_map.keys())], len(self.config.budget_list)
             ).to(device=device, dtype=dtype)
         else:
             # budget_list is enforced descending by sort_budget_list_descending

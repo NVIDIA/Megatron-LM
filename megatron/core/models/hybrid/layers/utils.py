@@ -1,5 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from collections.abc import Sequence
+
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
@@ -91,27 +93,40 @@ def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
 
 
 def validate_tp_comm_overlap(
-    config: TransformerConfig, segment: str, has_mtp: bool = False
+    config: TransformerConfig, layers: str | Sequence[TransformerConfig], has_mtp: bool = False
 ) -> None:
     """Validate TP communication overlap support for built-in hybrid layers.
 
     Args:
         config: Config whose TP communication overlap setting should be validated.
-        segment: Layer symbols governed by ``config``.
+        layers: Layer configs governed by ``config``. A string is also accepted by the
+            legacy pattern adapter.
         has_mtp: Whether this model instance will build an MTP block.
 
     Raises:
         ValueError: If TP communication overlap is enabled with MLA, DSA, or MTP.
     """
     unsupported_features: list[str] = []
-    if Symbols.MLA in segment:
+    if isinstance(layers, str):
+        overlap_enabled = config.tp_comm_overlap
+        has_mla = overlap_enabled and Symbols.MLA in layers
+        has_dsa = overlap_enabled and Symbols.DS_ATTENTION in layers
+        has_unsupported_mtp = overlap_enabled and has_mtp
+    else:
+        overlap_configs = [layer_config for layer_config in layers if layer_config.tp_comm_overlap]
+        layer_types = {type(layer_config) for layer_config in overlap_configs}
+        has_mla = MLALayerConfig in layer_types
+        has_dsa = DSALayerConfig in layer_types
+        has_unsupported_mtp = has_mtp and (config.tp_comm_overlap or bool(overlap_configs))
+
+    if has_mla:
         unsupported_features.append("MLA")
-    if Symbols.DS_ATTENTION in segment:
+    if has_dsa:
         unsupported_features.append("DSA")
-    if has_mtp:
+    if has_unsupported_mtp:
         unsupported_features.append("MTP")
 
-    if not config.tp_comm_overlap or not unsupported_features:
+    if not unsupported_features:
         return
 
     raise ValueError(

@@ -44,6 +44,7 @@ class TestHybridModelConfigInitialization:
         assert config.parallel_output is True
         assert config.share_embeddings_and_output_weights is False
         assert config.hybrid_layer_pattern is None
+        assert config.layer_config_list is None
         assert config.seq_length == 8192
         assert config.position_embedding_type == "none"
         assert config.rotary_percent == 1.0
@@ -349,6 +350,10 @@ class TestHybridModelBuilderBuildModel:
         assert kw["vocab_size"] == 32000
         assert kw["max_sequence_length"] == 4096
         assert kw["hybrid_layer_pattern"] == "M-A-"
+        assert kw["hybrid_attention_ratio"] is None
+        assert kw["hybrid_mlp_ratio"] is None
+        assert kw["hybrid_override_pattern"] is None
+        assert kw["layer_config_list"] is None
         assert kw["fp16_lm_cross_entropy"] is True
         assert kw["logit_dtype"] == torch.float32
         assert kw["parallel_output"] is False
@@ -359,6 +364,24 @@ class TestHybridModelBuilderBuildModel:
         assert kw["seq_len_interpolation_factor"] is None
         assert kw["pg_collection"] is pg
         assert kw["vp_stage"] is None
+
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_layer_config_list_passed_to_mcore(self, mock_model, *_):
+        architecture = [object()]
+        config = _make_hybrid_config(
+            layer_config_list=architecture, hybrid_attention_ratio=0.25, hybrid_override_pattern="M"
+        )
+
+        HybridModelBuilder(config).build_model(self.pg)
+
+        kwargs = mock_model.call_args.kwargs
+        assert kwargs["layer_config_list"] is architecture
+        assert kwargs["hybrid_attention_ratio"] == 0.25
+        assert kwargs["hybrid_mlp_ratio"] is None
+        assert kwargs["hybrid_override_pattern"] == "M"
 
 
 class TestHybridModelBuilderBuildDistributedModels:
