@@ -372,12 +372,14 @@ if _CUTE_AVAILABLE:
     @cute.kernel
     def _build_attention_indices_kernel(
         cu_seqlens: cute.Tensor,
+        cu_seqlens_unpadded: cute.Tensor,
         cu_seqlens_compressed: cute.Tensor,
         indexer_topk: cute.Tensor,
         seq_to_rank_row: cute.Tensor,
         topk_idxs: cute.Tensor,
         topk_length: cute.Tensor,
         indexer_physical_rows: cute.Tensor,
+        q_padding_mask: cute.Tensor,
         n_seq: cutlass.Int32,
         global_start: cutlass.Int32,
         l_local: cutlass.Int32,
@@ -391,6 +393,7 @@ if _CUTE_AVAILABLE:
         total_width: cutlass.Int32,
         index_mode: cutlass.Constexpr,
         compressed_is_sequence_major: cutlass.Constexpr,
+        has_unpadded_seqlens: cutlass.Constexpr,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -407,33 +410,57 @@ if _CUTE_AVAILABLE:
             seq_start_found = cutlass.Int32(-1)
             seq_comp_start = cutlass.Int32(0)
             seq_comp_len = cutlass.Int32(0)
+            seq_real_len = cutlass.Int32(0)
             if cutlass.const_expr(index_mode == 0):
                 for seq in range(n_seq):
                     seq_start = cu_seqlens[seq]
                     seq_end = cu_seqlens[seq + 1]
                     if global_q >= seq_start and global_q < seq_end:
                         seq_start_found = seq_start
+                        if cutlass.const_expr(has_unpadded_seqlens):
+                            seq_real_len = cu_seqlens_unpadded[seq + 1] - cu_seqlens_unpadded[seq]
                         if ratio > 1 and compressed_width > 0:
                             seq_comp_start = cu_seqlens_compressed[seq]
                             seq_comp_len = cu_seqlens_compressed[seq + 1] - seq_comp_start
             else:
-                shared = utils.SmemAllocator().allocate_tensor(cutlass.Int32, cute.make_layout(3))
+                shared = utils.SmemAllocator().allocate_tensor(cutlass.Int32, cute.make_layout(4))
                 if tidx == 0:
                     for seq in range(n_seq):
                         seq_start = cu_seqlens[seq]
                         seq_end = cu_seqlens[seq + 1]
                         if global_q >= seq_start and global_q < seq_end:
                             seq_start_found = seq_start
+                            if cutlass.const_expr(has_unpadded_seqlens):
+                                seq_real_len = (
+                                    cu_seqlens_unpadded[seq + 1] - cu_seqlens_unpadded[seq]
+                                )
                             if ratio > 1 and compressed_width > 0:
                                 seq_comp_start = cu_seqlens_compressed[seq]
                                 seq_comp_len = cu_seqlens_compressed[seq + 1] - seq_comp_start
                     shared[0] = seq_start_found
                     shared[1] = seq_comp_start
                     shared[2] = seq_comp_len
+                    shared[3] = seq_real_len
                 cute.arch.sync_threads()
                 seq_start_found = shared[0]
                 seq_comp_start = shared[1]
                 seq_comp_len = shared[2]
+                seq_real_len = shared[3]
+
+            is_padding = cutlass.Int32(0)
+            if cutlass.const_expr(has_unpadded_seqlens):
+                if cutlass.const_expr(index_mode == 0):
+                    if seq_start_found < 0:
+                        is_padding = 1
+                    elif global_q - seq_start_found >= seq_real_len:
+                        is_padding = 1
+                    q_padding_mask[row] = is_padding.to(q_padding_mask.element_type)
+                elif tidx == 0:
+                    if seq_start_found < 0:
+                        is_padding = 1
+                    elif global_q - seq_start_found >= seq_real_len:
+                        is_padding = 1
+                    q_padding_mask[row] = is_padding.to(q_padding_mask.element_type)
 
             if cutlass.const_expr(index_mode != 0):
                 col = tidx
@@ -544,12 +571,14 @@ if _CUTE_AVAILABLE:
     @cute.jit
     def _build_attention_indices_launch(
         cu_seqlens: cute.Tensor,
+        cu_seqlens_unpadded: cute.Tensor,
         cu_seqlens_compressed: cute.Tensor,
         indexer_topk: cute.Tensor,
         seq_to_rank_row: cute.Tensor,
         topk_idxs: cute.Tensor,
         topk_length: cute.Tensor,
         indexer_physical_rows: cute.Tensor,
+        q_padding_mask: cute.Tensor,
         n_seq: cutlass.Int32,
         global_start: cutlass.Int32,
         l_local: cutlass.Int32,
@@ -563,6 +592,7 @@ if _CUTE_AVAILABLE:
         total_width: cutlass.Int32,
         index_mode: cutlass.Constexpr,
         compressed_is_sequence_major: cutlass.Constexpr,
+        has_unpadded_seqlens: cutlass.Constexpr,
         launch_work: cutlass.Int32,
         stream: cuda.CUstream,
     ):
@@ -571,12 +601,14 @@ if _CUTE_AVAILABLE:
             "dsv4_thd_build_attention_indices",
             (
                 cu_seqlens,
+                cu_seqlens_unpadded,
                 cu_seqlens_compressed,
                 indexer_topk,
                 seq_to_rank_row,
                 topk_idxs,
                 topk_length,
                 indexer_physical_rows,
+                q_padding_mask,
                 n_seq,
                 global_start,
                 l_local,
@@ -590,6 +622,7 @@ if _CUTE_AVAILABLE:
                 total_width,
                 index_mode,
                 compressed_is_sequence_major,
+                has_unpadded_seqlens,
             ),
             grid=(cute.ceil_div(launch_work, 128), 1, 1),
             block=(128, 1, 1),
@@ -780,7 +813,8 @@ def build_attention_indices(
     compressed_base: int | None = None,
     compressed_rows: int | None = None,
     compressed_is_sequence_major: bool = False,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    cu_seqlens_unpadded: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Build final sparse-attention and optional indexer-loss indices.
 
     Inputs:
@@ -799,11 +833,14 @@ def build_attention_indices(
             ``compressed_width`` is nonzero.
         compressed_is_sequence_major: compressed rows already use sequence-major
             order, so logical rows address them directly without an identity map.
+        cu_seqlens_unpadded: optional true sequence lengths when ``cu_seqlens``
+            describes CUDA-graph-padded rows.
 
     Outputs:
         ``topk_idxs`` int32, shape ``(l_local, window_size + compressed_width)``;
         optional ``topk_length`` int32, shape ``(l_local,)``; and optional
         ``indexer_physical_rows`` int32, shape ``(l_local, compressed_width)``.
+        The fourth result is an optional bool padding-row mask, shape ``(l_local,)``.
         Normal attention puts window ids first. Indexer-loss mode puts selected
         compressed ids first and returns their physical compressed-buffer rows.
     """
@@ -815,7 +852,10 @@ def build_attention_indices(
         compressed_topk,
         cu_seqlens_compressed,
         seq_to_rank_row,
+        cu_seqlens_unpadded,
     )
+    if cu_seqlens_unpadded is not None and cu_seqlens_unpadded.shape != cu_seqlens.shape:
+        raise ValueError("padded and unpadded cumulative lengths must have the same shape")
     global_start, l_local = int(global_start), int(l_local)
     compressed_width = int(compressed_width)
     compressed_is_sequence_major = bool(compressed_is_sequence_major)
@@ -852,17 +892,27 @@ def build_attention_indices(
     else:
         topk_length_kernel = torch.empty((l_local,), dtype=torch.int32, device=cu_seqlens.device)
         indexer_physical_rows = torch.empty((1, 1), dtype=torch.int32, device=cu_seqlens.device)
+    has_unpadded_seqlens = cu_seqlens_unpadded is not None
+    # Store byte flags in CuTe and reinterpret them as torch.bool without a
+    # conversion launch; both dtypes have one-byte PyTorch storage.
+    if cu_seqlens_unpadded is None:
+        cu_seqlens_unpadded = cu_seqlens
+        q_padding_mask_kernel = torch.empty((1,), dtype=torch.uint8, device=cu_seqlens.device)
+    else:
+        q_padding_mask_kernel = torch.empty((l_local,), dtype=torch.uint8, device=cu_seqlens.device)
     launch_work = l_local * 128 if index_mode else l_local
     _run_compiled_launch(
         _build_attention_indices_launch,
         (
             cu_seqlens,
+            cu_seqlens_unpadded,
             cu_seqlens_compressed,
             compressed_topk,
             seq_to_rank_row,
             topk_idxs,
             topk_length_kernel,
             indexer_physical_rows,
+            q_padding_mask_kernel,
         ),
         (
             cu_seqlens.shape[0] - 1,
@@ -878,10 +928,12 @@ def build_attention_indices(
             total_width,
             index_mode,
             compressed_is_sequence_major,
+            has_unpadded_seqlens,
             launch_work,
         ),
-        static_arg_indices=(11, 12),
+        static_arg_indices=(11, 12, 13),
     )
+    q_padding_mask = q_padding_mask_kernel.view(torch.bool) if has_unpadded_seqlens else None
     if for_indexer_loss:
-        return topk_idxs, None, indexer_physical_rows
-    return topk_idxs, topk_length_kernel, None
+        return topk_idxs, None, indexer_physical_rows, q_padding_mask
+    return topk_idxs, topk_length_kernel, None, q_padding_mask

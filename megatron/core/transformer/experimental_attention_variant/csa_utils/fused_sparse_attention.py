@@ -31,7 +31,7 @@ from torch import Tensor
 from megatron.core.tensor_parallel.mappings import async_reduce_scatter_along_first_dim
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
-from . import thd_layout_kernels
+from . import thd_indexer_kernels, thd_layout_kernels
 from .csa_teacher_lse import can_use_fused_csa_teacher_lse, fused_csa_teacher_lse
 
 # ---------------------------------------------------------------------------
@@ -913,18 +913,9 @@ def _indexer_topk_core(
         sk = int(max_seqlen_kv)
         total_q = q.shape[0]
 
-        row_idx = torch.arange(total_q, device=device, dtype=torch.int32)
-        row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
-        row_valid = row_idx < cu_seqlens_q[-1]
-        pos_in_seq = row_idx - cu_seqlens_q[row_batch_ids]
-        if q_causal_offsets is not None:
-            pos_in_seq = pos_in_seq + q_causal_offsets[row_batch_ids]
-        pos_in_seq = torch.where(row_valid, pos_in_seq, torch.zeros_like(pos_in_seq))
-        seqlen_kv_per_row = (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1])[row_batch_ids]
-        seq_lens = (
-            ((pos_in_seq + 1) // ratio).clamp(max=seqlen_kv_per_row).to(torch.int32).contiguous()
+        seq_lens = thd_indexer_kernels.build_seq_lens(
+            cu_seqlens_q, cu_seqlens_kv, total_q, ratio, q_causal_offsets
         )
-        seq_lens = torch.where(row_valid, seq_lens, torch.zeros_like(seq_lens))
     else:
         if k.shape[1] == 0:
             raise ValueError("indexer_topk requires at least one K row.")
@@ -952,19 +943,14 @@ def _indexer_topk_core(
     )
     topk_indices = tk_result["indices"]  # (total_q, topk_k) int32
 
-    if topk_k < topk:
-        pad = torch.full((total_q, topk - topk_k), -1, dtype=torch.int32, device=device)
-        topk_indices = torch.cat([topk_indices, pad], dim=-1)
-
     if is_thd:
-        row_valid = (topk_indices >= 0) & (topk_indices < seq_lens.unsqueeze(1))
-        topk_indices = topk_indices.masked_fill(~row_valid, -1)
-        safe_topk = topk_indices.clamp(min=0, max=sk - 1).to(torch.long)
-        selected_scores = torch.gather(scores_flat, dim=-1, index=safe_topk)
-        selected_valid = (topk_indices >= 0) & (topk_indices < sk) & torch.isfinite(selected_scores)
-        topk_indices = topk_indices.masked_fill(~selected_valid, -1)
-        topk_length = (topk_indices >= 0).sum(dim=-1).int()
+        topk_indices, topk_length = thd_indexer_kernels.sanitize_topk(
+            topk_indices, scores_flat, seq_lens, output_width=topk
+        )
     else:
+        if topk_k < topk:
+            pad = torch.full((total_q, topk - topk_k), -1, dtype=torch.int32, device=device)
+            topk_indices = torch.cat([topk_indices, pad], dim=-1)
         topk_length = (topk_indices >= 0).sum(dim=-1).int()  # (total_q,)
 
     # ---------------- Layout-specific output reshape --------------------
@@ -1483,26 +1469,30 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
 
         # ---- 3. Combine indices (indexer first, then window) + globalize. ----
         indexer_physical_idxs = None
+        padding_row_mask: Optional[Tensor] = None  # True = padding (excluded from loss)
         if is_thd and thd_compressed_is_sequence_major:
             if compressed_kv is None or thd_window_size is None:
                 raise ValueError(
                     "Raw sequence-major THD lowering requires compressed_kv and thd_window_size."
                 )
             compressed_base = kv_full.shape[0] - compressed_kv.shape[0]
-            global_idxs, _, indexer_physical_idxs = thd_layout_kernels.build_attention_indices(
-                cu_seqlens_q,
-                0,
-                total_q,
-                0,
-                int(thd_window_size),
-                ratio,
-                indexer_topk,
-                topk_indices_cmp,
-                cu_seqlens_compressed=cu_seqlens_compressed_idx,
-                for_indexer_loss=True,
-                compressed_base=compressed_base,
-                compressed_rows=compressed_kv.shape[0],
-                compressed_is_sequence_major=True,
+            global_idxs, _, indexer_physical_idxs, padding_row_mask = (
+                thd_layout_kernels.build_attention_indices(
+                    cu_seqlens_q,
+                    0,
+                    total_q,
+                    0,
+                    int(thd_window_size),
+                    ratio,
+                    indexer_topk,
+                    topk_indices_cmp,
+                    cu_seqlens_compressed=cu_seqlens_compressed_idx,
+                    for_indexer_loss=True,
+                    compressed_base=compressed_base,
+                    compressed_rows=compressed_kv.shape[0],
+                    compressed_is_sequence_major=True,
+                    cu_seqlens_unpadded=cu_seqlens_q_unpadded,
+                )
             )
         elif is_thd:
             if window_idxs is None:
@@ -1567,16 +1557,16 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         # avoid keeping a second TopK-sized tensor for backward.
         global_idxs.clamp_min_(0)
 
-        # ---- 4b. Derive padding-row mask for loss exclusion. -----------------
+        # ---- 4b. Resolve padding-row mask for loss exclusion. ----------------
         # When CUDA-graph padding makes cu_seqlens_q cover all total_q rows
         # (including padding), cu_seqlens_q_unpadded supplies the true
         # boundaries.  Padding rows must not contribute to the indexer KL
         # loss or backward gradients — only the sparse-attention output
         # needs them for static-shape compatibility.
-        # The caller only passes cu_seqlens_q_unpadded when it differs from
-        # cu_seqlens_q (checked via data_ptr), so no GPU→CPU sync is needed.
-        padding_row_mask: Optional[Tensor] = None  # True = padding (excluded from loss)
-        if is_thd and cu_seqlens_q_unpadded is not None:
+        # Raw sequence-major THD emits this mask from final-index lowering.
+        # Legacy THD derives it here; the caller only supplies unpadded lengths
+        # when they differ from cu_seqlens_q, so no GPU→CPU sync is needed.
+        if padding_row_mask is None and is_thd and cu_seqlens_q_unpadded is not None:
             real_seg_lens = cu_seqlens_q_unpadded[1:] - cu_seqlens_q_unpadded[:-1]
             row_idx = torch.arange(total_q, device=query.device, dtype=torch.int32)
             row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)

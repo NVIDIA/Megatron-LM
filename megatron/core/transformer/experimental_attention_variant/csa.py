@@ -2340,7 +2340,7 @@ class CompressedSparseAttention(MegatronModule):
         compressed_width = (
             max_seqlen_compressed_idx if self.compress_ratio > 1 and compressed_rows > 0 else 0
         )
-        flat_idxs, flat_tlen, _ = thd_layout_kernels.build_attention_indices(
+        flat_idxs, flat_tlen, _, _ = thd_layout_kernels.build_attention_indices(
             cu_seqlens_q,
             0,
             total_q,
@@ -2409,7 +2409,7 @@ class CompressedSparseAttention(MegatronModule):
                 max_seqlen_kv=max_seqlen_compressed_idx,
             )
 
-        flat_idxs, flat_tlen, _ = thd_layout_kernels.build_attention_indices(
+        flat_idxs, flat_tlen, _, _ = thd_layout_kernels.build_attention_indices(
             cu_seqlens_q,
             0,
             total_q,
@@ -2759,10 +2759,20 @@ class CompressedSparseAttention(MegatronModule):
             if compressed_topk is not None
             else (max_seqlen_q // ratio if ratio > 1 else 0)
         )
+        cu_seqlens_q_unpadded = None
+        if (
+            use_indexer_loss
+            and packed_seq_params.cu_seqlens_q is not None
+            and packed_seq_params.cu_seqlens_q_padded is not None
+            and packed_seq_params.cu_seqlens_q.data_ptr()
+            != packed_seq_params.cu_seqlens_q_padded.data_ptr()
+        ):
+            cu_seqlens_q_unpadded = packed_seq_params.cu_seqlens_q
         # Lower the logical ids into two physical spaces: indexer_topk_rank_major
         # addresses the rank-major compressed buffers without kv_full_thd's
         # compressed base, while topk_idxs addresses final rows in kv_full_thd.
-        topk_idxs, topk_length, indexer_topk_rank_major = (
+        # The same row scan also emits the CUDA-graph padding mask when needed.
+        topk_idxs, topk_length, indexer_topk_rank_major, q_padding_mask = (
             thd_layout_kernels.build_attention_indices(
                 cu_seqlens,
                 global_start,
@@ -2776,6 +2786,7 @@ class CompressedSparseAttention(MegatronModule):
                 seq_to_rank_row=seq_to_rank_row,
                 for_indexer_loss=use_indexer_loss,
                 compressed_rows=compressed_kv_rank_major.shape[0],
+                cu_seqlens_unpadded=cu_seqlens_q_unpadded,
             )
         )
         if use_indexer_loss:
@@ -2790,28 +2801,6 @@ class CompressedSparseAttention(MegatronModule):
             if overlap_cp_backward:
                 k_indexer_for_loss = k_indexer_for_loss.detach()
                 compressed_kv_for_loss = compressed_kv_for_loss.detach()
-            cu_seqlens_q_unpadded = None
-            if (
-                packed_seq_params.cu_seqlens_q is not None
-                and packed_seq_params.cu_seqlens_q_padded is not None
-                and packed_seq_params.cu_seqlens_q.data_ptr()
-                != packed_seq_params.cu_seqlens_q_padded.data_ptr()
-            ):
-                cu_seqlens_q_unpadded = packed_seq_params.cu_seqlens_q
-            q_padding_mask = None
-            if cu_seqlens_q_unpadded is not None:
-                global_rows = torch.arange(
-                    global_start,
-                    global_start + l_local,
-                    device=query.device,
-                    dtype=cu_seqlens.dtype,
-                )
-                batch_ids = torch.bucketize(
-                    global_rows, cu_seqlens[1:], out_int32=True, right=True
-                ).clamp_max(cu_seqlens.shape[0] - 2)
-                real_seqlens = cu_seqlens_q_unpadded[1:] - cu_seqlens_q_unpadded[:-1]
-                positions = global_rows - cu_seqlens[batch_ids]
-                q_padding_mask = positions >= real_seqlens[batch_ids]
             loss_divisor = 1 if self.config.calculate_per_token_loss else l_local * cp_size
             if (
                 not self.use_fused_kernels
