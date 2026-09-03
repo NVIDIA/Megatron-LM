@@ -30,16 +30,14 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.fp8_utils import is_mxfp8tensor
+from megatron.core.jit import jit_fuser
 from megatron.core.transformer.moe.replica_weight_triton import (
     MAX_REPLICA_WEIGHT_SMS,
     compile_replica_weight_kernels,
     launch_compact_routing_map,
     launch_replica_grad_reduce,
     launch_replica_placement,
-    launch_replica_route_mapping,
-    launch_replica_route_ranking,
     launch_replica_weight_prefetch,
-    planner_route_partition_count,
 )
 from megatron.core.utils import nvtx_decorator
 
@@ -58,26 +56,19 @@ _MXFP8_COMPONENTS = (
 # --------------------------------------------------------------------------------------
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ReplicaPlan:
     """``virtual_experts``: int64 ``[num_tokens, router_topk]`` runtime ids;
     ``experts_to_copy``: int32 ``[ep_size, num_local_experts]`` semantic ids, ``-1`` if unused."""
 
-    virtual_experts: torch.Tensor
+    virtual_experts: torch.Tensor | None
     experts_to_copy: torch.Tensor
 
 
 @dataclass(slots=True)
 class ReplicaPlannerWorkspace:
-    """Fixed-address scratch for one ``(num_tokens, router_topk, num_experts, ep_size)`` shape.
+    """Placement scratch for one ``(num_experts, ep_size)`` shape; every plan overwrites it."""
 
-    Every plan overwrites the scratch, so ``plan_replica_routes`` gives each plan its own
-    output tensors; the ``virtual_experts``/``experts_to_copy`` fields only serve direct
-    kernel launches (tests, benchmarks).
-    """
-
-    num_tokens: int
-    router_topk: int
     num_experts: int
     ep_size: int
     num_local_experts: int
@@ -86,31 +77,21 @@ class ReplicaPlannerWorkspace:
     allocation: torch.Tensor  # [num_experts, ep_size] routes of each expert per destination
     placement_grid_sync: torch.Tensor
     # Per-expert destination segment ends in this rank's local ordinal space, padded to a
-    # power of two for the route mapper's binary search.
+    # power of two columns.
     destination_boundaries: torch.Tensor
     expert_replica_slots: torch.Tensor  # [num_experts, ep_size] slot holding an expert on a rank
-    # Stable per-expert route ordinals, packed with the expert id, and their per-partition prefix.
-    sort_route_metadata: torch.Tensor
-    sort_partition_counts: torch.Tensor
-    sort_grid_sync: torch.Tensor
-    sort_stream: torch.cuda.Stream
-    virtual_experts: torch.Tensor
-    experts_to_copy: torch.Tensor
+    experts_to_copy: torch.Tensor  # [ep_size, num_local_experts]
 
     @classmethod
-    def allocate(cls, *, num_tokens, router_topk, num_experts, ep_size, device):
-        """Allocate the scratch for one fixed route shape on ``device``."""
-        if min(num_tokens, router_topk, num_experts, ep_size) <= 0 or num_experts % ep_size:
+    def allocate(cls, *, num_experts, ep_size, device):
+        """Allocate the scratch for one expert layout on ``device``."""
+        if min(num_experts, ep_size) <= 0 or num_experts % ep_size:
             raise ValueError(
-                "Replica planner dimensions must be positive with equal experts per rank, got "
-                f"num_tokens={num_tokens}, router_topk={router_topk}, "
+                "Replica planner needs a positive, even expert distribution, got "
                 f"num_experts={num_experts}, ep_size={ep_size}."
             )
-        num_routes = num_tokens * router_topk
         int32 = dict(dtype=torch.int32, device=device)
         return cls(
-            num_tokens=num_tokens,
-            router_topk=router_topk,
             num_experts=num_experts,
             ep_size=ep_size,
             num_local_experts=num_experts // ep_size,
@@ -122,15 +103,6 @@ class ReplicaPlannerWorkspace:
                 (num_experts, 1 << (ep_size - 1).bit_length()), **int32
             ),
             expert_replica_slots=torch.empty((num_experts, ep_size), **int32),
-            sort_route_metadata=torch.empty(num_routes, **int32),
-            sort_partition_counts=torch.empty(
-                (planner_route_partition_count(num_routes), num_experts), **int32
-            ),
-            sort_grid_sync=torch.zeros(1, **int32),
-            sort_stream=torch.cuda.Stream(device=device),
-            virtual_experts=torch.zeros(
-                (num_tokens, router_topk), dtype=torch.int64, device=device
-            ),
             experts_to_copy=torch.empty((ep_size, num_experts // ep_size), **int32),
         )
 
@@ -138,22 +110,71 @@ class ReplicaPlannerWorkspace:
 _planner_workspaces: dict = {}
 
 
-def get_planner_workspace(
-    *, num_tokens: int, router_topk: int, num_experts: int, ep_size: int, device: torch.device
-) -> ReplicaPlannerWorkspace:
-    """Return the process-wide scratch for one route shape; planning is stream-ordered, so
-    every layer of a device can share it."""
-    key = (num_tokens, router_topk, num_experts, ep_size, device.index)
+def get_planner_workspace(*, num_experts: int, ep_size: int, device: torch.device):
+    """Return the process-wide placement scratch for one expert layout; planning is
+    stream-ordered, so every layer of a device can share it."""
+    key = (num_experts, ep_size, device.index)
     workspace = _planner_workspaces.get(key)
     if workspace is None:
         workspace = _planner_workspaces[key] = ReplicaPlannerWorkspace.allocate(
-            num_tokens=num_tokens,
-            router_topk=router_topk,
-            num_experts=num_experts,
-            ep_size=ep_size,
-            device=device,
+            num_experts=num_experts, ep_size=ep_size, device=device
         )
     return workspace
+
+
+@jit_fuser
+def _map_routes(
+    topk_indices: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    destination_boundaries: torch.Tensor,
+    expert_replica_slots: torch.Tensor,
+    num_local_experts: int,
+    ep_size: int,
+) -> torch.Tensor:
+    """Sort the routes by expert (stably, so each expert's routes keep token order) and read
+    every route's destination off one global array of segment ends."""
+    flat = topk_indices.reshape(-1)
+    sorted_experts, order = torch.sort(flat, stable=True)
+    experts = sorted_experts.long()
+    # Segment d of expert e ends, in sorted-position space, at the expert's bucket start plus
+    # its destination boundary clipped to the routes this rank actually holds.
+    bucket_start = torch.cumsum(tokens_per_expert, 0) - tokens_per_expert
+    boundaries = (
+        destination_boundaries[:, :ep_size].clamp(min=0).minimum(tokens_per_expert[:, None])
+    )
+    ends = (bucket_start[:, None] + boundaries).reshape(-1)
+    positions = torch.arange(flat.numel(), device=flat.device, dtype=torch.int64)
+    destination = torch.searchsorted(ends, positions, right=True) - experts * ep_size
+    slot = expert_replica_slots.view(-1)[experts * ep_size + destination]
+    runtime_local = torch.where(
+        destination == experts // num_local_experts,
+        experts % num_local_experts,
+        num_local_experts + slot,
+    )
+    virtual = torch.empty_like(positions)
+    virtual[order] = destination * (2 * num_local_experts) + runtime_local
+    return virtual.view(topk_indices.shape)
+
+
+def map_routes_to_runtime_experts(
+    topk_indices: torch.Tensor, tokens_per_expert: torch.Tensor, workspace: ReplicaPlannerWorkspace
+) -> torch.Tensor:
+    """Turn this rank's semantic routes into rank-major runtime expert ids under the
+    placement held by ``workspace``.
+
+    A route's stable ordinal among this rank's routes to its expert, offset by the routes
+    earlier ranks send that expert (already folded into ``destination_boundaries``), selects
+    the destination segment; a remote destination runs it in the replica slot the placement
+    assigned that expert there.
+    """
+    return _map_routes(
+        topk_indices,
+        tokens_per_expert,
+        workspace.destination_boundaries,
+        workspace.expert_replica_slots,
+        workspace.num_local_experts,
+        workspace.ep_size,
+    )
 
 
 def extract_semantic_routes(
@@ -195,40 +216,18 @@ def plan_replica_routes(
     """Plan deterministic replica placement for one EP group.
 
     ``topk_indices`` (int32/int64 ``[num_tokens, router_topk]``) and ``tokens_per_expert``
-    (int32 ``[num_experts]``) are this rank's semantic routes and histogram; the shape must
-    match ``workspace`` on every rank. ``on_placement_ready`` runs once
-    ``experts_to_copy`` is final, with the route mapping already enqueued as a sibling
-    branch, so the weight push can start without delaying the mapping.
+    (int32 ``[num_experts]``) are this rank's semantic routes and histogram; every rank must
+    route the same number of tokens. ``on_placement_ready`` runs as soon as
+    ``experts_to_copy`` is final so the weight push can start ahead of the route mapping.
     """
     ep_size = dist.get_world_size(group=ep_group)
-    num_tokens, router_topk, num_experts = (
-        workspace.num_tokens,
-        workspace.router_topk,
-        workspace.num_experts,
-    )
     if (
-        (*topk_indices.shape, tokens_per_expert.numel(), ep_size)
-        != (num_tokens, router_topk, num_experts, workspace.ep_size)
+        (tokens_per_expert.numel(), ep_size) != (workspace.num_experts, workspace.ep_size)
         or topk_indices.dtype not in (torch.int32, torch.int64)
         or tokens_per_expert.dtype != torch.int32
         or not (topk_indices.is_contiguous() and tokens_per_expert.is_contiguous())
     ):
         raise ValueError("Replica planner inputs do not match the workspace shape or dtypes.")
-    num_local_experts = num_experts // ep_size
-    num_routes = num_tokens * router_topk
-    kernel_shape = dict(num_experts=num_experts, num_routes=num_routes)
-
-    # Ranking depends only on local routes; run it under the histogram all-gather.
-    current_stream = torch.cuda.current_stream(topk_indices.device)
-    workspace.sort_stream.wait_stream(current_stream)
-    with torch.cuda.stream(workspace.sort_stream):
-        launch_replica_route_ranking(
-            topk_indices.reshape(-1),
-            workspace.sort_route_metadata,
-            workspace.sort_partition_counts,
-            workspace.sort_grid_sync,
-            **kernel_shape,
-        )
     # The only cross-rank input; from here every rank computes the same placement.
     dist.all_gather_into_tensor(
         workspace.gathered_counts.view(-1), tokens_per_expert, group=ep_group
@@ -241,35 +240,18 @@ def plan_replica_routes(
         workspace.experts_to_copy,
         workspace.expert_replica_slots,
         workspace.placement_grid_sync,
-        rank_route_capacity=num_routes,
+        rank_route_capacity=topk_indices.numel(),
         source_rank=dist.get_rank(group=ep_group),
         ep_size=ep_size,
-        num_experts=num_experts,
-        num_local_experts=num_local_experts,
+        num_experts=workspace.num_experts,
+        num_local_experts=workspace.num_local_experts,
     )
-    # Both outputs outlive this call (experts_to_copy in the backward push and reduction,
-    # virtual_experts in autograd's saved scatter index), possibly past another forward of
-    # the same layer, so a plan owns them instead of aliasing the shared scratch.
-    plan = ReplicaPlan(
-        torch.empty_like(workspace.virtual_experts), workspace.experts_to_copy.clone()
-    )
-    # Mapping waits only for placement. Enqueuing it after the prefetch callback would
-    # make CUDA-graph capture put the weight push on the mapping's critical path.
-    workspace.sort_stream.wait_stream(current_stream)
-    with torch.cuda.stream(workspace.sort_stream):
-        launch_replica_route_mapping(
-            workspace.sort_route_metadata,
-            workspace.sort_partition_counts,
-            workspace.destination_boundaries,
-            workspace.expert_replica_slots,
-            plan.virtual_experts,
-            ep_size=ep_size,
-            num_local_experts=num_local_experts,
-            **kernel_shape,
-        )
+    # A plan owns its outputs: the backward push and reduction read experts_to_copy and
+    # autograd saves virtual_experts, possibly past another forward of the same layer.
+    plan = ReplicaPlan(None, workspace.experts_to_copy.clone())
     if on_placement_ready is not None:
         on_placement_ready(plan)
-    current_stream.wait_stream(workspace.sort_stream)
+    plan.virtual_experts = map_routes_to_runtime_experts(topk_indices, tokens_per_expert, workspace)
     return plan
 
 
