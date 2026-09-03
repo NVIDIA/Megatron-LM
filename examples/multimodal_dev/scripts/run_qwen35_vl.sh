@@ -13,6 +13,10 @@
 #               support pipeline parallelism)
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
+#   ATTN_CADENCE: one period of the decoder attention layout, one symbol per
+#                 Qwen block ('G' GatedDeltaNet, '*' full attention). Repeated
+#                 and truncated to NUM_LAYERS. Defaults to Qwen3.5's "GGG*".
+#   MTP_NUM_LAYERS: number of MTP prediction depths (default: 1)
 #   FORCE_LOAD_BALANCING: set to 1 to enable --moe-router-force-load-balancing
 #                         (perf / mock-data only; OFF for real finetuning)
 #   LAUNCHER: torchrun (default) or python
@@ -48,6 +52,7 @@ VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-}
 # Batch sizes
 MBS=${MBS:-2}
 GBS=${GBS:-16}
+MTP_NUM_LAYERS=${MTP_NUM_LAYERS:-1}
 
 # Parallelism
 TP=${TP:-1}
@@ -69,6 +74,7 @@ case "$MODEL_VARIANT" in
     0.8b)
         NUM_LAYERS=${NUM_LAYERS:-24}
         NUM_EXPERTS=${NUM_EXPERTS:-0}
+        ATTN_CADENCE=${ATTN_CADENCE:-"GGG*"}
         HIDDEN_SIZE=1024
         FFN_HIDDEN_SIZE=3584
         NUM_ATTN_HEADS=8
@@ -79,6 +85,7 @@ case "$MODEL_VARIANT" in
     2b)
         NUM_LAYERS=${NUM_LAYERS:-24}
         NUM_EXPERTS=${NUM_EXPERTS:-0}
+        ATTN_CADENCE=${ATTN_CADENCE:-"GGG*"}
         HIDDEN_SIZE=2048
         FFN_HIDDEN_SIZE=6144
         NUM_ATTN_HEADS=8
@@ -89,6 +96,7 @@ case "$MODEL_VARIANT" in
     4b)
         NUM_LAYERS=${NUM_LAYERS:-32}
         NUM_EXPERTS=${NUM_EXPERTS:-0}
+        ATTN_CADENCE=${ATTN_CADENCE:-"GGG*"}
         HIDDEN_SIZE=2560
         FFN_HIDDEN_SIZE=9216
         NUM_ATTN_HEADS=16
@@ -99,6 +107,7 @@ case "$MODEL_VARIANT" in
     proxy)
         NUM_LAYERS=${NUM_LAYERS:-4}
         NUM_EXPERTS=${NUM_EXPERTS:-16}
+        ATTN_CADENCE=${ATTN_CADENCE:-"GGG*"}
         HIDDEN_SIZE=4096
         FFN_HIDDEN_SIZE=10240
         NUM_ATTN_HEADS=32
@@ -109,6 +118,7 @@ case "$MODEL_VARIANT" in
     9b)
         NUM_LAYERS=${NUM_LAYERS:-32}
         NUM_EXPERTS=${NUM_EXPERTS:-0}
+        ATTN_CADENCE=${ATTN_CADENCE:-"GGG*"}
         HIDDEN_SIZE=4096
         FFN_HIDDEN_SIZE=12288
         NUM_ATTN_HEADS=16
@@ -119,6 +129,7 @@ case "$MODEL_VARIANT" in
     27b)
         NUM_LAYERS=${NUM_LAYERS:-64}
         NUM_EXPERTS=${NUM_EXPERTS:-0}
+        ATTN_CADENCE=${ATTN_CADENCE:-"GGG*"}
         HIDDEN_SIZE=5120
         FFN_HIDDEN_SIZE=17408
         NUM_ATTN_HEADS=24
@@ -129,6 +140,7 @@ case "$MODEL_VARIANT" in
     35b_a3b)
         NUM_LAYERS=${NUM_LAYERS:-40}
         NUM_EXPERTS=${NUM_EXPERTS:-256}
+        ATTN_CADENCE=${ATTN_CADENCE:-"GGG*"}
         HIDDEN_SIZE=2048
         FFN_HIDDEN_SIZE=4096
         NUM_ATTN_HEADS=16
@@ -139,6 +151,7 @@ case "$MODEL_VARIANT" in
     35b_a3b_light)
         NUM_LAYERS=${NUM_LAYERS:-12}
         NUM_EXPERTS=${NUM_EXPERTS:-128}
+        ATTN_CADENCE=${ATTN_CADENCE:-"GGG*"}
         HIDDEN_SIZE=2048
         FFN_HIDDEN_SIZE=4096
         NUM_ATTN_HEADS=16
@@ -149,6 +162,7 @@ case "$MODEL_VARIANT" in
     122b_a10b)
         NUM_LAYERS=${NUM_LAYERS:-48}
         NUM_EXPERTS=${NUM_EXPERTS:-256}
+        ATTN_CADENCE=${ATTN_CADENCE:-"GGG*"}
         HIDDEN_SIZE=3072
         FFN_HIDDEN_SIZE=8192
         NUM_ATTN_HEADS=32
@@ -159,6 +173,7 @@ case "$MODEL_VARIANT" in
     397b_a17b)
         NUM_LAYERS=${NUM_LAYERS:-60}
         NUM_EXPERTS=${NUM_EXPERTS:-512}
+        ATTN_CADENCE=${ATTN_CADENCE:-"GGG*"}
         HIDDEN_SIZE=4096
         FFN_HIDDEN_SIZE=10240
         NUM_ATTN_HEADS=32
@@ -174,6 +189,7 @@ case "$MODEL_VARIANT" in
         : "${NUM_ATTN_HEADS:?NUM_ATTN_HEADS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
         : "${NUM_QUERY_GROUPS:?NUM_QUERY_GROUPS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
         : "${LINEAR_NUM_VALUE_HEADS:?LINEAR_NUM_VALUE_HEADS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
+        ATTN_CADENCE=${ATTN_CADENCE:-"GGG*"}
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
         ;;
 esac
@@ -260,13 +276,18 @@ TRAINING_ARGS=(
     --enable-experimental
     --manual-gc
     --manual-gc-interval 50
-    --mtp-num-layers 1
-    --mtp-loss-scaling-factor 0.1
     --sft
     --use-flash-attn
     # --attention-backend flash
     --calculate-per-token-loss
 )
+
+if [ "$MTP_NUM_LAYERS" -gt 0 ]; then
+    TRAINING_ARGS+=(
+        --mtp-num-layers "$MTP_NUM_LAYERS"
+        --mtp-loss-scaling-factor 0.1
+    )
+fi
 
 PROFILE_ARGS=()
 NSYS_CMD=()
@@ -336,8 +357,7 @@ fi
 
 # --- Qwen3.5 Decoder Architecture (variant-specific dims set above) ---
 # These must match examples/multimodal_dev/models/qwen35_vl/configuration.py
-GPT_MODEL_ARGS=(
-    --num-layers "$NUM_LAYERS"
+LANGUAGE_MODEL_ARGS=(
     --hidden-size "$HIDDEN_SIZE"
     --ffn-hidden-size "$FFN_HIDDEN_SIZE"
     --num-attention-heads "$NUM_ATTN_HEADS"
@@ -351,7 +371,11 @@ GPT_MODEL_ARGS=(
     --norm-epsilon 1e-06
     --swiglu
     --disable-bias-linear
-    --position-embedding-type rope
+    # The decoder applies 3D MRoPE. --mrope-section must match MROPE_SECTION in
+    # models/qwen35_vl/configuration.py and sum to half the rotary dimension
+    # (kv_channels * rotary_percent / 2 = 256 * 0.25 / 2 = 32).
+    --position-embedding-type mrope
+    --mrope-section 11 11 10
     --rotary-percent 0.25
     --rotary-base 10000000
     --rotary-seq-len-interpolation-factor 1
@@ -359,8 +383,12 @@ GPT_MODEL_ARGS=(
     --attention-output-gate
     --attention-dropout 0.0
     --hidden-dropout 0.0
+    # The variant flag drives the GDN dimension validation in TransformerConfig.
+    # --linear-attention-freq is deliberately absent: HybridModel takes the
+    # GDN / full-attention placement from --hybrid-layer-pattern instead, and
+    # TransformerConfig skips the linear_attention_freq assertion for hybrid
+    # models, so passing it would only create a second source of truth.
     --experimental-attention-variant gated_delta_net
-    --linear-attention-freq 4
     --linear-conv-kernel-dim 4
     --linear-key-head-dim 128
     --linear-value-head-dim 128
@@ -373,7 +401,7 @@ GPT_MODEL_ARGS=(
 # 0.8B, 2B, 4B use tied embeddings; all other variants untie them.
 case "$MODEL_VARIANT" in
     0.8b|2b|4b) ;;
-    *)           GPT_MODEL_ARGS+=( --untie-embeddings-and-output-weights ) ;;
+    *)           LANGUAGE_MODEL_ARGS+=( --untie-embeddings-and-output-weights ) ;;
 esac
 
 # --- MoE args (MoE variants only) ---
@@ -415,6 +443,38 @@ if [ "${NUM_EXPERTS:-0}" -gt 0 ]; then
         MOE_ARGS+=( --moe-router-force-load-balancing )
     fi
 fi
+
+# HybridModel expresses each historical GPT block as two independently ordered
+# layers: attention (GatedDeltaNet 'G' or full attention '*') followed by an
+# MLP ('-' for dense or 'E' for MoE).
+#
+# ATTN_CADENCE (set per variant above) is one period of the attention layout,
+# one symbol per Qwen block. Qwen3.5's "GGG*" -- three GatedDeltaNet blocks then
+# one full-attention block -- is what the former GPT path expressed as
+# --linear-attention-freq 4. The cadence repeats and is truncated to NUM_LAYERS,
+# so "GGG*" means (GGG*) x ceil(NUM_LAYERS/4); a NUM_LAYERS that is not a
+# multiple of the period leaves trailing GDN blocks, which is also what
+# --linear-attention-freq 4 produced, so proxy runs with any depth stay
+# supported. --hybrid-layer-pattern takes no repeat syntax of its own, so the
+# expansion happens here.
+#
+# Each MTP depth replicates the last block, as the GPT path derived the MTP spec
+# from the final decoder layer.
+if [ "${NUM_EXPERTS:-0}" -gt 0 ]; then
+    MLP_LAYER_SYMBOL="E"
+else
+    MLP_LAYER_SYMBOL="-"
+fi
+ATTN_LAYER_SYMBOL="${ATTN_CADENCE:0:1}"
+HYBRID_LAYER_PATTERN=""
+for ((block_idx = 0; block_idx < NUM_LAYERS; block_idx++)); do
+    ATTN_LAYER_SYMBOL="${ATTN_CADENCE:block_idx % ${#ATTN_CADENCE}:1}"
+    HYBRID_LAYER_PATTERN+="${ATTN_LAYER_SYMBOL}${MLP_LAYER_SYMBOL}"
+done
+for ((mtp_depth = 0; mtp_depth < MTP_NUM_LAYERS; mtp_depth++)); do
+    HYBRID_LAYER_PATTERN+="/${ATTN_LAYER_SYMBOL}${MLP_LAYER_SYMBOL}"
+done
+HYBRID_MODEL_ARGS=( --hybrid-layer-pattern "$HYBRID_LAYER_PATTERN" )
 
 # --- Recompute ---
 if [ "$RECOMPUTE" -eq 1 ]; then
@@ -476,6 +536,7 @@ echo "================================================================"
 echo "Qwen3.5-VL Multimodal Training (multimodal_dev)"
 echo "  Variant:       $MODEL_VARIANT"
 echo "  Vision layers: $VISION_NUM_LAYERS"
+echo "  Hybrid pattern: $HYBRID_LAYER_PATTERN"
 echo "  GPUs per node: $GPUS_PER_NODE"
 echo "  Num nodes:     $NUM_NODES"
 echo "  TP=$TP  EP=$EP  PP=$PP  CP=$CP"
@@ -510,7 +571,8 @@ cmd=( "${NSYS_CMD[@]}" "${LAUNCH_CMD[@]}" \
     "${EVAL_AND_LOGGING_ARGS[@]}" \
     "${TOKENIZER_ARGS[@]}" \
     "${MULTIMODAL_ARGS[@]}" \
-    "${GPT_MODEL_ARGS[@]}" \
+    "${LANGUAGE_MODEL_ARGS[@]}" \
+    "${HYBRID_MODEL_ARGS[@]}" \
     "${MOE_ARGS[@]}" \
     "${RECOMPUTE_ARGS[@]}" \
     "${FSDP_ARGS[@]}" \
