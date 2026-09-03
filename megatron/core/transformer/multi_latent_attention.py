@@ -192,6 +192,9 @@ class MultiLatentAttention(Attention):
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
         self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
         self.cache_mla_latents = self.config.cache_mla_latents
+        assert (
+            self.use_rope or not self.cache_mla_latents
+        ), "Caching MLA latents is not supported for layers without RoPE."
 
         if not self.use_rope:
             self.rotary_pos_emb = None
