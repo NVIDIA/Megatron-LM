@@ -36,7 +36,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.engines.dynamic_engine import EngineState, RequestEntry
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
@@ -932,7 +932,8 @@ def test_post_process_eviction_requeues_prefix_cached_request_with_fresh_hashes(
     engine.context = types.SimpleNamespace(
         chunked_prefill_request_id=-1, kv_block_allocator=types.SimpleNamespace()
     )
-    engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
+    engine.requests = {request.request_id: RequestEntry(record=record, future=mock.Mock())}
+    engine._discard_prompt_logprob_state = mock.Mock()
     engine.waiting_request_ids = deque()
     engine.finished_request_count = 0
     engine.evicted_request_count = 0
@@ -970,7 +971,8 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
         deallocate_inference_state_buffers=mock.Mock(),
         reinitialize_inference_state_buffers=mock.Mock(),
     )
-    engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
+    engine.requests = {request.request_id: RequestEntry(record=record, future=mock.Mock())}
+    engine._discard_prompt_logprob_state = mock.Mock()
     engine.waiting_request_ids = deque()
     engine.state = EngineState.RUNNING
     engine.unified_memory_level = 0
@@ -1163,19 +1165,25 @@ def test_streaming_partials_are_sent():
         generated_tokens=[11, 12, 13],
         generated_log_probs=[-0.1, -0.2, -0.3],
         generated_top_n_logprobs=[{"eleven": -0.01}, {"twelve": -0.02}, {"thirteen": -0.03}],
-        prompt_log_probs=[-0.4],
-        prompt_top_n_logprobs=[{"prompt": -0.04}],
+        prompt_log_probs=None,
+        prompt_top_n_logprobs=None,
         sampling_params=types.SimpleNamespace(
             streaming=True, return_log_probs=True, skip_prompt_log_probs=False
         ),
     )
-    engine.requests = {7: types.SimpleNamespace(record=[request])}
+    entry = types.SimpleNamespace(record=[request], prompt_logprobs_complete=True)
+    engine.requests = {7: entry}
+    engine._materialize_prompt_logprob_sidecars = mock.Mock(
+        side_effect=lambda _, **__: request.__dict__.update(
+            prompt_log_probs=[-0.4], prompt_top_n_logprobs=[{"prompt": -0.04}]
+        )
+    )
     engine.socket_for_receiving_requests = mock.Mock()
 
     engine._try_send_streaming_partials()
 
-    # Partials go out as [metadata, body] frames: the metadata names the request
-    # ids so the coordinator can route without decoding the bodies.
+    engine._materialize_prompt_logprob_sidecars.assert_called_once_with(entry, retain_state=True)
+    # Metadata names the request IDs so the coordinator can route the body.
     engine.socket_for_receiving_requests.send_multipart.assert_called_once()
     frames = engine.socket_for_receiving_requests.send_multipart.call_args.args[0]
     assert msgpack.unpackb(frames[0], raw=False) == [Headers.ENGINE_REPLY_PARTIAL.value, [7]]
