@@ -13,7 +13,6 @@ import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
 from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
-from megatron.core.context_parallel_layout.routes import _get_trusted_thd_cp_cu_seqlens_cpu
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
@@ -30,42 +29,13 @@ from megatron.core.ssm.gated_delta_net.common import (
 )
 from megatron.core.ssm.gated_delta_net.internal_gdn_backend.chunk import (
     chunk_gated_delta_rule as internal_chunk_gated_delta_rule,
-)
-from megatron.core.ssm.gated_delta_net.internal_gdn_backend.chunk import (
+    get_trusted_cp_cu_seqlens_cpu as get_internal_gdr_cp_cu_seqlens_cpu,
+    make_dense_cp_cu_seqlens_cpu as make_internal_gdr_dense_cp_cu_seqlens_cpu,
+    prepare_cp_context_metadata as prepare_internal_gdr_cp_context_metadata,
     prepare_validated_chunk_metadata as prepare_internal_gdr_chunk_metadata,
 )
-from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
-
-def _gdn_is_cuda_graphed(config) -> bool:
-    """Return whether this GDN attention region is included in CUDA-graph capture."""
-    impl = getattr(config, "cuda_graph_impl", "none")
-    if impl == "none":
-        return False
-    if impl == "full_iteration":
-        return True
-    modules = getattr(config, "cuda_graph_modules", None)
-    return not modules or CudaGraphModule.attn in modules
-
-
-def _bind_cutedsl_cp_context_metadata(context, global_cu_seqlens_cpu: torch.Tensor):
-    """Attach immutable global offsets needed for rank-invariant local CP dispatch."""
-    source_version = global_cu_seqlens_cpu._version
-    if (
-        getattr(context, "_cutedsl_global_offsets_owner", None) is global_cu_seqlens_cpu
-        and getattr(context, "_cutedsl_global_offsets_owner_version", None) == source_version
-    ):
-        return context
-    global_offsets = global_cu_seqlens_cpu.to(device="cpu", dtype=torch.long).clone()
-    context.global_num_seqs = len(global_offsets) - 1
-    context.global_cu_seqlens_cpu = global_offsets
-    context._cutedsl_global_offsets_owner = global_cu_seqlens_cpu
-    context._cutedsl_global_offsets_owner_version = source_version
-    context._cutedsl_metadata_generation = getattr(context, "_cutedsl_metadata_generation", 0) + 1
-    context._cutedsl_chain_memo = {}
-    context._cutedsl_window_memo = {}
-    return context
 
 
 class GatedDeltaNet(_GDNBase):
@@ -189,17 +159,6 @@ class GatedDeltaNet(_GDNBase):
         cp_size_chunkwise = cp_group_chunkwise.size() if cp_group_chunkwise is not None else 1
         cp_size_headwise = cp_group_headwise.size() if cp_group_headwise is not None else 1
         cp_size_runtime = cp_group.size()
-        if (
-            cp_size_chunkwise > 1
-            and packed_seq_params is not None
-            and packed_seq_params.qkv_format == "thd"
-            and _gdn_is_cuda_graphed(self.config)
-        ):
-            raise RuntimeError(
-                "Packed THD GatedDeltaNet with chunkwise CP does not support CUDA graphs: "
-                "FLA derives rank-chain topology from capture-time CPU offsets, which cannot "
-                "safely vary across graph replays. Disable CUDA graphs for this path."
-            )
         back_to_input_converter = None
         if self.config.linear_cp_mode == "chunkwise":
             hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
@@ -259,14 +218,9 @@ class GatedDeltaNet(_GDNBase):
                 else packed_seq_params.cu_seqlens_kv
             )
             if cp_size_chunkwise > 1:
-                trusted_global_cu_seqlens_cpu = _get_trusted_thd_cp_cu_seqlens_cpu(
-                    packed_seq_params, cu_seqlens_q
+                trusted_global_cu_seqlens_cpu = get_internal_gdr_cp_cu_seqlens_cpu(
+                    packed_seq_params, cu_seqlens_q, total_tokens=seq_len_global
                 )
-                if int(trusted_global_cu_seqlens_cpu[-1]) != seq_len_global:
-                    raise ValueError(
-                        "GDN: trusted cu_seqlens_q endpoint does not match "
-                        f"total_sequence_length={seq_len_global}."
-                    )
             else:
                 cu_seqlens_q = self._resolve_cu_seqlens(
                     None, cu_seqlens_q, seq_len_global, "cu_seqlens_q", cp_size=cp_size_runtime
@@ -303,12 +257,15 @@ class GatedDeltaNet(_GDNBase):
                         group=cp_group_chunkwise,
                         conv1d_kernel_size=self.conv_kernel_dim,
                     )
-                    _bind_cutedsl_cp_context_metadata(
-                        cached_ctx, torch.tensor([0, seq_len_global], dtype=torch.long)
+                    global_cu_seqlens_cpu = make_internal_gdr_dense_cp_cu_seqlens_cpu(
+                        batch, total_tokens_per_sequence=seq_len_global
                     )
-                    cached = (cached_cu_seqlens, cached_ctx)
+                    cached = (cached_cu_seqlens, cached_ctx, global_cu_seqlens_cpu)
                     self._chunkwise_cp_context_cache[cache_key] = cached
-                cu_seqlens_q, chunkwise_cp_context = cached
+                cu_seqlens_q, chunkwise_cp_context, global_cu_seqlens_cpu = cached
+                prepare_internal_gdr_cp_context_metadata(
+                    chunkwise_cp_context, global_cu_seqlens_cpu, config=self.config
+                )
             else:
                 chunkwise_cp_context = build_cp_context(
                     cu_seqlens=cu_seqlens_q,
@@ -316,14 +273,9 @@ class GatedDeltaNet(_GDNBase):
                     conv1d_kernel_size=self.conv_kernel_dim,
                     cu_seqlens_cpu=trusted_global_cu_seqlens_cpu,
                 )
-                _bind_cutedsl_cp_context_metadata(
-                    chunkwise_cp_context, trusted_global_cu_seqlens_cpu
+                prepare_internal_gdr_cp_context_metadata(
+                    chunkwise_cp_context, trusted_global_cu_seqlens_cpu, config=self.config
                 )
-            # Wrapper epochs advance in Python and therefore cannot be replayed
-            # by CUDA graphs. Set this on both dense and packed contexts every
-            # time (including cache hits). The existing model configuration is
-            # identical on every CP rank, so collective selection cannot split.
-            chunkwise_cp_context._cutedsl_cuda_graph_enabled = _gdn_is_cuda_graphed(self.config)
         else:
             chunkwise_cp_context = None
 

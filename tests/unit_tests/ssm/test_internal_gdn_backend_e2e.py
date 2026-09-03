@@ -91,7 +91,7 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
     from fla.ops.cp import build_cp_context
 
     from megatron.core import parallel_state
-    from megatron.core.ssm.gated_delta_net.gdn import _bind_cutedsl_cp_context_metadata
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import prepare_cp_context_metadata
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend import implementation
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels import fused_gdr_cp_cute
     from tests.unit_tests.test_utilities import Utils
@@ -111,7 +111,7 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
             group=parallel_state.get_context_parallel_group(),
             conv1d_kernel_size=4,
         )
-        _bind_cutedsl_cp_context_metadata(cp_context, global_cu_seqlens_cpu)
+        prepare_cp_context_metadata(cp_context, global_cu_seqlens_cpu)
 
     inputs, grad_output = _make_inputs(device, packed=cp_context is not None)
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "fla")

@@ -7,6 +7,8 @@ from typing import Callable
 
 import torch
 
+from megatron.core.transformer.enums import CudaGraphModule
+
 
 @lru_cache(maxsize=1)
 def _load_internal_chunk_gated_delta_rule() -> (
@@ -36,6 +38,64 @@ def _load_internal_prepare_validated_chunk_metadata() -> (
             "from the Megatron Core development environment."
         ) from exc
     return prepare_validated_chunk_metadata
+
+
+def _gdn_is_cuda_graphed(config) -> bool:
+    """Return whether this GDN attention region is included in CUDA-graph capture."""
+    impl = getattr(config, "cuda_graph_impl", "none")
+    if impl == "none":
+        return False
+    if impl == "full_iteration":
+        return True
+    modules = getattr(config, "cuda_graph_modules", None)
+    return not modules or CudaGraphModule.attn in modules
+
+
+
+def make_dense_cp_cu_seqlens_cpu(batch: int, *, total_tokens_per_sequence: int) -> torch.Tensor:
+    """Return synthetic dense-batch host offsets for internal CP preprocessing."""
+    return torch.arange(batch + 1, dtype=torch.long) * total_tokens_per_sequence
+
+
+def get_trusted_cp_cu_seqlens_cpu(
+    packed_seq_params: object, cu_seqlens: torch.Tensor, *, total_tokens: int
+) -> torch.Tensor:
+    """Return the prebuilt THD CP host offsets needed by internal CP preprocessing."""
+    from megatron.core.context_parallel_layout.routes import _get_trusted_thd_cp_cu_seqlens_cpu
+
+    cpu_offsets = _get_trusted_thd_cp_cu_seqlens_cpu(packed_seq_params, cu_seqlens)
+    if int(cpu_offsets[-1]) != total_tokens:
+        raise ValueError(
+            "GDN: trusted cu_seqlens_q endpoint does not match "
+            f"total_sequence_length={total_tokens}."
+        )
+    return cpu_offsets
+
+
+def prepare_cp_context_metadata(
+    context: object, global_cu_seqlens_cpu: torch.Tensor, *, config: object | None = None
+) -> object:
+    """Attach internal CP preprocessing metadata to an FLA CP context."""
+    if global_cu_seqlens_cpu.device.type != "cpu":
+        raise ValueError("Internal GDN CP context metadata requires CPU cu_seqlens offsets.")
+    source_version = global_cu_seqlens_cpu._version
+    if (
+        getattr(context, "_cutedsl_global_offsets_owner", None) is global_cu_seqlens_cpu
+        and getattr(context, "_cutedsl_global_offsets_owner_version", None) == source_version
+    ):
+        context._cutedsl_cuda_graph_enabled = _gdn_is_cuda_graphed(config)
+        return context
+
+    global_offsets = global_cu_seqlens_cpu.to(device="cpu", dtype=torch.long).clone()
+    context.global_num_seqs = len(global_offsets) - 1
+    context.global_cu_seqlens_cpu = global_offsets
+    context._cutedsl_global_offsets_owner = global_cu_seqlens_cpu
+    context._cutedsl_global_offsets_owner_version = source_version
+    context._cutedsl_metadata_generation = getattr(context, "_cutedsl_metadata_generation", 0) + 1
+    context._cutedsl_chain_memo = {}
+    context._cutedsl_window_memo = {}
+    context._cutedsl_cuda_graph_enabled = _gdn_is_cuda_graphed(config)
+    return context
 
 
 def prepare_validated_chunk_metadata(

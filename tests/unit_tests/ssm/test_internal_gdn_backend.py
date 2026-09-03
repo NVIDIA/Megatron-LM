@@ -67,63 +67,56 @@ def test_internal_backend_rejects_conflicting_state_layout_options():
         )
 
 
+def test_dense_cp_context_metadata_uses_batch_offsets():
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import (
+        make_dense_cp_cu_seqlens_cpu,
+    )
+
+    assert torch.equal(
+        make_dense_cp_cu_seqlens_cpu(3, total_tokens_per_sequence=64),
+        torch.tensor([0, 64, 128, 192]),
+    )
+
+
+
 def test_cutedsl_cp_context_metadata_rebind_invalidates_memos():
-    from megatron.core.ssm.gated_delta_net.gdn import _bind_cutedsl_cp_context_metadata
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import prepare_cp_context_metadata
 
     context = SimpleNamespace(
         _cutedsl_chain_memo={(0, 64): "fused"}, _cutedsl_window_memo={(0, True): (0, 64)}
     )
     first_offsets = torch.tensor([0, 64])
-    _bind_cutedsl_cp_context_metadata(context, first_offsets)
+    prepare_cp_context_metadata(context, first_offsets)
     first_generation = context._cutedsl_metadata_generation
 
     assert context._cutedsl_chain_memo == {}
     assert context._cutedsl_window_memo == {}
 
     context._cutedsl_chain_memo[(first_generation, 64)] = "fused"
-    _bind_cutedsl_cp_context_metadata(context, first_offsets)
+    prepare_cp_context_metadata(context, first_offsets)
     assert context._cutedsl_metadata_generation == first_generation
     assert context._cutedsl_chain_memo == {(first_generation, 64): "fused"}
 
-    _bind_cutedsl_cp_context_metadata(context, torch.tensor([0, 32, 64]))
+    prepare_cp_context_metadata(context, torch.tensor([0, 32, 64]))
 
     assert context._cutedsl_metadata_generation == first_generation + 1
     assert context.global_num_seqs == 2
 
 
 @pytest.mark.parametrize("captures_gdn", [True, False], ids=["attention", "mlp_only"])
-def test_packed_chunkwise_cp_cuda_graph_gate(monkeypatch, captures_gdn):
-    from megatron.core.packed_seq_params import PackedSeqParams
-    from megatron.core.ssm.gated_delta_net import gdn
+def test_cp_context_metadata_records_cuda_graph_gate(captures_gdn):
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import prepare_cp_context_metadata
     from megatron.core.transformer.enums import CudaGraphModule
 
-    class FakeGroup:
-        @staticmethod
-        def size():
-            return 4
-
-    class LayoutConversionReached(Exception):
-        pass
-
+    context = SimpleNamespace(_cutedsl_chain_memo={}, _cutedsl_window_memo={})
     config = SimpleNamespace(
-        linear_cp_mode="chunkwise",
         cuda_graph_impl="transformer_engine",
         cuda_graph_modules=None if captures_gdn else [CudaGraphModule.mlp],
-        sequence_parallel=False,
     )
-    fake = SimpleNamespace(
-        pg_collection=SimpleNamespace(cp=FakeGroup()), tp_group=object(), config=config
-    )
-    packed = PackedSeqParams(qkv_format="thd")
 
-    def conversion(**_kwargs):
-        raise LayoutConversionReached
+    prepare_cp_context_metadata(context, torch.tensor([0, 64]), config=config)
 
-    monkeypatch.setattr(gdn, "convert_module_input_tensors_cp_partition_mode", conversion)
-    expected_error = RuntimeError if captures_gdn else LayoutConversionReached
-    match = "does not support CUDA graphs" if captures_gdn else None
-    with pytest.raises(expected_error, match=match):
-        gdn.GatedDeltaNet.forward(fake, torch.empty(8, 1, 4), None, packed_seq_params=packed)
+    assert context._cutedsl_cuda_graph_enabled is captures_gdn
 
 
 def test_cutedsl_cp_wrapper_marshals_different_streams(monkeypatch):
