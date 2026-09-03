@@ -898,6 +898,21 @@ class TextGenerationController:
         else:
             self._all_logits_cuda = logits
 
+    def _replace_partial_prefill_sample_with_prompt_token(self) -> None:
+        """Use the known next prompt token for a partial chunk's selected logprob."""
+        context = self.inference_wrapped_model.inference_context
+        if context.chunked_prefill_request_id == -1:
+            return
+
+        context_idx = context.get_index_of_chunked_prefill_request(safe=True)
+        if context_idx == -1:
+            return
+        active_idx = context_idx - context.paused_request_count
+        active_request_count = context.total_request_count - context.paused_request_count
+        assert 0 <= active_idx < active_request_count
+        assert active_idx == active_request_count - 1
+        self._sampled_tokens_cuda[active_idx].copy_(context.chunked_prefill_next_prompt_token)
+
     def _rewind_kv_cache(self, accepted_counts_cpu: Optional[Tensor] = None) -> tuple:
         """Update the KV cache bookkeeping for speculative decoding.
 
@@ -1726,6 +1741,132 @@ class TextGenerationController:
 
         return top_n_results if top_n_results else None
 
+    def _store_prompt_logprob_sidecars(
+        self,
+        log_probs: Optional[List[List[float]]],
+        top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
+    ) -> Dict[int, Dict[str, Any]]:
+        """Store prompt rows in physical sidecars and return continuation carries."""
+        if not log_probs:
+            return {}
+
+        context = self.inference_wrapped_model.inference_context
+        if not context.enable_prefix_caching:
+            return {}
+        allocator = context.kv_block_allocator
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+        query_lengths = context.request_query_lengths[active_slice].tolist()
+        source_positions = context.token_to_position_in_request[: context.active_token_count].split(
+            query_lengths
+        )
+        request_ids = context.request_ids[active_slice].tolist()
+        prefill_status = context.request_in_prefill_status_tensor[active_slice].tolist()
+        updates: Dict[int, Dict[str, Any]] = {}
+        block_size = context.block_size_tokens
+
+        for active_idx, (request_id, is_prefill, positions, request_log_probs) in enumerate(
+            zip(request_ids, prefill_status, source_positions, log_probs)
+        ):
+            key = context.prompt_logprobs_cache_keys.get(request_id)
+            if not is_prefill or key is None:
+                continue
+
+            is_partial_prefill = request_id == context.chunked_prefill_request_id
+            prompt_row_count = (
+                len(request_log_probs) if is_partial_prefill else max(len(request_log_probs) - 1, 0)
+            )
+            stored_row_count = prompt_row_count - 1 if is_partial_prefill else prompt_row_count
+            assert stored_row_count >= 0
+            prompt_positions = positions[:stored_row_count].cpu().numpy().astype(np.int64) + 1
+            selected = np.asarray(request_log_probs[:prompt_row_count], dtype=np.float32)
+
+            if key.top_n > 0 and prompt_row_count > 0:
+                if top_n_logprobs is None or active_idx not in top_n_logprobs:
+                    raise RuntimeError(
+                        f"missing top-{key.top_n} prompt logprobs for request {request_id}"
+                    )
+                prompt_top_n = top_n_logprobs[active_idx][:prompt_row_count]
+                top_values = np.stack([values.cpu().numpy() for values, _ in prompt_top_n]).astype(
+                    np.float32, copy=False
+                )
+                top_ids = np.stack(
+                    [token_ids.cpu().numpy() for _, token_ids in prompt_top_n]
+                ).astype(np.int32, copy=False)
+            else:
+                top_values = None
+                top_ids = None
+
+            stored_selected = selected[:stored_row_count]
+            stored_top_values = top_values[:stored_row_count] if top_values is not None else None
+            stored_top_ids = top_ids[:stored_row_count] if top_ids is not None else None
+
+            pending_row = None
+            if is_partial_prefill:
+                assert prompt_row_count > 0
+                pending_row = (
+                    selected[-1:],
+                    top_values[-1:] if top_values is not None else None,
+                    top_ids[-1:] if top_ids is not None else None,
+                )
+
+            request_block_ids = context.request_to_kv_block_ids[
+                context.paused_request_count + active_idx
+            ]
+            valid_block_ids = request_block_ids[request_block_ids >= 0].tolist()
+            block_hashes = context.prompt_logprobs_block_hashes.get(request_id, ())
+            block_refs = dict(context.prompt_logprobs_matched_refs.get(request_id, {}))
+
+            for logical_block_index in np.unique(prompt_positions // block_size):
+                logical_block_index = int(logical_block_index)
+                row_mask = prompt_positions // block_size == logical_block_index
+                local_positions = (prompt_positions[row_mask] % block_size).astype(np.int32)
+                assert logical_block_index < len(valid_block_ids)
+                block_id = valid_block_ids[logical_block_index]
+                expected_hash = (
+                    block_hashes[logical_block_index]
+                    if logical_block_index < len(block_hashes)
+                    else None
+                )
+                block_ref = block_refs.get(logical_block_index)
+                block_ref = allocator.store_prompt_logprobs(
+                    logical_block_index=logical_block_index,
+                    block_id=block_id,
+                    key=key,
+                    target_positions=local_positions,
+                    selected_logprobs=stored_selected[row_mask],
+                    top_n_logprobs=(
+                        stored_top_values[row_mask] if stored_top_values is not None else None
+                    ),
+                    top_n_token_ids=(
+                        stored_top_ids[row_mask] if stored_top_ids is not None else None
+                    ),
+                    expected_block_hash=expected_hash,
+                    block=block_ref,
+                )
+                block_refs[logical_block_index] = block_ref
+
+            final_prefill = not is_partial_prefill
+            if final_prefill:
+                prompt_token_count = int(positions[-1]) + 1
+                if prompt_token_count > 1:
+                    expected_block_count = (prompt_token_count + block_size - 1) // block_size
+                    assert set(range(expected_block_count)).issubset(block_refs)
+
+            updates[request_id] = {
+                "blocks": block_refs,
+                "prompt_row_count": prompt_row_count,
+                "complete": final_prefill,
+                "pending_row": pending_row,
+            }
+            if final_prefill:
+                # Decode and later checkpoint segments must not keep collecting
+                # rows under this request ID. The engine owns the captured refs.
+                context.prompt_logprobs_cache_keys.pop(request_id, None)
+                context.prompt_logprobs_block_hashes.pop(request_id, None)
+                context.prompt_logprobs_matched_refs.pop(request_id, None)
+
+        return updates
+
     def _run_dummy_base_forward(self, input_ids: Tensor, position_ids: Tensor) -> None:
         """Run the base-model portion of an expert-parallel dummy step.
 
@@ -2287,6 +2428,7 @@ class TextGenerationController:
 
         range_push("sampling")
         self._dynamic_step_sample_logits()
+        self._replace_partial_prefill_sample_with_prompt_token()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         if sampled_tokens_gpu.is_cuda:
             self._async_sched_sample_gpu_ready_event.record(
@@ -2339,6 +2481,7 @@ class TextGenerationController:
             torch.int64
         )
         self._compute_serial_mtp_and_sample(base_position=base_position)
+        self._replace_partial_prefill_sample_with_prompt_token()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         sampled_mtp_tokens_gpu = self._sampled_mtp_tokens_cuda[:, :active_request_count]
         accepted_tokens_gpu = (
@@ -2861,6 +3004,7 @@ class TextGenerationController:
         decode_only: DecodeOnly,
         log_probs: Optional[List[List[float]]],
         top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
+        prompt_logprob_updates: Optional[Dict[int, Dict[str, Any]]] = None,
         *,
         count_compaction: bool,
     ) -> DynamicBatchControllerStepResult:
@@ -2876,6 +3020,8 @@ class TextGenerationController:
                 grouped by active request.
             top_n_logprobs (Optional[Dict[int, List[Tuple[Tensor, Tensor]]]]): Top-n
                 log probabilities and token IDs grouped by active request.
+            prompt_logprob_updates: Prompt sidecar references captured before
+                request lifecycle bookkeeping.
             count_compaction (bool): Whether finished requests discarded successor rows.
 
         Returns:
@@ -2901,12 +3047,13 @@ class TextGenerationController:
                 "accepted_tokens": request_result.accepted_tokens_cpu,
                 "log_probs": log_probs,
                 "top_n_logprobs": top_n_logprobs,
+                "prompt_logprob_updates": prompt_logprob_updates or {},
                 "cuda_graph_request_count": cuda_graph_request_count,
             },
         )
 
     async def _run_async_sched_step_no_overlap(
-        self, *, schedule_waiting_requests: Optional[Callable[[], None]]
+        self, *, schedule_waiting_requests: Optional[Callable[[Dict[int, Dict[str, Any]]], None]]
     ) -> DynamicBatchControllerStepResult:
         """Run ``sample/MTP -> update -> admit -> forward``.
 
@@ -2914,8 +3061,8 @@ class TextGenerationController:
         first two phases, admits requests, and launches a primer-only forward.
 
         Args:
-            schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
-                that admits eligible non-chunked prefill requests.
+            schedule_waiting_requests: Engine callback that stages consumed prompt
+                scores and admits eligible prefill requests.
 
         Returns:
             DynamicBatchControllerStepResult: Primer-only state or sampled output.
@@ -2927,6 +3074,9 @@ class TextGenerationController:
         request_result = None
         cuda_graph_request_count = None
         log_probs_transfer = None
+        log_probs = None
+        top_n_logprobs = None
+        prompt_logprob_updates = {}
 
         with torch.inference_mode():
             if had_pending_forward:
@@ -2946,6 +3096,23 @@ class TextGenerationController:
 
                 self._synchronize_async_sched_event(sample_result.sample_cpu_ready_event)
 
+                # Prefill sidecars must be sealed while the consumed request
+                # block table still owns its physical blocks. No-overlap is the
+                # only async path that can consume prefill work.
+                if log_probs_transfer is not None:
+                    self._synchronize_async_sched_event(log_probs_transfer.cpu_ready_event)
+                log_probs, top_n_logprobs = self._materialize_async_sched_log_probs(
+                    log_probs_transfer,
+                    (
+                        sample_result.accepted_counts_cpu_view
+                        if self.num_speculative_tokens > 0
+                        else None
+                    ),
+                )
+                prompt_logprob_updates = self._store_prompt_logprob_sidecars(
+                    log_probs, top_n_logprobs
+                )
+
                 # -------------------------------------------------------------------------
                 # Update
                 # -------------------------------------------------------------------------
@@ -2961,7 +3128,7 @@ class TextGenerationController:
             # -------------------------------------------------------------------------
             # This is the only async-scheduling admission mutation point.
             if schedule_waiting_requests is not None:
-                schedule_waiting_requests()
+                schedule_waiting_requests(prompt_logprob_updates)
 
             # -------------------------------------------------------------------------
             # Forward
@@ -2988,18 +3155,13 @@ class TextGenerationController:
                 return DynamicBatchControllerStepResult(decode_only=decode_only)
             return DynamicBatchControllerStepResult(decode_only=decode_only, primer_only=True)
 
-        if log_probs_transfer is not None:
-            self._synchronize_async_sched_event(log_probs_transfer.cpu_ready_event)
-        log_probs, top_n_logprobs = self._materialize_async_sched_log_probs(
-            log_probs_transfer,
-            sample_result.accepted_counts_cpu_view if self.num_speculative_tokens > 0 else None,
-        )
         result = self._build_async_sched_step_result(
             request_result,
             cuda_graph_request_count,
             decode_only,
             log_probs,
             top_n_logprobs,
+            prompt_logprob_updates,
             count_compaction=False,
         )
         await asyncio.sleep(0)
@@ -3287,6 +3449,8 @@ class TextGenerationController:
             else:
                 self._dynamic_step_sample_logits()
 
+            self._replace_partial_prefill_sample_with_prompt_token()
+
             log_probs = None
             top_n_logprobs = None
             if return_log_probs or return_top_n_logprobs:
@@ -3305,6 +3469,8 @@ class TextGenerationController:
                             log_probs_tensor
                         )
             range_pop()
+
+            prompt_logprob_updates = self._store_prompt_logprob_sidecars(log_probs, top_n_logprobs)
 
             # Capture before update_requests (called by _dynamic_step_context_bookkeeping)
             # resets num_prefill_requests to 0, which would make num_decode_requests
@@ -3335,6 +3501,7 @@ class TextGenerationController:
                 ),
                 "log_probs": log_probs,
                 "top_n_logprobs": top_n_logprobs,
+                "prompt_logprob_updates": prompt_logprob_updates,
                 "cuda_graph_request_count": cuda_graph_request_count,
             }
             if self.num_speculative_tokens > 0:
@@ -3350,7 +3517,7 @@ class TextGenerationController:
         skip_bookkeeping: Optional[bool] = False,
         *,
         run_async_overlap: bool = True,
-        schedule_waiting_requests: Optional[Callable[[], None]] = None,
+        schedule_waiting_requests: Optional[Callable[[Dict[int, Dict[str, Any]]], None]] = None,
     ) -> DynamicBatchControllerStepResult:
         """Forward step the model and update the inference context.
 
@@ -3358,8 +3525,8 @@ class TextGenerationController:
             skip_bookkeeping (Optional[bool]): If true, skip context bookkeeping
                 on the legacy path.
             run_async_overlap (bool): Whether to run the overlap ordering.
-            schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
-                used by the no-overlap path to admit eligible prefill requests.
+            schedule_waiting_requests: Engine callback used by the no-overlap path
+                to stage consumed prompt scores and admit eligible prefill requests.
 
         Returns:
             DynamicBatchControllerStepResult: One controller-step result.

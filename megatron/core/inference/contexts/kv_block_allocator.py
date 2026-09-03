@@ -2,7 +2,7 @@
 
 import heapq
 from collections import deque
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -12,6 +12,196 @@ from megatron.core.inference.config import PrefixCachingEvictionPolicy
 
 # Block deregistration observers are currently registered only by DynamoHelper.
 BlocksDeregisteredObserver = Callable[[list[int], set[int]], None]
+
+# Selected prompt scores plus top-N float32 values and int32 token IDs consume
+# roughly ``(1 + 2 * N) * 4`` bytes per token. A limit of 100 keeps a 256-token
+# sidecar below 1 MiB while covering practical API requests.
+MAX_CACHED_PROMPT_TOP_N_LOGPROBS = 100
+
+
+class PromptLogprobsKey(NamedTuple):
+    """Exact semantic identity for reusable prompt log probabilities.
+
+    Raw log probabilities do not depend on the sampling backend or sampling
+    filters, so those fields are normalized to ``None`` in raw mode. Processed
+    log probabilities include the exact backend and normalized request sampling
+    values. ``top_n`` is always exact: a sidecar created for one value of N is
+    never reused for another.
+    """
+
+    mode: str
+    top_n: int
+    sampling_backend: Optional[str]
+    temperature: Optional[float]
+    top_k: Optional[int]
+    top_p: Optional[float]
+
+    @classmethod
+    def create(
+        cls,
+        mode: str,
+        top_n: int,
+        sampling_backend: Optional[str] = None,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+    ) -> "PromptLogprobsKey":
+        """Create a normalized key from model and request configuration."""
+        if mode not in ("raw_logprobs", "processed_logprobs"):
+            raise ValueError(f"unsupported logprobs mode: {mode}")
+        if isinstance(top_n, bool) or int(top_n) != top_n or top_n < 0:
+            raise ValueError("top_n must be a non-negative integer")
+        if top_n > MAX_CACHED_PROMPT_TOP_N_LOGPROBS:
+            raise ValueError(
+                f"cached prompt top-N must not exceed {MAX_CACHED_PROMPT_TOP_N_LOGPROBS}"
+            )
+
+        if mode == "raw_logprobs":
+            return cls(mode, int(top_n), None, None, None, None)
+
+        if not sampling_backend:
+            raise ValueError("processed_logprobs requires a sampling backend identity")
+        normalized_temperature = 1.0 if temperature is None else float(temperature)
+        normalized_top_k = 0 if top_k is None else int(top_k)
+        normalized_top_p = 0.0 if top_p is None else float(top_p)
+        # Canonicalize negative zero without otherwise rounding exact values.
+        normalized_temperature += 0.0
+        normalized_top_p += 0.0
+        return cls(
+            mode,
+            int(top_n),
+            str(sampling_backend),
+            normalized_temperature,
+            normalized_top_k,
+            normalized_top_p,
+        )
+
+
+class PromptLogprobsBlock:
+    """Mutable prompt-logprob sidecar bound to one physical KV block.
+
+    Allocator mappings retain only the latest settings variant. A request may
+    keep a strong reference to an older object until its result is materialized.
+    """
+
+    __slots__ = (
+        "logical_block_index",
+        "key",
+        "block_id",
+        "selected_logprobs",
+        "top_n_logprobs",
+        "top_n_token_ids",
+        "valid",
+    )
+
+    def __init__(
+        self, block_size: int, logical_block_index: int, key: PromptLogprobsKey, block_id: int
+    ) -> None:
+        self.block_id = block_id
+        self.logical_block_index = logical_block_index
+        self.key = key
+        self.selected_logprobs = np.empty((block_size,), dtype=np.float32)
+        self.top_n_logprobs = np.empty((block_size, key.top_n), dtype=np.float32)
+        self.top_n_token_ids = np.empty((block_size, key.top_n), dtype=np.int32)
+        self.valid = np.zeros((block_size,), dtype=np.bool_)
+
+    def matches(self, logical_block_index: int, key: PromptLogprobsKey) -> bool:
+        """Whether newly stored rows belong to this same semantic sidecar."""
+        return self.logical_block_index == logical_block_index and self.key == key
+
+    def store(
+        self,
+        target_positions: np.ndarray,
+        selected_logprobs: np.ndarray,
+        top_n_logprobs: Optional[np.ndarray],
+        top_n_token_ids: Optional[np.ndarray],
+    ) -> None:
+        """Fill rows indexed by target-token position without replacing cached scores."""
+        positions = np.asarray(target_positions)
+        if positions.ndim != 1:
+            raise ValueError("target_positions must be one-dimensional")
+        if not np.issubdtype(positions.dtype, np.integer):
+            raise ValueError("target_positions must contain integers")
+        positions = positions.astype(np.int32, copy=False)
+        if positions.size and (
+            int(positions.min()) < 0 or int(positions.max()) >= self.valid.shape[0]
+        ):
+            raise ValueError("target position is outside the KV block")
+        if np.unique(positions).size != positions.size:
+            raise ValueError("target_positions must not contain duplicates")
+
+        selected = np.asarray(selected_logprobs)
+        if selected.shape != (positions.size,):
+            raise ValueError(
+                f"selected_logprobs shape {selected.shape} does not match "
+                f"{positions.size} target positions"
+            )
+        selected = selected.astype(np.float32, copy=False)
+
+        if self.key.top_n == 0:
+            if top_n_logprobs is not None and np.asarray(top_n_logprobs).size:
+                raise ValueError("top_n_logprobs must be empty when top_n is zero")
+            if top_n_token_ids is not None and np.asarray(top_n_token_ids).size:
+                raise ValueError("top_n_token_ids must be empty when top_n is zero")
+            top_values = np.empty((positions.size, 0), dtype=np.float32)
+            top_ids = np.empty((positions.size, 0), dtype=np.int32)
+        else:
+            if top_n_logprobs is None or top_n_token_ids is None:
+                raise ValueError("top-N values and token IDs are required when top_n is nonzero")
+            top_values_array = np.asarray(top_n_logprobs)
+            top_ids_array = np.asarray(top_n_token_ids)
+            expected_shape = (positions.size, self.key.top_n)
+            if top_values_array.shape != expected_shape or top_ids_array.shape != expected_shape:
+                raise ValueError(
+                    "top-N arrays must both have shape "
+                    f"{expected_shape}, got {top_values_array.shape} and {top_ids_array.shape}"
+                )
+            if top_ids_array.size and (
+                int(top_ids_array.min()) < np.iinfo(np.int32).min
+                or int(top_ids_array.max()) > np.iinfo(np.int32).max
+            ):
+                raise ValueError("top-N token ID does not fit in int32")
+            top_values = top_values_array.astype(np.float32, copy=False)
+            top_ids = top_ids_array.astype(np.int32, copy=False)
+
+        # A hybrid model can replay the final matched block after restoring the
+        # preceding Mamba state so it can compute the first uncached score. Keep
+        # the original scores for replayed positions: small numeric differences do
+        # not make cached scores stale. Newly missing rows remain mutable.
+        missing = ~self.valid[positions]
+        missing_positions = positions[missing]
+        self.selected_logprobs[missing_positions] = selected[missing]
+        self.top_n_logprobs[missing_positions] = top_values[missing]
+        self.top_n_token_ids[missing_positions] = top_ids[missing]
+        self.valid[missing_positions] = True
+
+    def has_rows(self, required_positions: np.ndarray) -> bool:
+        """Whether every requested target-token position has been stored."""
+        required = np.asarray(required_positions)
+        if required.ndim != 1 or not np.issubdtype(required.dtype, np.integer):
+            raise ValueError("required_positions must be a one-dimensional integer array")
+        required = required.astype(np.int32, copy=False)
+        if required.size and (
+            int(required.min()) < 0 or int(required.max()) >= self.valid.shape[0]
+        ):
+            raise ValueError("required target position is outside the KV block")
+        if np.unique(required).size != required.size:
+            raise ValueError("required_positions must not contain duplicates")
+        return bool(self.valid[required].all())
+
+    def extract(self, required_positions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Copy requested rows in caller-provided target-token order."""
+        required = np.asarray(required_positions, dtype=np.int32)
+        if not self.has_rows(required):
+            missing = required[~self.valid[required]]
+            raise ValueError(
+                f"prompt-logprob sidecar is missing target positions {missing.tolist()}"
+            )
+        return (
+            np.array(self.selected_logprobs[required], dtype=np.float32, copy=True),
+            np.array(self.top_n_logprobs[required], dtype=np.float32, copy=True),
+            np.array(self.top_n_token_ids[required], dtype=np.int32, copy=True),
+        )
 
 
 class KVBlockAllocator:
@@ -101,6 +291,11 @@ class KVBlockAllocator:
 
         # Per-block MoE routing storage (populated when routing replay is enabled)
         self.block_routing: Dict[int, np.ndarray] = {}
+
+        # Prompt-logprob sidecars share the lifetime and identity of physical KV
+        # blocks. Request-owned state carries scores until their target block is
+        # allocated, so this mapping contains only physically bound sidecars.
+        self.block_prompt_logprobs: Dict[int, PromptLogprobsBlock] = {}
 
     def __str__(self):
         return (
@@ -207,9 +402,10 @@ class KVBlockAllocator:
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.update_timestamps(block_ids)
 
-        # Clear stale routing data for re-allocated blocks
+        # Clear stale per-block data for re-allocated blocks.
         for bid in block_ids.tolist():
             self.block_routing.pop(bid, None)
+            self.block_prompt_logprobs.pop(bid, None)
 
         return block_ids
 
@@ -250,10 +446,14 @@ class KVBlockAllocator:
                 if unreg_mask.any():
                     unreg_blocks = unique_blocks[unreg_mask]
                     num_unreg = unreg_blocks.numel()
+                    for bid in unreg_blocks.tolist():
+                        self.block_prompt_logprobs.pop(bid, None)
                     self.block_bag[self.pool_avail : self.pool_avail + num_unreg] = unreg_blocks
                     self.pool_avail += num_unreg
         else:
             num_blocks = blocks.numel()
+            for bid in blocks.tolist():
+                self.block_prompt_logprobs.pop(bid, None)
             self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = blocks
             self.pool_avail += num_blocks
 
@@ -307,6 +507,7 @@ class KVBlockAllocator:
 
         # Clear per-block routing storage
         self.block_routing.clear()
+        self.block_prompt_logprobs.clear()
 
     # =========================================================================
     # Prefix caching methods
@@ -436,6 +637,11 @@ class KVBlockAllocator:
         block_ids_i64 = block_ids.to(torch.int64)
         block_ids_list = block_ids.tolist()
         hashes = self.block_hashes[block_ids_i64].tolist()
+
+        # Request-held PromptLogprobsBlock objects remain valid after these
+        # allocator-owned mappings are removed.
+        for bid in block_ids_list:
+            self.block_prompt_logprobs.pop(bid, None)
 
         # Remove from kv_hash_to_block_id dict (set ops + C-level map, no Python loop)
         keys_to_delete = set(hashes) - {-1}
@@ -619,6 +825,150 @@ class KVBlockAllocator:
         self._deregister_blocks(blocks_to_evict)
 
         return True
+
+    # =========================================================================
+    # Per-block prompt-logprob sidecars
+    # =========================================================================
+
+    def _validate_prompt_logprobs_block_id(self, block_id: int) -> int:
+        """Normalize and validate a non-dummy physical block ID."""
+        block_id = int(block_id)
+        if block_id < 0 or block_id >= self.dummy_block_idx:
+            raise ValueError(f"invalid prompt-logprob KV block ID: {block_id}")
+        return block_id
+
+    def _validate_prompt_logprobs_hash(
+        self, block_id: int, expected_block_hash: Optional[int]
+    ) -> None:
+        """Reject attachment to a physical block registered for other content."""
+        if not self.enable_prefix_caching or expected_block_hash is None:
+            return
+        actual_hash = int(self.block_hashes[block_id])
+        if actual_hash != -1 and actual_hash != int(expected_block_hash):
+            raise ValueError(
+                f"KV block {block_id} has hash {actual_hash}, expected {expected_block_hash}"
+            )
+
+    def store_prompt_logprobs(
+        self,
+        logical_block_index: int,
+        block_id: int,
+        key: PromptLogprobsKey,
+        target_positions: np.ndarray,
+        selected_logprobs: np.ndarray,
+        top_n_logprobs: Optional[np.ndarray] = None,
+        top_n_token_ids: Optional[np.ndarray] = None,
+        expected_block_hash: Optional[int] = None,
+        block: Optional[PromptLogprobsBlock] = None,
+    ) -> PromptLogprobsBlock:
+        """Store prompt scores in a mutable sidecar on a physical KV block.
+
+        Only the latest settings variant is discoverable. Existing strong
+        references remain valid when a new variant replaces the mapping.
+        """
+        logical_block_index = int(logical_block_index)
+        if logical_block_index < 0:
+            raise ValueError("logical_block_index must be non-negative")
+        block_id = self._validate_prompt_logprobs_block_id(block_id)
+        self._validate_prompt_logprobs_hash(block_id, expected_block_hash)
+        if block is not None:
+            if block.block_id != block_id or not block.matches(logical_block_index, key):
+                raise ValueError("prompt-logprob block reference does not match the store target")
+            entry = block
+        else:
+            entry = self.block_prompt_logprobs.get(block_id)
+        if entry is None or not entry.matches(logical_block_index, key):
+            entry = PromptLogprobsBlock(
+                self.context.block_size_tokens, logical_block_index, key, block_id
+            )
+
+        self.block_prompt_logprobs[block_id] = entry
+        entry.store(target_positions, selected_logprobs, top_n_logprobs, top_n_token_ids)
+        return entry
+
+    def get_prompt_logprobs_block(
+        self,
+        block_id: int,
+        key: PromptLogprobsKey,
+        expected_block_hash: Optional[int],
+        required_positions: Optional[np.ndarray] = None,
+    ) -> Optional[PromptLogprobsBlock]:
+        """Return a complete sidecar for the exact key and live KV hash."""
+        block_id = self._validate_prompt_logprobs_block_id(block_id)
+        if (
+            not self.enable_prefix_caching
+            or expected_block_hash is None
+            or int(self.block_hashes[block_id]) != int(expected_block_hash)
+        ):
+            return None
+        entry = self.block_prompt_logprobs.get(block_id)
+        if entry is None or entry.key != key:
+            return None
+        if required_positions is None:
+            required_positions = np.arange(
+                1 if entry.logical_block_index == 0 else 0,
+                self.context.block_size_tokens,
+                dtype=np.int32,
+            )
+        if not entry.has_rows(required_positions):
+            return None
+        return entry
+
+    def materialize_prompt_logprobs(
+        self,
+        block_refs: Sequence[PromptLogprobsBlock],
+        key: PromptLogprobsKey,
+        prompt_token_count: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Reconstruct numeric prompt results in target-token order.
+
+        A prompt of ``P`` tokens has ``P - 1`` prompt scores. Logical block zero
+        therefore contributes local target positions ``1..B-1``; every later
+        block contributes ``0..B-1``, trimmed at the final prompt token.
+        """
+        prompt_token_count = int(prompt_token_count)
+        if prompt_token_count < 0:
+            raise ValueError("prompt_token_count must be non-negative")
+        expected_count = max(prompt_token_count - 1, 0)
+        if expected_count == 0:
+            return (
+                np.empty((0,), dtype=np.float32),
+                np.empty((0, key.top_n), dtype=np.float32),
+                np.empty((0, key.top_n), dtype=np.int32),
+            )
+
+        block_size = self.context.block_size_tokens
+        num_blocks = (prompt_token_count + block_size - 1) // block_size
+        if len(block_refs) < num_blocks:
+            raise ValueError(f"materialization needs {num_blocks} block refs")
+
+        selected_parts = []
+        top_values_parts = []
+        top_ids_parts = []
+        for logical_block_index in range(num_blocks):
+            ref = block_refs[logical_block_index]
+            if ref.key != key or ref.logical_block_index != logical_block_index:
+                raise ValueError("prompt-logprob block reference has the wrong key or order")
+            global_start = logical_block_index * block_size
+            local_start = 1 if logical_block_index == 0 else 0
+            local_stop = min(block_size, prompt_token_count - global_start)
+            required = np.arange(local_start, max(local_start, local_stop), dtype=np.int32)
+            if not required.size:
+                continue
+
+            selected, top_values, top_ids = ref.extract(required)
+            selected_parts.append(selected)
+            top_values_parts.append(top_values)
+            top_ids_parts.append(top_ids)
+
+        selected = np.concatenate(selected_parts).astype(np.float32, copy=False)
+        top_values = np.concatenate(top_values_parts).astype(np.float32, copy=False)
+        top_ids = np.concatenate(top_ids_parts).astype(np.int32, copy=False)
+        if selected.shape != (expected_count,):
+            raise ValueError(
+                f"materialized {selected.size} prompt scores, expected {expected_count}"
+            )
+        return selected, top_values, top_ids
 
     # =========================================================================
     # Per-block routing storage methods (for MoE routing replay)
