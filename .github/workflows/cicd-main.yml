@@ -747,9 +747,6 @@ jobs:
             exit 0
           fi
 
-          yq -o=json '[.products[].test_case[] | {"bucket": .}] | sort_by(.bucket)' \
-            tests/test_utils/recipes/h100/unit-tests.yaml > unit-test-buckets.json
-
           FORCE_FULL_REASON=''
           if [[ "$IS_MERGE_GROUP" == "true" ]]; then
             FORCE_FULL_REASON='merge queue validation always runs the full unit-test suite'
@@ -776,6 +773,9 @@ jobs:
               FORCE_FULL_REASON='the latest pull-request commit could not be checked out'
             fi
           fi
+
+          yq -o=json '[.products[].test_case[] | {"bucket": .}] | sort_by(.bucket)' \
+            tests/test_utils/recipes/h100/unit-tests.yaml > unit-test-buckets.json
 
           SELECTOR_ARGS=(
             --buckets-file unit-test-buckets.json
