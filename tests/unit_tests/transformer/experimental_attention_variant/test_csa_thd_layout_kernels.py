@@ -5,7 +5,10 @@ from typing import List, Tuple
 import pytest
 import torch
 
-from megatron.core.transformer.experimental_attention_variant.csa_utils import thd_layout_kernels
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    thd_indexer_kernels,
+    thd_layout_kernels,
+)
 from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
     prepare_cp_compressor_input,
 )
@@ -22,6 +25,13 @@ def _require_cute_cuda():
         pytest.skip("DSv4 CP CuTe kernels require CUDA.")
     if not thd_layout_kernels._CUTE_AVAILABLE:
         pytest.skip("DSv4 CP CuTe kernels are not available in this environment.")
+
+
+def _require_triton_cuda():
+    if not torch.cuda.is_available():
+        pytest.skip("DSv4 THD indexer glue kernels require CUDA.")
+    if not thd_indexer_kernels._TRITON_AVAILABLE:
+        pytest.skip("DSv4 THD indexer Triton kernels are not available in this environment.")
 
 
 def _make_e2e_like_cu_seqlens(device: str = "cuda") -> torch.Tensor:
@@ -249,6 +259,47 @@ def _native_indexer_loss_indices(
     return topk, rank_major
 
 
+@pytest.mark.parametrize("with_causal_offsets", [False, True])
+def test_build_indexer_seq_lens_matches_native(with_causal_offsets):
+    _require_triton_cuda()
+    cu_q = torch.tensor([0, 5, 5, 9], dtype=torch.int32, device="cuda")
+    cu_kv = torch.tensor([0, 2, 2, 5], dtype=torch.int32, device="cuda")
+    causal_offsets = (
+        torch.tensor([3, 0, 1], dtype=torch.int32, device="cuda") if with_causal_offsets else None
+    )
+    total_q = 12
+    ratio = 4
+
+    actual = thd_indexer_kernels.build_seq_lens(cu_q, cu_kv, total_q, ratio, causal_offsets)
+    expected = thd_indexer_kernels._build_seq_lens_fallback(
+        cu_q, cu_kv, total_q, ratio, causal_offsets
+    )
+    assert torch.equal(actual, expected)
+
+
+def test_sanitize_indexer_topk_matches_native():
+    _require_triton_cuda()
+    scores = torch.tensor(
+        [[0.0, 1.0, -torch.inf, 3.0], [0.0, torch.nan, 2.0, 3.0], [0.0, 1.0, torch.inf, 3.0]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    candidates = torch.tensor(
+        [[0, 1, 2, 4, -1], [1, 2, 3, 0, -1], [2, 3, 1, 0, -1]], dtype=torch.int32, device="cuda"
+    )
+    seq_lens = torch.tensor([4, 3, 4], dtype=torch.int32, device="cuda")
+
+    output_width = candidates.shape[1] + 2
+    actual = thd_indexer_kernels.sanitize_topk(
+        candidates, scores, seq_lens, output_width=output_width
+    )
+    expected = thd_indexer_kernels._sanitize_topk_fallback(
+        candidates, scores, seq_lens, output_width=output_width
+    )
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])
+
+
 def test_compressor_input_compact_matches_native_forward_backward():
     _require_cute_cuda()
     cu = _make_e2e_like_cu_seqlens()
@@ -417,6 +468,39 @@ def test_build_attention_indices_indexer_loss_mode_matches_native():
     )
     assert torch.equal(fused[0], expected[0])
     assert torch.equal(fused[2], expected[1])
+
+
+def test_build_attention_indices_emits_padding_mask():
+    _require_cute_cuda()
+    cu_padded = torch.tensor([0, 4, 8, 12], dtype=torch.int32, device="cuda")
+    cu_unpadded = torch.tensor([0, 3, 7, 7], dtype=torch.int32, device="cuda")
+    cu_compressed = _compressed_cu_seqlens(cu_padded, ratio=4)
+    total_q = 14
+    logical_ids = torch.zeros((total_q, 1), dtype=torch.int32, device="cuda")
+
+    actual = thd_layout_kernels.build_attention_indices(
+        cu_padded,
+        0,
+        total_q,
+        2,
+        2,
+        4,
+        1,
+        logical_ids,
+        cu_seqlens_compressed=cu_compressed,
+        for_indexer_loss=True,
+        compressed_base=total_q + 2,
+        compressed_rows=int(cu_compressed[-1]),
+        compressed_is_sequence_major=True,
+        cu_seqlens_unpadded=cu_unpadded,
+    )
+    expected_mask = torch.tensor(
+        [False, False, False, True, False, False, False, False, True, True, True, True, True, True],
+        dtype=torch.bool,
+        device="cuda",
+    )
+    assert actual[3] is not None
+    assert torch.equal(actual[3], expected_mask)
 
 
 def test_build_attention_indices_sequence_major_matches_identity_mapping():
