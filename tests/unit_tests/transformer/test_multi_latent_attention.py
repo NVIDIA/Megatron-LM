@@ -36,6 +36,7 @@ from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
 from megatron.training.training import get_model
+from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
     init_basic_mock_args,
@@ -2048,6 +2049,11 @@ class TestFusedMLARequiresQLora:
             )
 
 
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    get_device_arch_version() < 10,
+    reason="Fused MLA Q up-projection requires Blackwell architecture",
+)
 class TestFusedMLAQUpProjIntegration:
     """Exercise Megatron MLA forward/backward through TE's fused Q projection."""
 
