@@ -139,12 +139,6 @@ pip install .
 
 - If `nvidia-resiliency-ext` is not installed, the async strategy will not be available.
 
-### Migration to NVRx
-
-- The **NVRx-based async strategy** will become the **default** in mcore v0.17.
-- The existing **mcore async strategy** is **deprecated** and will be removed in future versions.
-- A deprecation warning is emitted when using the mcore strategy.
-
 ### Async Saving for `fsdp_dtensor` and `torch_dcp` checkpoints
 
 Starting from mcore v0.17, asynchronous checkpoint saving is supported for `fsdp_dtensor` and `torch_dcp` formats.

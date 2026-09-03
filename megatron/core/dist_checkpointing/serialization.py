@@ -143,7 +143,7 @@ def load(
         sharded_state_dict
     )
     # Common (non-tensor) data is stored either as a single ShardedObject inside the
-    # torch_dist checkpoint (current format) or in a legacy common.pt. Loading it up front
+    # torch_dist checkpoint (current format) or in a legacy common.pt.
     common_state_dict = load_common_state_dict(checkpoint_dir)
     merge(common_state_dict, nonpersistent_state_dict)
 
