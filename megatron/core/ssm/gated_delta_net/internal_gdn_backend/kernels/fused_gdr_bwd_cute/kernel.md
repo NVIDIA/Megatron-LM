@@ -50,26 +50,15 @@ path, so the flag has no effect there.
 
 ### Context parallelism
 
-`GatedDeltaNet.forward` supports dense SBHD micro-batches with `B > 1` when
-chunkwise CP uses the internal backend. It builds one single-sequence context
-from `[0, T_global]` and reuses that context for every batch slice in causal-conv
-and pre-GDR processing. FLA and torch GDR backends still reject this dense CP
-layout when selected directly through `gdn_gdr_backend`. Inside the internal
-backend, however, explicit runtime `fla` mode and unsupported-shape `auto`
-fallback slice only the FLA GDR operator by batch and concatenate its outputs;
-the surrounding GatedDeltaNet layer remains a single dense-batch invocation.
-After preprocessing, BTHD inputs keep their native
-`[B, T_local, H, D]` layout. Only the CP boundary-state preprocessing is applied
-per batch element, because that primitive consumes one local sequence at a
-time. The resulting small boundary states are joined;
-the large token tensors and saved chunk states are not concatenated. Before
-the fused launch, tensors are flattened as views and a cached dense
-`cu_seqlens=[0, T_local, ..., B*T_local]` tensor describes the logical
-sequences. This avoids host metadata reads and their stream synchronization in
-the steady-state path.
+`GatedDeltaNet.forward` preserves MCore's established chunkwise-CP contract:
+dense SBHD input with `B > 1` is rejected. Use packed THD input, or use dense
+input with `B = 1`. Packed input carries validated global CPU sequence offsets
+through the CP context; the internal adapter converts those offsets to the
+rank-local metadata consumed by the fused backward.
 
-For context parallelism, the internal backend keeps the established FLA CP
-forward path. During backward it first runs the FLA CP preprocessing sequence:
+For context parallelism, the internal backend keeps the established FLA local
+forward path; CP boundary preprocessing may use FLA or the in-tree CuTe DSL
+kernels. During backward it first runs the CP preprocessing sequence:
 recompute `w`/`u`, reconstruct the local recurrent state when needed, compute
 the local `dv`, and run the CP AllGather/merge preprocessing to produce the
 rank-local boundary gradient `dht`. It then passes that `dht` and the saved or
@@ -81,16 +70,10 @@ This is a correctness-first integration and intentionally duplicates local
 must satisfy the fused backward contract (BF16, 64 heads, head dimension 128);
 `auto` falls back to the CP-aware FLA backward when they do not, while `cute`
 reports the unsupported contract explicitly. CP4 E2E validation must verify
-that both FLA merged preprocess kernels and the fused backward are invoked.
-The GB200 E2E coverage exercises the real `GatedDeltaNet.forward` entry for CP4,
-B=2 with local T=8192 and T=8190, and compares output plus all five GDR input
-gradients against the production dense-batch FLA CP dispatch. Local T=8190
-corresponds to global T=32760, which is divisible by the standard training
-partitioner's `2 * CP` requirement. Odd local lengths such as T=8191 remain
-valid module/kernel-level coverage, but are not reachable through that standard
-dense training partitioner. The non-CP case asserts that both
-CuTe DSL forward and backward kernels run; CP validates the
-FLA-forward/fused-backward path against FLA.
+that the selected CP preprocessing kernels and fused backward are invoked. The
+GB200 E2E coverage exercises packed THD CP4 with two logical sequences and
+compares output plus all five GDR input gradients against FLA. The non-CP case
+asserts that both CuTe DSL forward and backward kernels run.
 
 ## Package structure
 
@@ -205,19 +188,16 @@ the arbitrary packed-batch contract, and the named layout/storage structure.
 They do not duplicate a large shape sweep.
 
 `tests/unit_tests/ssm/test_internal_gdn_backend_e2e.py` is marked
-`launch_on_gb200`. It runs the non-CP explicit-`cute` full-fused case
-(`B=2`, `T=8192`, `H=64`, `D=128`, BF16), plus real GatedDeltaNet CP4 cases at
-local T=8192 and local T=8190. The CP cases assert that the merged FLA CP
-preprocessing and fused CuTe backward both execute, while their FLA references
-exercise the production dense-batch fallback rather than splitting the whole
-model invocation. Deterministic Q/K/V inputs use standard deviation 0.1
-to keep the long recurrence finite, and backward uses a fixed BF16 random
-`grad_output` without normalization by tensor size. It compares output and all
-five input gradients with FLA: output uses `atol=rtol=1e-2`, Q/K/V gradients
-use `5e-2`, and gate/beta gradients use `1e-1`, matching the repository's
-packed parameter-gradient tolerance. The test then records the median
-CUDA-event time after two warmups and five samples. The performance guard
-allows 10% noise relative to FLA. JIT time is excluded.
+`launch_on_gb200`. It calls the internal GDR backend directly for non-CP and CP4
+with `B=2`, `T=8192`, `H=64`, `D=128`, and BF16. The CP4 parameter manually
+builds a single-sequence CP context; it validates FLA CP forward plus fused CuTe
+backward, but it does not exercise dense `GatedDeltaNet.forward`. The test
+compares output and all five input gradients with FLA and records CUDA-event
+timing after two warmups and five samples, with a 10% regression allowance.
+JIT time is excluded.
+
+The production packed-THD CP4 aligned/tail validation is recorded in
+`fused_gdr_cp_cute/kernel.md`; it is separate from the checked-in CI test.
 
 ## Notes
 
