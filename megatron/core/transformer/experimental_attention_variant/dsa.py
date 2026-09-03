@@ -1385,10 +1385,11 @@ class DSAIndexer(MegatronModule):
         seqlen, bsz, _ = x.size()
 
         # =========================================
-        # q linear and apply rope to q  (FP8)
+        # q linear and apply rope to q
         # =========================================
         # [seqlen, batch, q_lora_rank] -> [seqlen, batch, index_n_heads * index_head_dim]
-        q, _ = self.linear_wq_b(qr)
+        with get_fp8_disabled_context(self.config):
+            q, _ = self.linear_wq_b(qr)
         # [seqlen, batch, index_n_heads * index_head_dim]
         #   -> [seqlen, batch, index_n_heads, index_head_dim]
         q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
