@@ -311,7 +311,7 @@ def test_mxfp8_split_scale_and_descriptor_cache_refreshes_per_iteration(monkeypa
 
 
 def test_mxfp8_split_scales_use_per_expert_descriptor_tables(monkeypatch):
-    from mok import ops
+    ops = pytest.importorskip("mok.ops", exc_type=ModuleNotFoundError)
 
     from megatron.core import fp8_utils
 
@@ -521,7 +521,7 @@ def test_register_shared_weights_rejects_non_bf16_parameters():
 
 
 def test_combined_shared_main_grad_uses_canonical_fc1_fc2_buffers(monkeypatch):
-    from mok import ops
+    ops = pytest.importorskip("mok.ops", exc_type=ModuleNotFoundError)
 
     module = _split_module(use_mxfp8_weights=False)
     module._split_main_grad_descriptor_cache = None

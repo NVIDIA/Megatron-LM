@@ -804,28 +804,14 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_megakernel_backend: Optional[str] = None
     """Optional backend that replaces MoE dispatch, expert computation, and combine.
-
-    MCore remains responsible for routing, trainable parameters, distributed-data-parallel
-    state, optimizer state, and checkpoints. Supported values: None and "mok".
+    Supported values: None and "mok".
     """
 
-    mok_fwd_num_comm_sms: int = 40
-    """Number of communication SMs used by the MoK forward megakernel."""
-
-    mok_bwd_num_comm_sms: int = 28
-    """Number of communication SMs used by the MoK backward megakernel."""
-
-    mok_minibatch_size: int = 4096
-    """MoK persistent-kernel scheduling minibatch size."""
-
-    mok_macrobatch_size: int = 131072
-    """MoK persistent-kernel scheduling macrobatch size."""
-
-    mok_schedule_capacity_multiplier: float = 0.5
-    """Multiplier used to size the MoK token schedule workspace."""
-
-    mok_all_gather_top_experts_chunk_bytes: int = 2048
-    """Chunk size for MoK symmetric-memory expert-ID all-gather."""
+    moe_megakernel_backend_config: Optional[dict] = None
+    """Backend options for moe_megakernel_backend.
+    Every key must use the selected backend's prefix, for example,
+    mok_fwd_num_comm_sms for the MOK backend.
+    """
 
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
@@ -2228,6 +2214,14 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_megakernel_backend must be None or 'mok', got "
                 f"{self.moe_megakernel_backend!r}"
             )
+        if self.moe_megakernel_backend_config is not None and not isinstance(
+            self.moe_megakernel_backend_config, dict
+        ):
+            raise ValueError("moe_megakernel_backend_config must be a mapping")
+        if self.moe_megakernel_backend is None and self.moe_megakernel_backend_config:
+            raise ValueError(
+                "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
+            )
 
         if self.moe_megakernel_backend == "mok":
             # TODO: Add a materialized-wgrad adapter for non-fused accumulation.
@@ -3203,6 +3197,17 @@ class TransformerConfig(ModelParallelConfig):
         assert all(
             isinstance(scope, CudaGraphModule) for scope in self.cuda_graph_modules
         ), f"cuda_graph_modules must be a list of CudaGraphModule, got {self.cuda_graph_modules}."
+        if self.moe_megakernel_backend == "mok" and any(
+            scope in self.cuda_graph_modules
+            for scope in (CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess)
+        ):
+            # TODO: Support router-only partial MoE graph replay for megakernel backends by
+            # passing graph-produced probabilities and routing maps directly to the backend,
+            # bypassing native token-dispatcher preprocess and state replay.
+            raise ValueError(
+                "MOK supports full-iteration CUDA Graph, but does not currently support "
+                "MCore's partial MoE graph replay protocol (moe_router/moe_preprocess)"
+            )
 
         assert self.cuda_graph_impl in [
             "none",

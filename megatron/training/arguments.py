@@ -2830,9 +2830,18 @@ def _add_network_size_args(parser):
         "apply_dsa_kernel_fusion",
         "dsa_kernel_backend",
         "mamba_training_ssm_states_dtype",
+        # Parsed manually as a JSON object below.
+        "moe_megakernel_backend_config",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
+    transformer_group.add_argument(
+        '--moe-megakernel-backend-config',
+        type=json.loads,
+        default=None,
+        metavar='JSON',
+        help='Backend-specific MoE megakernel options as a JSON object.',
+    )
 
     group = parser.add_argument_group(title='network size')
 

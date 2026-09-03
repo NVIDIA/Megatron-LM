@@ -8,7 +8,8 @@ replaces dispatch, routed/shared expert computation, and combine.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, fields
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import torch
 from torch import nn
@@ -30,6 +31,62 @@ from megatron.core.transformer.moe.megakernel.parameter_bridge import (
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+_MOK_OPTION_PREFIX = "mok_"
+
+
+@dataclass(frozen=True)
+class MoKBackendConfig:
+    """Typed MOK options resolved from the generic megakernel config mapping.
+
+    The external mapping keeps MOK prefixes so recipe dumps remain
+    self-describing. Once the selected backend is known, the typed fields do not
+    repeat that prefix because their MoKBackendConfig scope is unambiguous.
+    """
+
+    fwd_num_comm_sms: int = 40
+    bwd_num_comm_sms: int = 28
+    minibatch_size: int = 4096
+    macrobatch_size: int = 131072
+    schedule_capacity_multiplier: float = 0.5
+    all_gather_top_experts_chunk_bytes: int = 2048
+
+    @classmethod
+    def from_backend_config(
+        cls, backend_config: Optional[Mapping[str, Any]]
+    ) -> "MoKBackendConfig":
+        """Resolve MOK-prefixed entries from moe_megakernel_backend_config."""
+        if backend_config is None:
+            return cls()
+        if not isinstance(backend_config, Mapping):
+            raise ValueError("moe_megakernel_backend_config must be a mapping")
+
+        field_names = {field.name for field in fields(cls)}
+        expected_keys = {_MOK_OPTION_PREFIX + name for name in field_names}
+        unknown_keys = set(backend_config) - expected_keys
+        if unknown_keys:
+            raise ValueError(
+                "Unsupported MOK entries in moe_megakernel_backend_config: "
+                f"{sorted(unknown_keys)}"
+            )
+
+        values = {
+            key[len(_MOK_OPTION_PREFIX) :]: value for key, value in backend_config.items()
+        }
+        return cls(**values)
+
+
+def _require_mxfp8_post_all_gather_processing() -> None:
+    """Reject TE versions whose MXFP8 refresh relies on a later TE forward."""
+    from megatron.core import fp8_utils
+
+    if fp8_utils.te_post_all_gather_processing is None:
+        raise RuntimeError(
+            "MOK MXFP8 requires Transformer Engine with post_all_gather_processing support "
+            "(normally TE >= 2.10.0). Older TE versions rely on a later TE expert forward "
+            "to refresh columnwise weights, but MOK bypasses that forward path."
+        )
 
 
 class MoKMegakernel(MegakernelBackend):
@@ -86,14 +143,21 @@ class MoKMegakernel(MegakernelBackend):
         self.use_mxfp8_weights = bool(
             config.fp8 is not None and config.fp8_recipe == "mxfp8" and config.fp8_param
         )
+        if self.use_mxfp8_weights:
+            _require_mxfp8_post_all_gather_processing()
         self.native_single_grouped_weights = bool(config.moe_single_grouped_weight)
+        backend_config = MoKBackendConfig.from_backend_config(
+            config.moe_megakernel_backend_config
+        )
         self.mok_config = MoKConfig(
-            fwd_num_comm_sms=config.mok_fwd_num_comm_sms,
-            bwd_num_comm_sms=config.mok_bwd_num_comm_sms,
-            minibatch_size=config.mok_minibatch_size,
-            macrobatch_size=config.mok_macrobatch_size,
-            schedule_capacity_multiplier=config.mok_schedule_capacity_multiplier,
-            all_gather_top_experts_chunk_bytes=config.mok_all_gather_top_experts_chunk_bytes,
+            fwd_num_comm_sms=backend_config.fwd_num_comm_sms,
+            bwd_num_comm_sms=backend_config.bwd_num_comm_sms,
+            minibatch_size=backend_config.minibatch_size,
+            macrobatch_size=backend_config.macrobatch_size,
+            schedule_capacity_multiplier=backend_config.schedule_capacity_multiplier,
+            all_gather_top_experts_chunk_bytes=(
+                backend_config.all_gather_top_experts_chunk_bytes
+            ),
         )
 
         fc1 = routed_experts.linear_fc1

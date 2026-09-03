@@ -7,7 +7,9 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import fp8_utils
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.megakernel import factory
+from megatron.core.transformer.moe.megakernel.mok import backend as mok_backend
 from megatron.core.transformer.moe.megakernel.mok import weights
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -104,6 +106,65 @@ def test_mok_backend_accepts_native_mxfp8_parameters():
 def test_mok_backend_rejects_mxfp8_without_fp8_parameters():
     with pytest.raises(ValueError, match="fp8_param=True"):
         _mok_transformer_config(fp8="hybrid", fp8_recipe="mxfp8", fp8_param=False)
+
+
+def test_megakernel_backend_config_requires_backend():
+    with pytest.raises(ValueError, match="requires moe_megakernel_backend"):
+        _mok_transformer_config(
+            moe_megakernel_backend=None,
+            moe_megakernel_backend_config={"mok_fwd_num_comm_sms": 24},
+        )
+
+
+def test_mok_backend_config_defaults_and_prefixed_overrides():
+    defaults = mok_backend.MoKBackendConfig.from_backend_config(None)
+    configured = mok_backend.MoKBackendConfig.from_backend_config(
+        {"mok_fwd_num_comm_sms": 24, "mok_macrobatch_size": 32768}
+    )
+
+    assert defaults.fwd_num_comm_sms == 40
+    assert defaults.macrobatch_size == 131072
+    assert configured.fwd_num_comm_sms == 24
+    assert configured.macrobatch_size == 32768
+    assert configured.bwd_num_comm_sms == defaults.bwd_num_comm_sms
+
+
+@pytest.mark.parametrize("key", ["fwd_num_comm_sms", "other_fwd_num_comm_sms"])
+def test_mok_backend_config_rejects_non_mok_options(key):
+    with pytest.raises(ValueError, match="Unsupported MOK entries"):
+        mok_backend.MoKBackendConfig.from_backend_config({key: 24})
+
+
+@pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
+@pytest.mark.parametrize(
+    "cuda_graph_modules",
+    [
+        [CudaGraphModule.moe_router],
+        [CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
+    ],
+)
+def test_mok_backend_rejects_partial_moe_cuda_graph(cuda_graph_impl, cuda_graph_modules):
+    with pytest.raises(ValueError, match="partial MoE graph replay protocol"):
+        _mok_transformer_config(
+            cuda_graph_impl=cuda_graph_impl,
+            cuda_graph_modules=cuda_graph_modules,
+        )
+
+
+def test_mok_backend_accepts_full_iteration_cuda_graph():
+    config = _mok_transformer_config(
+        cuda_graph_impl="full_iteration",
+        cuda_graph_modules=[],
+    )
+
+    assert config.cuda_graph_impl == "full_iteration"
+
+
+def test_mok_mxfp8_rejects_te_without_post_all_gather_processing(monkeypatch):
+    monkeypatch.setattr(fp8_utils, "te_post_all_gather_processing", None)
+
+    with pytest.raises(RuntimeError, match="normally TE >= 2.10.0"):
+        mok_backend._require_mxfp8_post_all_gather_processing()
 
 
 @pytest.mark.parametrize(
