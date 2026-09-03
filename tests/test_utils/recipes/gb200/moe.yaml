@@ -228,7 +228,7 @@ products:
         scope: [mr-broken]
         platforms: [dgx_gb200]
 
-  - test_case: [deepseek_proxy_fsdp_ep2_fsdp2]
+  - test_case: [deepseek_proxy_mfsdp_v1_ep2]
     products:
       - environment: [dev]
         scope: [mr]
