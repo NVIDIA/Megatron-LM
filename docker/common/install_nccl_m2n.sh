@@ -4,7 +4,7 @@
 
 set -euxo pipefail
 
-NCCL_EXTENSIONS_COMMIT="6a81bce7c9fe5874e8c852224fa47c077033da72"
+NCCL_EXTENSIONS_COMMIT="e57f0dad43dc1ca5bf96f09bf4075afc2eae6599"
 PYTHON="${UV_PROJECT_ENVIRONMENT:-/opt/venv}/bin/python"
 
 while [[ $# -gt 0 ]]; do
