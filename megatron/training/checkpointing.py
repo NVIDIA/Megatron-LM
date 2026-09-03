@@ -1962,6 +1962,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('moe_router_score_function', force=True)
     _set_arg('moe_router_enable_expert_bias', force=True)
     _set_arg('moe_router_topk_scaling_factor', force=True)
+    _set_arg('moe_hybridep_routing_map_mode', force=False)
 
     # Mamba args.
     _set_arg('mamba_state_dim', force=True)

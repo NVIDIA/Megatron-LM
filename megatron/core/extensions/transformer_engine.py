@@ -3450,9 +3450,13 @@ if HAVE_TE and is_te_min_version("2.7.0.dev"):
             "qb_bin_bounds",
             "qb_histogram_mode",
         }.issubset(_fused_topk_sig.parameters)
+        fused_topk_with_score_function_supports_topk_indices = (
+            "topk_indices" in _fused_topk_sig.parameters
+        )
         del _fused_topk_sig
     except (TypeError, ValueError):
         fused_topk_with_score_function_supports_qb = False
+        fused_topk_with_score_function_supports_topk_indices = False
 
 else:
     fused_topk_with_score_function = None
@@ -3460,6 +3464,7 @@ else:
     fused_moe_aux_loss = None
     fused_topk_with_score_function_supports_qb = False
     mark_qb_bin_bounds_validated = None
+    fused_topk_with_score_function_supports_topk_indices = False
 
 
 def set_save_original_input(module):
