@@ -9,9 +9,11 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
 from megatron.core.inference.async_stream import AsyncStream
+from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
     _sanitize_chat_template_kwargs,
     _sanitize_messages_for_template,
+    bp,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.incremental_detokenizer import (
     HuggingFaceFastIncrementalDetokenizer,
@@ -66,9 +68,6 @@ def _make_byte_level_fast_tokenizer():
 @pytest.mark.asyncio
 async def test_chat_completions_uses_generated_logprobs_only_when_requested():
     quart = pytest.importorskip("quart")
-    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
-        bp as chat_completions_blueprint,
-    )
 
     class FakeTokenizer:
         bos, chat_template = None, None
@@ -107,7 +106,8 @@ async def test_chat_completions_uses_generated_logprobs_only_when_requested():
     fake_client = FakeInferenceClient()
     app = quart.Quart(__name__)
     app.config.update(client=fake_client, tokenizer=FakeTokenizer(), parsers=[], verbose=False)
-    app.register_blueprint(chat_completions_blueprint)
+    app.config["multimodal_prompt_config"] = MultimodalPromptConfig()
+    app.register_blueprint(bp)
     client = app.test_client()
     request_body = {
         "messages": [{"role": "user", "content": "prompt"}],
