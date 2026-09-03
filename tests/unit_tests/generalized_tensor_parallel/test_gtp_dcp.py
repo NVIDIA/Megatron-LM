@@ -2332,7 +2332,6 @@ def _worker_gdn_inproj_checkpoint(rank, world_size, port):
         reset_gtp_state()
 
 
-@pytest.mark.skipif(not HAVE_GDN_FLA, reason="FLA is not installed.")
 def _worker_fc1_swiglu_checkpoint(rank, world_size, port):
     """A gated fc1 under GTP must save logical gate/up splits and load the contiguous shard.
 
@@ -2444,6 +2443,7 @@ class TestGtpFc1SwigluDcp:
         _worker_fc1_swiglu_checkpoint(dist.get_rank(), 4, None)
 
 
+@pytest.mark.skipif(not HAVE_GDN_FLA, reason="FLA is not installed.")
 class TestGtpGdnDcp:
     def test_gdn_inproj_checkpoint(self):
         _require_world_size(4)

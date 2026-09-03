@@ -60,8 +60,15 @@ def untrimmed_gtp_shard(sh_ten) -> torch.Tensor:
     output off the local length and the trailing rank builds a tensor ``gtp_remat_size * keep``
     rows tall instead of the TP-local projection (and the ranks disagree on the collective, so
     the job hangs rather than failing). Callers strip the pad again after gathering.
+
+    Use ``gtp_pad_buffer`` (what the shard was sliced FROM), not ``gtp_pad_src`` (the live param,
+    kept for identity matching). For a native-FP8 param those differ: every other rank
+    contributes the dequantized BF16 copy, so contributing the FP8 param here would make the
+    collective's inputs disagree in dtype.
     """
-    src = getattr(sh_ten, "gtp_pad_src", None)
+    src = getattr(sh_ten, "gtp_pad_buffer", None)
+    if src is None:
+        src = getattr(sh_ten, "gtp_pad_src", None)
     return sh_ten.data if src is None else src
 
 

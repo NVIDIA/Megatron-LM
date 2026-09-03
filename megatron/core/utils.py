@@ -1048,14 +1048,27 @@ def _make_gtp_logical_sharded_tensor(
     # (``sh_ten.data = sh_ten.data.detach()`` in the torch strategy) and detach/clone/to all
     # produce a fresh tensor that silently drops attributes.
     if keep != shard_rows:
-        # Point at the LIVE param, which is what the optimizer holds and matches against.
-        # For a native-FP8 GTP weight `tensor` is already the dequantized BF16 copy carrying
-        # `_gtp_dequant_src`; slicing it drops that attribute, so without this hop both
-        # backlinks would break on exactly the trimmed rank and the param's optimizer state
-        # would vanish from the checkpoint with only a debug log.
+        # TWO backlinks, because the trimmed shard has two different consumers that want two
+        # different tensors. Keeping one attribute for both was wrong for native FP8, where the
+        # entry's data is a dequantized BF16 COPY and the live param is the FP8 tensor:
+        #
+        #   gtp_pad_src    -> the LIVE param, for IDENTITY (optimizer maps params to model
+        #                     entries by id()). For native FP8 that is the FP8 param, not the
+        #                     BF16 copy: slicing drops `_gtp_dequant_src`, so without this hop
+        #                     the trimmed rank's optimizer state vanishes with only a debug log.
+        #   gtp_pad_buffer -> the tensor this shard was SLICED FROM, for DATA. Load writes into
+        #                     the trimmed view, so only this tensor shares storage with what was
+        #                     written; handing back the FP8 param instead would discard the
+        #                     loaded rows. All-gather likewise needs a buffer whose dtype matches
+        #                     the other ranks' (they contribute the BF16 copy).
+        #
+        # Both live on the ShardedTensor, NOT on its data: ``data`` is reassigned
+        # (``sh_ten.data = sh_ten.data.detach()`` in the torch strategy) and detach/clone/to all
+        # produce a fresh tensor that silently drops attributes.
         # Explicit None check, not `a or b`: these are tensors.
         _live = getattr(tensor, "_gtp_dequant_src", None)
         sharded.gtp_pad_src = tensor if _live is None else _live
+        sharded.gtp_pad_buffer = tensor
     sharded.validate_metadata_integrity()
     return sharded
 

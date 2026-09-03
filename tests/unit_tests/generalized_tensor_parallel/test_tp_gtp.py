@@ -433,7 +433,7 @@ def _worker_multimodal_prefetch_order(rank, world_size, port, tp_size, gtp_remat
 
         def expected_full(weight):
             shard = weight.data.clone()
-            gathered = [torch.zeros_like(shard) for _ in range(world_size)]
+            gathered = [torch.zeros_like(shard) for _ in range(gtp_remat_size)]
             dist.all_gather(gathered, shard, group=gtp_remat_group)
             return torch.cat(gathered, dim=0)[: weight._unsharded_shape[0]]
 

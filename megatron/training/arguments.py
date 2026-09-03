@@ -4343,12 +4343,11 @@ def _add_distributed_args(parser):
         type=int,
         default=None,
         help='Pad each GTP weight-remat shard so its rows are a multiple of this value '
-        '(times the gtp_remat degree). Unset keeps the recipe default: 32 for mxfp8, 16 for '
-        'other quantized recipes, and 16 from GTPRematConfig for everything else including '
-        'bf16. Set 0 to disable padding. The pad rows are stripped before every GEMM, but they '
-        'are visible in the checkpoint: they widen a GTP tensor global shape, and they are '
-        're-zeroed rather than round-tripped on load, so pinning this is how a run isolates '
-        'whether they are responsible for a difference.',
+        '(times the gtp_remat degree). Unset keeps the recipe default, which is 32 for mxfp8, '
+        '16 for the other quantized recipes, and 1 (i.e. no padding) for everything else '
+        'including bf16. Set 0 to disable padding explicitly. The pad rows are stripped '
+        'before every GEMM and are kept out of the checkpoint entirely, so pinning this is '
+        'how a run isolates whether alignment is responsible for a throughput difference.',
     )
     group.add_argument(
         '--ddp-param-name-patterns-for-fp32-local-accumulation',
