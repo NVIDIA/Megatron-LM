@@ -232,11 +232,7 @@ def test_from_local_reuses_required_local_buffer(distributed_setup):
     local_buffer = replicated_buffer.local_buffer.narrow(0, offset, local_numel)
 
     sharded_buffer = DBuffer.from_local(
-        local_buffer,
-        mesh,
-        iter([Flat()]),
-        replicated_buffer.layout.tensor_shapes,
-        allocation_stream=replicated_buffer.allocation_stream,
+        local_buffer, mesh, [Flat()], replicated_buffer.layout.tensor_shapes
     )
 
     assert sharded_buffer.placements == (Flat(),)
@@ -244,6 +240,20 @@ def test_from_local_reuses_required_local_buffer(distributed_setup):
     assert sharded_buffer.offset == offset
     assert sharded_buffer.local_buffer.data_ptr() == local_buffer.data_ptr()
     _assert_dbuffer_local_tensors_close(sharded_buffer.allgather(0), tensors)
+
+
+def test_view_rejects_non_aliasing_placement_change(distributed_setup):
+    """A view rejects placement changes that need communication."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("DBuffer view test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    buffer = DBuffer.distribute_tensors(
+        _same_tensors_on_all_ranks(distributed_setup.device), mesh, [Flat()]
+    )
+
+    with pytest.raises(ValueError, match="DBuffer.view"):
+        buffer.view([Replicate()])
 
 
 def test_replicate_get_local_tensor_and_dtensor(distributed_setup):
@@ -327,13 +337,13 @@ def test_sharded_allgather_into_existing_buffer(distributed_setup):
     _assert_dbuffer_local_tensors_close(destination, tensors)
 
 
-def test_replicate_scatter_round_trip(distributed_setup):
-    """Replicated buffers locally chunk into sharded buffers and all-gather back."""
+def test_replicate_view_round_trip(distributed_setup):
+    """Replicated buffers view sharded local storage and all-gather back."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     tensors = _same_tensors_on_all_ranks(distributed_setup.device)
 
     replicated_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate()])
-    sharded_buffer = replicated_buffer.scatter(0, Flat())
+    sharded_buffer = replicated_buffer.view([Flat()])
     redistribute_destination = DBuffer(
         mesh=mesh,
         placements=[Flat()],
@@ -370,13 +380,15 @@ def test_partial_allreduce(distributed_setup):
     ]
     partial_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial()])
 
-    replicated_buffer = partial_buffer.allreduce(0)
+    replicated_buffer = partial_buffer.view([Replicate()])
+    partial_buffer.allreduce(0, out=replicated_buffer)
 
     scale_sum = float(distributed_setup.world_size * (distributed_setup.world_size + 1) // 2)
     expected = [
         torch.full((5, 3), scale_sum, dtype=torch.float32, device=distributed_setup.device),
         torch.full((4,), scale_sum * 10, dtype=torch.float32, device=distributed_setup.device),
     ]
+    assert replicated_buffer.local_buffer.data_ptr() == partial_buffer.local_buffer.data_ptr()
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
 
 
@@ -419,19 +431,17 @@ def test_partial_reduce_scatter_to_flat(distributed_setup):
     partial_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial()])
     layout = partial_buffer.layout
 
-    destination = DBuffer(
-        mesh=mesh,
-        placements=[Flat()],
-        tensor_shapes=partial_buffer.layout.tensor_shapes,
-        dtype=partial_buffer.dtype,
-        device=partial_buffer.local_buffer.device,
-    )
+    destination = partial_buffer.view([Flat()])
     sharded_buffer = partial_buffer.reduce_scatter(0, Flat(), out=destination)
     replicated_buffer = sharded_buffer.allgather(0)
 
     assert sharded_buffer is destination
     assert sharded_buffer.placements == (Flat(),)
     assert sharded_buffer.layout == layout
+    assert (
+        sharded_buffer.local_buffer.untyped_storage()
+        is partial_buffer.local_buffer.untyped_storage()
+    )
     assert replicated_buffer.layout == layout
     scale_sum = float(distributed_setup.world_size * (distributed_setup.world_size + 1) // 2)
     expected_tensors = [
@@ -661,8 +671,8 @@ def test_2d_mesh_partial_flat_reduce_scatter_to_flat_flat(distributed_setup):
     _assert_dbuffer_local_tensors_close(replicated_buffer, expected)
 
 
-def test_2d_mesh_replicate_flat_scatter_to_flat_flat(distributed_setup):
-    """Replicate+Flat scatter chunks the existing Flat local shard."""
+def test_2d_mesh_replicate_flat_view_to_flat_flat(distributed_setup):
+    """A Replicate+Flat view chunks the existing Flat local shard."""
     if distributed_setup.world_size < 4 or distributed_setup.world_size % 2 != 0:
         pytest.skip("2D DBuffer test requires an even world size of at least 4.")
 
@@ -674,7 +684,7 @@ def test_2d_mesh_replicate_flat_scatter_to_flat_flat(distributed_setup):
     )
 
     replicated_sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Flat()])
-    fully_sharded_buffer = replicated_sharded_buffer.scatter(0, Flat())
+    fully_sharded_buffer = replicated_sharded_buffer.view([Flat(), Flat()])
     replicated_buffer = fully_sharded_buffer.allgather(0).allgather(1)
 
     assert fully_sharded_buffer.placements == (Flat(), Flat())
