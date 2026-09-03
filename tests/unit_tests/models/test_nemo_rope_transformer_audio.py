@@ -16,7 +16,6 @@ from megatron.core.models.audio.nemo_audio_checkpoint import (
     write_nemo_audio_configs_to_checkpoint_dir,
 )
 from megatron.core.models.audio.nemo_rope_transformer_encoder import (
-    FeatureStacking,
     RopeTransformerEncoder,
     RopeTransformerEncoderConfig,
 )
@@ -24,6 +23,7 @@ from megatron.core.models.audio.nemo_transformer_audio_model import (
     NemoTransformerAudioConfig,
     NemoTransformerAudioModel,
 )
+from megatron.core.models.audio.nemo_transformer_encoder import StackingSubsampling
 
 
 def _rope_config(**overrides) -> NemoTransformerAudioConfig:
@@ -33,7 +33,8 @@ def _rope_config(**overrides) -> NemoTransformerAudioConfig:
         "n_heads": 2,
         "n_layers": 1,
         "drop_rate": 0.0,
-        "pre_encode": "feature_stacking",
+        "pre_encode": "stacking",
+        "stacking_pad_mode": "zeros",
         "subsampling_factor": 2,
         "qk_norm": True,
         "architecture": "rope_transformer",
@@ -44,8 +45,11 @@ def _rope_config(**overrides) -> NemoTransformerAudioConfig:
     return NemoTransformerAudioConfig(**values)
 
 
-def test_rope_feature_stacking_packed_matches_dense_valid_tokens():
-    stacking = FeatureStacking(subsampling_factor=4, feat_in=3, feat_out=5).eval()
+@pytest.mark.parametrize("pad_mode", ["learned", "zeros"])
+def test_stacking_packed_matches_dense_valid_tokens(pad_mode):
+    stacking = StackingSubsampling(
+        subsampling_factor=4, feat_in=3, feat_out=5, pad_mode=pad_mode
+    ).eval()
     features = torch.randn(2, 3, 12)
     lengths = torch.tensor([12, 9], dtype=torch.int64)
     features[1, :, 9:] = 0
@@ -58,8 +62,11 @@ def test_rope_feature_stacking_packed_matches_dense_valid_tokens():
     torch.testing.assert_close(packed, dense[valid])
 
 
-def test_rope_feature_stacking_accepts_already_packed_frames():
-    stacking = FeatureStacking(subsampling_factor=4, feat_in=3, feat_out=5).eval()
+@pytest.mark.parametrize("pad_mode", ["learned", "zeros"])
+def test_stacking_accepts_already_packed_frames(pad_mode):
+    stacking = StackingSubsampling(
+        subsampling_factor=4, feat_in=3, feat_out=5, pad_mode=pad_mode
+    ).eval()
     clips = [torch.randn(12, 3), torch.randn(9, 3)]
     lengths = torch.tensor([12, 9], dtype=torch.int64)
     dense_input = torch.nn.utils.rnn.pad_sequence(clips, batch_first=True).transpose(1, 2)
@@ -70,6 +77,36 @@ def test_rope_feature_stacking_accepts_already_packed_frames():
 
     torch.testing.assert_close(packed_lengths, dense_lengths)
     torch.testing.assert_close(packed, dense[valid])
+
+
+def test_stacking_pad_modes_preserve_padding_semantics_and_checkpoint_layout():
+    learned = StackingSubsampling(
+        subsampling_factor=2, feat_in=1, feat_out=1, pad_mode="learned"
+    ).eval()
+    zeros = StackingSubsampling(
+        subsampling_factor=2, feat_in=1, feat_out=1, pad_mode="zeros"
+    ).eval()
+    with torch.no_grad():
+        learned.proj_out.weight.fill_(1.0)
+        learned.pad_frame.fill_(3.0)
+        zeros.proj.weight.fill_(1.0)
+
+    features = torch.tensor([[[2.0]]])
+    lengths = torch.tensor([1], dtype=torch.int64)
+    learned_output, _ = learned(features, lengths)
+    zero_output, _ = zeros(features, lengths)
+
+    torch.testing.assert_close(learned_output, torch.tensor([[[5.0]]]))
+    torch.testing.assert_close(zero_output, torch.tensor([[[2.0]]]))
+    assert set(learned.state_dict()) == {"pad_frame", "proj_out.weight"}
+    assert set(zeros.state_dict()) == {"proj.weight"}
+
+
+def test_feature_stacking_config_alias_normalizes_to_zero_padded_stacking():
+    config = _rope_config(pre_encode="feature_stacking")
+
+    assert config.pre_encode == "stacking"
+    assert config.stacking_pad_mode == "zeros"
 
 
 def test_rope_encoder_builds_one_mixed_policy_object_without_reordering_tokens():
@@ -130,6 +167,16 @@ def test_rope_encoder_builds_one_mixed_policy_object_without_reordering_tokens()
 def test_rope_transformer_requires_transformer_engine_attention():
     with pytest.raises(ValueError, match="requires Transformer Engine"):
         NemoTransformerAudioModel(_rope_config(attn_impl="sdpa"))
+
+
+def test_rope_transformer_requires_zero_padded_stacking():
+    with pytest.raises(ValueError, match="stacking_pad_mode='zeros'"):
+        NemoTransformerAudioModel(_rope_config(stacking_pad_mode="learned"))
+
+
+def test_invalid_stacking_pad_mode_is_rejected():
+    with pytest.raises(ValueError, match="stacking_pad_mode must be"):
+        _rope_config(stacking_pad_mode="invalid")
 
 
 def test_rope_transformer_advertises_dynamic_causal_packed_attention():
@@ -305,7 +352,8 @@ def test_rope_archive_config_is_detected_from_nemo_fields():
 
     assert encoder_config.n_mels == 128
     assert encoder_config.architecture == "rope_transformer"
-    assert encoder_config.pre_encode == "feature_stacking"
+    assert encoder_config.pre_encode == "stacking"
+    assert encoder_config.stacking_pad_mode == "zeros"
     assert encoder_config.attn_impl == "te"
 
 
@@ -330,9 +378,7 @@ def test_resolve_rope_runtime_causal_mode(tmp_path, causal_mode, expected):
     assert resolved.left_context == 128
 
 
-def test_feature_stacking_token_estimator_uses_per_sample_ceil():
-    estimator = NemoTransformerAudioTokenEstimator(
-        encoder_time_stride=8, pre_encode="feature_stacking"
-    )
+def test_stacking_token_estimator_uses_per_sample_ceil():
+    estimator = NemoTransformerAudioTokenEstimator(encoder_time_stride=8, pre_encode="stacking")
 
     assert estimator.estimate(num_frames=9, padded_num_frames=64) == 2
