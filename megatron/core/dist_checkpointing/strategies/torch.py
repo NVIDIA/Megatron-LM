@@ -739,7 +739,8 @@ class TorchDistSaveShardedStrategy:
             )
         else:
             raise ModuleNotFoundError(
-                "nvidia-resiliency-ext is not installed. Please install it to use the async save strategy."
+                "nvidia-resiliency-ext is not installed. "
+                "Please install it to use the async save strategy."
             )
 
         return self._get_save_and_finalize_callbacks(writer, save_state_dict_ret)
