@@ -79,8 +79,17 @@ class Utils:
             store = PrefixStore("default_pg", store)
             Utils.store = store
 
+            # See MCORE_PG_TIMEOUT_MIN in initialize_model_parallel; applied here too so a
+            # hang on the default (world) group -- e.g. a barrier in a test teardown -- also
+            # raises instead of blocking.
+            timeout_min = os.environ.get("MCORE_PG_TIMEOUT_MIN")
+            pg_kwargs = {"timeout": timedelta(minutes=int(timeout_min))} if timeout_min else {}
             torch.distributed.init_process_group(
-                backend='nccl', world_size=Utils.world_size, rank=Utils.rank, store=store
+                backend='nccl',
+                world_size=Utils.world_size,
+                rank=Utils.rank,
+                store=store,
+                **pg_kwargs,
             )
 
             torch.distributed.barrier()
@@ -137,6 +146,13 @@ class Utils:
 
         ps.destroy_model_parallel()
         Utils.initialize_distributed()
+        # Debug aid: MCORE_PG_TIMEOUT_MIN shortens the collective timeout on every group
+        # created below, so a hung collective raises instead of blocking for the 30-minute
+        # default. Unset (the normal case) leaves the default untouched; an explicit
+        # distributed_timeout_minutes from the caller always wins.
+        timeout_min = os.environ.get("MCORE_PG_TIMEOUT_MIN")
+        if timeout_min and "distributed_timeout_minutes" not in kwargs:
+            kwargs["distributed_timeout_minutes"] = int(timeout_min)
         ps.initialize_model_parallel(
             tensor_model_parallel_size,
             pipeline_model_parallel_size,
