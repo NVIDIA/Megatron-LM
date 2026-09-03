@@ -9,8 +9,9 @@
 #   MODEL_VARIANT: proxy (default), 0.8b, 2b, 4b, 9b, 27b, 35b_a3b, 122b_a10b, 397b_a17b, 35b_a3b_light
 #   CKPT_LOAD: path to a pre-converted checkpoint to load (enables --load + --finetune)
 #   CKPT_FORMAT: checkpoint format override (e.g. torch_dist); auto-detected when empty
-#   TP, EP, PP: parallelism sizes (PP must stay 1; multimodal_dev does not
-#               support pipeline parallelism)
+#   TP, EP, PP: parallelism sizes (PP>1 forces USE_FSDP=0; FSDP and PP are
+#               mutually exclusive on the standard path)
+#   SAVE_CHECKPOINT: set to 0 to skip --save/--save-interval (default 1)
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
 #   FORCE_LOAD_BALANCING: set to 1 to enable --moe-router-force-load-balancing
@@ -294,11 +295,10 @@ fi
 
 # --- Logging & Checkpointing ---
 SAVE_INTERVAL=${SAVE_INTERVAL:-500}
+SAVE_CHECKPOINT=${SAVE_CHECKPOINT:-1}
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
-    --save-interval "$SAVE_INTERVAL"
     --eval-interval 500
-    --save "$CHECKPOINT_STORE_PATH"
     --eval-iters 10
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
     --wandb-project "$WANDB_PROJECT"
@@ -308,6 +308,13 @@ EVAL_AND_LOGGING_ARGS=(
     --log-timers-to-tensorboard
     --log-params-norm
 )
+# Smoke / perf runs do not need the end-of-training checkpoint write.
+if [ "$SAVE_CHECKPOINT" -eq 1 ]; then
+    EVAL_AND_LOGGING_ARGS+=(
+        --save-interval "$SAVE_INTERVAL"
+        --save "$CHECKPOINT_STORE_PATH"
+    )
+fi
 
 # --- Tokenizer ---
 TOKENIZER_MODEL=${TOKENIZER_MODEL:-Qwen/Qwen3.5-397B-A17B}
@@ -459,6 +466,11 @@ fi
 
 # --- FSDP ---
 USE_FSDP=${USE_FSDP:-1}
+# FSDP and PP are mutually exclusive on Megatron's standard path.
+if [ "$PP" -gt 1 ] && [ "$USE_FSDP" -eq 1 ]; then
+    echo "[run_qwen35_vl] PP=${PP} > 1 -> forcing USE_FSDP=0"
+    USE_FSDP=0
+fi
 if [ "$USE_FSDP" -eq 1 ]; then
     FSDP_ARGS=(
         --use-megatron-fsdp

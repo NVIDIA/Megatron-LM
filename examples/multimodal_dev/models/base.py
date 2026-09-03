@@ -1,11 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Base multimodal model for FSDP + EP training.
+"""Base multimodal model for FSDP + EP and PP training.
 
-Composes a vision encoder and a ``GPTModel`` language decoder.  Designed
-for FSDP + EP: always builds the **full** model on every rank (no PP
-flags).  PP support is only available through the MIMO ``MimoModel``
-assembly path.
+Composes a vision encoder and a ``GPTModel`` language decoder.  The
+vision encoder is built only on the first PP stage; the language
+decoder spans all PP stages following standard Megatron PP layout
+flags.
 
 Subclasses override ``compute_position_ids()`` for model-specific
 position encoding (e.g. MRoPE for Qwen3.5-VL).
@@ -83,13 +83,15 @@ class MultimodalModel(MegatronModule):
     """Base class for multimodal vision-language models.
 
     Composes a pre-constructed vision encoder and a ``GPTModel`` language
-    decoder.  Designed for FSDP + EP; always builds the full model on
-    every rank.
+    decoder.  Supports pipeline parallelism: the vision encoder is built
+    only on the first PP stage, while the language decoder spans all PP
+    stages following standard Megatron PP layout flags.
 
     Args:
         language_config: ``TransformerConfig`` for the language decoder.
         language_spec: ``ModuleSpec`` for decoder transformer layers.
-        vision_encoder: Pre-constructed vision encoder module.
+        vision_encoder: Pre-constructed vision encoder module (or ``None``
+            on non-first PP stages).
         vocab_size: Language model vocabulary size.
         max_sequence_length: Maximum sequence length.
         image_token_id: Token ID for image placeholder tokens.
@@ -100,13 +102,18 @@ class MultimodalModel(MegatronModule):
         mtp_block_spec: Optional MTP block spec.
         parallel_output: Keep outputs split across TP ranks.
         share_embeddings_and_output_weights: Tie input/output embeddings.
+        pre_process: First PP stage flag — when True, build embedding +
+            run vision encoder + scatter image embeddings.
+        post_process: Last PP stage flag — when True, build output layer +
+            compute loss inside ``GPTModel``.
+        vp_stage: Virtual pipeline stage (forwarded to ``GPTModel``).
     """
 
     def __init__(
         self,
         language_config: TransformerConfig,
         language_spec: ModuleSpec,
-        vision_encoder: MegatronModule,
+        vision_encoder: Optional[MegatronModule],
         vocab_size: int,
         max_sequence_length: int,
         image_token_id: int,
@@ -117,19 +124,34 @@ class MultimodalModel(MegatronModule):
         mtp_block_spec: Optional[ModuleSpec] = None,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
+        pre_process: bool = True,
+        post_process: bool = True,
+        vp_stage: Optional[int] = None,
     ):
         super().__init__(config=language_config)
 
         self.image_token_id = image_token_id
+        self.pre_process = pre_process
+        self.vp_stage = vp_stage
+        # ``post_process`` is deliberately not stored: nothing reads it off this
+        # wrapper, and ``get_attr_wrapped_model(model, 'post_process', ...)``
+        # (schedules.clear_embedding_activation_buffer) must keep resolving to
+        # the GPTModel that owns ``embedding_activation_buffer``.
+        # Surfaced for ``finalize_model_grads._allreduce_word_embedding_grads``
+        # which inspects the outer module (not the wrapped GPTModel) when
+        # PP > 1 and either tied embeddings or MTP layers are in use.
+        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
 
-        self.vision_model = vision_encoder
+        # Vision encoder lives only on the first PP stage.
+        self.vision_model = vision_encoder if pre_process else None
         self.language_model = GPTModel(
             config=language_config,
             transformer_layer_spec=language_spec,
             vocab_size=vocab_size,
             max_sequence_length=max_sequence_length,
-            pre_process=True,
-            post_process=True,
+            pre_process=pre_process,
+            post_process=post_process,
+            vp_stage=vp_stage,
             parallel_output=parallel_output,
             share_embeddings_and_output_weights=(share_embeddings_and_output_weights),
             position_embedding_type=position_embedding_type,
@@ -138,8 +160,17 @@ class MultimodalModel(MegatronModule):
             mtp_block_spec=mtp_block_spec,
         )
 
+    def shared_embedding_or_output_weight(self):
+        """Surface the wrapped language model's shared embedding / output
+        weight to the PP grad-finalize step (mirrors the LLaVA wrapper).
+        Needed when PP>1 and embeddings are tied or MTP is enabled.
+        """
+        return self.language_model.shared_embedding_or_output_weight()
+
     def set_input_tensor(self, input_tensor):
-        """Route input tensors (simplified, no PP routing)."""
+        """Forward the previous PP stage's activation into ``GPTModel``,
+        which routes it according to its own ``pre_process`` flag.
+        """
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
         assert len(input_tensor) == 1
@@ -334,12 +365,16 @@ class MultimodalModel(MegatronModule):
                 ``loss_mask``: only true padding, not SFT prompt tokens.
             pixel_values: Preprocessed image pixels.
             image_grid_thw: ``[num_images, 3]`` grid dimensions.
-            decoder_input: Pre-computed decoder input (skip embed).
+            decoder_input: Pre-computed decoder input (skip embed). Only
+                honored on the first pipeline stage; later stages take
+                their activation from ``set_input_tensor``.
             packed_seq_params: ``PackedSeqParams`` for THD attention.
 
         Returns:
             Loss tensor (post_process=True) or hidden states.
         """
+        # MRoPE freqs are computed per PP stage from position_ids inside
+        # GPTModel, so position_ids must be available on every stage.
         if position_ids is None:
             position_ids = self.compute_position_ids(
                 input_ids=input_ids,
@@ -347,19 +382,29 @@ class MultimodalModel(MegatronModule):
                 packed_seq_params=packed_seq_params,
             )
 
-        vision_embeddings = None
-        if self.vision_model is not None and pixel_values is not None:
-            vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+        if self.pre_process:
+            vision_embeddings = None
+            if self.vision_model is not None and pixel_values is not None:
+                vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
 
-        if decoder_input is None and self.language_model is not None:
-            text_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
-
-            if vision_embeddings is not None:
-                decoder_input = self._scatter_vision_embeddings(
-                    input_ids, text_embeddings, vision_embeddings
+            if decoder_input is None and self.language_model is not None:
+                text_embeddings = self.language_model.embedding(
+                    input_ids=input_ids, position_ids=None
                 )
-            else:
-                decoder_input = text_embeddings
+
+                if vision_embeddings is not None:
+                    decoder_input = self._scatter_vision_embeddings(
+                        input_ids, text_embeddings, vision_embeddings
+                    )
+                else:
+                    decoder_input = text_embeddings
+        else:
+            # Non-first PP stage: no vision encoder, no embedding; the
+            # activation arrives via GPTModel.set_input_tensor.
+            assert decoder_input is None, (
+                "decoder_input is only honored on the first pipeline stage; "
+                "later stages take their activation from set_input_tensor."
+            )
 
         (
             decoder_input, input_ids, labels, loss_mask,

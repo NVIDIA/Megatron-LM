@@ -79,10 +79,16 @@ class MockQwen35VLDataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
+        # Seed per index rather than from the global RNG: Megatron gives each
+        # pipeline stage a different global seed (initialize._set_random_seed
+        # adds 100 * pp_rank), and every PP rank builds its own dataset, so a
+        # globally-drawn sample would differ between stages of the same job.
+        generator = torch.Generator().manual_seed(idx)
+
         # Reserve 1 slot for the vision_start sentinel before image tokens.
         text_length = self.seq_length - self.image_seq_length - 1
         text_tokens = torch.randint(
-            1, self.vocab_size, (text_length,), dtype=torch.long,
+            1, self.vocab_size, (text_length,), dtype=torch.long, generator=generator,
         )
         special_ids = {
             self.image_token_id,
@@ -120,7 +126,7 @@ class MockQwen35VLDataset(Dataset):
             * self.patch_size
             * self.patch_size
         )
-        pixel_values = torch.randn(self.total_patches, pixel_dim)
+        pixel_values = torch.randn(self.total_patches, pixel_dim, generator=generator)
 
         image_grid_thw = self.grid_thw.clone()
 
