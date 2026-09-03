@@ -27,7 +27,7 @@ from tests.unit_tests.test_utilities import Utils
 pytestmark = pytest.mark.flaky_in_dev
 
 
-def build_model(config, use_padding_mask=False):
+def build_model(config, use_padding_mask=False, use_mtp_input_mask=False):
     seq_len = 32
     max_seq_len = 300
     # ids = random.sample([i for i in range(max_seq_len)], seq_len)
@@ -48,6 +48,18 @@ def build_model(config, use_padding_mask=False):
         padding_mask = torch.zeros((1, seq_len), dtype=torch.bool).cuda()
         padding_mask[0, -8:] = True
         data["padding_mask"] = padding_mask
+
+    # Optionally add mtp_input_mask, with False holes away from both ends. MTP rolls this
+    # mask together with input_ids and then uses it to pick which embedding rows keep a
+    # gradient, so the holes must not be symmetric under a one-position shift — otherwise a
+    # mask that is rolled one time too many still selects the same rows and the test passes
+    # for the wrong reason.
+    if use_mtp_input_mask:
+        mtp_input_mask = torch.ones((1, seq_len), dtype=torch.bool).cuda()
+        mtp_input_mask[0, 5] = False
+        mtp_input_mask[0, 11:14] = False
+        mtp_input_mask[0, 20] = False
+        data["mtp_input_mask"] = mtp_input_mask
 
     # build layer spec
     transformer_layer_spec = get_gpt_decoder_block_spec(config=config, use_transformer_engine=True)
@@ -72,6 +84,7 @@ def run_two_chunk_parity(
     extra_kwargs,
     microbatches=1,
     use_padding_mask=False,
+    use_mtp_input_mask=False,
     on_plans_built=None,
     on_forward_done=None,
 ):
@@ -98,7 +111,11 @@ def run_two_chunk_parity(
             # build config
             config = get_test_config(num_layers=layer_num, extra_kwargs=extra_kwargs)
             # build model
-            gpt_model, schedule_plan, data = build_model(config, use_padding_mask=use_padding_mask)
+            gpt_model, schedule_plan, data = build_model(
+                config,
+                use_padding_mask=use_padding_mask,
+                use_mtp_input_mask=use_mtp_input_mask,
+            )
             gpt_model.cuda()
             gpt_models.append(gpt_model)
             datas.append(data)
@@ -166,6 +183,57 @@ def run_two_chunk_parity(
             gpt_models[i] = None
         gc.collect()
         torch.cuda.empty_cache()
+
+
+def capture_overlap_grads(layers, extra_kwargs, use_mtp_input_mask=False):
+    """Run the two-chunk 1F1B overlap pattern once; return one grad dict per chunk.
+
+    Unlike ``run_two_chunk_parity`` this does not involve ``GPTModel.forward`` at all, so
+    both sides of a comparison built on it travel the identical schedule. That matters for
+    the embedding parameters: overlap-vs-reference does not agree on their gradients even
+    with the feature under test disabled (which is why ``run_two_chunk_parity`` passes
+    ``skip_embedding=True``), so a reference-based test cannot say anything about them.
+    Overlap-vs-overlap can.
+    """
+    with deterministic_mode():
+        gpt_models, schedule_plans, datas = [], [], []
+        for layer_num in layers:
+            config = get_test_config(num_layers=layer_num, extra_kwargs=extra_kwargs)
+            gpt_model, schedule_plan, data = build_model(
+                config, use_mtp_input_mask=use_mtp_input_mask
+            )
+            gpt_model.cuda()
+            gpt_models.append(gpt_model)
+            schedule_plans.append(schedule_plan)
+            datas.append(data)
+
+        f_input_0 = TransformerModelChunkSchedulePlan.run(schedule_plans[0], None)
+        f_input_1 = TransformerModelChunkSchedulePlan.run(
+            schedule_plans[1], schedule_plans[0], b_grad=torch.ones_like(f_input_0)
+        )
+        TransformerModelChunkSchedulePlan.run(
+            None, schedule_plans[1], b_grad=torch.ones_like(f_input_1)
+        )
+
+        captures = []
+        for gpt_model in gpt_models:
+            captures.append(
+                {
+                    name: (param.grad.clone() if param.grad is not None else None)
+                    for name, param in gpt_model.named_parameters()
+                }
+            )
+
+        for i in range(len(gpt_models)):
+            schedule_plans[i] = None
+            for k in datas[i]:
+                datas[i][k] = None
+            datas[i] = None
+            gpt_models[i].zero_grad()
+            gpt_models[i] = None
+        gc.collect()
+        torch.cuda.empty_cache()
+    return captures
 
 
 class TestA2AOverlap:
@@ -364,3 +432,44 @@ class TestA2AOverlap:
             recompute_num_layers,
             microbatches=4,
         )
+
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
+    def test_full_recompute_preserves_mtp_input_mask(self, dispatcher_type, flex_backend):
+        """Full recompute is transparent to MTP's input mask.
+
+        ``mtp_input_mask`` is a mutable chunk-state field: MTP's ``_get_embeddings`` rolls
+        it together with ``input_ids`` (one concatenated roll, so CP does a single boundary
+        exchange) and writes both back. A segment snapshot that omits it lets the replay
+        roll an already-rolled mask, shifting it one position against ``input_ids``, and the
+        mask then drives
+        ``torch.where(valid, decoder_input, decoder_input.detach())`` -- so the detached
+        embedding rows are the wrong ones.
+
+        That damage is confined to the embedding gradients: masking never changes a forward
+        value, so outputs and every non-embedding parameter still agree. The comparison is
+        therefore overlap-with-recompute against overlap-without-recompute, both through
+        ``capture_overlap_grads``, rather than against ``GPTModel.forward`` -- the reference
+        path does not agree with the overlap path on embedding gradients even without
+        recompute, so it cannot arbitrate this.
+
+        The mask's False holes are deliberately not symmetric under a one-position shift;
+        otherwise an over-rolled mask would still select the same rows and pass.
+        """
+        base_kwargs = {"mtp_num_layers": 1, "mtp_loss_scaling_factor": 1.1}
+        apply_flex_backend_kwargs(base_kwargs, dispatcher_type, flex_backend)
+        recompute_kwargs = dict(
+            base_kwargs,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+        )
+
+        eager = capture_overlap_grads([2, 1], base_kwargs, use_mtp_input_mask=True)
+        recomputed = capture_overlap_grads([2, 1], recompute_kwargs, use_mtp_input_mask=True)
+
+        for i in range(len(eager)):
+            assert "embedding.word_embeddings.weight" in eager[i], "embedding grad not captured"
+            comp_res = compare_captures(eager[i], recomputed[i], True, False)
+            assert comp_res[0], f"[rank {torch.distributed.get_rank()}] chunk {i}: {comp_res[1]}"

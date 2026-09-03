@@ -30,7 +30,21 @@ class ModelChunkState:
 
 # ModelChunkState fields the layer forwards mutate in place; each segment snapshots them
 # so its backward-time replay sees the pre-segment values instead of end-of-chunk ones.
-_MUTABLE_CHUNK_STATE_FIELDS = ("input_ids", "position_ids", "padding_mask", "mtp_hidden_states")
+#
+# ``mtp_input_mask`` belongs here for the same reason as ``input_ids``: MTP's
+# ``_get_embeddings`` rolls the two together (one concatenated roll, so CP does a single
+# boundary exchange) and writes both back to the chunk state. Leaving it out would let a
+# replay roll an already-rolled mask, shifting it one position against ``input_ids``, and
+# the mask drives ``torch.where(valid, decoder_input, decoder_input.detach())`` — so the
+# embedding rows detached would be the wrong ones and the MTP/embedding gradients would be
+# silently wrong rather than failing loudly.
+_MUTABLE_CHUNK_STATE_FIELDS = (
+    "input_ids",
+    "position_ids",
+    "padding_mask",
+    "mtp_input_mask",
+    "mtp_hidden_states",
+)
 
 
 def _copy_chunk_state_value(value: Any) -> Any:
