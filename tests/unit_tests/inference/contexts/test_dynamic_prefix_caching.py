@@ -1715,6 +1715,27 @@ class TestMatchedBlockWriteRedirect(PrefixCachingTestBase):
         for block_id in self._block_ids(ctx, 1, 4):
             assert ctx.kv_block_allocator.block_ref_counts[block_id].item() == 2
 
+    @pytest.mark.internal
+    def test_unaligned_continuation_without_new_matches_protects_inherited_block(self):
+        """An inherited partial match remains shared even when this chunk finds no new blocks."""
+        ctx = self._ctx()
+        block_size = ctx.block_size_tokens
+        dummy = ctx.kv_block_allocator.dummy_block_idx
+        prompt = self._prompt(block_size * 4)
+
+        ctx.add_request(self._req(ctx, prompt.clone()))
+        req = self._req(ctx, prompt.clone(), request_id=2)
+
+        first_chunk_length = block_size + 8
+        self._add_chunk(ctx, req, first_chunk_length)
+        assert req.num_matched_prefix_blocks == 2
+
+        # This chunk remains inside the second inherited block, so its matching
+        # range is empty: already_allocated_blocks == overall_required_blocks.
+        start, end = self._add_chunk(ctx, req, chunk_length=8)
+        assert req.num_matched_prefix_blocks == 2
+        assert ctx.token_to_block_idx[start:end].tolist() == [dummy] * (end - start)
+
 
 def _make_cpu_mamba_slot_allocator(
     monkeypatch, *, total_blocks: int, max_slots: int

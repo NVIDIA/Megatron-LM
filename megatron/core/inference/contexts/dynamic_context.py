@@ -3476,10 +3476,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx[
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = self.request_to_kv_block_ids[current_id][token_offset_range // self.block_size_tokens]
-        if num_matched_blocks > 0:
-            # Some tokens we are about to compute may land inside a block we matched
-            # by hash. That block already holds the correct KV for exactly these
-            # tokens and is shared with whoever cached it, so send those writes to the
+        if num_matched_blocks > 0 or req.num_matched_prefix_blocks > 0:
+            # Some tokens we are about to compute may land inside a block this or an
+            # earlier chunk matched by hash. That block already holds the correct KV
+            # for exactly these tokens and is shared with whoever cached it, so send those writes to the
             # dummy block rather than perturb a concurrent reader's values.
             #
             # Only the write mapping moves. `request_to_kv_block_ids` still points at
