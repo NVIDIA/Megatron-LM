@@ -21,7 +21,9 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest, S
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -31,6 +33,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.gated_delta_net import HAVE_FLA
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.inference.engines.ssm_test_helpers import (
@@ -53,8 +56,20 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     NCCL communicator memory from repeated init/destroy cycles.
     """
 
-    def teardown_method(self, method):
+    @staticmethod
+    def _release_ep_resources():
+        """Drop CUDA graphs and EP-registered buffers before the process group goes away.
+
+        NVLS symmetric-memory handles must never be alive across a destroy/reinit cycle of
+        the group they were registered on. All of these are no-ops when unused.
+        """
         delete_cuda_graphs()
+        NVLSAllGatherVDispatcher._delete_buffers()
+        SymmetricMemoryManager.destroy()
+        VllmFusedMoeBuffers._delete_buffers()
+
+    def teardown_method(self, method):
+        self._release_ep_resources()
         Utils.destroy_model_parallel()
 
     @classmethod
@@ -301,8 +316,12 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         if int(os.environ.get("WORLD_SIZE", "1")) < 2:
             pytest.skip("Test requires at least 2 GPUs")
 
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+
         env = self._run_test(
-            model_provider="gpt",
+            model_provider="hybrid",
+            # An attention (not recurrent) MTP head is what enables the draft KV cache.
+            mtp_layer_pattern="*-",
             expert_model_parallel_size=2,
             num_speculative_tokens=2,
             mtp_use_repeated_layer=True,
@@ -313,6 +332,9 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             num_gap_steps=1,
             num_cuda_graphs=num_cuda_graphs,
             force_build_cuda_graphs=num_cuda_graphs is not None,
+            # Local CUDA graphs + EP > 1 require expert padding: the graphs are captured
+            # with it enabled, so the router must not drop it at replay time.
+            moe_pad_experts_for_cuda_graph_inference=num_cuda_graphs is not None,
             context_max_requests=8,
             materialize_only_last_token_logits=False,
         )
@@ -339,8 +361,12 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         if int(os.environ.get("WORLD_SIZE", "1")) < 2:
             pytest.skip("Test requires at least 2 GPUs")
 
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+
         env = self._run_test(
-            model_provider="gpt",
+            model_provider="hybrid",
+            # An attention (not recurrent) MTP head is what enables the draft KV cache.
+            mtp_layer_pattern="*-",
             expert_model_parallel_size=2,
             num_speculative_tokens=2,
             mtp_use_repeated_layer=True,
@@ -360,31 +386,185 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
                 request.status == Status.COMPLETED
             ), f"Request {request.request_id}: status={request.status}"
 
+    # ---- Shared-prompt driver: the only way to force real prefix-cache HITS ---- #
+    #
+    # `_run_test` builds every prompt with `torch.randint`, so no two requests ever share a
+    # prefix and `enable_prefix_caching=True` alone yields zero cache hits -- the interesting
+    # branch of `_mtp_commit_pass` (inherited draft KV, `off > 0` with no prior chunk of our
+    # own) would never execute. These tests instead submit the SAME prompt twice and assert
+    # `_prefill_tokens_skipped > 0`, which is the engine's own evidence that a hit occurred.
+
+    @classmethod
+    def _run_shared_prompt_test(cls, prompt_length, **config_kwargs):
+        """Build an env with no auto-generated requests, then submit one prompt twice."""
+        from tests.unit_tests.inference.engines.test_dynamic_engine import DynamicEngineTestConfig
+
+        test_config = DynamicEngineTestConfig(num_requests=0, **config_kwargs)
+        env = cls._build_test_env(test_config)
+        prompt = torch.arange(prompt_length, dtype=torch.int64, device="cuda") % (
+            test_config.vocab_size - 1
+        )
+
+        def add_request(request_id):
+            env.engine.add_request(
+                request_id=request_id,
+                prompt=prompt.clone(),
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=4, termination_id=-1, top_k=1, top_p=0.0
+                ),
+            )
+
+        outputs = {}
+        add_request(0)
+        # Step once so request 0's blocks are cached before request 1 arrives.
+        env.engine.step_modern()
+        add_request(1)
+        while env.engine.has_unfinished_requests():
+            result = env.engine.step_modern()
+            for record in result["finished_request_records"]:
+                request = record.merge()
+                outputs[request.request_id] = list(request.generated_tokens)
+        return env, outputs
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
+    @torch.inference_mode()
+    def test_mtp_kv_cache_prefix_caching_matches_across_schedulers(self, enable_chunked_prefill):
+        """Prefix caching (and optionally chunked prefill) under EP, async vs legacy.
+
+        With BOTH features on, a request can reach the commit pass with `off > 0` for two
+        different reasons -- it resumed its own previous chunk, or it inherited a cached
+        prefix produced by a DIFFERENT request. `_mtp_commit_pass` must tell them apart
+        (`own_prior_chunk`): the first seeds the straddling entry at `off-1` from the carried
+        boundary hidden, the second must leave that shared entry alone. This combination is
+        the only way to exercise that disambiguation end to end.
+
+        The draft KV affects acceptance rate, never verified output, so the two scheduling
+        modes must emit identical tokens -- and they derive `base_position` differently
+        (async from the GPU pos-ids snapshot, legacy from post-rewind CPU state), which is
+        exactly the divergence this compares.
+        """
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+
+        shared = dict(
+            model_provider="hybrid",
+            mtp_layer_pattern="*-",
+            expert_model_parallel_size=2,
+            num_speculative_tokens=2,
+            mtp_use_repeated_layer=True,
+            enable_prefix_caching=True,
+            enable_chunked_prefill=enable_chunked_prefill,
+            num_tokens_to_generate=4,
+            max_sequence_length=768,
+            context_block_size_tokens=256,
+            # A budget below the prompt length is what forces the prompt to be chunked.
+            context_max_tokens=384 if enable_chunked_prefill else 1024,
+            context_max_requests=4,
+            materialize_only_last_token_logits=False,
+        )
+
+        results = {}
+        for mode in (AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC):
+            env, outputs = self._run_shared_prompt_test(
+                prompt_length=512, async_sched_mode=mode, **shared
+            )
+            self._assert_mtp_kv_cache_active(env)
+            assert env.engine._prefill_tokens_skipped > 0, (
+                "no prefix-cache hit occurred, so the inherited-draft-KV branch of "
+                "_mtp_commit_pass never ran and this test is vacuous"
+            )
+            assert all(len(tokens) == 4 for tokens in outputs.values())
+            results[mode] = outputs
+            # Reset between scheduling modes with the same EP-safe ordering as teardown.
+            self._release_ep_resources()
+            Utils.destroy_model_parallel()
+
+        assert results[AsyncScheduleMode.LEGACY] == results[AsyncScheduleMode.ASYNC], (
+            "async and legacy scheduling disagree on verified output; the MTP draft KV must "
+            "affect acceptance rate only"
+        )
+
+    # ---- MTP draft-KV cache on inference-optimized layers ------------------ #
+    #
+    # The inference-optimized transformer is a different attention implementation (NVLS
+    # symmetric-memory linears, RMSNorm, no bias, flash attention) from the local spec the
+    # tests above use. The MTP draft KV is appended and read back through that same attention
+    # path, so it needs its own coverage.
+    #
+    # Note the harness constraints, both asserted by `test_parallel_inference` above:
+    # MoE/EP is not supported with this transformer, and tp_size > 1 requires sequence
+    # parallelism. So these are dense, and EP coverage stays on the local spec.
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 4], ids=["eager", "cuda_graphs"])
+    @torch.inference_mode()
+    def test_mtp_kv_cache_inference_optimized(self, num_cuda_graphs):
+        """MTP draft KV cache on the inference-optimized transformer (TP=1, dense)."""
+        if not torch.distributed.is_initialized():
+            pytest.skip("Distributed not initialized")
+
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+
+        env = self._run_test(
+            model_provider="hybrid",
+            # An attention (not recurrent) MTP head is what enables the draft KV cache.
+            mtp_layer_pattern="*-",
+            transformer_impl="inference_optimized",
+            tensor_model_parallel_size=1,
+            num_speculative_tokens=2,
+            mtp_use_repeated_layer=True,
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=16,
+            num_tokens_to_generate=6,
+            num_gap_steps=1,
+            num_cuda_graphs=num_cuda_graphs,
+            force_build_cuda_graphs=num_cuda_graphs is not None,
+            context_max_requests=8,
+            materialize_only_last_token_logits=False,
+        )
+
+        self._assert_mtp_kv_cache_active(env)
+        for request in env.requests:
+            assert (
+                request.status == Status.COMPLETED
+            ), f"Request {request.request_id}: status={request.status}"
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
-    def test_mtp_kv_cache_expert_parallel_with_prefix_caching(self):
-        """A prefix-cache hit changes the commit pass's append COUNT, not its forward count.
-
-        On a hit the request inherits the matched blocks' draft KV and seeds only `q-1`
-        entries starting at `off` -- it must not rewrite the divergence entry at `off-1`,
-        which lives in a ref-counted block shared with the producer and its siblings.
-        """
-        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+    def test_mtp_kv_cache_inference_optimized_sequence_parallel(self):
+        """Same, with TP=2 + SP: the commit pass pads to a TP multiple and scatters."""
+        if not torch.distributed.is_initialized():
+            pytest.skip("Distributed not initialized")
+        if torch.distributed.get_world_size() < 2:
             pytest.skip("Test requires at least 2 GPUs")
 
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+
         env = self._run_test(
-            model_provider="gpt",
-            expert_model_parallel_size=2,
+            model_provider="hybrid",
+            # An attention (not recurrent) MTP head is what enables the draft KV cache.
+            mtp_layer_pattern="*-",
+            transformer_impl="inference_optimized",
+            tensor_model_parallel_size=2,
+            # The inference-optimized transformer requires SP when tp_size > 1.
+            sequence_parallel=True,
             num_speculative_tokens=2,
             mtp_use_repeated_layer=True,
-            enable_prefix_caching=True,
-            num_requests=6,
-            # Identical-length prompts maximize the chance of a shared-prefix hit.
-            min_prompt_length=32,
-            max_prompt_length=32,
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=16,
             num_tokens_to_generate=6,
             num_gap_steps=1,
             context_max_requests=8,
@@ -396,6 +576,203 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             assert (
                 request.status == Status.COMPLETED
             ), f"Request {request.request_id}: status={request.status}"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_mtp_kv_cache_inference_optimized_chunked_prefill(self):
+        """Continuation-chunk seeding on the inference-optimized attention path."""
+        if not torch.distributed.is_initialized():
+            pytest.skip("Distributed not initialized")
+
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+
+        env = self._run_test(
+            model_provider="hybrid",
+            # An attention (not recurrent) MTP head is what enables the draft KV cache.
+            mtp_layer_pattern="*-",
+            transformer_impl="inference_optimized",
+            tensor_model_parallel_size=1,
+            enable_chunked_prefill=True,
+            num_speculative_tokens=2,
+            mtp_use_repeated_layer=True,
+            num_requests=4,
+            min_prompt_length=32,
+            max_prompt_length=64,
+            num_tokens_to_generate=6,
+            num_gap_steps=0,
+            context_max_requests=8,
+            materialize_only_last_token_logits=False,
+        )
+
+        self._assert_mtp_kv_cache_active(env)
+        for request in env.requests:
+            assert (
+                request.status == Status.COMPLETED
+            ), f"Request {request.request_id}: status={request.status}"
+
+    # ---- Inference-optimized MoE + expert parallelism + CUDA graphs -------- #
+    #
+    # `test_parallel_inference` skips inference_optimized whenever ep_size > 1 ("MoE models are
+    # not supported"), but transformer_config validation actually PERMITS the combination --
+    # it just imposes requirements the harness never set. For EP (not expert TP) they are:
+    #
+    #   expert_tensor_parallel_size == 1   -- already passed by _build_test_env
+    #   moe_expert_capacity_factor is None -- dropless; the default
+    #   moe_router_padding_for_quantization is False -- the default
+    #   moe_router_dtype == "fp32"         -- NOT the default; supplied below
+    #   gated_linear_unit implies a torch/vllm grouped-GEMM backend -- GLU is off by default
+    #
+    # The dispatcher choice decides how much CUDA-graph coverage is even reachable:
+    # DynamicInferenceContext force-disables NON-decode graphs for the nccl and training EP
+    # dispatchers ("We only allow non-decode cuda graphs for the nvls dispatcher"). So nccl
+    # exercises decode graphs only, and nvls is the one that also captures prefill/mixed
+    # graphs. Both are covered, and the test asserts which regime it actually got rather than
+    # trusting the config -- otherwise a silently-downgraded run would look like a pass.
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("dispatcher", ["nccl", "nvls"])
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 4], ids=["eager", "cuda_graphs"])
+    @torch.inference_mode()
+    def test_mtp_kv_cache_inference_optimized_expert_parallel(self, num_cuda_graphs, dispatcher):
+        """Inference-optimized MoE layers with EP=2, across both EP dispatchers.
+
+        This is the combination the MTP KV cache is most exposed in: the MTP head's MLP is a
+        MoE layer, so every draft forward carries an EP all-to-all, and the commit pass has to
+        repoint the NVLS routing mask at its own token count
+        (`NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp`).
+        """
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+
+        env = self._run_test(
+            model_provider="hybrid",
+            transformer_impl="inference_optimized",
+            # An attention (not recurrent) MTP head is what enables the draft KV cache; its
+            # MLP becomes a MoE layer, which is what puts EP on the MTP forward path.
+            mtp_layer_pattern="*-",
+            expert_model_parallel_size=2,
+            # EP, explicitly not expert tensor parallelism (which inference_optimized rejects).
+            inference_moe_token_dispatcher_type=dispatcher,
+            moe_router_dtype="fp32",
+            num_speculative_tokens=2,
+            mtp_use_repeated_layer=True,
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=16,
+            num_tokens_to_generate=6,
+            num_gap_steps=1,
+            num_cuda_graphs=num_cuda_graphs,
+            force_build_cuda_graphs=num_cuda_graphs is not None,
+            context_max_requests=8,
+            materialize_only_last_token_logits=False,
+        )
+
+        self._assert_mtp_kv_cache_active(env)
+        context = env.engine.context
+
+        # Assert the graph regime we actually ran in, so a silent downgrade is not a pass.
+        if num_cuda_graphs is None:
+            assert not context.use_cuda_graphs_for_non_decode_steps
+        elif dispatcher == "nvls":
+            assert (
+                context.use_cuda_graphs_for_non_decode_steps
+            ), "expected full (decode + non-decode) graph coverage with the nvls dispatcher"
+        else:
+            assert (
+                not context.use_cuda_graphs_for_non_decode_steps
+            ), "nccl EP dispatcher is expected to force-disable non-decode graphs"
+
+        for request in env.requests:
+            assert (
+                request.status == Status.COMPLETED
+            ), f"Request {request.request_id}: status={request.status}"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("dispatcher", ["nccl", "nvls"])
+    @torch.inference_mode()
+    def test_mtp_kv_cache_inference_optimized_expert_parallel_chunked_prefill(self, dispatcher):
+        """Same, with chunked prefill so the commit pass seeds continuation chunks under EP."""
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+
+        env = self._run_test(
+            model_provider="hybrid",
+            transformer_impl="inference_optimized",
+            mtp_layer_pattern="*-",
+            expert_model_parallel_size=2,
+            inference_moe_token_dispatcher_type=dispatcher,
+            moe_router_dtype="fp32",
+            enable_chunked_prefill=True,
+            num_speculative_tokens=2,
+            mtp_use_repeated_layer=True,
+            num_requests=4,
+            min_prompt_length=32,
+            max_prompt_length=64,
+            num_tokens_to_generate=6,
+            num_gap_steps=0,
+            context_max_requests=8,
+            materialize_only_last_token_logits=False,
+        )
+
+        self._assert_mtp_kv_cache_active(env)
+        for request in env.requests:
+            assert (
+                request.status == Status.COMPLETED
+            ), f"Request {request.request_id}: status={request.status}"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("enable_chunked_prefill", [False, True])
+    @torch.inference_mode()
+    def test_mtp_kv_cache_inference_optimized_ep_prefix_caching(self, enable_chunked_prefill):
+        """Prefix caching (+ optional chunked prefill) on inference-optimized MoE with EP.
+
+        The richest configuration: inherited draft KV, NVLS EP dispatch (so non-decode CUDA
+        graphs are captured too), and MoE all-to-alls on every MTP draft forward.
+        """
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+
+        env, outputs = self._run_shared_prompt_test(
+            prompt_length=512,
+            model_provider="hybrid",
+            transformer_impl="inference_optimized",
+            mtp_layer_pattern="*-",
+            expert_model_parallel_size=2,
+            inference_moe_token_dispatcher_type="nvls",
+            moe_router_dtype="fp32",
+            num_speculative_tokens=2,
+            mtp_use_repeated_layer=True,
+            enable_prefix_caching=True,
+            enable_chunked_prefill=enable_chunked_prefill,
+            async_sched_mode=AsyncScheduleMode.ASYNC,
+            num_tokens_to_generate=4,
+            max_sequence_length=768,
+            context_block_size_tokens=256,
+            context_max_tokens=384 if enable_chunked_prefill else 1024,
+            context_max_requests=4,
+            num_cuda_graphs=4,
+            force_build_cuda_graphs=True,
+            materialize_only_last_token_logits=False,
+        )
+
+        self._assert_mtp_kv_cache_active(env)
+        assert env.engine._prefill_tokens_skipped > 0, "no prefix-cache hit occurred"
+        assert all(len(tokens) == 4 for tokens in outputs.values())
 
 
 CHUNKED_CG_BLOCK_SIZE = 256
