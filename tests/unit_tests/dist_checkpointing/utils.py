@@ -6,7 +6,6 @@ from unittest import mock
 
 import torch
 
-from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
