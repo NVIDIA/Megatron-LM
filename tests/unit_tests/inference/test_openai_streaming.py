@@ -72,12 +72,10 @@ async def test_chat_completions_uses_generated_logprobs_only_when_requested():
     class FakeTokenizer:
         bos, chat_template = None, None
 
-        @staticmethod
-        def tokenize(_text):
+        def tokenize(self, _text):
             return [11, 12]
 
-        @staticmethod
-        def detokenize(tokens):
+        def detokenize(self, tokens):
             return "".join(chr(ord("a") + token - 1) for token in tokens)
 
     class FakeInferenceClient:
@@ -91,7 +89,6 @@ async def test_chat_completions_uses_generated_logprobs_only_when_requested():
                 "status": "COMPLETED",
                 "generated_text": "ab",
                 "prompt_length": 2,
-                "num_cached_tokens": 1,
                 "generated_tokens": [1, 2],
                 "generated_log_probs": generated_log_probs,
                 "log_probs": [-9.0, -9.0],
@@ -102,6 +99,9 @@ async def test_chat_completions_uses_generated_logprobs_only_when_requested():
                 "sampling_params": {"num_tokens_to_generate": 2},
                 "routing_indices": None,
             }
+
+        def add_request_with_id(self, *args, **kwargs):
+            return "request-1", self.add_request(*args, **kwargs)
 
     fake_client = FakeInferenceClient()
     app = quart.Quart(__name__)
