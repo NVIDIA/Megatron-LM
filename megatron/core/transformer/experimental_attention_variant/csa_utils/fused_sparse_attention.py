@@ -31,6 +31,7 @@ from torch import Tensor
 from megatron.core.tensor_parallel.mappings import async_reduce_scatter_along_first_dim
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
+from . import thd_layout_kernels
 from .csa_teacher_lse import can_use_fused_csa_teacher_lse, fused_csa_teacher_lse
 
 # ---------------------------------------------------------------------------
@@ -1365,6 +1366,10 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
       (``_indexer_topk_core`` THD branch, ``local_to_global_flat`` THD
       branch, ``_compute_dense_*_score`` THD branch,
       ``dense_indexer_backward_wrapper`` with ``cu_seqlens_q/k``).
+      Generic fused THD stores KV as raw ``[all original, all compressed]``
+      sources and lowers the logical indexer output with the shared THD
+      final-index kernel. The legacy per-segment layout remains available to
+      direct callers.
 
     Two indexer-loss variants, selected by the ``sparse_loss`` argument
     (matches ``compute_dsa_indexer_loss`` in the reference ``dsa.py``):
@@ -1394,7 +1399,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         kv_full: Tensor,  # SBHD (skv, b, d) / THD (total_kv_full, d)
         attn_sink: Tensor,  # (np,) f32
         # Window indices (not differentiable)
-        window_idxs: Tensor,  # SBHD (b, sq, win_topk) / THD (total_q, win_topk)
+        window_idxs: Tensor | None,  # SBHD/legacy THD window ids; None for raw THD KV.
         # Indexer inputs (differentiable)
         q_indexer: Tensor,  # SBHD (sq, b, idx_nh, idx_hd) / THD (total_q, idx_nh, idx_hd)
         k_indexer: Tensor,  # SBHD (n_comp, b, idx_hd) / THD (total_comp_idx, idx_hd)
@@ -1417,6 +1422,8 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         max_seqlen_compressed_idx: Optional[int],  # indexer K max
         compressed_kv: Optional[Tensor] = None,  # THD only — pre-packed compressed KV
         cu_seqlens_q_unpadded: Optional[Tensor] = None,  # THD only — unpadded Q cu_seqlens
+        thd_window_size: int | None = None,
+        thd_compressed_is_sequence_major: bool = False,
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
@@ -1475,7 +1482,31 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         )
 
         # ---- 3. Combine indices (indexer first, then window) + globalize. ----
-        if is_thd:
+        indexer_physical_idxs = None
+        if is_thd and thd_compressed_is_sequence_major:
+            if compressed_kv is None or thd_window_size is None:
+                raise ValueError(
+                    "Raw sequence-major THD lowering requires compressed_kv and thd_window_size."
+                )
+            compressed_base = kv_full.shape[0] - compressed_kv.shape[0]
+            global_idxs, _, indexer_physical_idxs = thd_layout_kernels.build_attention_indices(
+                cu_seqlens_q,
+                0,
+                total_q,
+                0,
+                int(thd_window_size),
+                ratio,
+                indexer_topk,
+                topk_indices_cmp,
+                cu_seqlens_compressed=cu_seqlens_compressed_idx,
+                for_indexer_loss=True,
+                compressed_base=compressed_base,
+                compressed_rows=compressed_kv.shape[0],
+                compressed_is_sequence_major=True,
+            )
+        elif is_thd:
+            if window_idxs is None:
+                raise ValueError("Legacy THD lowering requires caller-supplied window indices.")
             row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
             offset_per_row = (
                 (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1])[row_batch_ids].unsqueeze(1).to(torch.int32)
@@ -1495,6 +1526,8 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
                 cu_seqlens_kv=cu_seqlens_kv_full,
             )
         else:
+            if window_idxs is None:
+                raise ValueError("SBHD lowering requires caller-supplied window indices.")
             compress_topk_idxs = torch.where(
                 topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1
             )
@@ -1588,6 +1621,10 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             topk_indices_cmp[padding_row_mask] = -1
             indexer_scores = indexer_scores.clone()
             indexer_scores[padding_row_mask] = float('-inf')
+            if indexer_physical_idxs is not None:
+                indexer_physical_idxs = indexer_physical_idxs.masked_fill(
+                    padding_row_mask.unsqueeze(-1), -1
+                )
 
         if sparse_loss:
             # Derive predict: gather topk scores from indexer_scores → softmax.
@@ -1602,12 +1639,15 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             # the packed (total_k, D) buffer, so promote per-segment-local
             # indices to flat-global against cu_seqlens_compressed_idx.
             if is_thd:
-                topk_for_target = local_to_global_flat(
-                    topk_indices_cmp,
-                    batch_size=-1,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_kv=cu_seqlens_compressed_idx,
-                )
+                if indexer_physical_idxs is not None:
+                    topk_for_target = indexer_physical_idxs
+                else:
+                    topk_for_target = local_to_global_flat(
+                        topk_indices_cmp,
+                        batch_size=-1,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_kv=cu_seqlens_compressed_idx,
+                    )
             else:
                 topk_for_target = topk_indices_cmp
 
@@ -1695,12 +1735,15 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
                 attn_score_for_bwd = target.clone()
                 index_score_for_bwd = predict.clone()
                 if is_thd:
-                    topk_indices_cmp_global = local_to_global_flat(
-                        topk_indices_cmp,
-                        batch_size=-1,
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_kv=cu_seqlens_compressed_idx,
-                    )
+                    if indexer_physical_idxs is not None:
+                        topk_indices_cmp_global = indexer_physical_idxs
+                    else:
+                        topk_indices_cmp_global = local_to_global_flat(
+                            topk_indices_cmp,
+                            batch_size=-1,
+                            cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_compressed_idx,
+                        )
                     bwd_q, bwd_w, bwd_k, bwd_attn, bwd_idx, bwd_topk = _thd_to_fake_bshd(
                         q_indexer_flat,
                         w_indexer,
@@ -1881,7 +1924,8 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         #   cu_seqlens_q, cu_seqlens_kv, cu_seqlens_kv_full,
         #   cu_seqlens_compressed_idx,
         #   max_seqlen_q, max_seqlen_compressed_idx,
-        #   compressed_kv, cu_seqlens_q_unpadded
+        #   compressed_kv, cu_seqlens_q_unpadded,
+        #   thd_window_size, thd_compressed_is_sequence_major
         return (
             grad_query,
             grad_kv_full,
@@ -1890,6 +1934,8 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             grad_q_indexer,
             grad_k_indexer,
             grad_weights,
+            None,
+            None,
             None,
             None,
             None,
@@ -2296,7 +2342,7 @@ def fused_csa_indexer_sparse_attn(
     query: Tensor,
     kv_full: Tensor,
     attn_sink: Tensor,
-    window_idxs: Tensor,
+    window_idxs: Tensor | None,
     q_indexer: Tensor,
     k_indexer: Tensor,
     weights: Tensor,
@@ -2317,6 +2363,8 @@ def fused_csa_indexer_sparse_attn(
     max_seqlen_compressed_idx: Optional[int] = None,
     compressed_kv: Optional[Tensor] = None,
     cu_seqlens_q_unpadded: Optional[Tensor] = None,
+    thd_window_size: int | None = None,
+    thd_compressed_is_sequence_major: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """Path B (training): fused indexer (+KL loss) + sparse attention.
 
@@ -2324,12 +2372,11 @@ def fused_csa_indexer_sparse_attn(
 
     * **SBHD** (``cu_seqlens_q is None``, default): inputs carry an
       explicit batch axis; the THD kwargs are ignored.
-    * **THD packed** (``cu_seqlens_q`` supplied): all four
-      ``cu_seqlens_*`` and four ``max_seqlen_*`` must be supplied (see
-      below). Both ``sparse_loss=True`` and ``sparse_loss=False`` are
-      supported — the sparse-loss path globalizes the per-segment-local
-      topk indices via ``local_to_global_flat`` and the cuDNN
-      sparse-indexer-backward kernel addresses K/dK by flat ids.
+    * **THD packed** (``cu_seqlens_q`` supplied): packed-sequence metadata
+      must be supplied as described below. Both ``sparse_loss=True`` and
+      ``sparse_loss=False`` are supported. Raw sequence-major THD lowers top-k
+      directly to physical compressed rows; the legacy per-segment layout
+      retains the eager globalization fallback.
 
     See :class:`FusedCSAIndexerSparseAttnFunc` for the detailed data flow.
 
@@ -2346,11 +2393,11 @@ def fused_csa_indexer_sparse_attn(
 
     THD args (when ``cu_seqlens_q is not None``):
         query:        ``(total_q, np, d)`` bf16 — flat-packed Q.
-        kv_full:      ``(total_kv_full, d)`` bf16 — per-segment-concat'd
-                      ``[kv, compressed_kv]`` (built by
-                      :func:`csa.cat_per_segment`).
-        window_idxs:  ``(total_q, win_topk)`` int32 — local-per-segment
-                      window indices.
+        kv_full:      ``(total_kv_full, d)`` bf16 — either the legacy
+                      per-segment layout or raw ``[all kv, all compressed_kv]``
+                      when ``thd_compressed_is_sequence_major=True``.
+        window_idxs:  ``(total_q, win_topk)`` local window indices for the
+                      legacy layout; pass ``None`` for raw sequence-major THD.
         q_indexer:    ``(total_q, idx_nh, idx_hd)`` bf16.
         k_indexer:    ``(total_comp_idx, idx_hd)`` bf16 — compressed-only K
                       (== Compressor's output, packed flat).
@@ -2358,7 +2405,8 @@ def fused_csa_indexer_sparse_attn(
         kv_offset:    ignored.
         cu_seqlens_q:               ``(B+1,)`` int32 CUDA.
         cu_seqlens_kv:              ``(B+1,)`` int32 — original-KV cu_seqlens.
-        cu_seqlens_kv_full:         ``(B+1,)`` int32 — built by
+        cu_seqlens_kv_full:         ``(B+1,)`` int32 — required only by the
+                                    legacy layout and built by
                                     :func:`csa.build_cu_seqlens_kv_full`.
         cu_seqlens_compressed_idx:  ``(B+1,)`` int32 — Compressor's
                                     second return value.
@@ -2383,9 +2431,8 @@ def fused_csa_indexer_sparse_attn(
             KL is computed over the full causally-valid KV. See
             :class:`FusedCSAIndexerSparseAttnFunc` for the full data flow.
         compressed_kv: THD only (required) — ``(total_compressed_kv, d)``
-            bf16, the pre-packed compressed KV from the Compressor. Used
-            by the loss path; THD ``kv_full`` is per-segment concatenated
-            so it cannot be sliced uniformly the way SBHD ``kv_full`` is.
+            bf16, the sequence-major compressed KV from the Compressor. Used
+            directly by the loss path and as the appended region of raw THD KV.
         calculate_per_token_loss: if True, report raw local KL sum and
             compensate the cuDNN backward wrappers' local averaging.
         cu_seqlens_q_unpadded: THD only (optional) — ``(B+1,)`` int32,
@@ -2395,13 +2442,16 @@ def fused_csa_indexer_sparse_attn(
             so padding rows are excluded from the indexer KL loss and
             backward gradients.  Ignored when ``None`` or when it equals
             ``cu_seqlens_q``.
+        thd_window_size: THD raw-layout sliding-window width. Required when
+            ``thd_compressed_is_sequence_major=True``.
+        thd_compressed_is_sequence_major: lower logical compressed ids directly
+            into the appended sequence-major compressed buffer.
     """
     if cu_seqlens_q is not None:
         missing = [
             name
             for name, val in (
                 ("cu_seqlens_kv", cu_seqlens_kv),
-                ("cu_seqlens_kv_full", cu_seqlens_kv_full),
                 ("cu_seqlens_compressed_idx", cu_seqlens_compressed_idx),
                 ("max_seqlen_q", max_seqlen_q),
                 ("max_seqlen_compressed_idx", max_seqlen_compressed_idx),
@@ -2409,6 +2459,10 @@ def fused_csa_indexer_sparse_attn(
             )
             if val is None
         ]
+        if not thd_compressed_is_sequence_major and cu_seqlens_kv_full is None:
+            missing.append("cu_seqlens_kv_full")
+        if thd_compressed_is_sequence_major and thd_window_size is None:
+            missing.append("thd_window_size")
         if missing:
             raise ValueError(
                 f"fused_csa_indexer_sparse_attn THD mode requires {missing} " "to all be supplied."
@@ -2437,6 +2491,8 @@ def fused_csa_indexer_sparse_attn(
         max_seqlen_compressed_idx,
         compressed_kv,
         cu_seqlens_q_unpadded,
+        thd_window_size,
+        thd_compressed_is_sequence_major,
     )
 
 

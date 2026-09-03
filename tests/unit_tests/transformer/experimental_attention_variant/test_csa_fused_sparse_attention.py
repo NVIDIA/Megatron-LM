@@ -3456,9 +3456,8 @@ class TestRealKernelFusedIndexerSparseAttnThd:
     pipeline produces a numerically equivalent loss to the SBHD pipeline
     with ``b=1`` on the same tensors — both go through the same
     underlying cuDNN kernels, differing only in the layout-glue around
-    them. The sparse-loss THD path additionally exercises
-    :func:`local_to_global_flat` (over ``cu_seqlens_compressed_idx``)
-    and the ``topk_indices_global=True`` flag wiring.
+    them. The THD path additionally exercises raw sequence-major KV
+    lowering and the ``topk_indices_global=True`` flag wiring.
     """
 
     SHAPES = dict(
@@ -3495,9 +3494,11 @@ class TestRealKernelFusedIndexerSparseAttnThd:
         kv_full_sbhd = torch.randn(s['skv'], b, s['d'], dtype=torch.bfloat16, device=dev)
         attn_sink = torch.zeros(s['np_'], dtype=torch.float32, device=dev)
         torch.manual_seed(1)
-        win_idxs_sbhd = torch.randint(
-            0, s['sq'], (b, s['sq'], s['win_topk']), dtype=torch.int32, device=dev
-        )
+        query_rows = torch.arange(s['sq'], dtype=torch.int32, device=dev).unsqueeze(1)
+        window_offsets = torch.arange(s['win_topk'], dtype=torch.int32, device=dev)
+        win_idxs = (query_rows - s['win_topk'] + 1).clamp_min(0) + window_offsets
+        win_idxs = torch.where(win_idxs <= query_rows, win_idxs, -1)
+        win_idxs_sbhd = win_idxs.unsqueeze(0)
         q_indexer_sbhd = torch.randn(
             s['sq'], b, s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, device=dev
         )
@@ -3525,11 +3526,10 @@ class TestRealKernelFusedIndexerSparseAttnThd:
 
         # ---- THD equivalent --------------------------------------------------
         # Reshape: SBHD (sq, 1, ...) -> THD flat (sq, ...).
-        # kv_full SBHD layout is [kv (sq), compressed (n_comp)] in dim 0;
-        # the THD analogue is [kv (sq), compressed (n_comp)] per-segment.
+        # kv_full SBHD and raw THD are both [kv (sq), compressed (n_comp)]
+        # for this single-segment case.
         query_thd = query_sbhd.squeeze(1)  # (sq, np, d)
         kv_full_thd = kv_full_sbhd.squeeze(1)  # (skv, d)
-        win_idxs_thd = win_idxs_sbhd.squeeze(0)  # (sq, win_topk)
         q_indexer_thd = q_indexer_sbhd.squeeze(1)  # (sq, idx_nh, idx_hd)
         k_indexer_thd = k_indexer_sbhd.squeeze(1)  # (n_comp, idx_hd)
         weights_thd = weights_sbhd.squeeze(1)  # (sq, idx_nh)
@@ -3537,7 +3537,6 @@ class TestRealKernelFusedIndexerSparseAttnThd:
         # Single-segment cu_seqlens (B=1): total_q == sq.
         cu_q = _make_cu_seqlens([s['sq']], device=dev)
         cu_kv = _make_cu_seqlens([kv_offset], device=dev)
-        cu_kv_full = _make_cu_seqlens([s['skv']], device=dev)
         # Indexer K is per-segment compressed-only (n_comp positions).
         cu_comp_idx = _make_cu_seqlens([s['n_comp']], device=dev)
 
@@ -3548,7 +3547,7 @@ class TestRealKernelFusedIndexerSparseAttnThd:
             query_thd,
             kv_full_thd,
             attn_sink,
-            win_idxs_thd,
+            None,
             q_indexer_thd,
             k_indexer_thd,
             weights_thd,
@@ -3561,11 +3560,12 @@ class TestRealKernelFusedIndexerSparseAttnThd:
             kv_offset=0,  # ignored in THD
             cu_seqlens_q=cu_q,
             cu_seqlens_kv=cu_kv,
-            cu_seqlens_kv_full=cu_kv_full,
             cu_seqlens_compressed_idx=cu_comp_idx,
             max_seqlen_q=s['sq'],
             max_seqlen_compressed_idx=s['n_comp'],
             compressed_kv=compressed_kv_thd,
+            thd_window_size=s['win_topk'],
+            thd_compressed_is_sequence_major=True,
         )
 
         # SBHD and THD share the same underlying kernels; for B=1 the

@@ -186,7 +186,7 @@ def test_prepare_cp_compressor_input_builds_rank_row_map(monkeypatch):
         return hidden_compact, comp_ids
 
     monkeypatch.setattr(
-        csa_cp_utils.cp_layout_kernels.CompressorInputCompact, "apply", staticmethod(fake_apply)
+        csa_cp_utils.thd_layout_kernels.CompressorInputCompact, "apply", staticmethod(fake_apply)
     )
     hidden = torch.arange(16, dtype=torch.float32).reshape(16, 1)
     boundary = torch.arange(2, dtype=torch.float32).reshape(2, 1)
