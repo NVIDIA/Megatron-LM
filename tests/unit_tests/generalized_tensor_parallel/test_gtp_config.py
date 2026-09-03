@@ -36,11 +36,18 @@ def test_recipe_defaults_set_pad_for_alignment(recipe_kwargs, expected_pad):
     assert gtp_module.GTP_CONFIG.pad_for_alignment == expected_pad
 
 
-def test_bf16_recipe_leaves_pad_for_alignment_untouched():
-    """No quantized branch fires for bf16; the pre-existing value must survive."""
+def test_bf16_recipe_resets_pad_for_alignment_to_one():
+    """bf16 takes the else branch, which pins the pad at 1 -- it does NOT leave the old value.
+
+    This test used to assert the opposite (that a pre-existing 48 survives), which is what the
+    --gtp-remat-pad-for-alignment help text also claimed. Both were wrong: the `else:
+    update_gtp_config(pad_for_alignment=1)` branch predates the flag, so an unqualified bf16 run
+    gets 1, not the GTPRematConfig default of 16 and not whatever was set before. Anyone using
+    this knob to A/B alignment needs that baseline to be stated correctly.
+    """
     gtp_module.update_gtp_config(pad_for_alignment=48)
     gtp_module.configure_gtp_remat_from_recipe()
-    assert gtp_module.GTP_CONFIG.pad_for_alignment == 48
+    assert gtp_module.GTP_CONFIG.pad_for_alignment == 1
 
 
 @pytest.mark.parametrize(
