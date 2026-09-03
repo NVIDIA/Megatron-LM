@@ -1650,7 +1650,13 @@ class MultiTokenPredictionLayer(MegatronModule):
                         rotary_pos_cos=rotary_pos_cos,
                         rotary_pos_sin=rotary_pos_sin,
                         attention_bias=attention_bias,
-                        inference_params=inference_params,
+                        # Pass the modern kwarg, matching the hybrid branch above. The
+                        # deprecated `inference_params=` alias is only normalized INSIDE
+                        # `TransformerLayer.forward`, but `_should_call_local_cudagraph`
+                        # inspects the raw kwargs before that and dereferences
+                        # `kwargs['inference_context']` -> KeyError. Harmless while MTP always
+                        # passed None; the MTP KV cache passes a real context here.
+                        inference_context=inference_params,
                         packed_seq_params=packed_seq_params,
                         sequence_len_offset=sequence_len_offset,
                         padding_mask=padding_mask,
