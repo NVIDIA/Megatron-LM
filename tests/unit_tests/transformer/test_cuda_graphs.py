@@ -198,18 +198,28 @@ class TestCudaGraphConfigAndArguments:
         assert cfg.delay_offload_until_cuda_graph
         assert any(expert_module in str(record.message) for record in warning_records)
 
-    def test_delayed_expert_offload_warns_about_final_queue_drain(self):
-        with pytest.warns(UserWarning, match="final eager expert group can remain queued"):
-            cfg = _base_cuda_graph_config(
-                cuda_graph_impl='transformer_engine',
-                cuda_graph_modules=[CudaGraphModule.moe_router],
-                fine_grained_activation_offloading=True,
-                offload_modules=['expert_fc1'],
-                delay_offload_until_cuda_graph=True,
-                num_moe_experts=4,
-            )
+    def test_delayed_expert_offload_logs_about_final_queue_drain(self, monkeypatch):
+        log_records = []
+        monkeypatch.setattr(
+            transformer_config_module,
+            'log_single_rank',
+            lambda logger, level, message: log_records.append((logger, level, message)),
+        )
+
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine',
+            cuda_graph_modules=[CudaGraphModule.moe_router],
+            fine_grained_activation_offloading=True,
+            offload_modules=['expert_fc1'],
+            delay_offload_until_cuda_graph=True,
+            num_moe_experts=4,
+        )
 
         assert cfg.delay_offload_until_cuda_graph
+        assert len(log_records) == 1
+        assert log_records[0][0] is transformer_config_module.logger
+        assert log_records[0][1] == logging.WARNING
+        assert "final eager expert group can remain queued" in log_records[0][2]
 
     def test_local_impl_rejects_moe_router_graph_with_mlp_norm_offload(self):
         with pytest.raises(
@@ -1513,6 +1523,13 @@ class TestHybridTECudaGraphDiscovery:
 
         assert calls == ['backward_record', 'body', 'forward_record']
         assert torch.equal(output[0], torch.full((2, 1, 4), 4.0))
+
+    def test_hybrid_capture_requires_offload_interface_for_enabled_boundary(self):
+        wrapper = self._bare_hybrid_wrapper(offload_in_graph=True)
+        object.__setattr__(wrapper, 'off_interface', None)
+
+        with pytest.raises(AssertionError, match='offload[ _]interface'):
+            wrapper._te_cuda_graph_capture(torch.ones(2, 1, 4))
 
     def test_hybrid_capture_impl_rejects_raw_packed_sequence_kwargs(self):
         wrapper = self._bare_hybrid_wrapper(offload_in_graph=False)
