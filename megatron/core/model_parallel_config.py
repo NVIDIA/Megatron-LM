@@ -343,10 +343,10 @@ class ModelParallelConfig:
     ep_overlap_use_scheduled_tensor_lifetime: bool = False
     """Use schedule-aware cross-stream tensor retirement for fine-grained EP overlap.
 
-    When enabled, schedule nodes hand internal tensors back to their statically known
-    creation stream through the plan's existing event chain. External and detached
-    gradients keep using allocator ``record_stream`` retirement. This option is
-    experimental and disabled by default.
+    When enabled, each model-chunk plan binds tensors produced by schedule nodes to
+    their creation stream and hands them back through the existing event chain.
+    External and detached gradients keep using allocator ``record_stream`` retirement.
+    This option is experimental and disabled by default.
     """
 
     delay_wgrad_compute: bool = False

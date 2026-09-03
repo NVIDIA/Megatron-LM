@@ -161,8 +161,6 @@ class ScheduleNode:
         forward_nvtx_name: Optional[str] = None,
         backward_nvtx_name: Optional[str] = None,
         lifetime_manager: Optional[ScheduleTensorLifetimeManager] = None,
-        input_owner_stream: Optional[torch.cuda.Stream] = None,
-        backward_input_owner_stream: Optional[torch.cuda.Stream] = None,
     ):
         """Initialize a schedule node.
 
@@ -185,12 +183,6 @@ class ScheduleNode:
             lifetime_manager (ScheduleTensorLifetimeManager, optional): Schedule-aware
                 owner for cross-stream tensor retirement. ``None`` preserves the
                 allocator ``record_stream`` behavior.
-            input_owner_stream (torch.cuda.Stream, optional): Statically known stream
-                that produced this node's forward input. Only required for nodes with
-                ``free_input=True`` when schedule-aware retirement is enabled.
-            backward_input_owner_stream (torch.cuda.Stream, optional): Statically known
-                stream that produced this node's incoming backward gradient. ``None``
-                keeps the allocator ``record_stream`` fallback for external boundaries.
         """
         self.name = name
         self.forward_nvtx_name = forward_nvtx_name or f"{name} forward"
@@ -201,8 +193,6 @@ class ScheduleNode:
         self.event = event
         self.free_input = free_input
         self.lifetime_manager = lifetime_manager
-        self.input_owner_stream = input_owner_stream
-        self.backward_input_owner_stream = backward_input_owner_stream
         self.inputs = None
         self.outputs = None
         # When True, the forward runs under torch.no_grad() so no autograd graph is
@@ -254,23 +244,19 @@ class ScheduleNode:
 
             self.output = data
 
-        if self.free_input:
-            if self.lifetime_manager is not None and self.input_owner_stream is not None:
-                if isinstance(self.input_owner_stream, Callable):
-                    self.input_owner_stream = self.input_owner_stream()
-                self.lifetime_manager.retire_forward_inputs(
-                    inputs,
-                    owner_stream=self.input_owner_stream,
-                    consumer_stream=self.stream,
-                    node=node_name,
-                )
-            else:
-                # Preserve the allocator fallback when the producer is external or
-                # otherwise not encoded by the layer-node topology.
-                for input in inputs:
-                    if input is not None:
-                        input.record_stream(self.stream)
-                        input.untyped_storage().resize_(0)
+        if self.lifetime_manager is not None:
+            self.lifetime_manager.finish_forward(
+                inputs,
+                self.output,
+                stream=self.stream,
+                node=node_name,
+                retire_consumed=self.free_input,
+            )
+        elif self.free_input:
+            for input in inputs:
+                if input is not None:
+                    input.record_stream(self.stream)
+                    input.untyped_storage().resize_(0)
 
         return self.output
 
@@ -302,17 +288,16 @@ class ScheduleNode:
         grads = self.get_grad()
 
         if self.lifetime_manager is not None:
-            if isinstance(self.backward_input_owner_stream, Callable):
-                self.backward_input_owner_stream = self.backward_input_owner_stream()
             fallback_grads = (
                 consumed_grads[len(output_grad) :]
                 if isinstance(consumed_grads, tuple)
                 else consumed_grads
             )
-            self.lifetime_manager.retire_backward_inputs(
+            self.lifetime_manager.finish_backward(
                 output_grad,
-                owner_stream=self.backward_input_owner_stream,
-                consumer_stream=self.stream,
+                grads,
+                forward_outputs=self.output,
+                stream=self.stream,
                 node=node_name,
                 fallback_consumed=fallback_grads,
             )

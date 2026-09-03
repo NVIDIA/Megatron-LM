@@ -2,10 +2,10 @@
 
 """Schedule-local lifetime management for tensors crossing CUDA streams.
 
-Only tensors that the existing ``ScheduleNode`` path actively retires participate:
-forward ``free_input`` tensors and backward incoming gradients.  Their owner
-streams are known from the static layer-node topology.  Unknown or externally
-produced gradients retain the existing ``record_stream`` behavior.
+Only tensors produced and consumed by a ``ScheduleNode`` participate.  Each
+model-chunk plan records the stream that produced a concrete tensor, consumes
+that binding at the next real node, and falls back to allocator ``record_stream``
+retirement when an input came from outside the plan.
 
 A cross-stream consumer holds the tensor until a later node from the same plan
 acquires the owner stream.  That acquire already waits on the plan event, so the
@@ -30,10 +30,19 @@ class ReleaseAction(Enum):
 
 
 @dataclass
+class TensorOwner:
+    """Strong, plan-local binding from one concrete tensor to its producer stream."""
+
+    tensor: torch.Tensor
+    stream: torch.cuda.Stream
+    producer_node: str
+
+
+@dataclass
 class DeferredRelease:
     """Strong reference held until the owner stream has acquired the consumer."""
 
-    payload: Any
+    tensor: torch.Tensor
     action: ReleaseAction
     owner_stream: torch.cuda.Stream
     consumer_node: str
@@ -55,6 +64,13 @@ def _iter_tensors(value: Any) -> Iterable[torch.Tensor]:
 
 
 def _unique_cuda_tensors(value: Any) -> list[torch.Tensor]:
+    # Schedule edges are overwhelmingly a single tensor (or a one-tensor tuple).
+    # Keep those hot paths allocation-light; recurse only for structured outputs.
+    if isinstance(value, torch.Tensor):
+        return [value] if value.is_cuda else []
+    if isinstance(value, (list, tuple)) and len(value) == 1 and isinstance(value[0], torch.Tensor):
+        return [value[0]] if value[0].is_cuda else []
+
     tensors = []
     seen = set()
     for tensor in _iter_tensors(value):
@@ -69,18 +85,21 @@ def _unique_cuda_tensors(value: Any) -> list[torch.Tensor]:
 class ScheduleTensorLifetimeManager:
     """Retire selected tensors within one model-chunk schedule plan.
 
-    Ownership is passed explicitly by the layer topology, so ordinary forward
-    outputs and backward gradients are not registered or scanned.  The only
-    dynamic tags identify gradients entering the schedule from an external
-    boundary, where the owner stream is deliberately unknown.
+    Ownership follows concrete tensor objects rather than schedule-node input
+    slots.  Bindings are strong and single-consumer: a real node consumes each
+    input binding once, while ``NoopScheduleNode`` naturally carries the same
+    object and binding to the next real node.  The schedule's existing
+    ``free_input`` contract guarantees that retired inputs do not alias outputs.
     """
 
     def __init__(self):
-        self._external_gradients: dict[int, torch.Tensor] = {}
+        self._owners: dict[int, TensorOwner] = {}
         self._pending: dict[int, list[DeferredRelease]] = {}
         self._pending_count = 0
         self.stats = {
-            "external_gradient_tags": 0,
+            "published": 0,
+            "consumed": 0,
+            "exported": 0,
             "same_stream": 0,
             "deferred": 0,
             "record_stream_fallback": 0,
@@ -89,8 +108,16 @@ class ScheduleTensorLifetimeManager:
             "max_pending": 0,
             "pending_before_finalize": 0,
             "pending_at_finalize": 0,
+            "owners_before_finalize": 0,
+            "owners_at_finalize": 0,
         }
         self.last_release_node: Optional[str] = None
+
+    @property
+    def owners(self) -> list[TensorOwner]:
+        """Return live tensor-owner bindings, primarily for diagnostics and tests."""
+
+        return list(self._owners.values())
 
     @property
     def pending(self) -> list[DeferredRelease]:
@@ -98,47 +125,64 @@ class ScheduleTensorLifetimeManager:
 
         return [entry for entries in self._pending.values() for entry in entries]
 
-    def retire_forward_inputs(
+    def finish_forward(
         self,
         consumed: Any,
+        produced: Any,
         *,
-        owner_stream: torch.cuda.Stream,
-        consumer_stream: torch.cuda.Stream,
+        stream: torch.cuda.Stream,
         node: str,
+        retire_consumed: bool,
     ) -> None:
-        """Retire ``free_input`` tensors using the statically known producer stream."""
+        """Consume input bindings and publish outputs from one forward node."""
 
-        self._retire(consumed, ReleaseAction.EMPTY_STORAGE, owner_stream, consumer_stream, node)
+        action = ReleaseAction.EMPTY_STORAGE if retire_consumed else None
+        self._consume(consumed, action=action, consumer_stream=stream, node=node)
+        self.publish(produced, stream, node)
 
-    def retire_backward_inputs(
+    def finish_backward(
         self,
         consumed: Any,
+        produced: Any,
         *,
-        owner_stream: Optional[torch.cuda.Stream],
-        consumer_stream: torch.cuda.Stream,
+        forward_outputs: Any,
+        stream: torch.cuda.Stream,
         node: str,
         fallback_consumed: Any = (),
     ) -> None:
-        """Protect incoming gradients using the statically known previous node stream."""
+        """Retire incoming gradients and publish gradients produced by one backward node."""
 
-        if owner_stream is None or (
-            self._external_gradients and self._consume_external_gradients(consumed)
-        ):
-            self._record_stream(consumed, consumer_stream)
-        else:
-            # Store the tuple as one strong-reference payload.  There is no need to
-            # inspect each ordinary gradient on this hot path.
-            self._retire(
-                consumed, ReleaseAction.DROP_REFERENCE, owner_stream, consumer_stream, node
-            )
+        # A recompute segment's final forward output is consumed by autograd rather
+        # than another forward node, so its owner metadata ends at this backward.
+        self._consume(forward_outputs, action=None, consumer_stream=stream, node=node)
+        self._consume(
+            consumed, action=ReleaseAction.DROP_REFERENCE, consumer_stream=stream, node=node
+        )
+        self._record_stream(fallback_consumed, stream)
+        self.publish(produced, stream, node)
 
-        self._record_stream(fallback_consumed, consumer_stream)
+    def publish(self, value: Any, stream: torch.cuda.Stream, node: str) -> None:
+        """Bind tensors produced by a real schedule node to its execution stream."""
 
-    def mark_external_gradients(self, gradients: Any) -> None:
-        """Mark gradients entering this plan without a statically known owner stream."""
+        for tensor in _unique_cuda_tensors(value):
+            tensor_id = id(tensor)
+            existing = self._owners.get(tensor_id)
+            if existing is not None and existing.tensor is tensor:
+                raise RuntimeError(
+                    f"Tensor already has an unconsumed owner binding from "
+                    f"{existing.producer_node!r}; producer={node!r}, "
+                    f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}"
+                )
+            self._owners[tensor_id] = TensorOwner(tensor=tensor, stream=stream, producer_node=node)
+            self.stats["published"] += 1
 
-        for tensor in _unique_cuda_tensors(gradients):
-            self._mark_external_gradient(tensor)
+    def export(self, value: Any) -> None:
+        """Move plan outputs outside manager ownership without retiring their storage."""
+
+        for tensor in _unique_cuda_tensors(value):
+            owner = self._take_owner(tensor)
+            if owner is not None:
+                self.stats["exported"] += 1
 
     def drain(self, stream: torch.cuda.Stream, release_node: str, terminal: bool = False) -> None:
         """Release entries after the caller has enqueued its normal plan-event wait."""
@@ -148,13 +192,13 @@ class ScheduleTensorLifetimeManager:
             return
         self._pending_count -= len(entries)
         for entry in entries:
-            self._apply_action(entry.payload, entry.action)
+            self._apply_action(entry.tensor, entry.action)
             stat = "released_terminal" if terminal else "released_natural"
             self.stats[stat] += 1
         self.last_release_node = release_node
 
-    def finalize_phase(self, event: torch.cuda.Event, phase: str) -> None:
-        """Hand back entries that have no later owner-stream node in this phase."""
+    def finalize_phase(self, event: torch.cuda.Event, phase: str, outputs: Any = ()) -> None:
+        """Hand pending tensors back, export outputs, and audit owner bindings."""
 
         self.stats["pending_before_finalize"] = self._pending_count
         for entries in list(self._pending.values()):
@@ -169,42 +213,66 @@ class ScheduleTensorLifetimeManager:
             raise RuntimeError(
                 f"Phase {phase!r} finalized with {self._pending_count} deferred tensors"
             )
-        self._external_gradients.clear()
 
-    def _mark_external_gradient(self, tensor: torch.Tensor) -> None:
-        self._external_gradients[id(tensor)] = tensor
-        self.stats["external_gradient_tags"] += 1
+        self.stats["owners_before_finalize"] = len(self._owners)
+        self.export(outputs)
+        self.stats["owners_at_finalize"] = len(self._owners)
+        if self._owners:
+            producers = sorted({owner.producer_node for owner in self._owners.values()})
+            raise RuntimeError(
+                f"Phase {phase!r} finalized with {len(self._owners)} unconsumed tensor-owner "
+                f"bindings from producers {producers}"
+            )
 
-    def _consume_external_gradients(self, gradients: Any) -> bool:
-        found = False
-        for tensor in _unique_cuda_tensors(gradients):
-            external = self._external_gradients.get(id(tensor))
-            if external is tensor:
-                self._external_gradients.pop(id(tensor), None)
-                found = True
-        return found
+    def _consume(
+        self,
+        value: Any,
+        *,
+        action: Optional[ReleaseAction],
+        consumer_stream: torch.cuda.Stream,
+        node: str,
+    ) -> None:
+        for tensor in _unique_cuda_tensors(value):
+            owner = self._take_owner(tensor)
+            if owner is None:
+                if action is not None:
+                    self._record_stream(tensor, consumer_stream)
+                    self._apply_action(tensor, action)
+                continue
+
+            self.stats["consumed"] += 1
+            if action is None:
+                continue
+            self._retire_tensor(tensor, action, owner.stream, consumer_stream, node)
+
+    def _take_owner(self, tensor: torch.Tensor) -> Optional[TensorOwner]:
+        owner = self._owners.get(id(tensor))
+        if owner is None or owner.tensor is not tensor:
+            return None
+        self._owners.pop(id(tensor), None)
+        return owner
 
     def _record_stream(self, tensors: Any, stream: torch.cuda.Stream) -> None:
         for tensor in _unique_cuda_tensors(tensors):
             tensor.record_stream(stream)
             self.stats["record_stream_fallback"] += 1
 
-    def _retire(
+    def _retire_tensor(
         self,
-        payload: Any,
+        tensor: torch.Tensor,
         action: ReleaseAction,
         owner_stream: torch.cuda.Stream,
         consumer_stream: torch.cuda.Stream,
         node: str,
     ) -> None:
         if _stream_handle(owner_stream) == _stream_handle(consumer_stream):
-            self._apply_action(payload, action)
+            self._apply_action(tensor, action)
             self.stats["same_stream"] += 1
             return
 
         self._pending.setdefault(_stream_handle(owner_stream), []).append(
             DeferredRelease(
-                payload=payload, action=action, owner_stream=owner_stream, consumer_node=node
+                tensor=tensor, action=action, owner_stream=owner_stream, consumer_node=node
             )
         )
         self._pending_count += 1
@@ -212,9 +280,8 @@ class ScheduleTensorLifetimeManager:
         self.stats["max_pending"] = max(self.stats["max_pending"], self._pending_count)
 
     @staticmethod
-    def _apply_action(payload: Any, action: ReleaseAction) -> None:
+    def _apply_action(tensor: torch.Tensor, action: ReleaseAction) -> None:
         if action is ReleaseAction.EMPTY_STORAGE:
-            for tensor in _unique_cuda_tensors(payload):
-                tensor.untyped_storage().resize_(0)
+            tensor.untyped_storage().resize_(0)
         elif action is not ReleaseAction.DROP_REFERENCE:
             raise AssertionError(f"Unknown scheduled tensor release action: {action}")

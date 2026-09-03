@@ -334,8 +334,6 @@ class TransformerLayerNode(ScheduleNode):
         bwd_dw_callables=None,
         extra_args={},
         lifetime_manager=None,
-        input_owner_stream=None,
-        backward_input_owner_stream=None,
     ):
         """Initialize a transformer layer node.
 
@@ -349,9 +347,6 @@ class TransformerLayerNode(ScheduleNode):
             name (str): Node name, also used to determine memory strategy
             bwd_dw_callables (list): List of weight gradient functions for the layer.
             extra_args (dict): Extra arguments for the node: is_moe, config.
-            input_owner_stream: Stream that produced this node's forward input.
-            backward_input_owner_stream: Stream that produced this node's incoming
-                backward gradient.
         """
         # Determine whether to free input memory
         config = extra_args.get("config", None)
@@ -372,8 +367,6 @@ class TransformerLayerNode(ScheduleNode):
             free_input=free_input,
             name=name,
             lifetime_manager=lifetime_manager,
-            input_owner_stream=input_owner_stream,
-            backward_input_owner_stream=backward_input_owner_stream,
         )
         self.layer_state = layer_state
         self.chunk_state = chunk_state
