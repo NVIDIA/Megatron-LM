@@ -27,6 +27,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_layer_type_list_from_layer_config_list,
     validate_segment_layers,
 )
+from megatron.core.models.hybrid.hybrid_layer_config import validate_hybrid_layer_config_families
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -134,6 +135,7 @@ class HybridStack(MegatronModule):
             )
             layer_config_list = validate_segment_layers(segment, config)
 
+        validate_hybrid_layer_config_families(layer_config_list)
         layer_utils.validate_tp_comm_overlap(config, layer_config_list, has_mtp=is_mtp_layer)
 
         super().__init__(config=config)

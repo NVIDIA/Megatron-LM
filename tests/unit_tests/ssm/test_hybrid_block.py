@@ -99,7 +99,14 @@ def test_all_layer_configs_route_to_matching_specs(monkeypatch, layer_pattern, e
     assert [layer.layer_number for layer in block.layers] == expected_layer_numbers
 
 
-def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
+@pytest.mark.parametrize(
+    ("layer_pattern", "expected_layouts"),
+    [
+        ("MG*-E", ("contiguous", "contiguous", "zigzag", "contiguous", "contiguous")),
+        ("MG-DE+", ("contiguous", "contiguous", "contiguous", "zigzag", "contiguous", "zigzag")),
+    ],
+)
+def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch, layer_pattern, expected_layouts):
     """Each layer config type selects the corresponding context-parallel layout."""
 
     class BuiltLayer(torch.nn.Module):
@@ -124,15 +131,13 @@ def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
     )
 
     config = MLATransformerConfig(
-        num_layers=7,
+        num_layers=len(layer_pattern),
         hidden_size=64,
         num_attention_heads=4,
         linear_cp_layout="contiguous",
         attention_cp_layout="zigzag",
     )
-    layer_config_list = validate_segment_layers("MG*-E", config) + validate_segment_layers(
-        "D+", config
-    )
+    layer_config_list = validate_segment_layers(layer_pattern, config)
 
     HybridStack(
         config=config,
@@ -146,15 +151,7 @@ def test_cp_layouts_are_selected_by_layer_config_type(monkeypatch):
         ),
     )
 
-    assert layout_manager_kwargs["layer_layouts"] == (
-        "contiguous",
-        "contiguous",
-        "zigzag",
-        "contiguous",
-        "contiguous",
-        "zigzag",
-        "zigzag",
-    )
+    assert layout_manager_kwargs["layer_layouts"] == expected_layouts
     assert layout_manager_kwargs["boundary_layout"] == "contiguous"
 
 
@@ -337,6 +334,23 @@ def test_explicit_layer_config_mutations_are_isolated(monkeypatch):
     assert type(layer_configs) is list
     assert root_config.add_bias_linear is True
     assert [layer_config.add_bias_linear for layer_config in layer_configs] == [False, True]
+
+
+def test_explicit_layer_configs_reject_mixed_attention_families():
+    root_config = MLATransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4)
+    layer_configs = validate_segment_layers(Symbols.ATTENTION, root_config)
+    layer_configs.extend(validate_segment_layers(Symbols.MLA, root_config))
+
+    with pytest.raises(ValueError, match="AttentionLayerConfig cannot be combined with MLA"):
+        HybridStack(
+            config=root_config,
+            submodules=hybrid_stack_spec.submodules,
+            layer_config_list=layer_configs,
+            pre_process=False,
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=_make_pg_collection(),
+        )
 
 
 @pytest.mark.parametrize(

@@ -2,7 +2,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, cast
 
 import torch
 
@@ -10,10 +10,16 @@ from megatron.core.models.hybrid.hybrid_layer_config import (
     ArchitectureEntry,
     MTPSplit,
     PipelineSplit,
+    scan_hybrid_layer_config_list,
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import log_on_each_pipeline_stage, log_single_rank
+from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
+    log_on_each_pipeline_stage,
+    log_single_rank,
+)
 
 Symbols = layer_utils.Symbols
 
@@ -342,6 +348,180 @@ def layer_config_list_from_hybrid_layer_pattern(
     return layer_config_list
 
 
+def _clone_layer_configs(layer_config_list: Sequence[TransformerConfig]) -> list[TransformerConfig]:
+    """Clone configs before constructing physical layers."""
+
+    return [type(layer_config).from_config(layer_config) for layer_config in layer_config_list]
+
+
+def _normalize_vp_stage(vp_stage: Optional[int], vp_size: int) -> int:
+    """Validate and normalize the virtual-pipeline stage index."""
+
+    if vp_stage is None:
+        if vp_size > 1:
+            raise ValueError(
+                "vp_stage must be provided when virtual_pipeline_model_parallel_size is set."
+            )
+        return 0
+    if not 0 <= vp_stage < vp_size:
+        raise ValueError(f"vp_stage must be in [0, {vp_size}), got {vp_stage}.")
+    return vp_stage
+
+
+def select_pipeline_config_segment(
+    decoder_entries: Sequence[TransformerConfig | type[PipelineSplit]],
+    config: TransformerConfig,
+    pp_group: Optional[torch.distributed.ProcessGroup],
+    vp_stage: Optional[int],
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> tuple[list[TransformerConfig], int]:
+    """Select this PP/VPP rank's decoder configs from a list architecture."""
+
+    pp_rank = get_pg_rank(pp_group)
+    pp_size = get_pg_size(pp_group)
+    if config.pipeline_model_parallel_size != pp_size:
+        raise ValueError(
+            f"config.pipeline_model_parallel_size is {config.pipeline_model_parallel_size}, "
+            f"but the model pipeline process group has size {pp_size}."
+        )
+    if (
+        config.virtual_pipeline_model_parallel_size is not None
+        and config.virtual_pipeline_model_parallel_size < 1
+    ):
+        raise ValueError(
+            "config.virtual_pipeline_model_parallel_size must be positive when set, got "
+            f"{config.virtual_pipeline_model_parallel_size}."
+        )
+    if any(entry is MTPSplit for entry in decoder_entries):
+        raise ValueError("decoder_entries must not contain MTPSplit markers.")
+
+    architecture_metadata = (
+        scan_hybrid_layer_config_list(decoder_entries, pp_size=pp_size) if decoder_entries else None
+    )
+    global_layer_config_list = [
+        cast(TransformerConfig, entry) for entry in decoder_entries if entry is not PipelineSplit
+    ]
+    decoder_layer_count = (
+        architecture_metadata.decoder_layer_count if architecture_metadata is not None else 0
+    )
+    if decoder_layer_count != config.num_layers:
+        raise ValueError(
+            f"layer_config_list defines {decoder_layer_count} decoder layers, "
+            f"but config.num_layers is {config.num_layers}."
+        )
+
+    topology_conflicts = []
+    if config.pipeline_model_parallel_layout is not None:
+        topology_conflicts.append("pipeline_model_parallel_layout")
+    has_pipeline_splits = bool(
+        architecture_metadata is not None and architecture_metadata.pipeline_split_indices
+    )
+    if has_pipeline_splits:
+        if config.num_layers_in_first_pipeline_stage is not None:
+            topology_conflicts.append("num_layers_in_first_pipeline_stage")
+        if config.num_layers_in_last_pipeline_stage is not None:
+            topology_conflicts.append("num_layers_in_last_pipeline_stage")
+    if config.account_for_embedding_in_pipeline_split:
+        topology_conflicts.append("account_for_embedding_in_pipeline_split")
+    if config.account_for_loss_in_pipeline_split:
+        topology_conflicts.append("account_for_loss_in_pipeline_split")
+    if topology_conflicts:
+        raise ValueError(
+            "layer_config_list cannot be combined with pipeline topology controls: "
+            + ", ".join(topology_conflicts)
+            + "."
+        )
+
+    if has_pipeline_splits:
+        assert architecture_metadata is not None
+        segments: list[list[TransformerConfig]] = [[]]
+        for entry in decoder_entries:
+            if entry is PipelineSplit:
+                segments.append([])
+            else:
+                segments[-1].append(cast(TransformerConfig, entry))
+
+        assert architecture_metadata.inferred_vpp_size is not None
+        vp_size = architecture_metadata.inferred_vpp_size
+        configured_vpp_size = config.virtual_pipeline_model_parallel_size or 1
+        if configured_vpp_size != vp_size:
+            raise ValueError(
+                f"PipelineSplit infers virtual pipeline size {vp_size}, but "
+                f"config.virtual_pipeline_model_parallel_size is "
+                f"{config.virtual_pipeline_model_parallel_size}."
+            )
+        vp_rank = _normalize_vp_stage(vp_stage, vp_size)
+        segment_index = vp_rank * pp_size + pp_rank
+        layer_offset = sum(len(segment) for segment in segments[:segment_index])
+        selected = segments[segment_index]
+        segment_log = f", segment_index={segment_index}/{len(segments)}"
+    else:
+        vp_size = config.virtual_pipeline_model_parallel_size or 1
+        vp_rank = _normalize_vp_stage(vp_stage, vp_size)
+        explicit_stage_layer_counts = [
+            layer_count
+            for layer_count in (
+                config.num_layers_in_first_pipeline_stage,
+                config.num_layers_in_last_pipeline_stage,
+            )
+            if layer_count is not None
+        ]
+        middle_stage_count = pp_size - len(explicit_stage_layer_counts)
+        middle_layer_count = len(global_layer_config_list) - sum(explicit_stage_layer_counts)
+        if (
+            middle_stage_count < 0
+            or middle_layer_count < 0
+            or (middle_stage_count == 0 and middle_layer_count != 0)
+        ):
+            raise ValueError(
+                "First/last pipeline stage overrides are incompatible with the PP size "
+                "and decoder layer count."
+            )
+
+        if pp_size == 1 and vp_size > 1:
+            if len(global_layer_config_list) % vp_size != 0:
+                raise ValueError(
+                    f"The {len(global_layer_config_list)} decoder configs in layer_config_list "
+                    f"must be evenly divisible across VPP={vp_size}."
+                )
+            chunk_layer_counts = [len(global_layer_config_list) // vp_size] * vp_size
+        else:
+            from megatron.core.transformer.transformer_block import get_num_layers_to_build
+
+            try:
+                chunk_layer_counts = [
+                    get_num_layers_to_build(config, vp_stage=chunk_vp_rank, pp_rank=chunk_pp_rank)
+                    for chunk_vp_rank in range(vp_size)
+                    for chunk_pp_rank in range(pp_size)
+                ]
+            except AssertionError as error:
+                raise ValueError(str(error)) from error
+
+        if sum(chunk_layer_counts) != len(global_layer_config_list):
+            raise ValueError(
+                f"Pipeline allocation owns {sum(chunk_layer_counts)} decoder layers, but "
+                f"layer_config_list defines {len(global_layer_config_list)}."
+            )
+        segment_index = vp_rank * pp_size + pp_rank
+        num_layers_to_build = chunk_layer_counts[segment_index]
+        layer_offset = sum(chunk_layer_counts[:segment_index])
+        selected = global_layer_config_list[layer_offset : layer_offset + num_layers_to_build]
+        segment_log = ""
+
+    selected = _clone_layer_configs(selected)
+    log_on_each_pipeline_stage(
+        logger,
+        logging.INFO,
+        f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_rank}, "
+        f"num_layers={len(selected)}, layer_offset={layer_offset}"
+        f"{segment_log}",
+        tp_group=tp_group,
+        dp_cp_group=dp_cp_group,
+    )
+    return selected, layer_offset
+
+
 def select_pipeline_segment(
     main_pattern: str,
     config: TransformerConfig,
@@ -352,7 +532,10 @@ def select_pipeline_segment(
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tuple[List[TransformerConfig], int]:
-    """Select and validate the pipeline segment for the given PP rank and VP stage.
+    """Legacy pattern-based pipeline selector.
+
+    ``HybridModel`` does not call this function; it converts compatibility patterns to
+    config lists and calls :func:`select_pipeline_config_segment` instead.
 
     When the main pattern contains '|' pipe separators, splits by '|' into
     pipeline segments and selects the segment for the current PP rank / VP stage.

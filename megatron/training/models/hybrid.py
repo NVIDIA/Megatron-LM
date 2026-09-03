@@ -15,7 +15,12 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
+from megatron.core.pipeline_parallel.utils import (
+    is_pp_first_stage,
+    is_pp_last_stage,
+    is_vp_first_stage,
+    is_vp_last_stage,
+)
 from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_stack_modelopt_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module, MegatronModule
@@ -176,12 +181,15 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         else:
             padded_vocab_size = self._model_config.vocab_size
 
-        pre_process = (
-            pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
-        )
-        post_process = (
-            post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
-        )
+        vp_size = self._model_config.virtual_pipeline_model_parallel_size
+        if pre_process is None:
+            pre_process = is_vp_first_stage(vp_stage, vp_size) and is_pp_first_stage(
+                pg_collection.pp
+            )
+        if post_process is None:
+            post_process = is_vp_last_stage(vp_stage, vp_size) and is_pp_last_stage(
+                pg_collection.pp
+            )
         return HybridModel(
             config=self._model_config.transformer,
             hybrid_stack_spec=hybrid_stack_spec,

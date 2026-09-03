@@ -2091,7 +2091,6 @@ class MultiTokenPredictionBlock(MegatronModule):
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        # Hybrid path: direct config template.
         mtp_num_depths: int = 0,
         hybrid_submodules: Optional["HybridStackSubmodules"] = None,
         mamba_submodules: Optional["HybridStackSubmodules"] = None,
@@ -2105,6 +2104,17 @@ class MultiTokenPredictionBlock(MegatronModule):
                 template for every physical HybridStack built by this MTP block.
         """
         super().__init__(config=config)
+        if mtp_num_depths not in (0, config.mtp_num_layers):
+            raise ValueError(
+                f"mtp_num_depths={mtp_num_depths} conflicts with "
+                f"config.mtp_num_layers={config.mtp_num_layers}."
+            )
+        if mtp_num_depths:
+            warnings.warn(
+                "mtp_num_depths is deprecated; set config.mtp_num_layers instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if mamba_submodules is not None:
             if hybrid_submodules is not None:
                 raise ValueError(
@@ -2124,6 +2134,10 @@ class MultiTokenPredictionBlock(MegatronModule):
             )
         if self.is_hybrid_mtp:
             assert mtp_layer_config_list is not None
+            if not isinstance(self.config.mtp_num_layers, int) or self.config.mtp_num_layers < 1:
+                raise ValueError(
+                    "Hybrid MTP requires config.mtp_num_layers to be a positive integer."
+                )
             if len(mtp_layer_config_list) == 0:
                 raise ValueError("mtp_layer_config_list must not be empty.")
             if not all(
@@ -2135,7 +2149,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self.vp_stage = vp_stage
-        self.mtp_num_depths = mtp_num_depths
+        self.mtp_num_depths = mtp_num_depths  # Deprecated compatibility attribute; not used.
         self.hybrid_submodules = hybrid_submodules
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
         self.name = name
@@ -2188,11 +2202,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         pg_collection: ProcessGroupCollection,
         mtp_layer_config_list: Sequence[TransformerConfig] | None,
     ) -> None:
-        # Determine number of depths to build
-        if self.mtp_num_depths > 0:
-            num_depths = self.mtp_num_depths
-        else:
-            num_depths = self.config.mtp_num_layers or len(self.submodules.layer_specs)
+        num_depths = self.config.mtp_num_layers or len(self.submodules.layer_specs)
 
         def build_gpt_layer(layer_spec, layer_number):
             """Build one GPT MTP layer from its module spec."""

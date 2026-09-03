@@ -11,6 +11,8 @@ from megatron.core.models.hybrid import (
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
 
@@ -172,6 +174,14 @@ def test_scanner_accepts_identity_aligned_mtp_heads():
     assert scan_hybrid_layer_config_list(
         [_layer(MambaLayerConfig), MTPSplit, *head, MTPSplit, *head]
     ).mtp_split_indices == (1, 4)
+
+
+@pytest.mark.parametrize("specialized_attention_config", [MLALayerConfig, DSALayerConfig])
+def test_scanner_rejects_mixed_attention_config_families(specialized_attention_config):
+    with pytest.raises(ValueError, match="AttentionLayerConfig cannot be combined with MLA"):
+        scan_hybrid_layer_config_list(
+            [_layer(AttentionLayerConfig), _layer(specialized_attention_config)]
+        )
 
 
 @pytest.mark.parametrize(

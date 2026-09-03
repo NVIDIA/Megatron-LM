@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Sequence, TypeAlias, get_args
+from typing import Sequence, TypeAlias, cast, get_args
 
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
@@ -10,6 +10,7 @@ from megatron.core.transformer.attention_layer_config import AttentionLayerConfi
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class PipelineSplit:
@@ -38,6 +39,18 @@ _SupportedLayerConfig: TypeAlias = (
 ArchitectureEntry: TypeAlias = _SupportedLayerConfig | type[PipelineSplit] | type[MTPSplit]
 
 _SUPPORTED_LAYER_CONFIG_TYPES = get_args(_SupportedLayerConfig)
+
+
+def validate_hybrid_layer_config_families(layer_config_list: Sequence[TransformerConfig]) -> None:
+    """Reject layer-config families that cannot share one HybridStack."""
+
+    layer_config_types = {type(layer_config) for layer_config in layer_config_list}
+    if AttentionLayerConfig in layer_config_types and layer_config_types.intersection(
+        {DSALayerConfig, MLALayerConfig}
+    ):
+        raise ValueError(
+            "AttentionLayerConfig cannot be combined with MLA or DSA layer configs in one model."
+        )
 
 
 @dataclass(frozen=True)
@@ -82,6 +95,7 @@ def scan_hybrid_layer_config_list(
 
     pipeline_split_indices: list[int] = []
     mtp_split_indices: list[int] = []
+    layer_configs: list[TransformerConfig] = []
     seen_mtp = False
 
     for index, entry in enumerate(layer_config_list):
@@ -99,6 +113,10 @@ def scan_hybrid_layer_config_list(
                 f"Invalid hybrid layer config entry at index {index}: {entry!r}. "
                 "Expected a supported TransformerConfig, PipelineSplit, or MTPSplit."
             )
+        else:
+            layer_configs.append(cast(TransformerConfig, entry))
+
+    validate_hybrid_layer_config_families(layer_configs)
 
     decoder_end = mtp_split_indices[0] if mtp_split_indices else len(layer_config_list)
     decoder_layer_count = sum(
@@ -165,4 +183,5 @@ __all__ = [
     "MTPSplit",
     "PipelineSplit",
     "scan_hybrid_layer_config_list",
+    "validate_hybrid_layer_config_families",
 ]

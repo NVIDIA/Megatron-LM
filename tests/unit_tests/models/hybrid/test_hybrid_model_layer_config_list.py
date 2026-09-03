@@ -97,10 +97,11 @@ def patch_cpu_model_construction(monkeypatch):
         return built
 
     monkeypatch.setattr(LanguageModule, "_set_attention_backend", lambda self: None)
-    monkeypatch.setattr(hybrid_model_module, "get_pg_rank", lambda group: group.rank())
     monkeypatch.setattr(hybrid_model_module, "get_pg_size", lambda group: group.size())
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: group.rank())
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: group.size())
     monkeypatch.setattr(
-        hybrid_model_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
+        hybrid_allocation_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(hybrid_model_module, "build_module", fake_build_module)
     return build_calls
@@ -124,15 +125,14 @@ def test_uneven_pipeline_split_segments_preserve_ownership_and_offsets(
             architecture.append(PipelineSplit)
         architecture.extend(segment)
 
-    metadata = scan_hybrid_layer_config_list(architecture, pp_size=2)
-    monkeypatch.setattr(hybrid_model_module, "get_pg_rank", lambda group: pp_rank)
-    monkeypatch.setattr(hybrid_model_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: pp_rank)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 2)
     monkeypatch.setattr(
-        hybrid_model_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
+        hybrid_allocation_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
     )
 
-    selected, offset = hybrid_model_module._select_pipeline_config_segment(
-        architecture, metadata, config, _FakeGroup(pp_rank, 2), vp_stage
+    selected, offset = hybrid_allocation_module.select_pipeline_config_segment(
+        architecture, config, _FakeGroup(pp_rank, 2), vp_stage
     )
 
     assert offset == expected_offset
@@ -151,15 +151,14 @@ def test_implicit_pipeline_selection_evenly_slices_pp_and_vpp(monkeypatch):
         _layer(MoELayerConfig, config),
         _layer(MLPLayerConfig, config),
     ]
-    metadata = scan_hybrid_layer_config_list(architecture, pp_size=2)
-    monkeypatch.setattr(hybrid_model_module, "get_pg_rank", lambda group: 0)
-    monkeypatch.setattr(hybrid_model_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 2)
     monkeypatch.setattr(
-        hybrid_model_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
+        hybrid_allocation_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
     )
 
-    selected, offset = hybrid_model_module._select_pipeline_config_segment(
-        architecture, metadata, config, _FakeGroup(0, 2), vp_stage=1
+    selected, offset = hybrid_allocation_module.select_pipeline_config_segment(
+        architecture, config, _FakeGroup(0, 2), vp_stage=1
     )
 
     assert offset == 2
@@ -174,13 +173,104 @@ def test_implicit_pipeline_selection_requires_exact_divisibility(monkeypatch):
         _layer(AttentionLayerConfig, config),
         _layer(MLPLayerConfig, config),
     ]
-    metadata = scan_hybrid_layer_config_list(architecture, pp_size=2)
-    monkeypatch.setattr(hybrid_model_module, "get_pg_rank", lambda group: 0)
-    monkeypatch.setattr(hybrid_model_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 2)
 
-    with pytest.raises(ValueError, match="must be evenly divisible across PP=2 and VPP=1"):
-        hybrid_model_module._select_pipeline_config_segment(
-            architecture, metadata, config, _FakeGroup(0, 2), vp_stage=None
+    with pytest.raises(ValueError, match="should be divisible"):
+        hybrid_allocation_module.select_pipeline_config_segment(
+            architecture, config, _FakeGroup(0, 2), vp_stage=None
+        )
+
+
+def test_pipeline_selection_rejects_config_and_group_size_mismatch(monkeypatch):
+    config = _config(num_layers=2, pp_size=2)
+    architecture = [_layer(MambaLayerConfig, config), _layer(AttentionLayerConfig, config)]
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 1)
+
+    with pytest.raises(ValueError, match="process group has size 1"):
+        hybrid_allocation_module.select_pipeline_config_segment(
+            architecture, config, _FakeGroup(), vp_stage=None
+        )
+
+
+def test_pipeline_selection_rejects_decoder_count_mismatch(monkeypatch):
+    config = _config(num_layers=2)
+    architecture = [_layer(MambaLayerConfig, config)]
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 1)
+
+    with pytest.raises(ValueError, match="defines 1 decoder layers.*config.num_layers is 2"):
+        hybrid_allocation_module.select_pipeline_config_segment(
+            architecture, config, _FakeGroup(), vp_stage=None
+        )
+
+
+@pytest.mark.parametrize(
+    ("vp_stage", "error_match"),
+    [(None, "vp_stage must be provided"), (2, r"vp_stage must be in \[0, 2\)")],
+)
+def test_pipeline_selection_validates_vp_stage(monkeypatch, vp_stage, error_match):
+    config = _config(num_layers=4, pp_size=2, vp_size=2)
+    architecture = [_layer(MambaLayerConfig, config) for _ in range(4)]
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 2)
+
+    with pytest.raises(ValueError, match=error_match):
+        hybrid_allocation_module.select_pipeline_config_segment(
+            architecture, config, _FakeGroup(0, 2), vp_stage
+        )
+
+
+@pytest.mark.parametrize(
+    ("pp_size", "first_stage_layers", "last_stage_layers"), [(1, 2, 2), (2, 10, None)]
+)
+def test_pipeline_selection_validates_uneven_stage_counts(
+    monkeypatch, pp_size, first_stage_layers, last_stage_layers
+):
+    config = _config(
+        num_layers=6,
+        pp_size=pp_size,
+        first_stage_layers=first_stage_layers,
+        last_stage_layers=last_stage_layers,
+    )
+    architecture = [_layer(MambaLayerConfig, config) for _ in range(6)]
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: pp_size)
+
+    with pytest.raises(ValueError, match="overrides are incompatible"):
+        hybrid_allocation_module.select_pipeline_config_segment(
+            architecture, config, _FakeGroup(0, pp_size), vp_stage=None
+        )
+
+
+@pytest.mark.parametrize("vp_size", [0, -1])
+def test_pipeline_selection_requires_positive_vpp(monkeypatch, vp_size):
+    config = _config(num_layers=1)
+    config.virtual_pipeline_model_parallel_size = vp_size
+    architecture = [_layer(MambaLayerConfig, config)]
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 1)
+
+    with pytest.raises(ValueError, match="virtual_pipeline_model_parallel_size must be positive"):
+        hybrid_allocation_module.select_pipeline_config_segment(
+            architecture, config, _FakeGroup(), vp_stage=None
+        )
+
+
+def test_pipeline_selection_requires_all_decoder_layers_to_be_owned(monkeypatch):
+    config = _config(num_layers=4, pp_size=2)
+    architecture = [_layer(MambaLayerConfig, config) for _ in range(4)]
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(
+        "megatron.core.transformer.transformer_block.get_num_layers_to_build",
+        lambda *args, **kwargs: 1,
+    )
+
+    with pytest.raises(ValueError, match="owns 2 decoder layers.*defines 4"):
+        hybrid_allocation_module.select_pipeline_config_segment(
+            architecture, config, _FakeGroup(0, 2), vp_stage=None
         )
 
 
@@ -197,19 +287,94 @@ def test_converted_pattern_preserves_uneven_first_and_last_stages(
     )
     for index, layer_config in enumerate(architecture):
         layer_config.architecture_index = index
-    metadata = scan_hybrid_layer_config_list(architecture, pp_size=4)
-    monkeypatch.setattr(hybrid_model_module, "get_pg_rank", lambda group: pp_rank)
-    monkeypatch.setattr(hybrid_model_module, "get_pg_size", lambda group: 4)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: pp_rank)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 4)
     monkeypatch.setattr(
-        hybrid_model_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
+        hybrid_allocation_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
     )
 
-    selected, offset = hybrid_model_module._select_pipeline_config_segment(
-        architecture, metadata, config, _FakeGroup(pp_rank, 4), vp_stage=None
+    selected, offset = hybrid_allocation_module.select_pipeline_config_segment(
+        architecture, config, _FakeGroup(pp_rank, 4), vp_stage=None
     )
 
     assert offset == expected_offset
     assert [layer_config.architecture_index for layer_config in selected] == expected_indices
+
+
+@pytest.mark.parametrize(
+    ("pp_rank", "vp_stage", "expected_indices", "expected_offset"),
+    [
+        (0, 0, [0], 0),
+        (1, 0, [1, 2, 3], 1),
+        (2, 0, [4, 5, 6], 4),
+        (3, 0, [7], 7),
+        (0, 1, [8], 8),
+        (1, 1, [9, 10, 11], 9),
+        (2, 1, [12, 13, 14], 12),
+        (3, 1, [15], 15),
+    ],
+)
+def test_marker_free_selection_uses_canonical_uneven_vpp_allocation(
+    monkeypatch, pp_rank, vp_stage, expected_indices, expected_offset
+):
+    config = _config(num_layers=16, pp_size=4, vp_size=2, first_stage_layers=2, last_stage_layers=2)
+    architecture = [_layer(MambaLayerConfig, config) for _ in range(16)]
+    for index, layer_config in enumerate(architecture):
+        layer_config.architecture_index = index
+
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: pp_rank)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 4)
+    monkeypatch.setattr(
+        hybrid_allocation_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
+    )
+
+    selected, offset = hybrid_allocation_module.select_pipeline_config_segment(
+        architecture, config, _FakeGroup(pp_rank, 4), vp_stage
+    )
+
+    assert offset == expected_offset
+    assert [layer_config.architecture_index for layer_config in selected] == expected_indices
+
+
+@pytest.mark.parametrize(
+    ("pp_rank", "vp_stage", "expected_offset"), [(0, 0, 0), (1, 0, 1), (0, 1, 2), (1, 1, 3)]
+)
+def test_marker_free_uneven_vpp_without_middle_stages(
+    monkeypatch, pp_rank, vp_stage, expected_offset
+):
+    config = _config(num_layers=4, pp_size=2, vp_size=2, first_stage_layers=2, last_stage_layers=2)
+    architecture = [_layer(MambaLayerConfig, config) for _ in range(4)]
+    for index, layer_config in enumerate(architecture):
+        layer_config.architecture_index = index
+
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: pp_rank)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(
+        hybrid_allocation_module, "log_on_each_pipeline_stage", lambda *args, **kwargs: None
+    )
+
+    selected, offset = hybrid_allocation_module.select_pipeline_config_segment(
+        architecture, config, _FakeGroup(pp_rank, 2), vp_stage
+    )
+
+    assert offset == expected_offset
+    assert [layer_config.architecture_index for layer_config in selected] == [expected_offset]
+
+
+def test_pipeline_config_selector_rejects_mtp_markers(monkeypatch):
+    config = _config(num_layers=1, mtp_num_layers=1)
+    architecture = [
+        _layer(MambaLayerConfig, config),
+        MTPSplit,
+        _layer(AttentionLayerConfig, config),
+    ]
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: 1)
+
+    with pytest.raises(ValueError, match="must not contain MTPSplit"):
+        hybrid_allocation_module.select_pipeline_config_segment(
+            architecture, config, _FakeGroup(), vp_stage=None
+        )
 
 
 def test_pattern_adapter_emits_split_markers_and_reuses_the_mtp_template():
@@ -522,7 +687,7 @@ def test_list_model_passes_source_mtp_template_without_a_pattern(
         layer_config_list=[decoder, MTPSplit, attention, moe, MTPSplit, attention, moe],
     )
 
-    assert captured_mtp["mtp_num_depths"] == 2
+    assert "mtp_num_depths" not in captured_mtp
     assert "mtp_layer_pattern" not in captured_mtp
     assert "is_hybrid_mtp" not in captured_mtp
     assert [type(layer_config) for layer_config in captured_mtp["mtp_layer_config_list"]] == [
@@ -565,7 +730,7 @@ def test_leading_mtp_split_builds_the_zero_decoder_case(patch_cpu_model_construc
 
     assert patch_cpu_model_construction[0].kwargs["layer_config_list"] == []
     assert model.mtp.kwargs["mtp_layer_config_list"] == (mtp_config,)
-    assert model.mtp.kwargs["mtp_num_depths"] == 1
+    assert "mtp_num_depths" not in model.mtp.kwargs
 
 
 @pytest.mark.parametrize(
@@ -599,7 +764,6 @@ def test_list_defined_mtp_builds_independent_or_repeated_physical_layers(
         config=config,
         spec=object(),
         pg_collection=SimpleNamespace(tp=_FakeGroup(), cp=_FakeGroup(), pp=_FakeGroup()),
-        mtp_num_depths=2,
         mtp_layer_config_list=source_template,
         hybrid_submodules=object(),
     )
@@ -657,6 +821,27 @@ def test_hybrid_mtp_requires_config_list_and_submodules_together(constructor, pr
             MultiTokenPredictionBlock(config=config, spec=object(), **kwargs)
         else:
             MultiTokenPredictionLayer(config=config, submodules=object(), **kwargs)
+
+
+@pytest.mark.parametrize("mtp_num_layers", [None, 0, -1, 1.5])
+def test_hybrid_mtp_block_requires_positive_depth_count(mtp_num_layers):
+    config = _config(num_layers=1)
+    config.mtp_num_layers = mtp_num_layers
+
+    with pytest.raises(ValueError, match="mtp_num_layers to be a positive integer"):
+        MultiTokenPredictionBlock(
+            config=config,
+            spec=object(),
+            mtp_layer_config_list=[_layer(AttentionLayerConfig, config)],
+            hybrid_submodules=object(),
+        )
+
+
+def test_mtp_num_depths_compatibility_argument_must_match_config():
+    config = _config(num_layers=1, mtp_num_layers=2)
+
+    with pytest.raises(ValueError, match="mtp_num_depths=1 conflicts"):
+        MultiTokenPredictionBlock(config=config, spec=object(), mtp_num_depths=1)
 
 
 def test_each_physical_mtp_layer_clones_the_source_template(monkeypatch):

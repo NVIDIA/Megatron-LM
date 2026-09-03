@@ -324,6 +324,26 @@ class TestHybridModelBuilderBuildModel:
         mock_last.assert_called_once_with(self.pg.pp)
         assert mock_model.call_args.kwargs["post_process"] is True
 
+    def test_infers_pre_and_post_process_from_vp_and_pp_stage(self):
+        self.config.transformer.virtual_pipeline_model_parallel_size = 2
+        with (
+            patch("megatron.training.models.hybrid.HybridModel") as mock_model,
+            patch(
+                "megatron.training.models.hybrid.is_vp_first_stage", return_value=False
+            ) as mock_vp_first,
+            patch(
+                "megatron.training.models.hybrid.is_vp_last_stage", return_value=True
+            ) as mock_vp_last,
+            patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True),
+            patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True),
+        ):
+            self.builder.build_model(self.pg, vp_stage=1)
+
+        mock_vp_first.assert_called_once_with(1, 2)
+        mock_vp_last.assert_called_once_with(1, 2)
+        assert mock_model.call_args.kwargs["pre_process"] is False
+        assert mock_model.call_args.kwargs["post_process"] is True
+
     @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
     @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
