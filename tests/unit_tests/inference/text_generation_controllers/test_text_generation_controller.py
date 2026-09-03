@@ -3314,13 +3314,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             return_value=torch.tensor([3, 4], device='cuda')
         )
 
-        controller_module = (
-            "megatron.core.inference.text_generation_controllers.text_generation_controller"
-        )
+        # The serial MTP path lives in the MTP mixin, so patch the SP collectives there.
+        mtp_module = "megatron.core.inference.text_generation_controllers.mtp_inference_mixin"
         with (
-            mock.patch(f"{controller_module}.gather_from_sequence_parallel_region", mock_gather),
+            mock.patch(f"{mtp_module}.gather_from_sequence_parallel_region", mock_gather),
             mock.patch(
-                f"{controller_module}.scatter_to_sequence_parallel_region",
+                f"{mtp_module}.scatter_to_sequence_parallel_region",
                 side_effect=lambda hidden, group=None: hidden[:1],
             ),
         ):
