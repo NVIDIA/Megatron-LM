@@ -1940,7 +1940,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     "Disabling mlp_norm offloading.",
                 )
         # Set the offload module in cuda graph flag.
-        self.offload_module_in_cuda_graph = self.offload_scope_in_cuda_graph()
+        # A shared Hybrid config can request an attention graph for a split layer
+        # whose attention branches are both IdentityOp. Require a real branch here
+        # as well as at the outer wrapper so this inner layer never advertises a
+        # graph/offload boundary that it cannot execute.
+        self.offload_module_in_cuda_graph = self.offload_scope_in_cuda_graph(
+            require_concrete_modules=True
+        )
         if self.offload_module_in_cuda_graph:
             assert is_torch_min_version(
                 "2.9.0a0"

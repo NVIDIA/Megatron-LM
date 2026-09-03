@@ -1335,8 +1335,10 @@ def fine_grained_offloading_group_start(tensor, name=None):
 
 class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
     """
-    Identity operation that marks the end of a layer group for offload synchronization.
-    Triggers offload during forward and synchronizes reload during backward.
+    Identity operation that marks a Transformer Engine per-callable capture boundary.
+
+    This is inserted by ``_te_cuda_graph_capture``; MCore local and full-iteration
+    CUDA graph runners do not use this callback-based boundary.
     """
 
     @staticmethod
@@ -1347,7 +1349,7 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        """Queue the graph-tail event and H2D join after every backward node finishes."""
+        """Queue the event and H2D join at the current TE callable's GraphTask tail."""
         debug_rank("FineGrainedOffloadingBackwardRecordFunction backward")
 
         def record_backward_completion():
@@ -1361,9 +1363,12 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
             current_stream.record_event(mgr.cuda_graph_event)
             current_stream.wait_stream(mgr.h2d_stream)
 
-        # Keep backward_record's autograd node on the outermost TE CUDA Graph callable
-        # boundary. If this record point moves inside a reentrant checkpoint backward, the
-        # callback will run when that inner GraphTask ends and record the graph-tail event early.
+        # TE warms up and captures every callable with a separate autograd.backward(),
+        # so this callback runs before that callable's backward capture context closes.
+        # Its CUDA commands become the tail of that callable's backward graph; normal
+        # training replay calls bwd_graph.replay() and does not run this Python callback
+        # again. Keep backward_record's node on this outer per-callable boundary: moving
+        # it into a reentrant checkpoint would instead target the inner GraphTask tail.
         torch.autograd.Variable._execution_engine.queue_callback(record_backward_completion)
         return (grad_output,)
 

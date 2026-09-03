@@ -2019,11 +2019,18 @@ class TECudaGraphHelper:
                 self.num_microbatches == len(order) // self.num_model_chunks // 2
             ), "num_microbatches must match the number of microbatches in order."
 
+        # Import once per sample-building pass to avoid module-load cycles without
+        # repeating the imports for every layer and microbatch.
+        from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
+        from megatron.core.transformer.identity_op import IdentityOp
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
         # Generate sample arguments and keyword arguments for capturing.
         sample_args = [None] * (len(self.flattened_callables) * self.num_microbatches)
         sample_kwargs = [None] * (len(self.flattened_callables) * self.num_microbatches)
 
         rotary_pos_emb_cache = {}
+        # Avoid repeating the same message across layers within this capture setup.
         warned_rotary_sample_contracts = set()
 
         def _get_layer_static_inputs(layer, chunk_of_the_layer):
@@ -2063,10 +2070,6 @@ class TECudaGraphHelper:
                     1, local_slen, dtype=torch.bool, device=torch.cuda.current_device()
                 )
 
-            from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
-            from megatron.core.transformer.identity_op import IdentityOp
-            from megatron.core.transformer.transformer_layer import TransformerLayer
-
             # Hybrid mHC wraps the concrete TransformerLayer, but the wrapper is the
             # callable passed to TE. Inspect the inner layer when deciding whether
             # rotary embeddings belong to the graph's static keyword inputs.
@@ -2082,10 +2085,12 @@ class TECudaGraphHelper:
                 )
             )
 
-            position_embedding_type = getattr(chunk_of_the_layer, 'position_embedding_type', None)
             if contains_self_attn and not self.config.multi_latent_attention:
+                position_embedding_type = getattr(
+                    chunk_of_the_layer, 'position_embedding_type', None
+                )
                 is_thd = 'cu_seqlens_q' in static_inputs
-                context_parallel_size = getattr(self.config, 'context_parallel_size', 1)
+                context_parallel_size = self.config.context_parallel_size
                 unsupported_reasons = []
                 if position_embedding_type == 'yarn':
                     unsupported_reasons.append(
@@ -2101,12 +2106,7 @@ class TECudaGraphHelper:
                         'runtime packed sequences use the full table'
                     )
 
-                warning_key = (
-                    position_embedding_type,
-                    is_thd,
-                    context_parallel_size,
-                    tuple(unsupported_reasons),
-                )
+                warning_key = (position_embedding_type, is_thd, context_parallel_size)
                 if unsupported_reasons and warning_key not in warned_rotary_sample_contracts:
                     warned_rotary_sample_contracts.add(warning_key)
                     reasons = '; '.join(unsupported_reasons)

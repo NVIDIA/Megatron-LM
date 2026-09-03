@@ -268,7 +268,11 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 
     @property
     def offload_module_in_cuda_graph(self) -> bool:
-        """Whether TE must join the wrapper graph with offload streams."""
+        """Whether TE must join the wrapper graph with offload streams.
+
+        The graph-group tail setter is the only grouping mutation and invalidates
+        this replay-hot-path cache whenever it attaches a tail.
+        """
         cached = self._offload_module_in_cuda_graph_cached
         if cached is None:
             cached = self._compute_offload_module_in_cuda_graph()
@@ -365,18 +369,24 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         # The Hybrid wrapper, not its inner TransformerLayer(s), is the TE graph
         # callable. Place the offload events at this outer boundary so every D2H/H2D
         # stream dependency belongs to the graph being captured.
-        if self.offload_module_in_cuda_graph:
+        offload_in_graph = self.offload_module_in_cuda_graph
+        off_interface = self.off_interface
+        if offload_in_graph:
+            assert off_interface is not None, (
+                "offload_module_in_cuda_graph requires a TransformerLayer-backed "
+                "Hybrid wrapper with an offload interface."
+            )
             if args:
-                hidden_states = self.off_interface.backward_record(args[0])
+                hidden_states = off_interface.backward_record(args[0])
                 args = (hidden_states,) + args[1:]
             else:
-                hidden_states = self.off_interface.backward_record(kwargs.pop('hidden_states'))
+                hidden_states = off_interface.backward_record(kwargs.pop('hidden_states'))
                 kwargs['hidden_states'] = hidden_states
 
         cuda_graph_outputs = self._te_cuda_graph_capture_impl(*args, **kwargs)
 
-        if self.offload_module_in_cuda_graph:
-            self.off_interface.forward_record()
+        if offload_in_graph:
+            off_interface.forward_record()
         return cuda_graph_outputs
 
     def _te_cuda_graph_capture_impl(self, *args, **kwargs):

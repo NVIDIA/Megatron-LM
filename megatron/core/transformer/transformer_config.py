@@ -3307,14 +3307,16 @@ class TransformerConfig(ModelParallelConfig):
                 stacklevel=2,
             )
         elif delayed_partial_expert_offload:
-            warnings.warn(
+            # TODO: replace this compatibility warning with a supported explicit
+            # end-of-iteration drain for the final delayed expert group.
+            log_single_rank(
+                logger,
+                logging.WARNING,
                 "Delayed expert offload currently flushes only at a later Transformer Engine "
                 "CUDA Graph replay. The final eager expert group can remain queued and be "
                 "discarded by the pipeline reset without a D2H copy, reducing the intended "
                 "memory saving. Disable delay_offload_until_cuda_graph to commit every expert "
                 "group immediately until an explicit end-of-iteration drain is implemented.",
-                UserWarning,
-                stacklevel=2,
             )
 
         # mHC selective recompute composes with CUDA graphs on two paths: the

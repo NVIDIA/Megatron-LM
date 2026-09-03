@@ -93,6 +93,8 @@ from all configured offload modules after those filters.
 
 Fine-grained offloading is compatible with CUDA graphs. When CUDA graph is enabled, the following constraints apply:
 
+> **Scope:** The event-boundary integration described in this section is specific to Transformer Engine's per-callable capture (`cuda_graph_impl=transformer_engine`). It does not change MCore's `local` or `full_iteration` CUDA graph runners.
+
 - `attn_norm` and `mlp_norm` **cannot** be offloaded (they cross CUDA graph boundaries).
 - Use an explicit scope containing each captured offloaded region: `attn` for attention-side offload, and add `moe_router` for the recommended partial-MoE delayed-expert setup.
 - Empty `cuda_graph_modules` (TE whole-layer capture) is not yet integrated with the offload event boundary and emits a warning; use explicit partial scopes.
@@ -200,6 +202,6 @@ A 'OffloadTensorPool` (on CPU with pinned memory) caches allocated tensors by `(
 When offloading interacts with CUDA graphs:
 
 - A dedicated `cuda_graph_stream` runs the captured computation, while `d2h_stream` overlaps D2H transfers for regions that are **inside** the graph capture.
-- The backward completion event is queued at the end of the autograd GraphTask, after all requested input and parameter gradients have been produced. TE can therefore synchronize the main stream without exposing partially written graph gradients; the subsequent `h2d_stream` join still prefetches the next offload group asynchronously.
+- During TE per-callable capture, the backward completion event is queued at the end of that callable's autograd GraphTask, after all requested input and parameter gradients have been produced. The CUDA event and stream wait become part of that callable's captured backward graph; replay does not run the Python callback again. TE can therefore synchronize the main stream without exposing partially written graph gradients, while the subsequent `h2d_stream` join still prefetches the next offload group asynchronously.
 - During CUDA graph **warmup**, offloading is disabled (`pre_warmup_hook` / `post_warmup_hook`).
 - The `delay_offload_until_cuda_graph` option defers D2H launches until graph replay, utilizing the CPU idle time during `cudaGraphLaunch` to issue offload commands with near-zero CPU overhead.
