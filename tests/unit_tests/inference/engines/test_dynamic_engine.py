@@ -994,6 +994,7 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     )
     engine.requests = {request.request_id: types.SimpleNamespace(record=record)}
     engine.waiting_request_ids = deque()
+    engine.controller = types.SimpleNamespace(_async_sched_logits=mock.Mock())
     engine.state = EngineState.RUNNING
     engine.unified_memory_level = 0
     engine.use_coordinator = False
@@ -1021,6 +1022,7 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
 
     assert engine.context.deallocate_inference_state_buffers.call_count == 1
     assert engine.context.reinitialize_inference_state_buffers.call_count == 1
+    engine.controller._async_sched_logits.clear.assert_called_once_with()
     assert engine.state == EngineState.RUNNING
     assert engine._add_request.call_count == 1
     assert engine._add_request.call_args.args[0] is checkpointed
