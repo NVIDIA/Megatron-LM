@@ -226,7 +226,7 @@ products:
   - test_case: [deepseek_proxy_mfsdp_v2_ep2]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   #######################################################################
   # Super important mr, mr-github tests that run for both DEV and LTS per mr, mr-github       #
