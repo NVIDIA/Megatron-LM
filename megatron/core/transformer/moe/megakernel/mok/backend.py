@@ -32,18 +32,6 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-def _require_mxfp8_post_all_gather_processing() -> None:
-    """Reject TE versions whose MXFP8 refresh relies on a later TE forward."""
-    from megatron.core import fp8_utils
-
-    if fp8_utils.te_post_all_gather_processing is None:
-        raise RuntimeError(
-            "MOK MXFP8 requires Transformer Engine with post_all_gather_processing support "
-            "(normally TE >= 2.10.0). Older TE versions rely on a later TE expert forward "
-            "to refresh columnwise weights, but MOK bypasses that forward path."
-        )
-
-
 class MoKMegakernel(MegakernelBackend):
     """Execute MOK using trainable parameters owned by native MCore modules."""
 
@@ -99,7 +87,15 @@ class MoKMegakernel(MegakernelBackend):
             config.fp8 is not None and config.fp8_recipe == "mxfp8" and config.fp8_param
         )
         if self.use_mxfp8_weights:
-            _require_mxfp8_post_all_gather_processing()
+            from megatron.core import fp8_utils
+
+            if fp8_utils.te_post_all_gather_processing is None:
+                raise RuntimeError(
+                    "MOK MXFP8 requires Transformer Engine with "
+                    "post_all_gather_processing support (normally TE >= 2.10.0). Older TE "
+                    "versions rely on a later TE expert forward to refresh columnwise weights, "
+                    "but MOK bypasses that forward path."
+                )
         self.native_single_grouped_weights = bool(config.moe_single_grouped_weight)
         self.mok_config = MoKConfig(**(config.moe_megakernel_backend_config or {}))
 

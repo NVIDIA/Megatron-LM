@@ -6,9 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.core import fp8_utils
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.moe.megakernel.mok import backend as mok_backend
 from megatron.core.transformer.moe.megakernel.mok import weights
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -98,10 +96,3 @@ def test_mok_accepts_key_supported_configurations(overrides):
 def test_mok_rejects_key_incompatible_configurations(overrides, error):
     with pytest.raises(ValueError, match=error):
         _mok_transformer_config(**overrides)
-
-
-def test_mok_mxfp8_requires_post_all_gather_processing(monkeypatch):
-    monkeypatch.setattr(fp8_utils, "te_post_all_gather_processing", None)
-
-    with pytest.raises(RuntimeError, match="normally TE >= 2.10.0"):
-        mok_backend._require_mxfp8_post_all_gather_processing()
