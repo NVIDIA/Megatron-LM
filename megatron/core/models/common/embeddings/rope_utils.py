@@ -16,6 +16,7 @@ from torch import Tensor
 from megatron.core import parallel_state
 
 logger = logging.getLogger(__name__)
+_ROPE_FUSION_FALLBACK_WARNINGS: set[str] = set()
 
 try:
     from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb
@@ -42,7 +43,35 @@ __all__ = [
     'fused_apply_rotary_pos_emb',
     'fused_apply_rotary_pos_emb_thd',
     'get_pos_emb_on_this_cp_rank',
+    'should_use_fused_mla_rope',
 ]
+
+
+def _warn_rope_fusion_fallback_once(key: str, message: str) -> None:
+    if key in _ROPE_FUSION_FALLBACK_WARNINGS:
+        return
+    _ROPE_FUSION_FALLBACK_WARNINGS.add(key)
+    warnings.warn(message, stacklevel=2)
+
+
+def should_use_fused_mla_rope(config: TransformerConfig) -> bool:
+    """Return whether MLA's custom fused RoPE kernels support this configuration.
+
+    Standard RoPE can rotate only a prefix of the positional channels when
+    ``rotary_percent < 1``. The custom MLA kernels currently rotate the full
+    positional slice, so partial rotary embeddings must retain the unfused path
+    that preserves the trailing pass-through channels.
+    """
+    if not config.apply_rope_fusion:
+        return False
+    if config.rope_type == "rope" and config.rotary_percent < 1.0:
+        _warn_rope_fusion_fallback_once(
+            "mla-partial-standard-rope",
+            "MLA/DSA RoPE fusion requires rotary_percent=1.0 for standard RoPE; "
+            f"got rotary_percent={config.rotary_percent}. Falling back to the unfused path.",
+        )
+        return False
+    return True
 
 
 def get_pos_emb_on_this_cp_rank(
@@ -355,9 +384,10 @@ def apply_rotary_pos_emb(
                 )
                 use_unfused = True
             if mla_rotary_interleaved:
-                warnings.warn(
-                    "apply_rope_fusion does not support MLA-style interleaving in RoPE."
-                    "Using unfused implementation."
+                _warn_rope_fusion_fallback_once(
+                    "te-rope-mla-rotary-interleaved",
+                    "apply_rope_fusion does not support MLA-style interleaving in RoPE. "
+                    "Using unfused implementation.",
                 )
                 use_unfused = True
             if inverse:
@@ -378,9 +408,10 @@ def apply_rotary_pos_emb(
                 )
                 use_unfused = True
             if mla_rotary_interleaved:
-                warnings.warn(
-                    "apply_rope_fusion does not support MLA-style interleaving in RoPE."
-                    "Using unfused implementation."
+                _warn_rope_fusion_fallback_once(
+                    "te-rope-mla-rotary-interleaved",
+                    "apply_rope_fusion does not support MLA-style interleaving in RoPE. "
+                    "Using unfused implementation.",
                 )
                 use_unfused = True
             if inverse:

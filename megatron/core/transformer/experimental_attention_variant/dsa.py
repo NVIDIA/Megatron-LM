@@ -12,6 +12,7 @@ from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
     apply_rotary_pos_emb,
+    should_use_fused_mla_rope,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -27,6 +28,11 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_pg_size
+
+try:
+    from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
+except ImportError:
+    fused_mla_rope_inplace = None
 
 try:
     from fast_hadamard_transform import hadamard_transform
@@ -1309,11 +1315,39 @@ class DSAIndexer(MegatronModule):
     def _apply_rope(
         self,
         x: torch.Tensor,
-        rotary_pos_emb: torch.Tensor,
+        rotary_pos_emb: Optional[torch.Tensor],
         mscale: float,
         cu_seqlens: Optional[torch.Tensor] = None,
+        rotary_pos_cos: Optional[torch.Tensor] = None,
+        rotary_pos_sin: Optional[torch.Tensor] = None,
     ):
         """Apply RoPE to the input tensor."""
+        if rotary_pos_cos is not None or rotary_pos_sin is not None:
+            assert rotary_pos_cos is not None and rotary_pos_sin is not None
+            assert fused_mla_rope_inplace is not None, "Fused MLA RoPE is not available"
+            if cu_seqlens is not None and cu_seqlens.device != x.device:
+                cu_seqlens = cu_seqlens.to(device=x.device)
+            squeezed_batch_dim = False
+            # THD RoPE expects [t, h, d], while indexer tensors are [t, 1, h, d].
+            if cu_seqlens is not None and x.ndim == 4 and x.size(1) == 1:
+                x = x.squeeze(1)
+                squeezed_batch_dim = True
+            x = fused_mla_rope_inplace(
+                x,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                nope_dim=self.index_head_dim - self.qk_pos_emb_head_dim,
+                emb_dim=self.qk_pos_emb_head_dim,
+                cu_seqlens_q=cu_seqlens,
+                cp_rank=self.pg_collection.cp.rank(),
+                cp_size=self.pg_collection.cp.size(),
+                rope_first=True,
+            )
+            if squeezed_batch_dim:
+                x = x.unsqueeze(1)
+            return x
+
+        assert rotary_pos_emb is not None
         # x_pe   [seqlen, batch, *, qk_pos_emb_head_dim]
         # x_nope [seqlen, batch, *, index_head_dim - qk_pos_emb_head_dim]
         # To align with DeepSeek's implementation,
@@ -1356,7 +1390,17 @@ class DSAIndexer(MegatronModule):
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
             None, None, x, self.config, packed_seq_params
         )
-        if self.config.rope_type == "rope":
+        fused_indexer_rope = self.config.dsa_indexer_rope_interleaved and should_use_fused_mla_rope(
+            self.config
+        )
+        rotary_pos_cos = rotary_pos_sin = None
+        if fused_indexer_rope:
+            rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                rotary_seq_len, dtype=x.dtype, packed_seq=packed_seq
+            )
+            rotary_pos_emb = None
+            mscale = 1.0
+        elif self.config.rope_type == "rope":
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
             mscale = 1.0
         else:
@@ -1386,7 +1430,14 @@ class DSAIndexer(MegatronModule):
         # [seqlen, batch, index_n_heads * index_head_dim]
         #   -> [seqlen, batch, index_n_heads, index_head_dim]
         q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
-        q = self._apply_rope(q, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_q)
+        q = self._apply_rope(
+            q,
+            rotary_pos_emb,
+            mscale,
+            cu_seqlens=cu_seqlens_q,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+        )
 
         # =========================================
         # k linear and apply rope to k
@@ -1400,7 +1451,14 @@ class DSAIndexer(MegatronModule):
             k = self.k_norm(k)
         # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
         k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
-        k = self._apply_rope(k, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_kv)
+        k = self._apply_rope(
+            k,
+            rotary_pos_emb,
+            mscale,
+            cu_seqlens=cu_seqlens_kv,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+        )
         # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
         k = k.reshape(seqlen, bsz, self.index_head_dim)
 

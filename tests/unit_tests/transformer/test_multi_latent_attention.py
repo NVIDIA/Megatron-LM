@@ -642,11 +642,7 @@ class TestTensorParallelMLAAttention:
 )
 @pytest.mark.parametrize(
     ("rope_type", "apply_rope_fusion"),
-    (
-        ('rope', False),
-        ('yarn', False),
-        ('yarn', True),  # apply_rope_fusion for MLA only works with YARN RoPE.
-    ),
+    (('rope', False), ('rope', True), ('yarn', False), ('yarn', True)),
 )
 class TestContextParallelMLAAttention:
 
@@ -895,11 +891,7 @@ class TestParallelMLAAttentionPrecision:
 )
 @pytest.mark.parametrize(
     ("rope_type", "apply_rope_fusion"),
-    (
-        ('rope', False),
-        ('yarn', False),
-        ('yarn', True),  # apply_rope_fusion for MLA only works with YARN RoPE.
-    ),
+    (('rope', False), ('rope', True), ('yarn', False), ('yarn', True)),
 )
 class TestContextParallelMLAAttentionPrecision:
 
@@ -1431,11 +1423,7 @@ class TestMLAClipQK:
 @pytest.mark.experimental
 @pytest.mark.parametrize(
     ("rope_type", "apply_rope_fusion"),
-    [
-        ("rope", False),
-        ("yarn", False),
-        ("yarn", True),  # apply_rope_fusion for MLA only works with YARN RoPE.
-    ],
+    [("rope", False), ("rope", True), ("yarn", False), ("yarn", True)],
 )
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),

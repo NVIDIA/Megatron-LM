@@ -1,6 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import copy
 import logging
+import math
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -2473,6 +2475,110 @@ class TestDSAIndexer:
         _assert_valid_topk_indices_unique(topk_indices)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("packed", [False, True], ids=["sbhd", "thd"])
+    @pytest.mark.parametrize("rotary_percent", [1.0, 0.5], ids=["full", "partial-fallback"])
+    def test_dsa_indexer_fused_rope_matches_unfused(self, seqlen, packed, rotary_percent):
+        """Fused leading-channel RoPE or fallback must preserve values and all gradients."""
+        from megatron.core.extensions.transformer_engine import TELinear, TENorm
+        from megatron.core.transformer.spec_utils import ModuleSpec
+
+        def build_indexer(apply_rope_fusion):
+            config = copy.deepcopy(self.config)
+            config.apply_rope_fusion = apply_rope_fusion
+            config.rotary_percent = rotary_percent
+            config.dsa_indexer_rope_interleaved = True
+            config.dsa_indexer_k_norm_fp32 = True
+            config.dsa_indexer_rotate_activation = False
+            submodules = DSAIndexerSubmodules(
+                linear_wq_b=ModuleSpec(module=TELinear),
+                linear_wk=ModuleSpec(module=TELinear),
+                k_norm=ModuleSpec(module=TENorm),
+                linear_weights_proj=ModuleSpec(module=TELinear),
+            )
+            return DSAIndexer(config, submodules, self.pg_collection).cuda()
+
+        unfused_indexer = build_indexer(False)
+        fused_indexer = build_indexer(True)
+        fused_indexer.load_state_dict(unfused_indexer.state_dict())
+        batch_size = 1
+        x_values = torch.randn(
+            seqlen, batch_size, self.config.hidden_size, dtype=torch.bfloat16, device="cuda"
+        )
+        qr_values = torch.randn(
+            seqlen, batch_size, self.config.q_lora_rank, dtype=torch.bfloat16, device="cuda"
+        )
+        q_grad = torch.randn(
+            seqlen,
+            batch_size,
+            unfused_indexer.index_n_heads,
+            unfused_indexer.index_head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        k_grad = torch.randn(
+            seqlen, batch_size, unfused_indexer.index_head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        weights_grad = torch.randn(
+            seqlen, batch_size, unfused_indexer.index_n_heads, dtype=torch.bfloat16, device="cuda"
+        )
+        packed_seq_params = None
+        if packed:
+            first_seqlen = seqlen // 4
+            cu_seqlens = torch.tensor([0, first_seqlen, seqlen], dtype=torch.int32, device="cuda")
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=seqlen - first_seqlen,
+                max_seqlen_kv=seqlen - first_seqlen,
+            )
+
+        def run(indexer):
+            x = x_values.detach().clone().requires_grad_(True)
+            qr = qr_values.detach().clone().requires_grad_(True)
+            q, k, weights = indexer.forward_before_topk(x, qr, packed_seq_params)
+            torch.autograd.backward((q, k, weights), (q_grad, k_grad, weights_grad))
+            parameter_grads = {
+                name: parameter.grad.detach().clone()
+                for name, parameter in indexer.named_parameters()
+                if parameter.grad is not None
+            }
+            return (
+                (q.detach().clone(), k.detach().clone(), weights.detach().clone()),
+                (x.grad.detach().clone(), qr.grad.detach().clone()),
+                parameter_grads,
+            )
+
+        unfused = run(unfused_indexer)
+        fused = run(fused_indexer)
+
+        for actual, expected in zip(fused[0], unfused[0]):
+            torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=5e-2)
+        for actual, expected in zip(fused[1], unfused[1]):
+            torch.testing.assert_close(actual.float(), expected.float(), rtol=2e-2, atol=5e-2)
+        assert fused[2].keys() == unfused[2].keys()
+        for name in fused[2]:
+            actual = fused[2][name].float()
+            expected = unfused[2][name].float()
+            relative_l2_error = torch.linalg.vector_norm(
+                actual - expected
+            ) / torch.linalg.vector_norm(expected).clamp_min(torch.finfo(torch.float32).tiny)
+            assert relative_l2_error < 1e-2, (
+                f"gradient relative L2 mismatch for {name}: "
+                f"{relative_l2_error.item():.6e} >= 1e-2"
+            )
+            torch.testing.assert_close(
+                actual,
+                expected,
+                rtol=2e-2,
+                # Parameter gradients reduce over the sequence dimension. Scale the
+                # near-zero absolute tolerance with the square root of the reduction
+                # length, while the relative-L2 check above bounds aggregate error.
+                atol=5e-2 * math.sqrt(seqlen),
+                msg=lambda msg: f"gradient mismatch for {name}: {msg}",
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_dsa_indexer_forward_with_scores(self, seqlen):
         """Test indexer forward pass with scores."""
         batch_size = 2
@@ -3974,6 +4080,11 @@ class TestDSAModuleSpecDispatch:
         """DSA config validation rejects bias because absorbed MLA does not support it."""
         with pytest.raises(ValueError, match="requires add_bias_linear=False"):
             self._make_dsa_config(experimental_attention_variant="dsa", add_bias_linear=True)
+
+    def test_dsa_accepts_fused_standard_rope(self):
+        """DSA can use the absorbed-MLA fused path with standard RoPE."""
+        config = self._make_dsa_config(experimental_attention_variant="dsa", apply_rope_fusion=True)
+        assert config.apply_rope_fusion
 
     def test_dsa_cp_requires_allgather_cp_comm_type(self):
         """DSA context parallelism should fail early for unsupported CP communication."""
