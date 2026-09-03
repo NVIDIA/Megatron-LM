@@ -2,7 +2,7 @@
 
 """Context-parallel sequence-layout conversion."""
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Literal
 
@@ -34,15 +34,21 @@ class THDCPLayoutPlan:
 
     contiguous_local_token_count: int
     zigzag_local_token_count: int
-    cu_seqlens_padded: torch.Tensor
-    max_seqlen_padded: int
-    pad_between_seqs: bool
     forward_send_indices: torch.Tensor
     forward_receive_positions: torch.Tensor
     forward_input_split_sizes: tuple[int, ...]
     forward_output_split_sizes: tuple[int, ...]
     reverse_send_indices: torch.Tensor
     reverse_receive_indices: torch.Tensor
+
+
+@dataclass(frozen=True, eq=False)
+class _THDZigzagMetadata:
+    """Metadata describing the padded zigzag ordering of a packed token stream."""
+
+    rank_order_indices: torch.Tensor
+    cu_seqlens_padded: torch.Tensor
+    pad_between_seqs: bool
 
 
 @dataclass(frozen=True)
@@ -255,13 +261,11 @@ def _build_layout_redistribution_plan(
 def _build_thd_cp_layout_plan_from_rank_order_indices(
     rank_order_indices: torch.Tensor,
     source_token_count: int,
-    cu_seqlens_padded: torch.Tensor,
     cp_size: int,
     cp_rank: int,
     tp_size: int = 1,
     tp_rank: int = 0,
     group_rank_by_logical_rank: tuple[int, ...] | None = None,
-    pad_between_seqs: bool | torch.Tensor = False,
 ) -> THDCPLayoutPlan:
     """Build a packed layout plan from source indices grouped by target logical rank.
 
@@ -332,28 +336,13 @@ def _build_thd_cp_layout_plan_from_rank_order_indices(
     forward_output_split_sizes = torch.zeros(
         group_size, dtype=torch.int64, device=rank_order_indices.device
     ).index_add_(0, source_group_ranks, torch.ones_like(source_group_ranks))
-    if not isinstance(pad_between_seqs, torch.Tensor):
-        pad_between_seqs = torch.tensor(
-            pad_between_seqs, dtype=torch.bool, device=rank_order_indices.device
-        )
-    plan_metadata = torch.cat(
-        (
-            forward_input_split_sizes,
-            forward_output_split_sizes,
-            (cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]).max().to(torch.int64).view(1),
-            pad_between_seqs.to(dtype=torch.int64, device=rank_order_indices.device).view(1),
-        )
-    ).tolist()
+    plan_metadata = torch.cat((forward_input_split_sizes, forward_output_split_sizes)).tolist()
     forward_input_split_sizes = tuple(plan_metadata[:group_size])
     forward_output_split_sizes = tuple(plan_metadata[group_size : 2 * group_size])
-    max_seqlen_padded, pad_between_seqs = plan_metadata[-2:]
 
     return THDCPLayoutPlan(
         contiguous_local_token_count=contiguous_local_token_count,
         zigzag_local_token_count=zigzag_local_token_count,
-        cu_seqlens_padded=cu_seqlens_padded,
-        max_seqlen_padded=max_seqlen_padded,
-        pad_between_seqs=bool(pad_between_seqs),
         forward_send_indices=forward_send_indices,
         forward_receive_positions=forward_receive_positions,
         forward_input_split_sizes=forward_input_split_sizes,
@@ -363,14 +352,10 @@ def _build_thd_cp_layout_plan_from_rank_order_indices(
     )
 
 
-def _build_thd_rank_order_indices(
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_padded: torch.Tensor | None,
-    cp_size: int,
-    tp_size: int,
-    expected_source_token_count: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build padded dual-chunk attention order without Transformer Engine helpers."""
+def _build_thd_zigzag_metadata(
+    cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.Tensor | None, cp_size: int, tp_size: int
+) -> _THDZigzagMetadata:
+    """Build padded dual-chunk metadata without Transformer Engine helpers."""
     if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
         raise ValueError("cu_seqlens must be one-dimensional with at least two entries")
     if cu_seqlens.dtype != torch.int32:
@@ -390,34 +375,29 @@ def _build_thd_rank_order_indices(
 
     source_lengths = source_cu_seqlens[1:] - source_cu_seqlens[:-1]
 
-    # The token counts are needed on the host to validate and allocate the route tensors.
     alignment = 2 * cp_size
     target_lengths = (
         torch.div(source_lengths + alignment - 1, alignment, rounding_mode="floor") * alignment
     )
-    source_token_count, target_token_count = torch.stack(
-        (source_cu_seqlens[-1].to(torch.int64), target_lengths.sum().to(torch.int64))
-    ).tolist()
-    if (
-        expected_source_token_count is not None
-        and source_token_count != expected_source_token_count
-    ):
-        raise ValueError(
-            "The packed token count does not match the physical cumulative sequence lengths, got "
-            f"{expected_source_token_count} and {source_token_count}"
-        )
 
     # CP attention needs two equal chunks per CP rank. Pad each sequence to that granularity,
     # then add only enough padding to the last sequence to split the batch evenly over TP.
-    local_target_token_count = target_token_count // cp_size
-    tp_padding = (-local_target_token_count) % tp_size
-    if tp_padding:
-        target_lengths = target_lengths.clone()
-        target_lengths[-1] += tp_padding * cp_size
-        target_token_count += tp_padding * cp_size
+    local_target_token_count = torch.div(target_lengths.sum(), cp_size, rounding_mode="floor")
+    tp_padding = torch.remainder(-local_target_token_count, tp_size)
+    target_lengths = target_lengths.clone()
+    target_lengths[-1] += tp_padding * cp_size
     target_cu_seqlens = torch.cat(
         (torch.zeros_like(cu_seqlens[:1]), target_lengths.cumsum(dim=0, dtype=torch.int32))
     )
+
+    # These values must be host-known by the route allocator and PackedSeqParams. Read them back
+    # together so target-layout metadata does not add another device synchronization.
+    target_token_count, pad_between_seqs = torch.stack(
+        (
+            target_cu_seqlens[-1].to(torch.int64),
+            torch.any(cu_seqlens != target_cu_seqlens).to(torch.int64),
+        )
+    ).tolist()
 
     target_positions = torch.arange(target_token_count, dtype=torch.int64, device=cu_seqlens.device)
     sequence_ids = torch.searchsorted(target_cu_seqlens[1:], target_positions, right=True)
@@ -448,26 +428,28 @@ def _build_thd_rank_order_indices(
     )
     rank_order_indices = torch.empty_like(source_indices)
     rank_order_indices.scatter_(0, rank_order_positions, source_indices)
-    return rank_order_indices, target_cu_seqlens
+    return _THDZigzagMetadata(
+        rank_order_indices=rank_order_indices,
+        cu_seqlens_padded=target_cu_seqlens,
+        pad_between_seqs=bool(pad_between_seqs),
+    )
 
 
 def build_thd_cp_layout_plan(
-    cu_seqlens: torch.Tensor,
-    total_tokens: int,
+    rank_order_indices: torch.Tensor,
+    source_token_count: int,
     cp_group: torch.distributed.ProcessGroup,
-    cu_seqlens_padded: torch.Tensor | None = None,
     sequence_parallel: bool = False,
     tp_group: torch.distributed.ProcessGroup | None = None,
     tp_cp_group: torch.distributed.ProcessGroup | None = None,
 ) -> THDCPLayoutPlan:
-    """Build a reusable packed sequence layout plan for attention.
+    """Build a reusable packed sequence layout-conversion plan.
 
     Args:
-        cu_seqlens: Global cumulative actual sequence lengths in ``torch.int32``.
-        total_tokens: Global token count in the contiguous residual stream.
+        rank_order_indices: Contiguous source indices in target rank order.
+        source_token_count: Global token count in the contiguous layout.
         cp_group: Context-parallel process group.
-        cu_seqlens_padded: Optional physical offsets already present in the input.
-        sequence_parallel: Whether the residual stream is also sharded over TP ranks.
+        sequence_parallel: Whether the contiguous input is also sharded over TP ranks.
         tp_group: Tensor-parallel process group, required with sequence parallelism.
         tp_cp_group: Combined TP x CP process group, required when TP size is greater than one.
 
@@ -475,30 +457,14 @@ def build_thd_cp_layout_plan(
         A rank-local plan reusable for both directions of the layout conversion.
     """
     context = _get_layout_parallel_context(cp_group, sequence_parallel, tp_group, tp_cp_group)
-    if total_tokens % context.group_size != 0:
-        raise ValueError(
-            "The packed token count must be divisible by CP * TP, got "
-            f"{total_tokens}, CP size {context.cp_size}, and TP size {context.tp_size}"
-        )
-
-    rank_order_indices, target_cu_seqlens_padded = _build_thd_rank_order_indices(
-        cu_seqlens,
-        cu_seqlens_padded,
-        context.cp_size,
-        context.tp_size,
-        expected_source_token_count=total_tokens,
-    )
-    pad_between_seqs = torch.any(cu_seqlens != target_cu_seqlens_padded)
     return _build_thd_cp_layout_plan_from_rank_order_indices(
         rank_order_indices,
-        source_token_count=total_tokens,
-        cu_seqlens_padded=target_cu_seqlens_padded,
+        source_token_count=source_token_count,
         cp_size=context.cp_size,
         cp_rank=context.cp_rank,
         tp_size=context.tp_size,
         tp_rank=context.tp_rank,
         group_rank_by_logical_rank=context.group_rank_by_logical_rank,
-        pad_between_seqs=pad_between_seqs,
     )
 
 
@@ -663,6 +629,30 @@ def zigzag_to_contiguous(
     )
 
 
+def convert_cp_layout(
+    input_: torch.Tensor,
+    source_layout: CPLayout,
+    target_layout: CPLayout,
+    cp_group: torch.distributed.ProcessGroup,
+    sequence_parallel: bool = False,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+    tp_cp_group: torch.distributed.ProcessGroup | None = None,
+    thd_plan: THDCPLayoutPlan | None = None,
+) -> torch.Tensor:
+    """Convert a tensor between physical CP layouts."""
+    if source_layout == target_layout or cp_group.size() == 1:
+        return input_
+    if source_layout == "contiguous" and target_layout == "zigzag":
+        return contiguous_to_zigzag(
+            input_, cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan
+        )
+    if source_layout == "zigzag" and target_layout == "contiguous":
+        return zigzag_to_contiguous(
+            input_, cp_group, sequence_parallel, tp_group, tp_cp_group, thd_plan
+        )
+    raise ValueError(f"Unsupported CP layout conversion: {source_layout} to {target_layout}")
+
+
 @dataclass(eq=False)
 class ContextParallelLayoutManager:
     """Manage CP layout transitions across a sequence of layers."""
@@ -688,27 +678,18 @@ class ContextParallelLayoutManager:
         target_layout: CPLayout,
         thd_plan: THDCPLayoutPlan | None = None,
     ) -> torch.Tensor:
-        if not self.requires_conversion or source_layout == target_layout:
+        if not self.requires_conversion:
             return hidden_states
-        if source_layout == "contiguous" and target_layout == "zigzag":
-            return contiguous_to_zigzag(
-                hidden_states,
-                self.cp_group,
-                self.sequence_parallel,
-                self.tp_group,
-                self.tp_cp_group,
-                thd_plan,
-            )
-        if source_layout == "zigzag" and target_layout == "contiguous":
-            return zigzag_to_contiguous(
-                hidden_states,
-                self.cp_group,
-                self.sequence_parallel,
-                self.tp_group,
-                self.tp_cp_group,
-                thd_plan,
-            )
-        raise ValueError(f"Unsupported CP layout conversion: {source_layout} to {target_layout}")
+        return convert_cp_layout(
+            hidden_states,
+            source_layout,
+            target_layout,
+            self.cp_group,
+            self.sequence_parallel,
+            self.tp_group,
+            self.tp_cp_group,
+            thd_plan,
+        )
 
     def prepare_layer_input(
         self, layer_index: int, hidden_states: torch.Tensor, thd_plan: THDCPLayoutPlan | None = None
@@ -731,66 +712,40 @@ class ContextParallelLayoutManager:
             hidden_states, self.layer_layouts[layer_index], self.boundary_layout, thd_plan
         )
 
-    def build_packed_zigzag_layout(
-        self, packed_seq_params: PackedSeqParams
-    ) -> tuple[THDCPLayoutPlan, PackedSeqParams]:
-        """Build one THD conversion plan and its zigzag-layout metadata."""
-        if packed_seq_params.qkv_format != "thd":
-            raise ValueError(
-                "Packed CP layout conversion requires packed_seq_params.qkv_format='thd'"
-            )
-
-        cu_seqlens = packed_seq_params.cu_seqlens_q
-        if cu_seqlens is None:
-            raise ValueError("Packed CP layout conversion requires actual query lengths")
-        if packed_seq_params.cu_seqlens_kv is not cu_seqlens:
-            raise ValueError("Packed CP layout conversion requires shared Q/KV sequence metadata")
-
-        cu_seqlens_padded = packed_seq_params.cu_seqlens_q_padded
-        if packed_seq_params.cu_seqlens_kv_padded is not cu_seqlens_padded:
-            raise ValueError("Packed CP layout conversion requires shared Q/KV padding metadata")
-
-        total_tokens = packed_seq_params.total_tokens
-        if total_tokens is None:
-            raise ValueError("Packed CP layout conversion requires total_tokens")
-        plan = build_thd_cp_layout_plan(
-            cu_seqlens,
-            total_tokens,
-            self.cp_group,
-            cu_seqlens_padded=cu_seqlens_padded,
-            sequence_parallel=self.sequence_parallel,
-            tp_group=self.tp_group,
-            tp_cp_group=self.tp_cp_group,
-        )
-        zigzag_packed_seq_params = replace(
-            packed_seq_params,
-            cu_seqlens_q_padded=plan.cu_seqlens_padded,
-            cu_seqlens_kv_padded=plan.cu_seqlens_padded,
-            max_seqlen_q=plan.max_seqlen_padded,
-            max_seqlen_kv=plan.max_seqlen_padded,
-            total_tokens=None,
-            seq_idx=None,
-            pad_between_seqs=plan.pad_between_seqs,
-        )
-        return plan, zigzag_packed_seq_params
-
     def build_forward_state(
-        self, packed_seq_params: PackedSeqParams | None
+        self,
+        packed_seq_params: PackedSeqParams | None,
+        packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
+        thd_plan: THDCPLayoutPlan | None = None,
     ) -> "ContextParallelLayoutState | None":
-        """Build the layout state for one forward pass."""
+        """Build the layout state for one forward pass.
+
+        Args:
+            packed_seq_params: Metadata for the stack's boundary layout.
+            packed_seq_params_by_layout: Prebuilt metadata for each physical layout.
+            thd_plan: Prebuilt route between packed contiguous and zigzag layouts.
+        """
         if not self.requires_conversion:
             return None
 
-        thd_plan = None
-        zigzag_packed_seq_params = packed_seq_params
+        if thd_plan is not None and packed_seq_params_by_layout is not None:
+            return ContextParallelLayoutState(
+                manager=self,
+                thd_plan=thd_plan,
+                contiguous_packed_seq_params=packed_seq_params_by_layout["contiguous"],
+                zigzag_packed_seq_params=packed_seq_params_by_layout["zigzag"],
+            )
+
         if packed_seq_params is not None:
-            thd_plan, zigzag_packed_seq_params = self.build_packed_zigzag_layout(packed_seq_params)
+            raise ValueError(
+                "Packed CP layout conversion requires prebuilt metadata for both layouts"
+            )
 
         return ContextParallelLayoutState(
             manager=self,
             thd_plan=thd_plan,
             contiguous_packed_seq_params=packed_seq_params,
-            zigzag_packed_seq_params=zigzag_packed_seq_params,
+            zigzag_packed_seq_params=packed_seq_params,
         )
 
 
