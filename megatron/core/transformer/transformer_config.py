@@ -3232,8 +3232,8 @@ class TransformerConfig(ModelParallelConfig):
             # passing graph-produced probabilities and routing maps directly to the backend,
             # bypassing native token-dispatcher preprocess and state replay.
             raise ValueError(
-                "MOK supports full-iteration CUDA Graph, but does not currently support "
-                "MCore's partial MoE graph replay protocol (moe_router/moe_preprocess)"
+                "MOK does not currently support MCore's partial MoE graph replay protocol "
+                "(moe_router/moe_preprocess)"
             )
 
         assert self.cuda_graph_impl in [
