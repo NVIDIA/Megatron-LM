@@ -30,12 +30,9 @@ from megatron.core.transformer.moe.replica_planner import (
     _ReplicaWaitGradReduce,
     extract_semantic_routes,
     map_replica_plan_to_hybridep,
+    map_routes_to_runtime_experts,
 )
-from megatron.core.transformer.moe.replica_weight_triton import (
-    launch_replica_placement,
-    launch_replica_route_mapping,
-    launch_replica_route_ranking,
-)
+from megatron.core.transformer.moe.replica_weight_triton import launch_replica_placement
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
@@ -88,25 +85,12 @@ def _histogram(routes: torch.Tensor) -> torch.Tensor:
 
 def _plan_locally(
     gathered_counts: torch.Tensor, routes: torch.Tensor | None, source_rank: int, device
-) -> ReplicaPlannerWorkspace:
-    """Run placement (and optionally ranking plus mapping) for one source rank."""
+) -> tuple[ReplicaPlannerWorkspace, torch.Tensor | None]:
+    """Run placement (and optionally route mapping) for one source rank."""
     workspace = ReplicaPlannerWorkspace.allocate(
-        num_tokens=NUM_TOKENS,
-        router_topk=ROUTER_TOPK,
-        num_experts=NUM_EXPERTS,
-        ep_size=EP_SIZE,
-        device=device,
+        num_experts=NUM_EXPERTS, ep_size=EP_SIZE, device=device
     )
     workspace.gathered_counts.copy_(gathered_counts)
-    if routes is not None:
-        launch_replica_route_ranking(
-            routes.reshape(-1).to(device),
-            workspace.sort_route_metadata,
-            workspace.sort_partition_counts,
-            workspace.sort_grid_sync,
-            num_experts=NUM_EXPERTS,
-            num_routes=NUM_ROUTES,
-        )
     launch_replica_placement(
         workspace.gathered_counts,
         workspace.balance,
@@ -121,20 +105,14 @@ def _plan_locally(
         num_experts=NUM_EXPERTS,
         num_local_experts=NUM_LOCAL_EXPERTS,
     )
+    virtual_experts = None
     if routes is not None:
-        launch_replica_route_mapping(
-            workspace.sort_route_metadata,
-            workspace.sort_partition_counts,
-            workspace.destination_boundaries,
-            workspace.expert_replica_slots,
-            workspace.virtual_experts,
-            ep_size=EP_SIZE,
-            num_experts=NUM_EXPERTS,
-            num_local_experts=NUM_LOCAL_EXPERTS,
-            num_routes=NUM_ROUTES,
+        routes = routes.to(device)
+        virtual_experts = map_routes_to_runtime_experts(
+            routes, gathered_counts[source_rank].contiguous(), workspace
         )
     torch.cuda.synchronize(device)
-    return workspace
+    return workspace, virtual_experts
 
 
 @requires_cuda
@@ -143,7 +121,7 @@ def test_replica_placement_balances_every_destination(skew):
     """Equalize route load across ranks without over-subscribing replica slots."""
     device = torch.device("cuda", torch.cuda.current_device())
     counts = _histogram(_routes_for_skew(skew))
-    workspace = _plan_locally(counts.to(device), None, source_rank=0, device=device)
+    workspace, _ = _plan_locally(counts.to(device), None, source_rank=0, device=device)
 
     allocation = workspace.allocation.cpu()
     experts_to_copy = workspace.experts_to_copy.cpu()
@@ -184,7 +162,7 @@ def test_replica_placement_balances_every_destination(skew):
         assert all(expert // NUM_LOCAL_EXPERTS != destination for expert in filled)
 
     # Placement is replayed independently on every rank and must agree exactly.
-    repeated = _plan_locally(counts.to(device), None, source_rank=EP_SIZE - 1, device=device)
+    repeated, _ = _plan_locally(counts.to(device), None, source_rank=EP_SIZE - 1, device=device)
     for field in ("balance", "allocation", "experts_to_copy", "expert_replica_slots"):
         torch.testing.assert_close(
             getattr(repeated, field).cpu(), getattr(workspace, field).cpu(), rtol=0, atol=0
@@ -203,11 +181,11 @@ def test_replica_planner_maps_every_route_to_the_expert_it_selected(skew):
     experts_to_copy = None
     observed = torch.zeros((NUM_EXPERTS, EP_SIZE), dtype=torch.int32)
     for source_rank in range(EP_SIZE):
-        workspace = _plan_locally(counts, routes[source_rank], source_rank, device)
+        workspace, virtual = _plan_locally(counts, routes[source_rank], source_rank, device)
         if allocation is None:
             allocation = workspace.allocation.cpu()
             experts_to_copy = workspace.experts_to_copy.cpu()
-        virtual_experts = workspace.virtual_experts.cpu().reshape(-1).tolist()
+        virtual_experts = virtual.cpu().reshape(-1).tolist()
         for route, virtual in zip(routes[source_rank].reshape(-1).tolist(), virtual_experts):
             destination, runtime_local = divmod(virtual, 2 * NUM_LOCAL_EXPERTS)
             if runtime_local < NUM_LOCAL_EXPERTS:
