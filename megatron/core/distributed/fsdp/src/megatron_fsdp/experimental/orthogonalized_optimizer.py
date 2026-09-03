@@ -59,6 +59,8 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.optim.optimizer import ParamsT
 
+from megatron.core.utils import nvtx_decorator
+
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import Flat
 from .shard_plan import (
@@ -675,6 +677,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
     def step(self, closure: Callable[[], float]) -> float: ...
 
     @torch.no_grad()
+    @nvtx_decorator(message="mfsdp_muon_step")
     @override
     def step(self, closure: Callable[[], float] | None = None) -> float | None:
         """Perform a single optimization step to update parameters.
