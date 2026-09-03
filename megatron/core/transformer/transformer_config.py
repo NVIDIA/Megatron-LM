@@ -2214,10 +2214,6 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_megakernel_backend must be None or 'mok', got "
                 f"{self.moe_megakernel_backend!r}"
             )
-        if self.moe_megakernel_backend_config is not None and not isinstance(
-            self.moe_megakernel_backend_config, dict
-        ):
-            raise ValueError("moe_megakernel_backend_config must be a mapping")
         if self.moe_megakernel_backend is None and self.moe_megakernel_backend_config:
             raise ValueError(
                 "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
