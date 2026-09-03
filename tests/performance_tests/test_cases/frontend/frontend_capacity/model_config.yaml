@@ -51,8 +51,9 @@ METRICS:
 
 # Past saturation, p99 stops describing the frontend and starts describing the
 # queue the load generator built in front of it. HTTP saturates at concurrency
-# 8; saturation is what throughput_req_per_sec and
-# peak_throughput_req_per_sec already measure.
+# 8. Throughput at individual saturated levels can move between neighbouring
+# levels under normal node noise, so unstable points are not gated; each path's
+# peak_throughput_req_per_sec summary remains gated.
 METRICS_EXCLUDE:
   - keys: "http*_concurrency_32"
     metrics: [p99_latency_ms]
@@ -60,6 +61,12 @@ METRICS_EXCLUDE:
     metrics: [p99_latency_ms]
   - keys: "*_concurrency_512"
     metrics: [p99_latency_ms]
+  - keys: "client_isl_512_concurrency_128"
+    metrics: [throughput_req_per_sec]
+  - keys: "http_stream_isl_512_concurrency_8"
+    metrics: [throughput_req_per_sec]
+  - keys: "http_stream_isl_512_concurrency_32"
+    metrics: [throughput_req_per_sec]
 
 # Wider than the 10% default: this benchmark competes with whatever else shares
 # the node's CPU, and it has no GPU work to hide behind.

@@ -399,5 +399,406 @@
       "max_stable_concurrency": 1,
       "total_errors": 0
     }
+  },
+  "gb200": {
+    "client_isl_512_concurrency_1": {
+      "concurrency": 1,
+      "num_requests": 327,
+      "errors": 0,
+      "throughput_req_per_sec": 65.21910185545525,
+      "avg_latency_ms": 15.332557449547584,
+      "p50_latency_ms": 15.290338000340853,
+      "p99_latency_ms": 15.430561000357557,
+      "request_bytes_per_request": 954.6177370030581,
+      "reply_bytes_per_request": 1306.2354740061162,
+      "scaling_efficiency": 1.0
+    },
+    "client_isl_512_concurrency_8": {
+      "concurrency": 8,
+      "num_requests": 2568,
+      "errors": 0,
+      "throughput_req_per_sec": 512.122514357521,
+      "avg_latency_ms": 15.609858261294523,
+      "p50_latency_ms": 15.607776999786438,
+      "p99_latency_ms": 15.934047999508039,
+      "request_bytes_per_request": 955.0,
+      "reply_bytes_per_request": 1307.0,
+      "scaling_efficiency": 0.981542408182298
+    },
+    "client_isl_512_concurrency_32": {
+      "concurrency": 32,
+      "num_requests": 10155,
+      "errors": 0,
+      "throughput_req_per_sec": 2026.455336300748,
+      "avg_latency_ms": 15.773868396756773,
+      "p50_latency_ms": 16.38608099983685,
+      "p99_latency_ms": 17.759581000063918,
+      "request_bytes_per_request": 955.0,
+      "reply_bytes_per_request": 1307.0,
+      "scaling_efficiency": 0.9709843812285098
+    },
+    "client_isl_512_concurrency_128": {
+      "concurrency": 128,
+      "num_requests": 28228,
+      "errors": 0,
+      "throughput_req_per_sec": 5629.3859633303455,
+      "avg_latency_ms": 22.668099814899193,
+      "p50_latency_ms": 22.5243410004623,
+      "p99_latency_ms": 29.056809000394423,
+      "request_bytes_per_request": 955.0,
+      "reply_bytes_per_request": 1307.0,
+      "scaling_efficiency": 0.6743358400732048
+    },
+    "client_isl_512_concurrency_512": {
+      "concurrency": 512,
+      "num_requests": 30714,
+      "errors": 0,
+      "throughput_req_per_sec": 6122.021630845174,
+      "avg_latency_ms": 82.84526207306193,
+      "p50_latency_ms": 82.54742799999804,
+      "p99_latency_ms": 90.99579700068716,
+      "request_bytes_per_request": 955.4289249202318,
+      "reply_bytes_per_request": 1307.8578498404636,
+      "scaling_efficiency": 0.1833369849870806
+    },
+    "client_isl_512_summary": {
+      "peak_throughput_req_per_sec": 6122.021630845174,
+      "max_stable_concurrency": 32,
+      "total_errors": 0
+    },
+    "client_isl_50000_concurrency_1": {
+      "concurrency": 1,
+      "num_requests": 827,
+      "errors": 0,
+      "throughput_req_per_sec": 165.23296124078047,
+      "avg_latency_ms": 6.051805665058667,
+      "p50_latency_ms": 6.05458300015016,
+      "p99_latency_ms": 6.080951000512869,
+      "request_bytes_per_request": 58691.0,
+      "reply_bytes_per_request": 1307.0,
+      "scaling_efficiency": 1.0
+    },
+    "client_isl_50000_summary": {
+      "peak_throughput_req_per_sec": 165.23296124078047,
+      "max_stable_concurrency": 1,
+      "total_errors": 0
+    },
+    "client_isl_100000_concurrency_1": {
+      "concurrency": 1,
+      "num_requests": 406,
+      "errors": 0,
+      "throughput_req_per_sec": 81.00101034216604,
+      "avg_latency_ms": 12.345189812778,
+      "p50_latency_ms": 12.340689000666316,
+      "p99_latency_ms": 12.459663999834447,
+      "request_bytes_per_request": 117025.7684729064,
+      "reply_bytes_per_request": 1308.536945812808,
+      "scaling_efficiency": 1.0
+    },
+    "client_isl_100000_summary": {
+      "peak_throughput_req_per_sec": 81.00101034216604,
+      "max_stable_concurrency": 1,
+      "total_errors": 0
+    },
+    "client_isl_150000_concurrency_1": {
+      "concurrency": 1,
+      "num_requests": 317,
+      "errors": 0,
+      "throughput_req_per_sec": 63.287330754853826,
+      "avg_latency_ms": 15.800601432200311,
+      "p50_latency_ms": 15.796143999978085,
+      "p99_latency_ms": 15.964655000061612,
+      "request_bytes_per_request": 175359.58990536278,
+      "reply_bytes_per_request": 1308.179810725552,
+      "scaling_efficiency": 1.0
+    },
+    "client_isl_150000_summary": {
+      "peak_throughput_req_per_sec": 63.287330754853826,
+      "max_stable_concurrency": 1,
+      "total_errors": 0
+    },
+    "client_isl_200000_concurrency_1": {
+      "concurrency": 1,
+      "num_requests": 261,
+      "errors": 0,
+      "throughput_req_per_sec": 52.15637839747857,
+      "avg_latency_ms": 19.172738149428852,
+      "p50_latency_ms": 19.15176100010285,
+      "p99_latency_ms": 19.407824000154505,
+      "request_bytes_per_request": 233692.33333333334,
+      "reply_bytes_per_request": 1307.6666666666667,
+      "scaling_efficiency": 1.0
+    },
+    "client_isl_200000_summary": {
+      "peak_throughput_req_per_sec": 52.15637839747857,
+      "max_stable_concurrency": 1,
+      "total_errors": 0
+    },
+    "http_isl_512_concurrency_1": {
+      "concurrency": 1,
+      "num_requests": 309,
+      "errors": 0,
+      "throughput_req_per_sec": 61.783139838335266,
+      "avg_latency_ms": 16.185169032350128,
+      "p50_latency_ms": 16.224535000219475,
+      "p99_latency_ms": 16.29128700005822,
+      "request_bytes_per_request": 954.5598705501618,
+      "reply_bytes_per_request": 1913.1197411003236,
+      "scaling_efficiency": 1.0
+    },
+    "http_isl_512_concurrency_8": {
+      "concurrency": 8,
+      "num_requests": 2373,
+      "errors": 0,
+      "throughput_req_per_sec": 473.4112164316534,
+      "avg_latency_ms": 16.874410528853016,
+      "p50_latency_ms": 16.641590999824984,
+      "p99_latency_ms": 18.4301660001438,
+      "request_bytes_per_request": 955.0,
+      "reply_bytes_per_request": 1914.0,
+      "scaling_efficiency": 0.9578082662810677
+    },
+    "http_isl_512_concurrency_32": {
+      "concurrency": 32,
+      "num_requests": 3448,
+      "errors": 0,
+      "throughput_req_per_sec": 684.9760604731699,
+      "avg_latency_ms": 46.59183775753625,
+      "p50_latency_ms": 44.10240800007159,
+      "p99_latency_ms": 54.84201800027222,
+      "request_bytes_per_request": 955.0,
+      "reply_bytes_per_request": 1914.0,
+      "scaling_efficiency": 0.34646186558011177
+    },
+    "http_isl_512_concurrency_128": {
+      "concurrency": 128,
+      "num_requests": 3456,
+      "errors": 0,
+      "throughput_req_per_sec": 678.6269512985305,
+      "avg_latency_ms": 187.20864763917407,
+      "p50_latency_ms": 167.51098399981856,
+      "p99_latency_ms": 460.08107000034215,
+      "request_bytes_per_request": 955.0,
+      "reply_bytes_per_request": 1914.0,
+      "scaling_efficiency": 0.08581261928242306
+    },
+    "http_isl_512_concurrency_512": {
+      "concurrency": 512,
+      "num_requests": 3656,
+      "errors": 0,
+      "throughput_req_per_sec": 699.5670623419741,
+      "avg_latency_ms": 711.2638930957344,
+      "p50_latency_ms": 627.0869429999948,
+      "p99_latency_ms": 2185.140760999275,
+      "request_bytes_per_request": 955.0,
+      "reply_bytes_per_request": 1914.0,
+      "scaling_efficiency": 0.022115125942318632
+    },
+    "http_isl_512_summary": {
+      "peak_throughput_req_per_sec": 699.5670623419741,
+      "max_stable_concurrency": 8,
+      "total_errors": 0
+    },
+    "http_isl_50000_concurrency_1": {
+      "concurrency": 1,
+      "num_requests": 211,
+      "errors": 0,
+      "throughput_req_per_sec": 42.175017316393635,
+      "avg_latency_ms": 23.71015064930133,
+      "p50_latency_ms": 21.39509700009512,
+      "p99_latency_ms": 26.530327000727993,
+      "request_bytes_per_request": 58689.92890995261,
+      "reply_bytes_per_request": 59647.85781990521,
+      "scaling_efficiency": 1.0
+    },
+    "http_isl_50000_summary": {
+      "peak_throughput_req_per_sec": 42.175017316393635,
+      "max_stable_concurrency": 1,
+      "total_errors": 0
+    },
+    "http_isl_100000_concurrency_1": {
+      "concurrency": 1,
+      "num_requests": 114,
+      "errors": 0,
+      "throughput_req_per_sec": 22.710638968117834,
+      "avg_latency_ms": 44.03147875434131,
+      "p50_latency_ms": 43.82373599946732,
+      "p99_latency_ms": 67.43224499950884,
+      "request_bytes_per_request": 117024.28070175438,
+      "reply_bytes_per_request": 117983.56140350878,
+      "scaling_efficiency": 1.0
+    },
+    "http_isl_100000_summary": {
+      "peak_throughput_req_per_sec": 22.710638968117834,
+      "max_stable_concurrency": 1,
+      "total_errors": 0
+    },
+    "http_isl_150000_concurrency_1": {
+      "concurrency": 1,
+      "num_requests": 75,
+      "errors": 0,
+      "throughput_req_per_sec": 14.984104403535143,
+      "avg_latency_ms": 66.73644150660644,
+      "p50_latency_ms": 67.43196600018564,
+      "p99_latency_ms": 68.58079799985717,
+      "request_bytes_per_request": 175358.0,
+      "reply_bytes_per_request": 176317.0,
+      "scaling_efficiency": 1.0
+    },
+    "http_isl_150000_summary": {
+      "peak_throughput_req_per_sec": 14.984104403535143,
+      "max_stable_concurrency": 1,
+      "total_errors": 0
+    },
+    "http_isl_200000_concurrency_1": {
+      "concurrency": 1,
+      "num_requests": 58,
+      "errors": 0,
+      "throughput_req_per_sec": 11.558075298693119,
+      "avg_latency_ms": 86.51793981033703,
+      "p50_latency_ms": 86.14042299996072,
+      "p99_latency_ms": 94.34083999985887,
+      "request_bytes_per_request": 233691.0,
+      "reply_bytes_per_request": 234650.0,
+      "scaling_efficiency": 1.0
+    },
+    "http_isl_200000_summary": {
+      "peak_throughput_req_per_sec": 11.558075298693119,
+      "max_stable_concurrency": 1,
+      "total_errors": 0
+    },
+    "http_stream_isl_512_concurrency_1": {
+      "concurrency": 1,
+      "num_requests": 297,
+      "errors": 0,
+      "throughput_req_per_sec": 59.3668444959751,
+      "avg_latency_ms": 16.843820100998972,
+      "p50_latency_ms": 16.911394999624463,
+      "p99_latency_ms": 17.87613099986629,
+      "request_bytes_per_request": 954.5084175084176,
+      "reply_bytes_per_request": 3962.094276094276,
+      "scaling_efficiency": 1.0
+    },
+    "http_stream_isl_512_concurrency_8": {
+      "concurrency": 8,
+      "num_requests": 752,
+      "errors": 0,
+      "throughput_req_per_sec": 149.94854338268837,
+      "avg_latency_ms": 53.33625955319847,
+      "p50_latency_ms": 50.35626599965326,
+      "p99_latency_ms": 79.08939199933229,
+      "request_bytes_per_request": 955.0,
+      "reply_bytes_per_request": 4026.0,
+      "scaling_efficiency": 0.31572451057436285
+    },
+    "http_stream_isl_512_concurrency_32": {
+      "concurrency": 32,
+      "num_requests": 800,
+      "errors": 0,
+      "throughput_req_per_sec": 147.60049681346973,
+      "avg_latency_ms": 215.35259398375615,
+      "p50_latency_ms": 193.92829600019468,
+      "p99_latency_ms": 503.4989850000784,
+      "request_bytes_per_request": 955.0,
+      "reply_bytes_per_request": 4026.0,
+      "scaling_efficiency": 0.07769514389018342
+    },
+    "http_stream_isl_512_concurrency_128": {
+      "concurrency": 128,
+      "num_requests": 925,
+      "errors": 0,
+      "throughput_req_per_sec": 173.18991064798516,
+      "avg_latency_ms": 721.8339519827103,
+      "p50_latency_ms": 715.5677380005727,
+      "p99_latency_ms": 1065.3641679991779,
+      "request_bytes_per_request": 955.0,
+      "reply_bytes_per_request": 4026.0,
+      "scaling_efficiency": 0.022791276653235572
+    },
+    "http_stream_isl_512_concurrency_512": {
+      "concurrency": 512,
+      "num_requests": 1381,
+      "errors": 0,
+      "throughput_req_per_sec": 185.86197934905138,
+      "avg_latency_ms": 2580.7948916198384,
+      "p50_latency_ms": 2550.853895000728,
+      "p99_latency_ms": 4395.192418000079,
+      "request_bytes_per_request": 955.0,
+      "reply_bytes_per_request": 4026.0,
+      "scaling_efficiency": 0.006114720792356197
+    },
+    "http_stream_isl_512_summary": {
+      "peak_throughput_req_per_sec": 185.86197934905138,
+      "max_stable_concurrency": 1,
+      "total_errors": 0
+    },
+    "http_stream_isl_50000_concurrency_1": {
+      "concurrency": 1,
+      "num_requests": 112,
+      "errors": 0,
+      "throughput_req_per_sec": 22.378220088479317,
+      "avg_latency_ms": 44.685289562469926,
+      "p50_latency_ms": 45.148191999942355,
+      "p99_latency_ms": 45.572447999802534,
+      "request_bytes_per_request": 58689.25892857143,
+      "reply_bytes_per_request": 61535.66071428572,
+      "scaling_efficiency": 1.0
+    },
+    "http_stream_isl_50000_summary": {
+      "peak_throughput_req_per_sec": 22.378220088479317,
+      "max_stable_concurrency": 1,
+      "total_errors": 0
+    },
+    "http_stream_isl_100000_concurrency_1": {
+      "concurrency": 1,
+      "num_requests": 62,
+      "errors": 0,
+      "throughput_req_per_sec": 12.39168764105952,
+      "avg_latency_ms": 80.69761893551502,
+      "p50_latency_ms": 80.29595299922221,
+      "p99_latency_ms": 82.26679699964734,
+      "request_bytes_per_request": 117024.0,
+      "reply_bytes_per_request": 119839.0,
+      "scaling_efficiency": 1.0
+    },
+    "http_stream_isl_100000_summary": {
+      "peak_throughput_req_per_sec": 12.39168764105952,
+      "max_stable_concurrency": 1,
+      "total_errors": 0
+    },
+    "http_stream_isl_150000_concurrency_1": {
+      "concurrency": 1,
+      "num_requests": 42,
+      "errors": 0,
+      "throughput_req_per_sec": 8.375061781210944,
+      "avg_latency_ms": 119.39982616671668,
+      "p50_latency_ms": 119.83988500014675,
+      "p99_latency_ms": 122.44634499984386,
+      "request_bytes_per_request": 175358.0,
+      "reply_bytes_per_request": 178173.0,
+      "scaling_efficiency": 1.0
+    },
+    "http_stream_isl_150000_summary": {
+      "peak_throughput_req_per_sec": 8.375061781210944,
+      "max_stable_concurrency": 1,
+      "total_errors": 0
+    },
+    "http_stream_isl_200000_concurrency_1": {
+      "concurrency": 1,
+      "num_requests": 33,
+      "errors": 0,
+      "throughput_req_per_sec": 6.489406594450015,
+      "avg_latency_ms": 154.095623848441,
+      "p50_latency_ms": 155.13555200050178,
+      "p99_latency_ms": 156.4665559999412,
+      "request_bytes_per_request": 233691.0,
+      "reply_bytes_per_request": 236506.0,
+      "scaling_efficiency": 1.0
+    },
+    "http_stream_isl_200000_summary": {
+      "peak_throughput_req_per_sec": 6.489406594450015,
+      "max_stable_concurrency": 1,
+      "total_errors": 0
+    }
   }
 }
