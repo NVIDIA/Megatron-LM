@@ -2077,21 +2077,18 @@ class TestFusedMLAQUpProjIntegration:
         backward) are compared, since a bug in the columnwise output would silently degrade
         K-path gradients without any other test catching it.
         """
+        fused_q_up_proj = mla_module.FusedMLAQUpProjRopeQuant
+        if fused_q_up_proj is None or not fused_q_up_proj.is_supported():
+            pytest.skip("Fused MLA Q up-projection requires SM100+ and cuDNN frontend 1.27+")
+        if mla_module.fused_apply_mla_rope_for_q is None:
+            pytest.skip("fused_apply_mla_rope_for_q not available")
+
         import transformer_engine_torch as tex
-        from transformer_engine.pytorch.attention import FusedMLAQUpProjRopeQuant
         from transformer_engine.pytorch.attention.dot_product_attention.utils import (
             mxfp8_quantize_only,
         )
         from transformer_engine.pytorch.cpp_extensions import general_gemm as _te_general_gemm
         from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
-
-        if (
-            mla_module.FusedMLAQUpProjRopeQuant is None
-            or not FusedMLAQUpProjRopeQuant.is_supported()
-        ):
-            pytest.skip("Fused MLA Q up-projection requires SM100+ and cuDNN frontend 1.27+")
-        if mla_module.fused_apply_mla_rope_for_q is None:
-            pytest.skip("fused_apply_mla_rope_for_q not available")
 
         fused_apply_rope = mla_module.fused_apply_mla_rope_for_q
 
@@ -2131,9 +2128,7 @@ class TestFusedMLAQUpProjIntegration:
         sin_flat = freqs.sin().to(torch.bfloat16)  # (S, 64)
 
         # ── Fused path ──────────────────────────────────────────────────────────────
-        query_fused, _ = FusedMLAQUpProjRopeQuant.run(
-            x_fused_mxfp8, w_mxfp8, cos_flat, sin_flat, S, B
-        )
+        query_fused, _ = fused_q_up_proj.run(x_fused_mxfp8, w_mxfp8, cos_flat, sin_flat, S, B)
 
         # ── Unfused path ─────────────────────────────────────────────────────────────
         # Step 1: MXFP8 GEMM.  Same as TE Linear's forward under fp8_autocast.
