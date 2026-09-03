@@ -37,7 +37,9 @@ class GlobalLayout:
     size: int
 
     @classmethod
-    def build(cls, shapes: Iterable[Shape], dp_size: int) -> "GlobalLayout":
+    def build(
+        cls, shapes: Iterable[Shape], dp_size: int, subgroup_size: int | None = None
+    ) -> "GlobalLayout":
         """Compute global tensor element offsets and padded size.
 
         This is a DBuffer-specific reimplementation of
@@ -70,6 +72,9 @@ class GlobalLayout:
         Args:
             shapes: Logical tensor shapes in tensor-id order.
             dp_size: Data-parallel shard count for this global layout.
+            subgroup_size: Optional number of contiguous DP ranks per parameter-placement
+                subgroup. When set below ``dp_size``, every tensor is packed wholly inside
+                one equally sized subgroup span, inserting padding between subgroups as needed.
 
         Returns:
             Global layout with row-aligned tensor offsets and a total size padded
@@ -88,6 +93,13 @@ class GlobalLayout:
                     f"Cannot compute a layout for zero-sized non-leading dims: {shape}."
                 )
             chunk_size = math.lcm(chunk_size, row_size)
+
+        if subgroup_size is not None:
+            if subgroup_size < dp_size:
+                offsets, size = _build_subgroup_layout(
+                    tensor_shapes, chunk_size, dp_size, subgroup_size
+                )
+                return cls(tensor_shapes=tensor_shapes, tensor_to_offset=offsets, size=size)
 
         # chunk_size is the packing granularity. Since every tensor row size divides it,
         # DP shard boundaries that are multiples of chunk_size avoid splitting dim-0 rows.
@@ -246,6 +258,49 @@ def non_leading_numel(shape: torch.Size) -> int:
     if len(shape) == 0:
         raise ValueError(f"DBuffer layout does not support 0D tensor shapes: {shape}.")
     return shape[1:].numel()
+
+
+def _build_subgroup_layout(
+    tensor_shapes: tuple[torch.Size, ...], chunk_size: int, dp_size: int, subgroup_size: int
+) -> tuple[tuple[int, ...], int]:
+    """Pack each tensor wholly into one equally sized contiguous DP subgroup span."""
+    num_subgroups = dp_size // subgroup_size
+    subgroup_cursors = [0] * num_subgroups
+    local_offsets = [-1] * len(tensor_shapes)
+    tensor_subgroups = [-1] * len(tensor_shapes)
+
+    # Largest-first placement keeps subgroup spans balanced. Stable tensor-id tie
+    # breaking makes every rank independently construct the same layout.
+    tensor_items = sorted(enumerate(tensor_shapes), key=lambda item: (-item[1].numel(), item[0]))
+    for tensor_id, shape in tensor_items:
+        row_size = non_leading_numel(shape)
+
+        def placement_end(subgroup_id: int) -> int:
+            start = _pad_to_multiple(subgroup_cursors[subgroup_id], row_size)
+            return start + shape.numel()
+
+        subgroup_id = min(
+            range(num_subgroups),
+            key=lambda candidate: (
+                placement_end(candidate),
+                subgroup_cursors[candidate],
+                candidate,
+            ),
+        )
+        start = _pad_to_multiple(subgroup_cursors[subgroup_id], row_size)
+        local_offsets[tensor_id] = start
+        tensor_subgroups[tensor_id] = subgroup_id
+        subgroup_cursors[subgroup_id] = start + shape.numel()
+
+    # Equal subgroup spans are required because Flat gives every DP rank the
+    # same local shard size. Aligning one subgroup span to chunk_size times the
+    # subgroup rank count keeps every per-rank boundary aligned to every row size.
+    subgroup_span = _pad_to_multiple(max(subgroup_cursors, default=0), chunk_size * subgroup_size)
+    tensor_to_offset = tuple(
+        tensor_subgroups[tensor_id] * subgroup_span + local_offsets[tensor_id]
+        for tensor_id in range(len(tensor_shapes))
+    )
+    return tensor_to_offset, subgroup_span * num_subgroups
 
 
 def _pad_to_multiple(value: int, multiple: int) -> int:

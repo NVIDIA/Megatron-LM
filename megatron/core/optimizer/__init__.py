@@ -848,7 +848,21 @@ def _get_megatron_emerging_optimizer(
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
         is_expert = group['is_expert_parallel'] and not use_layer_wise
-        grouped_param_groups[(opt_name, is_expert)].append(group)
+        if is_mfsdp_v2 and opt_name == eopt_name:
+            params_by_mesh = defaultdict(list)
+            for parameter in group['params']:
+                parameter_mesh = parameter.device_mesh
+                mesh_ranks = tuple(
+                    torch.distributed.get_process_group_ranks(parameter_mesh.get_group())
+                )
+                params_by_mesh[mesh_ranks].append(parameter)
+
+            for mesh_ranks, parameters in params_by_mesh.items():
+                mesh_group = group.copy()
+                mesh_group['params'] = parameters
+                grouped_param_groups[(opt_name, is_expert, mesh_ranks)].append(mesh_group)
+        else:
+            grouped_param_groups[(opt_name, is_expert, None)].append(group)
 
     # Set up DistOpt process groups + filtered buffers once, only if we'll
     # construct a DistributedOptimizer for non-Muon groups in layer-wise mode.
@@ -876,7 +890,7 @@ def _get_megatron_emerging_optimizer(
         # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
         # e.g., Muon). This includes scalar optimizers like Adam or Lion.
         not (opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS)
-        for (opt_name, _), groups in grouped_param_groups.items()
+        for (opt_name, _, _), groups in grouped_param_groups.items()
         if groups
     ):
         # ``setup_process_groups_for_optimizer`` rejects Gloo groups whenever
@@ -908,7 +922,7 @@ def _get_megatron_emerging_optimizer(
     # and the rest go through DistOpt's standard byte-level shard machinery.
     results = []
     layer_wise_base_results = []  # (raw_optimizer, init_state_fn) feeding LayerWise.
-    for (opt_name, is_expert), groups in grouped_param_groups.items():
+    for (opt_name, is_expert, _mesh_ranks), groups in grouped_param_groups.items():
         if not groups:
             continue
 

@@ -108,6 +108,7 @@ def fully_shard(
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
     grad_divisor: int = 1,
+    subgroup_size: int | None = None,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -131,6 +132,9 @@ def fully_shard(
             the expert-data-parallel mesh alone therefore divides by too little, and
             ``grad_divisor=ep_size`` makes up the difference. Dense parameters see only
             their own rank's tokens and need no divisor.
+        subgroup_size: Optional maximum number of contiguous DP ranks across which one
+            parameter may be sharded. Values larger than this mesh are capped to the mesh
+            size; otherwise the mesh size must be divisible by the subgroup size.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -146,6 +150,9 @@ def fully_shard(
 
     _validate_dp_axes(mesh, placements.dp_axes)
     mixed_precision_policy = mixed_precision_policy or MixedPrecisionPolicy()
+    if subgroup_size is not None:
+        subgroup_size = min(subgroup_size, mesh.size())
+
     original_cls = module.__class__
     _attach_mixin(module)
     try:
@@ -160,6 +167,7 @@ def fully_shard(
             mixed_precision_policy=mixed_precision_policy,
             grad_divisor=grad_divisor,
             use_symmetric_memory=context.use_symmetric_memory,
+            subgroup_size=subgroup_size,
         )
     except Exception:
         module.__class__ = original_cls

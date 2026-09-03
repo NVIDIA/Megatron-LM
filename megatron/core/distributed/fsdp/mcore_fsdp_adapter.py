@@ -654,6 +654,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             placements=expert_placements,
                             mixed_precision_policy=self.mp_policy,
                             grad_divisor=config.expert_model_parallel_size,
+                            subgroup_size=ddp_config.muon_dp_subgroup_size,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -667,6 +668,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         submodule,
                         mesh=dp_mesh,
                         placements=dense_placements,
+                        subgroup_size=ddp_config.muon_dp_subgroup_size,
                         mixed_precision_policy=self.mp_policy,
                     )
             if config.init_model_with_meta_device:
@@ -674,6 +676,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             fully_shard(
                 module,
                 mesh=dp_mesh,
+                subgroup_size=ddp_config.muon_dp_subgroup_size,
                 placements=dense_placements,
                 mixed_precision_policy=self.mp_policy,
             )

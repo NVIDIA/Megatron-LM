@@ -100,6 +100,7 @@ class FsdpParameterGroup:
         reduce_scatter_stream: torch.cuda.Stream,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        subgroup_size: int | None = None,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -117,6 +118,8 @@ class FsdpParameterGroup:
                 NCCL symmetric-memory pool.
             grad_divisor: Additional divisor applied on top of the mesh-size
                 averaging. See ``fully_shard``.
+            subgroup_size: Optional contiguous DP parameter-placement subgroup size.
+                The value is already normalized to this parameter group's mesh.
         """
         if not parameters:
             raise ValueError("FsdpParameterGroup requires at least one parameter.")
@@ -138,6 +141,7 @@ class FsdpParameterGroup:
         self.mesh = mesh
         self.grad_divisor = grad_divisor
         first_parameter = next(iter(parameter_to_fqns))
+        self.subgroup_size = subgroup_size
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
         for parameter, fqns in parameter_to_fqns.items():
@@ -158,6 +162,7 @@ class FsdpParameterGroup:
             (parameter.to(dtype=main_weight_dtype) for parameter in parameter_to_fqns),
             mesh=self.mesh,
             placements=main_weight_placements,
+            subgroup_size=self.subgroup_size,
         )
 
         if use_symmetric_memory:
@@ -178,6 +183,7 @@ class FsdpParameterGroup:
                     tensor_shapes=tensor_shapes,
                     dtype=self.dtype,
                     device=self.main_weight.device,
+                    subgroup_size=self.subgroup_size,
                 )
             # Cast into the preallocated model_weight on the current stream without
             # replacing its storage or its all-gather allocation stream.
@@ -190,6 +196,7 @@ class FsdpParameterGroup:
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
                 device=self.main_weight.device,
+                subgroup_size=self.subgroup_size,
             )
 
         self.main_grad = None
@@ -207,6 +214,7 @@ class FsdpParameterGroup:
                     tensor_shapes=self.main_weight.layout.tensor_shapes,
                     dtype=grad_dtype,
                     device=self.main_weight.device,
+                    subgroup_size=self.subgroup_size,
                 )
             assert self.main_grad.layout == self.main_weight.layout, (
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
@@ -341,6 +349,7 @@ class FsdpParameterGroup:
                 tensor_shapes=tuple(grad.shape for grad in grads),
                 dtype=grads[0].dtype,
                 device=grads[0].device,
+                subgroup_size=self.subgroup_size,
             )
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
@@ -410,6 +419,7 @@ class FsdpParameterGroup:
                     tensor_shapes=self.main_weight.layout.tensor_shapes,
                     dtype=self.main_grad.dtype,
                     device=self.main_weight.device,
+                    subgroup_size=self.subgroup_size,
                 )
                 if has_sharded_grads:
                     self.main_grad.local_buffer.zero_()

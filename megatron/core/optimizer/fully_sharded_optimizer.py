@@ -50,6 +50,12 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     MFSDP-specific storage operations explicit.
     """
 
+    # ChainedOptimizer's combined gradient-statistics path requires every DTensor
+    # to use the same device mesh. MFSDP needs the per-optimizer implementation
+    # below so dense and expert parameters on different meshes are counted
+    # correctly, even when their final reduction process group is the same.
+    requires_individual_grad_stats = True
+
     @override
     def __init__(
         self,

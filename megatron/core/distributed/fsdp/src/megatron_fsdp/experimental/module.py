@@ -178,6 +178,7 @@ class FsdpModule:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        subgroup_size: int | None = None,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
@@ -208,6 +209,7 @@ class FsdpModule:
                     reduce_scatter_stream=context.reduce_scatter_stream,
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
+                    subgroup_size=subgroup_size,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)

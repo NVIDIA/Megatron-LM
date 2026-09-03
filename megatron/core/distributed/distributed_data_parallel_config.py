@@ -260,6 +260,12 @@ class DistributedDataParallelConfig:
     Only effective with ``outer_dp_sharding_strategy='optim'``.
     """
 
+    muon_dp_subgroup_size: Optional[int] = None
+    """Maximum number of contiguous DP ranks across which one parameter may be sharded for
+    MFSDP v2 Muon. Values larger than a parameter mesh are capped to that mesh; otherwise
+    the mesh size must be divisible by this value.
+    """
+
     @property
     def param_sync_via_bucket_group(self) -> bool:
         """Whether DP parameter synchronization is dispatched through DDP bucket groups.

@@ -85,6 +85,7 @@ class DBuffer:
         tensor_shapes: Iterable[Shape],
         dtype: torch.dtype,
         device: torch.device | str,
+        subgroup_size: int | None = None,
     ) -> None:
         """Create a DBuffer and allocate its local buffer.
 
@@ -94,6 +95,7 @@ class DBuffer:
             tensor_shapes: Global shapes for each logical tensor in this buffer.
             dtype: Dtype for the local buffer.
             device: Device for the local buffer.
+            subgroup_size: Optional contiguous DP parameter-placement subgroup size.
         """
         placements = tuple(placements)
         if len(placements) != mesh.ndim:
@@ -104,9 +106,12 @@ class DBuffer:
 
         self.mesh = mesh
         self.placements = placements
+        self.subgroup_size = subgroup_size
 
         tensor_shapes = tuple(torch.Size(shape) for shape in tensor_shapes)
-        self.layout = GlobalLayout.build(tensor_shapes, dp_size=self.mesh.size())
+        self.layout = GlobalLayout.build(
+            tensor_shapes, dp_size=self.mesh.size(), subgroup_size=subgroup_size
+        )
 
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
         self.local_buffer = torch.empty(local_numel, dtype=dtype, device=device)
@@ -179,6 +184,7 @@ class DBuffer:
         tensor_shapes: Iterable[Shape],
         *,
         allocation_stream: torch.cuda.Stream | None,
+        subgroup_size: int | None = None,
     ) -> "DBuffer":
         """Create a DBuffer from an existing local buffer.
 
@@ -190,6 +196,7 @@ class DBuffer:
             placements: Per-mesh-axis DBuffer placements.
             tensor_shapes: Global shapes for each logical tensor in this buffer.
             allocation_stream: CUDA stream that allocated ``local_buffer``, or ``None`` for CPU.
+            subgroup_size: Optional contiguous DP parameter-placement subgroup size.
 
         Returns:
             A DBuffer that reuses ``local_buffer`` without allocating storage.
@@ -206,7 +213,7 @@ class DBuffer:
             raise ValueError("local_buffer must be contiguous for collective operations.")
 
         tensor_shapes = tuple(torch.Size(shape) for shape in tensor_shapes)
-        layout = GlobalLayout.build(tensor_shapes, dp_size=mesh.size())
+        layout = GlobalLayout.build(tensor_shapes, dp_size=mesh.size(), subgroup_size=subgroup_size)
         offset, local_numel = layout.get_local_range(mesh, placements)
         if local_buffer.numel() != local_numel:
             raise ValueError(
@@ -217,6 +224,7 @@ class DBuffer:
         buffer = cls.__new__(cls)
         buffer.mesh = mesh
         buffer.placements = placements
+        buffer.subgroup_size = subgroup_size
         buffer.layout = layout
         buffer.offset = offset
         buffer.local_buffer = local_buffer
@@ -225,7 +233,11 @@ class DBuffer:
 
     @classmethod
     def distribute_tensors(
-        cls, tensors: Iterable[torch.Tensor], mesh: DeviceMesh, placements: Iterable[Placement]
+        cls,
+        tensors: Iterable[torch.Tensor],
+        mesh: DeviceMesh,
+        placements: Iterable[Placement],
+        subgroup_size: int | None = None,
     ) -> "DBuffer":
         """Distribute full local tensors into a DBuffer.
 
@@ -234,6 +246,7 @@ class DBuffer:
                 shape and dtype metadata but no values.
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
+            subgroup_size: Optional contiguous DP parameter-placement subgroup size.
 
         Returns:
             A DBuffer whose real local storage matches ``placements``. Ranges
@@ -255,6 +268,7 @@ class DBuffer:
             tensor_shapes=tensor_shapes,
             dtype=dtype,
             device=mesh.device_type,
+            subgroup_size=subgroup_size,
         )
         # Only logical tensor ranges are initialized. Padding and layout gaps are not
         # observable through get_local_tensor() and can remain unspecified.
@@ -291,8 +305,8 @@ class DBuffer:
                 tensor_shapes=self.layout.tensor_shapes,
                 dtype=dtype,
                 device=self.device,
+                subgroup_size=self.subgroup_size,
             )
-
         if out.mesh != self.mesh:
             raise ValueError(f"Expected out mesh {self.mesh!r}, got {out.mesh!r}.")
         if out.placements != placements:
@@ -371,6 +385,7 @@ class DBuffer:
                 new_placements,
                 self.layout.tensor_shapes,
                 allocation_stream=self.allocation_stream,
+                subgroup_size=self.subgroup_size,
             )
         raise NotImplementedError(
             "Unsupported DBuffer placement transition on axis "
@@ -487,6 +502,7 @@ class DBuffer:
                 placements,
                 self.layout.tensor_shapes,
                 allocation_stream=self.allocation_stream,
+                subgroup_size=self.subgroup_size,
             )
 
         out.local_buffer.copy_(local_slice)
