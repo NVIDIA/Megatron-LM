@@ -53,8 +53,6 @@ def apply_thd_cp_local_rope_fused(
     inverse: bool = False,
 ) -> torch.Tensor:
     """Apply fused non-interleaved RoPE to local THD CP rows."""
-    position_ids = _thd_cp_position_ids(cu_seqlens_padded, global_start, x.shape[0])
-
     squeezed_batch = x.ndim == 4 and x.shape[1] == 1
     squeezed_head = x.ndim == 2
     rope_input = x.squeeze(1) if squeezed_batch else x
@@ -71,7 +69,7 @@ def apply_thd_cp_local_rope_fused(
         cu_seqlens_q=cu_seqlens_padded,
         inverse=inverse,
         remove_interleaving=True,
-        position_ids=position_ids,
+        thd_global_start=global_start,
     )
     if squeezed_batch:
         return output.unsqueeze(1)

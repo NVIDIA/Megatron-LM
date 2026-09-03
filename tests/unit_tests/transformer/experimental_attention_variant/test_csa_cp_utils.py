@@ -50,6 +50,32 @@ def _sequence_positions(cu_seqlens, rows):
     return torch.where((rows >= starts) & (rows < ends), rows - starts, 0)
 
 
+def test_apply_thd_cp_local_rope_fused_defers_position_mapping_to_kernel(monkeypatch):
+    calls = []
+
+    def fail_position_materialization(*_args, **_kwargs):
+        raise AssertionError("fused RoPE must not materialize THD position ids")
+
+    def fake_fused(rope_input, *_args, **kwargs):
+        calls.append(kwargs)
+        return rope_input
+
+    monkeypatch.setattr(csa_cp_utils, "_thd_cp_position_ids", fail_position_materialization)
+    monkeypatch.setattr(csa_cp_utils, "fused_mla_rope_inplace", fake_fused)
+
+    x = torch.randn(4, 2, 8)
+    cu_seqlens = torch.tensor([0, 4, 12], dtype=torch.int32)
+    output = apply_thd_cp_local_rope_fused(
+        x, torch.empty(0), torch.empty(0), 4, 4, cu_seqlens, global_start=3
+    )
+
+    assert output is x
+    assert len(calls) == 1
+    assert calls[0]["cu_seqlens_q"] is cu_seqlens
+    assert calls[0]["thd_global_start"] == 3
+    assert "position_ids" not in calls[0]
+
+
 def test_thd_cp_left_boundary_exchange_forward_backward():
     """Validate distributed CP boundary exchange forward/backward.
 
