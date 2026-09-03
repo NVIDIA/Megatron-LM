@@ -502,19 +502,15 @@ class TestDistributedOptimizer:
             'dp_reshardable',
             'dp_zero_gather_scatter',
             'fully_reshardable',
-            'fully_sharded_model_space',
+            # fsdp_dtensor uses a separate optimizer path. fully_sharded_model_space is
+            # deprecated and cannot be constructed with the current ShardedTensor API.
         ],
     )
     def test_torch_dist_optimizer_state_dict_key_types(self, sharding_type):
         """torch_dist optimizer checkpoints use only string or integer mapping keys."""
         Utils.initialize_model_parallel(1, 1)
         model, optimizer = setup_model_and_optimizer(
-            seed=2,
-            tp=1,
-            pp=1,
-            bf16=True,
-            dist_opt=True,
-            initialize_fn=initialize_pp_agnostic_model,
+            seed=2, tp=1, pp=1, bf16=True, dist_opt=True, initialize_fn=initialize_pp_agnostic_model
         )
         distributed_optimizer = self._unwrap_distributed_optimizer(optimizer)
         runtime_dtype_keys = [
@@ -528,9 +524,7 @@ class TestDistributedOptimizer:
             'distrib_optim_fully_reshardable_mem_efficient': False,
         }
 
-        optim_sd = optimizer.sharded_state_dict(
-            model[0].sharded_state_dict(), metadata=metadata
-        )
+        optim_sd = optimizer.sharded_state_dict(model[0].sharded_state_dict(), metadata=metadata)
         unsupported_keys = [
             (path, key)
             for path, key in iter_state_dict_keys(optim_sd)
@@ -605,9 +599,22 @@ class TestDistributedOptimizer:
                 model_B[0].sharded_state_dict(), metadata=metadata, is_loading=True
             )
             loaded_state_dict = load(load_sharded_state_dict, ckpt_dir)
+            loaded_has_tuple_key = torch.tensor(
+                any(isinstance(key, tuple) for _, key in iter_state_dict_keys(loaded_state_dict)),
+                device='cuda',
+                dtype=torch.int,
+            )
+            torch.distributed.all_reduce(loaded_has_tuple_key, op=torch.distributed.ReduceOp.MAX)
+            assert bool(loaded_has_tuple_key.item()) == legacy_keys
+
             optimizer_B.load_state_dict(loaded_state_dict)
             optim_param_state_B = get_param_state_dp_zero(optimizer_B)
 
+            if legacy_keys:
+                distributed_optimizer_A = self._unwrap_distributed_optimizer(optimizer_A)
+                distributed_optimizer_A._back_compat_normalize_loaded_dtype_keys(
+                    optim_param_state_A
+                )
             assert self.check_equal_dp_zero_state(
                 optim_param_state_A,
                 optim_param_state_B,
