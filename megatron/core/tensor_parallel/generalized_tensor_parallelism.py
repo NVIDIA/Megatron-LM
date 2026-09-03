@@ -444,8 +444,9 @@ class GTPRematConfig:
     # DDP's 1/replicate scaling to yield the full (replicate x gtp) mean.
     calculate_per_token_loss: bool = False
     # Run the gtp_remat wgrad reduce-scatter as all-to-all + local FP32 sum: same bytes on the
-    # wire, but accumulation no longer loses precision as the axis grows. Bypassed at axis size
-    # <= 2. Independent of the DDP-axis --ddp-reduce-scatter-with-fp32-accumulation.
+    # wire, but accumulation no longer loses precision as the axis grows, and the FP32 shard sum
+    # is added into main_grad unrounded (one BF16 rounding per microbatch). Bypassed at axis
+    # size <= 2. Independent of the DDP-axis --ddp-reduce-scatter-with-fp32-accumulation.
     reduce_scatter_with_fp32_accumulation: bool = False
     # Persistent wgrad slots per scheduling/shape domain for partial-CG asynchronous reduce-scatter.
     # Two slots cover the usual case of one same-key writer per graph. A graph containing multiple
@@ -1955,6 +1956,10 @@ class GTPShardedParam(torch.nn.Parameter):
     def _reduce_scatter_fp32_accum(self, tensor, out_buffer):
         """Issue one fp32-accum reduce-scatter (all-to-all now, FP32 sum at wait) -> (out, handle).
 
+        ``out`` is FP32 whatever the wgrad dtype: the consumer's ``main_grad.add_`` then
+        performs the only rounding of a BF16 gradient, instead of rounding the sum into a
+        BF16 output first and again on the add.
+
         Always issued async, even for a sync RS: under a coalescing manager the all-to-all is
         only enqueued at context exit, so the handle's FP32 sum must never run inline here. The
         caller waits the handle (immediately when sync) and then releases the scratch.
@@ -1970,7 +1975,12 @@ class GTPShardedParam(torch.nn.Parameter):
         tensor = tensor.contiguous()
         if out_buffer is None:
             out_shape = [tensor.shape[0] // self.group.size(), *tensor.shape[1:]]
-            out_buffer = torch.empty(out_shape, dtype=tensor.dtype, device=tensor.device)
+            out_buffer = torch.empty(out_shape, dtype=torch.float32, device=tensor.device)
+        elif out_buffer.dtype != torch.float32:
+            raise RuntimeError(
+                "[GTP] fp32-accumulating reduce-scatter needs an FP32 output buffer, got "
+                f"{out_buffer.dtype} for {self._debug_name}."
+            )
 
         a2a_buf = _wgrad_pool_get(tuple(tensor.shape), tensor.dtype, tensor.device)
         handle = reduce_scatter_with_fp32_accumulation(
@@ -2003,8 +2013,17 @@ class GTPShardedParam(torch.nn.Parameter):
 
         wgrads, release_bufs = self._prepare_wgrad_reduce_scatter_inputs(wgrads)
 
+        # fp32-accum all-to-all: skipped at size <= 2 and on symm-registered groups. Its shard
+        # sum stays FP32 all the way into main_grad.add_, so a BF16 main_grad rounds once per
+        # microbatch instead of once into a BF16 output and again on the add.
+        fp32_accumulation = (
+            GTP_CONFIG.reduce_scatter_with_fp32_accumulation
+            and self.group.size() > 2
+            and not is_gtp_symm_pool_registered(self.group)
+        )
+
         if async_op:
-            dtypes = [w.dtype for w in wgrads]
+            dtypes = [torch.float32 if fp32_accumulation else w.dtype for w in wgrads]
             out_buffers = []
             cache = get_global_GTP_cache()
             for p, dt in zip(self._weights, dtypes):
@@ -2032,12 +2051,7 @@ class GTPShardedParam(torch.nn.Parameter):
             rs_ctx = nullcontext()
 
         with rs_ctx:
-            # fp32-accum all-to-all: skipped at size <= 2 and on symm-registered groups.
-            if (
-                GTP_CONFIG.reduce_scatter_with_fp32_accumulation
-                and self.group.size() > 2
-                and not is_gtp_symm_pool_registered(self.group)
-            ):
+            if fp32_accumulation:
                 nvtx_range_push(f"{nvtx_label}.gtp_rs_fp32accum")
                 outputs, sum_handles = [], []
                 if len(wgrads) > 1:
