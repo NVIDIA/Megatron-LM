@@ -13,6 +13,7 @@ from torch import Tensor
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
+from megatron.core.dynamic_cp_group import get_logical_cp_transport_group, get_process_group_ranks
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
@@ -362,8 +363,8 @@ def _build_contiguous_packed_seq_roll_plan(
 
     local_seq_len = tensor.size(dims)
     cp_size = cp_group.size()
-    local_rank = torch.distributed.get_rank(group=cp_group)
-    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+    local_rank = cp_group.rank()
+    global_ranks = get_process_group_ranks(cp_group)
 
     cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
     if cu.numel() > 1:
@@ -644,24 +645,33 @@ def _roll_tensor_unpacked_zigzag_cp(tensor, shifts, dims, cp_group, fill_value=0
         tensor_recv_list.append(empty_tensor)
 
     # Get the global rank of next and prev process in the cp group
-    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
-    local_rank = torch.distributed.get_rank(group=cp_group)
+    global_ranks = get_process_group_ranks(cp_group)
+    local_rank = cp_group.rank()
     next_rank = global_ranks[(local_rank + 1) % len(global_ranks)]
     prev_rank = global_ranks[(local_rank - 1) % len(global_ranks)]
+    transport_group = get_logical_cp_transport_group(cp_group)
 
     # Start send and recv ops
     ops = []
     if local_rank != 0:
-        req_send_first_part = torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank)
+        req_send_first_part = torch.distributed.isend(
+            tensor=tensor_send_list[0], dst=prev_rank, group=transport_group
+        )
         ops.append(req_send_first_part)
-        req_recv_second_part = torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank)
+        req_recv_second_part = torch.distributed.irecv(
+            tensor=tensor_recv_list[1], src=prev_rank, group=transport_group
+        )
         ops.append(req_recv_second_part)
     else:
         tensor_recv_list[1] = fill_value
     if local_rank != len(global_ranks) - 1:
-        req_recv_first_part = torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank)
+        req_recv_first_part = torch.distributed.irecv(
+            tensor=tensor_recv_list[0], src=next_rank, group=transport_group
+        )
         ops.append(req_recv_first_part)
-        req_send_second_part = torch.distributed.isend(tensor=tensor_send_list[1], dst=next_rank)
+        req_send_second_part = torch.distributed.isend(
+            tensor=tensor_send_list[1], dst=next_rank, group=transport_group
+        )
         ops.append(req_send_second_part)
     else:
         # For the last CP rank, the removed elements of second part go into the first part
@@ -779,10 +789,11 @@ def _roll_tensor_packed_seq_zigzag_cp(tensor, shifts, dims, cu_seqlens, cp_group
     rolled_tensor = tensor.clone()
 
     # CP enabled: each rank owns two chunks per sequence (front and mirrored tail).
-    local_rank = torch.distributed.get_rank(group=cp_group)
-    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+    local_rank = cp_group.rank()
+    global_ranks = get_process_group_ranks(cp_group)
     next_rank = global_ranks[(local_rank + 1) % cp_size]
     prev_rank = global_ranks[(local_rank - 1) % cp_size]
+    transport_group = get_logical_cp_transport_group(cp_group)
 
     # Iterate over each sequence individually
     for i in range(len(cu_seqlens) - 1):
@@ -823,14 +834,30 @@ def _roll_tensor_packed_seq_zigzag_cp(tensor, shifts, dims, cu_seqlens, cp_group
 
         ops = []
         if local_rank != 0:
-            ops.append(torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank))
-            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank))
+            ops.append(
+                torch.distributed.isend(
+                    tensor=tensor_send_list[0], dst=prev_rank, group=transport_group
+                )
+            )
+            ops.append(
+                torch.distributed.irecv(
+                    tensor=tensor_recv_list[1], src=prev_rank, group=transport_group
+                )
+            )
         else:
             tensor_recv_list[1].fill_(fill_value)
 
         if local_rank != cp_size - 1:
-            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank))
-            ops.append(torch.distributed.isend(tensor=tensor_send_list[1], dst=next_rank))
+            ops.append(
+                torch.distributed.irecv(
+                    tensor=tensor_recv_list[0], src=next_rank, group=transport_group
+                )
+            )
+            ops.append(
+                torch.distributed.isend(
+                    tensor=tensor_send_list[1], dst=next_rank, group=transport_group
+                )
+            )
         else:
             tensor_recv_list[0].copy_(tensor_send_list[1])
 
@@ -917,11 +944,12 @@ def _prefetch_contiguous_packed_cp_roll_halos(
     # Retain contiguous send slices until every grouped work handle completes.
     send_buffers: List[Tensor] = []
     p2p_ops = []
+    transport_group = get_logical_cp_transport_group(plan.cp_group)
     if plan.has_sequences and plan.recv_rank is not None:
         for halo in halos:
             p2p_ops.append(
                 torch.distributed.P2POp(
-                    torch.distributed.irecv, halo, plan.recv_rank, group=plan.cp_group
+                    torch.distributed.irecv, halo, plan.recv_rank, group=transport_group
                 )
             )
     if plan.has_sequences and plan.send_rank is not None:
@@ -930,7 +958,7 @@ def _prefetch_contiguous_packed_cp_roll_halos(
             send_buffers.append(send_buffer)
             p2p_ops.append(
                 torch.distributed.P2POp(
-                    torch.distributed.isend, send_buffer, plan.send_rank, group=plan.cp_group
+                    torch.distributed.isend, send_buffer, plan.send_rank, group=transport_group
                 )
             )
 
@@ -1054,6 +1082,7 @@ def _roll_tensors_packed_seq_contiguous_cp(
     # Keep contiguous send buffers alive until every grouped work handle completes.
     send_buffers: List[Tensor] = []
     p2p_ops = []
+    transport_group = get_logical_cp_transport_group(contiguous_roll_plan.cp_group)
 
     if contiguous_roll_plan.recv_rank is not None:
         # After a left roll, each local tail consumes the first element from the
@@ -1066,7 +1095,7 @@ def _roll_tensors_packed_seq_contiguous_cp(
                     torch.distributed.irecv,
                     recv_buffer,
                     contiguous_roll_plan.recv_rank,
-                    group=contiguous_roll_plan.cp_group,
+                    group=transport_group,
                 )
             )
     if contiguous_roll_plan.send_rank is not None:
@@ -1079,7 +1108,7 @@ def _roll_tensors_packed_seq_contiguous_cp(
                     torch.distributed.isend,
                     send_buffer,
                     contiguous_roll_plan.send_rank,
-                    group=contiguous_roll_plan.cp_group,
+                    group=transport_group,
                 )
             )
 

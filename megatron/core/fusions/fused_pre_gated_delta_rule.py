@@ -24,6 +24,8 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from megatron.core.dynamic_cp_group import get_logical_cp_transport_group, get_process_group_ranks
+
 try:
     from causal_conv1d.cpp_functions import causal_conv1d_bwd_function
 except ImportError:
@@ -1677,10 +1679,9 @@ def _cp_neighbor_global_ranks(cp_group) -> Tuple[int, int, Optional[int], Option
 
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
-    prev_rank = torch.distributed.get_global_rank(cp_group, cp_rank - 1) if cp_rank > 0 else None
-    next_rank = (
-        torch.distributed.get_global_rank(cp_group, cp_rank + 1) if cp_rank < cp_size - 1 else None
-    )
+    global_ranks = get_process_group_ranks(cp_group)
+    prev_rank = global_ranks[cp_rank - 1] if cp_rank > 0 else None
+    next_rank = global_ranks[cp_rank + 1] if cp_rank < cp_size - 1 else None
     return cp_size, cp_rank, prev_rank, next_rank
 
 
@@ -1725,6 +1726,7 @@ def _start_left_boundary_exchange(
     """Start chunkwise-CP left-boundary exchange without waiting for completion."""
 
     _, _, prev_rank, next_rank = _cp_neighbor_global_ranks(cp_group)
+    transport_group = get_logical_cp_transport_group(cp_group)
     left_boundary = None
     send_buf = None
     recv_ops = []
@@ -1734,13 +1736,15 @@ def _start_left_boundary_exchange(
     if prev_rank is not None:
         left_boundary = qkvzba.new_empty((boundary, qkvzba.shape[1], conv_dim))
         p2p_ops.append(
-            torch.distributed.P2POp(torch.distributed.irecv, left_boundary, prev_rank, cp_group)
+            torch.distributed.P2POp(
+                torch.distributed.irecv, left_boundary, prev_rank, transport_group
+            )
         )
         op_roles.append("recv")
     if next_rank is not None:
         send_buf = qkvzba[-boundary:, :, :conv_dim].contiguous()
         p2p_ops.append(
-            torch.distributed.P2POp(torch.distributed.isend, send_buf, next_rank, cp_group)
+            torch.distributed.P2POp(torch.distributed.isend, send_buf, next_rank, transport_group)
         )
         op_roles.append("send")
     if p2p_ops:
@@ -1757,6 +1761,7 @@ def _start_boundary_grad_exchange(
     """Start chunkwise-CP boundary-gradient exchange without waiting for completion."""
 
     _, _, prev_rank, next_rank = _cp_neighbor_global_ranks(cp_group)
+    transport_group = get_logical_cp_transport_group(cp_group)
     d_right_boundary = None
     send_buf = None
     recv_ops = []
@@ -1766,7 +1771,9 @@ def _start_boundary_grad_exchange(
     if next_rank is not None:
         d_right_boundary = qkvzba.new_empty((boundary, qkvzba.shape[1], conv_dim))
         p2p_ops.append(
-            torch.distributed.P2POp(torch.distributed.irecv, d_right_boundary, next_rank, cp_group)
+            torch.distributed.P2POp(
+                torch.distributed.irecv, d_right_boundary, next_rank, transport_group
+            )
         )
         op_roles.append("recv")
     if prev_rank is not None:
@@ -1774,7 +1781,7 @@ def _start_boundary_grad_exchange(
             raise RuntimeError("Chunkwise CP backward requires a left-boundary gradient to send.")
         send_buf = d_left_boundary.contiguous()
         p2p_ops.append(
-            torch.distributed.P2POp(torch.distributed.isend, send_buf, prev_rank, cp_group)
+            torch.distributed.P2POp(torch.distributed.isend, send_buf, prev_rank, transport_group)
         )
         op_roles.append("send")
     if p2p_ops:

@@ -7,8 +7,12 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.dynamic_cp_group import LogicalCPGroup
+
 if TYPE_CHECKING:
     from megatron.core.context_parallel_layout import ThdCpRoute
+
+CPGroup = Union[dist.ProcessGroup, LogicalCPGroup]
 
 
 @dataclass
@@ -30,7 +34,7 @@ class PackedSeqParams:
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
     local_cp_size: int = None
-    cp_group: dist.ProcessGroup = None
+    cp_group: CPGroup = None
     total_tokens: int = None
     seq_idx: Tensor = None
     pad_between_seqs: Optional[bool] = None
@@ -80,8 +84,8 @@ class PackedSeqParams:
 
 
 def resolve_cp_group(
-    static_cp_group: dist.ProcessGroup, packed_seq_params: PackedSeqParams = None
-) -> dist.ProcessGroup:
+    static_cp_group: CPGroup, packed_seq_params: PackedSeqParams = None
+) -> CPGroup:
     """Return the dynamic CP group from packed_seq_params when available, else the static one.
 
     Dynamic CP assigns a per-microbatch CP group that may differ from the
@@ -310,7 +314,7 @@ def _resolve_thd_padding_lengths(
     target_len: Optional[int],
     alignment: Optional[int],
     padding_mask: Optional[Tensor] = None,
-    cp_group: Optional[dist.ProcessGroup] = None,
+    cp_group: Optional[CPGroup] = None,
     cp_size: Optional[int] = None,
     cp_rank: Optional[int] = None,
 ) -> Tuple[int, int, int, int, torch.device]:
@@ -404,7 +408,7 @@ def _resolve_thd_padding_lengths(
 
 def _resolve_thd_cp_geometry(
     packed_seq_params: PackedSeqParams,
-    cp_group: Optional[dist.ProcessGroup] = None,
+    cp_group: Optional[CPGroup] = None,
     cp_size: Optional[int] = None,
     cp_rank: Optional[int] = None,
 ) -> Tuple[int, int]:
@@ -414,7 +418,7 @@ def _resolve_thd_cp_geometry(
     Falling back to ``parallel_state`` preserves legacy call sites.
     """
     if cp_group is not None:
-        return int(dist.get_world_size(group=cp_group)), int(dist.get_rank(group=cp_group))
+        return int(cp_group.size()), int(cp_group.rank())
 
     if cp_size is not None:
         cp_size = int(cp_size)
@@ -425,7 +429,7 @@ def _resolve_thd_cp_geometry(
 
     if packed_seq_params.cp_group is not None:
         cp_group = packed_seq_params.cp_group
-        return int(dist.get_world_size(group=cp_group)), int(dist.get_rank(group=cp_group))
+        return int(cp_group.size()), int(cp_group.rank())
 
     if cp_size is None and packed_seq_params.local_cp_size is not None:
         cp_size = int(packed_seq_params.local_cp_size)
@@ -454,7 +458,7 @@ def pad_sequence_for_thd(
     max_num_seqs: Optional[int] = None,
     tail_padding_policy: Literal["append_dummy_seq", "extend_last"] = "append_dummy_seq",
     padding_mask: Optional[Tensor] = None,
-    cp_group: Optional[dist.ProcessGroup] = None,
+    cp_group: Optional[CPGroup] = None,
     cp_size: Optional[int] = None,
     cp_rank: Optional[int] = None,
 ) -> Tuple[

@@ -17,6 +17,7 @@ from megatron.core.context_parallel_layout.types import CpPartitionMode, ThdCpRo
 from megatron.core.context_parallel_layout.utils import (
     get_packed_seq_params_cp_partition_cu_seqlens,
 )
+from megatron.core.dynamic_cp_group import get_process_group_ranks
 from megatron.core.tensor_parallel.mappings import all_to_all
 from megatron.core.utils import nvtx_range
 
@@ -499,9 +500,9 @@ def _get_sbhd_group_rank_by_logical_rank(
     tp_cp_group: torch.distributed.ProcessGroup,
 ) -> tuple[int, ...]:
     return _build_sbhd_group_rank_by_logical_rank(
-        cp_global_ranks=tuple(torch.distributed.get_process_group_ranks(cp_group)),
-        tp_global_ranks=tuple(torch.distributed.get_process_group_ranks(tp_group)),
-        tp_cp_global_ranks=tuple(torch.distributed.get_process_group_ranks(tp_cp_group)),
+        cp_global_ranks=get_process_group_ranks(cp_group),
+        tp_global_ranks=get_process_group_ranks(tp_group),
+        tp_cp_global_ranks=get_process_group_ranks(tp_cp_group),
         current_global_rank=torch.distributed.get_rank(),
     )
 

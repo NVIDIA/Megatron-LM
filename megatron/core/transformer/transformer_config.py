@@ -55,6 +55,12 @@ except ImportError:
     HAVE_PACKAGING = False
 
 
+def is_p2p_cp_comm_type(cp_comm_type: Optional[Union[str, List[str], Tuple[str, ...]]]) -> bool:
+    """Return whether every configured attention CP transport uses P2P."""
+    cp_comm_types = cp_comm_type if isinstance(cp_comm_type, (list, tuple)) else (cp_comm_type,)
+    return all(comm_type in (None, "p2p") for comm_type in cp_comm_types)
+
+
 @dataclass
 @experimental_api
 class TransformerConfig(ModelParallelConfig):
