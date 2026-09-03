@@ -27,6 +27,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .countdown import Countdown
 from .indexed_order import IndexedOrder
+from .module_utils import get_parameter_owner
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import Flat
 
@@ -293,7 +294,22 @@ class FsdpModule:
             if not group.requires_grad:
                 continue
             for fsdp_parameter in group.fsdp_parameters:
-                fsdp_parameter.unsharded.register_post_accumulate_grad_hook(grad_hook)
+                parameter = fsdp_parameter.unsharded
+                # ``skip_backward_post_hook`` is TE's delayed-wgrad contract: these
+                # gradients are materialized by ``backward_dw()``, not autograd.
+                if not getattr(parameter, "skip_backward_post_hook", False):
+                    parameter.register_post_accumulate_grad_hook(grad_hook)
+                    continue
+                if len(fsdp_parameter.fqns) > 1:
+                    raise ValueError(
+                        "Tied parameters with delayed wgrad are not supported because "
+                        "Transformer Engine does not accumulate their gradients. See "
+                        "https://github.com/NVIDIA/TransformerEngine/issues/3437"
+                    )
+                parameter_module, _ = get_parameter_owner(module, fsdp_parameter.fqns[0])
+                parameter_module.register_wgrad_accumulation_and_reduce_hooks(
+                    lambda parameter=parameter: grad_hook(parameter)
+                )
 
     @staticmethod
     def _pre_load_state_dict(
