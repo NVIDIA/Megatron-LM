@@ -505,6 +505,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         # Rank inside pg_collection.tp — the *standard* TP group that SP shards
         # the routing map along. Base class self.tp_rank is the expt_tp rank,
         # which is not what we want for the SP padding offset.
+        self.sp_size = get_pg_size(pg_collection.tp)
         self.sp_rank = get_pg_rank(pg_collection.tp)
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
         self._local_tokens: int = 0
@@ -557,7 +558,16 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             Also updates self.routing_map to [global_max, topk] int64.
         """
         if self.ep_size == 1:
-            if self._runs_metadata_sync:
+            real_token_count = self.__class__._real_token_count_tensor
+            if real_token_count is not None:
+                if self._runs_metadata_sync:
+                    valid_tokens = InferenceAllGatherDispatcherBase._valid_tokens_tensor
+                    valid_tokens.copy_(real_token_count)
+                    if self.sp_size > 1:
+                        valid_tokens.sub_(self.sp_rank * hidden_states.shape[0])
+                        valid_tokens.clamp_(min=0, max=hidden_states.shape[0])
+                mask_routing_padding(self.routing_map, real_token_count, self.sp_rank)
+            elif self._runs_metadata_sync:
                 InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(hidden_states.shape[0])
             return hidden_states, probs
 
