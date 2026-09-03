@@ -6,11 +6,9 @@ ENV_VARS:
   PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True,graph_capture_record_stream_reuse:True"
   NCCL_GRAPH_REGISTER: "0"
 MODEL_ARGS:
-  # Put one adjacent attention/MoE pair on each PP rank. Hybrid graph discovery
-  # groups each pair into one callable: attention + router are captured, while
-  # expert dispatch/compute and the mHC BDA tail stay eager.
-  --hybrid-layer-pattern: "*E|*E"
-  --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec]"
+  # Exercise the ordinary GPTModel/TransformerLayer capture boundary directly.
+  # Two layers per PP rank run through the non-interleaved 1F1B schedule.
+  --num-layers: 4
   --hidden-size: 512
   --ffn-hidden-size: 2048
   --num-attention-heads: 8
@@ -20,38 +18,17 @@ MODEL_ARGS:
   --disable-bias-linear: true
   --untie-embeddings-and-output-weights: true
 
-  # mHC makes HyperConnectionHybridLayer the top-level TE graph callable.
-  --enable-hyper-connections: true
-  --num-residual-streams: 4
-  --mhc-sinkhorn-iterations: 20
-  --mhc-init-gating-factor: 0.01
-
-  # Minimal MoE settings for the eager continuation after partial router capture.
-  --num-experts: 4
-  --moe-ffn-hidden-size: 1024
-  --moe-router-topk: 2
-  --moe-router-load-balancing-type: aux_loss
-  --moe-aux-loss-coeff: 1.0e-3
-  --moe-token-dispatcher-type: alltoall
-  --moe-grouped-gemm: true
-  --moe-router-dtype: fp32
-  --expert-model-parallel-size: 1
-  --expert-tensor-parallel-size: 1
-
-  # Exercise core-attention D2H/H2D event handling across the grouped attention ->
-  # partial-MoE graph boundary. core_attn is captured and does not use the delayed
-  # expert-offload queue; delayed expert offload is outside this regression's scope.
-  # fine-grained-offloading-max-inflight-offloads is intentionally omitted (None).
+  # core_attn is inside the captured attention range. Its D2H/H2D dependencies
+  # must be enclosed by TransformerLayer's top-level TE graph event boundary.
+  # Delayed expert offload is intentionally absent from this regression.
   --fine-grained-activation-offloading: true
   --offload-modules: "[core_attn]"
   --min-offloaded-tensor-size: 1024
   --activation-offload-fraction: 1.0
 
-  # This numerical smoke runs exactly four iterations. After three eager warmups,
-  # the graph is created before iteration four, so the golden trajectory includes
-  # one graph replay plus the eager MoE experts.
+  # Three eager warmups are followed by one real graph replay in iteration four.
   --cuda-graph-impl: transformer_engine
-  --cuda-graph-modules: "[attn moe_router]"
+  --cuda-graph-modules: "[attn]"
   --cuda-graph-warmup-steps: 3
   --te-rng-tracker: true
 

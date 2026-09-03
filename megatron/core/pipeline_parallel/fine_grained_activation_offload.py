@@ -1361,6 +1361,9 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
             current_stream.record_event(mgr.cuda_graph_event)
             current_stream.wait_stream(mgr.h2d_stream)
 
+        # Keep backward_record's autograd node on the outermost TE CUDA Graph callable
+        # boundary. If this record point moves inside a reentrant checkpoint backward, the
+        # callback will run when that inner GraphTask ends and record the graph-tail event early.
         torch.autograd.Variable._execution_engine.queue_callback(record_backward_completion)
         return (grad_output,)
 
