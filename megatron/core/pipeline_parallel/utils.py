@@ -245,8 +245,9 @@ class ScheduleNode:
             self.output = data
 
         if self.lifetime_manager is not None:
-            self.lifetime_manager.finish_forward(
-                inputs,
+            lifetime_inputs = inputs[0] if len(inputs) == 1 else inputs
+            self.lifetime_manager.consume_inputs_and_publish_outputs(
+                lifetime_inputs,
                 self.output,
                 stream=self.stream,
                 node=node_name,
@@ -288,18 +289,23 @@ class ScheduleNode:
         grads = self.get_grad()
 
         if self.lifetime_manager is not None:
-            fallback_grads = (
-                consumed_grads[len(output_grad) :]
-                if isinstance(consumed_grads, tuple)
-                else consumed_grads
-            )
-            self.lifetime_manager.finish_backward(
-                output_grad,
+            if isinstance(consumed_grads, tuple):
+                additional_consumed_grads = consumed_grads[len(output_grad) :]
+            elif consumed_grads is None:
+                additional_consumed_grads = ()
+            else:
+                additional_consumed_grads = (consumed_grads,)
+
+            # A recompute segment's final forward output is consumed by autograd
+            # rather than another forward node, so its owner metadata ends here.
+            self.lifetime_manager.consume_forward_outputs(self.output)
+            lifetime_output_grads = output_grad[0] if len(output_grad) == 1 else output_grad
+            self.lifetime_manager.consume_output_grads_and_publish_input_grads(
+                lifetime_output_grads,
                 grads,
-                forward_outputs=self.output,
                 stream=self.stream,
                 node=node_name,
-                fallback_consumed=fallback_grads,
+                additional_consumed_grads=additional_consumed_grads,
             )
         elif consumed_grads:
             # Gradients may have been produced on another stream.

@@ -8,6 +8,7 @@ import weakref
 import pytest
 import torch
 
+from megatron.core.pipeline_parallel import tensor_lifetime
 from megatron.core.pipeline_parallel.tensor_lifetime import ScheduleTensorLifetimeManager
 from megatron.core.pipeline_parallel.utils import NoopScheduleNode
 
@@ -18,20 +19,30 @@ def _publish(manager, tensor, owner, node="producer"):
     manager.publish(tensor, owner, node)
 
 
-def _finish_forward(manager, consumed, produced, consumer, retire=True, node="consumer"):
-    manager.finish_forward(consumed, produced, stream=consumer, node=node, retire_consumed=retire)
-
-
-def _finish_backward(
-    manager, consumed, produced, consumer, node="consumer", forward_outputs=(), fallback_consumed=()
+def _consume_inputs_and_publish_outputs(
+    manager, consumed, produced, consumer, retire=True, node="consumer"
 ):
-    manager.finish_backward(
+    manager.consume_inputs_and_publish_outputs(
+        consumed, produced, stream=consumer, node=node, retire_consumed=retire
+    )
+
+
+def _consume_output_grads_and_publish_input_grads(
+    manager,
+    consumed,
+    produced,
+    consumer,
+    node="consumer",
+    forward_outputs=(),
+    additional_consumed_grads=(),
+):
+    manager.consume_forward_outputs(forward_outputs)
+    manager.consume_output_grads_and_publish_input_grads(
         consumed,
         produced,
-        forward_outputs=forward_outputs,
         stream=consumer,
         node=node,
-        fallback_consumed=fallback_consumed,
+        additional_consumed_grads=additional_consumed_grads,
     )
 
 
@@ -47,7 +58,7 @@ def test_same_stream_empty_storage_is_immediate():
     with torch.cuda.stream(owner):
         tensor = torch.empty(1024, device="cuda")
     _publish(manager, tensor, owner)
-    _finish_forward(manager, tensor, (), owner)
+    _consume_inputs_and_publish_outputs(manager, tensor, (), owner)
 
     assert tensor.untyped_storage().nbytes() == 0
     assert not manager.owners
@@ -68,7 +79,7 @@ def test_cross_stream_release_waits_for_owner_acquire():
     with torch.cuda.stream(consumer):
         tensor.add_(1)
         event.record(consumer)
-    _finish_forward(manager, tensor, (), consumer)
+    _consume_inputs_and_publish_outputs(manager, tensor, (), consumer)
 
     assert tensor.untyped_storage().nbytes() > 0
     assert not manager.owners
@@ -90,14 +101,76 @@ def test_non_retiring_consumer_replaces_input_binding_with_output_binding():
         output = tensor + 1
     _publish(manager, tensor, owner)
 
-    _finish_forward(manager, tensor, output, consumer, retire=False)
+    _consume_inputs_and_publish_outputs(manager, tensor, output, consumer, retire=False)
 
     assert tensor.untyped_storage().nbytes() > 0
     assert not manager.pending
     assert len(manager.owners) == 1
     assert manager.owners[0].tensor is output
     assert manager.owners[0].stream.cuda_stream == consumer.cuda_stream
+    assert manager.owners[0].stream_key == (consumer.device, int(consumer.cuda_stream))
     manager.export(output)
+
+
+def test_single_tensor_hot_path_skips_structured_iterator(monkeypatch):
+    stream = torch.cuda.Stream()
+    manager = ScheduleTensorLifetimeManager()
+    external_input = torch.empty(16, device="cuda")
+    output = torch.empty_like(external_input)
+    additional_grad = torch.empty_like(external_input)
+
+    def unexpected_structured_iteration(_value):
+        raise AssertionError("single tensors must bypass structured iteration")
+        yield
+
+    monkeypatch.setattr(
+        tensor_lifetime, "_iter_unique_cuda_tensors", unexpected_structured_iteration
+    )
+
+    # The external input exercises the direct record_stream fallback, while the
+    # output exercises the direct publish path.
+    manager.consume_inputs_and_publish_outputs(
+        external_input, output, stream=stream, node="single tensor", retire_consumed=True
+    )
+    manager.consume_forward_outputs(output)
+    manager.consume_output_grads_and_publish_input_grads(
+        (),
+        (),
+        stream=stream,
+        node="single additional grad",
+        additional_consumed_grads=(additional_grad,),
+    )
+
+    assert not manager.owners
+    assert manager.stats["record_stream_fallback"] == 2
+
+
+def test_empty_additional_consumed_grads_skip_record_stream(monkeypatch):
+    stream = torch.cuda.Stream()
+    manager = ScheduleTensorLifetimeManager()
+
+    def unexpected_record_stream(_tensors, _stream):
+        raise AssertionError("empty additional gradients must skip record_stream")
+
+    monkeypatch.setattr(manager, "_record_stream", unexpected_record_stream)
+    manager.consume_output_grads_and_publish_input_grads(
+        (), (), stream=stream, node="backward", additional_consumed_grads=()
+    )
+
+    assert manager.stats["record_stream_fallback"] == 0
+
+
+def test_structured_tensors_are_deduplicated():
+    stream = torch.cuda.Stream()
+    manager = ScheduleTensorLifetimeManager()
+    tensor = torch.empty(16, device="cuda")
+
+    manager.publish((tensor, None, tensor), stream, "structured producer")
+
+    assert len(manager.owners) == 1
+    assert manager.stats["published"] == 1
+    manager.export((tensor, tensor))
+    assert not manager.owners
 
 
 def test_two_managers_do_not_drain_another_microbatch():
@@ -115,7 +188,7 @@ def test_two_managers_do_not_drain_another_microbatch():
     with torch.cuda.stream(consumer):
         tensor.add_(1)
         backward_event.record(consumer)
-    _finish_forward(backward, tensor, (), consumer, node="B MLP")
+    _consume_inputs_and_publish_outputs(backward, tensor, (), consumer, node="B MLP")
 
     # An intervening F dispatch uses the same physical stream but a different
     # microbatch plan.  It must not release B's tensor or add a B -> F edge.
@@ -143,7 +216,7 @@ def test_terminal_hand_back_drains_all_owner_streams():
     with torch.cuda.stream(consumer):
         tensor.add_(1)
         event.record(consumer)
-    _finish_forward(manager, tensor, (), consumer)
+    _consume_inputs_and_publish_outputs(manager, tensor, (), consumer)
 
     manager.finalize_phase(event, "test")
 
@@ -199,7 +272,7 @@ def test_cross_stream_drop_reference_holds_gradient_until_owner_acquire():
     with torch.cuda.stream(consumer):
         grad.add_(1)
         event.record(consumer)
-    _finish_backward(manager, grad, (), consumer)
+    _consume_output_grads_and_publish_input_grads(manager, grad, (), consumer)
     del grad
     gc.collect()
 
@@ -214,7 +287,7 @@ def test_unknown_external_gradient_uses_record_stream_fallback():
     manager = ScheduleTensorLifetimeManager()
     grad = torch.empty(16, device="cuda")
 
-    _finish_backward(manager, grad, (), consumer)
+    _consume_output_grads_and_publish_input_grads(manager, grad, (), consumer)
 
     assert not manager.owners
     assert not manager.pending
@@ -226,7 +299,7 @@ def test_unknown_external_forward_input_preserves_record_stream_fallback():
     manager = ScheduleTensorLifetimeManager()
     tensor = torch.empty(16, device="cuda")
 
-    _finish_forward(manager, tensor, (), consumer)
+    _consume_inputs_and_publish_outputs(manager, tensor, (), consumer)
 
     assert tensor.untyped_storage().nbytes() == 0
     assert not manager.owners
@@ -242,7 +315,9 @@ def test_backward_consumes_recompute_output_binding_and_publishes_gradient():
     produced_grad = torch.empty_like(forward_output)
     _publish(manager, forward_output, stream, node="recompute forward")
 
-    _finish_backward(manager, incoming_grad, produced_grad, stream, forward_outputs=forward_output)
+    _consume_output_grads_and_publish_input_grads(
+        manager, incoming_grad, produced_grad, stream, forward_outputs=forward_output
+    )
 
     assert len(manager.owners) == 1
     assert manager.owners[0].tensor is produced_grad
@@ -259,7 +334,7 @@ def test_noop_preserves_tensor_binding_until_real_consumer():
     _publish(manager, tensor, owner)
 
     assert NoopScheduleNode().backward(tensor) is tensor
-    _finish_backward(manager, tensor, (), consumer)
+    _consume_output_grads_and_publish_input_grads(manager, tensor, (), consumer)
 
     assert not manager.owners
     assert len(manager.pending) == 1
@@ -275,7 +350,9 @@ def test_detached_gradient_without_registered_producer_falls_back():
         (leaf.square().sum()).backward()
     detached_grad = leaf.grad
 
-    _finish_backward(manager, detached_grad, (), consumer)
+    _consume_output_grads_and_publish_input_grads(
+        manager, (), (), consumer, additional_consumed_grads=(detached_grad,)
+    )
 
     assert manager.stats["record_stream_fallback"] == 1
     assert not manager.pending
@@ -301,7 +378,9 @@ def test_allocator_reuse_poison_does_not_overwrite_delayed_consumer():
             torch.cuda._sleep(1_000_000)
             observed.append(tensor.clone())
             event.record(consumer)
-        _finish_forward(manager, tensor, (), consumer, node=f"consumer {pattern}")
+        _consume_inputs_and_publish_outputs(
+            manager, tensor, (), consumer, node=f"consumer {pattern}"
+        )
 
         # The wait is enqueued before drain makes storage allocator-visible.
         _wait_and_drain(manager, event, owner)
@@ -331,7 +410,7 @@ def test_full_graph_capture_drains_during_capture_not_replay():
         with torch.cuda.stream(consumer):
             output = tensor + 1
             event.record(consumer)
-        _finish_forward(manager, tensor, output, consumer)
+        _consume_inputs_and_publish_outputs(manager, tensor, output, consumer)
         _wait_and_drain(manager, event, capture_stream, "captured owner hand-back")
         manager.finalize_phase(event, "capture", outputs=output)
 

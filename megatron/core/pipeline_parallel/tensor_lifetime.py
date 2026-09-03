@@ -29,57 +29,44 @@ class ReleaseAction(Enum):
     DROP_REFERENCE = auto()
 
 
-@dataclass
+StreamKey = tuple[torch.device, int]
+
+
+@dataclass(slots=True)
 class TensorOwner:
     """Strong, plan-local binding from one concrete tensor to its producer stream."""
 
     tensor: torch.Tensor
     stream: torch.cuda.Stream
+    stream_key: StreamKey
     producer_node: str
 
 
-@dataclass
+@dataclass(slots=True)
 class DeferredRelease:
     """Strong reference held until the owner stream has acquired the consumer."""
 
     tensor: torch.Tensor
     action: ReleaseAction
     owner_stream: torch.cuda.Stream
-    consumer_node: str
 
 
-def _stream_handle(stream: torch.cuda.Stream) -> int:
-    return int(stream.cuda_stream)
+def _stream_key(stream: torch.cuda.Stream) -> StreamKey:
+    return stream.device, int(stream.cuda_stream)
 
 
-def _iter_tensors(value: Any) -> Iterable[torch.Tensor]:
-    if isinstance(value, torch.Tensor):
-        yield value
-    elif isinstance(value, dict):
-        for item in value.values():
-            yield from _iter_tensors(item)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            yield from _iter_tensors(item)
+def _iter_unique_cuda_tensors(values: Iterable[Any]) -> Iterable[torch.Tensor]:
+    """Yield unique CUDA tensors from a flat, structured schedule edge."""
 
-
-def _unique_cuda_tensors(value: Any) -> list[torch.Tensor]:
-    # Schedule edges are overwhelmingly a single tensor (or a one-tensor tuple).
-    # Keep those hot paths allocation-light; recurse only for structured outputs.
-    if isinstance(value, torch.Tensor):
-        return [value] if value.is_cuda else []
-    if isinstance(value, (list, tuple)) and len(value) == 1 and isinstance(value[0], torch.Tensor):
-        return [value[0]] if value[0].is_cuda else []
-
-    tensors = []
     seen = set()
-    for tensor in _iter_tensors(value):
+    for tensor in values:
+        if not isinstance(tensor, torch.Tensor):
+            continue
         tensor_id = id(tensor)
         if not tensor.is_cuda or tensor_id in seen:
             continue
         seen.add(tensor_id)
-        tensors.append(tensor)
-    return tensors
+        yield tensor
 
 
 class ScheduleTensorLifetimeManager:
@@ -94,7 +81,7 @@ class ScheduleTensorLifetimeManager:
 
     def __init__(self):
         self._owners: dict[int, TensorOwner] = {}
-        self._pending: dict[int, list[DeferredRelease]] = {}
+        self._pending: dict[StreamKey, list[DeferredRelease]] = {}
         self._pending_count = 0
         self.stats = {
             "published": 0,
@@ -125,7 +112,7 @@ class ScheduleTensorLifetimeManager:
 
         return [entry for entries in self._pending.values() for entry in entries]
 
-    def finish_forward(
+    def consume_inputs_and_publish_outputs(
         self,
         consumed: Any,
         produced: Any,
@@ -137,57 +124,85 @@ class ScheduleTensorLifetimeManager:
         """Consume input bindings and publish outputs from one forward node."""
 
         action = ReleaseAction.EMPTY_STORAGE if retire_consumed else None
-        self._consume(consumed, action=action, consumer_stream=stream, node=node)
-        self.publish(produced, stream, node)
+        stream_key = _stream_key(stream)
+        if isinstance(consumed, torch.Tensor):
+            if consumed.is_cuda:
+                self._consume_tensor(consumed, action, stream, stream_key)
+        else:
+            self._consume_structured(consumed, action, stream, stream_key)
+        if isinstance(produced, torch.Tensor):
+            if produced.is_cuda:
+                self._publish_tensor(produced, stream, stream_key, node)
+        else:
+            self._publish_structured(produced, stream, stream_key, node)
 
-    def finish_backward(
+    def consume_forward_outputs(self, forward_outputs: Any) -> None:
+        """End owner bindings for forward outputs retained and consumed by autograd."""
+
+        if isinstance(forward_outputs, torch.Tensor):
+            if forward_outputs.is_cuda:
+                self._consume_tensor(forward_outputs, None, None, None)
+        else:
+            self._consume_structured(forward_outputs, None, None, None)
+
+    def consume_output_grads_and_publish_input_grads(
         self,
-        consumed: Any,
-        produced: Any,
+        output_grads: Any,
+        input_grads: Any,
         *,
-        forward_outputs: Any,
         stream: torch.cuda.Stream,
         node: str,
-        fallback_consumed: Any = (),
+        additional_consumed_grads: tuple[Any, ...] = (),
     ) -> None:
-        """Retire incoming gradients and publish gradients produced by one backward node."""
+        """Retire output grads and publish input grads produced by one backward node."""
 
-        # A recompute segment's final forward output is consumed by autograd rather
-        # than another forward node, so its owner metadata ends at this backward.
-        self._consume(forward_outputs, action=None, consumer_stream=stream, node=node)
-        self._consume(
-            consumed, action=ReleaseAction.DROP_REFERENCE, consumer_stream=stream, node=node
-        )
-        self._record_stream(fallback_consumed, stream)
-        self.publish(produced, stream, node)
+        stream_key = _stream_key(stream)
+        if isinstance(output_grads, torch.Tensor):
+            if output_grads.is_cuda:
+                self._consume_tensor(output_grads, ReleaseAction.DROP_REFERENCE, stream, stream_key)
+        else:
+            self._consume_structured(output_grads, ReleaseAction.DROP_REFERENCE, stream, stream_key)
+        if additional_consumed_grads:
+            if len(additional_consumed_grads) == 1 and isinstance(
+                additional_consumed_grads[0], torch.Tensor
+            ):
+                additional_grad = additional_consumed_grads[0]
+                if additional_grad.is_cuda:
+                    self._record_tensor_stream(additional_grad, stream)
+            else:
+                self._record_stream(additional_consumed_grads, stream)
+        if isinstance(input_grads, torch.Tensor):
+            if input_grads.is_cuda:
+                self._publish_tensor(input_grads, stream, stream_key, node)
+        else:
+            self._publish_structured(input_grads, stream, stream_key, node)
 
     def publish(self, value: Any, stream: torch.cuda.Stream, node: str) -> None:
         """Bind tensors produced by a real schedule node to its execution stream."""
 
-        for tensor in _unique_cuda_tensors(value):
-            tensor_id = id(tensor)
-            existing = self._owners.get(tensor_id)
-            if existing is not None and existing.tensor is tensor:
-                raise RuntimeError(
-                    f"Tensor already has an unconsumed owner binding from "
-                    f"{existing.producer_node!r}; producer={node!r}, "
-                    f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}"
-                )
-            self._owners[tensor_id] = TensorOwner(tensor=tensor, stream=stream, producer_node=node)
-            self.stats["published"] += 1
+        stream_key = _stream_key(stream)
+        if isinstance(value, torch.Tensor):
+            if value.is_cuda:
+                self._publish_tensor(value, stream, stream_key, node)
+            return
+        self._publish_structured(value, stream, stream_key, node)
 
     def export(self, value: Any) -> None:
         """Move plan outputs outside manager ownership without retiring their storage."""
 
-        for tensor in _unique_cuda_tensors(value):
-            owner = self._take_owner(tensor)
-            if owner is not None:
-                self.stats["exported"] += 1
+        if isinstance(value, torch.Tensor):
+            if value.is_cuda:
+                self._export_tensor(value)
+            return
+        if not value:
+            return
+        for tensor in _iter_unique_cuda_tensors(value):
+            self._export_tensor(tensor)
 
     def drain(self, stream: torch.cuda.Stream, release_node: str, terminal: bool = False) -> None:
         """Release entries after the caller has enqueued its normal plan-event wait."""
 
-        entries = self._pending.pop(_stream_handle(stream), ())
+        entries = self._pending.pop(_stream_key(stream), ())
         if not entries:
             return
         self._pending_count -= len(entries)
@@ -224,56 +239,105 @@ class ScheduleTensorLifetimeManager:
                 f"bindings from producers {producers}"
             )
 
-    def _consume(
+    def _consume_structured(
         self,
         value: Any,
-        *,
         action: Optional[ReleaseAction],
-        consumer_stream: torch.cuda.Stream,
-        node: str,
+        consumer_stream: Optional[torch.cuda.Stream],
+        consumer_stream_key: Optional[StreamKey],
     ) -> None:
-        for tensor in _unique_cuda_tensors(value):
-            owner = self._take_owner(tensor)
-            if owner is None:
-                if action is not None:
-                    self._record_stream(tensor, consumer_stream)
-                    self._apply_action(tensor, action)
-                continue
+        if not value:
+            return
+        for tensor in _iter_unique_cuda_tensors(value):
+            self._consume_tensor(tensor, action, consumer_stream, consumer_stream_key)
 
-            self.stats["consumed"] += 1
-            if action is None:
-                continue
-            self._retire_tensor(tensor, action, owner.stream, consumer_stream, node)
+    def _consume_tensor(
+        self,
+        tensor: torch.Tensor,
+        action: Optional[ReleaseAction],
+        consumer_stream: Optional[torch.cuda.Stream],
+        consumer_stream_key: Optional[StreamKey],
+    ) -> None:
+        owner = self._take_owner(tensor)
+        if owner is None:
+            if action is not None:
+                assert consumer_stream is not None
+                tensor.record_stream(consumer_stream)
+                self.stats["record_stream_fallback"] += 1
+                self._apply_action(tensor, action)
+            return
+
+        self.stats["consumed"] += 1
+        if action is None:
+            return
+        assert consumer_stream_key is not None
+        self._retire_tensor(tensor, action, owner, consumer_stream_key)
 
     def _take_owner(self, tensor: torch.Tensor) -> Optional[TensorOwner]:
-        owner = self._owners.get(id(tensor))
+        tensor_id = id(tensor)
+        owner = self._owners.get(tensor_id)
         if owner is None or owner.tensor is not tensor:
             return None
-        self._owners.pop(id(tensor), None)
+        self._owners.pop(tensor_id)
         return owner
 
     def _record_stream(self, tensors: Any, stream: torch.cuda.Stream) -> None:
-        for tensor in _unique_cuda_tensors(tensors):
-            tensor.record_stream(stream)
-            self.stats["record_stream_fallback"] += 1
+        if isinstance(tensors, torch.Tensor):
+            if tensors.is_cuda:
+                self._record_tensor_stream(tensors, stream)
+            return
+        if not tensors:
+            return
+        for tensor in _iter_unique_cuda_tensors(tensors):
+            self._record_tensor_stream(tensor, stream)
+
+    def _record_tensor_stream(self, tensor: torch.Tensor, stream: torch.cuda.Stream) -> None:
+        tensor.record_stream(stream)
+        self.stats["record_stream_fallback"] += 1
+
+    def _publish_structured(
+        self, value: Any, stream: torch.cuda.Stream, stream_key: StreamKey, node: str
+    ) -> None:
+        if not value:
+            return
+        for tensor in _iter_unique_cuda_tensors(value):
+            self._publish_tensor(tensor, stream, stream_key, node)
+
+    def _publish_tensor(
+        self, tensor: torch.Tensor, stream: torch.cuda.Stream, stream_key: StreamKey, node: str
+    ) -> None:
+        tensor_id = id(tensor)
+        existing = self._owners.get(tensor_id)
+        if existing is not None and existing.tensor is tensor:
+            raise RuntimeError(
+                f"Tensor already has an unconsumed owner binding from "
+                f"{existing.producer_node!r}; producer={node!r}, "
+                f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}"
+            )
+        self._owners[tensor_id] = TensorOwner(
+            tensor=tensor, stream=stream, stream_key=stream_key, producer_node=node
+        )
+        self.stats["published"] += 1
+
+    def _export_tensor(self, tensor: torch.Tensor) -> None:
+        owner = self._take_owner(tensor)
+        if owner is not None:
+            self.stats["exported"] += 1
 
     def _retire_tensor(
         self,
         tensor: torch.Tensor,
         action: ReleaseAction,
-        owner_stream: torch.cuda.Stream,
-        consumer_stream: torch.cuda.Stream,
-        node: str,
+        owner: TensorOwner,
+        consumer_stream_key: StreamKey,
     ) -> None:
-        if _stream_handle(owner_stream) == _stream_handle(consumer_stream):
+        if owner.stream_key == consumer_stream_key:
             self._apply_action(tensor, action)
             self.stats["same_stream"] += 1
             return
 
-        self._pending.setdefault(_stream_handle(owner_stream), []).append(
-            DeferredRelease(
-                tensor=tensor, action=action, owner_stream=owner_stream, consumer_node=node
-            )
+        self._pending.setdefault(owner.stream_key, []).append(
+            DeferredRelease(tensor=tensor, action=action, owner_stream=owner.stream)
         )
         self._pending_count += 1
         self.stats["deferred"] += 1
