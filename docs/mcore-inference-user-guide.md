@@ -87,26 +87,27 @@ This focus drives the major design benefits:
 
 ## Supported Model Architectures
 
-The table below lists the architectures the dynamic inference path supports,
-along with the configurations they have been exercised in and their current
-optimization maturity. "Comparable to dedicated serving engines" means we have
-measured rollout throughput in the same range as an equivalent vLLM
-configuration on internal workloads; there is no public benchmark harness in
-this repository yet, so treat maturity as guidance rather than a published
-number, and measure on your own model and workload.
+The table below lists the architectures the dynamic inference path supports and
+the configurations they have been exercised in.
 
 | Model family | Configurations exercised | Optimization maturity |
 |---|---|---|
-| Hybrid Mamba and attention (for example, Nemotron-H style) | TP, PP, EP; chunked prefill, prefix caching including Mamba state, CUDA graphs | Most mature. Rollout throughput comparable to dedicated serving engines |
+| Hybrid Mamba and attention (for example, Nemotron-H style) | TP, PP, EP; chunked prefill, prefix caching including Mamba state, CUDA graphs | Most mature; primary optimization target to date |
 | GPT-style dense | TP, PP; chunked prefill, prefix caching, CUDA graphs, speculative decoding | Mature |
-| MoE | TP with EP (for example, a 30B-class EP4 configuration on GB200); expert router replay, full CUDA-graph support, selectable grouped-GEMM backend | Supported. Additional throughput optimizations are in active development |
+| MoE | TP with EP; expert router replay, full CUDA-graph support, selectable grouped-GEMM backend | Supported. Additional throughput optimizations are in active development |
 | MLA (DeepSeek-style) | `cache_mla_latents=True`, KV block size 64, `flash_mla` | Supported, with the configuration constraints in [Known Limitations](#known-limitations) |
 | Gated Delta Net and Gated Delta Product | Dynamic batching only | Supported, with the feature gaps in [Known Limitations](#known-limitations) |
 | Vision-language | Image inputs only, `PP=1` | Supported, with the feature gaps in [Known Limitations](#known-limitations) |
 
-Performance is highly sensitive to model, batch size, sequence length,
-parallelism layout, and which consistency features (for example,
-batch-invariant kernels) are enabled.
+**A note on performance.** Throughput relative to dedicated serving engines
+varies by architecture, and Megatron Inference is not uniformly faster. Most
+optimization work to date has targeted the Nemotron model families, where
+rollout throughput is competitive with external engines. On architectures that
+have received less tuning, Megatron Inference can be somewhat slower; closing
+those gaps is in active development. Results are also sensitive to batch size,
+sequence length, parallelism layout, and which consistency features (for
+example, batch-invariant kernels) are enabled, so measure on your own model and
+workload rather than generalizing from any single comparison.
 
 ---
 
