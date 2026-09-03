@@ -130,6 +130,20 @@ lts = [
     "emerging_optimizers; python_version >= '3.12'",
 ]
 
+### Module-level extras consumed by `docker/Dockerfile.ci.lts`.               ###
+### They must stay defined on every branch that carries that Dockerfile, or   ###
+### the LTS image build fails with "Extra `...` is not defined in the         ###
+### project's `optional-dependencies` table".                                 ###
+te = [
+    "transformer-engine[pytorch,core_cu13]>=2.9.0a0,<2.12.0",
+]
+
+ssm = [
+    "mamba-ssm~=2.2",
+    "causal-conv1d~=1.5",
+    "flash-linear-attention==0.5.1",
+]
+
 [dependency-groups]
 test = [
     "coverage",
