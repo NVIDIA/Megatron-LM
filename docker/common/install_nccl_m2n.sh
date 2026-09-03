@@ -4,13 +4,13 @@
 
 set -euxo pipefail
 
-NCCL_EXTENSIONS_COMMIT="e57f0dad43dc1ca5bf96f09bf4075afc2eae6599"
+NCCL_EXTENSIONS_VERSION="0.1.0"
 PYTHON="${UV_PROJECT_ENVIRONMENT:-/opt/venv}/bin/python"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --NCCL_EXTENSIONS_COMMIT=*)
-            NCCL_EXTENSIONS_COMMIT="${1#*=}"
+        --NCCL_EXTENSIONS_VERSION=*)
+            NCCL_EXTENSIONS_VERSION="${1#*=}"
             ;;
         --PYTHON=*)
             PYTHON="${1#*=}"
@@ -23,10 +23,11 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-if [[ ! "${NCCL_EXTENSIONS_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "NCCL_EXTENSIONS_COMMIT must be a full 40-character Git SHA" >&2
+if [[ ! "${NCCL_EXTENSIONS_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "NCCL_EXTENSIONS_VERSION must be a semantic version such as 0.1.0" >&2
     exit 1
 fi
+NCCL_EXTENSIONS_TAG="nccl-extensions-v${NCCL_EXTENSIONS_VERSION}"
 
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 test -x "${CUDA_HOME}/bin/nvcc"
@@ -38,9 +39,9 @@ trap 'rm -rf "${WORK_DIR}"' EXIT
 NCCL_EXTENSIONS_DIR="${WORK_DIR}/nccl-extensions"
 git init "${NCCL_EXTENSIONS_DIR}"
 git -C "${NCCL_EXTENSIONS_DIR}" remote add origin https://github.com/NVIDIA/nccl-extensions.git
-git -C "${NCCL_EXTENSIONS_DIR}" fetch --depth 1 origin "${NCCL_EXTENSIONS_COMMIT}"
-git -C "${NCCL_EXTENSIONS_DIR}" checkout --detach FETCH_HEAD
-test "$(git -C "${NCCL_EXTENSIONS_DIR}" rev-parse HEAD)" = "${NCCL_EXTENSIONS_COMMIT}"
+git -C "${NCCL_EXTENSIONS_DIR}" fetch --depth 1 origin \
+    "refs/tags/${NCCL_EXTENSIONS_TAG}:refs/tags/${NCCL_EXTENSIONS_TAG}"
+git -C "${NCCL_EXTENSIONS_DIR}" checkout --detach "${NCCL_EXTENSIONS_TAG}^{commit}"
 
 # The Debian NCCL packages split headers and libraries across /usr/include and
 # the multiarch library directory. M2N expects a single NCCL_HOME prefix.

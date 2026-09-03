@@ -10,7 +10,7 @@ ARG TARGETARCH
 ARG YQ_VERSION=4.44.1
 # TE 2.18's NCCL EP build requires NCCL 2.30.7+; the 26.06 base uses CUDA 13.3.
 ARG NCCL_VERSION=2.30.7-1+cuda13.3
-ARG NCCL_EXTENSIONS_COMMIT=e57f0dad43dc1ca5bf96f09bf4075afc2eae6599
+ARG NCCL_EXTENSIONS_VERSION=0.1.0
 ENV PATH="/usr/local/bin:$PATH"
 ARG UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT}
@@ -112,10 +112,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     test -f /opt/nccl-ep/include/nccl_ep/device/hybrid_ep.cuh
 EOF
 
-ENV NCCL_EXTENSIONS_COMMIT=${NCCL_EXTENSIONS_COMMIT}
+ENV NCCL_EXTENSIONS_VERSION=${NCCL_EXTENSIONS_VERSION}
 RUN --mount=type=bind,source=docker/common/install_nccl_m2n.sh,target=/opt/install_nccl_m2n.sh \
     bash /opt/install_nccl_m2n.sh \
-        --NCCL_EXTENSIONS_COMMIT=${NCCL_EXTENSIONS_COMMIT} \
+        --NCCL_EXTENSIONS_VERSION=${NCCL_EXTENSIONS_VERSION} \
         --PYTHON=${UV_PROJECT_ENVIRONMENT}/bin/python
 
 ENV NCCL_EP_JIT_SOURCE_DIR=/opt/nccl-ep/include/nccl_ep
