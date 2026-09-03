@@ -8,6 +8,7 @@ import types
 import pytest
 import torch
 
+from megatron.core.context_parallel import ContextParallelBatch
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
@@ -35,10 +36,14 @@ from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
+    MultiTokenPredictionInputs,
     _initialize_hidden_state_mixing_rng_tracker,
     _mix_hidden_state_history,
     _mtp_logits_are_vocab_sharded,
     _packed_seq_params_for_local_hsm_roll,
+    get_mtp_layer_offset,
+    get_mtp_num_layers_to_build,
+    mtp_on_this_rank,
     process_mtp_loss,
     roll_tensor,
 )
@@ -117,6 +122,118 @@ class TestMultiTokenPredictionLayer:
             config=config, spec=transformer_layer_spec, use_transformer_engine=use_te
         )
         return config, mtp_block_spec
+
+    def test_mtp_placement_uses_explicit_pipeline_group(self, monkeypatch):
+        """An explicit PP group must avoid global MPU reads during model construction."""
+
+        pp_group = object()
+        pp_rank = 1
+
+        def explicit_pg_rank(group):
+            assert group is pp_group
+            return pp_rank
+
+        def explicit_pg_size(group):
+            assert group is pp_group
+            return 2
+
+        def unexpected_global_read(*args, **kwargs):
+            raise AssertionError("global pipeline state must not be read")
+
+        monkeypatch.setattr(mtp_module, "get_pg_rank", explicit_pg_rank)
+        monkeypatch.setattr(mtp_module, "get_pg_size", explicit_pg_size)
+        monkeypatch.setattr(
+            mtp_module.parallel_state, "get_pipeline_model_parallel_rank", unexpected_global_read
+        )
+        monkeypatch.setattr(
+            mtp_module.parallel_state,
+            "get_pipeline_model_parallel_world_size",
+            unexpected_global_read,
+        )
+        monkeypatch.setattr(
+            mtp_module.parallel_state,
+            "get_virtual_pipeline_model_parallel_world_size",
+            unexpected_global_read,
+        )
+
+        assert mtp_on_this_rank(
+            mtp_num_layers=1, ignore_virtual=False, vp_stage=0, pp_group=pp_group, vp_size=1
+        )
+        pp_rank = 0
+        assert not mtp_on_this_rank(
+            mtp_num_layers=1, ignore_virtual=False, vp_stage=0, pp_group=pp_group, vp_size=1
+        )
+
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.0,
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=1,
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float32,
+            use_cpu_initialization=True,
+        )
+        assert get_mtp_num_layers_to_build(config, pp_rank=1) == 1
+        assert get_mtp_num_layers_to_build(config, pp_rank=0) == 0
+
+        layout_config = TransformerConfig(
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.0,
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=1,
+            pipeline_model_parallel_size=2,
+            pipeline_model_parallel_layout=[['embedding', 'decoder', 'decoder', 'mtp'], ['loss']],
+            pipeline_dtype=torch.float32,
+            use_cpu_initialization=True,
+        )
+        assert get_mtp_layer_offset(layout_config, pp_rank=0) == 0
+        assert get_mtp_layer_offset(layout_config, pp_rank=1) == 1
+
+    def test_process_mtp_loss_uses_explicit_metric_group(self, monkeypatch):
+        """MTP metric reduction must use the language model's supplied data group."""
+        metric_avg_group = object()
+        captured = {}
+
+        def unexpected_global_read(*args, **kwargs):
+            raise AssertionError("global data-parallel state must not be read")
+
+        def capture_metrics(*args, **kwargs):
+            captured["avg_group"] = kwargs["avg_group"]
+
+        monkeypatch.setattr(
+            mtp_module.parallel_state, "get_data_parallel_group", unexpected_global_read
+        )
+        monkeypatch.setattr(MTPLossLoggingHelper, "save_metrics_to_tracker", capture_metrics)
+
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.0,
+            num_layers=2,
+            hidden_size=1,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        seq_len = 4
+        hidden_states = torch.ones(2 * seq_len, 1, 1)
+
+        process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=torch.zeros(1, seq_len, dtype=torch.long),
+            loss_mask=torch.ones(1, seq_len),
+            output_layer=lambda hidden, **kwargs: (hidden, None),
+            output_weight=None,
+            runtime_gather_output=None,
+            is_training=True,
+            compute_language_model_loss=lambda labels, logits: torch.ones_like(
+                labels, dtype=logits.dtype
+            ),
+            config=config,
+            metric_avg_group=metric_avg_group,
+        )
+
+        assert captured["avg_group"] is metric_avg_group
 
     def test_hsm_mix_preserves_dtype_and_gradients(self, monkeypatch):
         """HSM selects per-element history entries without changing dtype or gradients."""
@@ -296,16 +413,27 @@ class TestMultiTokenPredictionLayer:
             num_layers=2, hidden_size=4, num_attention_heads=1, mtp_num_layers=2, mtp_hsm=True
         )
         seen_inputs = []
+        seen_masks = []
 
         class _IncrementLayer:
-            def __call__(self, hidden_states, input_ids, position_ids, padding_mask, **kwargs):
+            def __call__(
+                self,
+                hidden_states,
+                input_ids,
+                position_ids,
+                padding_mask,
+                mtp_input_mask=None,
+                **kwargs,
+            ):
                 seen_inputs.append(hidden_states.clone())
-                return hidden_states + 1, input_ids, position_ids, padding_mask
+                seen_masks.append(mtp_input_mask)
+                return hidden_states + 1, input_ids, position_ids, padding_mask, mtp_input_mask
 
         block = types.SimpleNamespace(
             config=config,
             training=training,
             vp_stage=None,
+            pp_rank=0,
             mtp_use_repeated_layer=False,
             cp_group=None,
             tp_group=None,
@@ -323,12 +451,14 @@ class TestMultiTokenPredictionLayer:
         )
 
         hidden_states = torch.ones(2, 1, config.hidden_size)
+        mtp_input_mask = torch.tensor([[True, False]])
         MultiTokenPredictionBlock.forward(
             block,
             input_ids=torch.zeros(1, 2, dtype=torch.long),
             position_ids=torch.zeros(1, 2, dtype=torch.long),
             hidden_states=hidden_states,
             attention_mask=torch.ones(1, 1, 2, 2, dtype=torch.bool),
+            mtp_input_mask=mtp_input_mask,
         )
 
         torch.testing.assert_close(seen_inputs[0], hidden_states)
@@ -336,6 +466,8 @@ class TestMultiTokenPredictionLayer:
             seen_inputs[1],
             torch.tensor(expected_second_input).view(2, 1, 1).expand_as(hidden_states),
         )
+        assert len(seen_masks) == 2
+        assert all(mask is mtp_input_mask for mask in seen_masks)
 
     @pytest.mark.parametrize("packed", [False, True])
     def test_hsm_aligns_history_with_target_tokens(self, monkeypatch, packed):
@@ -348,12 +480,19 @@ class TestMultiTokenPredictionLayer:
         class _IncrementLayer:
             def __call__(self, hidden_states, input_ids, position_ids, padding_mask, **kwargs):
                 seen_inputs.append(hidden_states.clone())
-                return hidden_states + 10, input_ids, position_ids, padding_mask
+                return (
+                    hidden_states + 10,
+                    input_ids,
+                    position_ids,
+                    padding_mask,
+                    kwargs.get("mtp_input_mask"),
+                )
 
         block = types.SimpleNamespace(
             config=config,
             training=True,
             vp_stage=None,
+            pp_rank=0,
             mtp_use_repeated_layer=False,
             cp_group=None,
             tp_group=None,
@@ -505,7 +644,7 @@ class TestMultiTokenPredictionLayer:
         def fake_embedding(input_ids, position_ids):
             return torch.zeros(seq_len, batch_size, config.hidden_size, dtype=hidden_states.dtype)
 
-        rolled_input_ids, rolled_position_ids, rolled_padding_mask, _, _ = (
+        rolled_input_ids, rolled_position_ids, rolled_padding_mask, _, _, _ = (
             mtp_layer._get_embeddings(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -523,6 +662,103 @@ class TestMultiTokenPredictionLayer:
         assert torch.equal(rolled_input_ids, expected_input_ids)
         assert torch.equal(rolled_position_ids, expected_position_ids)
         assert torch.equal(rolled_padding_mask, expected_padding_mask)
+
+    @pytest.mark.parametrize("with_mask", [False, True])
+    def test_get_embeddings_does_not_add_a_mask_roll(self, monkeypatch, with_mask):
+        """Conditioning validity shares the token-ID roll instead of adding an exchange."""
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        mtp_layer = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).layers[0]
+        input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+        position_ids = torch.arange(input_ids.size(1), dtype=torch.int64).unsqueeze(0)
+        hidden_states = torch.randn(input_ids.size(1), 1, config.hidden_size)
+        mtp_input_mask = input_ids != 2 if with_mask else None
+        rolled_shapes = []
+
+        def capture_roll(tensor, *args, **kwargs):
+            rolled_shapes.append(tensor.shape)
+            return roll_tensor(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.multi_token_prediction.roll_tensor", capture_roll
+        )
+
+        mtp_layer._get_embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            embedding=lambda input_ids, position_ids: torch.zeros(
+                input_ids.size(1), input_ids.size(0), config.hidden_size
+            ),
+            hidden_states=hidden_states,
+            mtp_input_mask=mtp_input_mask,
+        )
+
+        assert len(rolled_shapes) == 2  # Token metadata and position IDs.
+        expected_metadata_batch = 2 * input_ids.size(0) if with_mask else input_ids.size(0)
+        assert rolled_shapes[0][0] == expected_metadata_batch
+
+    @pytest.mark.parametrize("cp", [1, 2])
+    def test_get_embeddings_rolls_packed_ids_and_validity_together(self, cp):
+        """Packed CP rolling keeps token IDs and their validity exactly aligned."""
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=cp, use_te=cp > 1)
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp_layer = mtp.layers[0]
+        cp_group = get_context_parallel_group() if cp > 1 else None
+        cp_rank = torch.distributed.get_rank(group=cp_group) if cp_group is not None else 0
+
+        if cp == 1:
+            input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.int64).cuda()
+            expected_ids = torch.tensor([[2, 3, 0, 5, 0]], dtype=torch.int64).cuda()
+            cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32).cuda()
+            max_seqlen = 3
+        elif cp_rank == 0:
+            input_ids = torch.tensor(
+                [[1, 2, 7, 8, 11, 12, 13, 20, 21, 22]], dtype=torch.int64
+            ).cuda()
+            expected_ids = torch.tensor(
+                [[2, 3, 8, 0, 12, 13, 14, 21, 22, 0]], dtype=torch.int64
+            ).cuda()
+            cu_seqlens = torch.tensor([0, 8, 20], dtype=torch.int32).cuda()
+            max_seqlen = 6
+        else:
+            input_ids = torch.tensor(
+                [[3, 4, 5, 6, 14, 15, 16, 17, 18, 19]], dtype=torch.int64
+            ).cuda()
+            expected_ids = torch.tensor(
+                [[4, 5, 6, 7, 15, 16, 17, 18, 19, 20]], dtype=torch.int64
+            ).cuda()
+            cu_seqlens = torch.tensor([0, 8, 20], dtype=torch.int32).cuda()
+            max_seqlen = 6
+
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            qkv_format='thd',
+        )
+        mtp_input_mask = (input_ids != 3) & (input_ids != 14)
+        position_ids = torch.arange(input_ids.size(1), device="cuda").unsqueeze(0)
+        hidden_states = torch.randn(input_ids.size(1), 1, config.hidden_size, device="cuda")
+
+        def fake_embedding(input_ids, position_ids):
+            return torch.zeros(
+                input_ids.size(1), input_ids.size(0), config.hidden_size, device="cuda"
+            )
+
+        rolled_ids, _, _, rolled_mask, _, _ = mtp_layer._get_embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            embedding=fake_embedding,
+            hidden_states=hidden_states,
+            packed_seq_params=packed_seq_params,
+            mtp_input_mask=mtp_input_mask,
+        )
+
+        expected_mask = (expected_ids != 0) & (expected_ids != 3) & (expected_ids != 14)
+        torch.testing.assert_close(rolled_ids, expected_ids)
+        torch.testing.assert_close(rolled_mask, expected_mask)
 
     def test_forward_propagates_rolled_padding_mask(self, monkeypatch):
         """Test forward passes rolled padding_mask to transformer path."""
@@ -558,6 +794,8 @@ class TestMultiTokenPredictionLayer:
             inference_params=None,
             packed_seq_params=None,
             sequence_len_offset=None,
+            packed_seq_params_by_layout=None,
+            cp_layout_plan=None,
         ):
             seen["padding_mask"] = padding_mask
             return hidden_states
@@ -568,7 +806,7 @@ class TestMultiTokenPredictionLayer:
             types.MethodType(fake_proj_and_transformer_layer, mtp_layer),
         )
 
-        _, _, _, returned_padding_mask = mtp_layer.forward(
+        _, _, _, returned_padding_mask, _ = mtp_layer.forward(
             input_ids=input_ids,
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -602,7 +840,7 @@ class TestMultiTokenPredictionLayer:
         def fake_embedding(input_ids, position_ids):
             return emb_weight.clone()
 
-        _, _, _, decoder_input, returned_hidden_states = mtp_layer._get_embeddings(
+        _, _, _, _, decoder_input, returned_hidden_states = mtp_layer._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
             embedding=fake_embedding,
@@ -742,6 +980,76 @@ class TestMultiTokenPredictionLayer:
             assert hidden_states.grad is not None
             assert emb_weight.grad is not None
 
+    @pytest.mark.parametrize("mtp_num_layers", [1, 2])
+    def test_invalid_conditioning_embedding_has_no_input_gradient(self, mtp_num_layers):
+        """A later causal loss must not update an invalid tied embedding row.
+
+        The selected output position can attend to the earlier invalid MTP input.
+        Its embedding value remains available in the forward pass, but its row in
+        the shared embedding table must be detached from the input-side gradient.
+        """
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        model_parallel_cuda_manual_seed(_SEED)
+        config = TransformerConfig(
+            mtp_num_layers=mtp_num_layers,
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        layer_spec = get_gpt_layer_local_spec()
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=layer_spec, use_transformer_engine=False
+        )
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).cuda()
+
+        vocab_size = 16
+        invalid_token_ids = (9, 10)
+
+        class SharedEmbedding(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.randn(vocab_size, config.hidden_size, device="cuda")
+                )
+
+            def forward(self, input_ids, position_ids):
+                return torch.nn.functional.embedding(input_ids, self.weight).transpose(0, 1)
+
+        embedding = SharedEmbedding()
+        input_ids = torch.tensor(
+            [[4, invalid_token_ids[0], 5, invalid_token_ids[1], 6, 7]], device="cuda"
+        )
+        position_ids = torch.arange(input_ids.size(1), device="cuda").unsqueeze(0)
+        mtp_input_mask = torch.ones_like(input_ids, dtype=torch.bool)
+        for invalid_token_id in invalid_token_ids:
+            mtp_input_mask &= input_ids != invalid_token_id
+        hidden_states = torch.randn(
+            input_ids.size(1), 1, config.hidden_size, device="cuda", requires_grad=True
+        )
+
+        output = mtp(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attention_mask=None,
+            embedding=embedding,
+            mtp_input_mask=mtp_input_mask,
+        )
+
+        # Each MTP output at position 4 can causally attend to every invalid
+        # shifted embedding that remains in that prediction depth.
+        seq_len = input_ids.size(1)
+        mtp_outputs = output[seq_len:].reshape(mtp_num_layers, seq_len, 1, config.hidden_size)
+        mtp_outputs[:, 4].square().sum().backward()
+
+        for invalid_token_id in invalid_token_ids:
+            assert torch.count_nonzero(embedding.weight.grad[invalid_token_id]) == 0
+        assert torch.count_nonzero(embedding.weight.grad[6]) > 0
+
     @pytest.mark.parametrize("detach_heads", [False, True])
     def test_process_mtp_loss_detaches_output_weight(self, detach_heads):
         """process_mtp_loss must detach the output-head weight when mtp_detach_heads=True
@@ -836,6 +1144,134 @@ class TestMultiTokenPredictionLayer:
         assert torch.count_nonzero(hidden_states.grad[seq_len:]) == 0
         assert output_weight.grad is not None
         assert torch.count_nonzero(output_weight.grad) == 0
+
+    def test_process_mtp_loss_masks_later_steps_after_invalid_input(self):
+        """Mask an MTP prediction after its conditioning path reaches an invalid token."""
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            mtp_loss_scaling_factor=1.0,
+            num_layers=2,
+            hidden_size=1,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        seq_len = 5
+        hidden_states = torch.ones(
+            (1 + config.mtp_num_layers) * seq_len, 1, config.hidden_size, requires_grad=True
+        )
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            return hidden, None
+
+        def compute_language_model_loss(labels, logits):
+            return logits.squeeze(-1).transpose(0, 1)
+
+        # Input validity: [text, modality, text, text, padding]. The first-step path
+        # starting at position 1 consumes only valid text at position 2. The second-step
+        # path starting at position 0 crosses the modality token at position 1.
+        process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=torch.tensor([[10, 13, 100, 101, 0]]),
+            loss_mask=torch.tensor([[0.0, 0.0, 1.0, 1.0, 0.0]]),
+            mtp_input_mask=torch.tensor([[True, False, True, True, True]]),
+            output_layer=output_layer,
+            output_weight=None,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=compute_language_model_loss,
+            config=config,
+        ).sum().backward()
+
+        first_step_grad = hidden_states.grad[seq_len : 2 * seq_len, 0, 0]
+        second_step_grad = hidden_states.grad[2 * seq_len :, 0, 0]
+
+        assert first_step_grad[1] != 0  # The one-step text-only path remains supervised.
+        assert second_step_grad[0] == 0  # The path that crossed the modality is masked.
+        assert second_step_grad[1] != 0  # Its neighboring text-only path remains supervised.
+
+    @pytest.mark.parametrize("with_mtp_input_mask", [False, True])
+    def test_process_mtp_loss_co_rolls_conditioning_mask(self, monkeypatch, with_mtp_input_mask):
+        """Conditioning validity must not add a CP roll at each prediction depth."""
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            mtp_loss_scaling_factor=1.0,
+            num_layers=2,
+            hidden_size=1,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        seq_len = 5
+        rolled = []
+
+        def capture_roll(tensor, *args, **kwargs):
+            rolled.append((tensor.shape, kwargs.get("return_sum", True)))
+            return roll_tensor(tensor, *args, **kwargs)
+
+        monkeypatch.setattr(mtp_module, "roll_tensor", capture_roll)
+        process_mtp_loss(
+            hidden_states=torch.ones((1 + config.mtp_num_layers) * seq_len, 1, 1),
+            labels=torch.arange(seq_len).unsqueeze(0),
+            loss_mask=torch.ones(1, seq_len),
+            mtp_input_mask=(
+                torch.tensor([[True, False, True, True, True]]) if with_mtp_input_mask else None
+            ),
+            output_layer=lambda hidden, **kwargs: (hidden, None),
+            output_weight=None,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=lambda labels, logits: torch.ones_like(
+                labels, dtype=logits.dtype
+            ),
+            config=config,
+        )
+
+        assert len(rolled) == 2 * config.mtp_num_layers
+        if with_mtp_input_mask:
+            assert [shape[0] for shape, _ in rolled] == [1, 2, 1, 2]
+            assert all(not return_sum for _, return_sum in rolled)
+        else:
+            assert [shape[0] for shape, _ in rolled] == [1, 1, 1, 1]
+            assert [return_sum for _, return_sum in rolled] == [False, True, False, True]
+
+    def test_process_mtp_loss_preserves_main_layout_hidden_states(self):
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=2,
+            use_cpu_initialization=True,
+        )
+        seq_len = 4
+        mtp_hidden_states = torch.randn(
+            (1 + config.mtp_num_layers) * seq_len, 1, config.hidden_size, requires_grad=True
+        )
+        main_hidden_states = torch.randn(seq_len, 1, config.hidden_size, requires_grad=True)
+        output_weight = torch.nn.Parameter(torch.randn(16, config.hidden_size))
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            return torch.matmul(hidden, weight.t()), None
+
+        def compute_language_model_loss(labels, logits):
+            return logits.square().sum(dim=-1).transpose(0, 1)
+
+        result = process_mtp_loss(
+            hidden_states=mtp_hidden_states,
+            labels=torch.arange(seq_len).unsqueeze(0),
+            loss_mask=torch.ones(1, seq_len),
+            output_layer=output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=compute_language_model_loss,
+            config=config,
+            main_hidden_states=main_hidden_states,
+        )
+        torch.testing.assert_close(result, main_hidden_states)
+
+        result.sum().backward()
+
+        torch.testing.assert_close(main_hidden_states.grad, torch.ones_like(main_hidden_states))
+        assert torch.count_nonzero(mtp_hidden_states.grad[seq_len:]) > 0
 
 
 class TestMTPHiddenStateRollUnderParallelism:
@@ -1025,7 +1461,13 @@ class TestMTPHiddenStateRollUnderParallelism:
 
             def __call__(self, hidden_states, input_ids, position_ids, padding_mask=None, **kwargs):
                 layer_inputs.append(hidden_states.detach().clone())
-                return hidden_states + 1, input_ids, position_ids, padding_mask
+                return (
+                    hidden_states + 1,
+                    input_ids,
+                    position_ids,
+                    padding_mask,
+                    kwargs.get("mtp_input_mask"),
+                )
 
         rolled_history = []
         mixed_states = []
@@ -1070,6 +1512,7 @@ class TestMTPHiddenStateRollUnderParallelism:
             config=config,
             training=True,
             vp_stage=None,
+            pp_rank=0,
             mtp_use_repeated_layer=False,
             cp_group=cp_group,
             tp_group=tp_group,
@@ -1762,6 +2205,7 @@ class TestMultiTokenPrediction:
         fp8=None,
         full_recompute=False,
         mtp_hsm=False,
+        freeze_base_model_for_mtp=False,
     ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
@@ -1771,6 +2215,7 @@ class TestMultiTokenPrediction:
         args.num_layers = 2
         args.mtp_num_layers = 2
         args.mtp_hsm = mtp_hsm
+        args.freeze_base_model_for_mtp = freeze_base_model_for_mtp
         args.mtp_loss_scaling_factor = 0.1
         args.padded_vocab_size = 128800
         args.hidden_size = 128
@@ -2027,6 +2472,57 @@ class TestMultiTokenPrediction:
             # for param in gpt_model[0].parameters():
             for name, param in gpt_model[0].named_parameters():
                 assert param.main_grad is not None
+
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("2.1.0"),
+        reason="grouped_gemm requires TransformerEngine >= 2.1.0",
+    )
+    @pytest.mark.parametrize("full_recompute", [False, True])
+    def test_forward_backward_with_frozen_base(self, full_recompute):
+        """Frozen-backbone training builds gradients and optimizer state only for MTP."""
+        args = self.create_test_args(
+            tp=1,
+            cp=1,
+            sequence_length=self.seq_length,
+            micro_batch_size=self.micro_batch_size,
+            full_recompute=full_recompute,
+            freeze_base_model_for_mtp=True,
+        )
+        set_args(args)
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        gpt_model, optimizer, _ = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder, self.model_provider
+        )
+        batch = self.get_batch(self.seq_length, self.micro_batch_size)
+        output = gpt_model[0].forward(
+            input_ids=batch['tokens'],
+            position_ids=batch['position_ids'],
+            attention_mask=batch['attention_mask'],
+            labels=batch['labels'],
+            loss_mask=batch['loss_mask'],
+        )
+
+        assert torch.isfinite(output).all()
+        tracker = MTPLossLoggingHelper.tracker
+        assert torch.isfinite(tracker['loss_values']).all()
+
+        output.mean().backward()
+        trainable_numel = sum(
+            param.numel() for param in gpt_model[0].parameters() if param.requires_grad
+        )
+        optimizer_numel = sum(param.numel() for param in optimizer.get_parameters())
+        assert optimizer_numel == trainable_numel
+        for name, param in gpt_model[0].named_parameters():
+            if 'mtp.layers.' in name:
+                assert param.requires_grad
+                assert param.main_grad is not None
+                assert torch.isfinite(param.main_grad).all()
+            else:
+                assert not param.requires_grad
+                assert getattr(param, 'main_grad', None) is None
 
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("2.1.0"),
@@ -2478,6 +2974,64 @@ class TestMultiTokenPrediction:
 
         Utils.destroy_model_parallel()
 
+    def test_roll_tensor_with_attention_padded_packed_sequences_without_cp(self):
+        tensor = torch.arange(1, 25)
+        expected = torch.zeros_like(tensor)
+        expected[:2] = torch.tensor([2, 3])
+        expected[8:17] = torch.arange(10, 19)
+        cu_seqlens = torch.tensor([0, 3, 13], dtype=torch.int32)
+        cu_seqlens_padded = torch.tensor([0, 8, 24], dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            qkv_format="thd",
+        )
+
+        rolled, _ = roll_tensor(tensor, shifts=-1, dims=-1, packed_seq_params=packed_seq_params)
+
+        torch.testing.assert_close(rolled, expected)
+
+    def test_roll_tensor_with_attention_padded_packed_sequences(self):
+        cp = 4
+        if int(os.environ.get("WORLD_SIZE", "1")) < cp:
+            pytest.skip(f"CP={cp} requires at least {cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group()
+        cp_rank = get_pg_rank(cp_group)
+
+        local_tensors = (
+            [1, 0, 5, 6, 0, 0],
+            [2, 0, 7, 8, 0, 0],
+            [3, 0, 9, 10, 0, 0],
+            [0, 0, 11, 12, 13, 14],
+        )
+        expected_tensors = (
+            [2, 0, 6, 7, 0, 0],
+            [3, 0, 8, 9, 0, 0],
+            [0, 0, 10, 11, 0, 0],
+            [0, 0, 12, 13, 14, 0],
+        )
+        tensor = torch.tensor(local_tensors[cp_rank], device="cuda")
+        expected = torch.tensor(expected_tensors[cp_rank], device="cuda")
+        cu_seqlens = torch.tensor([0, 3, 13], dtype=torch.int32, device="cuda")
+        cu_seqlens_padded = torch.tensor([0, 8, 24], dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            qkv_format="thd",
+        )
+
+        rolled, _ = roll_tensor(
+            tensor, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+
+        torch.testing.assert_close(rolled, expected)
+        Utils.destroy_model_parallel()
+
 
 class TestMTPLossLoggingHelper:
     def setup_method(self, method):
@@ -2772,7 +3326,8 @@ class TestMultiTokenPredictionHybrid:
     @staticmethod
     def _make_forward_stub():
         hidden_states = torch.arange(4, dtype=torch.float32).reshape(2, 1, 2)
-        call_counts = {"mtp": 0, "mtp_loss": 0, "main_loss": 0}
+        call_counts = {"mtp": 0, "mtp_loss": 0, "main_loss": 0, "mtp_input_mask": None}
+        metric_avg_group = object()
 
         def decoder(**kwargs):
             decoder_hidden_states = kwargs["hidden_states"]
@@ -2784,8 +3339,28 @@ class TestMultiTokenPredictionHybrid:
 
         def mtp(**kwargs):
             call_counts["mtp"] += 1
+            call_counts["mtp_input_mask"] = kwargs.get("mtp_input_mask")
             decoder_hidden_states = kwargs["hidden_states"]
             return torch.cat((decoder_hidden_states, decoder_hidden_states + 100.0), dim=0)
+
+        class MTPStub:
+            def __init__(self):
+                self.forward_impl = mtp
+
+            def prepare_cp_layout(self, **kwargs):
+                return MultiTokenPredictionInputs(
+                    input_ids=kwargs["input_ids"],
+                    position_ids=kwargs["position_ids"],
+                    hidden_states=kwargs["hidden_states"],
+                    mhc_multistream=kwargs["mhc_multistream"],
+                    labels=kwargs["labels"],
+                    loss_mask=kwargs["loss_mask"],
+                    mtp_input_mask=kwargs["mtp_input_mask"],
+                    packed_seq_params=kwargs["packed_seq_params"],
+                )
+
+            def __call__(self, **kwargs):
+                return self.forward_impl(**kwargs)
 
         def output_layer(output, **kwargs):
             return output, None
@@ -2797,6 +3372,7 @@ class TestMultiTokenPredictionHybrid:
         model = types.SimpleNamespace(
             config=types.SimpleNamespace(
                 fine_grained_activation_offloading=False,
+                freeze_base_model_for_mtp=False,
                 moe_paged_stash=False,
                 multi_latent_attention=False,
                 mtp_num_layers=1,
@@ -2810,15 +3386,17 @@ class TestMultiTokenPredictionHybrid:
             share_embeddings_and_output_weights=False,
             mtp_process=True,
             embedding=None,
-            mtp=mtp,
+            mtp=MTPStub(),
             output_layer=output_layer,
             training=True,
             compute_language_model_loss=compute_language_model_loss,
-            pg_collection=types.SimpleNamespace(cp=None),
+            pg_collection=types.SimpleNamespace(
+                cp=None, tp=None, tp_cp=None, dp_cp=metric_avg_group
+            ),
             tp_group=None,
             _scale_logits=lambda logits: logits,
         )
-        return model, hidden_states, call_counts
+        return model, hidden_states, call_counts, metric_avg_group
 
     @pytest.mark.parametrize(
         (
@@ -2845,19 +3423,21 @@ class TestMultiTokenPredictionHybrid:
         expected_main_loss_calls,
     ):
         """Test that MTP execution and the main output contract are independent."""
-        model, hidden_states, call_counts = self._make_forward_stub()
+        model, hidden_states, call_counts, metric_avg_group = self._make_forward_stub()
         labels = torch.tensor([[3, 4]]) if provide_labels else None
         input_ids = torch.zeros(1, 2, dtype=torch.long)
         loss_mask = torch.ones(1, 2)
+        mtp_input_mask = torch.ones(1, 2, dtype=torch.bool)
 
         def process_mtp_loss_spy(**kwargs):
             call_counts["mtp_loss"] += 1
             assert kwargs["labels"] is labels
             assert kwargs["input_ids"] is input_ids
             assert kwargs["loss_mask"] is loss_mask
-            return torch.chunk(kwargs["hidden_states"], 1 + kwargs["config"].mtp_num_layers, dim=0)[
-                0
-            ]
+            assert kwargs["mtp_input_mask"] is mtp_input_mask
+            assert kwargs["metric_avg_group"] is metric_avg_group
+            assert kwargs["main_hidden_states"] is hidden_states
+            return kwargs["main_hidden_states"]
 
         monkeypatch.setattr(
             "megatron.core.models.hybrid.hybrid_model.process_mtp_loss", process_mtp_loss_spy
@@ -2871,9 +3451,12 @@ class TestMultiTokenPredictionHybrid:
             decoder_input=hidden_states,
             labels=labels,
             loss_mask=loss_mask,
+            mtp_input_mask=mtp_input_mask,
             compute_mtp_loss=compute_mtp_loss,
         )
 
+        expected_block_mask = mtp_input_mask if expected_mtp_calls else None
+        assert call_counts.pop("mtp_input_mask") is expected_block_mask
         assert call_counts == {
             "mtp": expected_mtp_calls,
             "mtp_loss": expected_mtp_loss_calls,
@@ -2884,12 +3467,134 @@ class TestMultiTokenPredictionHybrid:
         else:
             torch.testing.assert_close(output, hidden_states.transpose(0, 1).contiguous())
 
+    def test_forward_uses_mtp_cp_layout_inputs(self, monkeypatch):
+        model, hidden_states, call_counts, metric_avg_group = self._make_forward_stub()
+        contiguous_packed_seq_params = object()
+        zigzag_packed_seq_params = object()
+        zigzag_hidden_states = hidden_states + 10.0
+        captured = {}
+
+        expected_packed_seq_params_by_layout = {
+            "contiguous": contiguous_packed_seq_params,
+            "zigzag": zigzag_packed_seq_params,
+        }
+        cp_layout_plan = object()
+        cp_group = types.SimpleNamespace(size=lambda: 2)
+        tp_group = object()
+        tp_cp_group = object()
+        model.pg_collection = types.SimpleNamespace(
+            cp=cp_group, tp=tp_group, tp_cp=tp_cp_group, dp_cp=metric_avg_group
+        )
+        model.mtp.config = types.SimpleNamespace(attention_cp_layout="zigzag")
+        model.mtp.cp_group = cp_group
+        model.mtp.tp_group = tp_group
+        model.mtp.tp_cp_group = tp_cp_group
+        model.mtp.sequence_parallel = True
+        model.mtp.prepare_cp_layout = types.MethodType(
+            MultiTokenPredictionBlock.prepare_cp_layout, model.mtp
+        )
+
+        def convert_cp_layout_spy(
+            layer_hidden_states,
+            source_layout,
+            target_layout,
+            passed_cp_group,
+            sequence_parallel,
+            passed_tp_group,
+            passed_tp_cp_group,
+            thd_plan,
+        ):
+            assert source_layout == "contiguous"
+            assert target_layout == "zigzag"
+            assert passed_cp_group is cp_group
+            assert sequence_parallel
+            assert passed_tp_group is tp_group
+            assert passed_tp_cp_group is tp_cp_group
+            assert thd_plan is cp_layout_plan
+            assert layer_hidden_states is hidden_states
+            return zigzag_hidden_states
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.multi_token_prediction.convert_cp_layout",
+            convert_cp_layout_spy,
+        )
+
+        def mtp(**kwargs):
+            call_counts["mtp"] += 1
+            captured["mtp"] = kwargs
+            return torch.cat((kwargs["hidden_states"], kwargs["hidden_states"] + 100.0), dim=0)
+
+        model.mtp.forward_impl = mtp
+        input_ids = torch.tensor([[1, 2]])
+        position_ids = torch.tensor([[0, 1]])
+        labels = torch.tensor([[2, 3]])
+        loss_mask = torch.ones(1, 2)
+        zigzag_input_ids = torch.tensor([[4, 3]])
+        zigzag_position_ids = torch.tensor([[3, 2]])
+        zigzag_labels = torch.tensor([[5, 4]])
+        zigzag_loss_mask = torch.tensor([[1.0, 0.0]])
+        batches_by_layout = {
+            "contiguous": {
+                "tokens": input_ids,
+                "position_ids": position_ids,
+                "labels": labels,
+                "loss_mask": loss_mask,
+            },
+            "zigzag": {
+                "tokens": zigzag_input_ids,
+                "position_ids": zigzag_position_ids,
+                "labels": zigzag_labels,
+                "loss_mask": zigzag_loss_mask,
+            },
+        }
+        cp_batch = ContextParallelBatch(
+            boundary_layout="contiguous",
+            batches_by_layout=batches_by_layout,
+            packed_seq_params_by_layout=expected_packed_seq_params_by_layout,
+            thd_plan=cp_layout_plan,
+        )
+
+        def process_mtp_loss_spy(**kwargs):
+            call_counts["mtp_loss"] += 1
+            captured["mtp_loss"] = kwargs
+            return kwargs["main_hidden_states"]
+
+        monkeypatch.setattr(
+            "megatron.core.models.hybrid.hybrid_model.process_mtp_loss", process_mtp_loss_spy
+        )
+
+        output = HybridModel.forward(
+            model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=None,
+            decoder_input=hidden_states,
+            labels=labels,
+            loss_mask=loss_mask,
+            packed_seq_params=contiguous_packed_seq_params,
+            cp_batch=cp_batch,
+        )
+
+        assert captured["mtp"]["hidden_states"] is zigzag_hidden_states
+        assert captured["mtp"]["input_ids"] is zigzag_input_ids
+        assert captured["mtp"]["position_ids"] is zigzag_position_ids
+        assert captured["mtp"]["packed_seq_params"] is zigzag_packed_seq_params
+        assert (
+            captured["mtp"]["packed_seq_params_by_layout"] is expected_packed_seq_params_by_layout
+        )
+        assert captured["mtp"]["cp_layout_plan"] is cp_layout_plan
+        assert captured["mtp_loss"]["labels"] is zigzag_labels
+        assert captured["mtp_loss"]["loss_mask"] is zigzag_loss_mask
+        assert captured["mtp_loss"]["input_ids"] is zigzag_input_ids
+        assert captured["mtp_loss"]["main_hidden_states"] is hidden_states
+        torch.testing.assert_close(output, labels.to(dtype=hidden_states.dtype) + 1000.0)
+
     @pytest.mark.parametrize("compute_mtp_loss", [True, False])
     def test_compute_mtp_loss_does_not_control_speculative_decoding(
         self, monkeypatch, compute_mtp_loss
     ):
         """Test the auxiliary MTP switch does not disable speculative-decoding state capture."""
-        model, hidden_states, call_counts = self._make_forward_stub()
+        model, hidden_states, call_counts, _ = self._make_forward_stub()
         inference_context = types.SimpleNamespace(
             is_dynamic_batching=lambda: True,
             num_speculative_tokens=1,
@@ -2919,6 +3624,7 @@ class TestMultiTokenPredictionHybrid:
 
         torch.testing.assert_close(output, hidden_states.transpose(0, 1).contiguous())
         torch.testing.assert_close(inference_context.mtp_decoder_hidden_states, hidden_states)
+        assert call_counts.pop("mtp_input_mask") is None
         assert call_counts == {"mtp": 0, "mtp_loss": 0, "main_loss": 0}
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
