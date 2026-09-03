@@ -92,7 +92,7 @@ class TestAsyncSave:
             'nvidia-resiliency-ext is not installed. Please install it to use the async save strategy.'
         )
         with (
-            mock.patch(megatron.core.dist_checkpointing.strategies.torch.HAVE_NVRX, False),
+            mock.patch('megatron.core.dist_checkpointing.strategies.torch.HAVE_NVRX', False),
             TempNamedDir(tmp_path_dist_ckpt / 'test_no_nvrx_async') as async_ckpt_dir,
             pytest.raises(
                 ModuleNotFoundError,
