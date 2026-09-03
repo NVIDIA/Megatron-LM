@@ -659,6 +659,8 @@ class DynamicInferenceEngineTestBase:
                 window_size=test_config.window_size,
                 window_attn_skip_freq=test_config.window_attn_skip_freq,
             )
+            # Layer-spec factories do not receive TransformerConfig. Forward num_moe_experts
+            # explicitly so MoE test cases build MoE layers instead of a dense MLP.
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
                 layer_spec = get_gpt_layer_with_transformer_engine_spec(
                     num_experts=transformer_config.num_moe_experts
