@@ -332,14 +332,15 @@ def _split_audio_configs(
     if "causal_mask" not in enc_cfg and enc_cfg.get("attn_mode") == "causal":
         enc_cfg["causal_mask"] = True
     # The LLM-style NeMo encoder names its input dimension ``feat_in`` and
-    # uses FeatureStacking + fused QKV/RoPE. Keep this compatibility mapping
-    # here so config-only inspection produces the same model shape as a
-    # converted archive.
+    # uses zero-padded frame stacking + fused QKV/RoPE. Keep this compatibility
+    # mapping here so config-only inspection produces the same model shape as
+    # a converted archive.
     if "n_mels" not in enc_cfg and "feat_in" in enc_cfg:
         enc_cfg["n_mels"] = enc_cfg["feat_in"]
     if enc_cfg.get("self_attention_model") == "rope":
         enc_cfg.setdefault("architecture", "rope_transformer")
-        enc_cfg.setdefault("pre_encode", "feature_stacking")
+        enc_cfg.setdefault("pre_encode", "stacking")
+        enc_cfg.setdefault("stacking_pad_mode", "zeros")
         enc_cfg.setdefault("attn_impl", "te")
 
     enc_target = enc_cfg.get("_target_", "")
@@ -449,6 +450,7 @@ def _validate_encoder_cfg(
         "n_layers",
         "pre_encode",
         "subsampling_factor",
+        "stacking_pad_mode",
         "qk_norm",
         "qkv_bias",
         "architecture",

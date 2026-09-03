@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
 from dataclasses import dataclass, fields
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 
 import torch
 
@@ -27,6 +27,9 @@ class NemoTransformerAudioConfig:
     nan_debug: bool = False
     qk_norm: bool = False
     subsampling_factor: int = 4
+    # ``None`` selects the architecture-compatible default: learned padding
+    # for legacy encoders and zero padding for the RoPE encoder.
+    stacking_pad_mode: Literal["learned", "zeros"] | None = None
     # Attention backend: "auto" prefers transformer_engine when importable, else SDPA.
     # Explicit values: "te" | "sdpa" | "fa". Not a structural field — checkpoints
     # trained with one backend load into another.
@@ -49,6 +52,22 @@ class NemoTransformerAudioConfig:
     pre_block_norm: bool = True
 
     def __post_init__(self) -> None:
+        if self.pre_encode == "feature_stacking":
+            if self.stacking_pad_mode not in (None, "zeros"):
+                raise ValueError(
+                    "pre_encode='feature_stacking' is a compatibility alias for "
+                    "pre_encode='stacking' with stacking_pad_mode='zeros'"
+                )
+            self.pre_encode = "stacking"
+            self.stacking_pad_mode = "zeros"
+        if self.stacking_pad_mode is None:
+            self.stacking_pad_mode = (
+                "zeros" if self.architecture == "rope_transformer" else "learned"
+            )
+        if self.stacking_pad_mode not in ("learned", "zeros"):
+            raise ValueError(
+                "stacking_pad_mode must be 'learned' or 'zeros', " f"got {self.stacking_pad_mode!r}"
+            )
         if self.architecture == "rope_transformer" and self.attn_impl == "auto":
             self.attn_impl = "te"
 
@@ -80,16 +99,24 @@ class NemoTransformerAudioModel(MegatronModule):
 
     def __init__(self, config: NemoTransformerAudioConfig) -> None:
         super().__init__(config=config)
+        stacking_pad_mode = config.stacking_pad_mode
+        if stacking_pad_mode is None:
+            raise ValueError("stacking_pad_mode must be resolved during config initialization")
         if config.architecture == "rope_transformer":
             if config.attn_impl != "te":
                 raise ValueError(
                     "rope_transformer requires Transformer Engine attention; "
                     f"got attn_impl={config.attn_impl!r}"
                 )
-            if config.pre_encode != "feature_stacking":
+            if config.pre_encode != "stacking":
                 raise ValueError(
-                    "rope_transformer checkpoints require pre_encode='feature_stacking', got "
+                    "rope_transformer checkpoints require pre_encode='stacking', got "
                     f"{config.pre_encode!r}"
+                )
+            if stacking_pad_mode != "zeros":
+                raise ValueError(
+                    "rope_transformer checkpoints require stacking_pad_mode='zeros', got "
+                    f"{stacking_pad_mode!r}"
                 )
             if config.self_attention_model != "rope":
                 raise ValueError(
@@ -108,6 +135,7 @@ class NemoTransformerAudioModel(MegatronModule):
                     ff_expansion=config.ff_expansion,
                     pre_block_norm=config.pre_block_norm,
                     subsampling_factor=config.subsampling_factor,
+                    stacking_pad_mode=stacking_pad_mode,
                     rope_base=config.rope_base,
                     rotary_fraction=config.rotary_fraction,
                     left_context=config.left_context,
@@ -129,6 +157,7 @@ class NemoTransformerAudioModel(MegatronModule):
                 nan_debug=config.nan_debug,
                 qk_norm=config.qk_norm,
                 subsampling_factor=config.subsampling_factor,
+                stacking_pad_mode=stacking_pad_mode,
                 attn_impl=config.attn_impl,
                 recompute_layers=config.recompute_layers,
                 left_context=config.left_context,
@@ -151,7 +180,7 @@ class NemoTransformerAudioModel(MegatronModule):
             return torch.div(
                 torch.div(input_seq_lengths, 2, rounding_mode="floor"), 2, rounding_mode="floor"
             )
-        if self.config.pre_encode in ("stacking", "feature_stacking"):
+        if self.config.pre_encode == "stacking":
             factor = int(self.config.subsampling_factor)
             return torch.div(input_seq_lengths + factor - 1, factor, rounding_mode="floor")
         raise ValueError(f"Unsupported pre_encode={self.config.pre_encode!r}")
@@ -182,7 +211,7 @@ class NemoTransformerAudioModel(MegatronModule):
                 + 2 * batch_size * t3 * d_model * d_model
             )
 
-        if self.config.pre_encode in ("stacking", "feature_stacking"):
+        if self.config.pre_encode == "stacking":
             factor = int(self.config.subsampling_factor)
             pad_size = (-max_input_frames) % factor
             stacked_frames = (max_input_frames + pad_size) // factor
@@ -299,10 +328,9 @@ class NemoTransformerAudioModel(MegatronModule):
         audio_bct = input_features.transpose(1, 2).contiguous()
         # Cast inputs to the encoder's parameter dtype before forward.
         # The dataloader emits float32 mels, but under Megatron's bf16/fp16
-        # wrapper the encoder parameters (incl. ``NGPTStackingSubsampling``'s
-        # learnable ``pad_frame``) live in low precision; mismatched dtypes
-        # break ``x[mask] = self.pad_frame`` (index_put requires matching
-        # dtypes), so cast at the audio encoder boundary.
+        # wrapper the encoder parameters (including a learned stacking pad
+        # frame when configured) live in low precision, so cast at the audio
+        # encoder boundary.
         encoder_dtype = next(self.encoder.parameters(), audio_bct).dtype
         if audio_bct.dtype != encoder_dtype:
             audio_bct = audio_bct.to(dtype=encoder_dtype)

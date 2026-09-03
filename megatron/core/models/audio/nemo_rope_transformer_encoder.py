@@ -13,112 +13,14 @@ conversion step.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-
-class FeatureStacking(nn.Module):
-    """Stack audio frames then project, matching NeMo's FeatureStacking."""
-
-    def __init__(self, subsampling_factor: int, feat_in: int, feat_out: int):
-        super().__init__()
-        self.subsampling_factor = subsampling_factor
-        self.proj = nn.Linear(subsampling_factor * feat_in, feat_out, bias=False)
-
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Stack and project a dense batch of padded audio features."""
-        # x: [batch, features, time] -> [batch, time, features]
-        x = x.transpose(1, 2)
-        batch, time, features = x.shape
-        pad_size = (-time) % self.subsampling_factor
-        if pad_size:
-            x = nn.functional.pad(x, (0, 0, 0, pad_size))
-        x = x.reshape(
-            batch, (time + pad_size) // self.subsampling_factor, features * self.subsampling_factor
-        )
-        x = self.proj(x)
-        lengths = torch.div(
-            lengths + self.subsampling_factor - 1, self.subsampling_factor, rounding_mode="floor"
-        )
-        return x, lengths
-
-    def forward_packed(
-        self, x: torch.Tensor, lengths: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Stack only valid frames and return contiguous per-audio token runs.
-
-        The regular dense path stacks the shared padded batch dimension.  That
-        is correct but particularly wasteful for long, variably-sized audio
-        inputs: it creates feature-stacked frames for every suffix pad before
-        attention has an opportunity to ignore them.  This path first crops
-        each sample to its real frame length, pads only its final partial stack
-        with zeros (the dense preprocessor's semantics), then concatenates
-        the resulting runs before the common projection.
-        """
-        if x.ndim == 2:
-            features = x.shape[1]
-            lengths = lengths.to(dtype=torch.int64, device=x.device).reshape(-1)
-            if int(lengths.sum().item()) != x.shape[0]:
-                raise ValueError(
-                    f"Packed features have {x.shape[0]} frames but "
-                    f"sum(lengths)={int(lengths.sum().item())}"
-                )
-            padded_lengths = (
-                torch.div(
-                    lengths + self.subsampling_factor - 1,
-                    self.subsampling_factor,
-                    rounding_mode="floor",
-                )
-                * self.subsampling_factor
-            )
-            output_lengths = padded_lengths // self.subsampling_factor
-            if x.shape[0] == 0:
-                return x.new_zeros((0, self.proj.out_features)), output_lengths
-
-            source_starts = lengths.cumsum(0) - lengths
-            destination_starts = padded_lengths.cumsum(0) - padded_lengths
-            frame_ids = torch.arange(x.shape[0], device=x.device)
-            within_clip = frame_ids - torch.repeat_interleave(source_starts, lengths)
-            destination = torch.repeat_interleave(destination_starts, lengths) + within_clip
-            canvas = x.new_zeros((int(padded_lengths.sum().item()), features))
-            canvas[destination] = x
-            stacked = canvas.reshape(-1, features * self.subsampling_factor)
-            return self.proj(stacked), output_lengths
-
-        if x.ndim != 3:
-            raise ValueError(
-                f"Expected [B, F, T] or packed [FTotal, F] audio features, got {tuple(x.shape)}"
-            )
-        batch, features, max_time = x.shape
-        if lengths.numel() != batch:
-            raise ValueError(f"Expected {batch} input lengths, got {lengths.numel()}")
-
-        x_btf = x.transpose(1, 2)
-        lengths = lengths.to(dtype=torch.int64, device=x.device)
-        output_lengths = torch.div(
-            lengths + self.subsampling_factor - 1, self.subsampling_factor, rounding_mode="floor"
-        )
-        stacked_chunks = []
-        for index, frame_count in enumerate(lengths.tolist()):
-            if frame_count < 0 or frame_count > max_time:
-                raise ValueError(
-                    f"Invalid input length {frame_count} for audio with {max_time} frames"
-                )
-            if frame_count == 0:
-                continue
-            sample = x_btf[index, :frame_count]
-            pad_size = (-frame_count) % self.subsampling_factor
-            if pad_size:
-                sample = F.pad(sample, (0, 0, 0, pad_size))
-            stacked_chunks.append(sample.reshape(-1, features * self.subsampling_factor))
-        if stacked_chunks:
-            stacked = torch.cat(stacked_chunks, dim=0)
-            return self.proj(stacked), output_lengths
-        return x.new_zeros((0, self.proj.out_features)), output_lengths
+from .nemo_transformer_encoder import StackingSubsampling
 
 
 class RotaryPositionalEncoding(nn.Module):
@@ -218,6 +120,7 @@ class RopeTransformerEncoderConfig:
     subsampling_factor: int
     rope_base: float
     rotary_fraction: float
+    stacking_pad_mode: Literal["learned", "zeros"] = "zeros"
     # Number of previous encoder positions visible to each causal query.
     # None or a negative value preserves unlimited-left causal attention.
     left_context: int | None = None
@@ -447,7 +350,12 @@ class RopeTransformerEncoder(nn.Module):
             if left_context < 0:
                 left_context = None
         self.causal_window_size = (-1, 0) if left_context is None else (left_context, 0)
-        self.pre_encode = FeatureStacking(config.subsampling_factor, config.n_mels, config.d_model)
+        self.pre_encode = StackingSubsampling(
+            config.subsampling_factor,
+            config.n_mels,
+            config.d_model,
+            pad_mode=config.stacking_pad_mode,
+        )
         self.embed_norm = nn.LayerNorm(config.d_model) if config.pre_block_norm else nn.Identity()
         self.pos_enc = RotaryPositionalEncoding(
             config.d_model // config.n_heads,
