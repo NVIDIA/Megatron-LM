@@ -5,6 +5,7 @@ These kernels skip padding rows (where permutation_map == -1) to avoid
 wasted computation on aligned-but-empty expert slots.
 """
 
+import os
 from unittest.mock import MagicMock
 
 import torch
@@ -32,6 +33,25 @@ if not HAVE_TRITON:
 
 def _ceil_div(a, b):
     return (a + b - 1) // b
+
+
+# Upper bound on the CTA count for the row-parallel activation kernels. A cap of
+# 512 leaves a GB200 SM array ~22% occupied at decode row counts (~2048 live rows
+# at batch 256 x top-8), which made SwiGLU cost ~10x its memory-bandwidth floor.
+# Sizing the grid to the row count instead lets each CTA own one row.
+#
+# The cap must stay a *small set of fixed powers of two*: NUM_BLOCKS is a
+# tl.constexpr, so every distinct value triggers a fresh JIT compile.
+_ACTIVATION_GRID_CAP = 8192
+
+
+def _activation_grid(max_rows: int) -> int:
+    """CTA count for a row-parallel activation kernel: one CTA per row, power-of-2 capped.
+
+    Set ``MCORE_MOE_ACTIVATION_GRID_CAP=512`` to restore the previous geometry.
+    """
+    cap = int(os.environ.get("MCORE_MOE_ACTIVATION_GRID_CAP", _ACTIVATION_GRID_CAP))
+    return min(triton.next_power_of_2(max_rows), cap)
 
 
 @triton.jit
@@ -191,7 +211,7 @@ def bounded_silu_mul(x: torch.Tensor, n_rows: torch.Tensor) -> torch.Tensor:
     N = two_N // 2
     out = torch.empty(M, N, dtype=x.dtype, device=x.device)
     BLOCK_N = min(triton.next_power_of_2(N), 1024)
-    NUM_BLOCKS = min(M, 512)
+    NUM_BLOCKS = _activation_grid(M)
     _silu_mul_bounded_kernel[(NUM_BLOCKS,)](
         x, out, n_rows, N, M, BLOCK_N=BLOCK_N, NUM_BLOCKS=NUM_BLOCKS
     )
