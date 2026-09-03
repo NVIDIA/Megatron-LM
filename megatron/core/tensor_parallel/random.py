@@ -66,9 +66,7 @@ _share_storage_ext = None
 _CHECKPOINT_WITHOUT_OUTPUT_STORAGE_ATTR = "_mcore_checkpoint_without_output"
 
 
-def _get_checkpoint_without_output_storage(
-    tensor: torch.Tensor,
-) -> torch.UntypedStorage | None:
+def _get_checkpoint_without_output_storage(tensor: torch.Tensor) -> torch.UntypedStorage | None:
     """Return a tensor's storage, or None for storage-less tensor subclasses."""
     try:
         return tensor.untyped_storage()
