@@ -388,6 +388,9 @@ class DynamicEngineTestConfig:
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
+    # A repeated (rather than per-depth) MTP head is one of the gates on
+    # DynamicInferenceContext.enable_mtp_kv_cache; set it to exercise the MTP draft KV cache.
+    mtp_use_repeated_layer: bool = False
     position_embedding_type: str = "learned_absolute"
     sampling_backend: str = 'torch'
     temperature: float = 1.0
@@ -597,6 +600,7 @@ class DynamicInferenceEngineTestBase:
                 params_dtype=torch.bfloat16,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
                 hidden_size=(
                     test_config.hidden_size
                     if test_config.hidden_size is not None
@@ -682,6 +686,7 @@ class DynamicInferenceEngineTestBase:
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
                 mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 **hybrid_mixer_kwargs(test_config.ssm_mixer),
                 num_attention_heads=16,

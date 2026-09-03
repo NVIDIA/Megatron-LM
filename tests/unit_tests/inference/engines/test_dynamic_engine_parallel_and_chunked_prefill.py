@@ -265,6 +265,138 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             num_expected = request.sampling_params.num_tokens_to_generate
             assert len(request.generated_tokens) <= num_expected
 
+    # ---- MTP draft-KV cache under expert parallelism ---------------------- #
+    #
+    # The MTP KV cache changes the per-step MTP forward COUNT: a rank with work runs one
+    # commit-pass forward before the draft loop and one extra append after it (D+2 total),
+    # and an idle EP rank must mirror both the count and the graph/eager mode via
+    # `_run_dummy_serial_mtp_forward`. A mismatch does not raise -- the MoE all-to-all simply
+    # blocks -- so these tests assert by COMPLETING every request.
+    #
+    # `mtp_use_repeated_layer=True` is the gate that turns `enable_mtp_kv_cache` on; without
+    # it the whole path is inert and these tests would pass vacuously, hence the explicit
+    # assert on the context flag.
+
+    @staticmethod
+    def _assert_mtp_kv_cache_active(env):
+        context = env.engine.context
+        assert context.enable_mtp_kv_cache, (
+            "MTP KV cache is OFF for this config, so this test passes vacuously; check the "
+            "mtp_use_repeated_layer / mtp_num_layers / num_speculative_tokens gates"
+        )
+        assert context.mtp_kv_layer_slot is not None
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 4], ids=["eager", "cuda_graphs"])
+    @torch.inference_mode()
+    def test_mtp_kv_cache_expert_parallel(self, num_cuda_graphs):
+        """MTP draft KV cache with EP=2, in both eager and CUDA-graphed modes.
+
+        Requests are spread unevenly across steps, so EP ranks naturally alternate between
+        having work (real commit pass + draft loop) and being idle (dummy MTP forwards).
+        """
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+
+        env = self._run_test(
+            model_provider="gpt",
+            expert_model_parallel_size=2,
+            num_speculative_tokens=2,
+            mtp_use_repeated_layer=True,
+            num_requests=4,
+            min_prompt_length=8,
+            max_prompt_length=16,
+            num_tokens_to_generate=6,
+            num_gap_steps=1,
+            num_cuda_graphs=num_cuda_graphs,
+            force_build_cuda_graphs=num_cuda_graphs is not None,
+            context_max_requests=8,
+            materialize_only_last_token_logits=False,
+        )
+
+        self._assert_mtp_kv_cache_active(env)
+        for request in env.requests:
+            assert (
+                request.status == Status.COMPLETED
+            ), f"Request {request.request_id}: status={request.status}"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_mtp_kv_cache_expert_parallel_with_chunked_prefill(self):
+        """Chunked prefill splits a prompt across steps.
+
+        The commit pass then has to seed a continuation chunk (count `q`, starting at
+        `off-1`, using the carried boundary hidden) instead of a fresh prompt, and the
+        still-prefilling request must be excluded from drafting without changing the MTP
+        forward count that the idle EP ranks are matched against.
+        """
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+
+        env = self._run_test(
+            model_provider="gpt",
+            expert_model_parallel_size=2,
+            num_speculative_tokens=2,
+            mtp_use_repeated_layer=True,
+            enable_chunked_prefill=True,
+            num_requests=4,
+            min_prompt_length=32,
+            max_prompt_length=64,
+            num_tokens_to_generate=6,
+            num_gap_steps=0,
+            context_max_requests=8,
+            materialize_only_last_token_logits=False,
+        )
+
+        self._assert_mtp_kv_cache_active(env)
+        for request in env.requests:
+            assert (
+                request.status == Status.COMPLETED
+            ), f"Request {request.request_id}: status={request.status}"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_mtp_kv_cache_expert_parallel_with_prefix_caching(self):
+        """A prefix-cache hit changes the commit pass's append COUNT, not its forward count.
+
+        On a hit the request inherits the matched blocks' draft KV and seeds only `q-1`
+        entries starting at `off` -- it must not rewrite the divergence entry at `off-1`,
+        which lives in a ref-counted block shared with the producer and its siblings.
+        """
+        if int(os.environ.get("WORLD_SIZE", "1")) < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+
+        env = self._run_test(
+            model_provider="gpt",
+            expert_model_parallel_size=2,
+            num_speculative_tokens=2,
+            mtp_use_repeated_layer=True,
+            enable_prefix_caching=True,
+            num_requests=6,
+            # Identical-length prompts maximize the chance of a shared-prefix hit.
+            min_prompt_length=32,
+            max_prompt_length=32,
+            num_tokens_to_generate=6,
+            num_gap_steps=1,
+            context_max_requests=8,
+            materialize_only_last_token_logits=False,
+        )
+
+        self._assert_mtp_kv_cache_active(env)
+        for request in env.requests:
+            assert (
+                request.status == Status.COMPLETED
+            ), f"Request {request.request_id}: status={request.status}"
+
 
 CHUNKED_CG_BLOCK_SIZE = 256
 CHUNKED_CG_VOCAB_SIZE = 10000
