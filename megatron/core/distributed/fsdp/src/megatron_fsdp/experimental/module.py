@@ -205,6 +205,7 @@ class FsdpModule:
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
         register_hooks: bool = True,
+        subgroup_size: int | None = None,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
@@ -247,6 +248,7 @@ class FsdpModule:
                     mixed_precision_policy=mixed_precision_policy,
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
+                    subgroup_size=subgroup_size,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)

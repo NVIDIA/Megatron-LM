@@ -121,6 +121,7 @@ class FsdpParameterGroup:
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        subgroup_size: int | None = None,
     ) -> None:
         """Create persistent sharded buffers for a group of parameters.
 
@@ -136,6 +137,8 @@ class FsdpParameterGroup:
                 NCCL symmetric-memory pool.
             grad_divisor: Additional divisor applied on top of the mesh-size
                 averaging. See ``fully_shard``.
+            subgroup_size: Optional contiguous DP parameter-placement subgroup size.
+                The value is already normalized to this parameter group's mesh.
         """
         parameter_to_fqns, self.dtype, self.requires_grad = self._collect_parameter_metadata(
             fqn_to_parameter
@@ -143,6 +146,7 @@ class FsdpParameterGroup:
         self._owning_module = ref(owning_module)
         self.mesh = mesh
         self.grad_divisor = grad_divisor
+        self.subgroup_size = subgroup_size
         parameters = tuple(parameter_to_fqns)
 
         self._initialize_buffers(
@@ -226,6 +230,7 @@ class FsdpParameterGroup:
             mesh=self.mesh,
             placements=main_weight_placements,
             block_size=block_size,
+            subgroup_size=self.subgroup_size,
         )
         for parameter in parameters_with_high_precision_init:
             parameter.clear_high_precision_init_val()
@@ -241,7 +246,6 @@ class FsdpParameterGroup:
             self._symm_mem_pool = symm_mem.get_mem_pool(self.main_weight.device)
         else:
             self._symm_mem_pool = None
-
         self._init_compute_weight_storage(
             tensor_shapes,
             main_weight_dtype,
@@ -270,6 +274,7 @@ class FsdpParameterGroup:
             dtype=grad_dtype,
             device=self.main_weight.device,
             block_size=block_size,
+            subgroup_size=self.subgroup_size,
         )
         self.pre_optimizer_main_grad = self.main_grad.view(main_weight_placements)
         assert self.main_grad.layout == self.main_weight.layout, (
@@ -330,6 +335,7 @@ class FsdpParameterGroup:
                     dtype=self.dtype,
                     device=self.main_weight.device,
                     block_size=block_size,
+                    subgroup_size=self.subgroup_size,
                 )
         assert self.model_weight is not None
         self.post_optimizer_model_weight = self.model_weight.view(main_weight_placements)
@@ -347,6 +353,7 @@ class FsdpParameterGroup:
                 dtype=self.dtype,
                 device=self.main_weight.device,
                 block_size=block_size,
+                subgroup_size=self.subgroup_size,
             )
 
     def _materialize_unsharded_parameter(
@@ -474,6 +481,7 @@ class FsdpParameterGroup:
                 dtype=grads[0].dtype,
                 device=grads[0].device,
                 block_size=self.main_weight.layout.block_size,
+                subgroup_size=self.subgroup_size,
             )
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
@@ -591,6 +599,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
         mixed_precision_policy: MixedPrecisionPolicy,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
+        subgroup_size: int | None = None,
     ) -> None:
         if use_symmetric_memory:
             raise ValueError("MFSDP v2 fp8 model weights do not support symmetric memory yet.")
@@ -609,6 +618,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             mixed_precision_policy=mixed_precision_policy,
             use_symmetric_memory=False,
             grad_divisor=grad_divisor,
+            subgroup_size=subgroup_size,
         )
         # Compute weights must be initialized before the first forward;
         # subsequent refreshes happen from the optimizer's post-step hook.
@@ -637,6 +647,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             dtype=torch.uint8,
             device=device,
             block_size=block_size,
+            subgroup_size=self.subgroup_size,
         )
         self._colwise_buffer = DBuffer.empty(
             mesh=self.mesh,
@@ -645,6 +656,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             dtype=torch.uint8,
             device=device,
             block_size=block_size,
+            subgroup_size=self.subgroup_size,
         )
         self._unsharded_rowwise = DBuffer.empty(
             mesh=self.mesh,
@@ -653,6 +665,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             dtype=torch.uint8,
             device=device,
             block_size=block_size,
+            subgroup_size=self.subgroup_size,
         )
         self._unsharded_colwise = DBuffer.empty(
             mesh=self.mesh,
@@ -661,6 +674,7 @@ class Fp8ParameterGroup(FsdpParameterGroup):
             dtype=torch.uint8,
             device=device,
             block_size=block_size,
+            subgroup_size=self.subgroup_size,
         )
         for index, shape in enumerate(tensor_shapes):
             if (

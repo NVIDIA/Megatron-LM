@@ -85,6 +85,7 @@ class DBuffer:
         layout: GlobalLayout,
         dtype: torch.dtype,
         device: torch.device | str,
+        subgroup_size: int | None = None,
     ) -> None:
         """Create a DBuffer and allocate its local buffer.
 
@@ -94,6 +95,7 @@ class DBuffer:
             layout: Global shapes, offsets, and allocation size for this buffer.
             dtype: Dtype for the local buffer.
             device: Device for the local buffer.
+            subgroup_size: Optional contiguous DP parameter-placement subgroup size.
         """
         placements = tuple(placements)
         if len(placements) != mesh.ndim:
@@ -104,6 +106,7 @@ class DBuffer:
 
         self.mesh = mesh
         self.placements = placements
+        self.subgroup_size = subgroup_size
 
         self.layout = layout
 
@@ -120,14 +123,16 @@ class DBuffer:
         device: torch.device | str,
         *,
         block_size: int = 1,
+        subgroup_size: int | None = None,
     ) -> "DBuffer":
         """Build a layout from logical tensor shapes and allocate its local buffer."""
         layout = GlobalLayout.build(
             tuple(torch.Size(shape) for shape in tensor_shapes),
             dp_size=mesh.size(),
             block_size=block_size,
+            subgroup_size=subgroup_size,
         )
-        return cls(mesh, placements, layout, dtype, device)
+        return cls(mesh, placements, layout, dtype, device, subgroup_size=subgroup_size)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -193,6 +198,7 @@ class DBuffer:
         mesh: DeviceMesh,
         placements: Iterable[Placement],
         layout: GlobalLayout,
+        subgroup_size: int | None = None,
     ) -> "DBuffer":
         """Create a DBuffer from an existing local buffer.
 
@@ -203,6 +209,7 @@ class DBuffer:
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
             layout: Existing global layout for the logical tensors in this buffer.
+            subgroup_size: Optional contiguous DP parameter-placement subgroup size.
 
         Returns:
             A DBuffer that reuses ``local_buffer`` without allocating storage.
@@ -228,6 +235,7 @@ class DBuffer:
         buffer = cls.__new__(cls)
         buffer.mesh = mesh
         buffer.placements = placements
+        buffer.subgroup_size = subgroup_size
         buffer.layout = layout
         buffer.offset = offset
         buffer.local_buffer = local_buffer
@@ -281,6 +289,7 @@ class DBuffer:
         placements: Iterable[Placement],
         *,
         block_size: int = 1,
+        subgroup_size: int | None = None,
     ) -> "DBuffer":
         """Distribute full local tensors into a DBuffer.
 
@@ -289,6 +298,7 @@ class DBuffer:
                 shape and dtype metadata but no values.
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
+            subgroup_size: Optional contiguous DP parameter-placement subgroup size.
 
         Returns:
             A DBuffer whose real local storage matches ``placements``. Ranges
@@ -311,6 +321,7 @@ class DBuffer:
             dtype=dtype,
             device=mesh.device_type,
             block_size=block_size,
+            subgroup_size=subgroup_size,
         )
         # Only logical tensor ranges are initialized. Padding and layout gaps are not
         # observable through get_local_tensor() and can remain unspecified.
@@ -347,8 +358,8 @@ class DBuffer:
                 layout=self.layout,
                 dtype=dtype,
                 device=self.device,
+                subgroup_size=self.subgroup_size,
             )
-
         if out.mesh != self.mesh:
             raise ValueError(f"Expected out mesh {self.mesh!r}, got {out.mesh!r}.")
         if out.placements != placements:
@@ -426,7 +437,13 @@ class DBuffer:
                 raise NotImplementedError(
                     "Replicate -> Partial redistribute does not support an out buffer."
                 )
-            return DBuffer.from_local(self.local_buffer, self.mesh, new_placements, self.layout)
+            return DBuffer.from_local(
+                self.local_buffer,
+                self.mesh,
+                new_placements,
+                self.layout,
+                subgroup_size=self.subgroup_size,
+            )
         raise NotImplementedError(
             "Unsupported DBuffer placement transition on axis "
             f"{axis}: {old_placement!r} -> {new_placement!r}."

@@ -279,6 +279,10 @@ class OptimizerConfig:
     muon_num_ns_steps: int = 5
     """The number of iteration steps to use in the Newton-Schulz iteration."""
 
+    muon_dp_subgroup_size: int | None = None
+    """Maximum number of contiguous DP ranks across which one parameter may be sharded for
+    MFSDP v2 Muon. None uses the full DP group."""
+
     muon_tp_mode: str = "duplicated"
     """How to perform NS calculation for tensor parallel weights. "blockwise" orthogonalizes
     each shard independently, which makes the update rule depend on the parallelism config;
