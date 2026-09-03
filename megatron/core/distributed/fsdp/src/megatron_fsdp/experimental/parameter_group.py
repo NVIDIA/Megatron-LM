@@ -28,7 +28,6 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
-from .placement import changed_mesh_axis
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -88,6 +87,13 @@ class FsdpParameterGroup:
     # view; the remaining model_weight slices must be all-gathered before compute.
     _model_weight_is_stale: bool
     main_grad: DBuffer | None
+    # Optimizer-layout view into main_grad storage, avoiding a second allocation.
+    # This is None exactly when main_grad is None.
+    pre_optimizer_main_grad: DBuffer | None
+    # zero_grad(set_to_none=False) clears only the current optimizer view. If final
+    # reduction created a smaller view (e.g. ZeRO-1 or HFSDP), the remaining main_grad
+    # storage is stale and must be cleared before the next accumulation begins.
+    _main_grad_is_stale: bool
     _unsharded_model_weight: DBuffer
     _symm_mem_pool: torch.cuda.MemPool | None
     grad_divisor: int
@@ -101,7 +107,6 @@ class FsdpParameterGroup:
         main_grad_placements: tuple[Placement, ...],
         main_weight_placements: tuple[Placement, ...],
         mixed_precision_policy: MixedPrecisionPolicy,
-        reduce_scatter_stream: torch.cuda.Stream,
         grad_divisor: int = 1,
         use_symmetric_memory: bool = False,
     ) -> None:
@@ -115,7 +120,6 @@ class FsdpParameterGroup:
             main_grad_placements: Main-gradient buffer placements.
             main_weight_placements: Main-weight buffer placements.
             mixed_precision_policy: Precision policy for main weights and gradients.
-            reduce_scatter_stream: Stream on which to allocate the main-gradient buffer.
             use_symmetric_memory: Allocate communication staging buffers from PyTorch's
                 NCCL symmetric-memory pool.
             grad_divisor: Additional divisor applied on top of the mesh-size
@@ -129,10 +133,6 @@ class FsdpParameterGroup:
         parameter_to_fqns: dict[nn.Parameter, list[str]] = {}
         for fqn, parameter in parameters.items():
             parameter_to_fqns.setdefault(parameter, []).append(fqn)
-
-        # main_grad rests here (DP-outer-Partial for HSDP) between microbatches and
-        # is finalized to main_weight's placements after the last microbatch.
-        self._main_grad_placements = main_grad_placements
 
         # Python dicts preserve insertion order, so parameter_to_fqns and
         # fsdp_parameters define the same stable DBuffer tensor order.
@@ -201,6 +201,8 @@ class FsdpParameterGroup:
             )
 
         self.main_grad = None
+        self.pre_optimizer_main_grad = None
+        self._main_grad_is_stale = False
         if self.requires_grad:
             grad_dtype = mixed_precision_policy.main_grads_dtype or self.dtype
             # Keep main_grad persistent for the initial implementation. For micro-batch
@@ -208,14 +210,14 @@ class FsdpParameterGroup:
             # eagerly deallocated right after optimizer.step(), avoiding main_grad
             # storage during forward. That requires a separate lifetime contract with
             # the optimizer, so this version keeps the simpler persistent buffer.
-            with torch.cuda.stream(reduce_scatter_stream):
-                self.main_grad = DBuffer(
-                    mesh=self.mesh,
-                    placements=main_grad_placements,
-                    tensor_shapes=self.main_weight.layout.tensor_shapes,
-                    dtype=grad_dtype,
-                    device=self.main_weight.device,
-                )
+            self.main_grad = DBuffer(
+                mesh=self.mesh,
+                placements=main_grad_placements,
+                tensor_shapes=self.main_weight.layout.tensor_shapes,
+                dtype=grad_dtype,
+                device=self.main_weight.device,
+            )
+            self.pre_optimizer_main_grad = self.main_grad.view(main_weight_placements)
             assert self.main_grad.layout == self.main_weight.layout, (
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
                 "and DBuffer layouts are deterministic from those shapes and mesh size."
@@ -376,43 +378,19 @@ class FsdpParameterGroup:
         rests finalized.
         """
         assert self.main_grad is not None
+        assert self.pre_optimizer_main_grad is not None
 
         # zero_grad(set_to_none=True) clears sharded parameter grads, so this
         # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
         # leaves sharded grads installed, so this backward accumulates into main_grad.
         has_sharded_grads = self._has_sharded_grads()
-
-        # A non-accumulation main_grad means the previous step finalized it; this
-        # only happens on the first microbatch. Restore it to the DP-outer-Partial
-        # accumulation placement. HSDP's finalize keeps the buffer size (Replicate
-        # on DP-outer), so relabel it in place; HFSDP's finalize reduce-scattered
-        # DP-outer to a smaller optimizer-sharded buffer, so allocate a fresh one
-        # (zeroed only when we accumulate into it, i.e. sharded grads are still set).
-        if self.main_grad.placements != self._main_grad_placements:
-            assert self.main_grad.allocation_stream == (
-                torch.cuda.current_stream(self.main_grad.device)
-            )
-            reset_axis = changed_mesh_axis(self.main_grad.placements, self._main_grad_placements)
-            assert reset_axis is not None  # the placements differ, so an axis changed
-            if isinstance(self.main_grad.placements[reset_axis], Replicate):
-                # HSDP: Replicate -> Partial changes only metadata and reuses the tensor.
-                self.main_grad = self.main_grad.redistribute(self._main_grad_placements)
-            else:
-                # HFSDP: main_grad was reduce-scattered to the optimizer shard, too small
-                # to hold the accumulation, so re-allocate. This runs inside the
-                # reduce_scatter stream context (see FsdpModule._reduce_gradient_groups),
-                # so the buffer is allocated on that stream and stays race-safe. Zero it
-                # only when we accumulate (set_to_none=False); with set_to_none=True the
-                # reduction below overwrites it via out=.
-                self.main_grad = DBuffer(
-                    mesh=self.mesh,
-                    placements=self._main_grad_placements,
-                    tensor_shapes=self.main_weight.layout.tensor_shapes,
-                    dtype=self.main_grad.dtype,
-                    device=self.main_weight.device,
-                )
-                if has_sharded_grads:
-                    self.main_grad.local_buffer.zero_()
+        if self._main_grad_is_stale:
+            # In ZeRO-1 and HFSDP, zero_grad(set_to_none=False) only zeros the smaller
+            # optimizer view. Clear the persistent full accumulation buffer before this
+            # new step; set_to_none=True needs no clear because out= below overwrites it.
+            if has_sharded_grads:
+                self.main_grad.local_buffer.zero_()
+            self._main_grad_is_stale = False
 
         if can_reduce_into_main_grad := (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
@@ -433,17 +411,24 @@ class FsdpParameterGroup:
             else:
                 self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
 
-        if is_last_microbatch:
-            # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
-            # reduce-scatter for HFSDP) before binding the sharded parameter grads.
-            assert self.main_grad.allocation_stream == (
-                torch.cuda.current_stream(self.main_grad.device)
-            )
-            self.main_grad = self.main_grad.redistribute(self.main_weight.placements)
+        def install_sharded_grads(main_grad: DBuffer) -> None:
+            for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+                fsdp_parameter.sharded.grad = main_grad.get_dtensor(index)
 
-        # Make each sharded parameter's .grad consistent with the final main_grad.
-        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.sharded.grad = self.main_grad.get_dtensor(index)
+        if is_last_microbatch and self.pre_optimizer_main_grad is not self.main_grad:
+            # Finalize the deferred DP-outer reduction (all-reduce for HSDP,
+            # reduce-scatter for HFSDP) into the persistent buffer's optimizer-layout
+            # view before binding the sharded parameter grads.
+            self.main_grad.redistribute(
+                self.main_weight.placements, out=self.pre_optimizer_main_grad
+            )
+            self._main_grad_is_stale = True
+            install_sharded_grads(self.pre_optimizer_main_grad)
+        else:
+            # We could install pre_optimizer_main_grad unconditionally because
+            # sharded.grad is only read by the optimizer. However, for consistency and
+            # debugging, keep sharded.grad valid even between microbatches.
+            install_sharded_grads(self.main_grad)
 
 
 def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:

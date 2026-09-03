@@ -204,7 +204,6 @@ class FsdpModule:
                         main_weight_placements, group_dtype
                     ),
                     mixed_precision_policy=mixed_precision_policy,
-                    reduce_scatter_stream=context.reduce_scatter_stream,
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
                 )
