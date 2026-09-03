@@ -201,6 +201,20 @@ class TestParallelMLAAttention:
         # we can't currently do this because the global memory buffer is on GPU
         pass
 
+    def test_no_rope_rejects_cache_mla_latents(self):
+        self.transformer_config.no_rope_freq = [1, 0]
+        self.transformer_config.cache_mla_latents = True
+
+        with pytest.raises(
+            AssertionError, match="Caching MLA latents is not supported for layers without RoPE"
+        ):
+            MLASelfAttention(
+                self.transformer_config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+
     def test_gpu_forward(self):
         if is_te_min_version("1.10.0"):
             config = self.parallel_attention.config
