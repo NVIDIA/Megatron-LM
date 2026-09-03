@@ -1,0 +1,57 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: 'gpt_inference_server_disagg_nccl_tp1_dp2_1node_{environment}_{platforms}'
+  model: gpt
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 4
+  n_repeat: 1
+  platforms: dgx_gb200
+  time_limit: 1800
+  script_setup: |
+    unset https_proxy
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
+
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+    cd /opt
+    rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin $MCORE_BACKWARDS_COMMIT
+    git checkout $MCORE_BACKWARDS_COMMIT
+    git rev-parse HEAD
+    rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+    rm -f "$HOME/.netrc"
+    unset RO_API_TOKEN
+  script: |-
+    rm -f "${{HOME}}/.netrc"
+    unset RO_API_TOKEN
+    cd /opt/megatron-lm
+
+    python \
+      tests/functional_tests/test_cases/gpt/gpt_inference_server_smoke_tp1_pp1_dp8_583m/serve_smoke.py \
+      --checkpoint-dir /mnt/artifacts/model/mcore_mistral/nemo_minitron-0.5b/v1 \
+      --tokenizer-model /mnt/artifacts/model/mcore_mistral/nemo_minitron-0.5b/v1/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json \
+      --server-log-dir {assets_dir}/logs/1 \
+      --num-gpus {gpus} \
+      --inference-shards '{inference_shards}'
+
+products:
+  - test_case: [gpt_inference_server_smoke_tp1_pp1_dp8_583m]
+    products:
+      - inference_shards: ["tp=1,dp=2,role=prefill+tp=1,dp=2,role=decode"]
+        environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]

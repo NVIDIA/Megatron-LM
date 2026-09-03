@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict
@@ -20,6 +21,9 @@ from megatron.core.inference.disaggregation.decode_admission import (
 from megatron.core.inference.disaggregation.handoff_completion_tracker import (
     HandoffCompletionTracker,
 )
+from megatron.core.inference.disaggregation.handoff_wire_protocol import (
+    strip_registered_nixl_agent_metadata,
+)
 from megatron.core.inference.disaggregation.pending_handoff_imports import (
     DeferredKvHandoff,
     PendingKvImport,
@@ -27,6 +31,7 @@ from megatron.core.inference.disaggregation.pending_handoff_imports import (
 )
 from megatron.core.inference.disaggregation.ssm_reshard import SSMShardLayout, SSMStateDims
 from megatron.core.inference.disaggregation.transfer_backends.base import (
+    TransferStartError,
     construct_kv_transfer_backend_class,
 )
 from megatron.core.inference.disaggregation.utils import (
@@ -57,14 +62,18 @@ class _PreparedHandoffMetadata:
     kv_meta: Any
     ssm_meta: Any
     resume_tokens: list[int]
+    resume_log_probs: list[float]
 
 
 class InferenceStateHandoffMixin:
     """Optional KV/SSM handoff behavior composed into the dynamic engine."""
 
+    requires_recurrent_state_dummy_slot = True
+
     def _initialize_disaggregation_state(self) -> None:
         """Initialize state without importing or constructing a transfer backend."""
 
+        self._disagg_config = None
         self._pinned_handoff_blocks: Dict[int, list] = {}  # Request ID -> pinned KV block IDs.
         self._pinned_handoff_ssm_slots: Dict[int, int] = {}  # Request ID -> detached live slot.
         self._kv_transfer_agent = None
@@ -75,10 +84,29 @@ class InferenceStateHandoffMixin:
         self._deferred_kv_handoffs = deque()
         self._pending_kv_imports = deque()
         self._quarantined_kv_imports: list[PendingKvImport] = []
+        self._pending_handoff_hash_owners: dict[int, int] = {}
         self._handoff_completion_tracker: HandoffCompletionTracker | None = None
-        self._handoff_completion_notifications: dict[int, bool] = {}  # Request ID -> failed.
+        # Request ID -> (failed, all model-parallel ranks are source-safe).
+        self._handoff_completion_notifications: dict[int, tuple[bool, bool]] = {}
+        self._failed_handoff_requests: set[int] = set()
         self._pending_kv_pushes: list = []
+        self._deferred_handoff_releases: set[int] = set()
         self._kv_transfer_role: str | None = None
+
+    def _get_disaggregation_config(self):
+        return self._disagg_config
+
+    def _is_disaggregated_role(self, role: str) -> bool:
+        return self._kv_transfer_role == role
+
+    def _handoff_push_error_source_safe(self, error: Exception) -> bool:
+        return not isinstance(error, TransferStartError) or error.storage_safe
+
+    def _notify_kv_read_done(self, request_id: int) -> None:
+        """Hook for control planes that release source storage after transfer completion."""
+
+    def _notify_kv_transfer_ready(self, request_id: int, cached_prefix_blocks: int) -> None:
+        """Hook used when decode commits storage for a two-sided transfer."""
 
     def _setup_handoff_completion_tracking(self, hostname: str | None = None) -> None:
         """Create the CPU path used to aggregate model-parallel transfer completion."""
@@ -88,7 +116,7 @@ class InferenceStateHandoffMixin:
         )
         self.zmq_sockets.extend(self._handoff_completion_tracker.sockets)
 
-    def _drain_handoff_completion_notifications(self) -> list[tuple[int, bool]]:
+    def _drain_handoff_completion_notifications(self) -> list[tuple[int, bool, bool]]:
         """Collect decisions that the existing MP schedule broadcast must distribute.
 
         Side: decode MP coordinator; pull and push transport paths.
@@ -98,13 +126,23 @@ class InferenceStateHandoffMixin:
             return []
         return self._handoff_completion_tracker.drain_completed()
 
-    def _record_handoff_completion_notification(self, request_id: int, failed: bool) -> None:
+    def _record_handoff_completion_notification(
+        self, request_id: int, failed: bool, source_safe: bool
+    ) -> None:
         """Record the coordinator's shared admission decision on every MP rank.
 
         Side: decode engine; pull and push transport paths.
         """
 
-        self._handoff_completion_notifications[request_id] = failed
+        if request_id in self._failed_handoff_requests:
+            if failed and source_safe:
+                self._failed_handoff_requests.remove(request_id)
+                self._notify_kv_read_done(request_id)
+                self._notify_request_aborted(request_id, source_safe=True)
+            return
+        if not failed and source_safe:
+            self._notify_kv_read_done(request_id)
+        self._handoff_completion_notifications[request_id] = (failed, source_safe)
 
     @property
     def pending_kv_import_count(self) -> int:
@@ -120,10 +158,15 @@ class InferenceStateHandoffMixin:
         """Whether a completed import can be handled at the next admission point."""
 
         for pending in self._pending_kv_imports:
-            failed = self._handoff_completion_notifications.get(pending.request_id)
-            if failed is None:
+            decision = self._handoff_completion_notifications.get(pending.request_id)
+            if decision is None:
                 continue
-            if failed or can_admit_prefilled_decode(self.context, len(pending.resume_tokens)):
+            failed, _ = decision
+            if (
+                failed
+                or pending.cancel_requested
+                or can_admit_prefilled_decode(self.context, len(pending.resume_tokens))
+            ):
                 return True
         return False
 
@@ -136,21 +179,24 @@ class InferenceStateHandoffMixin:
 
         return len(self._pending_kv_pushes)
 
+    @property
+    def pinned_handoff_block_count(self) -> int:
+        """Number of prefill KV blocks retained for unfinished handoffs."""
+
+        return sum(len(blocks) for blocks in self._pinned_handoff_blocks.values())
+
     def _reset_pending_kv_imports(self) -> None:
         """Drain and release pending handoff transfers before an engine reset."""
 
         unsafe_pushes = []
-        if not hasattr(self, "_pending_kv_pushes"):
-            self._pending_kv_pushes = []
         for request_id, handles in self._pending_kv_pushes:
             if not self._wait_for_transfer_handles(*handles):
                 unsafe_pushes.append((request_id, handles))
         self._pending_kv_pushes = unsafe_pushes
+        for request_id in list(self._deferred_handoff_releases):
+            self._deferred_handoff_releases.discard(request_id)
+            self.release_handoff_blocks(request_id)
 
-        if not hasattr(self, "_pending_kv_imports"):
-            self._pending_kv_imports = deque()
-        if not hasattr(self, "_deferred_kv_handoffs"):
-            self._deferred_kv_handoffs = deque()
         while self._deferred_kv_handoffs:
             handoff = self._deferred_kv_handoffs.popleft()
             if not handoff.future.done():
@@ -158,9 +204,7 @@ class InferenceStateHandoffMixin:
         unsafe = deque()
         while self._pending_kv_imports:
             pending = self._pending_kv_imports.popleft()
-            safe_to_release = pending.destinations_safe and self._wait_for_transfer_handles(
-                *self._pending_transfer_handles(pending)
-            )
+            safe_to_release = self._wait_for_pending_storage(pending)
             if safe_to_release:
                 self._release_pending_kv_import(pending)
                 if not pending.future.done():
@@ -170,9 +214,7 @@ class InferenceStateHandoffMixin:
         self._pending_kv_imports = unsafe
         quarantined = []
         for pending in self._quarantined_kv_imports:
-            safe_to_release = pending.destinations_safe and self._wait_for_transfer_handles(
-                *self._pending_transfer_handles(pending)
-            )
+            safe_to_release = self._wait_for_pending_storage(pending)
             if safe_to_release:
                 self._release_pending_kv_import(pending)
             else:
@@ -187,6 +229,8 @@ class InferenceStateHandoffMixin:
                 "Cannot reset while handoff state remains pinned; wait for RELEASE_KV"
             )
         self._handoff_completion_notifications.clear()
+        self._failed_handoff_requests.clear()
+        self._pending_handoff_hash_owners.clear()
 
     def schedule_waiting_requests(self) -> None:
         """Reject prompt scheduling on a dedicated disaggregated decode engine.
@@ -204,7 +248,7 @@ class InferenceStateHandoffMixin:
                 )
         super().schedule_waiting_requests()
 
-    def setup_kv_transfer(self, role: str, backend: str = "nixl") -> None:
+    def setup_kv_transfer(self, role: str) -> None:
         """Bring up the KV transfer agents for this engine.
 
         This method must be called collectively by every model-parallel rank in
@@ -212,8 +256,6 @@ class InferenceStateHandoffMixin:
 
         Args:
             role: "prefill" or "decode"; used to name the local transfer agent.
-            backend: transfer backend name, resolved through the explicit
-                registry ("nixl"; "nccl" selects the two-sided push family).
         """
         if role not in ("prefill", "decode"):
             raise ValueError(f"KV transfer role must be 'prefill' or 'decode', got {role!r}")
@@ -224,7 +266,7 @@ class InferenceStateHandoffMixin:
                     "do not configure prefix_caching_mamba_gb on the decode engine"
                 )
         self._kv_transfer_role = role
-        backend_cls = construct_kv_transfer_backend_class(backend)
+        backend_cls = construct_kv_transfer_backend_class(self.context.config.kv_transport_backend)
 
         # Prefill output blocks stay pinned until the peer finishes reading
         # them. Decode requests consume imports but do not produce another
@@ -238,6 +280,7 @@ class InferenceStateHandoffMixin:
         allocator.enable_handoff_pinning = role == "prefill"
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        agent_name = f"{role}-rank{rank}-{uuid.uuid4().hex}"
 
         # TP topology, so a peer at a different TP can re-shard our KV heads.
         # KV heads under GQA == num_query_groups (falls back to attention heads).
@@ -267,7 +310,7 @@ class InferenceStateHandoffMixin:
         layer_end = layer_start + local_num_layers
 
         self._kv_transfer_agent = backend_cls(
-            agent_name=f"{role}-rank{rank}",
+            agent_name=agent_name,
             memory_buffer=self.context.memory_buffer,
             expected_num_blocks=self.context.kv_block_allocator.pool_size,
             tp_size=tp_size,
@@ -289,7 +332,13 @@ class InferenceStateHandoffMixin:
         if self.context.is_hybrid_model:
             conv_states = self.context.mamba_conv_states
             recurrent_states = self.context.mamba_ssm_states
-            state_slot_count = self.context.max_requests
+            state_slot_count = int(conv_states.shape[1])
+            if recurrent_states.shape[1] != state_slot_count:
+                raise ValueError("SSM conv and recurrent state buffers have different slot counts")
+            if state_slot_count < self.context.max_requests:
+                raise ValueError(
+                    "SSM state buffers have fewer slots than the configured request capacity"
+                )
 
             conv_shape = conv_states.shape
             ssm_shape = recurrent_states.shape
@@ -332,7 +381,7 @@ class InferenceStateHandoffMixin:
             for state_kind, (memory_buffer, width, state_dim) in state_specs.items():
                 self._ssm_transfer_agents[state_kind] = (
                     self._kv_transfer_agent.new_registered_buffer(
-                        agent_name=f"{role}-ssm-{state_kind}-rank{rank}",
+                        agent_name=f"{agent_name}-ssm-{state_kind}",
                         memory_buffer=memory_buffer,
                         expected_num_blocks=state_slot_count,
                         heads_per_partition=width,
@@ -379,13 +428,14 @@ class InferenceStateHandoffMixin:
         self._pp_kv_peer_metas = [entry["kv"] for entry in gathered_stage_metas]
         self._pp_ssm_peer_metas = [entry["ssm"] for entry in gathered_stage_metas]
 
-    def push_handoff_kv(self, request_id: int, decode_metas: list) -> None:
+    def push_handoff_kv(
+        self, request_id: int, decode_metas: list, cached_prefix_blocks: int = 0
+    ) -> None:
         """Push a pinned hand-off's KV and live SSM state to the decode
         instance described by `decode_metas` (two-sided transports only).
 
-        The decode posted its matching receives when SUBMIT_REQUEST_WITH_KV
-        arrived; the sends are reaped asynchronously and the pins stay until
-        the coordinator's RELEASE_KV.
+        The decode committed its destination storage before requesting these
+        sends. Sends are reaped asynchronously and pins stay until RELEASE_KV.
 
         Side: prefill engine; push transport path only.
         """
@@ -399,6 +449,12 @@ class InferenceStateHandoffMixin:
                 "SEND_KV for request %d with no pinned hand-off blocks; skipping", request_id
             )
             return
+
+        if not 0 <= cached_prefix_blocks <= len(block_ids):
+            raise ValueError(
+                f"Invalid cached prefix length {cached_prefix_blocks} for "
+                f"{len(block_ids)} handoff blocks"
+            )
 
         ssm_pushes = []
         if self._ssm_transfer_agents:
@@ -415,17 +471,20 @@ class InferenceStateHandoffMixin:
                 ssm_pushes.append((self._ssm_transfer_agents[state_kind], peer_metas, [slot]))
 
         kv_peer = {"tp_metas": list(decode_metas)}
-        handles = [self._kv_transfer_agent.begin_push_blocks(kv_peer, block_ids)]
+        plans = [
+            self._kv_transfer_agent.prepare_push_blocks(kv_peer, block_ids[cached_prefix_blocks:])
+        ]
         # The source live slot remains detached until RELEASE_KV, so request
         # cleanup cannot reuse it while these sends are active.
         for agent, peer_metas, slots in ssm_pushes:
-            handles.append(agent.begin_push_blocks({"tp_metas": peer_metas}, slots))
+            plans.append(agent.prepare_push_blocks({"tp_metas": peer_metas}, slots))
+        handles = [self._kv_transfer_agent.start_prepared(plans)]
         self._pending_kv_pushes.append((request_id, handles))
         logging.info(
             "DISAGG_PREFILL_PUSH request_id=%d blocks=%d ssm=%d",
             request_id,
-            len(block_ids),
-            len(handles) - 1,
+            len(block_ids) - cached_prefix_blocks,
+            len(ssm_pushes),
         )
 
     def _poll_pending_kv_pushes(self) -> int:
@@ -436,19 +495,38 @@ class InferenceStateHandoffMixin:
         if not self._pending_kv_pushes:
             return 0
         remaining = []
+        releasable = []
         reaped = 0
         for request_id, handles in self._pending_kv_pushes:
-            if all(h.poll() for h in handles):
-                reaped += 1
-            else:
+            try:
+                complete = all(handle.poll() for handle in handles)
+            except Exception:
+                if not all(handle.storage_safe for handle in handles):
+                    remaining.append((request_id, handles))
+                    logging.exception(
+                        "Handoff push failed while source storage is still in use: request_id=%d",
+                        request_id,
+                    )
+                    continue
+                logging.exception("Handoff push failed: request_id=%d", request_id)
+                complete = True
+            if not complete:
                 remaining.append((request_id, handles))
+                continue
+            reaped += 1
+            if request_id in self._deferred_handoff_releases:
+                releasable.append(request_id)
         self._pending_kv_pushes = remaining
+        for request_id in releasable:
+            self._deferred_handoff_releases.discard(request_id)
+            self.release_handoff_blocks(request_id)
         return reaped
 
     def _prepare_handoff_metadata_batch(
         self,
         requests_and_state: list[tuple["DynamicInferenceRequest", list[int], int | None]],
         decode_tokens_by_request: Dict[int, list[int]],
+        decode_log_probs_by_request: Dict[int, list[float]],
     ) -> dict[int, _PreparedHandoffMetadata]:
         """Assemble metadata for all handoffs completed by one engine step.
 
@@ -487,12 +565,22 @@ class InferenceStateHandoffMixin:
             prepared = {}
             for request, candidate_blocks, ssm_slot in handoffs:
                 resume_tokens = list(decode_tokens_by_request.get(request.request_id, []))
+                resume_log_probs = (
+                    list(decode_log_probs_by_request.get(request.request_id, []))
+                    if request.sampling_params.return_log_probs
+                    else []
+                )
                 expected_resume_tokens = self.context.num_speculative_tokens + 1
                 if len(resume_tokens) != expected_resume_tokens:
                     raise RuntimeError(
                         "Cannot create a decode-only handoff without one sampled token plus "
                         f"the configured MTP proposals: expected {expected_resume_tokens}, "
                         f"got {len(resume_tokens)}"
+                    )
+                if request.sampling_params.return_log_probs and len(resume_log_probs) != 1:
+                    raise RuntimeError(
+                        "Cannot create a decode-only handoff without the first sampled "
+                        f"token log probability: expected 1, got {len(resume_log_probs)}"
                     )
                 if not candidate_blocks:
                     raise RuntimeError(
@@ -543,6 +631,7 @@ class InferenceStateHandoffMixin:
                     kv_meta=kv_meta,
                     ssm_meta=ssm_meta,
                     resume_tokens=resume_tokens,
+                    resume_log_probs=resume_log_probs,
                 )
             return prepared
         except Exception:
@@ -601,8 +690,14 @@ class InferenceStateHandoffMixin:
             # request-specific SSM metadata out of that shared object.
             kv_meta = dict(kv_meta)
         kv_meta["resume_tokens"] = prepared.resume_tokens
+        if prepared.resume_log_probs:
+            kv_meta["resume_log_probs"] = prepared.resume_log_probs
         if ssm_meta is not None:
             kv_meta["ssm"] = ssm_meta
+        if self._disagg_config is not None and self.context.config.kv_transport_backend == "nixl":
+            # Native engines register static NIXL agent blobs once. Keep each
+            # request payload limited to addresses, layouts, and block mappings.
+            kv_meta = strip_registered_nixl_agent_metadata(kv_meta)
 
         request.disaggregated_params = {
             "request_id": rid,
@@ -621,6 +716,10 @@ class InferenceStateHandoffMixin:
 
         Side: prefill engine; pull and push transport paths.
         """
+        if any(pending_id == request_id for pending_id, _ in self._pending_kv_pushes):
+            self._deferred_handoff_releases.add(request_id)
+            return
+
         block_ids = self._pinned_handoff_blocks.pop(request_id, None)
         ssm_slot = self._pinned_handoff_ssm_slots.pop(request_id, None)
         if not block_ids and ssm_slot is None:
@@ -705,9 +804,13 @@ class InferenceStateHandoffMixin:
                 "Decode-only handoff requires one sampled token plus the configured "
                 f"MTP proposals: expected {expected_resume_tokens}, got {len(resume_tokens)}"
             )
-        if sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0:
+        if sampling_params.top_n_logprobs > 0:
             raise NotImplementedError(
-                "Decode-only handoff does not yet transfer prompt or first-token log probabilities"
+                "Decode-only handoff does not yet transfer top-token log probabilities"
+            )
+        if sampling_params.return_log_probs and not sampling_params.skip_prompt_log_probs:
+            raise NotImplementedError(
+                "Decode-only handoff does not transfer prompt log probabilities"
             )
 
         prompt_tensor = torch.tensor(prompt, dtype=torch.int64)
@@ -716,6 +819,9 @@ class InferenceStateHandoffMixin:
         expected_blocks = (
             len(prompt) + self.context.block_size_tokens - 1
         ) // self.context.block_size_tokens
+        # Hashes cover complete blocks; the transfer also includes a partial tail.
+        if not len(hashes) <= expected_blocks <= len(hashes) + 1:
+            raise RuntimeError("Prompt hash and transfer block counts are inconsistent")
         if num_blocks != expected_blocks:
             raise RuntimeError(
                 "Decode-only handoff requires every prompt KV block, including the partial tail: "
@@ -761,13 +867,20 @@ class InferenceStateHandoffMixin:
         """
 
         allocator = self.context.kv_block_allocator
-        cached_blocks = []
-        if not self._kv_transfer_agent.is_push:
-            cached_blocks = self._find_cached_handoff_prefix(handoff.hashes, handoff.num_blocks)
+        cached_blocks = self._find_cached_handoff_prefix(handoff.hashes, handoff.num_blocks)
+
+        hashes_to_import = handoff.hashes[len(cached_blocks) : handoff.num_blocks]
+        if not self._reserve_handoff_hashes(handoff.request_id, hashes_to_import):
+            return False
 
         num_blocks_to_import = handoff.num_blocks - len(cached_blocks)
         resume_tokens = (
             [int(token) for token in handoff.kv_meta.get("resume_tokens", [])]
+            if isinstance(handoff.kv_meta, dict)
+            else []
+        )
+        resume_log_probs = (
+            [float(log_prob) for log_prob in handoff.kv_meta.get("resume_log_probs", [])]
             if isinstance(handoff.kv_meta, dict)
             else []
         )
@@ -782,8 +895,10 @@ class InferenceStateHandoffMixin:
         if not self._handoff_capacity_available(
             num_blocks_to_import + continuation_block_count, cached_blocks
         ):
+            self._release_handoff_hash_reservations(handoff.request_id, hashes_to_import)
             return False
         if ssm_meta and self.context.mamba_metadata.mamba_state_free_slot_count < 1:
+            self._release_handoff_hash_reservations(handoff.request_id, hashes_to_import)
             return False
 
         allocator.retain_memory_blocks(cached_blocks)
@@ -795,6 +910,7 @@ class InferenceStateHandoffMixin:
                 allocator.release_memory_blocks(
                     torch.tensor(cached_blocks, dtype=torch.int32, device="cpu")
                 )
+            self._release_handoff_hash_reservations(handoff.request_id, hashes_to_import)
             raise RuntimeError("KV allocator capacity changed during handoff admission")
         allocated_blocks = [int(block) for block in allocated_blocks_tensor.tolist()]
         imported_blocks = allocated_blocks[:num_blocks_to_import]
@@ -812,19 +928,40 @@ class InferenceStateHandoffMixin:
                 ssm_import = self._reserve_ssm_handoff_import()
             except Exception:
                 allocator.release_memory_blocks(owned_blocks_tensor)
+                self._release_handoff_hash_reservations(handoff.request_id, hashes_to_import)
                 raise
 
-        try:
-            transfer_meta, transfer_src_blocks = drop_transfer_prefix_blocks(
-                handoff.kv_meta, handoff.src_block_ids, len(cached_blocks)
-            )
-            handle = self._kv_transfer_agent.begin_pull_blocks(
-                transfer_meta, transfer_src_blocks, imported_blocks
-            )
-            if ssm_import is not None:
-                self._start_ssm_handoff_import(handoff.request_id, ssm_meta, ssm_import)
-        except Exception as exc:
-            start_error = exc
+        if imported_blocks or ssm_import is not None:
+            try:
+                transfer_meta, transfer_src_blocks = drop_transfer_prefix_blocks(
+                    handoff.kv_meta, handoff.src_block_ids, len(cached_blocks)
+                )
+                if self._kv_transfer_agent.is_push:
+                    plans = [
+                        self._kv_transfer_agent.prepare_pull_blocks(
+                            transfer_meta, transfer_src_blocks, imported_blocks
+                        )
+                    ]
+                    if ssm_import is not None:
+                        for state_kind in _SSM_STATE_KINDS:
+                            plans.append(
+                                self._ssm_transfer_agents[state_kind].prepare_pull_blocks(
+                                    ssm_meta[state_kind], [], [ssm_import.live_slot]
+                                )
+                            )
+                    # NCCL may rendezvous while posting a first-use P2P batch. Let
+                    # prefill post the matching sends after all receive resources
+                    # have been reserved and validated, but before entering that call.
+                    self._notify_kv_transfer_ready(handoff.request_id, len(cached_blocks))
+                    handle = self._kv_transfer_agent.start_prepared(plans)
+                else:
+                    handle = self._kv_transfer_agent.begin_pull_blocks(
+                        transfer_meta, transfer_src_blocks, imported_blocks
+                    )
+                    if ssm_import is not None:
+                        self._start_ssm_handoff_import(handoff.request_id, ssm_meta, ssm_import)
+            except Exception as exc:
+                start_error = exc
 
         pending = PendingKvImport(
             request_id=handoff.request_id,
@@ -837,10 +974,13 @@ class InferenceStateHandoffMixin:
             future=handoff.future,
             ssm=ssm_import,
             resume_tokens=resume_tokens,
+            resume_log_probs=resume_log_probs,
             continuation_blocks=continuation_blocks,
             local_error=start_error,
             destinations_safe=(
-                start_error is None or getattr(start_error, "transfer_destinations_safe", True)
+                start_error is None
+                or not isinstance(start_error, TransferStartError)
+                or start_error.storage_safe
             ),
         )
         self._pending_kv_imports.append(pending)
@@ -856,10 +996,28 @@ class InferenceStateHandoffMixin:
         self._loop.call_soon_threadsafe(self._loop.create_task, self._notify_cond_for_new_request())
         return True
 
+    def _reserve_handoff_hashes(self, request_id: int, hashes: list[int]) -> bool:
+        """Reserve unregistered hashes until one decode import publishes them."""
+
+        for block_hash in hashes:
+            owner = self._pending_handoff_hash_owners.get(block_hash)
+            if owner is not None and owner != request_id:
+                return False
+        for block_hash in hashes:
+            self._pending_handoff_hash_owners[block_hash] = request_id
+        return True
+
+    def _release_handoff_hash_reservations(self, request_id: int, hashes: list[int]) -> None:
+        """Release every pending hash owned by one decode import."""
+
+        for block_hash in hashes:
+            if self._pending_handoff_hash_owners.get(block_hash) == request_id:
+                self._pending_handoff_hash_owners.pop(block_hash)
+
     def _find_cached_handoff_prefix(self, hashes: list[int], num_blocks: int) -> list[int]:
         """Find the contiguous handoff prefix already cached on decode.
 
-        Side: decode engine; pull transport path only.
+        Side: decode engine; pull and push transport paths.
         """
 
         allocator = self.context.kv_block_allocator
@@ -909,6 +1067,30 @@ class InferenceStateHandoffMixin:
             )
         return started_count
 
+    def abort_kv_handoff(self, request_id: int) -> bool:
+        """Cancel a deferred or transferring decode handoff."""
+
+        remaining = deque()
+        deferred = None
+        while self._deferred_kv_handoffs:
+            handoff = self._deferred_kv_handoffs.popleft()
+            if handoff.request_id == request_id:
+                deferred = handoff
+            else:
+                remaining.append(handoff)
+        self._deferred_kv_handoffs = remaining
+        if deferred is not None:
+            if not deferred.future.done():
+                deferred.future.cancel()
+            self._notify_request_aborted(request_id, source_safe=True)
+            return True
+
+        for pending in self._pending_kv_imports:
+            if pending.request_id == request_id:
+                pending.cancel_requested = True
+                return True
+        return False
+
     @staticmethod
     def _pending_transfer_handles(pending: PendingKvImport) -> list:
         """Return this decode import's active KV and SSM transfer handles.
@@ -919,7 +1101,30 @@ class InferenceStateHandoffMixin:
         handles = [pending.handle]
         if pending.ssm is not None:
             handles.extend(pending.ssm.handles)
+        if isinstance(pending.local_error, TransferStartError):
+            handles.extend(pending.local_error.cleanup_handles)
         return [handle for handle in handles if handle is not None]
+
+    @staticmethod
+    def _pending_destinations_safe(pending: PendingKvImport) -> bool:
+        """Return whether a failed transfer has stopped accessing its destinations."""
+
+        if pending.destinations_safe:
+            return True
+        error = pending.local_error
+        return isinstance(error, TransferStartError) and error.storage_safe
+
+    def _wait_for_pending_storage(self, pending: PendingKvImport) -> bool:
+        """Wait for trackable operations and return whether storage can be reused."""
+
+        error = pending.local_error
+        if not pending.destinations_safe and (
+            not isinstance(error, TransferStartError) or not error.cleanup_handles
+        ):
+            return False
+        return self._wait_for_transfer_handles(
+            *self._pending_transfer_handles(pending)
+        ) and self._pending_destinations_safe(pending)
 
     def _validate_decode_ready_handoff(self, pending: PendingKvImport) -> None:
         """Validate that transferred state can start decode without prompt execution."""
@@ -930,9 +1135,14 @@ class InferenceStateHandoffMixin:
                 "Decode-only handoff is missing its sampled token or MTP proposals: "
                 f"expected {expected_tokens}, got {len(pending.resume_tokens)}"
             )
-        if self.context.is_hybrid_model:
-            if pending.ssm is None:
-                raise RuntimeError("Hybrid decode-only handoff is missing transferred SSM state")
+        if self.context.is_hybrid_model and pending.ssm is None:
+            raise RuntimeError("Hybrid decode-only handoff is missing transferred SSM state")
+        expected_log_probs = 1 if pending.sampling_params.return_log_probs else 0
+        if len(pending.resume_log_probs) != expected_log_probs:
+            raise RuntimeError(
+                "Decode-only handoff has an invalid first-token log probability count: "
+                f"expected {expected_log_probs}, got {len(pending.resume_log_probs)}"
+            )
 
     def _finalize_kv_handoff_import(self, pending: PendingKvImport) -> None:
         """Register transferred blocks and admit the decode request.
@@ -958,6 +1168,9 @@ class InferenceStateHandoffMixin:
                 pending.hashes[cached_prefix_block_count:registration_end],
                 parent_hashes=parent_hashes,
             )
+        self._release_handoff_hash_reservations(
+            pending.request_id, pending.hashes[cached_prefix_block_count:registration_end]
+        )
 
         logging.debug(
             "DISAGG_DECODE_IMPORT request_id=%d prompt_tokens=%d "
@@ -995,6 +1208,8 @@ class InferenceStateHandoffMixin:
             first_token = pending.resume_tokens[0]
             if request.sampling_params.num_tokens_to_generate > 0:
                 request.generated_tokens.append(first_token)
+                if pending.resume_log_probs:
+                    request.generated_log_probs = list(pending.resume_log_probs)
                 if self.track_generated_token_events:
                     first_token_event = request.add_event_generated_token(first_token)
                 else:
@@ -1077,6 +1292,7 @@ class InferenceStateHandoffMixin:
         Side: decode engine; pull and push transport paths.
         """
 
+        registration_end = min(len(pending.local_blocks), len(pending.hashes))
         owned_blocks = pending.local_blocks + pending.continuation_blocks
         if owned_blocks:
             block_tensor = torch.tensor(owned_blocks, dtype=torch.int32, device="cpu")
@@ -1086,10 +1302,13 @@ class InferenceStateHandoffMixin:
         if pending.ssm is not None:
             self.context.mamba_metadata.free_slot(pending.ssm.live_slot)
             pending.ssm = None
+        self._release_handoff_hash_reservations(
+            pending.request_id, pending.hashes[pending.cached_prefix_block_count : registration_end]
+        )
 
     @staticmethod
     def _wait_for_transfer_handles(*handles) -> bool:
-        """Wait for known handles; return false if any may still be active."""
+        """Wait for known handles; return false if any may still access storage."""
 
         safe_to_release = True
         for handle in handles:
@@ -1097,12 +1316,12 @@ class InferenceStateHandoffMixin:
                 continue
             try:
                 handle.wait()
-            except TimeoutError:
-                safe_to_release = False
             except Exception:
-                # NIXL reports transfer errors only after all segments belonging
-                # to the handle have reached a terminal state.
-                pass
+                # Backends may expose transport-specific failures. Their common
+                # storage_safe contract determines whether buffers can be reused.
+                if not handle.storage_safe:
+                    safe_to_release = False
+                logging.exception("KV handoff transfer failed while waiting for completion")
         return safe_to_release
 
     def _report_completed_kv_imports(self) -> None:
@@ -1124,6 +1343,9 @@ class InferenceStateHandoffMixin:
                     pending.local_error = exc
                     failed = True
 
+            source_safe = self._pending_destinations_safe(pending) and all(
+                handle.storage_safe for handle in self._pending_transfer_handles(pending)
+            )
             if (
                 self._handoff_completion_tracker is None
                 or self._handoff_completion_tracker.world_size == 1
@@ -1132,9 +1354,9 @@ class InferenceStateHandoffMixin:
                     raise RuntimeError(
                         "Model-parallel KV handoff requires coordinator completion tracking"
                     )
-                self._handoff_completion_notifications[request_id] = failed
+                self._record_handoff_completion_notification(request_id, failed, source_safe)
             else:
-                self._handoff_completion_tracker.report(request_id, failed)
+                self._handoff_completion_tracker.report(request_id, failed, source_safe)
             pending.terminal_state_reported = True
 
     def _poll_pending_kv_imports(self) -> int:
@@ -1143,11 +1365,46 @@ class InferenceStateHandoffMixin:
         Side: decode engine; pull and push transport paths.
         """
 
+        self._poll_quarantined_kv_imports()
         self._drain_deferred_kv_handoffs()
         if not self._pending_kv_imports:
             return 0
         self._report_completed_kv_imports()
         return int(self.has_admittable_kv_import)
+
+    def _poll_quarantined_kv_imports(self) -> None:
+        """Reclaim failed imports once their transfer handles become terminal."""
+
+        remaining = []
+        for pending in self._quarantined_kv_imports:
+            handles = self._pending_transfer_handles(pending)
+            try:
+                for handle in handles:
+                    handle.poll()
+            except Exception:
+                logging.exception(
+                    "Polling quarantined KV import failed for request_id=%d", pending.request_id
+                )
+            if self._pending_destinations_safe(pending) and all(
+                handle.storage_safe for handle in handles
+            ):
+                self._release_pending_kv_import(pending)
+                if (
+                    self._handoff_completion_tracker is None
+                    or self._handoff_completion_tracker.world_size == 1
+                ):
+                    if pending.request_id in self._failed_handoff_requests:
+                        self._record_handoff_completion_notification(
+                            pending.request_id, failed=True, source_safe=True
+                        )
+                    else:
+                        self._notify_kv_read_done(pending.request_id)
+                        self._notify_request_aborted(pending.request_id, source_safe=True)
+                else:
+                    self._handoff_completion_tracker.report(pending.request_id, True, True)
+            else:
+                remaining.append(pending)
+        self._quarantined_kv_imports = remaining
 
     def _admit_pending_kv_imports(self) -> int:
         """Handle completed imports at an engine scheduling admission point.
@@ -1159,15 +1416,29 @@ class InferenceStateHandoffMixin:
         remaining = deque()
         while self._pending_kv_imports:
             pending = self._pending_kv_imports.popleft()
-            failed = self._handoff_completion_notifications.get(pending.request_id)
-            if failed is None:
+            decision = self._handoff_completion_notifications.get(pending.request_id)
+            if decision is None:
                 remaining.append(pending)
                 continue
+            failed, source_safe = decision
             try:
                 if failed:
                     raise pending.local_error or RuntimeError(
                         "KV handoff transfer failed on a model-parallel peer"
                     )
+                if pending.cancel_requested:
+                    self._handoff_completion_notifications.pop(pending.request_id)
+                    safe_to_release = self._wait_for_transfer_handles(
+                        *self._pending_transfer_handles(pending)
+                    )
+                    if safe_to_release:
+                        self._release_pending_kv_import(pending)
+                    else:
+                        self._quarantined_kv_imports.append(pending)
+                    if not pending.future.done():
+                        pending.future.cancel()
+                    self._notify_request_aborted(pending.request_id, source_safe=safe_to_release)
+                    continue
                 self._validate_decode_ready_handoff(pending)
                 if not can_admit_prefilled_decode(self.context, len(pending.resume_tokens)):
                     remaining.append(pending)
@@ -1176,13 +1447,16 @@ class InferenceStateHandoffMixin:
                 self._finalize_kv_handoff_import(pending)
                 ready += 1
             except Exception as exc:
+                pending.local_error = exc
                 self._handoff_completion_notifications.pop(pending.request_id, None)
                 # A peer can fail before posting its half of a two-sided transfer.
                 # Do not wait on this rank's unmatched operation; quarantine its
                 # destination unless its own handle already reached a terminal state.
-                safe_to_release = pending.destinations_safe and pending.terminal_state_reported
-                safe_to_release = safe_to_release and self._wait_for_transfer_handles(
-                    *self._pending_transfer_handles(pending)
+                safe_to_release = (
+                    pending.terminal_state_reported and self._pending_destinations_safe(pending)
+                )
+                safe_to_release = safe_to_release and all(
+                    handle.storage_safe for handle in self._pending_transfer_handles(pending)
                 )
                 if safe_to_release:
                     self._release_pending_kv_import(pending)
@@ -1194,8 +1468,15 @@ class InferenceStateHandoffMixin:
                     )
                 if not pending.future.done():
                     pending.future.set_exception(exc)
+                if failed and not source_safe:
+                    self._failed_handoff_requests.add(pending.request_id)
+                self._notify_request_error(pending.request_id, exc, source_safe=source_safe)
                 logging.exception("DISAGG_DECODE_PULL_FAILED request_id=%d", pending.request_id)
                 if failed:
+                    if self._kv_transfer_agent.is_push and not source_safe:
+                        raise RuntimeError(
+                            "NCCL handoff failed while transfer storage may still be in use"
+                        ) from exc
                     continue
                 remaining.extend(self._pending_kv_imports)
                 self._pending_kv_imports = remaining

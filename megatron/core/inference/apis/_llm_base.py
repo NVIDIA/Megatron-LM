@@ -18,7 +18,7 @@ from typing import Any, Coroutine, List, Optional, Tuple, Type, Union
 import torch.distributed as dist
 
 from megatron.core.inference.config import InferenceConfig
-from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.engine_factory import build_dynamic_inference_engine
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
@@ -28,9 +28,6 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
     GPTInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-    TextGenerationController,
-)
 
 
 class _EventLoopManager:
@@ -266,8 +263,14 @@ class _MegatronLLMBase:
         coordinator_port: Optional[int] = None,
         inference_wrapper_cls: Type[AbstractModelInferenceWrapper] = GPTInferenceWrapper,
     ) -> None:
+        if inference_config is None:
+            inference_config = InferenceConfig()
+        disaggregated = inference_config.disaggregation_shards is not None
+
         if (coordinator_host is not None or coordinator_port is not None) and not use_coordinator:
             raise ValueError("coordinator_host/port require use_coordinator=True")
+        if disaggregated and not use_coordinator:
+            raise ValueError("disaggregated inference requires use_coordinator=True")
 
         if not use_coordinator:
             from megatron.core import parallel_state
@@ -279,14 +282,14 @@ class _MegatronLLMBase:
                     f"(got EP={ep_size}). Use coordinator mode to handle EP routing."
                 )
 
-        if inference_config is None:
-            inference_config = InferenceConfig()
-
-        # Build the engine pipeline. Mirrors examples/inference/gpt/gpt_dynamic_inference.py.
-        context = DynamicInferenceContext(model.config, inference_config)
-        wrapper = inference_wrapper_cls(model, context)
-        controller = TextGenerationController(inference_wrapped_model=wrapper, tokenizer=tokenizer)
-        engine = DynamicInferenceEngine(controller=controller, context=context)
+        engine = build_dynamic_inference_engine(
+            model=model,
+            tokenizer=tokenizer,
+            inference_config=inference_config,
+            inference_wrapper_cls=inference_wrapper_cls,
+        )
+        context = engine.context
+        controller = engine.controller
 
         if use_coordinator:
             is_primary_rank = dist.get_rank() == 0

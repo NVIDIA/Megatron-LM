@@ -237,6 +237,12 @@ class InferenceSetupConfig:
     """Skip the EP-group consensus all-reduce in the inference engine control loop and step on local
     state only. Only safe when EP coordination is not required (e.g. ep_world_size == 1)."""
 
+    inference_shards: str | None = None
+    """Partition the world into independent inference shards."""
+
+    disagg_kv_transport_backend: Literal["nixl", "nccl"] = "nixl"
+    """Backend for native disaggregated KV and recurrent-state transfers."""
+
     # ---------------- Mamba inference state dtypes ----------------
     # NOTE: These are provided on the CLI as strings ("bf16"/"fp16"/"fp32") but are mapped to the
     # corresponding torch dtype during argument validation (see validate_args in arguments.py).
@@ -314,6 +320,7 @@ class InferenceSetupConfig:
             PrefixCachingCoordinatorPolicy,
             PrefixCachingEvictionPolicy,
         )
+        from megatron.core.inference.shards_spec import spec_declares_disaggregation
         from megatron.core.utils import get_attr_wrapped_model
 
         # Effective max sequence length depends on the model's position embedding type.
@@ -397,6 +404,12 @@ class InferenceSetupConfig:
                 self.inference_dynamic_batching_allow_stale_multimodal_embeddings
             ),
             prefix_caching_mamba_gb=self.inference_dynamic_batching_prefix_caching_mamba_gb,
+            disaggregation_shards=(
+                self.inference_shards
+                if spec_declares_disaggregation(self.inference_shards)
+                else None
+            ),
+            kv_transport_backend=self.disagg_kv_transport_backend,
             metrics_writer=metrics_writer,
             logging_step_interval=self.inference_logging_step_interval,
             num_speculative_tokens=self.num_speculative_tokens,

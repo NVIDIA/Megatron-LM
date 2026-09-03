@@ -12,6 +12,8 @@ Covers:
   replaces a buffer).
 """
 
+from unittest.mock import MagicMock, call
+
 import pytest
 import torch
 import torch.nn as nn
@@ -218,7 +220,7 @@ def test_prepare_swap_threads_execution_batch_bytes(monkeypatch):
 
     refit.prepare_swap_model_weights(None, None, execution_batch_bytes=123)
 
-    assert forwarded["kwargs"] == {"execution_batch_bytes": 123}
+    assert forwarded["kwargs"] == {"pool_index": 0, "execution_batch_bytes": 123}
 
 
 def test_service_cache_distinguishes_process_groups(monkeypatch):
@@ -492,6 +494,57 @@ class TestSetupMxfp8TransformOnPlan:
         plan = ReshardPlan(send_ops=[], recv_ops=[])
         refit._setup_mxfp8_transform_on_plan(plan, _Model())
         assert captured["backend"] == plan.transform.backend == "triton"
+
+
+class TestMultiDestinationPreparation:
+    """Every destination pool must have a plan before graph capture."""
+
+    def test_prepares_each_pool_and_only_exposes_local_target(self, monkeypatch):
+        plans = [MagicMock(name="prefill_plan"), MagicMock(name="decode_plan")]
+        unwrap = MagicMock(return_value=("src_core", "dst_core", 8))
+        build_plan = MagicMock(side_effect=plans)
+        setup_transform = MagicMock()
+        monkeypatch.setattr(refit, "_unwrap_model_cores", unwrap)
+        monkeypatch.setattr(refit, "_build_or_get_plan", build_plan)
+        monkeypatch.setattr(refit, "_setup_mxfp8_transform_on_plan", setup_transform)
+
+        refit.prepare_swap_model_weights(
+            src_model="training",
+            target_model="inference",
+            num_dst_pools=2,
+            dst_pool_index=1,
+            execution_batch_bytes=123,
+        )
+
+        assert unwrap.call_args_list == [call("training", None), call("training", "inference")]
+        assert [invocation.kwargs["pool_index"] for invocation in build_plan.call_args_list] == [
+            0,
+            1,
+        ]
+        assert [
+            invocation.kwargs["execution_batch_bytes"] for invocation in build_plan.call_args_list
+        ] == [123, 123]
+        assert setup_transform.call_args_list == [call(plans[0], None), call(plans[1], "inference")]
+
+    @pytest.mark.parametrize(
+        "num_dst_pools,dst_pool_index", [(0, 0), (-1, 0), (1, -1), (1, 1), (2, 2)]
+    )
+    def test_rejects_invalid_pool_layout(self, num_dst_pools, dst_pool_index):
+        with pytest.raises(ValueError):
+            refit.prepare_swap_model_weights(
+                src_model=None,
+                target_model=None,
+                num_dst_pools=num_dst_pools,
+                dst_pool_index=dst_pool_index,
+            )
+        with pytest.raises(ValueError):
+            refit.swap_model_weights(
+                src_model=None,
+                target_model=None,
+                refit_method="nccl",
+                num_dst_pools=num_dst_pools,
+                dst_pool_index=dst_pool_index,
+            )
 
 
 class TestRefitTensorCache:

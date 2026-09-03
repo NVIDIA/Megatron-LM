@@ -339,14 +339,24 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     )
 
 
+def _validate_destination_pools(num_dst_pools: int, dst_pool_index: int) -> None:
+    """Validate a multi-destination refit layout."""
+    if num_dst_pools < 1:
+        raise ValueError(f"num_dst_pools must be at least 1; got {num_dst_pools}")
+    if not 0 <= dst_pool_index < num_dst_pools:
+        raise ValueError(f"dst_pool_index must be in [0, {num_dst_pools}); got {dst_pool_index}")
+
+
 def prepare_swap_model_weights(
-    src_model: LanguageModule,
-    target_model: LanguageModule,
+    src_model: LanguageModule | None,
+    target_model: LanguageModule | None,
     group=None,
     src_rank_offset: int = 0,
     dst_rank_offset: int = 0,
+    num_dst_pools: int = 1,
+    dst_pool_index: int = 0,
     execution_batch_bytes: int | None = None,
-):
+) -> None:
     """Pre-build and cache the reshard plan and any format-conversion transforms.
 
     Call this during initialization while models are in their native (BF16) format,
@@ -374,30 +384,36 @@ def prepare_swap_model_weights(
         group: Optional process group for collective communication.
         src_rank_offset: Rank offset for source (training) workers.
         dst_rank_offset: Rank offset for destination (inference) workers.
+        num_dst_pools: Number of disjoint destination pools to prepare.
+        dst_pool_index: Pool that owns ``target_model`` on this rank.
         execution_batch_bytes: Optional soft per-rank limit for transient
             generic-executor staging. A single complete parameter may exceed this
             value. None keeps the model-wide submission behavior.
     """
-    src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
-    plan = _build_or_get_plan(
-        src_core,
-        tgt_core,
-        num_experts,
-        group,
-        src_rank_offset,
-        dst_rank_offset,
-        execution_batch_bytes=execution_batch_bytes,
-    )
+    _validate_destination_pools(num_dst_pools, dst_pool_index)
+    for pool in range(num_dst_pools):
+        target = target_model if pool == dst_pool_index else None
+        src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target)
+        plan = _build_or_get_plan(
+            src_core,
+            tgt_core,
+            num_experts,
+            group,
+            src_rank_offset,
+            dst_rank_offset,
+            pool_index=pool,
+            execution_batch_bytes=execution_batch_bytes,
+        )
 
-    # Auto-detect and set up MXFP8 transform on the plan for the target model.
-    # This must happen after the plan is built (while BF16 params are still visible)
-    # and before any swap_model_weights call.
-    _setup_mxfp8_transform_on_plan(plan, target_model)
+        # Auto-detect and set up MXFP8 on the destination pool's plan. This
+        # must run while the target's BF16 parameters are still visible and
+        # before CUDA graphs capture their storage.
+        _setup_mxfp8_transform_on_plan(plan, target)
 
 
 def swap_model_weights(
-    src_model: LanguageModule,
-    target_model: LanguageModule,
+    src_model: LanguageModule | None,
+    target_model: LanguageModule | None,
     refit_method: Union[RefitBackendName, CopyService],
     group=None,
     src_rank_offset: int = 0,
@@ -406,7 +422,7 @@ def swap_model_weights(
     num_dst_pools: int = 1,
     dst_pool_index: int = 0,
     execution_batch_bytes: int | None = None,
-):
+) -> None:
     """
     Orchestrate weight swap/refit.
 
@@ -438,6 +454,7 @@ def swap_model_weights(
             setting or 256 MiB default. Other backends keep the model-wide
             submission behavior when this is None.
     """
+    _validate_destination_pools(num_dst_pools, dst_pool_index)
     if isinstance(refit_method, str):
         service = get_or_create_service(
             refit_method, group=group, execution_batch_bytes=execution_batch_bytes
@@ -541,8 +558,8 @@ def _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=None):
 
 
 def reshard_model_weights(
-    src_model: LanguageModule,
-    target_model: LanguageModule,
+    src_model: LanguageModule | None,
+    target_model: LanguageModule | None,
     service: CopyService,
     group=None,
     src_rank_offset: int = 0,
@@ -550,7 +567,7 @@ def reshard_model_weights(
     transform: Optional[ReshardTransform] = None,
     pool_index: int = 0,
     execution_batch_bytes: int | None = None,
-):
+) -> None:
     """Reshard and copy model weights from ``src_model`` to ``target_model`` using ``service``.
 
     Supports None for src_model and/or target_model to enable non-collocated mode:

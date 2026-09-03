@@ -41,8 +41,8 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
 # First-party.
-from megatron.core._rank_utils import safe_get_rank
 from megatron.core import mpu, nccl_allocator, tensor_parallel
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
@@ -58,8 +58,8 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
+from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_gated_delta_net_variant,
     is_linear_attention_variant,
@@ -117,7 +117,6 @@ from megatron.core.rerun_state_machine import (
     destroy_rerun_state_machine,
     get_rerun_state_machine,
 )
-from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.module import Float16Module
@@ -197,6 +196,7 @@ from .utils import (
 # dependency is unavailable; the ``has_*``/``HAVE_*`` flags gate later usage.
 try:
     from megatron.rl import rl_utils
+    from megatron.rl.inference.disagg import build_disagg_inference_model, is_disagg_rollout
     from megatron.rl.rl_profiling import (
         RL_LOGGABLE_TIMER_NAMES,
         initialize_rl_profiler,
@@ -223,14 +223,6 @@ try:
     HAVE_FSDP2 = True
 except ImportError:
     HAVE_FSDP2 = False
-
-try:
-    from torch_memory_saver import torch_memory_saver
-
-    torch_memory_saver.hook_mode = "torch"
-    HAVE_TORCH_MEMORY_SAVER = True
-except ImportError:
-    HAVE_TORCH_MEMORY_SAVER = False
 
 # Module-level globals.
 # Startup timestamps for tracking program initialization phases.
@@ -312,10 +304,10 @@ def set_startup_timestamps(
 
 # OTel: module-level helpers imported once at startup.
 try:
-    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
     from nemo.lens.helpers import managed_span as _otel_managed_span
     from nemo.lens.helpers import safe_set_span_attributes as _otel_safe_set_attrs
     from nemo.lens.helpers import trace_fn as _otel_trace_fn
+    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
 except ImportError:
     from megatron.core.telemetry.fallbacks import is_span_group_enabled as _otel_sg_enabled
     from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
@@ -429,9 +421,10 @@ def _start_otel_job_spans(model_type, program_start):
     if not _otel_sg_enabled('job'):
         return
 
-    from opentelemetry import context as _otel_ctx, trace as _otel_trace
-    from opentelemetry.context import Context as _OtelContext
     from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+    from opentelemetry import context as _otel_ctx
+    from opentelemetry import trace as _otel_trace
+    from opentelemetry.context import Context as _OtelContext
 
     _otel_ctx_module = _otel_ctx
     _otel_tracer = get_telemetry().tracer
@@ -585,7 +578,8 @@ def _reroot_otel_interval():
     global _otel_interval_span, _otel_interval_ctx_token
     if get_telemetry() is None or not _otel_sg_enabled('job'):
         return
-    from opentelemetry import context as _octx, trace as _otr
+    from opentelemetry import context as _octx
+    from opentelemetry import trace as _otr
     from opentelemetry.context import Context
     from opentelemetry.trace import Link
     prev = _otel_interval_span
@@ -1858,15 +1852,23 @@ def pretrain(
         # RL inference doesn't support CP; when training uses CP>1, always build a
         # separate CP=1 inference model (CP ranks become extra DP replicas, dp*=cp).
         force_cp1_inference_model = args.context_parallel_size > 1
-        if (
+        if is_disagg_rollout(args):
+            # Disaggregated rollouts: build this rank's prefill/decode shard
+            # model on its shard groups; the per-pool refit keeps it fresh.
+            inference_model = build_disagg_inference_model(
+                args,
+                model_type,
+                model_cfg,
+                cfg_container=cfg_container,
+                model_alloc_ctx=rl_utils.inference_model_alloc_context(args),
+            )
+        elif (
             args.rl_inference_tensor_model_parallel_size is not None
             or args.rl_inference_pipeline_model_parallel_size is not None
             or args.rl_inference_expert_model_parallel_size is not None
             or args.rl_inference_expert_tensor_model_parallel_size is not None
             or force_cp1_inference_model
         ):
-            from megatron.core.inference.shards import build_inference_pg_collection
-
             print_rank_0(
                 "Building separate RL inference model with custom parallelism: "
                 f"TP={args.rl_inference_tensor_model_parallel_size}, "
@@ -1904,32 +1906,7 @@ def pretrain(
                     args.rl_inference_expert_tensor_model_parallel_size
                 )
 
-            # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
-            # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
-            # Alternatively, use torch_memory_saver to offload the weights to CPU when idle.
-            uvm_mempool = None
-            uvm_level = args.rl_inference_model_unified_memory_level
-            if uvm_level and uvm_level > 0:
-                uvm_mempool = create_unified_mempool()
-
-            # Determine which context manager to use for model allocation
-            # Use torch_memory_saver if offloading is requested but UVM is not enabled
-            use_torch_saver_for_inference_model = (
-                args.rl_offload_inference_model_weights_when_idle
-                and uvm_level == 0
-                and HAVE_TORCH_MEMORY_SAVER
-            )
-            if use_torch_saver_for_inference_model:
-                # Use torch_memory_saver for offloading - allocate within a tagged region
-                model_alloc_ctx = torch_memory_saver.region(
-                    tag="rl_inference_model", enable_cpu_backup=True
-                )
-            elif uvm_mempool is not None:
-                model_alloc_ctx = torch.cuda.use_mem_pool(uvm_mempool)
-            else:
-                model_alloc_ctx = nullcontext()
-
-            with model_alloc_ctx:
+            with rl_utils.inference_model_alloc_context(args):
                 inference_model = get_model(
                     model_provider,
                     model_type,
@@ -2103,12 +2080,7 @@ def pretrain(
                 # If separate inference and training models, swap training weights
                 # back to the inference model for RL evaluation.
                 rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-                swap_model_weights(
-                    model,
-                    inference_model,
-                    args.refit_method,
-                    execution_batch_bytes=args.refit_execution_batch_bytes,
-                )
+                rl_utils.refit_inference_model(model, inference_model, args)
                 rl_eval_model = inference_model
                 rl_training_model = model
             rl_utils.evaluate_and_print_results_rl(
@@ -3045,7 +3017,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # OTel: set up per-step sub-span support.
     _otel_step_tracer = None
     if _otel_sg_enabled('forward_backward') or _otel_sg_enabled('optimizer'):
-        from nemo.lens.helpers import span_cm, safe_set_span_attributes as _otel_set_attrs
+        from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+        from nemo.lens.helpers import span_cm
         _otel_step_tracer = get_telemetry().tracer
 
     rerun_state_machine = get_rerun_state_machine()
@@ -3871,7 +3844,8 @@ def save_checkpoint_and_time(
     _exposed_save_span = None
     _exposed_save_token = None
     if _otel_sg_enabled('checkpoint'):
-        from opentelemetry import context as _octx, trace as _otr
+        from opentelemetry import context as _octx
+        from opentelemetry import trace as _otr
         _exposed_save_span = get_telemetry().tracer.start_span('megatron.checkpoint.exposed_save')
         _otel_mark_goodput(_exposed_save_span)
         _exposed_save_span.set_attribute('megatron.iteration', iteration)
@@ -4911,7 +4885,8 @@ def train(
         _report_span = None
         _report_token = None
         if _otel_sg_enabled('step'):
-            from opentelemetry import context as _octx, trace as _otr
+            from opentelemetry import context as _octx
+            from opentelemetry import trace as _otr
             _report_span = get_telemetry().tracer.start_span('megatron.train.iteration_report')
             _otel_mark_goodput(_report_span)
             _report_token = _octx.attach(_otr.set_span_in_context(_report_span))
@@ -4990,12 +4965,7 @@ def train(
                     rl_utils._maybe_prefetch_separate_inference_model_weights(
                         inf_core, to_cpu=False
                     )
-                    swap_model_weights(
-                        model,
-                        inference_model,
-                        args.refit_method,
-                        execution_batch_bytes=args.refit_execution_batch_bytes,
-                    )
+                    rl_utils.refit_inference_model(model, inference_model, args)
                     rl_eval_model = inference_model
                     rl_training_model = model
                 rl_utils.evaluate_and_print_results_rl(

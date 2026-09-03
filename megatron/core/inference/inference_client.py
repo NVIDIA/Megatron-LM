@@ -31,6 +31,14 @@ except:
     HAVE_MSGPACK = False
 
 
+class InferenceRequestError(RuntimeError):
+    """Terminal request failure reported by the inference coordinator."""
+
+    def __init__(self, reason: str, *, source_safe: bool = False):
+        super().__init__(reason)
+        self.source_safe = source_safe
+
+
 class InferenceClient:
     """
     An asynchronous client for communicating with an inference coordinator service.
@@ -90,6 +98,10 @@ class InferenceClient:
         self.next_request_id = 0
         self.streams: dict[int, AsyncStream[dict]] = {}
         self.aborted_request_ids: set[int] = set()
+        # Resolves when abort cleanup makes transferred state safe to reuse.
+        self.abort_futures: dict[int, asyncio.Future] = {}
+        # Background socket receiver for request, stream, and abort replies.
+        self.listener_task: asyncio.Task | None = None
 
     def add_request(
         self,
@@ -251,10 +263,26 @@ class InferenceClient:
 
     def abort_request(self, request_id: int) -> None:
         """Cancel an in-flight request and close its local response stream."""
+
+        self._send_abort(request_id)
+
+    def abort_request_and_wait(self, request_id: int) -> asyncio.Future:
+        """Cancel a request and return its source-safety acknowledgement."""
+
+        request_id = int(request_id)
+        existing = self.abort_futures.get(request_id)
+        if existing is not None:
+            return existing
+        abort_future = self._new_abort_future(request_id)
+        self._send_abort(request_id)
+        return abort_future
+
+    def _send_abort(self, request_id: int) -> None:
         request_id = int(request_id)
         stream = self.streams.pop(request_id, None)
         future = self.completion_futures.pop(request_id, None)
-        if stream is None and future is None:
+        abort_future = self.abort_futures.get(request_id)
+        if stream is None and future is None and abort_future is None:
             # Already completed (or never submitted): _submit_request and
             # _submit_stream register synchronously and _recv_task pops only
             # immediately before delivering, so absence from both means the
@@ -271,6 +299,20 @@ class InferenceClient:
         self.request_submission_times.pop(request_id, None)
         payload = [Headers.ABORT_REQUEST.value, request_id]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
+
+    def _new_abort_future(self, request_id: int) -> asyncio.Future:
+        """Create a future for the request's source-safety acknowledgement."""
+
+        future = asyncio.get_running_loop().create_future()
+        self.abort_futures[request_id] = future
+        future.add_done_callback(functools.partial(self._discard_abort_future, request_id))
+        return future
+
+    def _discard_abort_future(self, request_id: int, future: asyncio.Future) -> None:
+        """Remove a completed acknowledgement without discarding a newer waiter."""
+
+        if self.abort_futures.get(request_id) is future:
+            self.abort_futures.pop(request_id)
 
     def add_request_streaming(
         self,
@@ -379,7 +421,12 @@ class InferenceClient:
                         stream.put({"final": completed_request})
                         stream.finish()
                         continue
-                    completion_future = self.completion_futures.pop(request_id)
+                    completion_future = self.completion_futures.pop(request_id, None)
+                    if completion_future is None:
+                        logging.warning(
+                            "Client: ignoring late ENGINE_REPLY for request %d", request_id
+                        )
+                        continue
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
@@ -392,6 +439,31 @@ class InferenceClient:
                     stream = self.streams.get(request_id)
                     if stream is not None:
                         stream.put({"partial": partial})
+                elif header == Headers.REQUEST_ERROR:
+                    request_id, reason, source_safe = data[1:]
+                    self.request_submission_times.pop(request_id, None)
+                    error = InferenceRequestError(str(reason), source_safe=bool(source_safe))
+                    abort_future = self.abort_futures.get(request_id)
+                    if source_safe:
+                        self.aborted_request_ids.discard(request_id)
+                        if abort_future is not None and not abort_future.done():
+                            abort_future.set_result(True)
+                    stream = self.streams.pop(request_id, None)
+                    if stream is not None:
+                        stream.finish(exception=error)
+                        continue
+                    future = self.completion_futures.pop(request_id, None)
+                    if future is not None and not future.done():
+                        future.set_exception(error)
+                elif header == Headers.REQUEST_ABORTED:
+                    request_id, source_safe = int(data[1]), bool(data[2])
+                    if source_safe:
+                        self.aborted_request_ids.discard(request_id)
+                    future = self.abort_futures.get(request_id)
+                    if future is None:
+                        continue
+                    if source_safe and not future.done():
+                        future.set_result(True)
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -514,7 +586,7 @@ class InferenceClient:
         and terminates the ZMQ context. It should be called when the client is
         no longer needed to ensure a graceful shutdown.
         """
-        if hasattr(self, 'listener_task') and not self.listener_task.done():
+        if self.listener_task is not None and not self.listener_task.done():
             self.listener_task.cancel()
         # Wake up any listeners.
         for future in self.completion_futures.values():
@@ -525,6 +597,10 @@ class InferenceClient:
         for stream in self.streams.values():
             stream.finish()
         self.streams.clear()
+        for future in self.abort_futures.values():
+            if not future.done():
+                future.cancel()
+        self.abort_futures.clear()
         self.aborted_request_ids.clear()
         self.socket.close(linger=0)
         self.context.term()

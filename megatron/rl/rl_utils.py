@@ -50,6 +50,7 @@ from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_S
 from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.inference.unified_memory import (
     advise_managed_module_parameters_preferred_location,
+    create_unified_mempool,
     prefetch_managed_module_parameters,
 )
 from megatron.core.inference.utils import device_memory_summary, set_decode_expert_padding
@@ -61,7 +62,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import get_pp_last_rank, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
-from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.resharding import prepare_swap_model_weights, swap_model_weights
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
@@ -95,6 +96,7 @@ from megatron.rl.agent.api import (
 from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
 from megatron.rl.inference import ReturnsRaw
+from megatron.rl.inference.disagg import disagg_refit_pools
 from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
@@ -136,6 +138,44 @@ _GLOBAL_PACKING_CONTEXT = None
 # Track whether the inference model is currently paused (offloaded to CPU).
 # Model starts on GPU after creation and is used immediately, so starts as False.
 _INFERENCE_MODEL_IS_PAUSED = False
+
+
+def inference_model_alloc_context(args):
+    """Return the allocation context for a separate RL inference model."""
+    uvm_level = args.rl_inference_model_unified_memory_level
+    if (
+        args.rl_offload_inference_model_weights_when_idle
+        and uvm_level == 0
+        and HAVE_TORCH_MEMORY_SAVER
+    ):
+        return torch_memory_saver.region(tag="rl_inference_model", enable_cpu_backup=True)
+    if uvm_level and uvm_level > 0:
+        return torch.cuda.use_mem_pool(create_unified_mempool())
+    return nullcontext()
+
+
+def refit_inference_model(model, inference_model, args) -> int:
+    """Copy training weights and return the number of destination pools."""
+
+    num_dst_pools, dst_pool_index = disagg_refit_pools(
+        args.inference_shards, args.world_size
+    )
+    prepare_swap_model_weights(
+        src_model=model,
+        target_model=inference_model,
+        num_dst_pools=num_dst_pools,
+        dst_pool_index=dst_pool_index,
+        execution_batch_bytes=args.refit_execution_batch_bytes,
+    )
+    swap_model_weights(
+        model,
+        inference_model,
+        args.refit_method,
+        num_dst_pools=num_dst_pools,
+        dst_pool_index=dst_pool_index,
+        execution_batch_bytes=args.refit_execution_batch_bytes,
+    )
+    return num_dst_pools
 
 
 def _torch_saver_swap_inference_model(*, to_cpu: bool) -> None:
@@ -793,13 +833,8 @@ def get_environment_rollouts(
         with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
             inf_core = unwrap_model(inference_model[0])
             _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-        swap_model_weights(
-            model,
-            inference_model,
-            args.refit_method,
-            execution_batch_bytes=args.refit_execution_batch_bytes,
-        )
-        if args.rl_verify_model_weights_swap:
+        num_dst_pools = refit_inference_model(model, inference_model, args)
+        if args.rl_verify_model_weights_swap and num_dst_pools == 1:
             verify_model_weights_swap(
                 train_model=model,
                 inference_model=inference_model,

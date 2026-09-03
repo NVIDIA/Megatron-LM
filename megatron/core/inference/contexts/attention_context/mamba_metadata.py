@@ -21,6 +21,7 @@ class MambaMetadata:
         max_tokens: int,
         *,
         max_intermediate_count: int,
+        reserve_dummy_state_slot: bool = False,
         mamba_chunk_size: int = 128,
         d_conv: int = 0,
         decode_indices_dtype: torch.dtype = torch.int64,
@@ -37,6 +38,9 @@ class MambaMetadata:
                 buffers. Computed once by DynamicInferenceContext (as
                 max_mamba_intermediate_states_per_step) and shared with
                 MambaSlotAllocator.
+            reserve_dummy_state_slot (bool): Whether the state buffers include a dedicated
+                expert-parallel dummy slot at index ``max_requests``. Normal requests allocate
+                only lower indices, so they cannot consume this slot.
             mamba_chunk_size (int): The chunk size used by the Mamba SSM Triton kernels.
             d_conv (int): Convolution window size (from mamba_conv_states_shape[-1]).
                 Used for vectorized conv state extraction at intermediate offsets.
@@ -52,6 +56,14 @@ class MambaMetadata:
                 expanded stream, which no Mamba2 buffer describes.
         """
         self.max_requests = max_requests
+        # Request-owned slots are [0, max_requests). The optional final entry is reused by
+        # EP dummy forwards and never enters the request free-slot pool.
+        self.dummy_state_idx = max_requests if reserve_dummy_state_slot else None
+        self.dummy_state_indices = (
+            torch.tensor([self.dummy_state_idx], dtype=torch.int32, device='cpu')
+            if self.dummy_state_idx is not None
+            else None
+        )
         self.max_tokens = max_tokens
         self.mamba_chunk_size = mamba_chunk_size
         self.d_conv = d_conv
@@ -183,15 +195,13 @@ class MambaMetadata:
         self._gpu_view = gpu_view
 
     def reset(self) -> None:
-        """
-        Resets all Mamba states and frees all allocated slots.
-        """
-        self.request_to_mamba_state_idx.fill_(-1)
+        """Release request slots while preserving states retained for handoff."""
 
+        request_slots = self.request_to_mamba_state_idx
+        owned_request_slots = request_slots[request_slots >= 0]
+        self._return_slots(owned_request_slots)
+        request_slots.fill_(-1)
         self.reset_varlen_metadata()
-
-        torch.arange(self.max_requests, out=self.mamba_state_free_slots)
-        self.mamba_state_free_slot_count = self.max_requests
 
     def reset_varlen_metadata(self) -> None:
         """Resets varlen metadata."""
@@ -972,8 +982,7 @@ class MambaMetadata:
         # Get the Mamba state indices for finished requests
         mamba_indices_to_free = self.request_to_mamba_state_idx[request_indices]
 
-        # Filter out any invalid indices (e.g., -1)
-        mamba_indices_to_free = mamba_indices_to_free[mamba_indices_to_free != -1]
+        mamba_indices_to_free = mamba_indices_to_free[mamba_indices_to_free >= 0]
         self._return_slots(mamba_indices_to_free)
 
         # Invalidate the Mamba state index for the finished requests

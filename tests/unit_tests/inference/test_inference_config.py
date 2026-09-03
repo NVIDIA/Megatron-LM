@@ -212,6 +212,33 @@ class TestInferenceConfig:
 
         assert inference_config.async_sched_mode == expected
 
+    def test_inference_setup_config_maps_disaggregation_fields(self):
+        """Ensure declarative inference config maps disaggregation fields."""
+        model = SimpleNamespace(
+            position_embedding_type="rope",
+            max_sequence_length=4096,
+            pg_collection="pg",
+            decoder=SimpleNamespace(layer_type_list=None),
+        )
+        shards = "tp=1,role=prefill+tp=1,role=decode"
+        setup_config = InferenceSetupConfig(
+            inference_dynamic_batching_async_sched_mode="async",
+            inference_shards=shards,
+            disagg_kv_transport_backend="nccl",
+        )
+
+        inference_config = setup_config.to_inference_config(
+            model=model,
+            kv_cache_management_mode="persist",
+            static_kv_memory_pointers=False,
+            enable_cuda_graphs=False,
+            verbose=False,
+        )
+
+        assert inference_config.async_sched_mode == AsyncScheduleMode.ASYNC
+        assert inference_config.disaggregation_shards == shards
+        assert inference_config.kv_transport_backend == "nccl"
+
     def test_inference_setup_config_maps_multimodal_fields(self):
         """Ensure declarative inference config maps multimodal fields to runtime config."""
         model = SimpleNamespace(

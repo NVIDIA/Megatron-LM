@@ -14,6 +14,7 @@ there is no staging copy on the send side.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -22,12 +23,22 @@ import torch.distributed as dist
 from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout, plan_kv_reshard
 from megatron.core.inference.disaggregation.ssm_reshard import SSMShardLayout, plan_ssm_reshard
 from megatron.core.inference.disaggregation.transfer_backends.base import (
+    TransferStartError,
     compute_buffer_geometry,
     export_geometry_meta,
 )
 from megatron.core.inference.disaggregation.utils import transfer_peer_records
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class NcclTransferPlan:
+    """Validated point-to-point operations that have not been posted yet."""
+
+    ops: List[Any]  # Validated NCCL P2P operations awaiting submission.
+    keepalive: List[torch.Tensor]  # Transfer buffers retained until NCCL completes.
+    scatters: List[Any]  # Receive-side copies into paged KV or SSM storage.
 
 
 class NcclTransferHandle:
@@ -43,6 +54,12 @@ class NcclTransferHandle:
         self._keepalive = keepalive
         self._scatters = scatters
         self._done = not works and not scatters
+
+    @property
+    def storage_safe(self) -> bool:
+        """Whether every operation has stopped accessing its buffers."""
+
+        return self._done
 
     def poll(self) -> bool:
         """Return True if the transfer has settled, scattering received data
@@ -232,8 +249,17 @@ class NcclTransferBackend:
     ) -> NcclTransferHandle:
         """Post the receives matching the prefill's sends; the handle scatters
         into the destination blocks (or SSM slots) on completion."""
+        return self.start_prepared(
+            [self.prepare_pull_blocks(peer_meta, src_block_ids, dst_block_ids)]
+        )
+
+    def prepare_pull_blocks(
+        self, peer_meta: Any, src_block_ids: List[int], dst_block_ids: List[int]
+    ) -> NcclTransferPlan:
+        """Validate and build receive operations without posting them."""
+
         if not dst_block_ids:
-            return NcclTransferHandle([], [], [])
+            return NcclTransferPlan([], [], [])
         records = transfer_peer_records(peer_meta, src_block_ids)
 
         ops: List[Any] = []
@@ -265,8 +291,7 @@ class NcclTransferBackend:
                     ops.append(dist.P2POp(dist.irecv, buf, int(meta["nccl_rank"])))
                     scatters.append(_make_copy(self._kv_block_view(int(block), layers, heads), buf))
 
-        works = dist.batch_isend_irecv(ops) if ops else []
-        return NcclTransferHandle(works, buffers, scatters)
+        return NcclTransferPlan(ops, buffers, scatters)
 
     # --- prefill side ----------------------------------------------------------
     def begin_push_blocks(self, peer_meta: Any, src_block_ids: List[int]) -> NcclTransferHandle:
@@ -274,8 +299,13 @@ class NcclTransferBackend:
         pinned source blocks (or SSM slots). `peer_meta` is the decode
         instance's per-rank metadata in the same nested shape as a hand-off's
         kv_meta."""
+        return self.start_prepared([self.prepare_push_blocks(peer_meta, src_block_ids)])
+
+    def prepare_push_blocks(self, peer_meta: Any, src_block_ids: List[int]) -> NcclTransferPlan:
+        """Validate and build send operations without posting them."""
+
         if not src_block_ids:
-            return NcclTransferHandle([], [], [])
+            return NcclTransferPlan([], [], [])
         records = transfer_peer_records(peer_meta, [])
 
         ops: List[Any] = []
@@ -294,5 +324,17 @@ class NcclTransferBackend:
                     keep.append(sub)
                     ops.append(dist.P2POp(dist.isend, sub, int(meta["nccl_rank"])))
 
-        works = dist.batch_isend_irecv(ops) if ops else []
-        return NcclTransferHandle(works, keep, [])
+        return NcclTransferPlan(ops, keep, [])
+
+    @staticmethod
+    def start_prepared(plans: List[NcclTransferPlan]) -> NcclTransferHandle:
+        """Post a validated KV/SSM operation set as one NCCL batch."""
+
+        ops = [op for plan in plans for op in plan.ops]
+        keepalive = [tensor for plan in plans for tensor in plan.keepalive]
+        scatters = [scatter for plan in plans for scatter in plan.scatters]
+        try:
+            works = dist.batch_isend_irecv(ops) if ops else []
+        except Exception as error:
+            raise TransferStartError(str(error), storage_safe=False, resources=plans) from error
+        return NcclTransferHandle(works, keepalive, scatters)

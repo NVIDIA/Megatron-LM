@@ -1862,6 +1862,7 @@ def _load_non_persistent_base_checkpoint(
     checkpointing_context=None,
     dp_cp_group=None,
     expt_dp_group=None,
+    checkpoint_group=None,
 ):
     """Load the base state_dict from a non-persistent distributed checkpoint.
     Depending on the non_persistent_ckpt_type, different logic may be required.
@@ -1882,6 +1883,7 @@ def _load_non_persistent_base_checkpoint(
             checkpointing_context=checkpointing_context,
             dp_cp_group=dp_cp_group,
             expt_dp_group=expt_dp_group,
+            checkpoint_group=checkpoint_group,
         )
     elif args.non_persistent_ckpt_type == 'local':
         intermediate_state_dict, checkpoint_name = checkpointing_context[
@@ -1913,6 +1915,7 @@ def _load_global_dist_base_checkpoint(
     checkpointing_context=None,
     dp_cp_group=None,
     expt_dp_group=None,
+    checkpoint_group=None,
 ):
     """Load the base state_dict from the given directory containing the global distributed checkpoint"""
     if rank0:
@@ -1967,6 +1970,7 @@ def _load_global_dist_base_checkpoint(
         validate_access_integrity=args.ckpt_load_validate_sharding_integrity,
         strict=args.dist_ckpt_strictness,
         verify_integrity=args.verify_integrity,
+        process_group=checkpoint_group,
     )
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
@@ -2000,6 +2004,7 @@ def _load_base_checkpoint(
     checkpointing_context=None,
     dp_cp_group=None,
     expt_dp_group=None,
+    checkpoint_group=None,
     gpt_compat_layer_maps=None,
 ):
     """Load the base state_dict from the given directory
@@ -2041,6 +2046,7 @@ def _load_base_checkpoint(
                 checkpointing_context,
                 dp_cp_group=dp_cp_group,
                 expt_dp_group=expt_dp_group,
+                checkpoint_group=checkpoint_group,
             )
         else:
             print_rank_0('WARNING: non-persistent checkpoints are older than persistent checkpoint')
@@ -2093,6 +2099,7 @@ def _load_base_checkpoint(
             checkpointing_context=checkpointing_context,
             dp_cp_group=dp_cp_group,
             expt_dp_group=expt_dp_group,
+            checkpoint_group=checkpoint_group,
         )
     elif ckpt_format == 'torch':
         ckpt_type = CheckpointType.LEGACY
@@ -2380,6 +2387,10 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     from megatron.core.models.hybrid.hybrid_model import HybridModel
     from megatron.core.models.mimo.model.base import MimoModel
 
+    # Model-only inference checkpoints may omit the saved argument namespace.
+    if ckpt_args is None:
+        return None, False
+
     def _contains_hybrid_model(module):
         # Megatron-FSDP and Float16Module both retain the wrapped module under
         # ``module`` but are intentionally not handled by the regular
@@ -2468,6 +2479,7 @@ def load_checkpoint(
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
     rng_state_key_prefix: str = '',
 ):
     """Load a model checkpoint and return the iteration.
@@ -2480,6 +2492,8 @@ def load_checkpoint(
     dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
     dp_group: Data parallel group (default: None, falls back to mpu API)
     expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
+    checkpoint_group: Ranks that collectively form one complete checkpoint
+        view (default: None, uses the global process group)
     """
     args = get_args()
     load_dir = getattr(args, load_arg)
@@ -2539,13 +2553,13 @@ def load_checkpoint(
     load_kwargs = {}
     ignore_rng_state = False
     ignore_rerun_state = True
-    ckpt_args = types.SimpleNamespace()
+    ckpt_args = None
     if (
         ckpt_format in ('torch_dist', 'fsdp_dtensor')
         and state_dict is not None
         and 'args' in state_dict
     ):
-        ckpt_args = state_dict.get('args') or types.SimpleNamespace()
+        ckpt_args = state_dict.get('args')
 
     # Both model-space torch_dist and fsdp_dtensor checkpoints carry model-keyed
     # optimizer state that can be retargeted from GPTModel to HybridModel.
@@ -2555,6 +2569,7 @@ def load_checkpoint(
         else (None, False)
     )
     gpt_compat_load_optim = gpt_compat_load_optim and not release
+    ckpt_args = ckpt_args or types.SimpleNamespace()
 
     if ckpt_format == 'torch_dist':
         if not hasattr(ckpt_args, 'tensor_model_parallel_size'):
@@ -2837,6 +2852,7 @@ def load_checkpoint(
         checkpointing_context=checkpointing_context,
         dp_cp_group=dp_cp_group,
         expt_dp_group=expt_dp_group,
+        checkpoint_group=checkpoint_group,
         gpt_compat_layer_maps=gpt_compat_layer_maps,
         **load_kwargs,
     )

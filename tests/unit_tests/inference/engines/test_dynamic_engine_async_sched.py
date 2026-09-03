@@ -9,7 +9,10 @@ import pytest
 
 from megatron.core.inference.config import AsyncScheduleMode
 from megatron.core.inference.contexts.dynamic_context import DynamoHelper
-from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine
+from megatron.core.inference.disaggregation.engine import (
+    DisaggDynamicInferenceEngine,
+    StateHandoffDynamicInferenceEngine,
+)
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
@@ -189,8 +192,10 @@ def test_ready_handoff_uses_safe_no_overlap_admission_point():
     engine = _make_engine(engine_cls=DisaggDynamicInferenceEngine)
     engine._initialize_disaggregation_state()
     engine.waiting_request_ids = deque()
-    engine._pending_kv_imports.append(SimpleNamespace(request_id=7, resume_tokens=[55]))
-    engine._handoff_completion_notifications[7] = False
+    engine._pending_kv_imports.append(
+        SimpleNamespace(request_id=7, resume_tokens=[55], cancel_requested=False)
+    )
+    engine._handoff_completion_notifications[7] = (False, True)
 
     assert not engine._should_run_async_sched_overlap()
 
@@ -403,8 +408,14 @@ def test_base_engine_rejects_kv_handoff_commands():
 
 
 def test_disagg_engine_resolves_handoff_methods_from_mixin():
-    assert DisaggDynamicInferenceEngine.mro()[:3] == [
+    assert StateHandoffDynamicInferenceEngine.mro()[:3] == [
+        StateHandoffDynamicInferenceEngine,
+        InferenceStateHandoffMixin,
+        DynamicInferenceEngine,
+    ]
+    assert DisaggDynamicInferenceEngine.mro()[:4] == [
         DisaggDynamicInferenceEngine,
+        StateHandoffDynamicInferenceEngine,
         InferenceStateHandoffMixin,
         DynamicInferenceEngine,
     ]

@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
@@ -96,6 +97,9 @@ class TestDynamicContext:
         num_speculative_tokens=0,
         enable_chunked_prefill: bool = False,
         max_requests: int = None,
+        expert_model_parallel_size: int = 1,
+        reserve_recurrent_state_dummy_slot: bool = False,
+        mamba_memory_ratio: float = None,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -118,6 +122,8 @@ class TestDynamicContext:
                 num_layers=num_layers,
                 kv_channels=kv_channels,
                 num_attention_heads=num_attention_heads,
+                expert_model_parallel_size=expert_model_parallel_size,
+                num_moe_experts=2 if expert_model_parallel_size > 1 else None,
             ),
             inference_config=InferenceConfig(
                 max_sequence_length=max_sequence_length,
@@ -136,6 +142,8 @@ class TestDynamicContext:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 enable_chunked_prefill=enable_chunked_prefill,
                 max_requests=max_requests,
+                reserve_recurrent_state_dummy_slot=reserve_recurrent_state_dummy_slot,
+                mamba_memory_ratio=mamba_memory_ratio,
             ),
         )
         return dynamic_context
@@ -2412,6 +2420,67 @@ class TestDynamicContext:
             assert (fast_mamba >= 0).all(), "fast path should allocate valid mamba slots"
             assert (slow_mamba >= 0).all(), "slow path should allocate valid mamba slots"
             assert fast_mamba.unique().numel() == N, "fast path mamba slots must be unique"
+
+    def _get_hybrid_ep_context(self, **overrides):
+        args = dict(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=True,
+            layer_type_list=[Symbols.MAMBA, Symbols.ATTENTION, Symbols.MLP, Symbols.ATTENTION],
+            expert_model_parallel_size=2,
+        )
+        args.update(overrides)
+        return self._get_dynamic_context(**args)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_hybrid_ep_dummy_uses_reserved_state_when_request_slots_are_retained(self):
+        baseline = self._get_hybrid_ep_context(num_cuda_graphs=16)
+        ctx = self._get_hybrid_ep_context(
+            num_cuda_graphs=16, reserve_recurrent_state_dummy_slot=True
+        )
+        assert ctx.kv_block_allocator.pool_size == baseline.kv_block_allocator.pool_size
+        assert ctx.max_requests == baseline.max_requests
+        metadata = ctx.mamba_metadata
+        retained_slots = metadata.batch_allocate_slots(ctx.max_requests)
+        assert retained_slots is not None
+        assert metadata.mamba_state_free_slot_count == 0
+
+        ctx.initialize_attention_state(
+            is_expert_parallel_dummy_cuda_graph_step=True, transfer_bookkeeping_to_gpu=False
+        )
+
+        assert torch.all(metadata.request_to_mamba_state_idx == -1)
+        assert ctx._cpu_mamba_batch_indices_decode[0] == metadata.dummy_state_idx
+        ctx.reset()
+        assert metadata.mamba_state_free_slot_count == 0
+
+    @pytest.mark.internal
+    @rounder_override(1)
+    def test_hybrid_ep_dummy_requires_positive_request_capacity(self):
+        with pytest.raises(ValueError, match="leaves no request capacity"):
+            self._get_hybrid_ep_context(
+                reserve_recurrent_state_dummy_slot=True, mamba_memory_ratio=1e-12
+            )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_hybrid_ep_dummy_fails_cleanly_without_a_free_state_slot(self):
+        ctx = self._get_hybrid_ep_context(num_cuda_graphs=16)
+        metadata = ctx.mamba_metadata
+        assert metadata.batch_allocate_slots(ctx.max_requests) is not None
+        dummy_dimensions = InferenceBatchDimensions(
+            token_count=ctx.num_speculative_tokens + 1, prefill_req_count=0, decode_req_count=1
+        )
+
+        with pytest.raises(AssertionError, match="No free recurrent-state slots"):
+            ctx.add_dummy_requests_for_expert_parallel_step(dummy_dimensions)
 
     @pytest.mark.internal
     def test_gqa_high_tp_partition_heads(self):
