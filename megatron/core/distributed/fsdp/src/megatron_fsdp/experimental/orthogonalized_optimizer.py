@@ -88,12 +88,11 @@ def _require_emerging_optimizers() -> None:
 
 @dataclasses.dataclass
 class _BoundaryChunkState:
-    """In-flight owner-gather state for one boundary chunk, between issue and finish.
+    """In-flight gather and scatter state for one boundary chunk.
 
-    `FsdpOrthogonalizedOptimizer.step` issues every chunk's owner-gather first
-    (so fully-local Newton-Schulz overlaps the gathers), then finishes each chunk
-    (wait gather, orthogonalize, scatter, apply). This object carries everything
-    `_finish_boundary_step` needs across that gap.
+    `FsdpOrthogonalizedOptimizer.step` issues every chunk's owner-gather first,
+    then `_issue_boundary_update` fills the scatter fields for
+    `_finish_boundary_update` to consume.
     """
 
     b_params: Sequence[DTensor]
@@ -102,6 +101,7 @@ class _BoundaryChunkState:
     gather_plan: OwnerGatherPlan
     recv_buffers: dict[int, torch.Tensor]
     gather_works: list[dist.Work]
+    gather_event: torch.cuda.Event | None
     device: torch.device
     dtype: torch.dtype
     lr: float
@@ -112,6 +112,14 @@ class _BoundaryChunkState:
     weight_gather_plan: OwnerGatherPlan | None = None
     weight_recv_buffers: dict[int, torch.Tensor] | None = None
     weight_gather_works: list[dist.Work] | None = None
+    weight_gather_event: torch.cuda.Event | None = None
+
+    # Populated by `_issue_boundary_update` while this chunk's scatter is in flight.
+    full_updates: dict[int, torch.Tensor] = dataclasses.field(default_factory=dict)
+    scatter_plan: OwnerScatterPlan | None = None
+    scatter_recv: dict[int, torch.Tensor] = dataclasses.field(default_factory=dict)
+    scatter_works: list[dist.Work] = dataclasses.field(default_factory=list)
+    scatter_event: torch.cuda.Event | None = None
 
 
 class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
@@ -490,7 +498,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
 
     def _send_to_owner(
         self, gather_plan: OwnerGatherPlan, device: torch.device, dtype: torch.dtype
-    ) -> tuple[dict[int, torch.Tensor], list[dist.Work]]:
+    ) -> tuple[dict[int, torch.Tensor], list[dist.Work], torch.cuda.Event | None]:
         """Send orthogonalization input shards to their respective owner.
 
         Uses peer-to-peer communication (`batch_isend_irecv`) to avoid memory
@@ -521,6 +529,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             ops.append(dist.P2POp(dist.irecv, buf, group_peer=src, group=group))
 
         default_stream = torch.cuda.current_stream() if stream is not None else None
+        completion_event = None
         with torch.cuda.stream(stream) if stream is not None else nullcontext():
             if stream is not None:
                 assert default_stream is not None
@@ -529,7 +538,10 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             for buf in list(gather_plan.send_buffers.values()) + list(recv_buffers.values()):
                 if stream is not None:
                     buf.record_stream(stream)
-        return recv_buffers, list(works or [])
+            if stream is not None:
+                completion_event = torch.cuda.Event()
+                completion_event.record(stream)
+        return recv_buffers, list(works or []), completion_event
 
     # Orthogonalization and update application
     # ========================================
@@ -605,7 +617,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
 
     def _send_to_destination(
         self, scatter_plan: OwnerScatterPlan, device: torch.device, dtype: torch.dtype
-    ) -> tuple[dict[int, torch.Tensor], list[dist.Work]]:
+    ) -> tuple[dict[int, torch.Tensor], list[dist.Work], torch.cuda.Event | None]:
         """Send update shards to their respective destination.
 
         Uses peer-to-peer communication (`batch_isend_irecv`) to avoid memory
@@ -633,6 +645,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             ops.append(dist.P2POp(dist.irecv, buf, group_peer=owner, group=group))
 
         default_stream = torch.cuda.current_stream() if stream is not None else None
+        completion_event = None
         with torch.cuda.stream(stream) if stream is not None else nullcontext():
             if stream is not None:
                 assert default_stream is not None
@@ -641,7 +654,10 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             for buf in list(scatter_plan.send_buffers.values()) + list(recv_buffers.values()):
                 if stream is not None:
                     buf.record_stream(stream)
-        return recv_buffers, list(works or [])
+            if stream is not None:
+                completion_event = torch.cuda.Event()
+                completion_event.record(stream)
+        return recv_buffers, list(works or []), completion_event
 
     def _unpack_update_shards(
         self, scatter_plan: OwnerScatterPlan, recv_buffers: dict[int, torch.Tensor]
@@ -783,10 +799,16 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                     continue
                 self._orthogonalize_and_update(matrix_params[i], local_shards[i], lr, group)
 
-            # Phases 4-6: finish each boundary chunk - wait gather, orthogonalize
-            # on owners, scatter updates, and apply local update shards.
+            # Pipeline each chunk's owner-scatter with the next chunk's Newton-Schulz.
+            # Keeping one pending scatter bounds additional storage to one chunk.
+            pending_update: _BoundaryChunkState | None = None
             for state in chunk_states:
-                self._finish_boundary_step(state)
+                self._issue_boundary_update(state)
+                if pending_update is not None:
+                    self._finish_boundary_update(pending_update)
+                pending_update = state
+            if pending_update is not None:
+                self._finish_boundary_update(pending_update)
 
             for param in matrix_params:
                 pg = get_containing_parameter_group(param)
@@ -812,14 +834,16 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         """Pack and asynchronously P2P-send this chunk's pre-NS shards to owners.
 
         Returns the in-flight gather state; `step` finishes it later with
-        `_finish_boundary_step` so fully-local Newton-Schulz overlaps the gathers.
+        `_issue_boundary_update` so fully-local Newton-Schulz overlaps the gathers.
         """
         b_plans = [matrix_plans[i] for i in boundary_indices]
         b_params = [matrix_params[i] for i in boundary_indices]
         b_local = [local_shards[i] for i in boundary_indices]
         b_owners = {i: owners[boundary_indices[i]] for i in range(len(boundary_indices))}
         gather_plan = self._pack_owner_work(b_plans, b_owners, b_local, device, dtype)
-        recv_buffers, gather_works = self._send_to_owner(gather_plan, device, dtype)
+        recv_buffers, gather_works, gather_event = self._send_to_owner(
+            gather_plan, device, dtype
+        )
 
         # Optionally also gather each rank's local *weight* shard so the owner can
         # reconstruct the full parameter and pass it to `orthogonalize` (some
@@ -829,13 +853,14 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         weight_gather_plan = None
         weight_recv_buffers = None
         weight_gather_works = None
+        weight_gather_event = None
         if self.reconstruct_full_param:
             weight_local = [p.to_local() for p in b_params]
             weight_dtype = b_params[0].dtype
             weight_gather_plan = self._pack_owner_work(
                 b_plans, b_owners, weight_local, device, weight_dtype
             )
-            weight_recv_buffers, weight_gather_works = self._send_to_owner(
+            weight_recv_buffers, weight_gather_works, weight_gather_event = self._send_to_owner(
                 weight_gather_plan, device, weight_dtype
             )
         return _BoundaryChunkState(
@@ -845,6 +870,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             gather_plan=gather_plan,
             recv_buffers=recv_buffers,
             gather_works=gather_works,
+            gather_event=gather_event,
             device=device,
             dtype=dtype,
             lr=lr,
@@ -852,27 +878,28 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             weight_gather_plan=weight_gather_plan,
             weight_recv_buffers=weight_recv_buffers,
             weight_gather_works=weight_gather_works,
+            weight_gather_event=weight_gather_event,
         )
 
-    def _finish_boundary_step(self, state: _BoundaryChunkState) -> None:
-        """Finish one boundary chunk: wait gather, orthogonalize, scatter, apply."""
+    def _issue_boundary_update(self, state: _BoundaryChunkState) -> None:
+        """Wait for one owner-gather, orthogonalize, and issue its owner-scatter."""
         b_params = state.b_params
         b_plans = state.b_plans
         b_owners = state.b_owners
         gather_plan = state.gather_plan
         recv_buffers = state.recv_buffers
         device = state.device
-        lr = state.lr
         group_kwargs = state.group_kwargs
         this_rank = self._this_rank()
-        stream = self._owner_comm_stream(device)
 
-        # Phase 4 (owner): wait gather, reconstruct, orthogonalize. Default
-        # stream waits for the owner stream so the recv buffers are ready.
-        if stream is not None:
-            torch.cuda.current_stream(device).wait_stream(stream)
+        # Phase 4 (owner): wait only for this chunk's gather rather than the
+        # tail of the shared owner-comm stream, then reconstruct and orthogonalize.
+        if state.gather_event is not None:
+            torch.cuda.current_stream(device).wait_event(state.gather_event)
         self._wait_for_dist_buffer(state.gather_works)
         if state.weight_gather_works:
+            if state.weight_gather_event is not None:
+                torch.cuda.current_stream(device).wait_event(state.weight_gather_event)
             self._wait_for_dist_buffer(state.weight_gather_works)
 
         full_updates: dict[int, torch.Tensor] = {}
@@ -907,25 +934,39 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         scatter_plan = self._pack_update_shards(
             full_updates, b_plans, b_owners, device, state.dtype
         )
-        scatter_recv, scatter_works = self._send_to_destination(scatter_plan, device, state.dtype)
-        if stream is not None:
-            torch.cuda.current_stream(device).wait_stream(stream)
-        self._wait_for_dist_buffer(scatter_works)
-        received = self._unpack_update_shards(scatter_plan, scatter_recv)
+        scatter_recv, scatter_works, scatter_event = self._send_to_destination(
+            scatter_plan, device, state.dtype
+        )
+        state.full_updates = full_updates
+        state.scatter_plan = scatter_plan
+        state.scatter_recv = scatter_recv
+        state.scatter_works = scatter_works
+        state.scatter_event = scatter_event
+
+    def _finish_boundary_update(self, state: _BoundaryChunkState) -> None:
+        """Wait for one owner-scatter and apply its local update shards."""
+        # Depend only on this chunk's scatter, not later communication queued
+        # on the shared owner-comm stream.
+        if state.scatter_event is not None:
+            torch.cuda.current_stream(state.device).wait_event(state.scatter_event)
+        self._wait_for_dist_buffer(state.scatter_works)
+        scatter_plan = cast(OwnerScatterPlan, state.scatter_plan)
+        received = self._unpack_update_shards(scatter_plan, state.scatter_recv)
 
         # Phase 6: apply local update shards.
-        for i, param in enumerate(b_params):
-            plan = b_plans[i]
-            if b_owners[i] == this_rank:
+        this_rank = self._this_rank()
+        for i, param in enumerate(state.b_params):
+            plan = state.b_plans[i]
+            if state.b_owners[i] == this_rank:
                 row_start, row_count = plan.rank_rows[this_rank]
                 if row_count == 0:
                     continue
-                update_shard = full_updates[i][row_start : row_start + row_count]
+                update_shard = state.full_updates[i][row_start : row_start + row_count]
             else:
                 update_shard = received.get(i)
                 if update_shard is None:
                     continue
-            self._apply_update(param, update_shard, lr)
+            self._apply_update(param, update_shard, state.lr)
 
     def _step_non_matrix(
         self, param: DTensor, grad: DTensor, group: dict[str, Any], lr: float
