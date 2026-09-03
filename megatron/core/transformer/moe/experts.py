@@ -527,15 +527,9 @@ class TEGroupedMLP(MegatronModule):
                 for idx in range(linear.num_gemms):
                     op.register_parameter(f"bias{idx}", linear.get_parameter(f"bias{idx}"))
 
-        def register_replica_weights(
-            op: torch.nn.Module, runtime_weights: tuple[torch.nn.Parameter, ...]
-        ) -> None:
-            """Attach discrete native-plus-replica weights to a TE op shell."""
-            if len(runtime_weights) != op.num_groups:
-                raise ValueError(
-                    f"Expected {op.num_groups} replica runtime weights, got "
-                    f"{len(runtime_weights)}."
-                )
+        def register_replica_weights(op: torch.nn.Module, runtime_weights) -> None:
+            """Attach the bridge's native-then-replica runtime weights to a TE op shell."""
+            assert len(runtime_weights) == op.num_groups
             op.register_parameter("weight", None)
             for idx, runtime_weight in enumerate(runtime_weights):
                 op.register_parameter(f"weight{idx}", runtime_weight)
@@ -564,10 +558,8 @@ class TEGroupedMLP(MegatronModule):
         # for runs that enable it via overlap_dispatch_backward_with_experts_wgrad.
         fc1_delay_wgrad_compute = self.linear_fc1.delay_wgrad_compute
         fc2_delay_wgrad_compute = self.linear_fc2.delay_wgrad_compute
-        replica_bridge = getattr(self, "_replica_weight_bridge", None)
-        replica_num_gemms = (
-            replica_bridge.num_runtime_experts if replica_bridge is not None else None
-        )
+        replica_bridge = self._replica_weight_bridge
+        replica_num_gemms = replica_bridge.num_runtime_experts if replica_bridge else None
 
         # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
         # Using meta avoids allocating duplicate weights for the fused wrapper.
@@ -733,15 +725,14 @@ class TEGroupedMLP(MegatronModule):
             self.prepare_fused_impl_parameters()
             # Hooks such as DDP/FSDP all-gathers must run once per fused invocation.
             self._fused_impl_parameters_prepared = False
-            bridge = getattr(self, "_replica_weight_bridge", None)
-            if bridge is not None:
-                bridge.wait_prefetch(bridge.last_plan)
+            if self._replica_weight_bridge is not None:
+                self._replica_weight_bridge.wait_prefetch(self._replica_weight_bridge.last_plan)
 
         return forward_pre_hook
 
     def prepare_fused_impl_parameters(self) -> None:
         """Run fused-op parameter hooks before planner-side weight prefetch."""
-        if getattr(self, "_fused_impl_parameters_prepared", False):
+        if self._fused_impl_parameters_prepared:
             return
         for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
             for hook in submodule._forward_pre_hooks.values():

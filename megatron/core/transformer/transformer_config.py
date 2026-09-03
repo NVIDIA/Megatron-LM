@@ -1817,6 +1817,7 @@ class TransformerConfig(ModelParallelConfig):
                 and self.activation_func == squared_relu
                 and self.use_fused_weighted_squared_relu
             )
+            bf16_grads = self.grad_reduce_in_bf16
             required_values = {
                 "add_bias_linear": False,
                 "moe_grouped_gemm": True,
@@ -1837,16 +1838,16 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_apply_probs_on_input": False,
             }
             # (requirement satisfied, requirement description)
-            replica_requirements = [
+            requirements = [
                 (getattr(self, name) == value, f"{name}={value!r}")
                 for name, value in required_values.items()
             ] + [
                 (
-                    not self.grad_reduce_in_bf16 or self.ddp_reduce_scatter_with_fp32_accumulation,
+                    not bf16_grads or self.ddp_reduce_scatter_with_fp32_accumulation,
                     "--ddp-reduce-scatter-with-fp32-accumulation with --grad-reduce-in-bf16",
                 ),
                 (
-                    not (self.grad_reduce_in_bf16 and self.expert_gtp_weight_remat_size > 1)
+                    not (bf16_grads and self.expert_gtp_weight_remat_size > 1)
                     or self.gtp_remat_reduce_scatter_with_fp32_accumulation,
                     "--gtp-remat-reduce-scatter-with-fp32-accumulation with expert GTP and "
                     "--grad-reduce-in-bf16",
@@ -1877,14 +1878,17 @@ class TransformerConfig(ModelParallelConfig):
                     not self.moe_router_padding_for_quantization or replica_mxfp8,
                     "moe_router_padding_for_quantization=False",
                 ),
+                (
+                    self.recompute_granularity != "selective"
+                    or "moe" not in (self.recompute_modules or ()),
+                    "no MoE layer recompute (the replica hooks assume one forward per backward)",
+                ),
             ]
-            replica_errors = [
-                message for satisfied, message in replica_requirements if not satisfied
-            ]
-            if replica_errors:
+            unmet = [message for satisfied, message in requirements if not satisfied]
+            if unmet:
                 raise ValueError(
                     "Replica-HybridEP flex dispatcher configuration is unsupported; require "
-                    + ", ".join(replica_errors)
+                    + ", ".join(unmet)
                     + "."
                 )
 
