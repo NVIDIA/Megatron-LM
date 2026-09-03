@@ -18,7 +18,11 @@ from megatron.core.context_parallel import ContextParallelLayoutManager, CPLayou
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.extensions.transformer_engine import (
+    TENorm,
+    is_log_quantization_types_enabled,
+    qtype_debug_note,
+)
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -54,6 +58,23 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+
+
+def _describe_layer(layer: torch.nn.Module) -> str:
+    """Name a hybrid layer by its class and its mixer.
+
+    The forward dispatch groups layers by base class rather than by pattern symbol, and
+    the two do not line up: MoETransformerLayer and MLPLayer both subclass
+    TransformerLayer, and a 'G' layer is a TransformerLayer whose self_attention is a
+    GatedDeltaNet. Naming a layer from its own mixer keeps the label specific to the
+    symbol that built it, and survives the dispatch being reordered.
+    """
+    mixer = getattr(layer, "self_attention", None)
+    if mixer is None:
+        mixer = getattr(layer, "mixer", None)
+    if mixer is None or isinstance(mixer, IdentityOp):
+        return type(layer).__name__
+    return f"{type(layer).__name__}/{type(mixer).__name__}"
 
 
 @dataclass
@@ -148,6 +169,12 @@ class HybridStack(MegatronModule):
             )
 
         super().__init__(config=config)
+        # Kept so the quantization log can name a layer by the path a recipe would match
+        # it on, rather than by a bare index that repeats across blocks.
+        self.name = name
+        # The quantization log describes the model, not the iteration, so each block
+        # reports its layers once however many microbatches or MTP depths run.
+        self._logged_quantization_structure = False
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
@@ -525,6 +552,13 @@ class HybridStack(MegatronModule):
         # if we are using other fp8 recipes, then the context manager enter&exit are free
         # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
         # control which layer will be fp8 or bf16
+        # Report the layer structure on the first forward only. Later microbatches and
+        # repeated MTP depths re-run these same layers and would just repeat it.
+        log_structure = (
+            is_log_quantization_types_enabled() and not self._logged_quantization_structure
+        )
+        self._logged_quantization_structure = True
+
         use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
         use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
         use_fp4_context = self.config.fp4 is not None
@@ -612,6 +646,13 @@ class HybridStack(MegatronModule):
                             layer_config, layer.layer_number - 1
                         )
                         with inner_quant_context:
+                            if log_structure:
+                                where = (
+                                    f"{self.name}.layers.{layer_index}"
+                                    if self.name is not None
+                                    else f"[{layer_index}]"
+                                )
+                                qtype_debug_note(f"{where} ({_describe_layer(layer)})")
                             if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                                 layer_kwargs = dict(
                                     hidden_states=hidden_states,

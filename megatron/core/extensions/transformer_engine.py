@@ -6,6 +6,7 @@ import dataclasses
 import enum
 import inspect
 import io
+import logging
 import os
 import pickle
 import re
@@ -65,6 +66,7 @@ from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     is_te_min_version,
     is_torch_min_version,
+    log_single_rank,
 )
 
 try:
@@ -122,6 +124,9 @@ def _set_expert_parameter_attributes(
         if is_partitioned:
             param.partition_dim = 1 if parallel_mode == "row" else 0
             param.partition_stride = 1
+
+
+logger = logging.getLogger(__name__)
 
 
 class TransformerEngineConfigType(enum.Enum):
@@ -414,6 +419,124 @@ def _resolve_is_first_microbatch(module) -> Optional[bool]:
     ):
         return None
     return module.is_first_microbatch
+
+def _module_weight(module: torch.nn.Module) -> Optional[torch.Tensor]:
+    """The weight a TE linear reports on.
+
+    GroupedLinear names its per-expert weights weight0..N and has no plain ``weight``.
+    """
+    weight = getattr(module, "weight", None)
+    if weight is None:
+        weight = getattr(module, "weight0", None)
+    return weight
+
+
+def _param_storage_summary(module: torch.nn.Module) -> str:
+    """Describe how a module stores its weight, which the autocast does not tell us.
+
+    Parameters are quantized once, under fp8_model_init at construction, and TE freezes
+    that choice on the module. A recipe that reaches a module's forward but not its
+    construction leaves quantized parameters feeding a high-precision GEMM, so the two
+    have to be read separately.
+    """
+    weight = _module_weight(module)
+    param_type = type(weight).__name__ if weight is not None else "unknown"
+    quantized_params = getattr(module, "primary_weights_in_fp8", None)
+    return f"param_type: {param_type}, quantized_params: {quantized_params}"
+
+
+_log_quantization_types = False
+
+
+def set_log_quantization_types(enabled: bool) -> None:
+    """Turn the per-layer quantization log on or off.
+
+    Set from --log-quantization-types at the start of training and cleared after the
+    first step, so the log describes the model once rather than every iteration.
+    """
+    global _log_quantization_types
+    _log_quantization_types = enabled
+
+
+def is_log_quantization_types_enabled() -> bool:
+    """Whether the per-layer quantization log is currently on."""
+    return _log_quantization_types
+
+
+def qtype_debug_note(text: str) -> None:
+    """Log a layer header in the quantization log.
+
+    Layers are structure, not GEMMs, so they carry no quantization of their own. Naming
+    one alongside a quantization would report the autocast surrounding it, which its own
+    linears are free to override, and the header would then contradict the lines beneath.
+    """
+    if _log_quantization_types:
+        log_single_rank(logger, logging.INFO, text)
+
+
+# Lines sit under the layer header that precedes them. The indent is fixed rather than
+# scaled by depth: these are logged in execution order, so a depth-scaled indent steps in
+# and out within a layer, and each line already carries its full path anyway.
+_LINE_INDENT = "    "
+
+
+def _module_label(module: torch.nn.Module) -> str:
+    """Identify a module by the path a recipe matches it on, falling back to its class.
+
+    The path is only present where a parent threaded a name down. Where it is, it is
+    what a quant_recipe glob is written against, so it is the useful identifier.
+    """
+    path = getattr(module, "quantization_module_path", None)
+    if path is None:
+        return type(module).__name__
+    return f"{path} ({type(module).__name__})"
+
+
+def qtype_debug_log(module: torch.nn.Module) -> None:
+    """Log the quantization the current autocast context selects for a module.
+
+    Call this gated on ``self.is_first_microbatch`` rather than on the value passed to TE.
+    That value is None whenever the module will not run quantized, which is exactly the
+    case this log exists to report on.
+    """
+    if _log_quantization_types:
+        details = []
+        weight = _module_weight(module)
+        if weight is not None:
+            shape = f"weight shape: {tuple(weight.shape)}"
+            # GroupedLinear holds one weight of this shape per expert, so the shape alone
+            # would understate it.
+            num_gemms = getattr(module, "num_gemms", None)
+            if num_gemms is not None:
+                shape += f" x {num_gemms}"
+            details.append(shape)
+        if not HAVE_TE:
+            details.append("quantization_type: none")
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"{_LINE_INDENT}{_module_label(module)} --> " + ", ".join(details),
+            )
+            return
+        if not FP8GlobalStateManager.is_fp8_enabled():
+            quantization_type = "none"
+        elif FP8GlobalStateManager.get_fp8_recipe().nvfp4():
+            quantization_type = "nvfp4"
+        elif FP8GlobalStateManager.get_fp8_recipe().mxfp8():
+            quantization_type = "mxfp8"
+        elif FP8GlobalStateManager.get_fp8_recipe().delayed():
+            quantization_type = "fp8_delayed_per_tensor_scaling"
+        elif FP8GlobalStateManager.get_fp8_recipe().float8_current_scaling():
+            quantization_type = "fp8_current_per_tensor_scaling"
+        elif FP8GlobalStateManager.get_fp8_recipe().float8_block_scaling():
+            quantization_type = "fp8_block_scaling"
+        else:
+            quantization_type = "unknown"
+        details.append(f"quantization_type: {quantization_type}")
+        details.append(_param_storage_summary(module))
+        log_single_rank(
+            logger, logging.INFO, f"{_LINE_INDENT}{_module_label(module)} --> " + ", ".join(details)
+        )
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
@@ -1325,6 +1448,8 @@ class TELinear(te.pytorch.Linear):
                 tp_group_for_te = None
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
+        # Kept so the quantization log can name this module the way a recipe does.
+        self.quantization_module_path = name
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
@@ -1394,6 +1519,8 @@ class TELinear(te.pytorch.Linear):
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
         with quant_context:
+            if self.is_first_microbatch:
+                qtype_debug_log(self)
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
         self.is_first_microbatch = False
 
@@ -1550,6 +1677,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
+        # Kept so the quantization log can name this module the way a recipe does.
+        self.quantization_module_path = name
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
@@ -1648,6 +1777,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             x = x.to(self.layer_norm_weight.dtype)
 
         with quant_context:
+            if self.is_first_microbatch:
+                qtype_debug_log(self)
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
 
         self.is_first_microbatch = False
@@ -2588,6 +2719,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 )
 
             self.te_quant_params: Optional[TEQuantizationParams] = None
+            # Kept so the quantization log can name this module the way a recipe does.
+            self.quantization_module_path = name
             quant_config = get_quant_config_or_none(name, config.quant_recipe)
             self.finish_init(quant_config)
             init_quant_context = _get_fp8_model_init_for_quant_params(
@@ -2808,6 +2941,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
             with quant_context:
+                if self.is_first_microbatch:
+                    qtype_debug_log(self)
                 out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
             self.is_first_microbatch = False
 
