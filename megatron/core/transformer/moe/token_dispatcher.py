@@ -1360,8 +1360,6 @@ class _ReplicaHybridEPManager(_HybridEPManager):
                 "combined previous dispatch."
             )
         workspace = replica_planner.get_planner_workspace(
-            num_tokens=self.num_local_tokens,
-            router_topk=self.router_topk,
             num_experts=self.semantic_num_experts,
             ep_size=torch.distributed.get_world_size(group=self.group),
             device=hidden_states.device,
