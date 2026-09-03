@@ -347,89 +347,25 @@ def test_fully_shard_activation_recompute_reshards_parameters(distributed_setup,
     assert model.fc2.phase is FsdpModule.Phase.RESTING
 
 
+@pytest.mark.parametrize(
+    "placements_factory", [_hsdp_placements, _hfsdp_placements], ids=["hsdp", "hfsdp"]
+)
+@pytest.mark.parametrize("overlap", [False, True], ids=["serial", "overlap"])
 @pytest.mark.parametrize("set_to_none", [True, False])
 @pytest.mark.parametrize("num_microbatches", [1, 3])
-def test_hsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_none):
-    """HSDP (DP-outer replicated, DP-inner sharded) training should match single-rank SGD.
+def test_losses_match_baseline(
+    distributed_setup, num_microbatches, set_to_none, overlap, placements_factory
+):
+    """HSDP/HFSDP training should match single-rank SGD, with and without DP-outer overlap.
 
-    Gradients reduce-scatter within DP-inner every backward and accumulate into
-    main_grad; the DP-outer all-reduce runs only on the last microbatch, scoped
-    via ``microbatch(...)``. Every rank sees identical data, so the averaged
-    gradient equals the single-rank gradient and losses must match. Both
-    ``zero_grad`` modes are covered: ``set_to_none=True`` overwrites main_grad,
-    ``set_to_none=False`` accumulates into a zeroed main_grad.
+    Gradients reduce-scatter within DP-inner every backward and accumulate into main_grad;
+    the DP-outer reduction (all-reduce for HSDP, reduce-scatter for HFSDP) runs only on the
+    last microbatch. overlap_dp_outer_communication moves that reduction to its own stream,
+    which changes where it executes, not what it computes -- so losses stay bit-identical to
+    the serialized path. Both zero_grad modes are covered.
     """
-    rank = distributed_setup.rank
     world_size = distributed_setup.world_size
     device = distributed_setup.device
-    if world_size < 4 or world_size % 2 != 0:
-        pytest.skip("This test requires an even number of at least 4 ranks for a 2-D DP mesh.")
-
-    outer_size = 2
-    inner_size = world_size // outer_size
-    mesh = init_device_mesh(
-        device.type, (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp_inner")
-    )
-    torch.manual_seed(1234)
-    dim = 8
-    baseline = MultiChildModel(dim=dim, num_children=2).to(device)
-    model = MultiChildModel(dim=dim, num_children=2).to(device)
-    model.load_state_dict(baseline.state_dict())
-
-    with fully_shard_context(device=device) as context:
-        for layer in model.layers:
-            fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
-        fully_shard(model, mesh=mesh, placements=_hsdp_placements())
-    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-
-    micro_batch_size = 2
-    x = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
-    target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
-    microbatches = tuple(zip(x.unbind(), target.unbind()))
-
-    def train(model, optimizer, log_prefix) -> list[torch.Tensor]:
-        losses = []
-        for step in range(5):
-            optimizer.zero_grad(set_to_none=set_to_none)
-
-            for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
-                is_last = microbatch_index == num_microbatches - 1
-                with microbatch(context, is_last=is_last):
-                    loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
-                    (loss / num_microbatches).backward()
-                losses.append(loss.detach())
-                logger.debug(
-                    "%s train parity: rank=%s, step=%s, microbatch=%s, loss=%s",
-                    log_prefix,
-                    rank,
-                    step,
-                    microbatch_index,
-                    loss,
-                )
-
-            optimizer.step()
-        return losses
-
-    baseline_losses = train(baseline, baseline_optimizer, "Baseline")
-    sharded_losses = train(model, optimizer, "HSDP")
-
-    torch.testing.assert_close(
-        torch.stack(sharded_losses),
-        torch.stack(baseline_losses),
-        msg="HSDP losses did not match baseline losses.",
-    )
-
-
-@pytest.mark.parametrize("set_to_none", [True, False])
-@pytest.mark.parametrize("num_microbatches", [1, 3])
-def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to_none):
-    """HFSDP (optimizer sharded across DP-outer too) training should match single-rank SGD."""
-    rank = distributed_setup.rank
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-    # world_size=2 gives a 2x1 mesh: DP-inner is trivial but the DP-outer
-    # reduce-scatter finalize and the fresh-buffer reset still run and converge.
     if world_size % 2 != 0:
         pytest.skip("This test requires an even number of ranks for a 2-D DP mesh.")
 
@@ -438,24 +374,21 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
     mesh = init_device_mesh(
         device.type, (outer_size, inner_size), mesh_dim_names=("dp_outer", "dp_inner")
     )
+    placements = placements_factory()
     torch.manual_seed(1234)
     dim = 8
     baseline = MultiChildModel(dim=dim, num_children=2).to(device)
     model = MultiChildModel(dim=dim, num_children=2).to(device)
     model.load_state_dict(baseline.state_dict())
 
-    # Shard the child layers, then the model, so the children share a root context
-    # and reduce through the overlap path instead of as independent roots.
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(device=device, overlap_dp_outer_communication=overlap) as context:
         for layer in model.layers:
-            fully_shard(layer, mesh=mesh, placements=_hfsdp_placements())
-        fully_shard(model, mesh=mesh, placements=_hfsdp_placements())
+            fully_shard(layer, mesh=mesh, placements=placements)
+        fully_shard(model, mesh=mesh, placements=placements)
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-    # HFSDP's optimizer placement [Shard(0), Shard(0)] differs from the parameter placement
-    # [Replicate, Shard(0)], so main_weight and model_weight are distinct buffers and the
-    # compute weight is stale until the step post-hook registered here refreshes it.
-    # HSDP needs no wrapper: its two placements match, so the buffers alias.
+    # A no-op for HSDP (aliased weights) and required for HFSDP, so wrap unconditionally
+    # to refresh the compute weight after each optimizer step.
     fully_shard_optimizer(optimizer)
 
     micro_batch_size = 2
@@ -463,36 +396,26 @@ def test_hfsdp_losses_match_baseline(distributed_setup, num_microbatches, set_to
     target = torch.randn(num_microbatches, micro_batch_size, dim, device=device)
     microbatches = tuple(zip(x.unbind(), target.unbind()))
 
-    def train(model, optimizer, log_prefix) -> list[torch.Tensor]:
+    def train(model, optimizer) -> list[torch.Tensor]:
         losses = []
-        for step in range(5):
+        for _ in range(5):
             optimizer.zero_grad(set_to_none=set_to_none)
-
             for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
                 is_last = microbatch_index == num_microbatches - 1
                 with microbatch(context, is_last=is_last):
                     loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                     (loss / num_microbatches).backward()
                 losses.append(loss.detach())
-                logger.debug(
-                    "%s train parity: rank=%s, step=%s, microbatch=%s, loss=%s",
-                    log_prefix,
-                    rank,
-                    step,
-                    microbatch_index,
-                    loss,
-                )
-
             optimizer.step()
         return losses
 
-    baseline_losses = train(baseline, baseline_optimizer, "Baseline")
-    sharded_losses = train(model, optimizer, "HFSDP")
+    baseline_losses = train(baseline, baseline_optimizer)
+    sharded_losses = train(model, optimizer)
 
     torch.testing.assert_close(
         torch.stack(sharded_losses),
         torch.stack(baseline_losses),
-        msg="HFSDP losses did not match baseline losses.",
+        msg="Losses did not match baseline losses.",
     )
 
 
