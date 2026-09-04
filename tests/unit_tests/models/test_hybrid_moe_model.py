@@ -109,6 +109,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dsa_indexer_topk_freq": 1,
     "dsa_indexer_weights_proj_use_quantization": True,
     "dsa_kernel_backend": "none",
+    "mtp_repeated_layer_shared_components": None,
     "embedding_init_method": {},
     "embedding_init_method_std": 0.014,
     "enable_autocast": False,

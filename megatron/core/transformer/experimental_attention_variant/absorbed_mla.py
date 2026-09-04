@@ -909,6 +909,14 @@ class AbsorbedMLASelfAttention(Attention):
         assert (
             inference_context is None and inference_params is None
         ), "Inference is not supported for AbsorbedMLA"
+        if (
+            getattr(self.core_attention, "mtp_cross_depth_share", False)
+            and self.checkpoint_core_attention
+            and self.training
+        ):
+            raise RuntimeError(
+                "Repeated-MTP cross-depth sharing does not support core_attn recompute."
+            )
 
         # Set the right cp group for dynamic-cp. Downstream RoPE and CSA core
         # attention use self.pg_collection.cp, which must point at this

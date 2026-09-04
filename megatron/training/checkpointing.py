@@ -1941,6 +1941,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('mtp_hybrid_override_pattern', force=True)
     _set_arg('mtp_num_layers', force=True)
     _set_arg('mtp_use_repeated_layer', force=True)
+    _set_arg('mtp_repeated_layer_shared_components', force=True)
 
     _set_arg('spec', force=True)
 

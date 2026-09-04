@@ -15,6 +15,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_dsa_module_spec_for_backend,
     get_experimental_attention_variant_module_spec,
 )
+from megatron.core.models.gpt.gpt_layer_specs import _validate_dsa_mtp_index_share_pipeline_split
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -114,6 +115,22 @@ class TestDSAIndexShareHelpers:
         with pytest.raises(RuntimeError, match="pipeline split is invalid"):
             _validate_dsa_index_share_pipeline_split(config, [1, 2, 3, 4])
 
+    def test_repeated_mtp_index_share_rejects_cross_segment_source(self):
+        config = SimpleNamespace(
+            experimental_attention_variant="dsa",
+            mtp_repeated_layer_shared_components=["sparse_attention_index"],
+            dsa_indexer_topk_freq=4,
+            dsa_indexer_skip_topk_offset=3,
+        )
+
+        _validate_dsa_mtp_index_share_pipeline_split(
+            config, local_decoder_layer_ids=[2], mtp_layer_number=4
+        )
+        with pytest.raises(RuntimeError, match="repeated-MTP IndexShare pipeline split"):
+            _validate_dsa_mtp_index_share_pipeline_split(
+                config, local_decoder_layer_ids=[], mtp_layer_number=4
+            )
+
     def test_skip_layer_does_not_build_indexer(self, monkeypatch):
         def fail_build_module(*_args, **_kwargs):
             raise AssertionError("skip layers must not build indexer modules")
@@ -126,6 +143,7 @@ class TestDSAIndexShareHelpers:
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
 
@@ -148,6 +166,7 @@ class TestDSAIndexShareHelpers:
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
         attention = DSAttention(
@@ -174,6 +193,7 @@ class TestDSAIndexShareHelpers:
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
         attention = DSAttention(

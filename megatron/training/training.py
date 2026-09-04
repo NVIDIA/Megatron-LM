@@ -482,20 +482,44 @@ def _dsa_indexer_flops(
     )
 
 
-def _num_dsa_indexer_layers(num_layers, skip_topk_offset, topk_freq):
-    """Count layers that compute their own DSA index (the rest reuse one).
+def _num_dsa_indexer_layers(
+    num_decoder_layers,
+    skip_topk_offset,
+    topk_freq,
+    *,
+    mtp_num_layers=0,
+    mtp_use_repeated_layer=False,
+    mtp_shares_sparse_attention_index=False,
+):
+    """Count DSA layer executions that compute their own top-k index.
 
-    On the standard-model path every layer is a DSA attention layer (MTP
-    layers included -- ``DSAttention.__init__`` numbers them
-    ``layer_number + config.num_layers``, which is exactly how the caller
-    extends ``num_layers``), so the predicate runs over the whole
-    ``1..num_layers`` range.
+    Decoder layers have distinct global layer numbers. Non-repeated MTP layers
+    do too, while every prediction depth of a repeated MTP layer uses the same
+    global layer number (``num_decoder_layers + 1``). If that repeated layer
+    shares its sparse-attention index, only depth 0 executes its indexer.
     """
-    return sum(
+    decoder_indexer_layers = sum(
         1
-        for layer_number in range(1, num_layers + 1)
+        for layer_number in range(1, num_decoder_layers + 1)
         if not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
     )
+    if mtp_num_layers <= 0:
+        return decoder_indexer_layers
+
+    if not mtp_use_repeated_layer:
+        return decoder_indexer_layers + sum(
+            1
+            for layer_number in range(
+                num_decoder_layers + 1, num_decoder_layers + mtp_num_layers + 1
+            )
+            if not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
+        )
+
+    repeated_mtp_layer_number = num_decoder_layers + 1
+    if is_dsa_skip_topk_layer(repeated_mtp_layer_number, skip_topk_offset or 0, topk_freq or 1):
+        return decoder_indexer_layers
+    repeated_mtp_indexer_executions = 1 if mtp_shares_sparse_attention_index else mtp_num_layers
+    return decoder_indexer_layers + repeated_mtp_indexer_executions
 
 
 def _dsv4_hybrid_self_attention_flops(
@@ -1062,6 +1086,11 @@ def num_floating_point_operations(
             mtp_num_layers = 0
             num_layers = args.num_layers
 
+        mtp_use_repeated_layer = getattr(args, "mtp_use_repeated_layer", False)
+        mtp_shared_components = frozenset(
+            getattr(args, "mtp_repeated_layer_shared_components", None) or ()
+        )
+
         moe_ffn_hidden_size = (
             args.moe_ffn_hidden_size
             if args.moe_ffn_hidden_size is not None
@@ -1356,7 +1385,14 @@ def num_floating_point_operations(
                 n_heads=args.dsa_indexer_n_heads,
                 head_dim=args.dsa_indexer_head_dim,
                 num_indexer_layers=_num_dsa_indexer_layers(
-                    num_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
+                    args.num_layers,
+                    args.dsa_indexer_skip_topk_offset,
+                    args.dsa_indexer_topk_freq,
+                    mtp_num_layers=mtp_num_layers,
+                    mtp_use_repeated_layer=mtp_use_repeated_layer,
+                    mtp_shares_sparse_attention_index=(
+                        "sparse_attention_index" in mtp_shared_components
+                    ),
                 ),
                 indexer_loss_coeff=args.dsa_indexer_loss_coeff,
             )
@@ -1488,8 +1524,7 @@ def num_floating_point_operations(
         # ``kw_args``, never back onto ``args``), so the attribute alone misses
         # exactly the runs this guard exists for.
         assert (
-            args.experimental_attention_variant != "dsa"
-            and layer_counts[Symbols.DS_ATTENTION] == 0
+            args.experimental_attention_variant != "dsa" and layer_counts[Symbols.DS_ATTENTION] == 0
         ), (
             "num_floating_point_operations does not support DSA "
             "('D' layers / experimental_attention_variant='dsa') on the "
@@ -1663,6 +1698,7 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
+
             # Treat missing and explicit None identifier values as equivalent.
             # Wrap each component so None never compares directly with floats or strings.
             def key_fn(pg):
@@ -1670,6 +1706,7 @@ def preprocess_common_state_dict(common_state_dict):
                     (value is not None, value)
                     for value in (pg.get(key) for key in param_group_identifier_keys)
                 ]
+
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
@@ -5116,7 +5153,7 @@ def evaluate(
             ft_integration.on_eval_step_start()
             if getattr(config, 'sequence_packing_scheduler', None) is not None:
                 try:
-                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                    packed_data_iterator, scheduled_eval_num_microbatches, _, _ = (
                         wrap_data_iterator(data_iterator, config, eval_num_microbatches)
                     )
                 except StopIteration:
@@ -5414,7 +5451,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
     args = get_args()
 
-    (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
+    train_dataloader, valid_dataloaders, test_dataloader = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
 
