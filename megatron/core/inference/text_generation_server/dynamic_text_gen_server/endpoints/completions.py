@@ -305,11 +305,16 @@ try:
             if num_tokens_requested is None or len(generated_tokens) < num_tokens_requested:
                 finish_reason = "stop"
 
+            # Under payload offload the engine dropped the per-token log probs from the reply,
+            # so the OpenAI logprobs block is absent.
+            payload_offloaded = bool(result.get("payload_offloaded"))
+
             # Clamped: processed logprobs can be -inf, which JSON cannot carry.
             generated_log_probs = json_safe_logprobs(result.get('generated_log_probs') or [])
 
             logprobs_data = None
-            if sampling_params.return_log_probs:
+            if sampling_params.return_log_probs and not payload_offloaded:
+                # Get prompt tokens and logprobs
                 prompt_tokens_list = result["prompt_tokens"] or []
 
                 prompt_log_probs = json_safe_logprobs(result.get('prompt_log_probs') or [])
@@ -380,8 +385,9 @@ try:
                 "finish_reason": finish_reason,
                 "prompt_token_ids": result["prompt_tokens"],
                 "generation_token_ids": result["generated_tokens"],
-                "generation_log_probs": generated_log_probs,
             }
+            if not payload_offloaded:
+                choice_data["generation_log_probs"] = generated_log_probs
 
             if result["routing_indices"] is not None:
                 choice_data["moe_topk_indices"] = result["routing_indices"]

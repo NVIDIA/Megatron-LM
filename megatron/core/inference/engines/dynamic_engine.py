@@ -46,6 +46,8 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
     FinishedRequestRecord,
+    OffloadedRequestPayload,
+    RequestPayloadStager,
     Status,
     compute_media_cache_key,
     merge_multimodal_data,
@@ -389,6 +391,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self._initialize_disaggregation_state()
         # Initialize engine.
         self.reset()
+
+        # Payload offload: with a stager attached, each completed request's per-token payload
+        # (log probs, MoE routing indices, token ids) is handed to stage() and dropped from the
+        # reply instead of riding the RESTful API. Consumer-owned, so it survives reset().
+        self.payload_stager: Optional[RequestPayloadStager] = None
 
         # Set callback for getting stop word finished request IDs
         self.controller.set_stop_word_finished_ids_callback(
@@ -1341,19 +1348,22 @@ class DynamicInferenceEngine(AbstractEngine):
         """Send completed or failed request records from the MP coordinator."""
 
         merged_requests = [record.merge() for record in records]
-        if self.local_metadata_ledger_enabled:
-            # Failed requests are sent immediately but remain in the engine until the
-            # next bookkeeping pass. Index only completed requests as they are dropped.
-            for merged in merged_requests:
-                if merged.status == Status.FAILED:
-                    continue
+        # Failed requests are sent immediately but remain in the engine until the next
+        # bookkeeping pass; only completed requests are indexed and staged.
+        # A reply is stripped only when its payload was staged.
+        serialized = []
+        for merged in merged_requests:
+            completed = merged.status != Status.FAILED
+            if completed and self.local_metadata_ledger_enabled:
                 assert (
                     merged.uid not in self.local_metadata_ledger
                 ), f"finished-request ledger: duplicate uid {merged.uid!r}"
                 self.local_metadata_ledger[merged.uid] = FinishedRequestRecord.from_request(merged)
-        self.socket_for_receiving_requests.send_multipart(
-            _engine_reply_frames([request.serialize() for request in merged_requests])
-        )
+            offloaded = completed and self.payload_stager is not None
+            if offloaded:
+                self.payload_stager.stage(merged.uid, OffloadedRequestPayload.from_request(merged))
+            serialized.append(merged.serialize(payload_offloaded=offloaded))
+        self.socket_for_receiving_requests.send_multipart(_engine_reply_frames(serialized))
 
     def _handle_failed_request(self, request_id: int):
         """Handle a failed request by sending the reply immediately.

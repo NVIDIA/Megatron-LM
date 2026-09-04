@@ -13,6 +13,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     FinishedRequestRecord,
     InferenceRequest,
+    OffloadedRequestPayload,
     compute_block_hashes_batched,
     deserialize_ndarray,
     deserialize_tensor,
@@ -538,3 +539,43 @@ def test_supplied_block_hashes_are_not_re_salted():
         block_hash_salt="w9",
     )
     assert request.precomputed_block_hashes == [11, 22]
+
+
+def test_offloaded_request_payload_and_serialize():
+    """The payload copies a finished request's per-token data as plain host-side lists;
+    serialize(payload_offloaded=True) drops that data from the wire, marks the reply, and
+    restores local state; defaults are unchanged."""
+    routing = np.array([[1], [2], [3], [4]])  # total_tokens - 1 rows
+
+    def make_request():
+        req = DynamicInferenceRequest(
+            request_id=7,
+            prompt_tokens=torch.tensor([1, 2, 3]),
+            sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=0),
+            generated_tokens=[10, 11],
+        )
+        req.generated_log_probs = [-0.5, -0.25]
+        req.prompt_log_probs = torch.tensor([-1.0, -2.0])
+        req.routing_indices = routing
+        return req
+
+    req = make_request()
+    payload = OffloadedRequestPayload.from_request(req)
+    assert payload.prompt_token_ids == [1, 2, 3]
+    assert payload.generated_token_ids == [10, 11]
+    assert payload.generated_log_probs == [-0.5, -0.25]
+    assert payload.prompt_log_probs == [-1.0, -2.0]  # coerced from tensor
+    assert payload.routing_indices is routing
+
+    obj = req.serialize(payload_offloaded=True)
+    assert obj["payload_offloaded"] is True
+    assert obj["generated_log_probs"] is None
+    assert obj["prompt_log_probs"] is None and obj["routing_indices"] is None
+    assert obj["generated_tokens"] == [10, 11]  # token ids stay: they are the response
+    # The drop is wire-only: local state is restored after the send.
+    assert req.generated_log_probs == [-0.5, -0.25] and req.routing_indices is routing
+
+    obj = make_request().serialize()
+    assert obj["payload_offloaded"] is False
+    assert obj["generated_log_probs"] == [-0.5, -0.25]
+    assert obj["routing_indices"][0] == "ndarray"
