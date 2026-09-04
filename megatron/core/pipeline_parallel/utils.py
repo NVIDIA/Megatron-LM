@@ -289,23 +289,22 @@ class ScheduleNode:
         grads = self.get_grad()
 
         if self.lifetime_manager is not None:
+            # These gradients come from detach bridges outside the lifetime
+            # manager's producer/consumer chain, so retain the allocator fallback.
             if isinstance(consumed_grads, tuple):
-                additional_consumed_grads = consumed_grads[len(output_grad) :]
-            elif consumed_grads is None:
-                additional_consumed_grads = ()
-            else:
-                additional_consumed_grads = (consumed_grads,)
+                if len(consumed_grads) > len(output_grad):
+                    for grad in consumed_grads[len(output_grad) :]:
+                        if grad is not None:
+                            grad.record_stream(self.stream)
+            elif consumed_grads is not None:
+                consumed_grads.record_stream(self.stream)
 
             # A recompute segment's final forward output is consumed by autograd
             # rather than another forward node, so its owner metadata ends here.
             self.lifetime_manager.consume_forward_outputs(self.output)
             lifetime_output_grads = output_grad[0] if len(output_grad) == 1 else output_grad
             self.lifetime_manager.consume_output_grads_and_publish_input_grads(
-                lifetime_output_grads,
-                grads,
-                stream=self.stream,
-                node=node_name,
-                additional_consumed_grads=additional_consumed_grads,
+                lifetime_output_grads, grads, stream=self.stream, node=node_name
             )
         elif consumed_grads:
             # Gradients may have been produced on another stream.

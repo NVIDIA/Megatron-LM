@@ -55,9 +55,12 @@ def _stream_key(stream: torch.cuda.Stream) -> StreamKey:
     return stream.device, int(stream.cuda_stream)
 
 
-def _iter_unique_cuda_tensors(values: Iterable[Any]) -> Iterable[torch.Tensor]:
-    """Yield unique CUDA tensors from a flat, structured schedule edge."""
+def _iter_unique_cuda_tensors(value: Any) -> Iterable[torch.Tensor]:
+    """Yield unique CUDA tensors from one tensor or a flat schedule edge."""
 
+    values = (value,) if isinstance(value, torch.Tensor) else value
+    if not values:
+        return
     seen = set()
     for tensor in values:
         if not isinstance(tensor, torch.Tensor):
@@ -75,8 +78,9 @@ class ScheduleTensorLifetimeManager:
     Ownership follows concrete tensor objects rather than schedule-node input
     slots.  Bindings are strong and single-consumer: a real node consumes each
     input binding once, while ``NoopScheduleNode`` naturally carries the same
-    object and binding to the next real node.  The schedule's existing
-    ``free_input`` contract guarantees that retired inputs do not alias outputs.
+    object and binding to the next real node.  Storage aliases among tensors
+    participating in one real-node transition are unsupported: combined EFVPA
+    nodes must return fresh storage so tensor-object ownership remains unambiguous.
     """
 
     def __init__(self):
@@ -125,77 +129,26 @@ class ScheduleTensorLifetimeManager:
 
         action = ReleaseAction.EMPTY_STORAGE if retire_consumed else None
         stream_key = _stream_key(stream)
-        if isinstance(consumed, torch.Tensor):
-            if consumed.is_cuda:
-                self._consume_tensor(consumed, action, stream, stream_key)
-        else:
-            self._consume_structured(consumed, action, stream, stream_key)
-        if isinstance(produced, torch.Tensor):
-            if produced.is_cuda:
-                self._publish_tensor(produced, stream, stream_key, node)
-        else:
-            self._publish_structured(produced, stream, stream_key, node)
+        self._consume_and_publish(consumed, produced, action, stream, stream_key, node)
 
     def consume_forward_outputs(self, forward_outputs: Any) -> None:
         """End owner bindings for forward outputs retained and consumed by autograd."""
 
-        if isinstance(forward_outputs, torch.Tensor):
-            if forward_outputs.is_cuda:
-                self._consume_tensor(forward_outputs, None, None, None)
-        else:
-            self._consume_structured(forward_outputs, None, None, None)
+        self._consume(forward_outputs, None, None, None)
 
     def consume_output_grads_and_publish_input_grads(
-        self,
-        output_grads: Any,
-        input_grads: Any,
-        *,
-        stream: torch.cuda.Stream,
-        node: str,
-        additional_consumed_grads: tuple[Any, ...] = (),
+        self, output_grads: Any, input_grads: Any, *, stream: torch.cuda.Stream, node: str
     ) -> None:
         """Retire output grads and publish input grads produced by one backward node."""
 
         stream_key = _stream_key(stream)
-        if isinstance(output_grads, torch.Tensor):
-            if output_grads.is_cuda:
-                self._consume_tensor(output_grads, ReleaseAction.DROP_REFERENCE, stream, stream_key)
-        else:
-            self._consume_structured(output_grads, ReleaseAction.DROP_REFERENCE, stream, stream_key)
-        if additional_consumed_grads:
-            if len(additional_consumed_grads) == 1 and isinstance(
-                additional_consumed_grads[0], torch.Tensor
-            ):
-                additional_grad = additional_consumed_grads[0]
-                if additional_grad.is_cuda:
-                    self._record_tensor_stream(additional_grad, stream)
-            else:
-                self._record_stream(additional_consumed_grads, stream)
-        if isinstance(input_grads, torch.Tensor):
-            if input_grads.is_cuda:
-                self._publish_tensor(input_grads, stream, stream_key, node)
-        else:
-            self._publish_structured(input_grads, stream, stream_key, node)
-
-    def publish(self, value: Any, stream: torch.cuda.Stream, node: str) -> None:
-        """Bind tensors produced by a real schedule node to its execution stream."""
-
-        stream_key = _stream_key(stream)
-        if isinstance(value, torch.Tensor):
-            if value.is_cuda:
-                self._publish_tensor(value, stream, stream_key, node)
-            return
-        self._publish_structured(value, stream, stream_key, node)
+        self._consume_and_publish(
+            output_grads, input_grads, ReleaseAction.DROP_REFERENCE, stream, stream_key, node
+        )
 
     def export(self, value: Any) -> None:
         """Move plan outputs outside manager ownership without retiring their storage."""
 
-        if isinstance(value, torch.Tensor):
-            if value.is_cuda:
-                self._export_tensor(value)
-            return
-        if not value:
-            return
         for tensor in _iter_unique_cuda_tensors(value):
             self._export_tensor(tensor)
 
@@ -239,7 +192,38 @@ class ScheduleTensorLifetimeManager:
                 f"bindings from producers {producers}"
             )
 
-    def _consume_structured(
+    def _consume_and_publish(
+        self,
+        consumed: Any,
+        produced: Any,
+        action: Optional[ReleaseAction],
+        stream: torch.cuda.Stream,
+        stream_key: StreamKey,
+        node: str,
+    ) -> None:
+        """Consume one edge and publish the next, rejecting storage aliases."""
+
+        consumed_tensors = tuple(_iter_unique_cuda_tensors(consumed))
+        produced_tensors = tuple(_iter_unique_cuda_tensors(produced))
+
+        # EMPTY_STORAGE releases the entire storage, so tensor-object bindings
+        # cannot safely represent even disjoint views of the same allocation.
+        edge_tensors = consumed_tensors + produced_tensors
+        for tensor_index, tensor in enumerate(edge_tensors):
+            for prior_index in range(tensor_index):
+                if torch._C._is_alias_of(edge_tensors[prior_index], tensor):
+                    raise RuntimeError(
+                        f"Node {node!r} passed multiple tensor objects sharing one storage; "
+                        "scheduled tensor lifetime management does not support storage aliases"
+                    )
+
+        for tensor in consumed_tensors:
+            self._consume_tensor(tensor, action, stream, stream_key)
+
+        for tensor in produced_tensors:
+            self._publish_tensor(tensor, stream, stream_key, node)
+
+    def _consume(
         self,
         value: Any,
         action: Optional[ReleaseAction],
@@ -280,28 +264,6 @@ class ScheduleTensorLifetimeManager:
             return None
         self._owners.pop(tensor_id)
         return owner
-
-    def _record_stream(self, tensors: Any, stream: torch.cuda.Stream) -> None:
-        if isinstance(tensors, torch.Tensor):
-            if tensors.is_cuda:
-                self._record_tensor_stream(tensors, stream)
-            return
-        if not tensors:
-            return
-        for tensor in _iter_unique_cuda_tensors(tensors):
-            self._record_tensor_stream(tensor, stream)
-
-    def _record_tensor_stream(self, tensor: torch.Tensor, stream: torch.cuda.Stream) -> None:
-        tensor.record_stream(stream)
-        self.stats["record_stream_fallback"] += 1
-
-    def _publish_structured(
-        self, value: Any, stream: torch.cuda.Stream, stream_key: StreamKey, node: str
-    ) -> None:
-        if not value:
-            return
-        for tensor in _iter_unique_cuda_tensors(value):
-            self._publish_tensor(tensor, stream, stream_key, node)
 
     def _publish_tensor(
         self, tensor: torch.Tensor, stream: torch.cuda.Stream, stream_key: StreamKey, node: str
