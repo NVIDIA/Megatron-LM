@@ -35,6 +35,7 @@ from megatron.core.transformer.cuda_graph_config import (
     validate_moe_cuda_graph_support,
 )
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.experimental_attention_variant import dsa_logging
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
@@ -1763,6 +1764,11 @@ class TECudaGraphHelper:
     parameters that are covered by cudagraphs.
     """
 
+    # Subclasses that capture a disjoint module (for example, a vision encoder) must opt out:
+    # scanning their full parent model can discover language-model DSA writers whose tracker
+    # storage is not referenced by the subclass's graphs.
+    _captures_dsa_metric_tracker = True
+
     def __init__(
         self,
         model,
@@ -1813,6 +1819,7 @@ class TECudaGraphHelper:
         #   layers found)
         self._capture_finished = False
         self._graphs_created = False
+        self._dsa_metric_tracker_prepared = False
         # [fwd, bwd] positions of every sample input in the capture ``_order``,
         # keyed like sample_args. Static inputs may share an address only when
         # their liveness windows are disjoint; capture validates this for the
@@ -2666,6 +2673,8 @@ class TECudaGraphHelper:
         for optimizer in self.optimizers:
             optimizer.zero_grad()
         get_moe_metrics_tracker().clear()
+        if self._dsa_metric_tracker_prepared:
+            dsa_logging.DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
         reset_model_temporary_tensors(self.config, self.model)
 
     def _finish_capturing(self, start_time):
@@ -2715,6 +2724,14 @@ class TECudaGraphHelper:
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
         validate_moe_cuda_graph_support(self.config)
+        # TE supports capture without eager warmup. Scan the full local model (including
+        # non-graphable hybrid/MTP internals), then PP-negotiate one final tracker storage before
+        # any layer graph records a pointer to it.
+        self._dsa_metric_tracker_prepared = False
+        if self._captures_dsa_metric_tracker:
+            self._dsa_metric_tracker_prepared = (
+                dsa_logging.prepare_dsa_metric_tracker_for_capture(self.model, self.pp_group) > 0
+            )
         start_time = self._start_capturing()
 
         if not self.flattened_callables:
@@ -2783,6 +2800,11 @@ class TECudaGraphHelper:
             self._graphs_created = True
 
         self._finish_capturing(start_time)
+        if self._dsa_metric_tracker_prepared and not self._graphs_created:
+            # No graph retains the prepared tracker storage on this rank, and train() only
+            # calls delete_cuda_graphs() when graphs_created() is true.
+            dsa_logging.clear_dsa_metric_tracker_capture_state()
+            self._dsa_metric_tracker_prepared = False
 
     def cuda_graph_set_manual_hooks(self):
         """
@@ -2824,6 +2846,9 @@ class TECudaGraphHelper:
             f'{graphs_not_reset} graphs deleted without explicit reset.',
         )
         self._graphs_created = False
+        if self._dsa_metric_tracker_prepared:
+            dsa_logging.clear_dsa_metric_tracker_capture_state()
+            self._dsa_metric_tracker_prepared = False
 
 
 def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, schedule_table):
@@ -3096,6 +3121,10 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
             since the vision encoder always uses batch-dim = 1).
         num_microbatches: Number of microbatches per step.
     """
+
+    # Vision graphs do not execute language-model DSA/CSA writers even though ``model`` is the
+    # full multimodal model. Their lifecycle must not prepare or clear the language tracker.
+    _captures_dsa_metric_tracker = False
 
     def __init__(
         self,
