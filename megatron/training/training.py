@@ -43,7 +43,7 @@ _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core import mpu, nccl_allocator, tensor_parallel
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
+from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -261,6 +261,7 @@ stimer = StragglerDetector()
 # never call ``update_*`` so the flag stays ``False`` and no collective fires.
 _seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
+_seqlen_stats_are_global: bool = False
 
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
@@ -728,7 +729,7 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     the all-reduce; BSHD callers that never invoke this function leave the
     flag at ``False`` and pay zero collective cost.
     """
-    global _seqlen_stats_in_iteration, _seqlen_stats_active
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if cu_seqlens is None or cu_seqlens.numel() < 2:
         return
     # Pin the accumulator to the current CUDA device when available so the
@@ -747,6 +748,21 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     _seqlen_stats_in_iteration[0] += seqlens.sum()
     _seqlen_stats_in_iteration[1] += (seqlens * seqlens).sum()
     _seqlen_stats_active = True
+    _seqlen_stats_are_global = False
+
+
+def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
+    """Seed per-iteration THD FLOPs stats that were already computed globally."""
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
+    if total_real_tokens is None or seqlen_squared_sum is None:
+        return
+    if _seqlen_stats_in_iteration is None:
+        device = torch.device(f'cuda:{torch.cuda.current_device()}') if torch.cuda.is_available() else 'cpu'
+        _seqlen_stats_in_iteration = torch.zeros(2, dtype=torch.float64, device=device)
+    _seqlen_stats_in_iteration[0] = float(total_real_tokens)
+    _seqlen_stats_in_iteration[1] = float(seqlen_squared_sum)
+    _seqlen_stats_active = True
+    _seqlen_stats_are_global = True
 
 
 def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float]]:
@@ -774,13 +790,15 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     replicated across TP/CP/PP); the world all-reduce therefore overcounts by a
     factor of ``TP * CP * PP``, which we divide out.
     """
-    global _seqlen_stats_in_iteration, _seqlen_stats_active
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if not _seqlen_stats_active:
         # BSHD path: never allocated the tensor; tell the caller to use the
         # closed-form defaults.
         return None, None
     t = _seqlen_stats_in_iteration
-    if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
+    if _seqlen_stats_are_global:
+        dedup = 1
+    elif torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
         torch.distributed.all_reduce(t)
         tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
         cp_size = max(mpu.get_context_parallel_world_size(), 1)
@@ -796,6 +814,7 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     # iterations reuse it without reallocating.
     t.zero_()
     _seqlen_stats_active = False
+    _seqlen_stats_are_global = False
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
 
 
@@ -2346,6 +2365,48 @@ def _freeze_all_model_chunks(model_list):
     return model_list
 
 
+def _freeze_base_model_for_mtp(model_list):
+    """Freeze backbone parameters and router bias updates while keeping MTP trainable."""
+    frozen_params = 0
+    trainable_params = 0
+    frozen_router_biases = 0
+
+    for model_module in model_list:
+        for name, param in model_module.named_parameters():
+            is_mtp_parameter = 'mtp.layers.' in name
+            param.requires_grad_(is_mtp_parameter)
+            if is_mtp_parameter:
+                trainable_params += param.numel()
+            else:
+                frozen_params += param.numel()
+
+        for name, module in model_module.named_modules():
+            if hasattr(module, 'expert_bias'):
+                freeze_router_bias = 'mtp.layers.' not in name
+                module.frozen_expert_bias = freeze_router_bias
+                if freeze_router_bias:
+                    frozen_router_biases += 1
+
+    print_rank_0(
+        f'[freeze-base-model-for-mtp] Frozen {frozen_params:,} backbone parameters and '
+        f'{frozen_router_biases:,} backbone router expert-bias buffers. '
+        f'Trainable MTP parameters: {trainable_params:,}.'
+    )
+    return model_list
+
+
+def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_base_model_for_mtp):
+    """Install the requested freeze hook before a config-built model is wrapped."""
+    freeze_hook = None
+    if freeze_all_layers:
+        freeze_hook = _freeze_all_model_chunks
+    elif freeze_base_model_for_mtp:
+        freeze_hook = _freeze_base_model_for_mtp
+
+    if freeze_hook is not None and freeze_hook not in model_config.pre_wrap_hooks:
+        model_config.pre_wrap_hooks.append(freeze_hook)
+
+
 def _forward_backward_grad_context(args):
     """Grad context for a train step's forward/backward pass.
 
@@ -2434,6 +2495,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
         _freeze_all_model_chunks(model)
+    elif args.freeze_base_model_for_mtp:
+        _freeze_base_model_for_mtp(model)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -2701,10 +2764,13 @@ def setup_model_and_optimizer(
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
 
-            # Inject freeze_all_layers as a pre-wrap hook so DDP sees requires_grad=False
-            # and skips grad-buffer allocation for all params (matching get_model behavior).
-            if args.freeze_all_layers:
-                model_config.pre_wrap_hooks.append(_freeze_all_model_chunks)
+            # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
+            # gradient storage for parameters that remain trainable (matching get_model behavior).
+            _add_model_freeze_pre_wrap_hook(
+                model_config,
+                freeze_all_layers=args.freeze_all_layers,
+                freeze_base_model_for_mtp=args.freeze_base_model_for_mtp,
+            )
 
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
@@ -3094,6 +3160,20 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 for optim_instance in mxfp8_overlap_optimizers:
                     optim_instance._copy_main_params_to_param_buffer()
 
+        if getattr(config, "sequence_packing_scheduler", None) is not None:
+            (
+                data_iterator,
+                scheduled_num_microbatches,
+                total_real_tokens_in_batch,
+                seqlen_squared_sum_in_batch,
+            ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
+            set_seqlen_stats_in_iteration(
+                total_real_tokens_in_batch,
+                seqlen_squared_sum_in_batch,
+            )
+        else:
+            scheduled_num_microbatches = get_num_microbatches()
+
         # Forward pass.
         if save_activations_in_this_iteration:
             enable_activation_logging(model, args.save)
@@ -3103,7 +3183,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_dgrad_logging(model, args.save)
         grad_context, forward_only = _forward_backward_grad_context(args)
         _fb_cm = (
-            span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, num_microbatches=get_num_microbatches())
+            span_cm("megatron.train.iteration.forward_backward", tracer=_otel_step_tracer, num_microbatches=scheduled_num_microbatches)
             if _otel_sg_enabled('forward_backward') and _otel_step_tracer is not None else nullcontext()
         )
         with grad_context, _fb_cm:
@@ -3111,7 +3191,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
-                num_microbatches=get_num_microbatches(),
+                num_microbatches=scheduled_num_microbatches,
                 seq_length=args.seq_length,
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
@@ -4709,6 +4789,9 @@ def train(
 
         # Completely skip iteration if needed.
         if (iteration + 1) in args.iterations_to_skip:
+            assert (
+                getattr(config, "sequence_packing_scheduler", None) is None
+            ), "Sequence packing scheduler is not supported in skip iteration mode"
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
             if iteration == start_iteration:
@@ -5250,13 +5333,23 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
+            if getattr(config, "sequence_packing_scheduler", None) is not None:
+                try:
+                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
+                        wrap_data_iterator(data_iterator, config, eval_num_microbatches)
+                    )
+                except StopIteration:
+                    break
+            else:
+                packed_data_iterator = data_iterator
+                scheduled_eval_num_microbatches = eval_num_microbatches
             with _otel_managed_span('evaluate', 'megatron.evaluate.step',
                                     **{'megatron.eval_iteration': iteration}):
                 loss_dicts = forward_backward_func(
                     forward_step_func=forward_step_func,
-                    data_iterator=data_iterator,
+                    data_iterator=packed_data_iterator,
                     model=model,
-                    num_microbatches=eval_num_microbatches,
+                    num_microbatches=scheduled_eval_num_microbatches,
                     seq_length=args.seq_length,
                     micro_batch_size=eval_micro_batch_size,
                     decoder_seq_length=args.decoder_seq_length,

@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core.context_parallel import ContextParallelBatch, convert_cp_layout
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -46,6 +47,7 @@ from megatron.core.utils import (
 )
 
 if TYPE_CHECKING:
+    from megatron.core.context_parallel import CPLayout, THDCPLayoutPlan
     from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 
 if is_torch_min_version("1.13.0"):
@@ -334,6 +336,9 @@ def _roll_tensor_packed_seq(
     assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
     cu_seqlens = packed_seq_params.cu_seqlens_q
     assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
+    physical_cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+    if physical_cu_seqlens is None:
+        physical_cu_seqlens = cu_seqlens
 
     rolled_tensor = tensor.clone()
 
@@ -341,13 +346,16 @@ def _roll_tensor_packed_seq(
     if cp_size == 1:
         # CP disabled: roll each packed sequence independently within its boundaries
         for i in range(len(cu_seqlens) - 1):
-            start_idx = cu_seqlens[i]
-            end_idx = cu_seqlens[i + 1]
+            start_idx = physical_cu_seqlens[i]
+            valid_length = cu_seqlens[i + 1] - cu_seqlens[i]
+            end_idx = start_idx + valid_length
+            physical_end_idx = physical_cu_seqlens[i + 1]
             seq_slice = tensor[..., start_idx:end_idx]
             rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=dims)
             # Zero out the last position(s) that would cross sequence boundaries
             rolled_seq[..., shifts:] = 0
             rolled_tensor[..., start_idx:end_idx] = rolled_seq
+            rolled_tensor[..., end_idx:physical_end_idx] = 0
         rolled_sum = rolled_tensor.sum() if return_sum else None
         return rolled_tensor, rolled_sum
 
@@ -359,8 +367,8 @@ def _roll_tensor_packed_seq(
 
     # Iterate over each sequence individually
     for i in range(len(cu_seqlens) - 1):
-        start_idx = cu_seqlens[i]
-        end_idx = cu_seqlens[i + 1]
+        start_idx = physical_cu_seqlens[i]
+        end_idx = physical_cu_seqlens[i + 1]
 
         # the idx has been multiplied by cp_size, need to divide it by cp_size to get the local idx
         local_start_idx = start_idx // cp_size
@@ -993,6 +1001,7 @@ def process_mtp_loss(
     input_ids: Optional[Tensor] = None,
     mtp_input_mask: Optional[Tensor] = None,
     metric_avg_group: Optional[torch.distributed.ProcessGroup] = None,
+    main_hidden_states: Optional[Tensor] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -1022,12 +1031,14 @@ def process_mtp_loss(
             additional MTP conditioning inputs. The mask accumulates across prediction
             steps so a path stays masked after it reaches an invalid token.
         metric_avg_group (Optional[ProcessGroup]): Group used to average MTP logging metrics.
+        main_hidden_states (Optional[Tensor]): Hidden states returned to the main model.
+            Defaults to the first chunk of ``hidden_states``.
 
     Returns:
-        Tensor: Updated hidden states after MTP loss processing (first chunk only).
+        Tensor: Main-model hidden states with the MTP loss attached.
     """
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
-    hidden_states = hidden_states_list[0]
+    hidden_states = hidden_states_list[0] if main_hidden_states is None else main_hidden_states
 
     # When labels are not provided (e.g. RL training), derive them from input_ids by
     # rolling left so that label[i] = input_id[i + 1], matching the SFT label format.
@@ -1363,6 +1374,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 post_process=True,  # MTP layer is self-contained
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
+                boundary_layout=self.config.attention_cp_layout,
                 name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:
@@ -1586,6 +1598,8 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[torch.Tensor] = None,
+        packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
+        cp_layout_plan: Optional[THDCPLayoutPlan] = None,
     ) -> torch.Tensor:
         """
         Concatenates embeddings with hidden states and then applies transformer layer forward.
@@ -1621,6 +1635,8 @@ class MultiTokenPredictionLayer(MegatronModule):
                         rotary_pos_emb=rotary_pos_emb,
                         inference_context=inference_params,
                         packed_seq_params=packed_seq_params,
+                        packed_seq_params_by_layout=packed_seq_params_by_layout,
+                        cp_layout_plan=cp_layout_plan,
                     )
                 else:
                     # GPT path: single TransformerLayer
@@ -1728,20 +1744,15 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
+        cp_layout_plan: Optional[THDCPLayoutPlan] = None,
     ):
         """Forward a legacy GPT MTP layer with activation recomputation.
 
         Mirrors ``transformer_block._checkpointed_forward``:
 
-        * Non-tensor objects (``attention_bias``, ``inference_params``,
-          ``packed_seq_params``) are captured by the ``custom_forward``
-          closure; only tensor / ``None`` arguments flow positionally
-          through the underlying checkpoint primitive. This is required
-          by both backends: ``tensor_parallel.checkpoint`` because its
-          ``save_for_backward`` only accepts tensors and ``None``, and
-          ``te_checkpoint`` because its reentrant implementation only
-          tracks positional tensor inputs as checkpoint inputs (kwarg
-          tensors are not represented in the recompute backward path).
+        * Non-tensor objects are captured by the ``custom_forward`` closure; only tensor / ``None``
+          arguments flow positionally through the underlying checkpoint primitive.
         * Quantized recipes (fp8, fp4) route through ``te_checkpoint``;
           everything else uses ``tensor_parallel.checkpoint``.
         * Only ``fp8 + delayed scaling`` needs an outer quantization
@@ -1779,6 +1790,8 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                packed_seq_params_by_layout=packed_seq_params_by_layout,
+                cp_layout_plan=cp_layout_plan,
             )
 
         # Decide the outer quantization context, matching
@@ -1828,8 +1841,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 # tensor_parallel.checkpoint stashes args via autograd's
                 # ``save_for_backward``, which only accepts tensors and ``None``.
                 # Pass tensor / ``None`` args positionally and capture the
-                # non-tensor objects (``attention_bias``, ``inference_params``,
-                # ``packed_seq_params``) via the ``custom_forward`` closure.
+                # non-tensor objects via the ``custom_forward`` closure.
                 return tensor_parallel.checkpoint(
                     custom_forward,
                     self.config.distribute_saved_activations,
@@ -1873,6 +1885,8 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                packed_seq_params_by_layout=packed_seq_params_by_layout,
+                cp_layout_plan=cp_layout_plan,
             )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -1897,6 +1911,8 @@ class MultiTokenPredictionLayer(MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
         mtp_input_mask: Optional[Tensor] = None,
+        packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
+        cp_layout_plan: Optional[THDCPLayoutPlan] = None,
     ):
         """
         Execute the forward pass through the Multi-Token Prediction (MTP) layer.
@@ -1957,6 +1973,8 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                packed_seq_params_by_layout=packed_seq_params_by_layout,
+                cp_layout_plan=cp_layout_plan,
             )
         else:
             hidden_states = self._proj_and_transformer_layer(
@@ -1973,6 +1991,8 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                packed_seq_params_by_layout=packed_seq_params_by_layout,
+                cp_layout_plan=cp_layout_plan,
             )
 
         return hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask
@@ -2022,6 +2042,20 @@ class MultiTokenPredictionBlockSubmodules:
     """
 
     layer_specs: Optional[List[ModuleSpec]] = None
+
+
+@dataclass(eq=False)
+class MultiTokenPredictionInputs:
+    """Inputs prepared in the CP layout consumed by an MTP block."""
+
+    input_ids: Tensor
+    position_ids: Tensor
+    hidden_states: Tensor
+    mhc_multistream: Optional[Tensor]
+    labels: Optional[Tensor]
+    loss_mask: Optional[Tensor]
+    mtp_input_mask: Optional[Tensor]
+    packed_seq_params: Optional[PackedSeqParams]
 
 
 def _get_mtp_block_submodules(
@@ -2143,6 +2177,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
+        self.tp_cp_group = getattr(pg_collection, 'tp_cp', None)
         self.pp_rank = pg_collection.pp.rank()
         self.dp_group = pg_collection.dp if self.config.mtp_hsm else None
         self.hidden_state_mixing_rng_tracker_name = (
@@ -2156,6 +2191,69 @@ class MultiTokenPredictionBlock(MegatronModule):
             # Tag MTP params so the optimizer can clip their gradients separately.
             for param in self.parameters():
                 param.grad_norm_group = 'mtp'
+
+    def prepare_cp_layout(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        hidden_states: Tensor,
+        mhc_multistream: Optional[Tensor],
+        labels: Optional[Tensor],
+        loss_mask: Optional[Tensor],
+        mtp_input_mask: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        cp_batch: Optional[ContextParallelBatch],
+    ) -> MultiTokenPredictionInputs:
+        """Prepare activations and token-aligned inputs for the MTP block's CP layout."""
+        source_layout = (
+            cp_batch.boundary_layout if cp_batch is not None else self.config.linear_cp_layout
+        )
+        target_layout = self.config.attention_cp_layout
+        requires_conversion = self.cp_group.size() > 1 and source_layout != target_layout
+
+        if requires_conversion:
+            if mtp_input_mask is not None:
+                raise ValueError("mtp_input_mask is not supported with CP layout conversion")
+            if cp_batch is None:
+                raise ValueError("cp_batch is required when MTP uses a different CP layout")
+            hidden_states = convert_cp_layout(
+                hidden_states,
+                source_layout,
+                target_layout,
+                self.cp_group,
+                self.sequence_parallel,
+                self.tp_group,
+                self.tp_cp_group,
+                cp_batch.thd_plan,
+            )
+            if mhc_multistream is not None:
+                mhc_multistream = convert_cp_layout(
+                    mhc_multistream,
+                    source_layout,
+                    target_layout,
+                    self.cp_group,
+                    self.sequence_parallel,
+                    self.tp_group,
+                    self.tp_cp_group,
+                    cp_batch.thd_plan,
+                )
+            packed_seq_params = cp_batch.get_packed_seq_params(target_layout)
+            layout_batch = cp_batch.get_batch(target_layout)
+            input_ids = layout_batch["tokens"]
+            position_ids = layout_batch["position_ids"]
+            labels = layout_batch["labels"]
+            loss_mask = layout_batch["loss_mask"]
+
+        return MultiTokenPredictionInputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            mhc_multistream=mhc_multistream,
+            labels=labels,
+            loss_mask=loss_mask,
+            mtp_input_mask=mtp_input_mask,
+            packed_seq_params=packed_seq_params,
+        )
 
     def _build_layers(self, pg_collection):
         # Determine number of depths to build
@@ -2264,6 +2362,8 @@ class MultiTokenPredictionBlock(MegatronModule):
         embedding=None,
         mtp_input_mask: Optional[Tensor] = None,
         mhc_multistream: Optional[Tensor] = None,
+        packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
+        cp_layout_plan: Optional[THDCPLayoutPlan] = None,
     ) -> Tensor:
         """
         Perform the forward pass through all of the MTP modules.
@@ -2376,6 +2476,8 @@ class MultiTokenPredictionBlock(MegatronModule):
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,
                 packed_seq_params=packed_seq_params,
+                packed_seq_params_by_layout=packed_seq_params_by_layout,
+                cp_layout_plan=cp_layout_plan,
                 sequence_len_offset=sequence_len_offset,
                 embedding=embedding,
                 mtp_input_mask=mtp_input_mask,

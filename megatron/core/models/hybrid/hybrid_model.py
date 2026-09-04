@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+from contextlib import nullcontext
 from typing import Literal, Optional
 
 import torch
@@ -8,6 +9,7 @@ from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.context_parallel import ContextParallelBatch
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -448,6 +450,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
         compute_mtp_loss: bool = True,
+        cp_batch: ContextParallelBatch | None = None,
     ) -> Tensor:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -461,6 +464,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 loaded. This does not control speculative decoding. On post-process stages,
                 ``labels`` still determine whether the model returns loss or logits.
                 Defaults to True.
+            cp_batch: Input tensors and packed metadata keyed by CP layout.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -540,15 +544,28 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         #   be None, so this assert will succeed.
         # assert attention_mask is None, "The attention mask is ignored and should be set to None"
 
-        # Run decoder.
-        decoder_output = self.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
+        packed_seq_params_by_layout = (
+            cp_batch.packed_seq_params_by_layout if cp_batch is not None else None
         )
+        cp_layout_plan = cp_batch.thd_plan if cp_batch is not None else None
+
+        # Run decoder.
+        backbone_context = (
+            torch.no_grad()
+            if self.config.freeze_base_model_for_mtp and self.training
+            else nullcontext()
+        )
+        with backbone_context:
+            decoder_output = self.decoder(
+                hidden_states=decoder_input,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                packed_seq_params_by_layout=packed_seq_params_by_layout,
+                cp_layout_plan=cp_layout_plan,
+            )
         if isinstance(decoder_output, tuple):
             hidden_states, mhc_multistream = decoder_output
         else:
@@ -572,22 +589,38 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         mtp_forward_ran = (
             self.mtp_process and not (in_inference_mode or is_spec_decode) and compute_mtp_loss
         )
+        mtp_hidden_states = hidden_states
+        mtp_inputs = None
         if mtp_forward_ran:
-            hidden_states = self.mtp(
+            mtp_inputs = self.mtp.prepare_cp_layout(
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 mhc_multistream=mhc_multistream,
+                labels=labels,
+                loss_mask=loss_mask,
+                mtp_input_mask=mtp_input_mask,
+                packed_seq_params=packed_seq_params,
+                cp_batch=cp_batch,
+            )
+            assert mtp_inputs.input_ids is not None and mtp_inputs.position_ids is not None
+            mtp_hidden_states = self.mtp(
+                input_ids=mtp_inputs.input_ids,
+                position_ids=mtp_inputs.position_ids,
+                hidden_states=mtp_inputs.hidden_states,
+                mhc_multistream=mtp_inputs.mhc_multistream,
                 attention_mask=attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
-                packed_seq_params=packed_seq_params,
+                packed_seq_params=mtp_inputs.packed_seq_params,
                 embedding=self.embedding,
-                mtp_input_mask=mtp_input_mask,
+                mtp_input_mask=mtp_inputs.mtp_input_mask,
+                packed_seq_params_by_layout=packed_seq_params_by_layout,
+                cp_layout_plan=cp_layout_plan,
             )
 
         if not self.post_process:
-            return hidden_states
+            return mtp_hidden_states if mtp_forward_ran else hidden_states
 
         if self.config.mtp_num_layers is not None and self.mtp_process:
             assert self.config.mtp_num_layers > 0
@@ -606,12 +639,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     # this back to None after reading to allow GC.
                     inference_context.mtp_decoder_hidden_states = hidden_states
             elif mtp_forward_ran:
+                assert mtp_inputs is not None
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
                 hidden_states = process_mtp_loss(
-                    hidden_states=hidden_states,
-                    labels=labels,
-                    loss_mask=loss_mask,
+                    hidden_states=mtp_hidden_states,
+                    labels=mtp_inputs.labels,
+                    loss_mask=mtp_inputs.loss_mask,
                     output_layer=self.output_layer,
                     output_weight=output_weight,
                     runtime_gather_output=runtime_gather_output,
@@ -620,14 +654,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     config=self.config,
                     cp_group=self.pg_collection.cp,
                     tp_group=self.tp_group,
-                    packed_seq_params=packed_seq_params,
+                    packed_seq_params=mtp_inputs.packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
-                    input_ids=input_ids,
-                    mtp_input_mask=mtp_input_mask,
+                    input_ids=mtp_inputs.input_ids,
+                    mtp_input_mask=mtp_inputs.mtp_input_mask,
                     metric_avg_group=(
                         getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
                         or self.pg_collection.dp_cp
                     ),
+                    main_hidden_states=hidden_states,
                 )
         sequence_parallel_override = False
         if (

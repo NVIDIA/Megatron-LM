@@ -169,6 +169,24 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
     """Route to the rank with the fewest in-flight requests. Ignores prefix affinity."""
 
 
+def routes_on_prefix(policy) -> bool:
+    """Whether `policy` needs per-request block hashes to make a routing decision.
+
+    Frontends call this to decide whether hashing a prompt is worth anything: under
+    LOAD_BALANCED the coordinator discards the hashes, so computing them is pure
+    overhead on the request path. Kept beside the enum so a new prefix-aware policy
+    only has to be added in one place.
+
+    Accepts the enum, its string value, or None (no policy configured).
+    """
+    if policy is None:
+        return False
+    return PrefixCachingCoordinatorPolicy(policy) in (
+        PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK,
+    )
+
+
 class MediaCacheCoordinatorPolicy(str, Enum):
     """Routing policy for the DP inference coordinator with media caching."""
 
@@ -195,17 +213,26 @@ class KVCacheManagementMode(str, Enum):
 class CudaGraphSizingDistribution(str, Enum):
     """How CUDA graph token-count sizes are spaced when generating the captured graphs.
 
-    EXPONENTIAL (default) — token counts halve from `cuda_graph_max_tokens` down to `tp_size`,
+    EXPONENTIAL — token counts halve from `cuda_graph_max_tokens` down to `tp_size`,
     giving a log-spaced distribution. Bounded relative padding (~2x worst case) at every scale and
     `log2(max_tokens)` total graphs.
 
     LINEAR — Include size-1 and size-2 graphs where applicable, linear spacing up until 256, and
     sparser linear spacing past 256. e.g. `[1, 2, 4] + range(8, 256, 8) + range(256, max+1, 16)`.
     Higher graph density at the top end.
+
+    HYBRID (default) — EXPONENTIAL for prefill and mixed graphs, LINEAR for decode-only graphs.
+    The two
+    serve different ranges: prefill token counts span the whole `cuda_graph_max_tokens` (thousands),
+    where log spacing keeps padding bounded at ~2x for a handful of graphs, while decode-only counts
+    are capped at `max_requests * (num_speculative_tokens + 1)` (tens), where halving is far too
+    coarse -- a 33-request step would pad up to a 64-request graph. Linear spacing there covers
+    every small request count densely for little extra capture cost.
     """
 
     EXPONENTIAL = "exponential"
     LINEAR = "linear"
+    HYBRID = "hybrid"
 
 
 class AsyncScheduleMode(str, Enum):
@@ -373,14 +400,14 @@ class InferenceConfig:
     The number of mixed prefill graphs to capture if mixed prefill/decode graphs are enabled.
     """
 
-    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = (
-        CudaGraphSizingDistribution.EXPONENTIAL
-    )
+    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = CudaGraphSizingDistribution.HYBRID
     """
-    How CUDA graph token counts are spaced. EXPONENTIAL (default) halves from
-    `cuda_graph_max_tokens` down to `tp_size` (log-spaced, ~log2(max_tokens) graphs).
-    LINEAR uses a range of linear strides (includes small graphs + mid-range linearity + 
-    a bigger step size at the top end).
+    How CUDA graph token counts are spaced. HYBRID (default) applies EXPONENTIAL to prefill and
+    mixed graphs and LINEAR to decode-only graphs, since the two cover ranges that differ by
+    orders of magnitude. EXPONENTIAL halves from `cuda_graph_max_tokens` down to `tp_size`
+    (log-spaced, ~log2(max_tokens) graphs). LINEAR uses a range of linear strides (includes small
+    graphs + mid-range linearity + a bigger step size at the top end). Set EXPONENTIAL or LINEAR
+    explicitly to apply one distribution to both families.
     """
 
     use_cuda_graphs_for_non_decode_steps: bool = True
@@ -460,16 +487,14 @@ class InferenceConfig:
     generation epoch changes.
     """
 
-    prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = (
-        PrefixCachingEvictionPolicy.REF_ZERO
-    )
+    prefix_caching_eviction_policy: PrefixCachingEvictionPolicy = PrefixCachingEvictionPolicy.LRU
     """Eviction policy for prefix caching blocks. See `PrefixCachingEvictionPolicy` for options.
 
     Only applies when enable_prefix_caching is True.
     """
 
     prefix_caching_coordinator_policy: PrefixCachingCoordinatorPolicy = (
-        PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+        PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
     )
     """Routing policy for the DP inference coordinator. See
     `PrefixCachingCoordinatorPolicy` for options.
@@ -477,10 +502,32 @@ class InferenceConfig:
     Only applies when enable_prefix_caching is True and using a coordinator.
     """
 
-    prefix_caching_routing_alpha: float = 0.5
-    """Weight for prefix-aware scoring: score = alpha * match + (1 - alpha) * normalized_load.
-    Higher alpha favors prefix cache hits; lower alpha favors load balance.
-    Must be in [0, 1]. Only applies when enable_prefix_caching is True and using a coordinator.
+    prefix_caching_routing_alpha: float = 1.0
+    """How hard the coordinator penalises load when routing on prefix affinity:
+    score = cache_score - alpha * relative_load.
+
+    ``relative_load`` is a rank's in-flight count measured against the fleet mean, so it is
+    zero while ranks are even and grows only as they diverge. Both terms are normalized, which
+    makes alpha dimensionless: 0 is pure prefix affinity, and higher values divert to idle ranks
+    more readily as the fleet becomes lopsided. Must be non-negative; it is not a blend weight
+    and is not capped at 1.
+
+    At 1.0 a single request of imbalance across two ranks exactly cancels a full cache hit, so
+    affinity stops being decisive as soon as the fleet is uneven at all. The default keeps a hit
+    decisive against mild imbalance while still diverting to idle ranks once ranks genuinely
+    diverge. Larger fleets are less sensitive, since one request moves the mean less; the
+    16-engine runs this was tuned on ran at 1.0.
+
+    Only applies when enable_prefix_caching is True and using a coordinator.
+    """
+
+    prefix_cache_ttl_seconds: float = 300.0
+    """How long the coordinator assumes an engine still holds a block it routed there.
+
+    The coordinator sees blocks being routed but never blocks being evicted, so its view of
+    each engine's cache only gets staler. Entries untouched for this long are dropped. Too long
+    and it claims hits on blocks already evicted, routing for affinity and paying a cold prefill
+    anyway; too short and it forgets blocks the engine still holds.
     """
 
     media_cache_coordinator_policy: MediaCacheCoordinatorPolicy = (
@@ -609,9 +656,12 @@ class InferenceConfig:
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
         self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)
-        if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
+        # Not capped at 1: alpha stopped being a blend weight when the score became
+        # cache_score - alpha * relative_load, and values above 1 are meaningful --
+        # they let load outweigh a full cache hit once ranks diverge.
+        if self.prefix_caching_routing_alpha < 0.0:
             raise ValueError(
-                f"prefix_caching_routing_alpha must be in [0, 1], "
+                f"prefix_caching_routing_alpha must be non-negative, "
                 f"got {self.prefix_caching_routing_alpha}"
             )
         if self.media_cache_routing_weight < 0:

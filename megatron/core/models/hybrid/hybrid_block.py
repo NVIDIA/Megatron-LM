@@ -14,7 +14,7 @@ from typing import List, Optional, Sequence, Tuple, Union
 import torch
 from torch import Tensor, nn
 
-from megatron.core.context_parallel import ContextParallelLayoutManager
+from megatron.core.context_parallel import ContextParallelLayoutManager, CPLayout, THDCPLayoutPlan
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -32,6 +32,7 @@ from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConn
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
+from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
@@ -95,6 +96,7 @@ class HybridStack(MegatronModule):
         pg_collection (ProcessGroupCollection): the required model communication
             process groups to use.
         is_mtp_layer (bool, optional): whether this is an MTP layer. Defaults to False.
+        boundary_layout (CPLayout, optional): CP layout at the stack boundary.
     """
 
     def __init__(
@@ -112,6 +114,7 @@ class HybridStack(MegatronModule):
         is_mtp_layer: bool = False,
         name: str | None = None,
         layer_config_list: Sequence[TransformerConfig] | None = None,
+        boundary_layout: CPLayout | None = None,
     ) -> None:
         """
         Args:
@@ -145,6 +148,9 @@ class HybridStack(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
+        boundary_layout = (
+            self.config.linear_cp_layout if boundary_layout is None else boundary_layout
+        )
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -160,6 +166,11 @@ class HybridStack(MegatronModule):
         self._mhc_block_end_plan: Optional[List[bool]] = None
 
         self.layer_config_list = layer_config_list
+        self._has_linear_layer_with_chunkwise_cp = self.cp_group.size() > 1 and any(
+            type(layer_config) is layer_utils.MambaLayerConfig
+            and layer_config.linear_cp_mode == "chunkwise"
+            for layer_config in self.layer_config_list
+        )
         self._cp_layout_manager = None
         if self.cp_group.size() > 1:
             layer_layouts = tuple(
@@ -172,7 +183,7 @@ class HybridStack(MegatronModule):
             )
             self._cp_layout_manager = ContextParallelLayoutManager(
                 layer_layouts=layer_layouts,
-                boundary_layout=self.config.linear_cp_layout,
+                boundary_layout=boundary_layout,
                 sequence_parallel=self.config.sequence_parallel,
                 cp_group=self.cp_group,
                 tp_group=self.tp_group,
@@ -419,6 +430,8 @@ class HybridStack(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
+        packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
+        cp_layout_plan: THDCPLayoutPlan | None = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -440,9 +453,28 @@ class HybridStack(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        if self._has_linear_layer_with_chunkwise_cp and padding_mask is not None:
+            raise NotImplementedError(
+                "Hybrid chunkwise context parallelism does not support padding masks."
+            )
+
         cp_layout_state = None
         if self._cp_layout_manager is not None:
-            cp_layout_state = self._cp_layout_manager.build_forward_state(packed_seq_params)
+            cp_layout_state = self._cp_layout_manager.build_forward_state(
+                packed_seq_params,
+                packed_seq_params_by_layout=packed_seq_params_by_layout,
+                thd_plan=cp_layout_plan,
+            )
+
+        packed_sequence_cp_metadata = None
+        if self._has_linear_layer_with_chunkwise_cp and packed_seq_params is not None:
+            if packed_seq_params.seq_idx is None:
+                raise ValueError("Packed chunkwise CP requires packed_seq_params.seq_idx")
+            packed_sequence_cp_metadata = build_packed_sequence_cp_metadata(
+                packed_seq_params.seq_idx,
+                cp_rank=self.cp_group.rank(),
+                cp_size=self.cp_group.size(),
+            )
 
         if not self.pre_process:
             # See set_input_tensor()
@@ -526,6 +558,7 @@ class HybridStack(MegatronModule):
                     padding_mask=padding_mask,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
+                    packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )
             else:
                 for layer_idx, (layer_config, layer) in enumerate(
@@ -543,6 +576,12 @@ class HybridStack(MegatronModule):
                     mhc_manager = mhc_layer_managers[layer_idx]
                     if mhc_manager is not None:
                         mhc_manager.is_last_layer_in_recompute_block = mhc_block_ends[layer_idx]
+                    layer_cp_metadata = (
+                        packed_sequence_cp_metadata
+                        if type(layer_config) is layer_utils.MambaLayerConfig
+                        and layer_config.linear_cp_mode == "chunkwise"
+                        else None
+                    )
 
                     with inner_quant_context:
                         if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
@@ -555,11 +594,21 @@ class HybridStack(MegatronModule):
                                 packed_seq_params=layer_packed_seq_params,
                                 padding_mask=padding_mask,
                             )
+                            if layer_cp_metadata is not None:
+                                layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
                             if mhc_manager is not None and isinstance(
                                 layer, HyperConnectionHybridLayer
                             ):
                                 layer_kwargs["mhc_recompute_manager"] = mhc_manager
                             hidden_states, _ = layer(**layer_kwargs)
+                        elif layer_cp_metadata is not None:
+                            hidden_states = layer(
+                                hidden_states=hidden_states,
+                                attention_mask=attention_mask,
+                                inference_context=inference_context,
+                                packed_seq_params=layer_packed_seq_params,
+                                packed_sequence_cp_metadata=layer_cp_metadata,
+                            )
                         else:  # MambaLayer, Expert, or MLP
                             hidden_states = layer(
                                 hidden_states=hidden_states,

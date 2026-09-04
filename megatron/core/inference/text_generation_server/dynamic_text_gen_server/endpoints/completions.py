@@ -9,7 +9,8 @@ from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
-from ..openai_streaming import openai_stream
+from ..openai_streaming import json_safe_logprobs, json_safe_top_n_logprobs, openai_stream
+from .common import abort_requests
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +69,11 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(req.get("temperature", 1.0))
-            top_p = float(req.get("top_p", 1.0))
-            top_k = int(req.get("top_k", 0))
+            temperature = float(
+                req.get("temperature", current_app.config.get('default_temperature', 1.0))
+            )
+            top_p = float(req.get("top_p", current_app.config.get('default_top_p', 1.0)))
+            top_k = int(req.get("top_k", current_app.config.get('default_top_k', 0)))
             echo = bool(req.get("echo", False))
 
             if temperature == 0.0:
@@ -162,34 +165,55 @@ try:
                 return str(error), 400
 
         tasks = []
-        for prompt_tokens in prompts_as_tokens:
-            per_req_params = SamplingParams(
-                temperature=sampling_params.temperature,
-                top_k=sampling_params.top_k,
-                top_p=sampling_params.top_p,
-                return_log_probs=sampling_params.return_log_probs,
-                top_n_logprobs=sampling_params.top_n_logprobs,
-                skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
-                num_tokens_to_generate=sampling_params.num_tokens_to_generate,
-                stop_words=sampling_params.stop_words,
-                termination_id=sampling_params.termination_id,
-                # This endpoint always echoes prompt_token_ids in its response, so
-                # keep the prompt tokens on the payload (default is now to drop them).
-                return_prompt_tokens=True,
-                streaming_interval=sampling_params.streaming_interval,
-            )
-            if stream_requested:
-                tasks.append(
-                    client.add_request_streaming(
+        # Populated on the non-streaming path only; the streaming path aborts
+        # through the AsyncStream callback its generator already owns.
+        request_ids = []
+        # The submission loop itself can fail partway -- the zmq send, or
+        # multimodal serialization on a malformed payload -- with the earlier
+        # prompts already submitted to the engine. Without this the exception
+        # escapes the handler and those requests generate to their token limit
+        # holding batch slots, the same leak the abort below closes.
+        #
+        # TODO: streaming submissions made before a mid-loop failure are not
+        # covered. Their handles are AsyncStreams, not ids, and they abort
+        # through openai_stream's finally, which never runs because the
+        # generator is never started.
+        try:
+            for prompt_tokens in prompts_as_tokens:
+                per_req_params = SamplingParams(
+                    temperature=sampling_params.temperature,
+                    top_k=sampling_params.top_k,
+                    top_p=sampling_params.top_p,
+                    return_log_probs=sampling_params.return_log_probs,
+                    top_n_logprobs=sampling_params.top_n_logprobs,
+                    skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
+                    num_tokens_to_generate=sampling_params.num_tokens_to_generate,
+                    stop_words=sampling_params.stop_words,
+                    termination_id=sampling_params.termination_id,
+                    # This endpoint always echoes prompt_token_ids in its response, so
+                    # keep the prompt tokens on the payload (default is now to drop them).
+                    return_prompt_tokens=True,
+                    streaming_interval=sampling_params.streaming_interval,
+                )
+                if stream_requested:
+                    tasks.append(
+                        client.add_request_streaming(
+                            prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
+                        )
+                    )
+                else:
+                    # add_request_with_id, not add_request: a non-streaming response
+                    # writes nothing to the socket while generating, so a disconnect
+                    # is never discovered as a broken pipe. Aborting needs the ids.
+                    request_id, future = client.add_request_with_id(
                         prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
                     )
-                )
-            else:
-                tasks.append(
-                    client.add_request(
-                        prompt_tokens, per_req_params, multi_modal_data=multi_modal_data
-                    )
-                )
+                    request_ids.append(request_id)
+                    tasks.append(future)
+        except Exception as e:
+            abort_requests(client, request_ids, f"submission failed: {e}")
+            logger.error(f"Error submitting request: {e}")
+            return f"Error submitting request: {e}", 500
 
         if stream_requested:
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
@@ -214,6 +238,15 @@ try:
 
         try:
             batch_results = await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            # Quart cancels this handler when the peer goes away (its ASGI
+            # connection races handle_messages against handle_request and
+            # cancels the loser). Without this the engine would keep generating
+            # for a client that is gone, holding a slot until it hit the token
+            # limit -- orphans then accumulate faster than they retire and the
+            # batch saturates.
+            abort_requests(client, request_ids, "client disconnected")
+            raise
         except Exception as e:
             return f"Error during inference: {e}", 500
 
@@ -272,18 +305,23 @@ try:
             if num_tokens_requested is None or len(generated_tokens) < num_tokens_requested:
                 finish_reason = "stop"
 
+            # Clamped: processed logprobs can be -inf, which JSON cannot carry.
+            generated_log_probs = json_safe_logprobs(result.get('generated_log_probs') or [])
+
             logprobs_data = None
             if sampling_params.return_log_probs:
-                # Get prompt tokens and logprobs
                 prompt_tokens_list = result["prompt_tokens"] or []
 
-                prompt_log_probs = result.get('prompt_log_probs') or []
-                prompt_top_n_logprobs = result.get('prompt_top_n_logprobs') or []
+                prompt_log_probs = json_safe_logprobs(result.get('prompt_log_probs') or [])
+                prompt_top_n_logprobs = json_safe_top_n_logprobs(
+                    result.get('prompt_top_n_logprobs') or []
+                )
 
                 # Get generated tokens and logprobs
                 generated_tokens_list = result["generated_tokens"] or []
-                generated_log_probs = result.get('generated_log_probs') or []
-                generated_top_n_logprobs = result.get('generated_top_n_logprobs') or []
+                generated_top_n_logprobs = json_safe_top_n_logprobs(
+                    result.get('generated_top_n_logprobs') or []
+                )
 
                 if echo:
                     # When echo=True, include prompt tokens and their logprobs
@@ -342,7 +380,7 @@ try:
                 "finish_reason": finish_reason,
                 "prompt_token_ids": result["prompt_tokens"],
                 "generation_token_ids": result["generated_tokens"],
-                "generation_log_probs": result.get("generated_log_probs", []),
+                "generation_log_probs": generated_log_probs,
             }
 
             if result["routing_indices"] is not None:
