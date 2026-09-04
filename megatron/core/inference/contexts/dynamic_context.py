@@ -880,9 +880,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Bind the GPU real-token-count tensor onto the NVLS dispatcher class
         # so it can mask out CUDA-graph padding tokens during routing. The
         # tensor lives inside gpu_view._buf (fixed address) and is refreshed
-        # each step by transfer_bookkeeping_to_gpu(). NVLS-only — the NCCL
-        # dispatcher requires equal token counts across ranks already.
-        if self._nvls_dispatcher:
+        # each step by transfer_bookkeeping_to_gpu(). EP=1 still constructs the
+        # NVLS dispatcher even though it does not allocate communication
+        # buffers, and needs this tensor to distinguish real from graph-padded
+        # rows.
+        if model_config.inference_moe_token_dispatcher_type == 'nvls':
             NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         # Print info.
@@ -3474,10 +3476,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx[
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = self.request_to_kv_block_ids[current_id][token_offset_range // self.block_size_tokens]
-        if num_matched_blocks > 0:
-            # Some tokens we are about to compute may land inside a block we matched
-            # by hash. That block already holds the correct KV for exactly these
-            # tokens and is shared with whoever cached it, so send those writes to the
+        if num_matched_blocks > 0 or req.num_matched_prefix_blocks > 0:
+            # Some tokens we are about to compute may land inside a block this or an
+            # earlier chunk matched by hash. That block already holds the correct KV
+            # for exactly these tokens and is shared with whoever cached it, so send those writes to the
             # dummy block rather than perturb a concurrent reader's values.
             #
             # Only the write mapping moves. `request_to_kv_block_ids` still points at
