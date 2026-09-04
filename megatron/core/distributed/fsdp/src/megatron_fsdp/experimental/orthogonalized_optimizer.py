@@ -24,10 +24,9 @@ Fully local parameters (owned by a single rank) skip the communication and run N
 locally; their compute overlaps the boundary P2P. Non-2D parameters fall back to a plain
 momentum-SGD step (no orthogonalization).
 
-Communication is asynchronous and issued on a dedicated owner-comm stream using a dedicated
-(duplicate) owner-comm process group, so owner P2P ordering is independent of FSDP's
-forward/backward collectives. The synchronous waiting (`_wait_for_dist_buffer`) is deferred as late
-as possible so local Newton-Schulz work overlaps owner gathers/scatters."""
+Communication is asynchronous and issued on a dedicated owner-comm stream using each
+parameter's FSDP data-parallel process group. The synchronous waiting (`_wait_for_dist_buffer`) is
+deferred as late as possible so local Newton-Schulz work overlaps owner gathers/scatters."""
 
 from __future__ import annotations
 
@@ -56,7 +55,6 @@ except (ModuleNotFoundError, ImportError):
     OrthogonalizedOptimizer = cast(Any, object)
     Muon = cast(Any, object)
     HAVE_EMERGING_OPTIMIZERS = False
-from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.optim.optimizer import ParamsT
 
@@ -75,6 +73,12 @@ from .shard_plan import (
 )
 
 logger = logging.getLogger(__name__)
+
+_LocalUpdate = tuple[int, dict[str, Any], DTensor, torch.Tensor]
+
+
+def _get_parameter_dp_group(param: DTensor) -> dist.ProcessGroup:
+    return cast(FsdpParameterGroup, get_containing_parameter_group(param)).mesh.get_group()
 
 
 def _always_nvtx_decorator(message: str) -> Callable:
@@ -162,8 +166,6 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         *args, **kwargs: Forwarded to the inner `OrthogonalizedOptimizer`
             (e.g. `lr`, `momentum`, `weight_decay`, `nesterov`,
             `weight_decay_method`, `fp32_matmul_prec`, `scaled_orthogonalize_fn`).
-        dp_mesh: Device mesh of the FSDP data-parallel group. The optimizer shards
-            Newton-Schulz work across the ranks of this mesh via P2P.
         use_owner_comm_stream: Whether to use a separate communication stream for
             owner-based peer-to-peer communications. Useful to disable for testing
             reasons, giving a synchronous algorithm. Defaults to True.
@@ -178,18 +180,10 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             in one chunk.
     """
 
-    # Shared across optimizer instances so a process that constructs several
-    # optimizers over the same DP group does not call `new_group` more than
-    # once per group (each `new_group` is a collective that allocates NCCL
-    # resources, which a multi-rank-on-one-GPU dev box exhausts quickly).
-    _shared_owner_group_cache: dict[tuple[int, ...], dist.ProcessGroup] = {}
-    _shared_owner_group_initialized: set[tuple[int, ...]] = set()
-
     def __init__(
         self,
         params: ParamsT,
         inner_optimizer: OrthogonalizedOptimizer,
-        dp_mesh: DeviceMesh,
         use_owner_comm_stream: bool = True,
         reconstruct_full_param: bool = False,
         num_ns_steps: int | None = None,
@@ -202,7 +196,6 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
 
-        self.dp_mesh = dp_mesh
         self._num_ns_steps: int = num_ns_steps
         self._max_params_per_owner_chunk = max_params_per_owner_chunk
         # Owner P2P runs on a dedicated owner-comm stream so it overlaps local
@@ -211,9 +204,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         # tests (the only synchronous-use case) fall back to the default stream.
         self.use_owner_comm_stream: bool = use_owner_comm_stream
         self.reconstruct_full_param: bool = reconstruct_full_param
-        self._owner_comm_needed: bool | None = None
         self._shard_plans: dict[int, ShardPlan] = {}
-        self._owners: dict[int, int] = {}
         self._owner_comm_stream_cache: dict[torch.device, torch.cuda.Stream] = {}
 
         # Disable properties while initializing this instance. We'd either have a missing attribute
@@ -307,45 +298,8 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             for name, (cls_, descriptor) in saved.items():
                 setattr(cls_, name, descriptor)
 
-    # Mesh, group, and stream helpers
-    # ===============================
-
-    def _dp_group(self) -> dist.ProcessGroup:
-        return self.dp_mesh.get_group()
-
-    def _world_size(self) -> int:
-        return self.dp_mesh.size()
-
-    def _this_rank(self) -> int:
-        return self.dp_mesh.get_local_rank()
-
-    def _this_global_rank(self) -> int:
-        return dist.get_global_rank(self._dp_group(), self._this_rank())
-
-    def _init_collective_groups(self) -> dist.ProcessGroup:
-        """Create (and cache) a duplicate owner-comm group for the DP group.
-
-        A duplicate NCCL group with the same ranks lets owner P2P use an
-        independent communicator/queue from FSDP's forward/backward collectives,
-        so owner comm ordering is decoupled. The group is created once (a
-        collective `new_group`) and initialized with a barrier so the first
-        batched P2P may involve a subset of ranks.
-        """
-        ranks = tuple(dist.get_process_group_ranks(self._dp_group()))
-        cached = self._shared_owner_group_cache.get(ranks)
-        if cached is not None:
-            return cached
-        group = dist.new_group(ranks=list(ranks))
-        type(self)._shared_owner_group_cache[ranks] = group
-        # Initialize the communicator so the first batched P2P may involve a
-        # subset of ranks; a barrier is a collective all ranks in the group run.
-        if self._dp_group().size() > 1:
-            if self.dp_mesh.device_type == "cuda":
-                dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
-            else:
-                dist.barrier(group=group)
-        type(self)._shared_owner_group_initialized.add(ranks)
-        return group
+    # Stream helpers
+    # ==============
 
     def _owner_comm_stream(self, device: torch.device) -> torch.cuda.Stream | None:
         """Cached owner-comm stream (CUDA only; None on CPU or when disabled).
@@ -402,10 +356,9 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                 plans.append(None)
                 continue
             tensor_flat_offset = layout.tensor_to_offset[index]
-            rank_flat_shard_size = layout.size // self._world_size()
-            plan = compute_shard_plan(
-                shape, tensor_flat_offset, rank_flat_shard_size, self._world_size()
-            )
+            world_size = dist.get_world_size(group=group.mesh.get_group())
+            rank_flat_shard_size = layout.size // world_size
+            plan = compute_shard_plan(shape, tensor_flat_offset, rank_flat_shard_size, world_size)
             self._shard_plans[key] = plan
             plans.append(plan)
         return plans
@@ -504,24 +457,30 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         local_shards: Sequence[torch.Tensor],
         device: torch.device,
         dtype: torch.dtype,
+        group_param: DTensor,
     ) -> OwnerGatherPlan:
         """Pack all orthogonalization input shards for an owner into the owner's respective
         collective buffer.
 
         This sets up the buffers for communicating orthogonalization input shards to their owner.
         """
+        group = _get_parameter_dp_group(group_param)
         return pack_owner_work(
             plans,
             owners,
             local_shards,
-            self._world_size(),
-            self._this_rank(),
+            dist.get_world_size(group=group),
+            dist.get_rank(group=group),
             device=device,
             dtype=dtype,
         )
 
     def _send_to_owner(
-        self, gather_plan: OwnerGatherPlan, device: torch.device, dtype: torch.dtype
+        self,
+        gather_plan: OwnerGatherPlan,
+        device: torch.device,
+        dtype: torch.dtype,
+        group_param: DTensor,
     ) -> tuple[dict[int, torch.Tensor], list[dist.Work], torch.cuda.Event | None]:
         """Send orthogonalization input shards to their respective owner.
 
@@ -535,7 +494,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             device: Device for the send/recv buffers (the pre-NS device).
             dtype: Dtype for the send/recv buffers (the pre-NS dtype).
         """
-        group = self._init_collective_groups()
+        group = _get_parameter_dp_group(group_param)
         stream = self._owner_comm_stream(device)
         recv_buffers: dict[int, torch.Tensor] = {
             src: torch.empty(size, dtype=dtype, device=device)
@@ -622,6 +581,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         owners: dict[int, int],
         device: torch.device,
         dtype: torch.dtype,
+        group_param: DTensor,
     ) -> OwnerScatterPlan:
         """Set up the buffers for communication by packing update shards into their respective
         collective buffers.
@@ -629,18 +589,23 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         Pack all update shards for their destination into the destination's respective collective
         buffer. This sets up the buffers for communicating update shards to their destination.
         """
+        group = _get_parameter_dp_group(group_param)
         return pack_update_shards(
             full_updates,
             plans,
             owners,
-            self._world_size(),
-            self._this_rank(),
+            dist.get_world_size(group=group),
+            dist.get_rank(group=group),
             device=device,
             dtype=dtype,
         )
 
     def _send_to_destination(
-        self, scatter_plan: OwnerScatterPlan, device: torch.device, dtype: torch.dtype
+        self,
+        scatter_plan: OwnerScatterPlan,
+        device: torch.device,
+        dtype: torch.dtype,
+        group_param: DTensor,
     ) -> tuple[dict[int, torch.Tensor], list[dist.Work], torch.cuda.Event | None]:
         """Send update shards to their respective destination.
 
@@ -653,7 +618,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             device: Device for the send/recv buffers (the update device).
             dtype: Dtype for the send/recv buffers (the update dtype).
         """
-        group = self._init_collective_groups()
+        group = _get_parameter_dp_group(group_param)
         stream = self._owner_comm_stream(device)
         recv_buffers: dict[int, torch.Tensor] = {
             owner: torch.empty(size, dtype=dtype, device=device)
@@ -707,15 +672,11 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         Separates collective (P2P) and local (NS) work into phases so that no
         rank is blocked waiting on another rank computing NS to reach P2P:
 
-        1. Compute local pre-NS shards (weight decay + momentum + Nesterov) for
-           all matrix params.
-        2. P2P-send all boundary pre-NS shards to their owners (async, no NS).
-        3. Newton-Schulz + weight update for fully-local params on the default
-           stream, overlapping the boundary owner-gathers issued in phase 2.
-        4. On each owner, wait gather, reconstruct, and orthogonalize to produce
-           the full updates.
-        5. P2P-send update shards from owners back to their destinations.
-        6. Each rank applies its local update shard to its local weight shard.
+        1. Compute local pre-NS shards and submit all boundary owner-gathers.
+        2. Run half of the fully-local Newton-Schulz work while gathers progress.
+        3. Reconstruct and orthogonalize boundary parameters, then submit scatters.
+        4. Run the remaining fully-local work while scatters progress.
+        5. Enqueue the received updates and finally wait for all scatter work.
         """
         if closure is not None:
             with torch.enable_grad():
@@ -723,21 +684,9 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         else:
             loss = None
 
-        if self._world_size() > 1:
-            if self._owner_comm_needed is None:
-                has_boundary = False
-                for group in self.param_groups:
-                    plans = self._init_shard_plans(group["params"])
-                    if any(p is not None and p.is_boundary() for p in plans):
-                        has_boundary = True
-                        break
-                flag = torch.tensor(int(has_boundary), device=self._device(), dtype=torch.int)
-                dist.all_reduce(flag, op=dist.ReduceOp.SUM, group=self._dp_group())
-                self._owner_comm_needed = flag.item() > 0
-            if self._owner_comm_needed:
-                self._init_collective_groups()
-
         fsdp_parameter_groups: set[FsdpParameterGroup] = set()
+        local_updates: list[_LocalUpdate] = []
+        chunk_states: list[_BoundaryChunkState] = []
         for group in self.param_groups:
             self._init_group(group)
             params = group["params"]
@@ -767,11 +716,12 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             assert len(matrix_plans) == len(matrix_indices)
             matrix_plans = cast(list[ShardPlan], matrix_plans)
 
-            # Phase 1: local pre-NS shards for all matrix params.
+            # Phase 1: compute pre-NS shards and submit boundary gathers for every
+            # optimizer param group before starting any Newton-Schulz work.
             local_shards: list[torch.Tensor] = []
             for param in matrix_params:
                 if param.grad is None:
-                    local_shards.append(torch.empty(0, dtype=torch.float32, device=self._device()))
+                    local_shards.append(torch.empty(0, dtype=torch.float32, device=param.device))
                     continue
                 local_shards.append(
                     self._compute_orthogonalization_inputs(param, param.grad, group, lr)
@@ -779,10 +729,6 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
 
             chunks = self._group_updates(matrix_params, local_shards, matrix_plans)
             owners = self._assign_owner_work(matrix_plans, chunks)
-            self._owners.update({matrix_indices[k]: v for k, v in owners.items()})
-
-            # Separate fully-local and boundary params. Fully-local NS+update
-            # overlaps the boundary owner gather.
             local_indices = [
                 i for i in range(len(matrix_plans)) if not matrix_plans[i].is_boundary()
             ]
@@ -790,15 +736,6 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                 i for i in range(len(matrix_plans)) if matrix_plans[i].is_boundary()
             }
 
-            # Phase 2: issue all boundary owner-gathers (async on the owner-comm
-            # stream) before any Newton-Schulz, so the fully-local NS in phase 3
-            # overlaps the gathers. This matches the V1 pseudocode, which runs the
-            # owner-gather before the local orthogonalization. Boundary params are
-            # grouped by collective group, shard device/dtype, and parameter dtype
-            # (see `_group_updates`) so each chunk uses consistent P2P metadata; a
-            # single optimizer param group may span multiple FSDP groups and/or
-            # mixed dtypes (e.g. FP32 + BF16).
-            chunk_states: list[_BoundaryChunkState] = []
             for chunk_indices in chunks:
                 chunk_boundary = [i for i in chunk_indices if i in boundary_indices_set]
                 if not chunk_boundary:
@@ -819,27 +756,42 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                     )
                 )
 
-            # Phase 3: fully-local Newton-Schulz + weight update on the default
-            # stream, overlapping the boundary owner-gathers issued above.
             for i in local_indices:
                 plan = matrix_plans[i]
-                if plan.rank_row_count(self._this_rank()) == 0:
-                    continue
-                self._orthogonalize_and_update(matrix_params[i], local_shards[i], lr, group)
-
-            # Submit all owner-scatter work before applying any received updates so
-            # host-side Work.wait() does not stall later chunk launches.
-            for state in chunk_states:
-                self._issue_boundary_update(state)
-            for state in chunk_states:
-                self._enqueue_boundary_update(state)
-            for state in chunk_states:
-                self._wait_for_dist_buffer(state.scatter_works)
+                param = matrix_params[i]
+                if plan.rank_row_count(dist.get_rank(group=_get_parameter_dp_group(param))) > 0:
+                    rows, cols = plan.full_shape
+                    cost = plan.full_numel() * (min(rows, cols) * self._num_ns_steps + 1)
+                    local_updates.append((cost, group, param, local_shards[i]))
 
             for param in matrix_params:
                 pg = get_containing_parameter_group(param)
                 if pg is not None:
                     fsdp_parameter_groups.add(pg)
+
+        # Split fully-local NS across both communication edges. The first side
+        # hides owner gathers; after boundary NS launches every scatter, the
+        # second side hides the scatter tail before updates are consumed.
+        local_sides: tuple[list[_LocalUpdate], list[_LocalUpdate]] = ([], [])
+        local_costs = [0, 0]
+        for update in sorted(local_updates, key=lambda item: item[0], reverse=True):
+            side = int(local_costs[0] > local_costs[1])
+            local_sides[side].append(update)
+            local_costs[side] += update[0]
+
+        for _, group, param, local_shard in local_sides[0]:
+            self._orthogonalize_and_update(param, local_shard, group["lr"], group)
+
+        for state in chunk_states:
+            self._issue_boundary_update(state)
+
+        for _, group, param, local_shard in local_sides[1]:
+            self._orthogonalize_and_update(param, local_shard, group["lr"], group)
+
+        for state in chunk_states:
+            self._enqueue_boundary_update(state)
+        for state in chunk_states:
+            self._wait_for_dist_buffer(state.scatter_works)
 
         for parameter_group in fsdp_parameter_groups:
             parameter_group.sync_model_weight_from_main_weight()
@@ -866,9 +818,11 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         b_params = [matrix_params[i] for i in boundary_indices]
         b_local = [local_shards[i] for i in boundary_indices]
         b_owners = {i: owners[boundary_indices[i]] for i in range(len(boundary_indices))}
-        gather_plan = self._pack_owner_work(b_plans, b_owners, b_local, device, dtype)
+        gather_plan = self._pack_owner_work(
+            b_plans, b_owners, b_local, device, dtype, b_params[0]
+        )
         recv_buffers, gather_works, gather_event = self._send_to_owner(
-            gather_plan, device, dtype
+            gather_plan, device, dtype, b_params[0]
         )
 
         # Optionally also gather each rank's local *weight* shard so the owner can
@@ -884,10 +838,10 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             weight_local = [p.to_local() for p in b_params]
             weight_dtype = b_params[0].dtype
             weight_gather_plan = self._pack_owner_work(
-                b_plans, b_owners, weight_local, device, weight_dtype
+                b_plans, b_owners, weight_local, device, weight_dtype, b_params[0]
             )
             weight_recv_buffers, weight_gather_works, weight_gather_event = self._send_to_owner(
-                weight_gather_plan, device, weight_dtype
+                weight_gather_plan, device, weight_dtype, b_params[0]
             )
         return _BoundaryChunkState(
             b_params=b_params,
@@ -916,7 +870,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         recv_buffers = state.recv_buffers
         device = state.device
         group_kwargs = state.group_kwargs
-        this_rank = self._this_rank()
+        this_rank = dist.get_rank(group=_get_parameter_dp_group(b_params[0]))
 
         # Phase 4 (owner): wait only for this chunk's gather rather than the
         # tail of the shared owner-comm stream, then reconstruct and orthogonalize.
@@ -958,10 +912,10 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
 
         # Phase 5: pack + P2P-send update shards from owners (async on owner stream).
         scatter_plan = self._pack_update_shards(
-            full_updates, b_plans, b_owners, device, state.dtype
+            full_updates, b_plans, b_owners, device, state.dtype, b_params[0]
         )
         scatter_recv, scatter_works, scatter_event = self._send_to_destination(
-            scatter_plan, device, state.dtype
+            scatter_plan, device, state.dtype, b_params[0]
         )
         state.full_updates = full_updates
         state.scatter_plan = scatter_plan
@@ -979,7 +933,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         received = self._unpack_update_shards(scatter_plan, state.scatter_recv)
 
         # Phase 6: apply local update shards.
-        this_rank = self._this_rank()
+        this_rank = dist.get_rank(group=_get_parameter_dp_group(state.b_params[0]))
         for i, param in enumerate(state.b_params):
             plan = state.b_plans[i]
             if state.b_owners[i] == this_rank:
@@ -1018,10 +972,6 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         p_local.add_(update, alpha=-lr)
         self._inner.post_weight_update_fn_inplace(p_local)
 
-    def _device(self) -> torch.device:
-        return torch.device(self.dp_mesh.device_type)
-
-
 class FsdpMuon(FsdpOrthogonalizedOptimizer):
     """Muon optimizer for all-`Flat` M-FSDPv2 parameters.
 
@@ -1035,7 +985,6 @@ class FsdpMuon(FsdpOrthogonalizedOptimizer):
         self,
         params: ParamsT,
         inner_optimizer: Muon,
-        dp_mesh: DeviceMesh,
         use_owner_comm_stream: bool = True,
         reconstruct_full_param: bool = False,
         max_params_per_owner_chunk: int | None = 4,
@@ -1061,7 +1010,6 @@ class FsdpMuon(FsdpOrthogonalizedOptimizer):
         super().__init__(
             params,
             inner_optimizer,
-            dp_mesh=dp_mesh,
             use_owner_comm_stream=use_owner_comm_stream,
             reconstruct_full_param=reconstruct_full_param,
             num_ns_steps=self._num_ns_steps,
