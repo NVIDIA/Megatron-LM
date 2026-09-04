@@ -39,13 +39,22 @@ except ImportError:
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
+from ..dist_checkpointing.metadata import (
+    DP_RESHARDABLE_PADDING_MANIFEST_KEY,
+    extract_scoped_dp_reshardable_padding_metadata,
+    merge_scoped_dp_reshardable_padding_metadata,
+)
 from ..dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
     make_sharded_optimizer_tensor,
     optim_state_to_sharding_state,
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
-from ..fp8_utils import copy_back_gathered_bf16_into_fp8_param, is_float8tensor
+from ..fp8_utils import (
+    copy_back_gathered_bf16_into_fp8_params,
+    is_layerwise_fp8_param,
+    pop_high_precision_init_val,
+)
 from ..transformer.module import param_is_not_shared
 from ..utils import log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
@@ -976,15 +985,14 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             # Seed the fp32 master from the high-precision pre-quantization init
                             # for fp8 params (not the lossy fp8 dequant), matching DistOpt so
                             # fp8_param_gather ON/OFF hold an identical master at iter 0.
-                            if hasattr(param, 'get_high_precision_init_val'):
+                            high_precision_init_val = pop_high_precision_init_val(param)
+                            if high_precision_init_val is not None:
                                 main_param = (
-                                    param.get_high_precision_init_val()
-                                    .detach()
+                                    high_precision_init_val.detach()
                                     .clone()
                                     .to(param.device)
                                     .float()
                                 )
-                                param.clear_high_precision_init_val()
                             else:
                                 main_param = param.detach().clone().float()
                             # Copy tensor model parallel attributes.
@@ -1096,15 +1104,15 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             other_model_data, other_main_data = [], []
             for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
                 for model_param, main_param in zip(model_group, main_group):
-                    if is_float8tensor(model_param):
+                    if is_layerwise_fp8_param(model_param):
                         # Gathered fp8 params get ``Q(bf16(master))`` written into ``param.data``
                         # by the fp8 all-gather's requantize (``_allgather_helper_fp8``), which
                         # would overwrite this copy -- so skip it for them. Non-gathered fp8 params
                         # (e.g. MoE experts at expt_dp == 1, which the all-gather skips) are not
                         # tagged and still get their ``Q(bf16(master))`` written here.
                         if not getattr(model_param, '_layer_wise_fp8_gathered', False):
-                            copy_back_gathered_bf16_into_fp8_param(
-                                model_param, main_param.detach().to(torch.bfloat16)
+                            copy_back_gathered_bf16_into_fp8_params(
+                                [model_param], [main_param.detach().to(torch.bfloat16)]
                             )
                     else:
                         other_model_data.append(model_param.data)
@@ -1718,11 +1726,28 @@ class ChainedOptimizer(MegatronOptimizer):
             self._synchronize_steps()
             sharded_state_dict = {}
             for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+                child_prefix = f'chained_{optimizer_idx}.' if should_add_prefix else ''
+                child_kwargs = dict(kwargs)
+                if is_loading:
+                    child_metadata = extract_scoped_dp_reshardable_padding_metadata(
+                        metadata, child_prefix
+                    )
+                else:
+                    # Each child builds a manifest using its pre-prefix ShardedTensor keys. Keep
+                    # that fragment isolated, then merge it into the parent with the same prefix
+                    # applied below to the actual state dict.
+                    child_metadata = dict(metadata)
+                    child_metadata.pop(DP_RESHARDABLE_PADDING_MANIFEST_KEY, None)
+                child_kwargs['metadata'] = child_metadata
                 optim_state_dict = optimizer.sharded_state_dict(
-                    model_sharded_state_dict, is_loading, **kwargs
+                    model_sharded_state_dict, is_loading, **child_kwargs
                 )
                 if should_add_prefix:
-                    add_prefix_for_sharding(optim_state_dict, f'chained_{optimizer_idx}.')
+                    add_prefix_for_sharding(optim_state_dict, child_prefix)
+                if not is_loading:
+                    merge_scoped_dp_reshardable_padding_metadata(
+                        metadata, child_metadata, child_prefix
+                    )
                 sharded_state_dict[optimizer_idx] = optim_state_dict
             return sharded_state_dict
 

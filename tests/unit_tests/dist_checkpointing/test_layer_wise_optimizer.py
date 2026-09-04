@@ -1,5 +1,8 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import hashlib
+import json
+import traceback
 from copy import deepcopy
 from functools import partial
 from unittest import mock
@@ -8,14 +11,16 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import load, save
+from megatron.core.dist_checkpointing import load, load_content_metadata, save
 from megatron.core.dist_checkpointing.dict_utils import nested_values
+from megatron.core.dist_checkpointing.metadata import DP_RESHARDABLE_PADDING_MANIFEST_KEY
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import ChainedOptimizer
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
@@ -23,6 +28,7 @@ from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_pg_size
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
+from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
     init_basic_mock_args,
@@ -119,6 +125,21 @@ def load_checkpoint_no_arg_checks(*args, **kwargs):
     with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
         with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
             return load_checkpoint(*args, **kwargs)
+
+
+def _save_and_load_into_fresh(build, ckpt_dir, metadata):
+    """Save build(2)'s optimizer state in ``metadata`` format and load it into build(3)'s.
+
+    Returns ``(model_A, opt_A, sd_A), (model_B, opt_B, sd_B)``.
+    """
+    model_A, opt_A = build(2)
+    sd_A = model_A[0].sharded_state_dict()
+    save(opt_A.sharded_state_dict(sd_A, metadata=metadata), ckpt_dir)
+    model_B, opt_B = build(3)
+    sd_B = model_B[0].sharded_state_dict()
+    load_sd = opt_B.sharded_state_dict(sd_B, is_loading=True, metadata=metadata)
+    opt_B.load_state_dict(load(load_sd, ckpt_dir))
+    return (model_A, opt_A, sd_A), (model_B, opt_B, sd_B)
 
 
 class TestLayerWiseOptimizer:
@@ -354,6 +375,302 @@ class TestLayerWiseOptimizer:
                 plain_sd_B = load_plain_tensors(ckpt_dir_B)
 
                 check_equal(plain_sd_A, plain_sd_B)
+
+    # grad_reduce_in_fp32=True gives the mixed-dtype (bf16 param, fp32 grad) DistOpt sibling
+    # buffer of the decoupled Muon layout -- the layout that trips 'empty bucket encountered'
+    # in sharded_param_state_dp_reshardable on the real fp8 SFT save.
+    @pytest.mark.parametrize('grad_reduce_in_fp32', [False, True])
+    @pytest.mark.parametrize('bf16', [True])
+    def test_dp_reshardable_decouple_ckpt(self, tmp_path_dist_ckpt, bf16, grad_reduce_in_fp32):
+        """dp_reshardable save/load of the decoupled compact LayerWise (Muon) optimizer, for the
+        uniform (bf16, bf16) and mixed-dtype (bf16, fp32) sibling DistOpt buffers.
+        """
+        Utils.initialize_model_parallel(1, 1)  # tp=pp=1 -> dp = world_size
+        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
+
+        def _build(seed):
+            return setup_model_and_optimizer(
+                seed=seed,
+                tp=1,
+                pp=1,
+                bf16=bf16,
+                dist_opt=True,
+                initialize_fn=initialize_gpt_model,
+                optimizer='dist_muon',
+                use_param_layout=True,
+                grad_reduce_in_fp32=grad_reduce_in_fp32,
+            )
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_layer_wise_dp_reshardable', sync=True
+        ) as ckpt_dir:
+            _save_and_load_into_fresh(_build, ckpt_dir, metadata)
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize('ep', [2, 4])
+    def test_dp_reshardable_decouple_moe_ckpt(self, tmp_path_dist_ckpt, ep):
+        """dp_reshardable save/load of the decoupled compact LayerWise (Muon) optimizer on an
+        MoE model with expert parallelism (dense single-bucket ownership).
+        """
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=ep,
+        )
+        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
+
+        def _build(seed):
+            return setup_moe_model_and_optimizer(
+                seed=seed,
+                tp=1,
+                pp=1,
+                ep=ep,
+                bf16=True,
+                dist_opt=True,
+                optimizer='dist_muon',
+                use_param_layout=True,
+                grad_reduce_in_fp32=True,
+            )
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_layer_wise_dp_reshardable_moe', sync=True
+        ) as ckpt_dir:
+            _save_and_load_into_fresh(_build, ckpt_dir, metadata)
+        Utils.destroy_model_parallel()
+
+    def test_dp_reshardable_moe_sparse_padding_roundtrip(self, tmp_path_dist_ckpt):
+        """Round-trip a multi-bucket checkpoint with real trailing and intra-param padding.
+
+        The geometry assertions are part of the regression: without both padding forms this test
+        would no longer exercise the sparse coverage manifest or the empty local bucket path.
+        """
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=2,
+        )
+
+        def _build(seed):
+            return setup_moe_model_and_optimizer(
+                seed=seed,
+                tp=1,
+                pp=1,
+                ep=2,
+                bf16=True,
+                dist_opt=True,
+                optimizer='dist_muon',
+                use_param_layout=True,
+                grad_reduce_in_fp32=True,
+                ddp_bucket_size=32,
+            )
+
+        def _distributed_optimizers(root_optimizer):
+            if isinstance(root_optimizer, DistributedOptimizer):
+                return [root_optimizer]
+            return [
+                dist_opt
+                for child in getattr(root_optimizer, 'chained_optimizers', ())
+                for dist_opt in _distributed_optimizers(child)
+            ]
+
+        def _assert_and_collect_padding_geometry(root_optimizer):
+            expected_manifest = {}
+            trailing_shards = []
+            intra_param_shards = []
+            for dist_opt in _distributed_optimizers(root_optimizer):
+                dp_size = dist_opt.data_parallel_group.size()
+                for gbuf_idx, (buffer, gbuf_ranges) in enumerate(
+                    zip(dist_opt.buffers, dist_opt.gbuf_ranges)
+                ):
+                    assert len(gbuf_ranges) == 1
+                    dtype = next(iter(gbuf_ranges))
+                    for bucket_idx, bucket in enumerate(buffer.buckets):
+                        world_numel = bucket.grad_data.numel()
+                        world_numel_unpadded = bucket.numel_unpadded
+                        assert world_numel >= world_numel_unpadded
+                        assert world_numel % dp_size == 0
+                        local_numel = world_numel // dp_size
+
+                        param_ranges = sorted(bucket.param_to_index.values())
+                        padding_gaps = []
+                        cursor = 0
+                        for param_start, param_end in param_ranges:
+                            if cursor < param_start:
+                                padding_gaps.append([cursor, param_start])
+                            cursor = max(cursor, param_end)
+                        if cursor < world_numel_unpadded:
+                            padding_gaps.append([cursor, world_numel_unpadded])
+
+                        bucket_intra_param_shards = []
+                        for rank in range(dp_size):
+                            shard_start = rank * local_numel
+                            shard_end = min(shard_start + local_numel, world_numel_unpadded)
+                            if shard_start >= world_numel_unpadded:
+                                trailing_shards.append([shard_start, shard_start + local_numel])
+                            elif any(
+                                gap_start <= shard_start and shard_end <= gap_end
+                                for gap_start, gap_end in padding_gaps
+                            ):
+                                bucket_intra_param_shards.append([shard_start, shard_end])
+                                intra_param_shards.append([shard_start, shard_end])
+
+                        if bucket_intra_param_shards:
+                            bucket_key = (
+                                'optimizer.distributed.'
+                                f'dp_group_idx_{dist_opt.data_parallel_group_idx}'
+                                f'.gbuf_idx_{gbuf_idx}.dtype_{dtype}.bucket_idx_{bucket_idx}'
+                            )
+                            expected_manifest[bucket_key] = {
+                                'global_numel': world_numel_unpadded,
+                                'padding_ranges': padding_gaps,
+                            }
+
+            padding_presence = torch.tensor(
+                [bool(trailing_shards), bool(intra_param_shards)],
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(padding_presence, op=torch.distributed.ReduceOp.MAX)
+            has_trailing_padding, has_intra_param_padding = padding_presence.tolist()
+            assert (
+                has_trailing_padding
+            ), 'test setup did not create a full trailing-padding DP shard'
+            assert (
+                has_intra_param_padding
+            ), 'test setup did not create a full intra-param-padding shard'
+            return expected_manifest
+
+        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
+
+        def _assert_manifest_contains(actual_manifest, expected_manifest):
+            local_errors = []
+            for bucket_key, bucket_metadata in expected_manifest.items():
+                matching_entries = [
+                    value for key, value in actual_manifest.items() if key.endswith(bucket_key)
+                ]
+                if not matching_entries:
+                    local_errors.append(
+                        f'{bucket_key} missing from manifest keys {list(actual_manifest)}'
+                    )
+                elif any(entry != bucket_metadata for entry in matching_entries):
+                    local_errors.append(
+                        f'{bucket_key} metadata mismatch: {matching_entries} != {bucket_metadata}'
+                    )
+            gathered_errors = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered_errors, local_errors)
+            assert not any(gathered_errors), gathered_errors
+
+        def _assert_collective_success(local_error):
+            gathered_errors = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered_errors, local_error)
+            assert not any(gathered_errors), '\n'.join(
+                error for error in gathered_errors if error is not None
+            )
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'moe_sparse_rt', sync=True) as rt_dir:
+            model_A, optimizer_A = _build(2)
+            model_sd_A = model_A[0].sharded_state_dict()
+            expected_manifest = _assert_and_collect_padding_geometry(optimizer_A)
+            optim_sd_A = optimizer_A.sharded_state_dict(model_sd_A, metadata=metadata)
+
+            local_manifest = metadata[DP_RESHARDABLE_PADDING_MANIFEST_KEY]['buckets']
+            _assert_manifest_contains(local_manifest, expected_manifest)
+            serialized_manifest = json.dumps(local_manifest, sort_keys=True, separators=(',', ':'))
+            manifest_digest = hashlib.sha256(serialized_manifest.encode()).hexdigest()
+            gathered_digests = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered_digests, manifest_digest)
+            assert len(set(gathered_digests)) == 1, (
+                'bucket-layout-derived padding manifest differs across ranks',
+                gathered_digests,
+            )
+
+            save(optim_sd_A, rt_dir, content_metadata=metadata)
+            loaded_metadata = load_content_metadata(rt_dir)
+            persisted_manifest = loaded_metadata[DP_RESHARDABLE_PADDING_MANIFEST_KEY]['buckets']
+            _assert_manifest_contains(persisted_manifest, expected_manifest)
+
+            model_B, optimizer_B = _build(3)
+            model_sd_B = model_B[0].sharded_state_dict()
+            load_template = optimizer_B.sharded_state_dict(
+                model_sd_B, is_loading=True, metadata=loaded_metadata
+            )
+            loaded_state = load(load_template, rt_dir)
+            loaded_state.pop('content_metadata', None)
+            load_error = None
+            try:
+                optimizer_B.load_state_dict(loaded_state)
+            except Exception:
+                load_error = traceback.format_exc()
+            _assert_collective_success(load_error)
+
+            comparison_error = None
+            try:
+                check_equal(optimizer_A.state_dict(), optimizer_B.state_dict())
+            except Exception:
+                comparison_error = traceback.format_exc()
+            _assert_collective_success(comparison_error)
+
+        Utils.destroy_model_parallel()
+
+    # NOTE: 'fully_sharded_model_space' is intentionally NOT covered: it is non-functional for
+    # EVERY DistributedOptimizer here (it sets flattened_range on every non-factory param, which
+    # dist_checkpointing rejects) and raises non-uniformly across DP ranks, so it cannot be
+    # asserted cleanly. Pre-existing, independent of this fix.
+    @pytest.mark.parametrize('fp8', [False, True])
+    @pytest.mark.parametrize('sharding_type', ['dp_reshardable', 'fully_reshardable'])
+    def test_decouple_ckpt_roundtrip_values(self, tmp_path_dist_ckpt, sharding_type, fp8):
+        """Value-level save/load round-trip of the decoupled compact LayerWise (Muon) optimizer
+        (bf16 and MXFP8 params). Save A in ``sharding_type``, load into a differently-seeded B,
+        assert B's state == A's by value. Compared through a padding-free ``fully_reshardable``
+        canonical view, because ``dp_reshardable`` serializes padding as uninitialized
+        ``torch.empty`` (values discarded on load) so two saves differ in the padding bytes.
+        """
+        # fp8=True uses MXFP8, whose dequantize path requires Blackwell (arch >= 10); skip below.
+        if fp8 and get_device_arch_version() < 10:
+            pytest.skip("MXFP8 dequantization requires Blackwell architecture (>= 10)")
+
+        from megatron.core.dist_checkpointing import load_plain_tensors
+
+        Utils.initialize_model_parallel(1, 1)  # tp=pp=1 -> dp = world_size
+        metadata = {'distrib_optim_sharding_type': sharding_type}
+        # Padding-free canonical view used to compare optimizer state by value.
+        canonical = {'distrib_optim_sharding_type': 'fully_reshardable'}
+
+        def _build(seed):
+            kwargs = dict(
+                seed=seed,
+                tp=1,
+                pp=1,
+                bf16=True,
+                dist_opt=True,
+                initialize_fn=initialize_gpt_model,
+                optimizer='dist_muon',
+                use_param_layout=True,
+                grad_reduce_in_fp32=True,
+            )
+            if fp8:
+                kwargs['fp8'] = True
+            return setup_model_and_optimizer(**kwargs)
+
+        tag = f'{"fp8" if fp8 else "bf16"}_{sharding_type}'
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / f'{tag}_rt', sync=True) as rt_dir,
+            TempNamedDir(tmp_path_dist_ckpt / f'{tag}_A', sync=True) as canon_dir_A,
+            TempNamedDir(tmp_path_dist_ckpt / f'{tag}_B', sync=True) as canon_dir_B,
+        ):
+            # Save A in the format under test, load it into a differently seeded B.
+            (model_A, optimizer_A, model_sd_A), (model_B, optimizer_B, model_sd_B) = (
+                _save_and_load_into_fresh(_build, rt_dir, metadata)
+            )
+
+            # Compare A vs post-load B by value, through the padding-free canonical view.
+            save(optimizer_A.sharded_state_dict(model_sd_A, metadata=canonical), canon_dir_A)
+            save(optimizer_B.sharded_state_dict(model_sd_B, metadata=canonical), canon_dir_B)
+            Utils.destroy_model_parallel()
+
+            Utils.initialize_model_parallel(1, 1)
+            check_equal(load_plain_tensors(canon_dir_A), load_plain_tensors(canon_dir_B))
+        Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize('tp', [1, 2, 4])
     @pytest.mark.parametrize('pp', [1, 2, 4])

@@ -1,6 +1,8 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-""" Strategies using PyTorch distributed.checkpoint as an underlying format. """
+"""Strategies using PyTorch distributed.checkpoint as an underlying format."""
+
+import dataclasses
 import inspect
 import io
 import os
@@ -35,6 +37,11 @@ from torch.distributed.checkpoint import (
 )
 from torch.distributed.checkpoint._nested_dict import FLATTEN_MAPPING, unflatten_state_dict
 from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
+from torch.distributed.checkpoint.default_planner import (
+    _validate_global_plan,
+    create_default_global_save_plan,
+    dedup_save_plans,
+)
 from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
@@ -48,6 +55,7 @@ from ..mapping import (
     StateDict,
     is_main_replica,
 )
+from ..metadata import get_dp_reshardable_padding_manifest
 from .async_utils import AsyncRequest
 from .checkpointable import CheckpointableShardedTensor, LocalShardsContainer
 from .nvrx import has_nvrx_async_support, make_nvrx_async_request
@@ -332,7 +340,7 @@ def mcore_to_pyt_state_dict(
 
 
 def _unwrap_pyt_sharded_tensor(
-    sh_ten: Union[TorchShardedTensor, CheckpointableShardedTensor, LocalShardsContainer, Any]
+    sh_ten: Union[TorchShardedTensor, CheckpointableShardedTensor, LocalShardsContainer, Any],
 ) -> Union[List[torch.Tensor], Any]:
     """Unwrap tensor from PyT ShardedTensor instance.
 
@@ -403,6 +411,99 @@ def _restore_dict_types(x: Union[dict, list, Any], keys_template: Union[dict, li
             _restore_dict_types(x_val, templ_val)
 
 
+def _validate_global_plan_with_dp_reshardable_padding(
+    global_plan: List[SavePlan], metadata: Metadata, padding_manifest: dict
+) -> None:
+    """Validate DCP coverage while allowing only manifest-declared 1-D padding holes."""
+    bucket_manifest = padding_manifest['buckets']
+    sparse_keys = set()
+    matched_buckets = set()
+    errors = []
+
+    for key, tensor_metadata in metadata.state_dict_metadata.items():
+        if not isinstance(tensor_metadata, TensorStorageMetadata):
+            continue
+        matching_buckets = [
+            bucket_key for bucket_key in bucket_manifest if key.startswith(f'{bucket_key}.')
+        ]
+        if not matching_buckets:
+            continue
+        if len(matching_buckets) != 1:
+            errors.append(f'{key}: matches multiple padding manifest buckets {matching_buckets}')
+            continue
+
+        bucket_key = matching_buckets[0]
+        bucket_metadata = bucket_manifest[bucket_key]
+        sparse_keys.add(key)
+        matched_buckets.add(bucket_key)
+        global_numel = bucket_metadata['global_numel']
+        if tuple(tensor_metadata.size) != (global_numel,):
+            errors.append(
+                f'{key}: manifest global_numel={global_numel} does not match '
+                f'tensor shape {tuple(tensor_metadata.size)}'
+            )
+            continue
+
+        saved_ranges = [
+            (int(chunk.offsets[0]), int(chunk.offsets[0] + chunk.sizes[0]))
+            for chunk in tensor_metadata.chunks
+            if len(chunk.offsets) == 1 and len(chunk.sizes) == 1
+        ]
+        if len(saved_ranges) != len(tensor_metadata.chunks):
+            errors.append(f'{key}: sparse padding manifest only supports 1-D tensors')
+            continue
+
+        def _is_padding(start, end):
+            padding_cursor = start
+            for padding_start, padding_end in bucket_metadata['padding_ranges']:
+                if padding_end <= padding_cursor:
+                    continue
+                if padding_start > padding_cursor:
+                    break
+                padding_cursor = max(padding_cursor, padding_end)
+                if padding_cursor >= end:
+                    return True
+            return padding_cursor >= end
+
+        cursor = 0
+        for start, end in sorted(saved_ranges):
+            if start < 0 or end > global_numel or start >= end:
+                errors.append(f'{key}: saved range [{start}, {end}) is outside [0, {global_numel})')
+                break
+            if start < cursor:
+                errors.append(
+                    f'{key}: saved range [{start}, {end}) overlaps previous coverage at {cursor}'
+                )
+                break
+            if cursor < start and not _is_padding(cursor, start):
+                errors.append(f'{key}: undeclared coverage gap [{cursor}, {start})')
+                break
+            cursor = end
+        else:
+            if cursor < global_numel and not _is_padding(cursor, global_numel):
+                errors.append(f'{key}: undeclared coverage gap [{cursor}, {global_numel})')
+
+    unmatched_buckets = set(bucket_manifest) - matched_buckets
+    if unmatched_buckets:
+        errors.append(
+            f'padding manifest buckets have no optimizer-state tensors: {unmatched_buckets}'
+        )
+
+    regular_metadata = dataclasses.replace(
+        metadata,
+        state_dict_metadata={
+            key: value
+            for key, value in metadata.state_dict_metadata.items()
+            if key not in sparse_keys
+        },
+    )
+    if not _validate_global_plan(global_plan, regular_metadata):
+        errors.append('PyTorch DCP validation failed for tensors without declared padding')
+
+    if errors:
+        raise ValueError('Failed to validate global plan:\n' + '\n'.join(errors))
+
+
 class MCoreSavePlanner(DefaultSavePlanner):
     """Differs with the default planner by saving BytesIO objects on all ranks.
 
@@ -419,6 +520,7 @@ class MCoreSavePlanner(DefaultSavePlanner):
         *args,
         dedup_replicated_tensors: Optional[bool] = None,
         can_run_decentralized_global_plan: bool = True,
+        dp_reshardable_padding_manifest: Optional[dict] = None,
         **kwargs,
     ) -> None:
         # `dedup_replicated_tensors` was deprecated in 2.3; this check avoids warnings
@@ -428,6 +530,7 @@ class MCoreSavePlanner(DefaultSavePlanner):
         if get_torch_version() <= PkgVersion("2.2"):
             kwargs['dedup_replicated_tensors'] = dedup_replicated_tensors
         super().__init__(*args, **kwargs)
+        self.dp_reshardable_padding_manifest = dp_reshardable_padding_manifest
         self.can_run_decentralized_global_plan = can_run_decentralized_global_plan
         if can_run_decentralized_global_plan:
             assert (
@@ -436,6 +539,23 @@ class MCoreSavePlanner(DefaultSavePlanner):
             assert (
                 not self.flatten_state_dict
             ), 'Cannot run decentralized plan with flatten_state_dict=True'
+
+    def create_global_plan(self, all_plans: List[SavePlan]) -> Tuple[List[SavePlan], Metadata]:
+        """Create a DCP plan, allowing only exact padding holes declared by MCore metadata."""
+        if self.dp_reshardable_padding_manifest is None:
+            return super().create_global_plan(all_plans)
+
+        # MCore always disables flatten_state_dict for this planner. Keeping the sparse path here
+        # avoids copying PyTorch's version-dependent flattening and plan-cache bookkeeping.
+        assert not self.flatten_state_dict
+        all_plans = dedup_save_plans(all_plans, self.dedup_save_to_lowest_rank)
+        global_plan, metadata = create_default_global_save_plan(all_plans)
+        _validate_global_plan_with_dp_reshardable_padding(
+            global_plan, metadata, self.dp_reshardable_padding_manifest
+        )
+        self.global_plan = global_plan
+        self.metadata = metadata
+        return self.global_plan, self.metadata
 
     def create_local_plan(self) -> SavePlan:
         """Adds IOBytes write request on non-coordinator ranks."""
@@ -678,8 +798,15 @@ class TorchDistSaveShardedStrategy:
                 )
                 _logged_mcore_async_deprecation = True
 
+        padding_manifest = None
+        common_state = sharded_state_dict.get('common_state')
+        if isinstance(common_state, ShardedObject) and isinstance(common_state.data, dict):
+            padding_manifest = get_dp_reshardable_padding_manifest(
+                common_state.data.get('content_metadata')
+            )
+
         # Translate the state dict
-        (sharded_state_dict, flat_mapping, rename_mapping) = (
+        sharded_state_dict, flat_mapping, rename_mapping = (
             _replace_state_dict_keys_with_sharded_keys(
                 sharded_state_dict, self.keep_only_main_replica
             )
@@ -762,6 +889,7 @@ class TorchDistSaveShardedStrategy:
                 dedup_replicated_tensors=not self.keep_only_main_replica,
                 flatten_state_dict=False,
                 flatten_sharded_tensors=False,
+                dp_reshardable_padding_manifest=padding_manifest,
             ),
             **state_dict_saver_kwargs,
         )
@@ -884,7 +1012,7 @@ class TorchDistLoadShardedStrategy:
 
         orig_sharded_state_dict = sharded_state_dict
         # MCore state dict to PyT Distributed compatible
-        (sharded_state_dict, flat_mapping, rename_mapping) = (
+        sharded_state_dict, flat_mapping, rename_mapping = (
             _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)

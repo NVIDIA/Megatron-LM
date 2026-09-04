@@ -14,9 +14,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_pg_rank, get_pg_size, log_single_rank
 
 from ..fp8_utils import (
-    _stage_param_to_bf16,
-    copy_back_gathered_bf16_into_fp8_param,
-    is_float8tensor,
+    copy_back_gathered_bf16_into_fp8_params,
+    is_layerwise_fp8_param,
     post_all_gather_processing,
 )
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
@@ -418,7 +417,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         self.shard_params(optimizers, full_param_layouts, model_chunks)
 
         # Engage FP8 param sync automatically when the decouple-managed params are actually
-        # quantized (fp8_param_gather on + TE Float8/MXFP8 weights). Off -> plain bf16 path.
+        # quantized (fp8_param_gather on + supported MXFP8/blockwise weights). Off -> plain bf16.
         # Also tag the gathered fp8 params: the fp8 all-gather (``_allgather_helper_fp8``)
         # requantizes bf16 -> each rank's fp8 ``param.data``, so the child optimizer's pre-gather
         # fp8 copy-back into ``param.data`` is redundant for them and is skipped. Params in these
@@ -431,7 +430,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     continue
                 for per_rank in params_list:
                     for p in per_rank:
-                        if is_float8tensor(p):
+                        if is_layerwise_fp8_param(p):
                             self.use_fp8_param_sync = True
                             p._layer_wise_fp8_gathered = True
 
@@ -665,7 +664,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             group["params"] = local_params
 
         # Simplify when expt_dp group size is 1 or expert parallel is off.
-        if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
+        if expt_dp_size == 1 or not any(self.expt_dp_params_list):
             self.expt_dp_params_list = None
 
     def _build_param_sort_keys(self, model_chunks):
@@ -757,7 +756,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             groups["params"] = params
 
         # Simplify when expt_dp group size is 1 or expert parallel is off.
-        if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
+        if expt_dp_size == 1 or not any(self.expt_dp_params_list):
             self.expt_dp_params_list = None
 
     def set_bucket_layerwise_params_list(self, model_chunks):
@@ -848,16 +847,33 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # No rank owns any param in this buffer -> nothing to gather.
                 return
 
-            # Stage fp32 master->bf16 (high-precision source), not lossy dequant(fp8).
-            owned = params_list[rank]
-            src = (
-                _flatten_dense_tensors([_stage_param_to_bf16(p) for p in owned])
-                if len(owned) > 0
-                else torch.empty(0, device=device, dtype=torch.bfloat16)
-            )
             flat_sizes = [sum(p.numel() for p in params) for params in params_list]
             if max(flat_sizes) == 0:
                 return
+
+            # Stage FP32 masters directly into one flat BF16 transport tensor rather than
+            # allocating a temporary BF16 tensor per parameter and flattening those copies.
+            owned = params_list[rank]
+            src = torch.empty(flat_sizes[rank], device=device, dtype=torch.bfloat16)
+            offset = 0
+            for param in owned:
+                main_param = getattr(param, "main_param", None)
+                if main_param is None:
+                    raise RuntimeError(
+                        "LayerWise FP8 parameter-gather staging requires "
+                        "param.main_param (FP32 master)."
+                    )
+                param_numel = param.numel()
+                main_param = main_param.detach()
+                if main_param.numel() != param_numel:
+                    raise RuntimeError(
+                        "LayerWise parameter-gather staging source size mismatch: "
+                        f"source has {main_param.numel()} elements, parameter has "
+                        f"{param_numel}."
+                    )
+                src[offset : offset + param_numel].copy_(main_param.reshape(-1))
+                offset += param_numel
+            assert offset == flat_sizes[rank]
 
             gather_list = []
             for i in range(dp_size):
@@ -879,20 +895,26 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     torch.empty(p.shape, device="meta", dtype=torch.bfloat16) for p in params
                 ]
                 updated_params = _unflatten_dense_tensors(gather_list[idx], templates)
-                for updated_bf16, model_p in zip(updated_params, params):
-                    copy_back_gathered_bf16_into_fp8_param(model_p, updated_bf16)
+                copy_back_gathered_bf16_into_fp8_params(params, updated_params)
 
             # Rebuild fp8 columnwise/transpose after the gather (mirrors the overlap / DistOpt
             # paths; blockwise/Float8 build it, mxfp8 is a noop). Else it'd be deferred to forward.
-            fp8_params = [p for params in params_list for p in params if is_float8tensor(p)]
+            fp8_params = [p for params in params_list for p in params if is_layerwise_fp8_param(p)]
             if fp8_params:
                 post_all_gather_processing(fp8_params)
 
         # helper function to flatten local params, all-gather,
         # unflatten and copy to model params
         def _allgather_helper(params_list, group):
-            device = params_list[0][0].device
-            dtype = params_list[0][0].dtype
+            # Rank 0 may own zero params in this list -- the ping-pong assignment, and the
+            # dtype split in ``_dispatch`` below, both leave per-rank lists that can be empty.
+            # Mirror ``_allgather_helper_fp8``'s lookup instead of indexing rank 0 blindly.
+            _first = next((params[0] for params in params_list if len(params) > 0), None)
+            if _first is None:
+                # No rank owns any param in this group -> nothing to gather.
+                return
+            device = _first.device
+            dtype = _first.dtype
             rank = get_pg_rank(group)
             dp_size = get_pg_size(group)
             # Flatten this rank's params.
@@ -937,11 +959,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             # flatten is invalid. For a pure-bf16 model (no fp32 Muon params) the native group is
             # empty and this collapses to the original single-helper dispatch.
             staged = [
-                [p for p in owned if is_float8tensor(p) or p.dtype != torch.float32]
+                [p for p in owned if is_layerwise_fp8_param(p) or p.dtype != torch.float32]
                 for owned in params_list
             ]
             native = [
-                [p for p in owned if not is_float8tensor(p) and p.dtype == torch.float32]
+                [p for p in owned if not is_layerwise_fp8_param(p) and p.dtype == torch.float32]
                 for owned in params_list
             ]
             if any(owned for owned in staged):
