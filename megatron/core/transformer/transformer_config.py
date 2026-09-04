@@ -2311,6 +2311,11 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.delay_wgrad_compute:
                 raise ValueError("MOK does not support delay_wgrad_compute")
+            if self.overlap_dispatch_backward_with_experts_wgrad:
+                raise ValueError(
+                    "MOK does not support overlap_dispatch_backward_with_experts_wgrad; "
+                    "the megakernel never runs the native dispatch path"
+                )
             if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
                 raise ValueError("MOK currently requires TP=1 and expert TP=1")
             if self.expert_model_parallel_size not in (1, 4, 8, 16, 32, 64):
