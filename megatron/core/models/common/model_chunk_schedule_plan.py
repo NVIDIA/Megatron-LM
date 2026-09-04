@@ -9,7 +9,7 @@ from torch import Tensor
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.pipeline_parallel.tensor_lifetime import ScheduleTensorLifetimeManager
+from megatron.core.pipeline_parallel.combined_1f1b_tensor_release import Combined1F1BTensorRelease
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -205,7 +205,7 @@ class TransformerLayerSchedulePlan:
         comp_stream,
         comm_stream,
         extra_args={},
-        lifetime_manager=None,
+        tensor_release=None,
     ):
         """Initializes a transformer layer schedule plan.
 
@@ -237,7 +237,7 @@ class TransformerLayerSchedulePlan:
 
         # get callable nodes for transformer/mtp layer
         self._build_callable_nodes(
-            event, comp_stream, comm_stream, extra_args, lifetime_manager=lifetime_manager
+            event, comp_stream, comm_stream, extra_args, tensor_release=tensor_release
         )
 
     def release_state(self):
@@ -288,7 +288,7 @@ class TransformerLayerSchedulePlan:
             del self.layer
 
     def _build_callable_nodes(
-        self, event, comp_stream, comm_stream, extra_args, lifetime_manager=None
+        self, event, comp_stream, comm_stream, extra_args, tensor_release=None
     ):
         """
         Builds the callable nodes for the transformer/mtp layer:
@@ -328,7 +328,7 @@ class TransformerLayerSchedulePlan:
                 name=name,
                 bwd_dw_callables=bwd_dw_callables,
                 extra_args=extra_args,
-                lifetime_manager=lifetime_manager,
+                tensor_release=tensor_release,
             )
 
         (
@@ -378,7 +378,7 @@ class TransformerLayerSchedulePlan:
                 event,
                 name="mhc_recompute",
                 forward_nvtx_name=f"mhc/recompute/{module_tag}/group_{group_index}/B",
-                lifetime_manager=lifetime_manager,
+                tensor_release=tensor_release,
             )
         else:
             self.mhc_recompute = None
@@ -679,9 +679,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
         self._event = torch.cuda.Event()
-        self._lifetime_manager = (
-            ScheduleTensorLifetimeManager()
-            if model.config.ep_overlap_use_scheduled_tensor_lifetime
+        self._tensor_release = (
+            Combined1F1BTensorRelease()
+            if model.config.ep_overlap_use_scheduled_tensor_release
             else None
         )
         self.pre_process = None
@@ -784,7 +784,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 comp_stream,
                 comm_stream,
                 extra_args,
-                lifetime_manager=self._lifetime_manager,
+                tensor_release=self._tensor_release,
             )
             self._transformer_layers.append(layer_plan)
 
@@ -847,9 +847,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         return self._event
 
     @property
-    def lifetime_manager(self):
-        """Gets the optional schedule-aware tensor lifetime manager."""
-        return self._lifetime_manager
+    def tensor_release(self):
+        """Gets the optional combined 1F1B scheduled tensor-release state."""
+        return self._tensor_release
 
     def record_current_stream(self):
         """Records the current CUDA stream in the event."""
@@ -1018,10 +1018,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # post process forward
         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
-            if f_schedule_plan.lifetime_manager is not None:
+            if f_schedule_plan.tensor_release is not None:
                 # Post-processing is outside the managed layer-node chain.  Its input
                 # remains live, but no later managed node should consume this binding.
-                f_schedule_plan.lifetime_manager.export(f_input)
+                f_schedule_plan.tensor_release.export(f_input)
             if f_schedule_plan.recompute_full and f_input is not None and not f_input.requires_grad:
                 # The last layer ran under no_grad, so post_process needs a grad-tracking
                 # leaf to seed the replayed last segment's backward.
@@ -1029,9 +1029,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_input = f_schedule_plan.post_process.forward(f_input)
         # pre process backward
         if b_schedule_plan is not None:
-            if b_schedule_plan.lifetime_manager is not None:
+            if b_schedule_plan.tensor_release is not None:
                 # Pre-processing is the backward boundary of the managed layer-node chain.
-                b_schedule_plan.lifetime_manager.export(b_grad)
+                b_schedule_plan.tensor_release.export(b_grad)
             b_schedule_plan.pre_process.backward(b_grad)
 
         # The forward output has been consumed (PP send / post_process), so the
@@ -1041,14 +1041,14 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         if f_schedule_plan:
             f_schedule_plan.wait_current_stream()
-            if f_schedule_plan.lifetime_manager is not None:
-                f_schedule_plan.lifetime_manager.finalize_phase(
+            if f_schedule_plan.tensor_release is not None:
+                f_schedule_plan.tensor_release.finalize_phase(
                     f_schedule_plan.event, phase="forward", outputs=f_input
                 )
         if b_schedule_plan:
             b_schedule_plan.wait_current_stream()
-            if b_schedule_plan.lifetime_manager is not None:
-                b_schedule_plan.lifetime_manager.finalize_phase(
+            if b_schedule_plan.tensor_release is not None:
+                b_schedule_plan.tensor_release.finalize_phase(
                     b_schedule_plan.event, phase="backward"
                 )
             # Release reference as early as possible, this helps avoid memory leak.

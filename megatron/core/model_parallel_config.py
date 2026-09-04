@@ -340,12 +340,12 @@ class ModelParallelConfig:
     in 1f1b phase of pipelining or non-pipelining schedule.
     """
 
-    ep_overlap_use_scheduled_tensor_lifetime: bool = False
-    """Use schedule-aware cross-stream tensor retirement for fine-grained EP overlap.
+    ep_overlap_use_scheduled_tensor_release: bool = False
+    """Use scheduled cross-stream tensor release for fine-grained EP overlap.
 
     When enabled, each model-chunk plan binds tensors produced by schedule nodes to
     their creation stream and hands them back through the existing event chain.
-    External and detached gradients keep using allocator ``record_stream`` retirement.
+    External and detached gradients keep using allocator ``record_stream`` release.
     This option is experimental and disabled by default.
     """
 

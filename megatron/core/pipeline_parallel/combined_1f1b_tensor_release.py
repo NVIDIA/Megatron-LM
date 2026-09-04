@@ -1,15 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Schedule-local lifetime management for tensors crossing CUDA streams.
+"""Scheduled tensor release for the combined 1F1B pipeline schedule.
 
 Only tensors produced and consumed by a ``ScheduleNode`` participate.  Each
 model-chunk plan records the stream that produced a concrete tensor, consumes
 that binding at the next real node, and falls back to allocator ``record_stream``
-retirement when an input came from outside the plan.
+when an input came from outside the plan.
 
 A cross-stream consumer holds the tensor until a later node from the same plan
 acquires the owner stream.  That acquire already waits on the plan event, so the
-manager can drop the reference (or empty forward storage) without adding a new
+release state can drop the reference (or empty forward storage) without adding a new
 dependency to the overlap schedule.
 """
 
@@ -24,7 +24,7 @@ import torch
 
 
 class ReleaseAction(Enum):
-    """Action performed after a tensor is safe to retire."""
+    """Action performed after a tensor is safe to release."""
 
     EMPTY_STORAGE = auto()
     DROP_REFERENCE = auto()
@@ -69,8 +69,8 @@ def _iter_unique_cuda_tensors(value: Any) -> Iterable[torch.Tensor]:
         yield tensor
 
 
-class ScheduleTensorLifetimeManager:
-    """Retire selected tensors within one model-chunk schedule plan.
+class Combined1F1BTensorRelease:
+    """Release selected tensors within one combined 1F1B model-chunk plan.
 
     Ownership follows concrete tensor objects rather than schedule-node input
     slots.  Bindings are strong and single-consumer: a real node consumes each
@@ -93,11 +93,11 @@ class ScheduleTensorLifetimeManager:
         *,
         stream: torch.cuda.Stream,
         node: str,
-        retire_consumed: bool,
+        release_consumed: bool,
     ) -> None:
         """Consume input bindings and publish outputs from one forward node."""
 
-        action = ReleaseAction.EMPTY_STORAGE if retire_consumed else None
+        action = ReleaseAction.EMPTY_STORAGE if release_consumed else None
         self._consume_and_publish(consumed, produced, action, stream, node)
 
     def consume_forward_outputs(self, forward_outputs: Any) -> None:
@@ -112,14 +112,14 @@ class ScheduleTensorLifetimeManager:
     def consume_output_grads_and_publish_input_grads(
         self, output_grads: Any, input_grads: Any, *, stream: torch.cuda.Stream, node: str
     ) -> None:
-        """Retire output grads and publish input grads produced by one backward node."""
+        """Release output grads and publish input grads produced by one backward node."""
 
         self._consume_and_publish(
             output_grads, input_grads, ReleaseAction.DROP_REFERENCE, stream, node
         )
 
     def export(self, value: Any) -> None:
-        """Move plan outputs outside manager ownership without retiring their storage."""
+        """Move plan outputs outside scheduled release without changing storage."""
 
         for tensor in _iter_unique_cuda_tensors(value):
             self._export_tensor(tensor)
@@ -175,14 +175,14 @@ class ScheduleTensorLifetimeManager:
         # Object-id ownership cannot safely describe two tensors sharing an
         # allocation, especially when EMPTY_STORAGE releases the whole storage.
         # Validate the complete edge before mutating any binding or storage so a
-        # rejected transition leaves the manager and its tensors unchanged.
+        # rejected transition leaves the release state and its tensors unchanged.
         edge_tensors = consumed_tensors + produced_tensors
         for tensor_index, tensor in enumerate(edge_tensors):
             for prior_index in range(tensor_index):
                 if torch._C._is_alias_of(edge_tensors[prior_index], tensor):
                     raise RuntimeError(
                         f"Node {node!r} passed multiple tensor objects sharing one storage; "
-                        "scheduled tensor lifetime management does not support storage aliases"
+                        "combined 1F1B tensor release does not support storage aliases"
                     )
 
         for tensor in consumed_tensors:
@@ -208,7 +208,7 @@ class ScheduleTensorLifetimeManager:
         action: Optional[ReleaseAction],
         consumer_stream: Optional[torch.cuda.Stream],
     ) -> None:
-        """Consume one binding and retire it according to its producer stream.
+        """Consume one binding and release it according to its producer stream.
 
         A missing owner means the tensor entered from outside the managed node
         chain.  In that case the allocator's conservative ``record_stream`` path
@@ -223,12 +223,12 @@ class ScheduleTensorLifetimeManager:
                 self._apply_action(tensor, action)
             return
 
-        # action=None transfers the tensor out of this manager without freeing
-        # storage; autograd or the caller still owns its real lifetime.
+        # action=None removes the tensor from scheduled release without freeing
+        # storage; autograd or the caller still controls when it becomes dead.
         if action is None:
             return
         assert consumer_stream is not None
-        self._retire_tensor(tensor, action, owner, consumer_stream)
+        self._release_tensor(tensor, action, owner, consumer_stream)
 
     def _take_owner(self, tensor: torch.Tensor) -> Optional[TensorOwner]:
         """Remove and return the binding only when it owns this exact object."""
@@ -254,11 +254,11 @@ class ScheduleTensorLifetimeManager:
         self._owners[tensor_id] = TensorOwner(tensor=tensor, stream=stream, producer_node=node)
 
     def _export_tensor(self, tensor: torch.Tensor) -> None:
-        """Remove manager ownership without changing tensor storage."""
+        """Remove scheduled-release ownership without changing tensor storage."""
 
         self._take_owner(tensor)
 
-    def _retire_tensor(
+    def _release_tensor(
         self,
         tensor: torch.Tensor,
         action: ReleaseAction,

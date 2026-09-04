@@ -333,7 +333,7 @@ class TransformerLayerNode(ScheduleNode):
         name="default",
         bwd_dw_callables=None,
         extra_args={},
-        lifetime_manager=None,
+        tensor_release=None,
     ):
         """Initialize a transformer layer node.
 
@@ -366,7 +366,7 @@ class TransformerLayerNode(ScheduleNode):
             weak_method(self.backward_impl),
             free_input=free_input,
             name=name,
-            lifetime_manager=lifetime_manager,
+            tensor_release=tensor_release,
         )
         self.layer_state = layer_state
         self.chunk_state = chunk_state

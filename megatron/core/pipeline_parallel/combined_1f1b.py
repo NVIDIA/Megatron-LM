@@ -5,11 +5,11 @@
 The schedule decomposes a model chunk into nodes and co-schedules forward and
 backward nodes from different microbatches on compute and communication streams.
 
-Tensor lifetime optimization
-----------------------------
-When ``ep_overlap_use_scheduled_tensor_lifetime`` is enabled, every model-chunk
+Scheduled tensor release
+------------------------
+When ``ep_overlap_use_scheduled_tensor_release`` is enabled, every model-chunk
 plan tracks the producer stream of CUDA tensors passed between its real schedule
-nodes.  A same-stream consumer can release a retired tensor immediately.  A
+nodes.  A same-stream consumer can release a consumed tensor immediately.  A
 cross-stream consumer instead keeps a strong reference until the producer stream
 next acquires the plan's shared event; that existing wait orders the producer
 after the consumer, so storage can become reusable without adding another event

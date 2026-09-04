@@ -158,7 +158,7 @@ class TestFSDP1F1BOverlap:
                 **extra_kwargs,
                 "overlap_moe_expert_parallel_comm": True,
                 "ep_overlap_early_attn_memory_release": early_attn_memory_release,
-                "ep_overlap_use_scheduled_tensor_lifetime": True,
+                "ep_overlap_use_scheduled_tensor_release": True,
             }
             test_config = get_test_config(num_layers=num_layers, extra_kwargs=test_kwargs)
             test_model = build_gpt_model(test_config, vocab_size=VOCAB_SIZE)

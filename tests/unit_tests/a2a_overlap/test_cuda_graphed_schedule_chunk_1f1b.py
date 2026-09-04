@@ -369,7 +369,7 @@ class TestPartialCudaGraphedA2AOverlap:
                 cuda_graph_modules,
                 cuda_graph_warmup_steps,
                 ep_overlap=True,
-                ep_overlap_use_scheduled_tensor_lifetime=True,
+                ep_overlap_use_scheduled_tensor_release=True,
                 **extra_kwargs,
             )
             assert len(loss_list) == len(loss_list_ref)
@@ -422,8 +422,8 @@ class TestPartialCudaGraphedA2AOverlap:
         not (HAVE_TE and is_te_min_version("2.10.0")),
         reason="Partial CUDA graph support requires TransformerEngine version >= 2.10.0",
     )
-    def test_scheduled_tensor_lifetime_with_partial_cudagraph(self):
-        """A stable capture/replay smoke test for schedule-owned tensor leases."""
+    def test_scheduled_tensor_release_with_partial_cudagraph(self):
+        """A stable capture/replay smoke test for scheduled tensor release."""
 
         extra_kwargs = {"moe_layer_freq": 1, "moe_token_dispatcher_type": "alltoall"}
         warmup_steps = 2
@@ -435,7 +435,7 @@ class TestPartialCudaGraphedA2AOverlap:
             cuda_graph_modules,
             warmup_steps,
             ep_overlap=True,
-            ep_overlap_use_scheduled_tensor_lifetime=True,
+            ep_overlap_use_scheduled_tensor_release=True,
             **extra_kwargs,
         )
 

@@ -196,9 +196,9 @@ class TestA2AOverlap:
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     @pytest.mark.parametrize("layers", [[2, 1], [1, 2], [1, 1]])
-    @pytest.mark.parametrize("scheduled_lifetime", [False, True])
+    @pytest.mark.parametrize("scheduled_release", [False, True])
     def test_1f1b_schedule_model_chunk(
-        self, mtp_layers, dispatcher_type, flex_backend, fp8_flag, layers, scheduled_lifetime
+        self, mtp_layers, dispatcher_type, flex_backend, fp8_flag, layers, scheduled_release
     ):
         """
         Verifies all-to-all overlap optimization in transformer layer produces
@@ -207,7 +207,7 @@ class TestA2AOverlap:
         # create TransformerConfig
         extra_kwargs = {
             "overlap_moe_expert_parallel_comm": True,
-            "ep_overlap_use_scheduled_tensor_lifetime": scheduled_lifetime,
+            "ep_overlap_use_scheduled_tensor_release": scheduled_release,
         }
         apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
         if fp8_flag is not None:
@@ -218,14 +218,14 @@ class TestA2AOverlap:
             extra_kwargs["mtp_loss_scaling_factor"] = 1.1
         run_two_chunk_parity(layers, extra_kwargs)
 
-    def test_scheduled_tensor_lifetime_with_mixed_dense_layer(self):
-        """Dense-layer Noop dispatch/combine nodes preserve tensor leases."""
+    def test_scheduled_tensor_release_with_mixed_dense_layer(self):
+        """Dense-layer Noop dispatch/combine nodes preserve tensor-release bindings."""
 
         extra_kwargs = {
             "moe_token_dispatcher_type": "alltoall",
             "moe_layer_freq": [1, 0],
             "overlap_moe_expert_parallel_comm": True,
-            "ep_overlap_use_scheduled_tensor_lifetime": True,
+            "ep_overlap_use_scheduled_tensor_release": True,
         }
         run_two_chunk_parity([2, 2], extra_kwargs, cast_model_to_config_dtype=True)
 

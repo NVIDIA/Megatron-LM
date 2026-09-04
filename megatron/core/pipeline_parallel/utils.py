@@ -17,7 +17,7 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
-from .tensor_lifetime import ScheduleTensorLifetimeManager
+from .combined_1f1b_tensor_release import Combined1F1BTensorRelease
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ class ScheduleNode:
         name: str = "schedule_node",
         forward_nvtx_name: Optional[str] = None,
         backward_nvtx_name: Optional[str] = None,
-        lifetime_manager: Optional[ScheduleTensorLifetimeManager] = None,
+        tensor_release: Optional[Combined1F1BTensorRelease] = None,
     ):
         """Initialize a schedule node.
 
@@ -180,9 +180,9 @@ class ScheduleNode:
             name (str): Name of the node for debugging purposes.
             forward_nvtx_name (str, optional): Stable NVTX label for forward execution.
             backward_nvtx_name (str, optional): Stable NVTX label for backward execution.
-            lifetime_manager (ScheduleTensorLifetimeManager, optional): Schedule-aware
-                owner for cross-stream tensor retirement. ``None`` preserves the
-                allocator ``record_stream`` behavior.
+            tensor_release (Combined1F1BTensorRelease, optional): Combined 1F1B
+                state for schedule-aware cross-stream tensor release. ``None``
+                preserves the allocator ``record_stream`` behavior.
         """
         self.name = name
         self.forward_nvtx_name = forward_nvtx_name or f"{name} forward"
@@ -192,7 +192,7 @@ class ScheduleNode:
         self.stream = stream
         self.event = event
         self.free_input = free_input
-        self.lifetime_manager = lifetime_manager
+        self.tensor_release = tensor_release
         self.inputs = None
         self.outputs = None
         # When True, the forward runs under torch.no_grad() so no autograd graph is
@@ -244,14 +244,14 @@ class ScheduleNode:
 
             self.output = data
 
-        if self.lifetime_manager is not None:
-            lifetime_inputs = inputs[0] if len(inputs) == 1 else inputs
-            self.lifetime_manager.consume_inputs_and_publish_outputs(
-                lifetime_inputs,
+        if self.tensor_release is not None:
+            release_inputs = inputs[0] if len(inputs) == 1 else inputs
+            self.tensor_release.consume_inputs_and_publish_outputs(
+                release_inputs,
                 self.output,
                 stream=self.stream,
                 node=node_name,
-                retire_consumed=self.free_input,
+                release_consumed=self.free_input,
             )
         elif self.free_input:
             for input in inputs:
@@ -288,9 +288,9 @@ class ScheduleNode:
 
         grads = self.get_grad()
 
-        if self.lifetime_manager is not None:
-            # These gradients come from detach bridges outside the lifetime
-            # manager's producer/consumer chain, so retain the allocator fallback.
+        if self.tensor_release is not None:
+            # These gradients come from detach bridges outside the scheduled
+            # producer/consumer chain, so retain the allocator fallback.
             if isinstance(consumed_grads, tuple):
                 if len(consumed_grads) > len(output_grad):
                     for grad in consumed_grads[len(output_grad) :]:
@@ -301,10 +301,10 @@ class ScheduleNode:
 
             # A recompute segment's final forward output is consumed by autograd
             # rather than another forward node, so its owner metadata ends here.
-            self.lifetime_manager.consume_forward_outputs(self.output)
-            lifetime_output_grads = output_grad[0] if len(output_grad) == 1 else output_grad
-            self.lifetime_manager.consume_output_grads_and_publish_input_grads(
-                lifetime_output_grads, grads, stream=self.stream, node=node_name
+            self.tensor_release.consume_forward_outputs(self.output)
+            release_output_grads = output_grad[0] if len(output_grad) == 1 else output_grad
+            self.tensor_release.consume_output_grads_and_publish_input_grads(
+                release_output_grads, grads, stream=self.stream, node=node_name
             )
         elif consumed_grads:
             # Gradients may have been produced on another stream.
@@ -344,8 +344,8 @@ class ScheduleNode:
             with torch.cuda.stream(self.stream):
                 # The wait above transfers every previously consumed tensor owned by
                 # this plan back to its creation stream before storage becomes reusable.
-                if self.lifetime_manager is not None:
-                    self.lifetime_manager.drain(self.stream)
+                if self.tensor_release is not None:
+                    self.tensor_release.drain(self.stream)
                 yield
         finally:
             if name:
