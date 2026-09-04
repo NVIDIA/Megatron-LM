@@ -161,7 +161,7 @@ Many of these are toggled through `InferenceConfig`. Refer to the
 ## Basic Usage: The High-Level API
 
 The API lives in
-[`megatron/core/inference/apis/`](../megatron/core/inference/apis/) and gives
+[`megatron/core/inference/apis/`](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/inference/apis) and gives
 you a *vLLM-style* `generate(prompts, sampling_params)` interface. It hides
 the underlying pipeline (`DynamicInferenceContext` to `GPTInferenceWrapper` to
 `TextGenerationController` to `DynamicInferenceEngine`) so that you do not have to
@@ -290,7 +290,7 @@ with MegatronLLM(
 ### Sync Offline Batch Generation
 
 The runnable end-to-end script is
-[`examples/inference/offline_inference.py`](../examples/inference/offline_inference.py).
+[`examples/inference/offline_inference.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/offline_inference.py).
 A minimal version:
 
 ```python
@@ -578,9 +578,9 @@ Each route is also served without the `/v1` prefix. Chat completions report
 prefix-cache hits as `usage.prompt_tokens_details.cached_tokens`.
 
 The runnable script is
-[`examples/inference/launch_inference_server.py`](../examples/inference/launch_inference_server.py),
+[`examples/inference/launch_inference_server.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/launch_inference_server.py),
 with the shell wrapper
-[`examples/inference/run_inference_server.sh`](../examples/inference/run_inference_server.sh)
+[`examples/inference/run_inference_server.sh`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/run_inference_server.sh)
 (packaged for a Nemotron-6 3B hybrid MoE config: TP 2, EP 8, PP 1).
 
 ```python
@@ -708,7 +708,7 @@ MXFP8 targets are handled transparently: when the destination model uses
 `prepare_swap_model_weights` installs a quantizing transform that later
 `swap_model_weights` calls pick up. The built-in RL loop calls
 `swap_model_weights(model, inference_model, args.refit_method)`; refer to
-[`megatron/core/resharding/README.md`](../megatron/core/resharding/README.md) for
+[`megatron/core/resharding/README.md`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/resharding/README.md) for
 the plan-building and caching details.
 
 ---
@@ -877,28 +877,28 @@ while engine.has_unfinished_requests():
 ```
 
 The fully worked manual-stepping example is
-[`examples/inference/advanced/gpt_dynamic_inference.py`](../examples/inference/advanced/gpt_dynamic_inference.py).
+[`examples/inference/advanced/gpt_dynamic_inference.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/advanced/gpt_dynamic_inference.py).
 It demonstrates arrival scheduling, batch-drain, suspend and resume, CUDA-graph
 bucketing, log-probs, and JSON dumping. For explicit coordinator with `InferenceClient`
 lifecycle management, refer to
-[`gpt_dynamic_inference_with_coordinator.py`](../examples/inference/advanced/gpt_dynamic_inference_with_coordinator.py).
+[`gpt_dynamic_inference_with_coordinator.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/advanced/gpt_dynamic_inference_with_coordinator.py).
 
 ---
 
 ## Examples Directory
 
 Everything above is runnable from
-[`examples/inference/`](../examples/inference/):
+[`examples/inference/`](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/inference):
 
 | Path | Description |
 |---|---|
-| [`offline_inference.py`](../examples/inference/offline_inference.py) | Batched offline generation through the high-level API. Covers all three supported mode combinations using `--mode sync|async` and `--use-coordinator`. |
-| [`run_offline_inference.sh`](../examples/inference/run_offline_inference.sh) | Shell wrapper for a Qwen 2.5-1.5B offline-inference config. |
-| [`launch_inference_server.py`](../examples/inference/launch_inference_server.py) | OpenAI-compatible HTTP server using `MegatronAsyncLLM.serve(...)`. |
-| [`run_inference_server.sh`](../examples/inference/run_inference_server.sh) | Shell wrapper for a Nemotron-6 3B hybrid-MoE server config. |
-| [`utils.py`](../examples/inference/utils.py) | Shared helpers including `Request`, `build_requests`, output formatting, and JSON dump. |
-| [`advanced/gpt_dynamic_inference.py`](../examples/inference/advanced/gpt_dynamic_inference.py) | Manual `add_request`/`step_modern` stepping. |
-| [`advanced/gpt_dynamic_inference_with_coordinator.py`](../examples/inference/advanced/gpt_dynamic_inference_with_coordinator.py) | Explicit coordinator and `InferenceClient` lifecycle. |
+| [`offline_inference.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/offline_inference.py) | Batched offline generation through the high-level API. Covers all three supported mode combinations using `--mode sync|async` and `--use-coordinator`. |
+| [`run_offline_inference.sh`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/run_offline_inference.sh) | Shell wrapper for a Qwen 2.5-1.5B offline-inference config. |
+| [`launch_inference_server.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/launch_inference_server.py) | OpenAI-compatible HTTP server using `MegatronAsyncLLM.serve(...)`. |
+| [`run_inference_server.sh`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/run_inference_server.sh) | Shell wrapper for a Nemotron-6 3B hybrid-MoE server config. |
+| [`utils.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/utils.py) | Shared helpers including `Request`, `build_requests`, output formatting, and JSON dump. |
+| [`advanced/gpt_dynamic_inference.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/advanced/gpt_dynamic_inference.py) | Manual `add_request`/`step_modern` stepping. |
+| [`advanced/gpt_dynamic_inference_with_coordinator.py`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/advanced/gpt_dynamic_inference_with_coordinator.py) | Explicit coordinator and `InferenceClient` lifecycle. |
 
 Run the offline example across modes:
 
@@ -1030,12 +1030,12 @@ is the opposite of the `MegatronLLM` constructor default.
 
 ## Additional Resources
 
-- API reference and mental model documentation: [`megatron/core/inference/README.md`](../megatron/core/inference/README.md)
-- Examples overview: [`examples/inference/README.md`](../examples/inference/README.md)
-- Low-level engine source: [`megatron/core/inference/`](../megatron/core/inference/)
-- High-level API source: [`megatron/core/inference/apis/`](../megatron/core/inference/apis/)
-- Weight refit and resharding: [`megatron/core/resharding/README.md`](../megatron/core/resharding/README.md)
+- API reference and mental model documentation: [`megatron/core/inference/README.md`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/inference/README.md)
+- Examples overview: [`examples/inference/README.md`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/README.md)
+- Low-level engine source: [`megatron/core/inference/`](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/inference)
+- High-level API source: [`megatron/core/inference/apis/`](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/inference/apis)
+- Weight refit and resharding: [`megatron/core/resharding/README.md`](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/resharding/README.md)
 - MoE router replay: [`docs/api-guide/router_replay.md`](api-guide/router_replay.md)
-- MoE routing trace tooling: [`examples/inference/README.md`](../examples/inference/README.md)
+- MoE routing trace tooling: [`examples/inference/README.md`](https://github.com/NVIDIA/Megatron-LM/blob/main/examples/inference/README.md)
 - Functional tests: `tests/functional_tests/test_cases/gpt/gpt_offline_inference_*`, `gpt_inference_server_smoke_*`, `gpt_dynamic_inference_*`, `tests/functional_tests/test_cases/hybrid/hybrid_dynamic_inference_*`
 - Unit tests: `tests/unit_tests/inference/`
