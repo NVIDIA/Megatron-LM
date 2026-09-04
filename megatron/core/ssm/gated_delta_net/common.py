@@ -99,13 +99,23 @@ class GatedDeltaRuleInterface(Protocol):
 
 
 class _GDNBase(MegatronModule):
-    """Shared implementation for the GDN-family layers.
+    """Common base class for the Gated Delta Net (GDN) family of layers.
 
-    Provides the projection, Q/K/V causal convolution, gated delta-rule parameters,
-    context-parallel layout handling, gated output normalization, output projection,
-    and sharded-checkpoint plumbing shared by head-wise GatedDeltaNet and channel-wise
-    Kimi Delta Attention.
+    Hosts everything the GDN variants share: the fused input projection, causal
+    convolution on q/k/v, the CP all-to-all plumbing, the kernel-input preparation
+    skeleton, the gated output norm + projection, and sharded checkpointing.
     """
+
+    dt_bias_dim: int
+    a_log_dim: int
+    in_proj_qkvg_dim: int
+    in_proj_extra_dim: int
+    in_proj_dim: int
+
+    dt_bias: nn.Parameter
+    A_log: nn.Parameter
+
+    gated_delta_rule: GatedDeltaRuleInterface
 
     dt_bias_dim: int
     a_log_dim: int

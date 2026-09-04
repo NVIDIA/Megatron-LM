@@ -383,8 +383,6 @@ def get_default_packed_seq_params(
         PackedSeqParams configured as a single unpacked sequence.
     """
 
-    args = get_args()
-
     # Pad to the maximum number of sequences in the bin for the attention kernel.
     # We add 2 to account for the initial 0 and the final bin_size.
     cu_seqlens = torch.full(
@@ -401,6 +399,7 @@ def get_default_packed_seq_params(
         max_seqlen_q=seq_length,
         max_seqlen_kv=seq_length,
         total_tokens=seq_length,
+        pad_between_seqs=False,
     )
 
 
@@ -417,6 +416,7 @@ def create_packed_seq_params(packing_context: PackingContext):
             bin_size=bin_size,
             max_sequences_per_bin=max_sequences_per_bin,
             device=device,
+            seq_length_multiple=packing_context.packer.seq_length_multiple,
         )
         cached_packed_seq_params.append(params)
     return cached_packed_seq_params
@@ -441,6 +441,9 @@ def create_packed_seq_params_for_bin(
         bin_size: Size of the bin (padded sequence length)
         max_sequences_per_bin: Maximum number of sequences per bin
         device: Device to create tensors on
+        seq_length_multiple: Slot alignment the packer used (2*cp_size under context
+            parallelism). When > 1, every padded slot length is validated against it —
+            TE's THD partitioner requires slots to split evenly across CP ranks.
 
     Returns:
         PackedSeqParams with cu_seqlens set for proper attention masking (or None if empty)
@@ -453,10 +456,47 @@ def create_packed_seq_params_for_bin(
 
     # Get actual sequence lengths for sequences in this bin
     seq_lengths_in_bin = [packing_info.seq_lengths[idx] for idx in seq_indices]
+    assert len(seq_lengths_in_bin) <= max_sequences_per_bin, (
+        f"bin {bin_idx} holds {len(seq_lengths_in_bin)} sequences, exceeding "
+        f"max_sequences_per_bin={max_sequences_per_bin}"
+    )
+    # Aligned placement offsets from the packer: [start_0, ..., start_{n-1}, padded_end].
+    seq_starts = packing_info.seq_starts[bin_idx]
+    assert len(seq_starts) == len(seq_lengths_in_bin) + 1, (
+        f"seq_starts for bin {bin_idx} must contain one start per sequence plus the padded "
+        f"end sentinel (got {len(seq_starts)} entries for {len(seq_lengths_in_bin)} sequences)"
+    )
+    padded_end = seq_starts[-1]
 
-    # Build cumulative sequence lengths for actual sequences
-    # cu_seqlens should be [0, len(seq1), len(seq1)+len(seq2), ..., total_actual_len]
-    cu_seqlens_list = np.append(np.cumsum([0] + seq_lengths_in_bin), bin_size)
+    # Layout boundaries (cu_seqlens_padded): where each sequence's reserved slot
+    # begins and ends in the bin. The packer places sequences at
+    # seq_length_multiple-aligned offsets; the trailing bin padding
+    # [padded_end, bin_size) forms a final ghost slot.
+    cu_seqlens_padded_list = np.append(np.asarray(seq_starts), bin_size)
+
+    if seq_length_multiple > 1:
+        slot_lengths = np.diff(cu_seqlens_padded_list)
+        assert np.all(slot_lengths % seq_length_multiple == 0), (
+            f"bin {bin_idx} padded slot lengths {slot_lengths.tolist()} must each be "
+            f"divisible by seq_length_multiple={seq_length_multiple} for TE's THD "
+            f"context-parallel partitioning"
+        )
+
+    # Actual cumulative lengths (cu_seqlens): real token count per slot, so TE
+    # masks each sequence's pad tail. The trailing ghost slot keeps its full
+    # size (its pad tokens self-attend), matching the legacy behaviour — with
+    # seq_length_multiple == 1 both arrays equal the legacy single array.
+    cu_seqlens_list = np.cumsum([0] + seq_lengths_in_bin + [bin_size - padded_end])
+
+    # Pad both arrays to a fixed size by repeating their last boundary (creates
+    # zero-length ghost sequences). This ensures a fixed tensor size for CUDA
+    # graph compatibility. We add 2 to account for the initial 0 and the final
+    # boundary.
+    fixed_size = max_sequences_per_bin + 2
+    cu_seqlens_list = np.pad(cu_seqlens_list, (0, fixed_size - len(cu_seqlens_list)), mode='edge')
+    cu_seqlens_padded_list = np.pad(
+        cu_seqlens_padded_list, (0, fixed_size - len(cu_seqlens_padded_list)), mode='edge'
+    )
 
     cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int32, device=device)
 
@@ -474,11 +514,12 @@ def create_packed_seq_params_for_bin(
         qkv_format='thd',
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
-        cu_seqlens_q_padded=None,
-        cu_seqlens_kv_padded=None,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
         total_tokens=bin_size,
+        pad_between_seqs=seq_length_multiple > 1,
     )
 
 
@@ -497,7 +538,10 @@ def pack_inference_logprobs(
         bin_size: Size of each bin
 
     Returns:
-        Packed inference logprobs tensor of shape [num_bins, bin_size - 1]
+        Packed inference logprobs tensor of shape [num_bins, bin_size - 1], and a
+        bool mask of the same shape marking positions actually filled from the
+        engine (the train side appends tokens, e.g. EOD, that the engine never
+        reported a logprob for; those stay zero-filled and must not be compared).
     """
     num_bins = len(packing_info.bin_seq_indices)
 
@@ -505,6 +549,7 @@ def pack_inference_logprobs(
     packed_inference_logprobs = torch.zeros(
         (num_bins, bin_size - 1), dtype=torch.float32, device='cpu'
     )
+    filled_mask = torch.zeros((num_bins, bin_size - 1), dtype=torch.bool, device='cpu')
 
     # Create mapping from global sequence index to local bin index
     # This is needed because seq_to_bin_idx uses global bin indices,
@@ -515,6 +560,7 @@ def pack_inference_logprobs(
             seq_to_local_bin[seq_idx] = local_bin_idx
 
     # Align and pack inference logprobs based on generation masks
+    device = packed_inference_logprobs.device
     for seq_idx in range(len(inference_logprobs)):
         if seq_idx not in seq_to_local_bin:
             continue  # Skip sequences not on this rank
@@ -526,31 +572,28 @@ def pack_inference_logprobs(
         seq_pos_in_bin = seq_positions.index(seq_idx)
         seq_start = packing_info.seq_starts[local_bin_idx][seq_pos_in_bin]
 
-        # Get generation mask for this sequence to find where generation starts
-        gen_mask = generation_masks[seq_idx]
-        # Find first generation token (accounting for the shift in get_logprobs)
-        first_gen_idx = gen_mask.int().argmax().item() - 1
-
         # Get the inference logprobs for this sequence
-        if isinstance(inference_logprobs[seq_idx], torch.Tensor):
-            seq_inf_logprobs = inference_logprobs[seq_idx]
-        else:
+        if not isinstance(inference_logprobs[seq_idx], torch.Tensor):
             continue  # Skip if no inference logprobs
+        seq_inf_logprobs = inference_logprobs[seq_idx].to(device)
 
-        # Calculate where to place inference logprobs in the packed tensor
-        # The inference logprobs start at the first generated token position
-        pack_start = seq_start + first_gen_idx
-        pack_end = min(
-            pack_start + len(seq_inf_logprobs), seq_start + packing_info.seq_lengths[seq_idx] - 1
-        )
-        actual_len = pack_end - pack_start
+        # Scatter logprobs to their generated token slots.
+        # Generation can span multiple regions for multi-turn rollouts; place each logprob at the
+        # slot for its token: a token at position `p` occupies packed slot `seq_start + (p - 1)`.
+        gen_positions = generation_masks[seq_idx].nonzero(as_tuple=True)[0].to(device)
+        if gen_positions.numel() == 0:
+            continue
+        target = seq_start + gen_positions - 1
+        n = min(seq_inf_logprobs.numel(), target.numel())
+        target = target[:n]
+        # Keep within this sequence's logprob span in the bin.
+        seq_lp_end = seq_start + packing_info.seq_lengths[seq_idx] - 1
+        in_range = (target >= seq_start) & (target < seq_lp_end)
+        target_in_range = target[in_range]
+        packed_inference_logprobs[local_bin_idx, target_in_range] = seq_inf_logprobs[:n][in_range]
+        filled_mask[local_bin_idx, target_in_range] = True
 
-        if actual_len > 0 and pack_end <= bin_size - 1:
-            packed_inference_logprobs[local_bin_idx, pack_start:pack_end] = seq_inf_logprobs[
-                :actual_len
-            ]
-
-    return packed_inference_logprobs
+    return packed_inference_logprobs, filled_mask
 
 
 def compute_packed_inference_logprobs_stats(
@@ -558,6 +601,7 @@ def compute_packed_inference_logprobs_stats(
     packed_inference_logprobs: torch.Tensor,
     packed_loss_mask: torch.Tensor,
     group_stats: Any,
+    filled_mask: Optional[torch.Tensor] = None,
 ) -> None:
     """Compute statistics for packed inference logprobs for logging purposes.
 
@@ -569,21 +613,36 @@ def compute_packed_inference_logprobs_stats(
         packed_inference_logprobs: Packed inference logprobs [num_bins, seq_len-1]
         packed_loss_mask: Loss mask indicating valid positions [num_bins, seq_len]
         group_stats: Statistics object to update with computed metrics
+        filled_mask: Optional bool mask [num_bins, seq_len-1] marking positions actually
+            filled from the engine's reported logprobs. Positions the engine never
+            reported (e.g. the train-side EOD append) stay zero-filled and are excluded
+            from the stats so they do not contribute spurious |p_old - 1| terms.
     """
     # Lazy import to avoid circular dependency (rl_utils imports from this module)
     from megatron.rl.rl_utils import update_inference_logprobs_group_stats
 
-    # Ensure all tensors are on the same device (CPU for stats computation)
+    # Ensure all tensors are on the same device (CPU for stats computation).
+    # Compare in the training dtype: old_logprobs are bf16 while the engine reports
+    # fp32 logprobs, so comparing raw values shows bf16-rounding noise even when the
+    # two sides are bitwise identical (the unpacked path already rounds by writing
+    # into an old_logprobs-dtype buffer in align_unpacked_inference_logprobs).
     old_logprobs = old_logprobs.cpu()
-    packed_inference_logprobs = packed_inference_logprobs.cpu()
+    packed_inference_logprobs = packed_inference_logprobs.cpu().to(old_logprobs.dtype)
     packed_loss_mask = packed_loss_mask.cpu()
 
     # Use packed_loss_mask to identify valid positions for stats (shift by 1 for logprobs)
     mask = packed_loss_mask[:, 1:].bool()
+    if filled_mask is not None:
+        # Exclude positions the engine never reported (zero-filled in packing), e.g.
+        # the train-side EOD append: comparing exp(0)=1 against a real prob there
+        # poisons the mismatch stats with spurious |p_old - 1| terms.
+        mask = mask & filled_mask.to(mask.device)
 
-    # Ensure shapes match
     if mask.shape != old_logprobs.shape:
-        return
+        raise RuntimeError(
+            f"packed inference-logprob stats shape mismatch: loss-mask "
+            f"{tuple(mask.shape)} vs old_logprobs {tuple(old_logprobs.shape)}"
+        )
 
     # Update group statistics using common helper
     update_inference_logprobs_group_stats(
@@ -595,12 +654,33 @@ def compute_packed_inference_logprobs_stats(
 
 
 class SequencePacker:
-    """Packs multiple sequences into bins to minimize padding and improve GPU utilization."""
+    """Packs multiple sequences into bins to minimize padding and improve GPU utilization.
 
-    def __init__(self, bin_size: int, pad_token: int, max_sequences_per_bin: int = 16):
+    Args:
+        bin_size: Size of each bin (padded sequence length).
+        pad_token: Padding token id.
+        max_sequences_per_bin: Maximum number of sequences per bin.
+        seq_length_multiple: Align sequences within a bin to multiples of this value:
+            the slot a sequence occupies is its length rounded up to the next multiple.
+            Context parallelism requires every padded sequence length to be a multiple of 2*cp_size.
+    """
+
+    def __init__(
+        self,
+        bin_size: int,
+        pad_token: int,
+        max_sequences_per_bin: int = 16,
+        seq_length_multiple: int = 1,
+    ):
+        assert seq_length_multiple >= 1
+        assert bin_size % seq_length_multiple == 0, (
+            f"bin_size ({bin_size}) must be divisible by seq_length_multiple "
+            f"({seq_length_multiple})"
+        )
         self.bin_size = bin_size
         self.pad_token = pad_token
         self.max_sequences_per_bin = max_sequences_per_bin
+        self.seq_length_multiple = seq_length_multiple
 
     def pack_sequences(
         self, trajs: torch.Tensor, generation_masks: Optional[torch.Tensor] = None
@@ -624,11 +704,11 @@ class SequencePacker:
         current_bin_indices = []
         current_bin_length = 0
 
-        # Pack sequences into bins
+        # Pack sequences into bins.
         sequences_per_bin = []
         for idx in sorted_indices:
             seq = sequences[idx]
-            seq_len = len(seq)
+            seq_len = round_up_to_nearest_multiple(len(seq), self.seq_length_multiple)
 
             if (
                 current_bin_length + seq_len <= self.bin_size
@@ -693,7 +773,9 @@ class SequencePacker:
             for seq_idx in seq_indices:
                 seq_to_bin_idx[seq_idx] = bin_idx
 
-        # Fill bins
+        # Fill bins. Each sequence is placed at a seq_length_multiple-aligned
+        # offset; the gap up to the next aligned offset stays pad tokens with a
+        # zero loss mask.
         for bin_idx, (bin_seqs, seq_indices) in enumerate(zip(bins, bin_seq_indices)):
             seq_starts = []
             current_pos = 0
@@ -702,7 +784,9 @@ class SequencePacker:
                 start = current_pos
                 end = start + len(seq)
                 seq_starts.append(start)
-                current_pos = end
+                current_pos = start + round_up_to_nearest_multiple(
+                    len(seq), self.seq_length_multiple
+                )
 
                 # Pack sequence
                 packed_sequences[bin_idx, start:end] = seq
@@ -923,7 +1007,11 @@ def pack_all_trajectories(
             inference_logprobs = _gather(inference_logprobs)
 
     with nvtx_range("rl/pack-sequences", time=True):
-        # Create packer with max sequences per bin limit to prevent extreme imbalance
+        # Create packer with max sequences per bin limit to prevent extreme imbalance.
+        # Context parallelism requires every sequence's padded slot in the bin to be
+        # divisible by 2*cp_size so TE's THD ring attention can split each sequence
+        # evenly across CP ranks (see _scatter_for_context_parallel in rl_utils).
+        cp_size = mpu.get_context_parallel_world_size()
         packer = SequencePacker(
             bin_size=bin_size, pad_token=tokenizer.pad, max_sequences_per_bin=max_sequences_per_bin
         )

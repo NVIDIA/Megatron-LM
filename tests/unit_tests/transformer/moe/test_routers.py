@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
+import dataclasses
 from typing import cast
 
 import pytest
@@ -66,6 +67,21 @@ class TestTop2Router:
 
         num_weights = sum([p.numel() for p in self.router.parameters()])
         assert num_weights == 12 * 4, num_weights
+
+    @pytest.mark.internal
+    def test_skip_muon(self):
+        assert getattr(self.router.weight, 'use_muon', True)
+
+        self.transformer_config.moe_router_skip_muon = True
+        self.transformer_config.add_bias_linear = True
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(num_experts=4, moe_grouped_gemm=False).mlp
+        )
+        router = cast(Router, MoELayer(self.transformer_config, submodules).router)
+
+        assert getattr(router.weight, 'use_muon', True) is False
+        assert router.bias is not None
+        assert getattr(router.bias, 'use_muon', True) is False
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

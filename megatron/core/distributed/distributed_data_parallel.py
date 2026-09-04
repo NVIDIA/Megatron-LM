@@ -13,6 +13,15 @@ from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import PARAM_READY_CALLBACK_ATTR, log_single_rank
+<<<<<<< HEAD
+
+try:
+    from nemo.lens.helpers import trace_fn as _otel_trace_fn
+except ImportError:
+    from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
+
+=======
+>>>>>>> origin/dev
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers, partition_buckets
@@ -21,7 +30,21 @@ logger = logging.getLogger(__name__)
 
 
 class _BucketParamReadyCallback:
+<<<<<<< HEAD
+    """Publishes one bucket group's parameters on demand.
+
+    DDP's side of ``megatron.core.utils.ensure_params_ready``: one instance is stored on every
+    parameter of the group under ``PARAM_READY_CALLBACK_ATTR``, and calling it makes those
+    parameters readable. For consumers reading ``param.data`` ahead of the owning module's
+    pre-hook.
+
+    Publishing may START an undispatched gather, not just wait on one. Holds DDP and the bucket
+    group weakly; the callback outlives this DDP on re-wrap. No-ops under CUDA-graph capture, so
+    a consumer that captures its reads must replay this itself.
+    """
+=======
     """Publish one bucket group's parameters before a direct parameter read."""
+>>>>>>> origin/dev
 
     def __init__(self, ddp: 'DistributedDataParallel', bucket_group) -> None:
         self._ddp = weakref.ref(ddp)
@@ -32,11 +55,37 @@ class _BucketParamReadyCallback:
         if bucket_group is None:
             return
 
+<<<<<<< HEAD
+        # HOT PATH: already published. True for every microbatch after the first one of an
+        # iteration, so it precedes the DDP deref and the graph-capture query.
+=======
         # This is the hot path for every microbatch after the first one in an iteration.
+>>>>>>> origin/dev
         if bucket_group.param_gather_dispatched and bucket_group.param_gather_handle is None:
             return
 
         ddp = self._ddp()
+<<<<<<< HEAD
+        if ddp is None:
+            # Weakref is dead: the DDP object was garbage-collected while this callback lived on
+            # (it is stored on the parameters, which outlive the wrapper). Its buffers are gone.
+            return
+
+        if is_graph_capturing():
+            # A captured collective re-runs on EVERY replay: once per microbatch, not once per
+            # iteration. Consumers that capture their reads must publish before launching.
+            return
+
+        # No pre-hooks installed means the caller removed them and now drives param sync itself
+        # (``disable_forward_pre_hook(param_sync=False)``), so the schedule is not ours to touch.
+        ddp_owns_schedule = bool(ddp.remove_forward_pre_hook_handles)
+
+        if bucket_group.param_gather_handle is not None:
+            # A gather is in flight over the very buffer we are about to read, so it must be
+            # waited on. finish_param_sync() does two things: wait for THIS bucket, then start
+            # the NEXT bucket's gather. The wait is mandatory; starting the next bucket is a
+            # scheduling decision, so only let it happen while DDP still owns the schedule.
+=======
         if ddp is None or is_graph_capturing():
             return
 
@@ -44,11 +93,17 @@ class _BucketParamReadyCallback:
         # gather still has to finish, but this callback must not dispatch another bucket.
         ddp_owns_schedule = bool(ddp.remove_forward_pre_hook_handles)
         if bucket_group.param_gather_handle is not None:
+>>>>>>> origin/dev
             if ddp_owns_schedule:
                 ddp._finish_param_sync_for_bucket_group(bucket_group)
             else:
                 bucket_group.finish_param_sync(skip_next_bucket_dispatch=True)
         elif ddp_owns_schedule:
+<<<<<<< HEAD
+            # No handle and not published (the hot path returned above) => never dispatched, so
+            # publishing STARTS a gather. Only safe while DDP owns the schedule.
+=======
+>>>>>>> origin/dev
             assert not bucket_group.param_gather_dispatched
             ddp._finish_param_sync_for_bucket_group(bucket_group)
 
@@ -207,6 +262,15 @@ class DistributedDataParallel(_BaseDataParallel):
                 ), f"param_indices for {buffer_key} do not match between grouping and layout"
 
         self.full_param_layout = full_param_layout
+
+        # GTP_remat needs average_in_collective=False: the per-bucket collective runs over the
+        # replicate group, so NCCL AVG would miss the 1/gtp_remat factor. arguments.py
+        # guards the training path; this assert covers direct megatron-core users.
+        gtp_active = ProcessGroupCollection.is_gtp_remat_active(process_group_dict)
+        assert not (gtp_active and self.ddp_config.average_in_collective), (
+            "GTP requires average_in_collective=False (the default); averaged collectives reduce "
+            "over the GTP-excluded group and would miss the 1/gtp_remat gradient scaling factor."
+        )
 
         # Compute gradient scaling factors.
         if config.calculate_per_token_loss:
@@ -367,6 +431,12 @@ class DistributedDataParallel(_BaseDataParallel):
         # Create map from param to bucket group, used in pre_hook.
         for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
             for bucket_group in bucket_groups:
+<<<<<<< HEAD
+                # One readiness callback per bucket group, stamped on all its params, so a
+                # consumer reading param.data outside the owning module's pre-hook can publish it
+                # first. Backend-agnostic: DDP never learns which consumers use it.
+=======
+>>>>>>> origin/dev
                 ready_callback = (
                     _BucketParamReadyCallback(self, bucket_group)
                     if self.ddp_config.overlap_param_gather
@@ -378,7 +448,13 @@ class DistributedDataParallel(_BaseDataParallel):
                         if ready_callback is not None:
                             setattr(param, PARAM_READY_CALLBACK_ATTR, ready_callback)
                         elif hasattr(param, PARAM_READY_CALLBACK_ATTR):
+<<<<<<< HEAD
+                            # Re-wrapping a model chunk: a previous DDP may have left a marker
+                            # pointing at ITS bucket group. This DDP owns the parameter now and
+                            # publishes nothing, so the stale callback must go.
+=======
                             # A re-wrapped model must not retain the previous DDP's callback.
+>>>>>>> origin/dev
                             delattr(param, PARAM_READY_CALLBACK_ATTR)
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
@@ -421,8 +497,20 @@ class DistributedDataParallel(_BaseDataParallel):
                     param_tmp = param.expand_as(param)
                     # Get the gradient accumulator function.
                     grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                    grad_acc.register_hook(self._make_backward_post_hook(param))
-                    self.grad_accs.append(grad_acc)
+                    if getattr(param, 'is_gtp_weight_remat', False) and hasattr(
+                        param, 'register_grad_accum_hook'
+                    ):
+                        # GTP_remat computes wgrad via an async reduce-scatter, so autograd's
+                        # AccumulateGrad sees only a dummy; grad-ready is driven manually from
+                        # _handle_megatron_grad_accum (the hook passed here). RETAINING the node
+                        # keeps it on the capture stream for full-iteration CUDA-graph capture.
+                        # No autograd hook or grad_accs entry: either would fire on a stale grad.
+                        param.register_grad_accum_hook(
+                            grad_acc, self._make_backward_post_hook(param)
+                        )
+                    else:
+                        grad_acc.register_hook(self._make_backward_post_hook(param))
+                        self.grad_accs.append(grad_acc)
 
         # Note: overlap_param_gather covers both the distributed optimizer and the
         # layer-wise optimizer cases; the latter sets overlap_param_gather=True
@@ -491,7 +579,15 @@ class DistributedDataParallel(_BaseDataParallel):
         return hook
 
     def _finish_param_sync_for_bucket_group(self, bucket_group):
+<<<<<<< HEAD
+        """Drain one bucket group's param all-gather and run its post-all-gather processing."""
+        # If aligning param all-gather across pipeline stages, all-gather is dispatched
+        # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
+        # If overlapping param all-gather with optimizer step, then all-gather has
+        # already been dispatched in optimizer step.
+=======
         """Drain one bucket group's param all-gather and run its post-processing."""
+>>>>>>> origin/dev
         skip_next_bucket_dispatch = (
             self.ddp_config.align_param_gather or self.overlap_param_gather_with_optimizer_step
         )
@@ -512,9 +608,13 @@ class DistributedDataParallel(_BaseDataParallel):
                 assert param.requires_grad
                 cudagraph_wgrad_ready_event = getattr(param, '_cudagraph_wgrad_ready_event', None)
                 if self.ddp_config.overlap_grad_reduce and cudagraph_wgrad_ready_event is None:
-                    assert (
-                        param.grad is not None
-                    ), 'param.grad being None is not safe when overlap_grad_reduce is True'
+                    # GTP_remat keeps its real wgrad in main_grad (via finalize); param.grad here is
+                    # throwaway (None or a dummy), so skip this assert and rely on
+                    # grad_added_to_main_grad below.
+                    if not getattr(param, 'is_gtp_weight_remat', False):
+                        assert (
+                            param.grad is not None
+                        ), 'param.grad being None is not safe when overlap_grad_reduce is True'
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
@@ -606,6 +706,7 @@ class DistributedDataParallel(_BaseDataParallel):
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_grad_sync()
 
+    @_otel_trace_fn('communication', 'megatron.grad_sync.finish')
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
         Finishes grad sync (all-reduce or reduce-scatter) communication operations

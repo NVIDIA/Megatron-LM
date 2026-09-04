@@ -788,6 +788,29 @@ class TestHybridConfigFromArgs:
         assert config["hybrid_stack_spec"] is static_spec
 
 
+class TestMegatronMixedPrecisionArguments:
+    """Test language-model logit dtype CLI choices."""
+
+    @staticmethod
+    def _parser() -> ArgumentParser:
+        from megatron.training.arguments import _add_mixed_precision_args
+
+        return _add_mixed_precision_args(ArgumentParser(exit_on_error=False))
+
+    def test_logit_dtype_defaults_to_input_dtype(self):
+        args = self._parser().parse_args([])
+        assert args.logit_dtype is None
+
+    @pytest.mark.parametrize("dtype", ["bf16", "fp32"])
+    def test_logit_dtype_accepts_supported_choices(self, dtype):
+        args = self._parser().parse_args(["--output-logit-dtype", dtype])
+        assert args.logit_dtype == dtype
+
+    def test_logit_dtype_rejects_fp16(self):
+        with pytest.raises(ArgumentError, match="invalid choice"):
+            self._parser().parse_args(["--output-logit-dtype", "fp16"])
+
+
 # ---------------------------------------------------------------------------
 # Tests for pretrain_cfg_container_from_args
 # ---------------------------------------------------------------------------

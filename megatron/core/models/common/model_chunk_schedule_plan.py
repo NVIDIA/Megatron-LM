@@ -631,7 +631,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         loss_mask: Optional[Tensor] = None,
         padding_mask=None,
         *,
-        output_processor: Optional[Callable[..., Tensor]] = None,
+        output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
     ):
         """Initialize the schedule plan of all Transformer layers' sub-modules.

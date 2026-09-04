@@ -15,10 +15,10 @@ import torch
 
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.training import get_args, get_model
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 from model_provider import model_provider
 
@@ -84,7 +84,7 @@ if __name__ == "__main__":
     unwrapped_model.to_empty(device="cpu")
 
     if args.load is not None and Path(args.load).is_dir():
-        _ = load_modelopt_checkpoint(model)
+        load_checkpoint(model, None, None)
     else:
         raise ValueError(f"Invalid load checkpoint directory: {args.load}")
 

@@ -84,6 +84,55 @@ def _make_moe_inputs(
     return hidden, probs, routing_map, fc1_weight, fc2_weight
 
 
+def _make_swiglu_inputs(max_tokens, hidden_size, ffn_hidden, topk, num_experts, seed=42):
+    """Create random inputs for SwiGLU fused MoE: FC1 output is 2*ffn_hidden (gate|up)."""
+    torch.manual_seed(seed)
+    hidden = torch.randn(max_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    probs = torch.rand(max_tokens, topk, device="cuda", dtype=torch.float32)
+    routing_map = torch.randint(0, num_experts, (max_tokens, topk), device="cuda")
+    fc1_weight = (
+        torch.randn(num_experts, 2 * ffn_hidden, hidden_size, device="cuda", dtype=torch.bfloat16)
+        * 0.01
+    )
+    fc2_weight = (
+        torch.randn(num_experts, hidden_size, ffn_hidden, device="cuda", dtype=torch.bfloat16)
+        * 0.01
+    )
+    return hidden, probs, routing_map, fc1_weight, fc2_weight
+
+
+def _ref_sequential_moe_swiglu(
+    hidden_states,
+    probs,
+    fc1_weight,
+    fc2_weight,
+    routing_map,
+    num_local_experts,
+    local_expert_start,
+    valid_tokens,
+):
+    """PyTorch reference for SwiGLU MoE: gate|up split -> SiLU(gate)*up -> FC2."""
+    vt = valid_tokens if isinstance(valid_tokens, int) else valid_tokens.item()
+    max_tokens, topk = routing_map.shape
+    hidden_size = hidden_states.shape[1]
+    n_half = fc1_weight.shape[1] // 2
+    out = torch.zeros(max_tokens, hidden_size, device="cuda", dtype=torch.float32)
+    for t in range(vt):
+        acc = torch.zeros(hidden_size, device="cuda", dtype=torch.float32)
+        for k in range(topk):
+            eid = routing_map[t, k].item()
+            lid = eid - local_expert_start
+            if 0 <= lid < num_local_experts:
+                h = hidden_states[t].float()
+                fc1_out = h @ fc1_weight[lid].float().T  # [2*ffn_hidden]
+                gate, up = fc1_out[:n_half], fc1_out[n_half:]
+                activated = torch.nn.functional.silu(gate) * up
+                fc2_out = activated @ fc2_weight[lid].float().T
+                acc += probs[t, k].item() * fc2_out
+        out[t] = acc
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────
 # _get_default_config (mirrors vLLM's get_default_config)
 # ──────────────────────────────────────────────────────────────────────
@@ -445,6 +494,37 @@ class TestVllmFusedMoe:
 
         assert result.shape == (max_tokens, hidden_size)
         assert result.dtype == torch.float32
+        torch.testing.assert_close(result, expected, atol=5e-2, rtol=5e-2)
+
+    @pytest.mark.parametrize(
+        "max_tokens,hidden_size,ffn_hidden,topk,num_experts",
+        [(4, 64, 64, 2, 4), (16, 128, 128, 4, 8), (32, 128, 256, 6, 8), (128, 64, 128, 8, 16)],
+    )
+    def test_matches_reference_swiglu(self, max_tokens, hidden_size, ffn_hidden, topk, num_experts):
+        """SwiGLU (SiLU(gate)*up) output matches the sequential per-token reference."""
+        from megatron.core.inference.moe.fused_moe import ActivationType
+        from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+
+        hidden, probs, routing_map, fc1_weight, fc2_weight = _make_swiglu_inputs(
+            max_tokens, hidden_size, ffn_hidden, topk, num_experts
+        )
+
+        result = vllm_fused_moe(
+            hidden,
+            probs,
+            fc1_weight,
+            fc2_weight,
+            ActivationType.SWIGLU,
+            num_experts,
+            0,
+            _vt(max_tokens),
+            routing_map,
+        )
+        expected = _ref_sequential_moe_swiglu(
+            hidden, probs, fc1_weight, fc2_weight, routing_map, num_experts, 0, max_tokens
+        )
+
+        assert result.shape == (max_tokens, hidden_size)
         torch.testing.assert_close(result, expected, atol=5e-2, rtol=5e-2)
 
     @pytest.mark.parametrize(

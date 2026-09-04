@@ -91,6 +91,10 @@ class Router(ABC, MegatronModule):
             )
         else:
             self.bias = None
+        if self.config.moe_router_skip_muon:
+            setattr(self.weight, 'use_muon', False)
+            if self.bias is not None:
+                setattr(self.bias, 'use_muon', False)
         # If calculate per token loss, we need to scale up moe aux loss by the number of tokens.
         # So we need to know if the model is configured to calculate per token loss.
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
@@ -483,6 +487,10 @@ class TopKRouter(Router):
             valid_token_count=local_num_tokens * bsz,
             aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
+<<<<<<< HEAD
+            aux_loss_scale_num_tokens=total_num_tokens,
+=======
+>>>>>>> origin/dev
         )
         return probs
 
@@ -1078,7 +1086,21 @@ class InferenceTopKRouter(TopKRouter):
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
 
+<<<<<<< HEAD
+        # QB selects on (logits - qb_beta); at inference qb_beta is fixed, so it's per-token.
+        precomputed_indices = None
+        if self.qb_beta is not None:
+            precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
+
+        routing = (
+            topk_routing_with_score_function
+            if is_batch_invariant_mode_enabled()
+            else self._compiled_topk_routing
+        )
+        probs, top_indices = routing(
+=======
         probs, top_indices = self._compiled_topk_routing(
+>>>>>>> origin/dev
             logits,
             self.topk,
             use_pre_softmax=self.config.moe_router_pre_softmax,

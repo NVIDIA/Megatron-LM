@@ -560,6 +560,10 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
         return kwargs
 
 
+<<<<<<< HEAD
+def gpt_config_from_args(args: Namespace, config: TransformerConfig | None = None) -> Any:
+    """Create a GPTModelConfig from the appropriate values in the `args` Namespace."""
+=======
 def gpt_config_from_args(
     args: Namespace, config: TransformerConfig | None = None, model_config_cls: type | None = None
 ) -> Any:
@@ -572,6 +576,7 @@ def gpt_config_from_args(
         model_config_cls = GPTModelConfig
     else:
         assert issubclass(model_config_cls, GPTModelConfig)
+>>>>>>> origin/dev
 
     kwargs = {}
     if config is None:
@@ -589,6 +594,7 @@ def gpt_config_from_args(
         kwargs["transformer_layer_spec"] = import_module(args.spec)
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
+    kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)
     kwargs["position_embedding_type"] = args.position_embedding_type
     kwargs["rotary_percent"] = args.rotary_percent
     kwargs["rotary_base"] = args.rotary_base
@@ -612,6 +618,13 @@ def gpt_config_from_args(
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True
 
+<<<<<<< HEAD
+    return GPTModelConfig(**kwargs)
+
+
+def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None = None) -> Any:
+    """Create a HybridModelConfig from the appropriate values in the `args` Namespace."""
+=======
     return model_config_cls(**kwargs)
 
 
@@ -627,6 +640,7 @@ def hybrid_config_from_args(
         model_config_cls = HybridModelConfig
     else:
         assert issubclass(model_config_cls, HybridModelConfig)
+>>>>>>> origin/dev
 
     kwargs = {}
     if config is None:
@@ -649,6 +663,7 @@ def hybrid_config_from_args(
         kwargs["hybrid_stack_spec"] = hybrid_stack_spec
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
+    kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)
     kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
     kwargs["position_embedding_type"] = args.position_embedding_type
     kwargs["rotary_percent"] = args.rotary_percent

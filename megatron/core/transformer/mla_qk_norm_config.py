@@ -4,7 +4,10 @@
 Resolve MLA and DSA Q/KV norm configuration from a layer specification.
 """
 
+<<<<<<< HEAD
+=======
 from dataclasses import replace
+>>>>>>> origin/dev
 from typing import NoReturn
 
 from megatron.core.models.backends import get_backend
@@ -235,6 +238,10 @@ class QKNormConfigResolver:
     def _mla_fused_linear_or_default(self, module_spec, module_name):
         """Return a fused MLA projection, using the backend default when available."""
         if self._is_fused_norm_linear(module_spec):
+<<<<<<< HEAD
+            return module_spec
+        return self._require_linear(self.fused_norm_linear_impl, module_name)
+=======
             fused_linear = module_spec
         else:
             fused_linear = self._require_linear(self.fused_norm_linear_impl, module_name)
@@ -250,6 +257,7 @@ class QKNormConfigResolver:
         if isinstance(module_spec, ModuleSpec):
             return replace(module_spec, params=params)
         return ModuleSpec(module=module_spec, params=params)
+>>>>>>> origin/dev
 
     def _require_linear(self, module_spec, module_name):
         """Return a configured projection or report that no viable implementation exists."""

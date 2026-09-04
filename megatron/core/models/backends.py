@@ -203,7 +203,11 @@ class InferenceSpecProvider(BackendSpecProvider):
 
 
 def get_backend(
+<<<<<<< HEAD
+    transformer_impl: Literal["local", "transformer_engine", "inference_optimized"]
+=======
     transformer_impl: Literal["local", "transformer_engine", "inference_optimized"],
+>>>>>>> origin/dev
 ) -> BackendSpecProvider:
     """Return the backend that's selected with the given `transformer_impl`."""
     if transformer_impl == "transformer_engine":
