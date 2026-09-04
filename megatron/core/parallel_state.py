@@ -2506,7 +2506,7 @@ def get_all_ranks():
 def destroy_model_parallel():
     """Set the groups to none."""
     try:
-        from megatron.core.transformer.moe.replica_planner import (
+        from megatron.core.transformer.moe.virtual_expert_load_balancer import (
             finalize_replica_weight_bridges,
         )
 

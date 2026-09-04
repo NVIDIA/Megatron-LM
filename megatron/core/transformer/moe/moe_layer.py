@@ -32,6 +32,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
 )
+from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
@@ -348,7 +349,9 @@ class MoELayer(BaseMoELayer):
             pg_collection=pg_collection,
             name=(name + ".experts") if name is not None else None,
         )
-        self.token_dispatcher.set_experts(self.experts)
+
+        if isinstance(self.token_dispatcher._comm_manager, VirtualExpertLoadBalancer):
+            self.token_dispatcher._comm_manager.bind_experts(self.experts)
 
         # Initialize shared experts
         if self.use_shared_expert:
@@ -460,6 +463,7 @@ class MoELayer(BaseMoELayer):
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping.
         """
+        hidden_states = self.token_dispatcher.wrap_layer_input(hidden_states)
         probs, routing_map = apply_module(self.router)(hidden_states, padding_mask)
         return probs, routing_map
 
@@ -503,9 +507,6 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
-        # Backend work that only depends on routing (the replica planner and weight
-        # push) starts here, ahead of the shared experts that follow.
-        self.token_dispatcher.dispatch_plan(hidden_states)
         return hidden_states, probs
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
@@ -617,7 +618,7 @@ class MoELayer(BaseMoELayer):
             torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
             output = output + self._latent_shared_expert_output
             self._latent_shared_expert_output = None
-        return self.token_dispatcher.finalize_output(output)
+        return self.token_dispatcher.finalize_layer_output(output)
 
     def router_and_preprocess(self, hidden_states: torch.Tensor):
         """This method is a combined method of route and preprocess. Deprecated."""
@@ -674,16 +675,9 @@ class MoELayer(BaseMoELayer):
             shared_expert_output = None
             try:
                 if "route" in self.fwd_execution_map:
-                    # Backend hooks on the layer input run their backward only after
-                    # every consumer of the input (router, shared experts, latent
-                    # projection) has run its own.
-                    layer_input = self.token_dispatcher.wrap_layer_input(hidden_states)
-                    probs, routing_map = self.route(layer_input, padding_mask)
-                    hidden_states, probs = self.preprocess(layer_input, probs, routing_map)
-                    # The shared experts follow preprocessing so that asynchronous
-                    # backend work started there (the replica weight push) overlaps
-                    # their GEMMs instead of the token all-to-all.
-                    shared_expert_output = self.shared_experts_compute(layer_input)
+                    probs, routing_map = self.route(hidden_states, padding_mask)
+                    hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                    shared_expert_output = self.shared_experts_compute(hidden_states)
 
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output
@@ -693,11 +687,7 @@ class MoELayer(BaseMoELayer):
                 # It means we should early-return from the MoE layer forward pass.
                 # This happens when we are partially capturing the CUDA graph of the MoE layer,
                 # like cuda_graph_modules=["moe_router", "moe_preprocess"].
-                # We need to return the intermediate tensors as CUDA graph outputs. The shared
-                # experts have not run yet at this point; compute them here so they stay inside
-                # the captured segment.
-                if shared_expert_output is None:
-                    shared_expert_output = self.shared_experts_compute(layer_input)
+                # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
             if "expert_compute" in self.fwd_execution_map:

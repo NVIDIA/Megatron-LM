@@ -1096,16 +1096,13 @@ def validate_args(args, defaults={}):
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
             '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
 
-    if (
-        args.moe_flex_dispatcher_backend == 'replica_hybridep'
-        and args.fp8_recipe == 'mxfp8'
-    ):
+    if args.moe_virtual_expert_load_balance and args.fp8_recipe == 'mxfp8':
         assert args.fp8 == 'e4m3' and args.fp8_param_gather, (
-            'replica_hybridep + mxfp8 requires --fp8-format e4m3 and '
+            '--moe-virtual-expert-load-balance + mxfp8 requires --fp8-format e4m3 and '
             '--fp8-param-gather so expert replicas use native MXFP8 storage.'
         )
         assert args.reuse_grad_buf_for_mxfp8_param_ag, (
-            'replica_hybridep + mxfp8 + --fp8-param-gather requires '
+            '--moe-virtual-expert-load-balance + mxfp8 + --fp8-param-gather requires '
             '--reuse-grad-buf-for-mxfp8-param-ag so MXFP8 parameter storage remains stable.'
         )
 

@@ -64,7 +64,7 @@ def test_gdp_num_householder_accepts_positive_values():
 
 
 def _replica_hybridep_config(**overrides):
-    """Build a minimal valid replica_hybridep config, then apply one override."""
+    """Build a minimal virtual-expert HybridEP config, then apply one override."""
     kwargs = dict(
         num_layers=1,
         hidden_size=128,
@@ -72,7 +72,8 @@ def _replica_hybridep_config(**overrides):
         num_moe_experts=2,
         expert_model_parallel_size=2,
         moe_token_dispatcher_type="flex",
-        moe_flex_dispatcher_backend="replica_hybridep",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_virtual_expert_load_balance=True,
         moe_grouped_gemm=True,
         moe_router_dtype="fp32",
         use_transformer_engine_op_fuser=True,
@@ -99,6 +100,15 @@ def test_replica_hybridep_defaults_a_dropless_rank_capacity():
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
+        # The feature augments HybridEP rather than introducing another dispatcher backend.
+        (
+            {"moe_flex_dispatcher_backend": "deepep"},
+            "--moe-token-dispatcher-type flex and --moe-flex-dispatcher-backend hybridep",
+        ),
+        (
+            {"moe_token_dispatcher_type": "alltoall"},
+            "--moe-token-dispatcher-type flex and --moe-flex-dispatcher-backend hybridep",
+        ),
         # Every runtime expert needs its own weight address for the owner push.
         ({"moe_single_grouped_weight": True}, "moe_single_grouped_weight=False"),
         ({"moe_grouped_gemm": False}, "moe_grouped_gemm=True"),
