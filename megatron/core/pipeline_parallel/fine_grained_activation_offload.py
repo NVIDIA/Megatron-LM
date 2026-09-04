@@ -7,6 +7,8 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from torch.autograd.graph import saved_tensors_hooks
 
+from megatron.core.tensor_parallel.random import is_checkpoint_without_output_tensor
+
 # CPU offload implementation for pipeline parallelism
 DEBUG = False
 DEBUG_RANK = 0
@@ -599,10 +601,8 @@ class PipelineOffloadManager:
         for chunk in self._cached_chunks_backward:
             for group in chunk.offload_groups:
                 if group.offload and keep_on_gpu_bytes > 0:
-                    debug_rank(
-                        f"group {group._name} offload {group.offload} \
-                        keep_on_gpu_bytes {keep_on_gpu_bytes}"
-                    )
+                    debug_rank(f"group {group._name} offload {group.offload} \
+                        keep_on_gpu_bytes {keep_on_gpu_bytes}")
                     keep_on_gpu_bytes -= group.total_offload_bytes
                     group.offload = False
         # Disable the later groups to meet the activation offload fraction.
@@ -989,6 +989,8 @@ class ChunkOffloadHandler:
         if not self._can_manage_tensor_for_offload(tensor):
             return False
         if _te_do_not_offload(tensor):
+            return False
+        if is_checkpoint_without_output_tensor(tensor):
             return False
         if tensor.numel() < self.min_offloaded_tensor_size:
             return False

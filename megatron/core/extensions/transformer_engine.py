@@ -989,6 +989,141 @@ class TELinear(te.pytorch.Linear):
             super().backward_dw()
 
 
+class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
+    """Transformer Engine RMSNormLinear with weights duplicated across TP ranks."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        parallel_mode: Optional[str],
+        config: TransformerConfig,
+        init_method: Callable,
+        bias: bool,
+        skip_bias_add: bool,
+        skip_weight_param_allocation: bool,
+        is_expert: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
+    ):
+        if not HAVE_TE:
+            raise ImportError(
+                "Transformer Engine is not installed. "
+                "Please install it with `pip install transformer-engine`."
+            )
+        if parallel_mode != "duplicated":
+            raise ValueError("TERMSNormDuplicatedLinear requires parallel_mode='duplicated'.")
+        if is_expert:
+            raise ValueError("TERMSNormDuplicatedLinear does not support expert parameters.")
+        if skip_weight_param_allocation:
+            raise ValueError(
+                "Transformer Engine linear layers do not support skip_weight_param_allocation"
+            )
+
+        self.config = config
+        self.te_return_bias = skip_bias_add and bias
+        self.is_first_microbatch = True
+        self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
+        self.rng_tracker_name = get_data_parallel_rng_tracker_name()
+
+        extra_kwargs = _get_extra_te_kwargs(config)
+        if self.config.delay_wgrad_compute:
+            if is_te_min_version("2.3.0"):
+                extra_kwargs["delay_wgrad_compute"] = True
+            else:
+                raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
+
+        self.te_quant_params: Optional[TEQuantizationParams] = None
+        quant_config = get_quant_config_or_none(name, config.quant_recipe)
+        self.finish_init(quant_config)
+        init_quant_context = _get_fp8_model_init_for_quant_params(
+            self.te_quant_params, torch.is_grad_enabled()
+        )
+
+        # TODO: When GTP reaches LatentMoE on dev, accept its rematerialization and replica
+        # groups here and wrap TE construction in `_init_gtp_remat_context` with
+        # `rng_via_kwarg=False`. GTP should shard only the linear weight's output dimension
+        # (including any alignment padding); the RMSNorm scale stays replicated at [input_size],
+        # and the rematerialized output keeps the logical [..., output_size] shape.
+        with init_quant_context:
+            super().__init__(
+                in_features=input_size,
+                out_features=output_size,
+                eps=self.config.layernorm_epsilon,
+                sequence_parallel=False,
+                fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
+                tp_group=None,
+                tp_size=1,
+                get_rng_state_tracker=(
+                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                ),
+                init_method=condition_init_method(config, init_method),
+                bias=bias,
+                normalization="RMSNorm",
+                return_bias=self.te_return_bias,
+                parallel_mode=None,
+                return_layernorm_output=False,
+                zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+                **extra_kwargs,
+            )
+
+        # TODO: With GTP, restore the optional bias after pre-sharded TE construction. GTP
+        # shards only the linear weight, so bias must remain replicated at [output_size].
+        self._tp_group = (
+            tp_group
+            if tp_group is not None
+            else get_tensor_model_parallel_group_if_none(tp_group, is_expert=False)
+        )
+        for param in self.parameters():
+            setattr(param, "allreduce", True)
+            setattr(param, "sequence_parallel", self.config.sequence_parallel)
+            setattr(param, "tensor_model_parallel", False)
+
+    def finish_init(self, quantization_config: QuantizationConfig):
+        """Post-init of quantization override."""
+        if quantization_config is None:
+            self.te_quant_params = None
+        else:
+            self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
+
+    def will_execute_quantized(self, is_context_quantized: bool) -> bool:
+        """Return whether the module is configured to execute quantized."""
+        return _get_should_context_be_quantized_params(
+            self.te_quant_params, self.training, is_context_quantized
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply RMSNorm followed by the duplicated linear projection."""
+        _is_first_microbatch = (
+            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+        )
+        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+        with quant_context:
+            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        self.is_first_microbatch = False
+        if self.te_return_bias:
+            return out
+        return out, None
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Replicate parameters across TP and DP checkpoint coordinates."""
+        state_dict = self.state_dict(prefix="", keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict,
+            prefix,
+            None,
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
+        )
+
+    def backward_dw(self):
+        """Compute weight gradients when delayed wgrad computation is enabled."""
+        if self.config.delay_wgrad_compute:
+            super().backward_dw()
+
+
 class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     """Wrapper for the Transformer-Engine's `LayerNormLinear` layer
     that combines layernorm and linear layers."""
@@ -1954,6 +2089,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
 
+    _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR = (
+        "use_grouped_tensor" in inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
+    )
+
     class TEGroupedLinear(te.pytorch.GroupedLinear):
         """
         Wrapper for the Transformer-Engine's `GroupedLinear` layer.
@@ -2066,6 +2205,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     extra_kwargs["single_grouped_bias"] = getattr(
                         config, "moe_single_grouped_bias", False
                     )
+
+            if _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR:
+                extra_kwargs["use_grouped_tensor"] = config.moe_use_grouped_tensor
+            elif config.moe_use_grouped_tensor and not config.use_transformer_engine_op_fuser:
+                raise RuntimeError(
+                    "moe_use_grouped_tensor=True requires a Transformer Engine GroupedLinear "
+                    "that exposes the use_grouped_tensor argument."
+                )
 
             self.te_quant_params: Optional[TEQuantizationParams] = None
             quant_config = get_quant_config_or_none(name, config.quant_recipe)
@@ -2568,6 +2715,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             )
 
 else:
+    _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR = False
     TEGroupedLinear = None  # type: ignore[assignment, misc]
     TEColumnParallelGroupedLinear = None  # type: ignore[assignment, misc]
     TERowParallelGroupedLinear = None  # type: ignore[assignment, misc]
@@ -3423,10 +3571,30 @@ if HAVE_TE and is_te_min_version("2.7.0.dev"):
         fused_topk_with_score_function,
     )
 
+    try:
+        from transformer_engine.pytorch.router import (  # pylint: disable=unused-import
+            mark_qb_bin_bounds_validated,
+        )
+    except ImportError:
+        mark_qb_bin_bounds_validated = None
+
+    try:
+        _fused_topk_sig = inspect.signature(fused_topk_with_score_function)
+        fused_topk_with_score_function_supports_qb = {
+            "qb_histogram",
+            "qb_bin_bounds",
+            "qb_histogram_mode",
+        }.issubset(_fused_topk_sig.parameters)
+        del _fused_topk_sig
+    except (TypeError, ValueError):
+        fused_topk_with_score_function_supports_qb = False
+
 else:
     fused_topk_with_score_function = None
     fused_compute_score_for_moe_aux_loss = None
     fused_moe_aux_loss = None
+    fused_topk_with_score_function_supports_qb = False
+    mark_qb_bin_bounds_validated = None
 
 
 def set_save_original_input(module):

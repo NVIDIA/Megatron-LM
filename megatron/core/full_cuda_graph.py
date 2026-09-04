@@ -139,7 +139,10 @@ class StaticBufferLoader:
                     StaticBufferLoader.static_buffers[stage][microbatch], inputs
                 )
         torch.cuda.current_stream().wait_stream(self.stream)
-        return StaticBufferLoader.static_buffers[stage][microbatch]
+        # Shallow-copy so callers may replace or remove top-level entries to tailor the
+        # batch to their pipeline stage without mutating the cached static buffer. Nested
+        # containers and the tensors themselves are still shared with the buffer.
+        return StaticBufferLoader.static_buffers[stage][microbatch].copy()
 
 
 class FullCudaGraphWrapper:

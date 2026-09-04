@@ -27,7 +27,9 @@ def _load_internal_module(name: str, path: Path):
 
 
 runner = _load_internal_module("mlite_local_test_runner", HARNESS_ROOT / "runner.py")
-worker = _load_internal_module("mlite_local_pytest_worker", HARNESS_ROOT / "pytest_worker.py")
+worker = _load_internal_module(
+    "mlite_local_pytest_worker", HARNESS_ROOT / "pytest_worker.py"
+)
 markers = importlib.import_module("markers")
 
 
@@ -61,6 +63,15 @@ class _FakeItem:
 
     def iter_markers(self, name: str):
         return iter(self._markers.get(name, []))
+
+
+class _FakeConfig:
+    def __init__(self) -> None:
+        self.marker_descriptions = []
+
+    def addinivalue_line(self, name: str, value: str) -> None:
+        assert name == "markers"
+        self.marker_descriptions.append(value)
 
 
 def _marker(*args, **kwargs):
@@ -102,7 +113,9 @@ def _suite(
     environment: tuple[tuple[str, str | None], ...] = (),
     timeout: int = markers.DEFAULT_TIMEOUT_SECONDS,
     allow_skips: bool = False,
-    targets: tuple[str, ...] = ("experimental/lite/tests/unit/runtime/test_example.py::test_case",),
+    targets: tuple[str, ...] = (
+        "experimental/lite/tests/unit/runtime/test_example.py::test_case",
+    ),
 ) -> runner.Suite:
     return runner.Suite(
         name=name,
@@ -115,13 +128,23 @@ def _suite(
 
 
 def _counts(**overrides: int) -> dict[str, int]:
-    counts = {"passed": 1, "failed": 0, "skipped": 0, "xfailed": 0, "xpassed": 0, "error": 0}
+    counts = {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "error": 0,
+    }
     counts.update(overrides)
     return counts
 
 
 def _rank_report(
-    rank: int, outcome_digest: str = "a" * 64, status: str = "PASS", **count_overrides: int
+    rank: int,
+    outcome_digest: str = "a" * 64,
+    status: str = "PASS",
+    **count_overrides: int,
 ) -> dict[str, object]:
     return {
         "rank": rank,
@@ -155,7 +178,10 @@ def test_stable_configuration_is_code_owned_and_does_not_enumerate_tests():
     assert "--strict-markers" in runner.PYTEST_ARGS
     assert "--disable-warnings" in runner.PYTEST_ARGS
     assert runner.PYTEST_ARGS[:2] == ("-o", "addopts=")
-    assert runner.HARDWARE_PROFILES == {"standard": (8, "hopper"), "blackwell": (4, "blackwell")}
+    assert runner.HARDWARE_PROFILES == {
+        "standard": (8, "hopper"),
+        "blackwell": (4, "blackwell"),
+    }
     assert not (HARNESS_ROOT / "manifest.json").exists()
 
 
@@ -181,10 +207,26 @@ def test_marker_defaults_describe_cpu_hopper_and_600_seconds():
     assert gpu.min_architecture == "hopper"
 
 
+def test_legacy_gpu_and_mlite_smoke_markers_are_registered_and_scheduled():
+    config = _FakeConfig()
+    markers.register(config)
+
+    registered = "\n".join(config.marker_descriptions)
+    assert "gpu:" in registered
+    assert "mlite:" in registered
+    assert "smoke:" in registered
+    legacy_gpu = markers.execution_for_item(_FakeItem(gpu=[_marker()]))
+    assert legacy_gpu.gpus == 1
+    assert legacy_gpu.min_architecture == "hopper"
+
+
 def test_marker_scopes_merge_environment_and_closest_values_win():
     item = _FakeItem(
         gpus=[_marker(4, min_architecture="blackwell"), _marker(2)],
-        env=[_marker(CUDA_DEVICE_MAX_CONNECTIONS=None), _marker(CUDA_DEVICE_MAX_CONNECTIONS="1")],
+        env=[
+            _marker(CUDA_DEVICE_MAX_CONNECTIONS=None),
+            _marker(CUDA_DEVICE_MAX_CONNECTIONS="1"),
+        ],
         timeout=[_marker(seconds=45), _marker(seconds=3600)],
         optional=[_marker()],
     )
@@ -263,7 +305,9 @@ def test_collection_command_uses_shared_args_and_generated_plan(monkeypatch, tmp
                 }
             ]
         }
-        Path(kwargs["env"]["MLITE_TEST_PLAN_PATH"]).write_text(json.dumps(plan), encoding="utf-8")
+        Path(kwargs["env"]["MLITE_TEST_PLAN_PATH"]).write_text(
+            json.dumps(plan), encoding="utf-8"
+        )
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(runner.subprocess, "run", fake_run)
@@ -275,7 +319,9 @@ def test_collection_command_uses_shared_args_and_generated_plan(monkeypatch, tmp
     assert captured["command"][-2:] == list(runner.TEST_ROOTS)
     assert f"--rootdir={REPO_ROOT}" in captured["command"]
     assert "--collect-only" in captured["command"]
-    assert not any(argument.startswith("--ignore-glob=") for argument in captured["command"])
+    assert not any(
+        argument.startswith("--ignore-glob=") for argument in captured["command"]
+    )
     assert captured["environment"]["CUDA_VISIBLE_DEVICES"] == ""
     assert captured["environment"]["MLITE_TEST_HARNESS"] == "1"
     cache_root = tmp_path / "cache"
@@ -288,7 +334,9 @@ def test_collection_command_uses_shared_args_and_generated_plan(monkeypatch, tmp
 def test_profile_selection_uses_default_and_explicit_subset_semantics():
     cpu = _case("experimental/lite/tests/unit/runtime/test_a.py::test_cpu")
     hopper = _case(
-        "experimental/lite/tests/unit/model/test_a.py::test_hopper", gpus=1, architecture="hopper"
+        "experimental/lite/tests/unit/model/test_a.py::test_hopper",
+        gpus=1,
+        architecture="hopper",
     )
     blackwell = _case(
         "experimental/lite/tests/unit/model/test_b.py::test_blackwell",
@@ -303,9 +351,16 @@ def test_profile_selection_uses_default_and_explicit_subset_semantics():
     )
     cases = [cpu, hopper, blackwell, optional]
 
-    assert runner.select_cases(cases, _selection("standard", "hopper", 8), False) == [cpu, hopper]
-    assert runner.select_cases(cases, _selection("blackwell", "blackwell", 4), False) == [blackwell]
-    assert runner.select_cases(cases, _selection("subset", "blackwell", 4), True) == cases
+    assert runner.select_cases(cases, _selection("standard", "hopper", 8), False) == [
+        cpu,
+        hopper,
+    ]
+    assert runner.select_cases(
+        cases, _selection("blackwell", "blackwell", 4), False
+    ) == [blackwell]
+    assert (
+        runner.select_cases(cases, _selection("subset", "blackwell", 4), True) == cases
+    )
     with pytest.raises(runner.SelectionError):
         runner.select_cases([blackwell], _selection("subset", "hopper", 8), True)
 
@@ -340,7 +395,9 @@ def test_suites_group_gpu_functions_by_file_and_execution_contract():
     assert len(suites) == 3
     cpu = next(suite for suite in suites if suite.gpus == 0)
     gpu = next(
-        suite for suite in suites if suite.targets == tuple(sorted([gpu_a.nodeid, gpu_b.nodeid]))
+        suite
+        for suite in suites
+        if suite.targets == tuple(sorted([gpu_a.nodeid, gpu_b.nodeid]))
     )
     assert cpu.name == "cpu"
     assert cpu.targets == tuple(sorted([cpu_a.nodeid, cpu_b.nodeid]))
@@ -364,9 +421,12 @@ def test_optional_cases_are_isolated_into_skip_tolerant_suites():
 
 
 @pytest.mark.parametrize(
-    ("capabilities", "expected_profile"), [([(9, 0)] * 8, "standard"), ([(10, 0)] * 4, "blackwell")]
+    ("capabilities", "expected_profile"),
+    [([(9, 0)] * 8, "standard"), ([(10, 0)] * 4, "blackwell")],
 )
-def test_default_hardware_detection_selects_supported_profile(capabilities, expected_profile):
+def test_default_hardware_detection_selects_supported_profile(
+    capabilities, expected_profile
+):
     selection = runner.detect_default_hardware(_FakeTorch(capabilities))
 
     assert selection.profile == expected_profile
@@ -382,8 +442,12 @@ def test_default_hardware_detection_rejects_unsupported_or_mixed_topology(capabi
         runner.detect_default_hardware(_FakeTorch(capabilities))
 
 
-@pytest.mark.parametrize("capabilities", [[(9, 0)], [(9, 0)] * 2, [(10, 0)], [(10, 0)] * 3])
-def test_subset_hardware_accepts_any_positive_homogeneous_supported_gpu_count(capabilities):
+@pytest.mark.parametrize(
+    "capabilities", [[(9, 0)], [(9, 0)] * 2, [(10, 0)], [(10, 0)] * 3]
+)
+def test_subset_hardware_accepts_any_positive_homogeneous_supported_gpu_count(
+    capabilities,
+):
     selection = runner.detect_subset_hardware(_FakeTorch(capabilities))
 
     assert selection.profile == "subset"
@@ -404,7 +468,9 @@ def test_suite_environment_sanitizes_then_applies_declared_variables(tmp_path):
         "PYTEST_PLUGINS": "untrusted_plugin",
         "PYTHONPATH": "/untrusted/path",
     }
-    suite = _suite("two-gpu", gpus=2, environment=(("CUDA_DEVICE_MAX_CONNECTIONS", "1"),))
+    suite = _suite(
+        "two-gpu", gpus=2, environment=(("CUDA_DEVICE_MAX_CONNECTIONS", "1"),)
+    )
 
     environment = runner.build_suite_environment(suite, tmp_path, base)
 
@@ -416,7 +482,9 @@ def test_suite_environment_sanitizes_then_applies_declared_variables(tmp_path):
     assert environment["QWEN35_HF_DIR"] == "/external/checkpoint"
     assert "PYTEST_ADDOPTS" not in environment
     assert "PYTEST_PLUGINS" not in environment
-    assert environment["PYTHONPATH"] == os.pathsep.join((str(REPO_ROOT), str(TEST_ROOT.parent)))
+    assert environment["PYTHONPATH"] == os.pathsep.join(
+        (str(TEST_ROOT.parent), str(REPO_ROOT))
+    )
     assert environment["MLITE_TEST_HARNESS"] == "1"
     assert "MLITE_TEST_ALLOW_SKIPS" not in environment
     assert environment["CUBLAS_WORKSPACE_CONFIG"] == ":4096:8"
@@ -451,7 +519,9 @@ def test_optional_suite_environment_enables_skip_policy(tmp_path):
 
 def test_suite_commands_use_direct_worker_or_isolated_torchrun():
     cpu = _suite()
-    distributed = _suite(gpus=2, targets=("experimental/lite/tests/unit/model/test_b.py::test_b",))
+    distributed = _suite(
+        gpus=2, targets=("experimental/lite/tests/unit/model/test_b.py::test_b",)
+    )
 
     cpu_command = runner.build_suite_command(cpu)
     distributed_command = runner.build_suite_command(distributed)
@@ -469,7 +539,9 @@ def test_source_revision_marks_untracked_changes_without_exposing_paths(monkeypa
     revision = "a" * 40
 
     def fake_run(command, **_kwargs):
-        stdout = revision + "\n" if command[1] == "rev-parse" else "?? private-local-name\n"
+        stdout = (
+            revision + "\n" if command[1] == "rev-parse" else "?? private-local-name\n"
+        )
         return SimpleNamespace(stdout=stdout)
 
     monkeypatch.setattr(runner.subprocess, "run", fake_run)
@@ -492,7 +564,10 @@ def test_rank_report_integrity_rejects_same_counts_for_different_node_outcomes()
     suite = _suite("two-rank", gpus=2)
     result = runner.evaluate_suite_reports(
         suite,
-        [_rank_report(0, outcome_digest="a" * 64), _rank_report(1, outcome_digest="b" * 64)],
+        [
+            _rank_report(0, outcome_digest="a" * 64),
+            _rank_report(1, outcome_digest="b" * 64),
+        ],
         process_exit_code=0,
         timed_out=False,
     )
@@ -509,9 +584,13 @@ def test_rank_report_integrity_rejects_same_counts_for_different_node_outcomes()
         [_rank_report(0), _rank_report(0)],
     ],
 )
-def test_rank_report_integrity_rejects_missing_failed_malformed_or_duplicate_ranks(reports):
+def test_rank_report_integrity_rejects_missing_failed_malformed_or_duplicate_ranks(
+    reports,
+):
     suite = _suite("two-rank", gpus=2)
-    result = runner.evaluate_suite_reports(suite, reports, process_exit_code=0, timed_out=False)
+    result = runner.evaluate_suite_reports(
+        suite, reports, process_exit_code=0, timed_out=False
+    )
 
     assert result.status == "FAIL"
 
@@ -520,8 +599,16 @@ def test_rank_report_integrity_rejects_missing_failed_malformed_or_duplicate_ran
     ("test_source", "expected_exit", "outcome"),
     [
         ("def test_ok():\n    assert True\n", 0, "passed"),
-        ("import pytest\ndef test_skip():\n    pytest.skip('not allowed')\n", 1, "skipped"),
-        ("import pytest\npytest.importorskip('mlite_module_that_does_not_exist')\n", 1, "skipped"),
+        (
+            "import pytest\ndef test_skip():\n    pytest.skip('not allowed')\n",
+            1,
+            "skipped",
+        ),
+        (
+            "import pytest\npytest.importorskip('mlite_module_that_does_not_exist')\n",
+            1,
+            "skipped",
+        ),
         (
             "import pytest\n"
             "@pytest.fixture\n"
@@ -541,12 +628,16 @@ def test_rank_report_integrity_rejects_missing_failed_malformed_or_duplicate_ran
         ),
     ],
 )
-def test_worker_enforces_skip_and_xpass_policy(tmp_path, test_source, expected_exit, outcome):
+def test_worker_enforces_skip_and_xpass_policy(
+    tmp_path, test_source, expected_exit, outcome
+):
     test_file = tmp_path / "test_worker_case.py"
     report_dir = tmp_path / "reports"
     test_file.write_text(test_source, encoding="utf-8")
     environment = dict(os.environ)
-    environment.update({"MLITE_TEST_REPORT_DIR": str(report_dir), "PYTHONDONTWRITEBYTECODE": "1"})
+    environment.update(
+        {"MLITE_TEST_REPORT_DIR": str(report_dir), "PYTHONDONTWRITEBYTECODE": "1"}
+    )
 
     completed = subprocess.run(
         [
@@ -586,16 +677,22 @@ def test_worker_allows_skips_only_for_optional_suites():
     assert optional.as_dict(0)["status"] == "FAIL"
 
 
-def test_explicit_cpu_subset_does_not_import_torch_or_probe_hardware(monkeypatch, capsys):
+def test_explicit_cpu_subset_does_not_import_torch_or_probe_hardware(
+    monkeypatch, capsys
+):
     target = "experimental/lite/tests/unit/runtime/test_local_validation_runner.py"
     case = _case(f"{target}::test_synthetic_cpu")
     monkeypatch.chdir(REPO_ROOT)
     monkeypatch.setattr(runner, "collect_tests", lambda *_args, **_kwargs: [case])
     monkeypatch.setattr(
-        runner, "_load_torch", lambda: pytest.fail("CPU subset must not import torch in the runner")
+        runner,
+        "_load_torch",
+        lambda: pytest.fail("CPU subset must not import torch in the runner"),
     )
     monkeypatch.setattr(runner, "_print_header", lambda *_args: None)
-    monkeypatch.setattr(runner, "run_suite", lambda suite, _temporary: _passing_result(suite))
+    monkeypatch.setattr(
+        runner, "run_suite", lambda suite, _temporary: _passing_result(suite)
+    )
 
     assert runner.main([target]) == 0
     assert "overall=PASS" in capsys.readouterr().out

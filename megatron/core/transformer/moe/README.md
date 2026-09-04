@@ -297,6 +297,7 @@ Routers determine which expert(s) handle each token. A lightweight MLP scores ev
 | **seq_aux_loss** | Sequence-level auxiliary loss for balancing expert usage on each sequence| `--moe-router-load-balancing-type seq_aux_loss` |
 | **global_aux_loss** | Global auxiliary loss for balancing expert usage on a global batch across all ranks | `--moe-router-load-balancing-type global_aux_loss` |
 | **sinkhorn** | Optimal transport formulation for balancing expert usage | `--moe-router-load-balancing-type sinkhorn` |
+| **quantile_balancing** | Kimi K3 aux-loss-free global-batch histogram quantile bias updates | `--moe-router-load-balancing-type quantile_balancing --moe-router-score-function sigmoid --moe-aux-loss-coeff 0` |
 | **aux loss free** | Dynamic bias-based load balancing strategy without auxiliary loss | `--moe-router-enable-expert-bias --moe-router-bias-update-rate 1e-3`|
 | **none** | No load balancing | `--moe-router-load-balancing-type none` |
 
@@ -574,7 +575,9 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 ### Router Arguments
 | Argument | Description | Default |
 |----------|-------------|---------|
-| --moe-router-load-balancing-type | Load balancing: aux_loss, sinkhorn, seq_aux_loss, none | aux_loss |
+| --moe-router-load-balancing-type | Load balancing: aux_loss, seq_aux_loss, global_aux_loss, sinkhorn, quantile_balancing, none | aux_loss |
+| --moe-router-quantile-balancing-estimation-scope | Quantile population; dev supports global_batch | global_batch |
+| --moe-router-qb-num-bins | Uniform histogram bins per expert for global-batch quantile balancing | 1000 |
 | --moe-router-topk | Number of experts per token | 2 |
 | --moe-router-score-function | Score function: softmax, sigmoid | softmax |
 | --moe-router-pre-softmax | Softmax before top-k | False |
