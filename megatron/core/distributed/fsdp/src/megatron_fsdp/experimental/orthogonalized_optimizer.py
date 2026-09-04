@@ -193,7 +193,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         use_owner_comm_stream: bool = True,
         reconstruct_full_param: bool = False,
         num_ns_steps: int | None = None,
-        max_params_per_owner_chunk: int | None = 16,
+        max_params_per_owner_chunk: int | None = 4,
     ) -> None:
         _require_emerging_optimizers()
 
@@ -1041,7 +1041,7 @@ class FsdpMuon(FsdpOrthogonalizedOptimizer):
         dp_mesh: DeviceMesh,
         use_owner_comm_stream: bool = True,
         reconstruct_full_param: bool = False,
-        max_params_per_owner_chunk: int | None = 16,
+        max_params_per_owner_chunk: int | None = 4,
     ) -> None:
         _require_emerging_optimizers()
 
