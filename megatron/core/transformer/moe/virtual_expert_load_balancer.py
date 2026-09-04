@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Replica planning and the weight bridge behind the ``replica_hybridep`` dispatcher.
+"""Virtual-expert load balancing, replica planning, and runtime weight movement.
 
 Every EP rank exposes ``2 * L`` runtime experts to HybridEP: its ``L`` native
 experts followed by ``L`` replica slots. Each rank gathers the per-rank expert
@@ -25,21 +25,38 @@ import math
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
 
 from megatron.core.fp8_utils import is_mxfp8tensor
 from megatron.core.jit import jit_fuser
-from megatron.core.transformer.moe.replica_weight_triton import (
-    MAX_REPLICA_WEIGHT_SMS,
-    compile_replica_weight_kernels,
-    launch_compact_routing_map,
-    launch_replica_grad_reduce,
-    launch_replica_placement,
-    launch_replica_weight_prefetch,
-)
+
+try:
+    from megatron.core.transformer.moe.virtual_expert_triton import (
+        MAX_REPLICA_WEIGHT_SMS,
+        compile_replica_weight_kernels,
+        launch_compact_routing_map,
+        launch_replica_grad_reduce,
+        launch_replica_placement,
+        launch_replica_weight_prefetch,
+    )
+
+    _TRITON_AVAILABLE = True
+except ImportError:
+    MAX_REPLICA_WEIGHT_SMS = 32
+    compile_replica_weight_kernels = None
+    launch_compact_routing_map = None
+    launch_replica_grad_reduce = None
+    launch_replica_placement = None
+    launch_replica_weight_prefetch = None
+    _TRITON_AVAILABLE = False
 from megatron.core.utils import nvtx_decorator
+
+if TYPE_CHECKING:
+    from megatron.core.transformer.transformer_config import TransformerConfig
 
 # Push directions. MXFP8 forward GEMMs read the rowwise components, backward the columnwise.
 FORWARD, BACKWARD = 0, 1
@@ -827,3 +844,164 @@ class _ReplicaWaitGradReduce(torch.autograd.Function):
                     )
                 )
         return (grad_hidden_states, *grads, None, None)
+
+
+class VirtualExpertLoadBalancer:
+    """Mixin that plans virtual experts and manages their runtime weights.
+
+    Dispatch managers provide the transport-specific glue: they feed semantic routes into
+    :meth:`setup_virtual_expert_metadata`, install the mapped routes returned by
+    :meth:`prepare_virtual_expert_dispatch`, and bracket their combine operation with the
+    corresponding pre/post helpers.
+    """
+
+    def initialize_virtual_expert_load_balancer(
+        self,
+        *,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        router_topk: int,
+        num_experts: int,
+        config: "TransformerConfig",
+    ) -> None:
+        """Initialize virtual-expert state without initializing the transport parent."""
+        if not _TRITON_AVAILABLE:
+            raise ImportError("--moe-virtual-expert-load-balance requires Triton.")
+        world_size = torch.distributed.get_world_size(group=group)
+        if num_experts != world_size * num_local_experts:
+            raise ValueError(
+                "Virtual-expert load balancing requires an even expert distribution: "
+                f"num_experts={num_experts}, world_size={world_size}, "
+                f"num_local_experts={num_local_experts}."
+            )
+        self.group = group
+        self.config = config
+        self.router_topk = router_topk
+        self.semantic_num_experts = num_experts
+        self.num_owned_experts = num_local_experts
+        self.semantic_token_probs = None
+        self.semantic_token_indices = None
+        self.semantic_tokens_per_expert = None
+        self._bridge = None
+        self._plan = None
+        self._context = None
+
+    def bind_experts(self, experts: torch.nn.Module) -> None:
+        """Bind the expert module and its optimizer-owned weights to runtime expert slots."""
+        self._bridge = ReplicaWeightBridge(
+            experts=experts,
+            group=self.group,
+            num_local_experts=self.num_owned_experts,
+            grad_dtype=torch.bfloat16 if self.config.grad_reduce_in_bf16 else torch.float32,
+            num_sms=self.config.moe_flex_dispatcher_num_sms,
+        )
+        experts.set_replica_weight_bridge(self._bridge)
+
+    def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Attach the replica-gradient completion hook to the whole MoE layer input."""
+        if self._context is not None:
+            raise RuntimeError("Virtual-expert layer input wrapped twice without a combine.")
+        self._context = SimpleNamespace(plan=None)
+        return _ReplicaWaitGradReduce.apply(
+            hidden_states, *self._bridge.source_parameters, self._bridge, self._context
+        )
+
+    def setup_virtual_expert_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> None:
+        """Extract compact semantic routes for the placement planner."""
+        num_tokens = int(routing_map.shape[0])
+        self.semantic_token_probs, self.semantic_token_indices, self.semantic_tokens_per_expert = (
+            extract_semantic_routes(
+                routing_map.reshape(num_tokens, self.semantic_num_experts),
+                probs.reshape(num_tokens, self.semantic_num_experts),
+                self.router_topk,
+            )
+        )
+        self.num_local_tokens = num_tokens
+        self.token_probs = self.semantic_token_probs
+
+    def plan_dispatch(self, hidden_states: torch.Tensor) -> None:
+        """Plan routes and begin the weight push before shared-expert compute."""
+        if self._bridge is None or self._context is None or self._plan is not None:
+            raise RuntimeError(
+                "Virtual-expert planning needs bound experts, a wrapped layer input and a "
+                "combined previous dispatch."
+            )
+        workspace = get_planner_workspace(
+            num_experts=self.semantic_num_experts,
+            ep_size=torch.distributed.get_world_size(group=self.group),
+            device=hidden_states.device,
+        )
+        self._plan = self._context.plan = plan_replica_routes(
+            self.semantic_token_indices,
+            self.semantic_tokens_per_expert,
+            self.group,
+            workspace,
+            on_placement_ready=self._start_prefetch,
+        )
+
+    def _start_prefetch(self, plan) -> None:
+        self._bridge.last_plan = plan
+        self._bridge.start_prefetch(plan)
+
+    def prepare_virtual_expert_dispatch(
+        self, hidden_states: torch.Tensor, *, num_runtime_experts: int, alignment: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Map planned routes to runtime experts and attach dispatch-backward work."""
+        plan = self._plan
+        if plan is None:
+            raise RuntimeError("Virtual-expert dispatch requires plan_dispatch to run first.")
+        routing_map, token_probs = map_replica_plan_to_hybridep(
+            plan, self.semantic_token_probs, num_experts=self.semantic_num_experts * 2
+        )
+        num_permuted_tokens = self._get_rank_capacity(
+            num_tokens=self.num_local_tokens,
+            router_topk=self.router_topk,
+            capacity_factor=self.config.moe_expert_rank_capacity_factor,
+            num_runtime_experts=num_runtime_experts,
+            alignment=alignment,
+        )
+        hidden_states = _ReplicaBackwardHook.apply(
+            hidden_states, functools.partial(self._bridge.start_pending_grad_reduces, plan)
+        )
+        return hidden_states, routing_map, token_probs, num_permuted_tokens
+
+    def prepare_virtual_expert_combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Attach the backward weight-push wait before transport combine."""
+        if self._plan is None:
+            raise RuntimeError("Virtual-expert combine requires a matching dispatch plan.")
+        return _ReplicaBackwardHook.apply(
+            hidden_states, functools.partial(self._bridge.wait_prefetch_for_backward, self._plan)
+        )
+
+    def finish_virtual_expert_combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Release transport routing metadata after combine."""
+        self.token_probs = self.routing_map = None
+        return hidden_states
+
+    def finalize_output(self, output: torch.Tensor) -> torch.Tensor:
+        """Start the backward weight push from the MoE layer output."""
+        plan, self._plan, self._context = self._plan, None, None
+        if plan is None:
+            raise RuntimeError("Virtual-expert output finalization requires a combined plan.")
+        return _ReplicaBackwardHook.apply(
+            output, functools.partial(self._bridge.start_prefetch, plan, BACKWARD)
+        )
+
+    @staticmethod
+    def _get_rank_capacity(
+        *,
+        num_tokens: int,
+        router_topk: int,
+        capacity_factor: float,
+        num_runtime_experts: int,
+        alignment: int,
+    ) -> int:
+        """Return a static, dropless route capacity for one transport rank."""
+        num_routes = num_tokens * router_topk
+        rank_capacity = int(num_routes * capacity_factor)
+        if alignment > 1:
+            rank_capacity = max(
+                rank_capacity, num_routes + num_runtime_experts * (alignment - 1)
+            )
+            rank_capacity += -rank_capacity % alignment
+        return rank_capacity

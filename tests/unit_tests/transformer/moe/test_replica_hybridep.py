@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""End-to-end gradient parity for the replica_hybridep flex dispatcher.
+"""End-to-end gradient parity for HybridEP virtual-expert load balancing.
 
 Run on one four-GPU NVLink node::
 
@@ -8,7 +8,7 @@ Run on one four-GPU NVLink node::
       tests/unit_tests/transformer/moe/test_replica_hybridep.py
 
 Each case builds the same MoE layer twice -- once on a reference dispatcher and
-once on replica_hybridep -- loads identical weights, and compares the output and
+once with virtual-expert load balancing -- loads identical weights, and compares the output and
 every training gradient. Planner and bridge internals are covered
 process-locally in ``test_replica_planner.py``; the transport kernels in
 ``test_replica_weight_triton.py``.
@@ -38,7 +38,7 @@ requires_four_ranks = pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) != 4
     or not torch.cuda.is_available()
     or not fused_a2a.HAVE_HYBRIDEP,
-    reason="replica_hybridep parity requires a 4-rank torchrun launch with HybridEP",
+    reason="virtual-expert parity requires a 4-rank torchrun launch with HybridEP",
 )
 
 
@@ -214,7 +214,8 @@ def _run_full_layer_parity(
     replica_config = TransformerConfig(
         **common,
         moe_token_dispatcher_type="flex",
-        moe_flex_dispatcher_backend="replica_hybridep",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_virtual_expert_load_balance=True,
         grad_reduce_in_bf16=bf16_grads,
         ddp_reduce_scatter_with_fp32_accumulation=bf16_grads,
         gtp_remat_reduce_scatter_with_fp32_accumulation=bf16_grads and gtp,
@@ -425,9 +426,12 @@ def _run_repeated_mtp_parity(monkeypatch):
     }
     layer_spec = get_gpt_layer_with_transformer_engine_spec(num_experts=4, moe_grouped_gemm=True)
 
-    def build(backend):
+    def build(virtual_expert_load_balance):
         config = TransformerConfig(
-            **common, moe_token_dispatcher_type="flex", moe_flex_dispatcher_backend=backend
+            **common,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            moe_virtual_expert_load_balance=virtual_expert_load_balance,
         )
         return GPTModel(
             config=config,
@@ -479,8 +483,8 @@ def _run_repeated_mtp_parity(monkeypatch):
             )
 
     try:
-        reference_model = build("hybridep")
-        replica_model = build("replica_hybridep")
+        reference_model = build(False)
+        replica_model = build(True)
         replica_model.load_state_dict(reference_model.state_dict())
         assert replica_model.state_dict().keys() == reference_model.state_dict().keys()
         initialize_main_grads(reference_model)

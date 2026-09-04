@@ -19,7 +19,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.transformer.moe.replica_weight_triton import (
+from megatron.core.transformer.moe.virtual_expert_triton import (
     MAX_REPLICA_WEIGHT_SMS,
     _transport_tile,
     _validate_transport_shape,
