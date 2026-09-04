@@ -18,10 +18,13 @@ This module contains only the framework-side wiring:
     reference and the fallback everywhere).
 
 What the fused path replaces (see the frontend's ``docs/fe-oss-apis/csa.md`` for kernel
-details): for the THD packed, non-pre-grouped path, the chain gather-index build ->
-gather -> ``+ APE`` -> overlap-window transform (``coff == 2``) -> fp32 softmax ->
-gated weighted sum -> bf16 cast, i.e. one fused compute kernel per direction (backward
-adds a small ``dAPE`` zero-init) instead of ~40 forward / ~50 backward eager launches.
+details): for a THD packed path, the chain gather-index build -> gather -> ``+ APE`` ->
+overlap-window transform (``coff == 2``) -> fp32 softmax -> gated weighted sum -> bf16
+cast, i.e. one fused compute kernel per direction (backward adds a small ``dAPE``
+zero-init) instead of ~40 forward / ~50 backward eager launches. CP pre-grouped buffers
+reuse the same API with local token/group prefixes emitted by their compaction kernel;
+static-capacity halo and padding rows remain noncanonical and their output gradients are
+ignored by the frontend contract.
 Numerics are fp32 with a single final bf16 rounding: not
 bit-identical to the eager region (which rounds the softmax weights to bf16 and
 multiplies in bf16) but at least as accurate against an fp64 oracle; forward, ``dKV``

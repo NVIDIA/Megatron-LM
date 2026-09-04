@@ -142,6 +142,57 @@ def _native_compressor_input_compact(
     return hidden_compact, comp_ids
 
 
+def _native_cp_compressor_metadata(
+    cu_seqlens: torch.Tensor,
+    global_start: int,
+    l_local: int,
+    ratio: int,
+    d_comp: int,
+    c_cap: int,
+    cp_size: int,
+):
+    """Build a simple host reference for the metadata emitted during compaction."""
+    cu = [int(x) for x in cu_seqlens.cpu().tolist()]
+    groups = _compressed_groups(cu_seqlens, global_start, l_local, ratio, d_comp)
+
+    position_values = [comp_id * ratio for _, comp_id in groups[:c_cap]]
+    position_values.extend([0] * (c_cap - len(position_values)))
+    position_ids = torch.tensor(position_values, dtype=torch.int32, device=cu_seqlens.device)
+
+    local_counts = [0] * (len(cu) - 1)
+    for seq, _ in groups:
+        local_counts[seq] += 1
+    local_cuc_values = [0]
+    global_cuc_values = [0]
+    for seq, local_count in enumerate(local_counts):
+        local_cuc_values.append(local_cuc_values[-1] + local_count)
+        global_cuc_values.append(global_cuc_values[-1] + (cu[seq + 1] - cu[seq]) // ratio)
+    local_cuc = torch.tensor(local_cuc_values, dtype=torch.int32, device=cu_seqlens.device)
+    local_cu = local_cuc * ratio
+    global_cuc = torch.tensor(global_cuc_values, dtype=torch.int32, device=cu_seqlens.device)
+
+    rank_rows = []
+    for logical_row in range((l_local * cp_size) // ratio):
+        if logical_row >= global_cuc_values[-1]:
+            rank_rows.append(-1)
+            continue
+        seq_id = 0
+        while logical_row >= global_cuc_values[seq_id + 1]:
+            seq_id += 1
+        comp_id = logical_row - global_cuc_values[seq_id]
+        owner_rank = min(cp_size - 1, max(0, (cu[seq_id] + (comp_id + 1) * ratio - 1) // l_local))
+        rank_start = owner_rank * l_local
+        first_seq_id = 0
+        while first_seq_id + 1 < len(cu) - 1 and rank_start >= cu[first_seq_id + 1]:
+            first_seq_id += 1
+        first_numer = max(0, rank_start - d_comp - cu[first_seq_id])
+        first_comp_id = (first_numer + ratio - 1) // ratio
+        first_logical_row = global_cuc_values[first_seq_id] + first_comp_id
+        rank_rows.append(owner_rank * c_cap + logical_row - first_logical_row)
+    seq_to_rank_row = torch.tensor(rank_rows, dtype=torch.int32, device=cu_seqlens.device)
+    return position_ids, local_cu, local_cuc, global_cuc, seq_to_rank_row
+
+
 def _native_attention_indices(
     cu_seqlens: torch.Tensor,
     cu_seqlens_compressed: torch.Tensor,
@@ -336,11 +387,16 @@ def test_compressor_input_compact_matches_native_forward_backward():
     boundary.grad.zero_()
 
     fused = thd_layout_kernels.CompressorInputCompact.apply(
-        hidden, boundary, cu, global_start, ratio, d_comp, c_cap
+        hidden, boundary, cu, global_start, ratio, d_comp, c_cap, _E2E_CP_SIZE
+    )
+    metadata_ref = _native_cp_compressor_metadata(
+        cu, global_start, l_local, ratio, d_comp, c_cap, _E2E_CP_SIZE
     )
     fused[0].backward(grad)
     assert torch.equal(fused[0], ref[0])
     assert torch.equal(fused[1], ref[1])
+    for actual, expected in zip(fused[2:], metadata_ref):
+        assert torch.equal(actual, expected)
     assert torch.equal(hidden.grad, ref_hidden_grad)
     assert torch.equal(boundary.grad, ref_boundary_grad)
 
@@ -726,10 +782,18 @@ def test_composed_cp_layout_maps_every_index_and_gradient_to_its_source(ratio, l
                 hidden[max(0, start - d_window) : start],
             )
         )
-        compact, group_ids, row_map = prepare_cp_compressor_input(
-            local, boundary, cu, cu_compressed, start, cp_size, ratio
+        compact, group_ids, position_ids, local_cu, local_cuc, emitted_cu_compressed, row_map = (
+            prepare_cp_compressor_input(local, boundary, cu, start, cp_size, ratio)
         )
         grouped = compact.reshape(group_ids.shape[0], ratio, 1)
+        expected_metadata = _native_cp_compressor_metadata(
+            cu, start, local_rows, ratio, d_window, group_ids.shape[0], cp_size
+        )
+        assert torch.equal(position_ids, expected_metadata[0])
+        assert torch.equal(local_cu, expected_metadata[1])
+        assert torch.equal(local_cuc, expected_metadata[2])
+        assert torch.equal(emitted_cu_compressed, cu_compressed)
+        assert torch.equal(row_map, expected_metadata[4])
         boundaries.append(boundary)
         locals_.append(local)
         compact_values.append(grouped.sum(dim=1))

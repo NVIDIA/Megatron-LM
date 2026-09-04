@@ -204,12 +204,19 @@ def test_apply_thd_cp_local_rope_unfused_matches_explicit_positions(inverse):
 def test_prepare_cp_compressor_input_builds_rank_row_map(monkeypatch):
     calls = []
 
-    def fake_apply(hidden, boundary, cu, global_start, ratio, d_comp, c_cap):
-        calls.append((int(global_start), hidden.shape[0], int(c_cap), tuple(boundary.shape)))
+    def fake_apply(hidden, boundary, cu, global_start, ratio, d_comp, c_cap, cp_size):
+        calls.append(
+            (int(global_start), hidden.shape[0], int(c_cap), int(cp_size), tuple(boundary.shape))
+        )
         marker = len(calls)
         hidden_compact = torch.full((int(c_cap) * int(ratio), 1), marker, dtype=hidden.dtype)
         comp_ids = torch.arange(int(c_cap), dtype=torch.int32) + marker * 10
-        return hidden_compact, comp_ids
+        position_ids = comp_ids * int(ratio)
+        local_cu = torch.tensor([0, 32], dtype=torch.int32)
+        local_cuc = torch.tensor([0, 8], dtype=torch.int32)
+        global_cuc = torch.tensor([0, 8], dtype=torch.int32)
+        rank_rows = torch.tensor([0, 1, 2, 3, 10, 11, 12, 13], dtype=torch.int32)
+        return (hidden_compact, comp_ids, position_ids, local_cu, local_cuc, global_cuc, rank_rows)
 
     monkeypatch.setattr(
         csa_cp_utils.thd_layout_kernels.CompressorInputCompact, "apply", staticmethod(fake_apply)
@@ -217,15 +224,16 @@ def test_prepare_cp_compressor_input_builds_rank_row_map(monkeypatch):
     hidden = torch.arange(16, dtype=torch.float32).reshape(16, 1)
     boundary = torch.arange(2, dtype=torch.float32).reshape(2, 1)
     cu = torch.tensor([0, 32], dtype=torch.int32)
-    cu_comp = torch.tensor([0, 8], dtype=torch.int32)
+    result = prepare_cp_compressor_input(hidden, boundary, cu, 0, cp_size=2, ratio=4)
+    hidden_compact, comp_ids, position_ids, local_cu, local_cuc, global_cuc, rank_rows = result
 
-    hidden_compact, comp_ids, rank_rows = prepare_cp_compressor_input(
-        hidden, boundary, cu, cu_comp, 0, cp_size=2, ratio=4
-    )
-
-    assert calls == [(0, 16, 8, (2, 1))]
+    assert calls == [(0, 16, 8, 2, (2, 1))]
     assert hidden_compact.shape == (32, 1)
     assert torch.equal(comp_ids, torch.arange(10, 18, dtype=torch.int32))
+    assert torch.equal(position_ids, comp_ids * 4)
+    assert torch.equal(local_cu, torch.tensor([0, 32], dtype=torch.int32))
+    assert torch.equal(local_cuc, torch.tensor([0, 8], dtype=torch.int32))
+    assert torch.equal(global_cuc, torch.tensor([0, 8], dtype=torch.int32))
     assert torch.equal(rank_rows, torch.tensor([0, 1, 2, 3, 10, 11, 12, 13], dtype=torch.int32))
 
 
