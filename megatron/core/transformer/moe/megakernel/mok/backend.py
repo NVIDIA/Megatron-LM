@@ -100,13 +100,9 @@ class MoKMegakernel(MegakernelBackend):
         try:
             self.mok_config = MoKConfig(**(config.moe_megakernel_backend_config or {}))
         except TypeError as exc:
-            raise ValueError(
-                f"Invalid MOK option in moe_megakernel_backend_config: {exc}"
-            ) from exc
+            raise ValueError(f"Invalid MOK option in moe_megakernel_backend_config: {exc}") from exc
 
-        if not hasattr(routed_experts, "linear_fc1") or not hasattr(
-            routed_experts, "linear_fc2"
-        ):
+        if not hasattr(routed_experts, "linear_fc1") or not hasattr(routed_experts, "linear_fc2"):
             raise ValueError(
                 "MOK requires grouped routed experts exposing linear_fc1 and linear_fc2"
             )

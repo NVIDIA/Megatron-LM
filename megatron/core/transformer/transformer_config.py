@@ -2283,9 +2283,7 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_megakernel_backend == "mok":
             # TODO: Add a materialized-wgrad adapter for non-fused accumulation.
             if not self.gradient_accumulation_fusion:
-                raise ValueError(
-                    "MOK currently requires gradient_accumulation_fusion=True"
-                )
+                raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
             if not self.moe_grouped_gemm:
                 raise ValueError("MOK currently requires moe_grouped_gemm=True")
             mok_bf16 = (
@@ -3378,9 +3376,7 @@ class TransformerConfig(ModelParallelConfig):
                         "moe/moe_router/moe_preprocess"
                     )
             elif self.cuda_graph_impl not in ("none", "full_iteration"):
-                raise ValueError(
-                    f"MOK does not support cuda_graph_impl={self.cuda_graph_impl!r}"
-                )
+                raise ValueError(f"MOK does not support cuda_graph_impl={self.cuda_graph_impl!r}")
 
         # mHC selective recompute composes with CUDA graphs on two paths: the
         # opt-in attention-only split, and whole-range capture for everything

@@ -15,9 +15,7 @@ if TYPE_CHECKING:
     from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
 
 
-def _gate_up_weight_arguments(
-    shared_fc1: torch.Tensor, routed_fc1, intermediate_size: int
-):
+def _gate_up_weight_arguments(shared_fc1: torch.Tensor, routed_fc1, intermediate_size: int):
     """Adapt MCore-owned combined FC1 weights to MOK's gate/up API.
 
     Shared FC1 is a dense two-dimensional parameter, so gate and up are
@@ -43,14 +41,7 @@ def _gate_up_main_grad_arguments(main_grads, main_grad_storage_tables, intermedi
     shared_gate, shared_up, routed_gate, routed_up = _gate_up_weight_arguments(
         shared_fc1, routed_fc1, intermediate_size
     )
-    split_main_grads = (
-        shared_gate,
-        routed_gate,
-        shared_up,
-        routed_up,
-        shared_fc2,
-        routed_fc2,
-    )
+    split_main_grads = (shared_gate, routed_gate, shared_up, routed_up, shared_fc2, routed_fc2)
     if main_grad_storage_tables is None:
         return split_main_grads, None
     routed_fc1_table, routed_fc2_table = main_grad_storage_tables

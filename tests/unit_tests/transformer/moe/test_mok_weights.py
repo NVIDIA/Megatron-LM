@@ -80,10 +80,7 @@ def test_mok_accepts_key_supported_configurations(overrides):
             "does not support overlap_moe_expert_parallel_comm",
         ),
         ({"gradient_accumulation_fusion": False}, "gradient_accumulation_fusion=True"),
-        (
-            {"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": False},
-            "fp8_param=True",
-        ),
+        ({"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": False}, "fp8_param=True"),
     ],
 )
 def test_mok_rejects_key_incompatible_configurations(overrides, error):
@@ -94,10 +91,7 @@ def test_mok_rejects_key_incompatible_configurations(overrides, error):
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
 def test_mok_rejects_per_layer_whole_layer_cuda_graph(cuda_graph_impl):
     with pytest.raises(ValueError, match="whole-layer CUDA Graph capture"):
-        _mok_transformer_config(
-            cuda_graph_impl=cuda_graph_impl,
-            cuda_graph_modules=[],
-        )
+        _mok_transformer_config(cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=[])
 
 
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
@@ -110,13 +104,10 @@ def test_mok_rejects_per_layer_whole_layer_cuda_graph(cuda_graph_impl):
         [CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
     ],
 )
-def test_mok_rejects_per_layer_cuda_graph_covering_moe(
-    cuda_graph_impl, cuda_graph_modules
-):
+def test_mok_rejects_per_layer_cuda_graph_covering_moe(cuda_graph_impl, cuda_graph_modules):
     with pytest.raises(ValueError, match="moe/moe_router/moe_preprocess"):
         _mok_transformer_config(
-            cuda_graph_impl=cuda_graph_impl,
-            cuda_graph_modules=cuda_graph_modules,
+            cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=cuda_graph_modules
         )
 
 
@@ -130,12 +121,9 @@ def test_mok_rejects_per_layer_cuda_graph_covering_moe(
     ],
 )
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
-def test_mok_accepts_per_layer_cuda_graph_outside_moe(
-    cuda_graph_impl, cuda_graph_modules
-):
+def test_mok_accepts_per_layer_cuda_graph_outside_moe(cuda_graph_impl, cuda_graph_modules):
     config = _mok_transformer_config(
-        cuda_graph_impl=cuda_graph_impl,
-        cuda_graph_modules=cuda_graph_modules,
+        cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=cuda_graph_modules
     )
 
     assert config.cuda_graph_modules == cuda_graph_modules

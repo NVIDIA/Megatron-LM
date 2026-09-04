@@ -78,9 +78,7 @@ def _single_grouped_mxfp8_scale_view(
     # member view per expert; their scale views share expert-major backing storage.
     members = get_grouped_quantized_members(param)
     if not members or len(members) != shape[0]:
-        raise RuntimeError(
-            f"MOK {name} expected {shape[0]} grouped members, got {len(members)}"
-        )
+        raise RuntimeError(f"MOK {name} expected {shape[0]} grouped members, got {len(members)}")
 
     first = getattr(members[0], member_attr)
     expected_numel = math.prod(shape)
@@ -96,12 +94,7 @@ def _single_grouped_mxfp8_scale_view(
         ):
             raise RuntimeError(f"MOK {name} member {expert} scale is not packed expert-major")
 
-    flat = torch.as_strided(
-        first,
-        (expected_numel,),
-        (1,),
-        storage_offset=first.storage_offset(),
-    )
+    flat = torch.as_strided(first, (expected_numel,), (1,), storage_offset=first.storage_offset())
     return flat.view(shape)
 
 
@@ -197,10 +190,7 @@ def _native_single_grouped_weight_view(
         raise RuntimeError("MOK MXFP8 requires native TE grouped MXFP8 parameters")
 
     row_data = _storage_view(
-        weight.rowwise_data,
-        shape,
-        dtype=torch.float8_e4m3fn,
-        name="single-grouped MXFP8 rowwise",
+        weight.rowwise_data, shape, dtype=torch.float8_e4m3fn, name="single-grouped MXFP8 rowwise"
     )
     column_data = _storage_view(
         weight.columnwise_data,
@@ -219,7 +209,9 @@ def _native_single_grouped_weight_view(
         "_columnwise_scale_inv",
         (num_experts, rows // 32, columns),
         name="single-grouped columnwise",
-    ).transpose(-2, -1)  # Logical transpose [M/32, K] -> [K, M/32] for MOK dgrad.
+    ).transpose(
+        -2, -1
+    )  # Logical transpose [M/32, K] -> [K, M/32] for MOK dgrad.
 
     # Refresh converted scales in place so graph-captured addresses remain
     # stable; payloads stay zero-copy views of the current TE storage.
@@ -264,12 +256,7 @@ def _parameter_storage_attr(param: nn.Parameter, name: str) -> torch.Tensor | No
 
 
 def _native_split_weight_view(
-    params: tuple[nn.Parameter, ...],
-    *,
-    rows: int,
-    columns: int,
-    use_mxfp8: bool,
-    cached_view=None,
+    params: tuple[nn.Parameter, ...], *, rows: int, columns: int, use_mxfp8: bool, cached_view=None
 ):
     """Build or refresh one MOK view over independent per-expert parameters."""
     from mok import functional, ops
@@ -311,9 +298,7 @@ def _native_split_weight_view(
                     f"expert={expert}, got={tuple(column_scale.shape)}, "
                     f"expected={(rows // 32, columns)}"
                 )
-            _swizzle_mxfp8_scale(
-                row_scale.unsqueeze(0), rows=rows, columns=columns, out=row_out
-            )
+            _swizzle_mxfp8_scale(row_scale.unsqueeze(0), rows=rows, columns=columns, out=row_out)
             # MOK dgrad views [M, K] as [K, M], so its logical scale shape is [K, M/32].
             _swizzle_mxfp8_scale(
                 column_scale.transpose(-2, -1).unsqueeze(0),
@@ -418,8 +403,8 @@ def _native_split_weight_view(
         scale=row_scale_tensors[0],  # Representative rowwise scale tensor.
         scale_storage_table=ops.make_routed_scale_storage_table(row_scale_tensors),
         scale_tensors=tuple(row_scale_tensors),
-        transposed_data=column_payloads[0], # Representative columnwise payload tensor.
-        transposed_scale=column_scale_tensors[0], # Representative columnwise scale tensor.
+        transposed_data=column_payloads[0],  # Representative columnwise payload tensor.
+        transposed_scale=column_scale_tensors[0],  # Representative columnwise scale tensor.
         transposed_storage_table=column_storage_table,
         transposed_scale_storage_table=ops.make_routed_scale_storage_table(column_scale_tensors),
         transposed_scale_tensors=tuple(column_scale_tensors),

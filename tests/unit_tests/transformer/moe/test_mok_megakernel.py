@@ -92,9 +92,10 @@ def test_mxfp8_scale_layout_and_single_grouped_storage_contract(monkeypatch):
 
     assert swizzled.shape == (1, 1, 32, 16)
     for lane, row_group, column_scale in ((0, 0, 0), (7, 2, 1), (31, 3, 3)):
-        assert swizzled[0, 0, lane, row_group * 4 + column_scale] == logical[
-            0, row_group * 32 + lane, column_scale
-        ]
+        assert (
+            swizzled[0, 0, lane, row_group * 4 + column_scale]
+            == logical[0, row_group * 32 + lane, column_scale]
+        )
 
     num_experts = 3
     member_shape = (4, 2)
@@ -113,9 +114,7 @@ def test_mxfp8_scale_layout_and_single_grouped_storage_contract(monkeypatch):
         )
         for _ in range(2)
     ]
-    monkeypatch.setattr(
-        fp8_utils, "get_grouped_quantized_members", lambda _: separate_members
-    )
+    monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", lambda _: separate_members)
     with pytest.raises(RuntimeError, match="not packed expert-major"):
         mok_weights._single_grouped_mxfp8_scale_view(
             object(), "_rowwise_scale_inv", (2, *member_shape), name="test rowwise"
@@ -167,11 +166,7 @@ def test_single_grouped_mxfp8_view_builds_and_refreshes_scales(monkeypatch):
     monkeypatch.setattr(mok_weights, "_swizzle_mxfp8_scale", fake_swizzle)
 
     first = mok_weights._native_single_grouped_weight_view(
-        weight,
-        num_experts=num_experts,
-        rows=rows,
-        columns=columns,
-        use_mxfp8=True,
+        weight, num_experts=num_experts, rows=rows, columns=columns, use_mxfp8=True
     )
     assert first[0] is weight.rowwise_data
     assert first[2] is weight.columnwise_data
