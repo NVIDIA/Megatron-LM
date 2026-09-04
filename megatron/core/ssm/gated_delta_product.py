@@ -114,6 +114,7 @@ from megatron.core.ssm.ops.common.intermediate_extraction import (
 from megatron.core.ssm.ops.gdp import (
     chunk_gated_delta_product_varlen,
     fused_recurrent_gated_delta_rule_update,
+    gdp_decode_prepare,
 )
 from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_INFERENCE_CHUNK_SIZE
 
@@ -827,8 +828,6 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         x,
         conv_state=None,
         seq_idx=None,
-        is_decode=False,
-        conv_state_indices=None,
         l2_norm_in_kernel=False,
         cu_seqlens=None,
         precomputed_seq_idx=None,
@@ -842,14 +841,13 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         the checkpointed subgraph takes the (b, l, d) slice as input and hands back a
         gradient that is already contiguous in (b, l, d) for the split backward's concat.
 
-        Decode passes ``is_decode`` to step the cached conv state one token at a time
-        with ``causal_conv1d_update`` (l == 1), selecting per-request cache rows with
-        ``conv_state_indices``.
+        Decode does not come through here: it runs ``_decode_conv`` followed by the
+        fused ``gdp_decode_prepare`` kernel, which produces the same query, key, and
+        value in one launch.
 
         ``l2_norm_in_kernel`` leaves the query/key L2 norm to the caller's kernel, which
         every caller whose kernel normalizes internally must set: the CuTeDSL path
-        (``use_qk_l2norm_in_kernel``), ``ssm_prefill``'s varlen kernel, and decode's fused
-        recurrent kernel, which normalizes after the householder zeros are interleaved in.
+        (``use_qk_l2norm_in_kernel``) and ``ssm_prefill``'s varlen kernel.
 
         Dynamic-batching prefill passes `cu_seqlens` plus the precomputed per-token
         conv metadata, which routes to the forked varlen conv instead of
@@ -867,25 +865,10 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             "convolves across request boundaries"
         )
 
-        if is_decode:
+        if precomputed_seq_idx is not None:
             assert self.cp is not None
-            # Indexed conv update: reads/writes the per-request conv state rows selected
-            # by ``conv_state_indices``, in place. Unlike ``causal_conv1d_fn`` below, the
-            # Triton ``causal_conv1d_update`` takes ``x`` as (batch, seq_len, dim) -- a
-            # 2-D (batch, dim) input is unsqueezed at dim 1 -- so decode keeps the
-            # (b, l, d) layout rather than transposing to [B, D, L]. Here l == 1.
-            x = causal_conv1d_update(
-                x,
-                conv_state,
-                rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                self.cp.get_conv1d_bias(),
-                self.activation,
-                conv_state_indices=conv_state_indices,
-            )
-        elif precomputed_seq_idx is not None:
-            assert self.cp is not None
-            # Forked varlen conv. Stays in the (b, l, d) layout like the decode branch
-            # above: the kernel takes a packed ``(T, d)`` sequence, so squeeze the
+            # Forked varlen conv. Stays in the (b, l, d) layout like `_decode_conv`:
+            # the kernel takes a packed ``(T, d)`` sequence, so squeeze the
             # batch dim rather than transposing to [B, D, L]. `conv_initial_states`
             # carries the left boundary: zeros for a fresh prefill, the previous
             # chunk's tail under chunked prefill.
@@ -981,6 +964,25 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             query = rearrange(query, "b l g n -> (b l) (g n)")
 
         return query, key, value
+
+    def _decode_conv(self, x, conv_state, conv_state_indices):
+        """Step the cached short conv one token per request, in place.
+
+        Indexed conv update: reads/writes the per-request conv state rows selected by
+        ``conv_state_indices``. Unlike ``causal_conv1d_fn``, the Triton
+        ``causal_conv1d_update`` takes ``x`` as (batch, seq_len, dim) -- a 2-D
+        (batch, dim) input is unsqueezed at dim 1 -- so decode keeps the (b, l, d)
+        layout rather than transposing to [B, D, L]. Here l == 1.
+        """
+        assert self.cp is not None
+        return causal_conv1d_update(
+            x,
+            conv_state,
+            rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+            self.cp.get_conv1d_bias(),
+            self.activation,
+            conv_state_indices=conv_state_indices,
+        )
 
     def _compute_gating(self, ba):
         """Compute the beta and g gating tensors from the ba slice."""
@@ -1107,32 +1109,31 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         # it back the (1, n, proj_dim) view; both transposes are free at l == 1.
         z, VKQ, ba = self._preprocess(zVKQba.transpose(0, 1))
 
-        # `_prepare_qkv` routes decode through the forked Triton `causal_conv1d_update`
-        # (not the pip `causal_conv1d` used by the training path): it treats a `-1`
-        # index as padding, zeroing that row's output without touching the cache,
-        # which is what makes a replayed CUDA graph with a partially filled batch
-        # match an eager run. `batch_indices=None` is static batching, where the
-        # cache is already in request order.
-        query, key, value = self._prepare_qkv(
-            VKQ,
-            conv_state=conv_state,
-            is_decode=True,
-            conv_state_indices=batch_indices,
-            l2_norm_in_kernel=True,
-        )
+        # Decode runs the forked Triton `causal_conv1d_update` (not the pip
+        # `causal_conv1d` used by the training path): it treats a `-1` index as
+        # padding, zeroing that row's output without touching the cache, which is
+        # what makes a replayed CUDA graph with a partially filled batch match an
+        # eager run. `batch_indices=None` is static batching, where the cache is
+        # already in request order.
+        x_conv = self._decode_conv(VKQ, conv_state, batch_indices)
 
-        beta, g = self._compute_gating(ba)
-
-        # Interleave the (length-1) query / decay with householder zeros so the recurrent
-        # kernel sees an (1 * num_householder)-length sequence (matches static decode).
-        g_new = g.new_zeros(g.shape[0], g.shape[1], self.num_householder, g.shape[2])
-        g_new[:, :, 0] = g
-        g = rearrange(g_new, "n t m h -> n (t m) h")
-        query_new = query.new_zeros(
-            query.shape[0], query.shape[1], self.num_householder, query.shape[2], query.shape[3]
+        # Everything between the conv and the recurrence is one kernel: the
+        # value/key/query split, the GQA expansion, the householder interleave
+        # (query on the last copy, decay on the first, matching static decode),
+        # and the beta/g gating. Each of those is a separate elementwise or copy
+        # kernel in PyTorch, and at one token per request their launch overhead
+        # outweighs the work they do.
+        query, key, value, beta, g = gdp_decode_prepare(
+            x_conv,
+            ba,
+            A_log=self.cp.get_A_log(),
+            dt_bias=self.cp.get_dt_bias(),
+            num_householder=self.num_householder,
+            num_heads=self.nheads_local_cp,
+            num_groups=self.ngroups_local_cp,
+            head_dim=self.headdim,
+            state_dim=self.d_state,
         )
-        query_new[:, :, -1] = query
-        query = rearrange(query_new, "n t m h d -> n (t m) h d")
 
         # Forked recurrent kernel: reads and writes `ssm_state` in place at the
         # slots named by `batch_indices`, so there is no gather of the initial
