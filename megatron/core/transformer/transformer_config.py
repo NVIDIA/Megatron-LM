@@ -3548,6 +3548,11 @@ class MLATransformerConfig(TransformerConfig):
     v_head_dim: int = 128
     """Dimension of the head in the V projection."""
 
+    mla_native_v_head_dim: bool = True
+    """Pass V at its native width on the thd path instead of padding it to the QK width.
+    Faster from compute capability 9.0. Below that no backend has a kernel for unequal QK
+    and V widths, so attention falls back to the unfused path: set it False there."""
+
     normalization: str = "RMSNorm"
     """Default normalization layer for MLA models is RMSNorm."""
 
