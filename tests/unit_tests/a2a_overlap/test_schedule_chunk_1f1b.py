@@ -70,6 +70,7 @@ def run_two_chunk_parity(
     extra_kwargs,
     microbatches=1,
     use_padding_mask=False,
+    cast_model_to_config_dtype=False,
     on_plans_built=None,
     on_forward_done=None,
 ):
@@ -97,6 +98,12 @@ def run_two_chunk_parity(
             # build model
             gpt_model, schedule_plan, data = build_model(config, use_padding_mask=use_padding_mask)
             gpt_model.cuda()
+            if cast_model_to_config_dtype:
+                # The production model wrapper casts embeddings as well as TE modules to
+                # params_dtype.  This standalone helper normally omits that wrapper; dense
+                # TE MLPs require the explicit cast because their BF16 weights reject the
+                # otherwise-FP32 embedding activation outside an autocast region.
+                gpt_model.to(dtype=config.params_dtype)
             gpt_models.append(gpt_model)
             datas.append(data)
             schedule_plans.append(schedule_plan)
@@ -189,15 +196,19 @@ class TestA2AOverlap:
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     @pytest.mark.parametrize("layers", [[2, 1], [1, 2], [1, 1]])
+    @pytest.mark.parametrize("scheduled_release", [False, True])
     def test_1f1b_schedule_model_chunk(
-        self, mtp_layers, dispatcher_type, flex_backend, fp8_flag, layers
+        self, mtp_layers, dispatcher_type, flex_backend, fp8_flag, layers, scheduled_release
     ):
         """
         Verifies all-to-all overlap optimization in transformer layer produces
         the same results as the reference implementation.
         """
         # create TransformerConfig
-        extra_kwargs = {}
+        extra_kwargs = {
+            "overlap_moe_expert_parallel_comm": True,
+            "ep_overlap_use_scheduled_tensor_release": scheduled_release,
+        }
         apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
         if fp8_flag is not None:
             extra_kwargs["fp8"] = fp8_flag[0]
@@ -206,6 +217,17 @@ class TestA2AOverlap:
             extra_kwargs["mtp_num_layers"] = mtp_layers
             extra_kwargs["mtp_loss_scaling_factor"] = 1.1
         run_two_chunk_parity(layers, extra_kwargs)
+
+    def test_scheduled_tensor_release_with_mixed_dense_layer(self):
+        """Dense-layer Noop dispatch/combine nodes preserve tensor-release bindings."""
+
+        extra_kwargs = {
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_layer_freq": [1, 0],
+            "overlap_moe_expert_parallel_comm": True,
+            "ep_overlap_use_scheduled_tensor_release": True,
+        }
+        run_two_chunk_parity([2, 2], extra_kwargs, cast_model_to_config_dtype=True)
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())

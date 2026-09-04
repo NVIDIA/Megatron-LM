@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import gc
 
 import pytest
@@ -235,6 +235,7 @@ class TestDelayWgradCompute:
                 **base_kwargs,
                 "delay_wgrad_compute": True,
                 "overlap_moe_expert_parallel_comm": True,
+                "ep_overlap_use_scheduled_tensor_release": True,
             }
             test_config = get_test_config(num_layers=num_layers, extra_kwargs=test_kwargs)
             test_model = build_gpt_model(test_config, vocab_size=VOCAB_SIZE)
