@@ -423,6 +423,54 @@ def test_build_attention_indices_matches_native():
     assert torch.equal(padded[1][8:10], torch.tensor([1, 1], dtype=torch.int32, device="cuda"))
 
 
+def test_build_attention_indices_writes_aligned_width():
+    _require_cute_cuda()
+    cu = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
+    cu_comp = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+    logical_ids = torch.tensor([[0, 1, -1], [1, 0, -1]], dtype=torch.int32, device="cuda").repeat(
+        4, 1
+    )
+
+    exact = thd_layout_kernels.build_attention_indices(
+        cu,
+        0,
+        8,
+        0,
+        3,
+        4,
+        logical_ids.shape[-1],
+        logical_ids,
+        cu_seqlens_compressed=cu_comp,
+        for_indexer_loss=True,
+        compressed_base=8,
+        compressed_rows=2,
+        compressed_is_sequence_major=True,
+    )
+    aligned = thd_layout_kernels.build_attention_indices(
+        cu,
+        0,
+        8,
+        0,
+        3,
+        4,
+        logical_ids.shape[-1],
+        logical_ids,
+        cu_seqlens_compressed=cu_comp,
+        for_indexer_loss=True,
+        compressed_base=8,
+        compressed_rows=2,
+        compressed_is_sequence_major=True,
+        output_alignment=8,
+    )
+
+    logical_width = 3 + logical_ids.shape[-1]
+    assert exact[0].shape == (8, logical_width)
+    assert aligned[0].shape == (8, 8)
+    assert torch.equal(aligned[0][:, :logical_width], exact[0])
+    assert torch.all(aligned[0][:, logical_width:] == -1)
+    assert torch.equal(aligned[2], exact[2])
+
+
 def test_build_attention_indices_indexer_loss_mode_matches_native():
     _require_cute_cuda()
     cu = _make_e2e_like_cu_seqlens()
