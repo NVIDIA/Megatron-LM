@@ -761,6 +761,41 @@ class TestHashRouting:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("aux_loss_type", ["aux_loss", "seq_aux_loss", "global_aux_loss"])
+    def test_hash_routing_skips_aux_loss(self, aux_loss_type, monkeypatch):
+        """Hash layers must not attach learned-routing aux-loss gradients."""
+        config = _hash_routing_config(
+            moe_router_load_balancing_type=aux_loss_type,
+            moe_aux_loss_coeff=1.0,
+        )
+        router = TopKRouter(
+            config=config, pg_collection=get_default_pg_collection(), layer_number=1
+        )
+
+        def fail_if_called(*args, **kwargs):
+            pytest.fail("hash routing must not recompute a learned top-k map for aux loss")
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.moe.router.compute_routing_scores_for_aux_loss",
+            fail_if_called,
+        )
+
+        logits = (
+            torch.tensor([3.0, 2.0, 1.0, 0.0], device="cuda")
+            .expand(4, 2, -1)
+            .clone()
+            .requires_grad_()
+        )
+        input_ids = torch.arange(8, device="cuda").reshape(2, 4)
+
+        probs, _ = router.routing(logits, input_ids=input_ids)
+        probs.sum().mul_(0).backward()
+
+        assert logits.grad is not None
+        torch.testing.assert_close(logits.grad, torch.zeros_like(logits.grad))
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_moe_layer_hash_routing_integration(self):
         """End-to-end MoELayer forward/backward with hash routing; raises without input_ids."""
         config = _hash_routing_config(moe_n_hash_layers=1)
