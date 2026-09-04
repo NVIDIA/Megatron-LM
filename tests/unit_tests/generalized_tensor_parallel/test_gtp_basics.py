@@ -1237,6 +1237,214 @@ class TestWaitAsyncCommsFallback:
 
 
 # ---------------------------------------------------------------------------
+# wgrad finalize placement: the accumulation must run on rs_stream
+# ---------------------------------------------------------------------------
+
+
+class _StubRSHandle:
+    """Stand-in for an in-flight reduce-scatter Work handle (no NCCL needed)."""
+
+    def __init__(self):
+        self.waited = False
+
+    def wait(self):
+        self.waited = True
+
+
+class TestWgradFinalizeOnRSStream:
+    """``_wait_reduce_scatter(finalize_grad=True)`` must accumulate on rs_stream.
+
+    The cascade in ``wgrad_reduce_scatter`` used to fence the compute stream on next_w's
+    rs_event and run main_grad.add_ there. Nothing in backward reads main_grad, so that
+    fence only serialized compute behind the collective -- worst with the fp32-accum
+    one-shot RS, where handle.wait() also launches the FP32 sum and the downcast copy.
+    These pin the accumulation to rs_stream so a compute-stream fence cannot creep back.
+    """
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_finalize_runs_on_rs_stream(self):
+        dtype = torch.bfloat16
+        p = TestWaitAsyncCommsFallback._make_inflight_param(main_grad_fill=0.0)
+        handle = _StubRSHandle()
+        p._wgrad_rs_handle = handle
+
+        cache = gtp_module.get_global_GTP_cache()
+        p._rs_ticket = cache.reserve(p, dtype, fwd=False, reduce_scatter=True)
+        cache.get(p._rs_ticket).fill_(3.0)
+
+        # Record the stream each cache.get() is issued on; the accumulate reads its wgrad
+        # through cache.get, so this is the stream main_grad.add_ lands on.
+        seen_streams = []
+        original_get = cache.get
+
+        def _spy_get(ticket):
+            seen_streams.append(torch.cuda.current_stream())
+            return original_get(ticket)
+
+        compute_stream = torch.cuda.current_stream()
+        cache.get = _spy_get
+        try:
+            waited = p._wait_reduce_scatter(finalize_grad=True)
+        finally:
+            del cache.get  # drop the instance attribute, restoring the class method
+
+        torch.cuda.synchronize()
+        rs_stream = gtp_module.get_rs_stream(p.chain_id, p.group)
+
+        assert waited is True, "an in-flight handle must report waited=True"
+        assert handle.waited is True, "the RS handle must have been waited on"
+        assert seen_streams, "the finalize path must read the wgrad through cache.get"
+        assert all(s == rs_stream for s in seen_streams), (
+            f"accumulation must be issued on rs_stream, got {seen_streams} "
+            f"(rs_stream={rs_stream}, compute={compute_stream})"
+        )
+        assert rs_stream != compute_stream, "rs_stream must not be the compute stream"
+        assert torch.all(p.main_grad == 3.0), f"main_grad should be 3.0; got {p.main_grad}"
+        assert p._already_finalized is True, "_already_finalized must be set by the finalize"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_no_accumulation_without_rs_handle(self):
+        """waited=False must leave main_grad alone -- the ticket buffer holds no new result.
+
+        MTP consumes the embedding twice per forward, so the embedding's backward can run
+        before decoder layer 0 has reduce-scattered anything. Its ticket buffer then still
+        holds stale data, and accumulating it would silently corrupt main_grad. The caller
+        used to guard this; the guard now lives here.
+        """
+        dtype = torch.bfloat16
+        p = TestWaitAsyncCommsFallback._make_inflight_param(main_grad_fill=5.0)
+        p._wgrad_rs_handle = None  # nothing in flight
+
+        cache = gtp_module.get_global_GTP_cache()
+        p._rs_ticket = cache.reserve(p, dtype, fwd=False, reduce_scatter=True)
+        cache.get(p._rs_ticket).fill_(9.0)  # stale content, must not be accumulated
+
+        waited = p._wait_reduce_scatter(finalize_grad=True)
+
+        torch.cuda.synchronize()
+        assert waited is False, "no handle in flight must report waited=False"
+        assert torch.all(p.main_grad == 5.0), f"main_grad must be untouched; got {p.main_grad}"
+        assert p._already_finalized is False, "nothing was finalized, flag must stay False"
+
+
+def _worker_finalize_depth_accumulates_once(rank, world_size, port):
+    """Five-layer GTP chain at finalize depth 3: every wgrad lands in main_grad exactly once.
+
+    More layers than the depth, so several reduce-scatters are still queued when the last
+    backward returns and only the end-of-backward flush can claim them. Two identical backwards
+    must leave main_grad at exactly 2x the first: a double-add, a dropped add, or a queue entry
+    the flush forgets all break the ratio.
+    """
+    torch.manual_seed(0)
+    in_f, out_f = 32, 64
+    dtype = torch.bfloat16
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+
+    depth = gtp_module.GTP_CONFIG.wgrad_finalize_depth
+    layers = [_make_gtp_linear(in_f, out_f, gtp_remat_group, dtype) for _ in range(depth + 2)]
+    assert len(layers) > depth, "the chain must be longer than the finalize depth"
+
+    inp = torch.randn(8, in_f, dtype=dtype, device="cuda", requires_grad=True)
+    dist.broadcast(inp, src=0)
+
+    for lyr in layers:
+        lyr.weight.main_grad = torch.zeros(lyr.weight.shape, dtype=dtype, device="cuda")
+
+    def _one_backward(is_first):
+        out = layers[0](inp, is_first_microbatch=is_first)
+        for lyr in layers[1:]:
+            out = out + lyr(inp, is_first_microbatch=is_first)
+        out.sum().backward()
+        # What the training loop does before reading gradients: this is also what drains the
+        # reduce-scatters still queued behind the finalize depth.
+        gtp_module.wait_for_gtp_grad_reduction_on_current_stream()
+        torch.cuda.synchronize()
+
+    _one_backward(True)
+    after_one = [lyr.weight.main_grad.detach().clone() for lyr in layers]
+    _one_backward(False)
+    after_two = [lyr.weight.main_grad.detach().clone() for lyr in layers]
+
+    for idx, (g1, g2) in enumerate(zip(after_one, after_two)):
+        assert torch.isfinite(g1).all(), f"layer{idx} main_grad must be finite"
+        assert g1.abs().max() > 0, f"layer{idx} main_grad must be non-zero after one backward"
+        torch.testing.assert_close(
+            g2.float(),
+            2.0 * g1.float(),
+            rtol=2e-2,
+            atol=1e-3,
+            msg=lambda m: f"layer{idx}: second backward must add each wgrad exactly once: {m}",
+        )
+
+    for queue in gtp_module._PENDING_WGRAD_RS.values():
+        assert not queue, "every queued reduce-scatter must be finalized by the flush"
+
+
+def _worker_finalize_depth_is_transparent(rank, world_size, port):
+    """main_grad must be BITWISE identical at every finalize depth.
+
+    Depth changes only *when* a reduce-scatter result is accumulated, never what is accumulated
+    or in what order: each param still gets exactly one add of the same collective's output. So
+    any numerical difference across depths is a bug -- a dropped gradient, a double-add, or a
+    grad-ready fired more than once. This is the acceptance criterion for the knob, and it is far
+    more sensitive than an end-to-end loss trajectory, where such bugs only show as drift.
+    """
+    torch.manual_seed(0)
+    in_f, out_f = 32, 64
+    dtype = torch.bfloat16
+    gtp_remat_group = dist.new_group(list(range(world_size)))
+
+    layers = [_make_gtp_linear(in_f, out_f, gtp_remat_group, dtype) for _ in range(6)]
+    inp = torch.randn(8, in_f, dtype=dtype, device="cuda", requires_grad=True)
+    dist.broadcast(inp, src=0)
+    for lyr in layers:
+        lyr.weight.main_grad = torch.zeros(lyr.weight.shape, dtype=dtype, device="cuda")
+
+    def _grads_at_depth(depth):
+        saved = gtp_module.GTP_CONFIG.wgrad_finalize_depth
+        gtp_module.GTP_CONFIG.wgrad_finalize_depth = depth
+        try:
+            for lyr in layers:
+                lyr.weight.main_grad.zero_()
+            out = layers[0](inp, is_first_microbatch=True)
+            for lyr in layers[1:]:
+                out = out + lyr(inp, is_first_microbatch=True)
+            out.sum().backward()
+            gtp_module.wait_for_gtp_grad_reduction_on_current_stream()
+            torch.cuda.synchronize()
+            return [lyr.weight.main_grad.detach().clone() for lyr in layers]
+        finally:
+            gtp_module.GTP_CONFIG.wgrad_finalize_depth = saved
+
+    reference = _grads_at_depth(1)
+    assert any(g.abs().max() > 0 for g in reference), "reference grads must be non-zero"
+
+    for depth in (2, 3, 4):
+        got = _grads_at_depth(depth)
+        for idx, (ref, cur) in enumerate(zip(reference, got)):
+            if not torch.equal(ref, cur):
+                delta = (ref.float() - cur.float()).abs().max().item()
+                raise AssertionError(
+                    f"finalize depth {depth} changed layer{idx} main_grad "
+                    f"(max |delta| = {delta:.6g}, ref_norm = {ref.float().norm():.6g}, "
+                    f"got_norm = {cur.float().norm():.6g}). Depth must be a scheduling knob "
+                    f"with no numerical footprint."
+                )
+        for queue in gtp_module._PENDING_WGRAD_RS.values():
+            assert not queue, f"depth {depth} left work queued after the flush"
+
+
+class TestGTPWgradFinalizeDepth:
+    def test_finalize_depth_accumulates_once(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_finalize_depth_accumulates_once, 4)
+
+    def test_finalize_depth_is_transparent(self):
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_finalize_depth_is_transparent, 4)
+
+
+# ---------------------------------------------------------------------------
 # GTP_remat DDP bucket alignment: distributed optimizer bucket-end assertion
 # ---------------------------------------------------------------------------
 

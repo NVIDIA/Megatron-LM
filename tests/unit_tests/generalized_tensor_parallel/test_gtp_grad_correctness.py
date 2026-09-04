@@ -309,7 +309,15 @@ def _run_step_distopt(ddp_model, optim, rank):
         out, _ = layer(out, attention_mask=None)
     loss = out.float().mean()
     loss.backward()
-    # Production order (finalize_model_grads): reduce across DP first, THEN the gtp_remat finalize.
+    # Production order (finalize_model_grads): fence GTP's wgrad reduce-scatters (line 634),
+    # reduce across DP (line 640), THEN the gtp_remat all-reduce of replicated grads. The fence
+    # matters once wgrad_finalize_depth > 1: collectives still queued behind the depth have not
+    # been accumulated into main_grad yet, and finish_grad_sync would reduce without them.
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        wait_for_gtp_grad_reduction_on_current_stream,
+    )
+
+    wait_for_gtp_grad_reduction_on_current_stream()
     ddp_model.finish_grad_sync()
     from megatron.core import parallel_state as ps
     from megatron.core.distributed.finalize_model_grads import (
@@ -432,6 +440,155 @@ def _make_moe_stack(config, pg_collection):
 
 def _is_expert_param(name, p):
     return ('experts' in name) or (not getattr(p, 'allreduce', True))
+
+
+def _worker_depth_grad_invariance(rank, world_size, port, moe=False):
+    """main_grad must be BITWISE identical at every wgrad_finalize_depth, through DDP.
+
+    The plain-chain invariance test in test_gtp_basics cannot see the hazard this targets:
+    DDP dispatches a bucket's reduce-scatter from inside grad-ready, and it reduces the WHOLE
+    bucket. So the invariant is not "each param's main_grad ends up right" but "every param in
+    the bucket has its add landed before the bucket is dispatched". Deferring the finalize moves
+    a param's add and its grad-ready together, but moves both relative to its bucket peers -- and
+    with several microbatches a queued entry can carry its grad-ready into the next microbatch,
+    where register_grad_ready counts it again.
+
+    Runs several microbatches (no_sync on all but the last, as the training loop does), reduces,
+    and compares. No optimizer step, so every depth starts from identical weights.
+    """
+    from contextlib import nullcontext
+
+    import megatron.core.tensor_parallel.generalized_tensor_parallelism as gtp_module
+    from megatron.core import parallel_state as ps
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        wait_for_gtp_grad_reduction_on_current_stream,
+    )
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    num_microbatches = 4
+
+    ps.destroy_model_parallel()
+    # Every worker in this file resets the chain-linking anchor before building a stack: a stale
+    # _chain_state["last_weight"] gives this stack's first weight a non-None prev_w, so it issues
+    # an async RS instead of the sync one and the chain has no head -- and the state left behind
+    # leaks into the next worker.
+    GTPShardedParam._chain_state = {}
+    if moe:
+        # MoE/EGTP: grouped experts add their own chains and their own (chain, group) queues,
+        # and the expert weights sit in different DDP buckets from the dense ones. None =>
+        # pull every group from the MPU globals (the token dispatcher needs tp_ep).
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=2,
+            gtp_remat_size=2,
+            expert_gtp_remat_size=2,
+        )
+        model_parallel_cuda_manual_seed(42)
+        pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=None)
+        stack = _make_moe_stack(_make_moe_config(), pgc)
+    else:
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
+        )
+        model_parallel_cuda_manual_seed(42)
+        pgc = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp', 'cp', 'gtp_remat']
+        )
+        stack = _make_stack(_make_config(), pgc)
+    for layer in stack:
+        layer.cuda()
+    for n, p in stack.named_parameters():
+        # Expert weights are EP-local and must not be broadcast (see _worker_moe_distopt).
+        if not _is_expert_param(n, p):
+            dist.broadcast(p.data, src=0)
+
+    # Small buckets so there is more than one bucket group: a single bucket cannot expose an
+    # early dispatch, because there is no second bucket whose params are still accumulating.
+    ddp_model, optim = _build_ddp_distopt_and_optim(
+        stack, overlap_grad_reduce=True, bucket_size=10_000
+    )
+
+    torch.manual_seed(1000 + rank)
+    inputs = [
+        torch.randn(SEQ, BATCH, HIDDEN, dtype=dtype, device='cuda')
+        for _ in range(num_microbatches)
+    ]
+
+    def _grads_at_depth(depth):
+        saved_depth = gtp_module.GTP_CONFIG.wgrad_finalize_depth
+        gtp_module.GTP_CONFIG.wgrad_finalize_depth = depth
+        try:
+            optim.zero_grad()
+            ddp_model.zero_grad_buffer()
+            for mb, x in enumerate(inputs):
+                last = mb == len(inputs) - 1
+                ctx = nullcontext() if last else ddp_model.no_sync()
+                with ctx:
+                    out = x
+                    for layer in ddp_model.module.children():
+                        out, _ = layer(out, attention_mask=None)
+                    out.float().mean().backward()
+                # No manual drain: the autograd end-of-backward callback settles the queue.
+                # Assert that it actually did, for every queue including the MoE/EGTP chains.
+                leaked = {
+                    key: [w._debug_name for w in q]
+                    for key, q in gtp_module._PENDING_WGRAD_RS.items()
+                    if q
+                }
+                assert not leaked, (
+                    f"depth={depth}: reduce-scatters still queued at the end of microbatch "
+                    f"{mb} (of {num_microbatches}): {leaked}"
+                )
+            # Production order (finalize_model_grads): fence GTP, then reduce across DP.
+            wait_for_gtp_grad_reduction_on_current_stream()
+            ddp_model.finish_grad_sync()
+            torch.cuda.synchronize()
+            return {
+                n: p.main_grad.detach().clone()
+                for n, p in ddp_model.module.named_parameters()
+                if hasattr(p, 'main_grad')
+            }
+        finally:
+            gtp_module.GTP_CONFIG.wgrad_finalize_depth = saved_depth
+
+    def _worst_delta(a, b):
+        worst_name, worst = None, 0.0
+        for name, ref in a.items():
+            delta = (ref.float() - b[name].float()).abs().max().item()
+            if delta > worst:
+                worst_name, worst = name, delta
+        return worst_name, worst
+
+    reference = _grads_at_depth(1)
+    assert reference, "no main_grad captured"
+    assert any(g.abs().max() > 0 for g in reference.values()), "reference grads are all zero"
+
+    # CONTROL first: repeat the SAME depth. MoE dispatch/permutation can use atomics, so this
+    # config is not guaranteed bitwise reproducible; without measuring that, a between-depth
+    # difference cannot be attributed to depth. The control sets the bar the depth runs must meet.
+    control = _grads_at_depth(1)
+    ctl_name, ctl_delta = _worst_delta(reference, control)
+    print(f"[rank {rank}] same-depth control: worst max|delta|={ctl_delta:.6g} on {ctl_name}")
+
+    tolerance = ctl_delta * 4 if ctl_delta > 0 else 0.0
+    for depth in (2, 3):
+        got = _grads_at_depth(depth)
+        name, delta = _worst_delta(reference, got)
+        print(f"[rank {rank}] depth {depth}: worst max|delta|={delta:.6g} on {name}")
+        assert delta <= tolerance, (
+            f"wgrad_finalize_depth={depth} changed main_grad through DDP over "
+            f"{num_microbatches} microbatches: worst max|delta|={delta:.6g} on {name}, "
+            f"vs same-depth control {ctl_delta:.6g} (tolerance {tolerance:.6g}). "
+            f"Depth must be a scheduling knob with no numerical footprint."
+        )
+
+    for queue in gtp_module._PENDING_WGRAD_RS.values():
+        assert not queue, "work left queued after the end-of-backward flush"
+
+    ps.destroy_model_parallel()
+    GTPShardedParam._chain_state = {}
 
 
 def _worker_moe_distopt(rank, world_size, port):
@@ -940,6 +1097,18 @@ class TestGTPGradCorrectness:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_distopt, 4)
+
+    def test_depth_grad_invariance_through_ddp(self):
+        """wgrad_finalize_depth must not change main_grad, through DDP + microbatches."""
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_depth_grad_invariance, 4)
+
+    def test_depth_grad_invariance_through_ddp_moe(self):
+        """Same invariant on the MoE/EGTP path: more chains, more queues, more buckets."""
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_depth_grad_invariance, 4, True)
 
     def test_moe_egtp_distopt_grad_norm_matches_baseline(self):
         """GTP2/EGTP2 MoE dist-opt grad-norm must match GTP1/EGTP1 baseline (EP=2 both)."""
