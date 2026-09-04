@@ -818,16 +818,25 @@ class TopKRouter(Router):
             f"input_ids contains {flat_ids.numel()} tokens, but router logits contain "
             f"{logits.shape[0]}."
         )
-        top_indices = self.tid2eid[flat_ids].long()
+        default_top_indices = self.tid2eid[flat_ids].long()
         if (
             self.config.moe_router_force_load_balancing
             or self.config.moe_router_force_biased is not None
         ):
             # Benchmark forcing must override the fixed table, just as it overrides
             # learned top-k routing.
-            top_indices = torch.topk(logits, k=self.topk, dim=1).indices
+            default_top_indices = torch.topk(logits, k=self.topk, dim=1).indices
 
-        probs = scores.gather(1, top_indices)
+        def _compute_hash_topk(scores, topk, num_groups=None, group_topk=None):
+            del topk, num_groups, group_topk
+            return scores.gather(1, default_top_indices), default_top_indices
+
+        if self.router_replay is not None:
+            probs, top_indices = self.router_replay.get_replay_topk(
+                scores, self.topk, default_compute_topk=_compute_hash_topk
+            )
+        else:
+            probs, top_indices = _compute_hash_topk(scores, self.topk)
         if self.score_function != "softmax" and self.topk > 1:
             probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-20)
         if self.config.moe_router_topk_scaling_factor:

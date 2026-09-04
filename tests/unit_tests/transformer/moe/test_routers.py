@@ -17,6 +17,7 @@ from megatron.core.transformer.moe.moe_utils import (
     topk_routing_with_score_function,
 )
 from megatron.core.transformer.moe.router import InferenceTopKRouter, Router, TopKRouter
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -752,6 +753,7 @@ class TestHashRouting:
     """Hash expert selection and generic TransformerLayer integration."""
 
     def setup_method(self, method):
+        RouterReplay.clear_global_router_replay_instances()
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1,
             pipeline_model_parallel_size=1,
@@ -761,6 +763,7 @@ class TestHashRouting:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        RouterReplay.clear_global_router_replay_instances()
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -791,6 +794,127 @@ class TestHashRouting:
         )
         assert torch.equal(routing_map, expected_map)
         torch.testing.assert_close(routing_probs, expected_routing_probs)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
+    def test_hash_routing_replay_record_forward_and_backward(self, score_function):
+        config = _hash_routing_config(
+            moe_enable_routing_replay=True, moe_router_score_function=score_function
+        )
+        router = _make_hash_router(config, layer_number=1).cuda()
+        logits = torch.randn(16, config.num_moe_experts, device="cuda")
+        input_ids = torch.randint(0, config.hash_moe_vocab_size, (4, 4), device="cuda")
+
+        default_indices = router.tid2eid[input_ids.T.reshape(-1)].long()
+        if score_function == "softmax":
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+        elif score_function == "sigmoid":
+            scores = torch.sigmoid(logits.float()).type_as(logits)
+        else:
+            scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
+
+        def expected_probs(indices):
+            probs = scores.gather(1, indices)
+            if score_function != "softmax":
+                probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-20)
+            return probs
+
+        router.router_replay.set_router_replay_action(RouterReplayAction.RECORD)
+        probs, top_indices = router._hash_routing(logits, input_ids, dense_output=True)
+        assert torch.equal(top_indices, default_indices)
+        assert torch.equal(router.router_replay.get_recorded_indices(), default_indices)
+        recorded_data = RouterReplay.get_recorded_data()
+        assert torch.equal(torch.stack(recorded_data, dim=1)[:, 0], default_indices)
+        torch.testing.assert_close(probs, expected_probs(default_indices))
+
+        replay_indices_1 = (default_indices + 1) % config.num_moe_experts
+        router.router_replay.set_target_indices(replay_indices_1)
+        router.router_replay.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+        probs, top_indices = router._hash_routing(logits, input_ids, dense_output=True)
+        assert torch.equal(top_indices, replay_indices_1)
+        torch.testing.assert_close(probs, expected_probs(replay_indices_1))
+
+        replay_indices_2 = (default_indices + 2) % config.num_moe_experts
+        router.router_replay.set_target_indices(replay_indices_2)
+        probs, top_indices = router._hash_routing(logits, input_ids, dense_output=True)
+        assert torch.equal(top_indices, replay_indices_2)
+        torch.testing.assert_close(probs, expected_probs(replay_indices_2))
+
+        router.router_replay.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+        probs, top_indices = router._hash_routing(logits, input_ids, dense_output=True)
+        assert torch.equal(top_indices, replay_indices_1)
+        torch.testing.assert_close(probs, expected_probs(replay_indices_1))
+        probs, top_indices = router._hash_routing(logits, input_ids, dense_output=True)
+        assert torch.equal(top_indices, replay_indices_2)
+        torch.testing.assert_close(probs, expected_probs(replay_indices_2))
+        assert router.router_replay.replay_backward_list == []
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_hash_routing_replay_records_mixed_layers_in_cuda_graph(self):
+        config = _hash_routing_config(
+            moe_enable_routing_replay=True, moe_router_score_function="softmax"
+        )
+        hash_router = _make_hash_router(config, layer_number=1).cuda()
+        learned_router = _make_hash_router(config, layer_number=3).cuda()
+        num_tokens = 16
+
+        token_ids = torch.arange(config.hash_moe_vocab_size, device="cuda")
+        hash_router.tid2eid.copy_(
+            torch.stack(
+                (token_ids % config.num_moe_experts, (token_ids + 1) % config.num_moe_experts),
+                dim=1,
+            )
+        )
+        input_ids = torch.zeros((4, 4), dtype=torch.long, device="cuda")
+        hash_logits = torch.randn(num_tokens, config.num_moe_experts, device="cuda")
+        learned_logits = torch.tensor([0.0, 1.0, 2.0, 3.0], device="cuda").repeat(num_tokens, 1)
+        routing_buffer = torch.full(
+            (num_tokens + 2, 2, config.moe_router_topk), -1, dtype=torch.int32, device="cuda"
+        )
+        RouterReplay.set_global_static_buffers(routing_buffer)
+        RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
+        def run_routers():
+            hash_router._hash_routing(hash_logits, input_ids, dense_output=True)
+            topk_routing_with_score_function(
+                learned_logits,
+                config.moe_router_topk,
+                use_pre_softmax=config.moe_router_pre_softmax,
+                score_function=config.moe_router_score_function,
+                router_replay=learned_router.router_replay,
+                dense_output=True,
+            )
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                run_routers()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+        torch.cuda.synchronize()
+
+        routing_buffer.fill_(-1)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run_routers()
+
+        input_ids.fill_(2)
+        learned_logits.copy_(
+            torch.tensor([3.0, 2.0, 1.0, 0.0], device="cuda").expand(num_tokens, -1)
+        )
+        routing_buffer.fill_(-1)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        expected_hash = hash_router.tid2eid[input_ids.T.reshape(-1)].to(torch.int32)
+        expected_learned = torch.topk(learned_logits, k=config.moe_router_topk, dim=1).indices.to(
+            torch.int32
+        )
+        assert torch.equal(routing_buffer[:num_tokens, 0], expected_hash)
+        assert torch.equal(routing_buffer[:num_tokens, 1], expected_learned)
+        assert routing_buffer[num_tokens:].eq(-1).all()
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
