@@ -238,7 +238,91 @@ class RerunStateMachine:
 
         self.saved_results: dict[Call, Any] = {}
         self.stats: dict[Caller, QuickStats] = defaultdict(lambda: QuickStats())
+
+        # Bank validate_result() verdicts on device; merge them into the all-reduce
+        # should_run_forward_backward() already performs at the loop exit.
+        self._defer_capacity: int = 0
+        self._deferred_flags: Optional[torch.Tensor] = None
+        self._deferred_calls: List[Tuple[Call, Any, str]] = []
+        self._deferred_streams: Set[Any] = set()
+        self._defer_overflow_warned: bool = False
+
         log_single_rank(logger, logging.WARNING, f"RerunStateMachine initialized in mode {mode}")
+
+    def _record_initial_rejection(self, validation_call: Call, result: Any, message: str) -> None:
+        """Record the rejection that drives the rerun."""
+        self.failed_validation_call = validation_call
+        self.initial_result = result
+        self.rerun_requested = True
+        self._log_validation_error_to_file(
+            status=RerunValidationStatus.INITIAL_RUN, result=result, message=message
+        )
+        logger.error(
+            f"Unexpected result {result} "
+            f"on rank {safe_get_rank()} "
+            f"at iteration #{self.current_iteration + 1} "
+            f"invocation #{validation_call.sequence} "
+            f"(message='{message}')"
+        )
+
+    def _reset_deferred_validations(self) -> None:
+        """Drop the previous iteration's verdicts and size the flag vector.
+
+        Call only where nothing is in flight, so the realloc cannot race a pending write.
+        """
+        needed: int = max(4096, 2 * len(self._deferred_calls))
+        if self._deferred_flags is None or self._defer_capacity < needed:
+            self._defer_capacity = needed
+            self._deferred_flags = torch.zeros(
+                (needed,), dtype=torch.int8, device=torch.cuda.current_device()
+            )
+        self._deferred_calls = []
+        self._deferred_streams = set()
+
+    def _defer_validation(
+        self, validation_call: Call, result: Any, message: str, rejected: torch.Tensor
+    ) -> bool:
+        """Bank one verdict on device. Return False if it must be validated synchronously."""
+        index: int = len(self._deferred_calls)
+        if self._deferred_flags is None or index >= self._defer_capacity:
+            # Fall back rather than realloc mid-iteration; resize at the next reset.
+            if not self._defer_overflow_warned:
+                self._defer_overflow_warned = True
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"deferred validation buffer ({self._defer_capacity}) exceeded; "
+                    "validating synchronously for the remainder",
+                )
+            return False
+        self._deferred_calls.append((validation_call, result, message))
+        self._deferred_flags[index] = rejected.reshape(()).to(torch.int8)
+        self._deferred_streams.add(torch.cuda.current_stream())
+        return True
+
+    def _deferred_rejection_flag(self) -> Optional[torch.Tensor]:
+        """Return the device-side OR of this iteration's verdicts, or None if empty."""
+        if not self._deferred_calls:
+            return None
+        collector = torch.cuda.current_stream()
+        for stream in self._deferred_streams:
+            if stream != collector:
+                # Order the read after the producing stream's writes. check_grads()
+                # runs on autograd's backward streams, not this one.
+                collector.wait_stream(stream)
+        return self._deferred_flags[: len(self._deferred_calls)].any()
+
+    def _identify_deferred_rejection(self) -> None:
+        """Attribute a rejection to its call. Reached only when the reduction came back set."""
+        if not self._deferred_calls:
+            return
+        flags = self._deferred_flags[: len(self._deferred_calls)].tolist()
+        for index, flag in enumerate(flags):
+            if flag:
+                # Act on the first rejection only, matching the synchronous path's
+                # `and not self.rerun_requested` short-circuit.
+                self._record_initial_rejection(*self._deferred_calls[index])
+                break
 
     def set_mode(self, mode: RerunMode) -> None:
         """Method to set the operating mode"""
@@ -264,6 +348,14 @@ class RerunStateMachine:
             val_tensor: torch.Tensor = torch.tensor(value, dtype=torch.int32, device='cuda')
             torch.distributed.all_reduce(val_tensor)
             return tuple([x > 0 for x in val_tensor.tolist()])
+        elif torch.is_tensor(value):
+            # Skip the blocking pageable copy torch.tensor([...], device='cuda') would do.
+            # Keep int32: the all-reduce below sums across ranks and is tested > 0, so a
+            # narrower dtype would wrap past 127 ranks. copy=True so the in-place
+            # all-reduce never lands in the caller's buffer.
+            val_tensor = value.reshape(1).to(torch.int32, copy=True)
+            torch.distributed.all_reduce(val_tensor)
+            return val_tensor.item() > 0
         else:
             val_tensor: torch.Tensor = torch.tensor([value], dtype=torch.int32, device='cuda')
             torch.distributed.all_reduce(val_tensor)
@@ -318,6 +410,7 @@ class RerunStateMachine:
             self.restart_again_requested = False
             self.continue_requested = False
             self.injected_result = None
+            self._reset_deferred_validations()
             self.current_iteration += 1
             self.state = RerunState.INITIAL_RUN
             return True
@@ -326,7 +419,22 @@ class RerunStateMachine:
             if self.mode == RerunMode.DISABLED:
                 self.state = RerunState.NOT_RUNNING_YET
                 return False
-            will_rerun = self._reduce_any(self.rerun_requested)
+            # Merge this iteration's banked verdicts into the all-reduce already here.
+            # Still before optimizer.step(), so a NaN is caught before the step consumes it.
+            # Reduce a scalar, never the flag vector: ranks bank different numbers of
+            # verdicts, and a rank that banked none takes the bool branch below. Both
+            # paths must reduce (1,) int32 over the world group for the collective to
+            # match across ranks.
+            deferred_any = self._deferred_rejection_flag()
+            if deferred_any is not None:
+                if self.rerun_requested:
+                    deferred_any.fill_(1)
+                will_rerun = self._reduce_any(deferred_any)
+            else:
+                will_rerun = self._reduce_any(self.rerun_requested)
+            if will_rerun:
+                self._identify_deferred_rejection()
+            self._reset_deferred_validations()
             if not will_rerun:
                 self.state = RerunState.NOT_RUNNING_YET
                 return False
@@ -594,21 +702,19 @@ class RerunStateMachine:
             if not self.first_iteration_complete:
                 return
 
-            result_rejected = self.error_injector.maybe_inject() or rejection_func(result)
-            if result_rejected:
-                self.failed_validation_call = validation_call
-                self.initial_result = result
-                self.rerun_requested = True
-                self._log_validation_error_to_file(
-                    status=RerunValidationStatus.INITIAL_RUN, result=result, message=message
-                )
-                logger.error(
-                    f"Unexpected result {result} "
-                    f"on rank {safe_get_rank()} "
-                    f"at iteration #{self.current_iteration + 1} "
-                    f"invocation #{validation_call.sequence} "
-                    f"(message='{message}')"
-                )
+            injected = self.error_injector.maybe_inject()
+            rejected = rejection_func(result)
+            # Bank a device verdict instead of reading it; nothing consumes it until
+            # the loop exit merges it into the all-reduce there.
+            if (
+                not injected
+                and torch.is_tensor(rejected)
+                and rejected.is_cuda
+                and self._defer_validation(validation_call, result, message, rejected)
+            ):
+                return
+            if bool(injected) or bool(rejected):
+                self._record_initial_rejection(validation_call, result, message)
         # If this the first rerun (same GPU) or second 2nd rerun (different GPU), and have we
         # reached the validation call that failed during the initial run?
         elif (
