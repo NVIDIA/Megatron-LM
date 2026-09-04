@@ -1200,6 +1200,9 @@ class Compressor(MegatronModule):
         max_seqlen_q: Optional[int] = None,
         compressed_group_ids: Optional[torch.Tensor] = None,
         fixed_total_comp: Optional[int] = None,
+        compressed_position_ids: Optional[torch.Tensor] = None,
+        pre_grouped_cu_seqlens: Optional[torch.Tensor] = None,
+        pre_grouped_cu_seqlens_compressed: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """THD per-segment compression — fully vectorized.
 
@@ -1222,6 +1225,11 @@ class Compressor(MegatronModule):
                 ``x`` is already packed into ``ratio``-sized groups.
             fixed_total_comp: when set, overrides ``cu_seqlens_compressed[-1]``
                 as the output row count. Must be >= the true compressed count.
+            compressed_position_ids: precomputed RoPE positions for a pre-grouped
+                input. Padding entries must map to a safe position.
+            pre_grouped_cu_seqlens/pre_grouped_cu_seqlens_compressed: local
+                token/group prefixes describing the physical pre-grouped buffer.
+                Supplying both enables the regular THD fused compressor for CP.
 
         Returns:
             ``(compressed_thd, cu_seqlens_compressed)`` where
@@ -1236,6 +1244,16 @@ class Compressor(MegatronModule):
         device = x.device
         dtype = x.dtype
         pre_grouped = compressed_group_ids is not None
+        has_pre_grouped_metadata = (
+            pre_grouped_cu_seqlens is not None and pre_grouped_cu_seqlens_compressed is not None
+        )
+        if (pre_grouped_cu_seqlens is None) != (pre_grouped_cu_seqlens_compressed is None):
+            raise ValueError(
+                "pre_grouped_cu_seqlens and pre_grouped_cu_seqlens_compressed "
+                "must be supplied together."
+            )
+        if has_pre_grouped_metadata and not pre_grouped:
+            raise ValueError("Pre-grouped compressor metadata requires compressed_group_ids.")
 
         if pre_grouped:
             cu_seqlens_compressed = None
@@ -1268,13 +1286,26 @@ class Compressor(MegatronModule):
         # (-> keep the eager region) for any unsupported configuration; see
         # csa_utils/fused_compressor.py for the gating rules.
         compressed_thd = None
-        if not pre_grouped:
+        if not pre_grouped or has_pre_grouped_metadata:
+            # CP compaction describes its contiguous physical buffer as ordinary
+            # local THD segments. For ratio 4, a segment whose first original group
+            # id is nonzero starts with a noncanonical halo row; every canonical row
+            # still has the predecessor required by the overlap window.
+            if pre_grouped:
+                assert pre_grouped_cu_seqlens is not None
+                assert pre_grouped_cu_seqlens_compressed is not None
+                fused_cu_seqlens = pre_grouped_cu_seqlens
+                fused_cu_seqlens_compressed = pre_grouped_cu_seqlens_compressed
+            else:
+                assert cu_seqlens_compressed is not None
+                fused_cu_seqlens = cu_seqlens
+                fused_cu_seqlens_compressed = cu_seqlens_compressed
             compressed_thd = maybe_compress_thd_fused(
                 kv,
                 score,
                 self.ape,
-                cu_seqlens,
-                cu_seqlens_compressed,
+                fused_cu_seqlens,
+                fused_cu_seqlens_compressed,
                 total_comp,
                 ratio=ratio,
                 head_dim=self.head_dim,
@@ -1328,7 +1359,11 @@ class Compressor(MegatronModule):
         compressed_thd = self.norm(compressed_thd.to(dtype))
 
         if pre_grouped:
-            position_ids = compressed_group_ids[:total_comp].clamp_min(0) * ratio
+            position_ids = (
+                compressed_position_ids[:total_comp]
+                if compressed_position_ids is not None
+                else compressed_group_ids[:total_comp].clamp_min(0) * ratio
+            )
             if self.config.apply_rope_fusion:
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
                     int(max_seqlen_q), dtype=compressed_thd.dtype, packed_seq=True, mscale=1.0
@@ -2584,30 +2619,20 @@ class CompressedSparseAttention(MegatronModule):
         if self.compressor is not None and ratio > 1:
             # ---- Step 3: build fixed-capacity compressor input ----------------
 
-            # One compressed row per full ratio-sized group; tails are dropped.
-            compressed_lens = torch.div(
-                cu_seqlens[1:] - cu_seqlens[:-1], ratio, rounding_mode="floor"
-            )
-            cu_seqlens_compressed = torch.cat(
-                (
-                    torch.zeros_like(cu_seqlens[:1]),
-                    torch.cumsum(compressed_lens, dim=0, dtype=torch.int32),
-                )
-            )
             # ``hidden_compact`` packs the local and boundary tokens needed by the
-            # Compressor. ``compressed_group_ids`` gives each compressed block's
-            # position within its sequence for RoPE. ``seq_to_rank_row`` maps each
-            # block to its row in the all-gathered K and KV buffers.
-            hidden_compact, compressed_group_ids, seq_to_rank_row = (
-                cp_utils.prepare_cp_compressor_input(
-                    x,
-                    boundary_hidden,
-                    cu_seqlens,
-                    cu_seqlens_compressed,
-                    global_start,
-                    cp_size,
-                    ratio,
-                )
+            # Compressor. The same two CuTe launches also emit local prefixes for
+            # the fused pooling kernel, RoPE positions, global compressed prefixes,
+            # and the sequence-major -> rank-major gather map.
+            (
+                hidden_compact,
+                compressed_group_ids,
+                compressed_position_ids,
+                local_cu_seqlens,
+                local_cu_seqlens_compressed,
+                cu_seqlens_compressed,
+                seq_to_rank_row,
+            ) = cp_utils.prepare_cp_compressor_input(
+                x, boundary_hidden, cu_seqlens, global_start, cp_size, ratio
             )
 
             if indexer is not None:
@@ -2624,6 +2649,9 @@ class CompressedSparseAttention(MegatronModule):
                     cu_seqlens,
                     max_seqlen_q=max_seqlen_q,
                     compressed_group_ids=compressed_group_ids,
+                    compressed_position_ids=compressed_position_ids,
+                    pre_grouped_cu_seqlens=local_cu_seqlens,
+                    pre_grouped_cu_seqlens_compressed=local_cu_seqlens_compressed,
                 )
                 nvtx_range_pop("dsv4_cp_indexer_k_compressor")
                 # Build this edge before the independent attention
@@ -2649,6 +2677,9 @@ class CompressedSparseAttention(MegatronModule):
                 cu_seqlens,
                 max_seqlen_q=max_seqlen_q,
                 compressed_group_ids=compressed_group_ids,
+                compressed_position_ids=compressed_position_ids,
+                pre_grouped_cu_seqlens=local_cu_seqlens,
+                pre_grouped_cu_seqlens_compressed=local_cu_seqlens_compressed,
             )
             nvtx_range_pop("dsv4_cp_attention_kv_compressor")
             if indexer is not None:

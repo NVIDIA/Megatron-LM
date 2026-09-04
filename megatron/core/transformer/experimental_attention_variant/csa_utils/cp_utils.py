@@ -209,11 +209,12 @@ def prepare_cp_compressor_input(
     hidden_local: torch.Tensor,
     boundary_hidden: torch.Tensor,
     cu_seqlens: torch.Tensor,
-    cu_seqlens_compressed: torch.Tensor,
     global_start: int,
     cp_size: int,
     ratio: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
     """Build fixed-capacity compressor input for this rank's token block.
 
     Returns:
@@ -222,6 +223,12 @@ def prepare_cp_compressor_input(
         ``compressed_group_ids``: original per-sequence compressed group id for each
             compact group, shape ``(compact_group_capacity,)``. For example,
             with ``ratio=4``, ``comp_id=3`` maps to RoPE position ``12``.
+        ``compressed_position_ids``: precomputed RoPE positions, with padding
+            groups mapped to position zero.
+        ``local_cu_seqlens`` and ``local_cu_seqlens_compressed``: prefixes that
+            describe the physically compacted token/group segments. They let the
+            regular THD fused compressor consume a pre-grouped CP buffer directly.
+        ``cu_seqlens_compressed``: global sequence-major compressed prefixes.
         ``seq_to_rank_row``: map from global sequence-major compressed rows
             to their canonical rank-major all-gather rows.
             If rank 0 owns ``A0, A1`` and rank 1 owns ``B0, B1``, with four
@@ -236,40 +243,9 @@ def prepare_cp_compressor_input(
     group_alignment = 32 // math.gcd(32, ratio)
     c_cap = max(1, (l_local + d_comp) // ratio)
     c_cap = ((c_cap + group_alignment - 1) // group_alignment) * group_alignment
-    hidden_compact, compressed_group_ids = thd_layout_kernels.CompressorInputCompact.apply(
-        hidden_local, boundary_hidden, cu_seqlens, global_start, ratio, d_comp, c_cap
+    return thd_layout_kernels.CompressorInputCompact.apply(
+        hidden_local, boundary_hidden, cu_seqlens, global_start, ratio, d_comp, c_cap, cp_size
     )
-
-    # A compressed group belongs to the rank containing its last token. From
-    # that rank's first visible compressed row, its fixed-capacity
-    # rank-major slot follows directly; no (seq, comp, valid) tensors or repack
-    # kernel are needed.
-    seq_major_rows = (l_local * cp_size) // ratio
-    logical_rows = torch.arange(seq_major_rows, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
-    n_seq = cu_seqlens.shape[0] - 1
-    seq_ids = torch.bucketize(
-        logical_rows, cu_seqlens_compressed[1:], out_int32=True, right=True
-    ).clamp_max(n_seq - 1)
-    comp_ids = logical_rows - cu_seqlens_compressed[seq_ids]
-    group_last_rows = cu_seqlens[seq_ids] + (comp_ids + 1) * ratio - 1
-    owner_ranks = torch.div(group_last_rows, l_local, rounding_mode="floor").clamp_(0, cp_size - 1)
-
-    rank_starts = torch.arange(cp_size, dtype=cu_seqlens.dtype, device=cu_seqlens.device) * l_local
-    first_seq_ids = torch.bucketize(
-        rank_starts, cu_seqlens[1:], out_int32=True, right=True
-    ).clamp_max(n_seq - 1)
-    first_comp_ids = torch.div(
-        (rank_starts - d_comp - cu_seqlens[first_seq_ids]).clamp_min_(0) + ratio - 1,
-        ratio,
-        rounding_mode="floor",
-    )
-    first_logical_rows = cu_seqlens_compressed[first_seq_ids] + first_comp_ids
-    rank_slots = logical_rows - first_logical_rows[owner_ranks]
-    rank_rows = owner_ranks * compressed_group_ids.shape[0] + rank_slots
-    seq_to_rank_row = torch.where(logical_rows < cu_seqlens_compressed[-1], rank_rows, -1).to(
-        torch.int32
-    )
-    return hidden_compact, compressed_group_ids, seq_to_rank_row
 
 
 @torch.compile

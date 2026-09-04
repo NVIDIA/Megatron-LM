@@ -1,10 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """CuTeDSL kernels for DSv4 packed-THD layout work.
 
-This module contains the context-parallel compressor compaction kernels and the
-final-index kernel shared by CP and generic packed THD paths. ``cp_utils.py``
-owns CP row mapping and compressor input layout; ``csa.py`` calls final-index
-lowering directly. Local THD RoPE reuses MCore's fused MLA implementation.
+This module contains the context-parallel compressor compaction/metadata kernels
+and the final-index kernel shared by CP and generic packed THD paths.
+``cp_utils.py`` dispatches CP layout work; ``csa.py`` calls final-index lowering
+directly. Local THD RoPE reuses MCore's fused MLA implementation.
 """
 
 import math
@@ -57,6 +57,10 @@ if _CUTE_AVAILABLE:
     #   boundary_hidden: left boundary rows, shape (d_window, row_width).
     #   hidden_compact: output compact rows, shape (compact_len, row_width).
     #   comp_ids: original per-sequence compressed group ids, shape (c_cap,).
+    #   position_ids: RoPE positions for the compact groups, shape (c_cap,).
+    #   local_cu_seqlens/local_cu_seqlens_comp: prefixes describing the physically
+    #   compacted token/group segments, shape (n_seq + 1,).
+    #   cu_seqlens_comp: global per-sequence compressed prefixes, shape (n_seq + 1,).
     #   Enumerates visible full compression groups in [global_start-d_comp,
     #   global_start+l_local), copies their ratio tokens from boundary/local
     #   hidden into hidden_compact, and emits compressed group ids.
@@ -67,6 +71,10 @@ if _CUTE_AVAILABLE:
         hidden_compact: cute.Tensor,
         cu_seqlens: cute.Tensor,
         comp_ids: cute.Tensor,
+        position_ids: cute.Tensor,
+        local_cu_seqlens: cute.Tensor,
+        local_cu_seqlens_comp: cute.Tensor,
+        cu_seqlens_comp: cute.Tensor,
         n_seq: cutlass.Int32,
         global_start: cutlass.Int32,
         l_local: cutlass.Int32,
@@ -90,6 +98,38 @@ if _CUTE_AVAILABLE:
         range_start = global_start
         range_end = global_start + l_local
         first_range_group_start = range_start - d_comp
+
+        # Metadata is consumed by a later launch on the same stream. Keeping the
+        # short prefix scans in this launch avoids the eager diff/div/cumsum/cat
+        # chains without requiring grid-wide synchronization.
+        if bidx == 0 and tidx == 0:
+            local_running_groups = 0
+            global_running_groups = 0
+            local_cu_seqlens[0] = 0
+            local_cu_seqlens_comp[0] = 0
+            cu_seqlens_comp[0] = 0
+            for seq in range(n_seq):
+                seq_start = cu_seqlens[seq]
+                seq_end = cu_seqlens[seq + 1]
+                global_running_groups = global_running_groups + (seq_end - seq_start) // ratio
+                cu_seqlens_comp[seq + 1] = global_running_groups
+
+                local_seq_end = seq_end
+                if local_seq_end > range_end:
+                    local_seq_end = range_end
+                visible_group_count = 0
+                if seq_start < local_seq_end and range_start < local_seq_end:
+                    first_visible_numer = first_range_group_start - seq_start
+                    if first_visible_numer < 0:
+                        first_visible_numer = 0
+                    first_visible_group = (first_visible_numer + ratio - 1) // ratio
+                    stop_visible_group = (local_seq_end - seq_start) // ratio
+                    visible_group_count = stop_visible_group - first_visible_group
+                    if visible_group_count < 0:
+                        visible_group_count = 0
+                local_running_groups = local_running_groups + visible_group_count
+                local_cu_seqlens_comp[seq + 1] = local_running_groups
+                local_cu_seqlens[seq + 1] = local_running_groups * ratio
 
         src_global = cutlass.Int32(-1)
         visible_comp_id = cutlass.Int32(-1)
@@ -127,6 +167,10 @@ if _CUTE_AVAILABLE:
             src_global = cute.arch.shuffle_sync(src_global, 0, mask=-1, mask_and_clamp=31)
             if row % ratio == 0 and tidx == 0:
                 comp_ids[row // ratio] = visible_comp_id
+                if visible_comp_id < 0:
+                    position_ids[row // ratio] = 0
+                else:
+                    position_ids[row // ratio] = visible_comp_id * ratio
 
             vec_col = tidx
             while vec_col < vec_cols:
@@ -183,6 +227,10 @@ if _CUTE_AVAILABLE:
         hidden_compact: cute.Tensor,
         cu_seqlens: cute.Tensor,
         comp_ids: cute.Tensor,
+        position_ids: cute.Tensor,
+        local_cu_seqlens: cute.Tensor,
+        local_cu_seqlens_comp: cute.Tensor,
+        cu_seqlens_comp: cute.Tensor,
         n_seq: cutlass.Int32,
         global_start: cutlass.Int32,
         l_local: cutlass.Int32,
@@ -202,6 +250,10 @@ if _CUTE_AVAILABLE:
                 hidden_compact,
                 cu_seqlens,
                 comp_ids,
+                position_ids,
+                local_cu_seqlens,
+                local_cu_seqlens_comp,
+                cu_seqlens_comp,
                 n_seq,
                 global_start,
                 l_local,
@@ -213,6 +265,93 @@ if _CUTE_AVAILABLE:
             ),
             grid=(compact_len, 1, 1),
             block=(64, 1, 1),
+            stream=stream,
+        )
+
+    # Build the global sequence-major -> rank-major compact-row map after the
+    # compaction launch has produced ``cu_seqlens_comp``. One thread owns one
+    # logical compressed row; n_seq is tiny for the intended packed workloads,
+    # so two short linear scans are cheaper than materializing bucketize inputs.
+    @cute.kernel
+    def _compressor_rank_row_kernel(
+        cu_seqlens: cute.Tensor,
+        cu_seqlens_comp: cute.Tensor,
+        seq_to_rank_row: cute.Tensor,
+        n_seq: cutlass.Int32,
+        l_local: cutlass.Int32,
+        cp_size: cutlass.Int32,
+        ratio: cutlass.Constexpr,
+        d_comp: cutlass.Constexpr,
+        c_cap: cutlass.Int32,
+        seq_major_rows: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        logical_row = bidx * 128 + tidx
+
+        if logical_row < seq_major_rows:
+            physical_row = cutlass.Int32(-1)
+            if logical_row < cu_seqlens_comp[n_seq]:
+                seq_id = cutlass.Int32(0)
+                for seq in range(n_seq):
+                    if logical_row >= cu_seqlens_comp[seq + 1]:
+                        seq_id = seq + 1
+
+                comp_id = logical_row - cu_seqlens_comp[seq_id]
+                group_last_row = cu_seqlens[seq_id] + (comp_id + 1) * ratio - 1
+                owner_rank = group_last_row // l_local
+                if owner_rank < 0:
+                    owner_rank = 0
+                if owner_rank >= cp_size:
+                    owner_rank = cp_size - 1
+
+                rank_start = owner_rank * l_local
+                first_seq_id = cutlass.Int32(0)
+                for seq in range(n_seq):
+                    if rank_start >= cu_seqlens[seq + 1]:
+                        first_seq_id = seq + 1
+                if first_seq_id >= n_seq:
+                    first_seq_id = n_seq - 1
+
+                first_visible_numer = rank_start - d_comp - cu_seqlens[first_seq_id]
+                if first_visible_numer < 0:
+                    first_visible_numer = 0
+                first_comp_id = (first_visible_numer + ratio - 1) // ratio
+                first_logical_row = cu_seqlens_comp[first_seq_id] + first_comp_id
+                physical_row = owner_rank * c_cap + logical_row - first_logical_row
+            seq_to_rank_row[logical_row] = physical_row
+
+    @cute.jit
+    def _compressor_rank_row_launch(
+        cu_seqlens: cute.Tensor,
+        cu_seqlens_comp: cute.Tensor,
+        seq_to_rank_row: cute.Tensor,
+        n_seq: cutlass.Int32,
+        l_local: cutlass.Int32,
+        cp_size: cutlass.Int32,
+        ratio: cutlass.Constexpr,
+        d_comp: cutlass.Constexpr,
+        c_cap: cutlass.Int32,
+        seq_major_rows: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        _launch_named(
+            _compressor_rank_row_kernel,
+            "dsv4_cp_compressor_rank_row",
+            (
+                cu_seqlens,
+                cu_seqlens_comp,
+                seq_to_rank_row,
+                n_seq,
+                l_local,
+                cp_size,
+                ratio,
+                d_comp,
+                c_cap,
+                seq_major_rows,
+            ),
+            grid=(cute.ceil_div(seq_major_rows, 128), 1, 1),
+            block=(128, 1, 1),
             stream=stream,
         )
 
@@ -696,7 +835,7 @@ def _run_compiled_launch(
 
 
 class CompressorInputCompact(torch.autograd.Function):
-    """Compact local and boundary hidden rows for compressor input.
+    """Compact local and boundary rows and build the CP compressor metadata.
 
     Inputs:
         hidden_local: CUDA tensor, shape ``(l_local, ...)``.
@@ -704,12 +843,15 @@ class CompressorInputCompact(torch.autograd.Function):
         cu_seqlens: int32 CUDA tensor, shape ``(n_seq + 1,)``.
         global_start: first global row in ``hidden_local``.
         ratio/d_comp/c_cap: compressor window and fixed group capacity.
+        cp_size: number of context-parallel ranks.
 
     Outputs:
         ``hidden_compact`` shape ``(c_cap * ratio, ...)``, same dtype as hidden,
-        and ``comp_ids`` int32 shape ``(c_cap,)``.
+        ``comp_ids`` and ``position_ids`` int32 tensors of shape ``(c_cap,)``,
+        local token/group prefixes and global group prefixes of shape
+        ``(n_seq + 1,)``, and the global sequence-major to rank-major row map.
         The kernel copies the ratio source tokens for each visible compressed
-        group and emits each row's compressed group id.
+        group while emitting all metadata needed by the compressor and gather.
     """
 
     @staticmethod
@@ -722,8 +864,9 @@ class CompressorInputCompact(torch.autograd.Function):
         ratio: int,
         d_comp: int,
         c_cap: int,
+        cp_size: int,
     ):
-        """Compact local and boundary hidden rows into compressor input rows."""
+        """Compact hidden rows and produce graph-safe compressor metadata."""
         _require_cute(
             "DSv4 CP compressor compaction requires CUDA tensors and CuTeDSL.",
             hidden_local,
@@ -740,6 +883,13 @@ class CompressorInputCompact(torch.autograd.Function):
         compact_len = int(c_cap) * int(ratio)
         hidden_compact = hidden_local.new_empty((compact_len,) + tuple(hidden_local.shape[1:]))
         comp_ids = torch.empty((int(c_cap),), dtype=torch.int32, device=hidden_local.device)
+        position_ids = torch.empty_like(comp_ids)
+        metadata_shape = (cu_seqlens.shape[0],)
+        local_cu_seqlens = torch.empty(
+            metadata_shape, dtype=torch.int32, device=hidden_local.device
+        )
+        local_cu_seqlens_comp = torch.empty_like(local_cu_seqlens)
+        cu_seqlens_comp = torch.empty_like(local_cu_seqlens)
         row_width = math.prod(hidden_local.shape[1:])
         _run_compiled_launch(
             _compressor_input_compact_fwd_launch,
@@ -749,6 +899,10 @@ class CompressorInputCompact(torch.autograd.Function):
                 hidden_compact.reshape(compact_len, row_width),
                 cu_seqlens,
                 comp_ids,
+                position_ids,
+                local_cu_seqlens,
+                local_cu_seqlens_comp,
+                cu_seqlens_comp,
             ),
             (
                 cu_seqlens.shape[0] - 1,
@@ -762,10 +916,56 @@ class CompressorInputCompact(torch.autograd.Function):
             ),
             static_arg_indices=(3, 4, 5, 7),
         )
-        return hidden_compact, comp_ids
+
+        seq_major_rows = (int(l_local) * int(cp_size)) // int(ratio)
+        seq_to_rank_row = torch.empty(
+            (seq_major_rows,), dtype=torch.int32, device=hidden_local.device
+        )
+        if seq_major_rows > 0:
+            _run_compiled_launch(
+                _compressor_rank_row_launch,
+                (cu_seqlens, cu_seqlens_comp, seq_to_rank_row),
+                (
+                    cu_seqlens.shape[0] - 1,
+                    int(l_local),
+                    int(cp_size),
+                    int(ratio),
+                    int(d_comp),
+                    int(c_cap),
+                    seq_major_rows,
+                ),
+                static_arg_indices=(3, 4),
+            )
+        ctx.set_materialize_grads(False)
+        ctx.mark_non_differentiable(
+            comp_ids,
+            position_ids,
+            local_cu_seqlens,
+            local_cu_seqlens_comp,
+            cu_seqlens_comp,
+            seq_to_rank_row,
+        )
+        return (
+            hidden_compact,
+            comp_ids,
+            position_ids,
+            local_cu_seqlens,
+            local_cu_seqlens_comp,
+            cu_seqlens_comp,
+            seq_to_rank_row,
+        )
 
     @staticmethod
-    def backward(ctx, grad_hidden_compact: torch.Tensor, _grad_comp_ids: torch.Tensor):
+    def backward(
+        ctx,
+        grad_hidden_compact: torch.Tensor,
+        _grad_comp_ids: Optional[torch.Tensor],
+        _grad_position_ids: Optional[torch.Tensor],
+        _grad_local_cu_seqlens: Optional[torch.Tensor],
+        _grad_local_cu_seqlens_comp: Optional[torch.Tensor],
+        _grad_cu_seqlens_comp: Optional[torch.Tensor],
+        _grad_seq_to_rank_row: Optional[torch.Tensor],
+    ):
         """Scatter compacted compressor gradients to local and boundary rows."""
         (cu_seqlens,) = ctx.saved_tensors
         global_start, l_local, ratio, d_comp, d_window = ctx.compact_args
@@ -795,7 +995,7 @@ class CompressorInputCompact(torch.autograd.Function):
             ),
             static_arg_indices=(3, 4, 5, 7),
         )
-        return (grad_hidden, grad_boundary, *([None] * 5))
+        return (grad_hidden, grad_boundary, *([None] * 6))
 
 
 def build_attention_indices(
