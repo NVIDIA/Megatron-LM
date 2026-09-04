@@ -3390,6 +3390,37 @@ def _none_if_absent(stat):
     return None if stat == -1.0 else stat
 
 
+def start_exit_duration_vote(args, iteration, is_first_iteration):
+    """Reduce every rank's --exit-duration-in-mins verdict, without reading it.
+
+    Each rank reads its own host clock, so the ranks must agree before any of
+    them exits or the survivors hang in the next collective. Issue the collective
+    here and leave the result on device; training_log() reads it along with the
+    logging stats, which costs nothing extra, and hands it to
+    checkpoint_and_decide_exit().
+
+    Gated on exactly the condition training_log() gates that batched read on, and
+    gated here rather than at the call site so the two cannot drift: casting more
+    often adds a collective nobody reads, casting less leaves the verdict unread
+    and the run past its limit.
+
+    Returns:
+        A device tensor holding the reduced verdict, or None when no duration
+        limit is set or this iteration will not read it.
+    """
+    if not args.exit_duration_in_mins:
+        return None
+    if iteration % args.log_interval != 0 and not is_first_iteration:
+        return None
+    train_time = (time.time() - _TRAIN_START_TIME) / 60.0
+    # full(), not tensor([...]): the latter is a pageable host-to-device copy.
+    done = torch.full(
+        (1,), int(train_time > args.exit_duration_in_mins), dtype=torch.int, device='cuda'
+    )
+    torch.distributed.all_reduce(done, op=torch.distributed.ReduceOp.MAX)
+    return done
+
+
 def training_log(
     loss_dict,
     total_loss_dict,
@@ -3406,8 +3437,17 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    exit_duration_vote=None,
 ):
-    """Log training information such as losses, timing, ...."""
+    """Log training information such as losses, timing, ....
+
+    Args:
+        exit_duration_vote: Device tensor from start_exit_duration_vote(), read
+            here with the logging stats so it costs no synchronization of its own.
+
+    Returns:
+        tuple: (report_memory_flag, exit_duration_done)
+    """
     args = get_args()
     timers = get_timers()
     writer = get_tensorboard_writer()
@@ -3417,6 +3457,8 @@ def training_log(
 
     # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
     should_reset = not is_first_iteration
+    # False unless this iteration performs the batched read that resolves the vote.
+    exit_duration_done = False
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
@@ -3701,13 +3743,16 @@ def training_log(
             for key in total_loss_dict
             if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]
         ]
-        loss_scale, params_norm, grad_norm, num_zeros_in_grad, learning_rate, *loss_totals = (
-            _read_logging_stats(
-                [loss_scale, params_norm, grad_norm, num_zeros_in_grad, learning_rate]
-                + [total_loss_dict[key] for key in loss_keys]
-            )
-        )
-        loss_totals = dict(zip(loss_keys, loss_totals))
+        stats = [loss_scale, params_norm, grad_norm, num_zeros_in_grad, learning_rate]
+        n_fixed = len(stats)
+        stats += [total_loss_dict[key] for key in loss_keys]
+        if exit_duration_vote is not None:
+            stats.append(exit_duration_vote)
+        resolved = _read_logging_stats(stats)
+        loss_scale, params_norm, grad_norm, num_zeros_in_grad, learning_rate = resolved[:n_fixed]
+        loss_totals = dict(zip(loss_keys, resolved[n_fixed : n_fixed + len(loss_keys)]))
+        if exit_duration_vote is not None:
+            exit_duration_done = bool(resolved[-1])
         # calc_params_l2_norm returned the SQUARED norm; root it here.
         params_norm = None if params_norm is None else params_norm**0.5
         grad_norm = _none_if_absent(grad_norm)
@@ -3880,7 +3925,7 @@ def training_log(
         # Log timers to stdout
         timers.log(timers_to_log, normalizer=args.log_interval, reset=should_reset)
 
-    return report_memory_flag
+    return report_memory_flag, exit_duration_done
 
 
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
@@ -4209,10 +4254,18 @@ def checkpoint_and_decide_exit(
     num_floating_point_operations_so_far,
     checkpointing_context,
     train_data_iterator,
+    exit_duration_done=False,
 ):
     """Save checkpoint and decide whether to exit based on arguments (e.g., if
     --exit-duration-in-mins is set). Actual exit happens in main training loop
-    based on the return value of this function."""
+    based on the return value of this function.
+
+    Args:
+        exit_duration_done (bool): Already-reduced verdict for
+            --exit-duration-in-mins, cast by start_exit_duration_vote() and read
+            by training_log() in its batched host read. Reading it here instead
+            would cost a synchronization per iteration.
+    """
     args = get_args()
     timers = get_timers()
 
@@ -4265,19 +4318,11 @@ def checkpoint_and_decide_exit(
         )
         saved_checkpoint = True
 
-    # Exit based on duration.
+    # Exit based on duration. The vote was cast before training_log and read
+    # there as part of the batched host read, so nothing synchronizes here.
     if args.exit_duration_in_mins:
         train_time = (time.time() - _TRAIN_START_TIME) / 60.0
-        done_cuda = torch.tensor(
-            [train_time > args.exit_duration_in_mins], dtype=torch.int, device='cuda'
-        )
-        # MAX all-reduce so every rank makes the SAME exit decision despite each
-        # reading its own wall-clock (a determinism guarantee, not a sync point).
-        # ~0.1ms and left unspanned: the GPU is already drained by here, and the
-        # real post-checkpoint wait is the cross-rank save skew at timers.log.
-        torch.distributed.all_reduce(done_cuda, op=torch.distributed.ReduceOp.MAX)
-        done = done_cuda.item()
-        if done:
+        if exit_duration_done:
             if args.save and not saved_checkpoint:
                 save_checkpoint_and_time(
                     iteration,
@@ -5054,10 +5099,15 @@ def train(
                 learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
             else:
                 learning_rate = None
+            # Cast the exit-duration vote before the log, so its host read rides
+            # along with the logging batch instead of paying for a sync of its own.
+            exit_duration_vote = start_exit_duration_vote(
+                args, iteration, is_first_iteration
+            )
             # Per-iteration logging (throughput calc, tensorboard/wandb writes) --
             # uninstrumented per-iteration overhead outside the train_step span.
             with _otel_managed_span('step', 'megatron.train.log', is_goodput_span=True):
-                report_memory_flag = training_log(
+                report_memory_flag, exit_duration_done = training_log(
                     loss_dict,
                     total_loss_dict,
                     learning_rate,
@@ -5073,6 +5123,7 @@ def train(
                     is_first_iteration=is_first_iteration,
                     seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
                     total_real_tokens_in_batch=total_real_tokens_in_batch,
+                    exit_duration_vote=exit_duration_vote,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
@@ -5171,6 +5222,7 @@ def train(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator,
+            exit_duration_done=exit_duration_done,
         )
         if should_exit:
             break
