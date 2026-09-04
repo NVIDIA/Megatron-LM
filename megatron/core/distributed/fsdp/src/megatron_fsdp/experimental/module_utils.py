@@ -12,22 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Experimental Megatron-FSDP implementation."""
+"""Utilities for resolving parameters within FSDP modules."""
 
-from .checkpoint import load_checkpoint, save_checkpoint
-from .dbuffer import DBuffer
-from .fully_shard import Placements, fully_shard, fully_shard_context, microbatch
-from .optimizer import fully_shard_optimizer
-from .schedule import SchedulePolicy
+from torch import nn
 
-__all__ = [
-    "DBuffer",
-    "Placements",
-    "SchedulePolicy",
-    "fully_shard",
-    "fully_shard_context",
-    "fully_shard_optimizer",
-    "load_checkpoint",
-    "microbatch",
-    "save_checkpoint",
-]
+
+def get_parameter_owner(root_module: nn.Module, parameter_fqn: str) -> tuple[nn.Module, str]:
+    """Resolve a root-module-relative parameter FQN to its direct owner."""
+    module_name, separator, parameter_name = parameter_fqn.rpartition(".")
+    owner = root_module.get_submodule(module_name) if separator else root_module
+    return owner, parameter_name

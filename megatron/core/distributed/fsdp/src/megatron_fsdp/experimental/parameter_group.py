@@ -28,6 +28,7 @@ from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
 from .dbuffer import DBuffer
+from .module_utils import get_parameter_owner
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
 
@@ -265,7 +266,7 @@ class FsdpParameterGroup:
         if owning_module is None:
             raise RuntimeError("FSDP parameter group outlived its owning module.")
         for fqn in fqns:
-            module, parameter_name = _get_parameter_owner(owning_module, fqn)
+            module, parameter_name = get_parameter_owner(owning_module, fqn)
             module._parameters[parameter_name] = parameter
 
     def _switch_to_sharded_parameters(self) -> None:
@@ -429,10 +430,3 @@ class FsdpParameterGroup:
             # sharded.grad is only read by the optimizer. However, for consistency and
             # debugging, keep sharded.grad valid even between microbatches.
             install_sharded_grads(self.main_grad)
-
-
-def _get_parameter_owner(module: nn.Module, name: str) -> tuple[nn.Module, str]:
-    """Resolve a root-module-relative parameter FQN to its direct owner."""
-    module_name, separator, parameter_name = name.rpartition(".")
-    owner = module.get_submodule(module_name) if separator else module
-    return owner, parameter_name
