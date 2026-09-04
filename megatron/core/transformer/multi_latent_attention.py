@@ -932,24 +932,23 @@ class MLASelfAttention(MultiLatentAttention):
                 q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
             )
 
-            if self.use_rope:
-                # Dynamic batching: use inference context methods
-                q_pos_emb = inference_context.apply_rotary_emb_query(
-                    q_pos_emb,
-                    rotary_pos_emb,
-                    config=self.config,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cp_group=self.pg_collection.cp,
-                    mscale=mscale,
-                )
-                # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
-                k_pos_emb = inference_context.apply_rotary_emb_key(
-                    k_pos_emb,
-                    rotary_pos_emb,
-                    config=self.config,
-                    cp_group=self.pg_collection.cp,
-                    mscale=mscale,
-                )
+            # Cached MLA latents require RoPE; use the dynamic batching inference context methods.
+            q_pos_emb = inference_context.apply_rotary_emb_query(
+                q_pos_emb,
+                rotary_pos_emb,
+                config=self.config,
+                cu_seqlens_q=cu_seqlens_q,
+                cp_group=self.pg_collection.cp,
+                mscale=mscale,
+            )
+            # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
+            k_pos_emb = inference_context.apply_rotary_emb_key(
+                k_pos_emb,
+                rotary_pos_emb,
+                config=self.config,
+                cp_group=self.pg_collection.cp,
+                mscale=mscale,
+            )
 
             # Create KV cache entry. It will the be the key vector in cache mla latents path
             k_pos_emb_squeezed = k_pos_emb.squeeze(1)
