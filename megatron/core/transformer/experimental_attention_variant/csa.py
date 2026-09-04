@@ -2611,6 +2611,12 @@ class CompressedSparseAttention(MegatronModule):
         indexer = self.indexer
         indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
         training_with_grad = self.training and torch.is_grad_enabled()
+        reconstruct_kv_for_backward = (
+            torch.is_grad_enabled()
+            and self.use_fused_kernels
+            and self.config.recompute_granularity == "selective"
+            and "mla_up_proj" in (self.config.recompute_modules or [])
+        )
         sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
         local_k_indexer_grad_edge = None
         indexer_k_rs_state = None
@@ -2788,6 +2794,13 @@ class CompressedSparseAttention(MegatronModule):
             compressed_kv_rank_major.detach() if overlap_cp_backward else compressed_kv_rank_major
         )
         kv_full_thd = torch.cat((boundary_kv, kv_local, compressed_kv_for_attention), dim=0)
+        # ``kv_full_thd`` stays the autograd input so its cat edge owns dKV.
+        # Saving the direct producers only changes which values survive until backward.
+        kv_reconstruction_parts = (
+            (boundary_kv, kv_local, compressed_kv_for_attention)
+            if reconstruct_kv_for_backward
+            else None
+        )
         compressed_width = (
             compressed_topk.shape[-1]
             if compressed_topk is not None
@@ -2876,6 +2889,7 @@ class CompressedSparseAttention(MegatronModule):
                     indexer_k_rs_state,
                     compressed_kv_rs_state,
                     self.window_size,
+                    kv_reconstruction_parts,
                 )
             else:
                 output, indexer_loss = _unfused_indexer_sparse_attn_from_topk(
@@ -2901,6 +2915,7 @@ class CompressedSparseAttention(MegatronModule):
                 self.softmax_scale,
                 topk_length=topk_length,
                 is_thd=True,
+                kv_reconstruction_parts=kv_reconstruction_parts,
             )
         else:
             output = unfused_compressed_sparse_attn(

@@ -1473,6 +1473,67 @@ class TestDsaSparseAttn:
         assert torch.equal(attn_sink.grad, d_sink_kernel), "(b) attn_sink.grad mismatch"
         fake_dsa.sparse_attention_backward_wrapper.assert_called_once()
 
+    def test_thd_backward_reconstructs_kv_without_saving_concatenation(self, monkeypatch):
+        """THD backward rebuilds KV while gradients still use the original cat edge."""
+        total_q, num_heads, head_dim = 4, 2, 3
+        boundary_kv = torch.randn(1, head_dim, requires_grad=True)
+        local_kv = torch.randn(4, head_dim, requires_grad=True)
+        compressed_kv = torch.randn(2, head_dim, requires_grad=True)
+        kv_full = torch.cat((boundary_kv, local_kv, compressed_kv), dim=0)
+        kv_full.retain_grad()
+        query = torch.randn(total_q, num_heads, head_dim, requires_grad=True)
+        attn_sink = torch.randn(num_heads, requires_grad=True)
+        topk_idxs = torch.zeros(total_q, 2, dtype=torch.int32)
+        expected_kv = kv_full.detach().clone()
+        expected_dkv = torch.arange(kv_full.numel(), dtype=kv_full.dtype).reshape_as(kv_full)
+        seen = {}
+
+        def fake_flash(q, *args, **kwargs):
+            del args, kwargs
+            return torch.zeros_like(q), torch.zeros(total_q, num_heads), None
+
+        class FakeDSA:
+            @staticmethod
+            def sparse_attention_backward_wrapper(q, kv, out, dO, lse, sink, topk, **kwargs):
+                del out, dO, lse, topk, kwargs
+                seen['backward_kv'] = kv.detach().clone()
+                return {
+                    'dq': torch.zeros_like(q),
+                    'dkv': expected_dkv,
+                    'd_sink': torch.zeros_like(sink),
+                }
+
+        monkeypatch.setattr(dk, '_ensure_dsa_namespace', lambda: None)
+        monkeypatch.setattr(dk, '_csa_fwd_flash_mla', fake_flash)
+        monkeypatch.setattr(dk, '_DSA', FakeDSA)
+
+        saved_storage_ids = []
+
+        def pack_hook(tensor):
+            saved_storage_ids.append(tensor.untyped_storage()._cdata)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack_hook, lambda tensor: tensor):
+            output = csa_sparse_attn(
+                query,
+                kv_full,
+                attn_sink,
+                topk_idxs,
+                softmax_scale=0.5,
+                is_thd=True,
+                kv_reconstruction_parts=(boundary_kv, local_kv, compressed_kv),
+            )
+            output.sum().backward()
+
+        assert kv_full.untyped_storage()._cdata not in saved_storage_ids
+        for part in (boundary_kv, local_kv, compressed_kv):
+            assert part.untyped_storage()._cdata in saved_storage_ids
+        torch.testing.assert_close(seen['backward_kv'], expected_kv)
+        torch.testing.assert_close(kv_full.grad, expected_dkv)
+        expected_parts = expected_dkv.split((1, 4, 2), dim=0)
+        for part, expected_grad in zip((boundary_kv, local_kv, compressed_kv), expected_parts):
+            torch.testing.assert_close(part.grad, expected_grad)
+
 
 # ---------------------------------------------------------------------------
 # fused_csa_indexer_sparse_attn — Path B autograd Function (mocked)
@@ -2437,6 +2498,94 @@ class TestFusedIndexerSparseAttnFromTopk:
         )
         assert torch.count_nonzero(seen['dO'][1]) == 0
         assert torch.count_nonzero(seen['lse'][1]) == 0
+
+    def test_backward_reconstructs_kv_without_saving_concatenation(self, monkeypatch):
+        """The fused indexer path also saves KV producers instead of ``kv_full``."""
+        inputs = self._inputs()
+        total_q, num_heads, head_dim = inputs['query'].shape
+        boundary_kv = torch.randn(1, head_dim, requires_grad=True)
+        local_kv = torch.randn(3, head_dim, requires_grad=True)
+        compressed_kv = torch.randn(2, head_dim, requires_grad=True)
+        kv_reconstruction_parts = (boundary_kv, local_kv, compressed_kv)
+        inputs['kv_full'] = torch.cat(kv_reconstruction_parts, dim=0)
+        inputs['kv_full'].retain_grad()
+        expected_kv = inputs['kv_full'].detach().clone()
+        expected_dkv = torch.arange(
+            inputs['kv_full'].numel(), dtype=inputs['kv_full'].dtype
+        ).reshape_as(inputs['kv_full'])
+        seen = {}
+
+        def fake_flash(query, *args, **kwargs):
+            del args, kwargs
+            return torch.zeros_like(query), torch.zeros(total_q, num_heads), None
+
+        class FakeDSA:
+            @staticmethod
+            def sparse_indexer_score_recompute_wrapper(q, k, w, topk, **kwargs):
+                del q, k, w, kwargs
+                return {'predict': torch.ones_like(topk, dtype=torch.float32)}
+
+            @staticmethod
+            def sparse_attn_score_recompute_wrapper(q, k, lse, topk, scale, **kwargs):
+                del q, k, lse, scale, kwargs
+                return {'target': torch.ones_like(topk, dtype=torch.float32)}
+
+            @staticmethod
+            def sparse_attention_backward_wrapper(q, kv, out, dO, lse, sink, topk, **kwargs):
+                del out, dO, lse, topk, kwargs
+                seen['backward_kv'] = kv.detach().clone()
+                return {
+                    'dq': torch.zeros_like(q),
+                    'dkv': expected_dkv,
+                    'd_sink': torch.zeros_like(sink),
+                }
+
+        monkeypatch.setattr(dk, '_ensure_dsa_namespace', lambda: None)
+        monkeypatch.setattr(dk, '_csa_fwd_flash_mla', fake_flash)
+        monkeypatch.setattr(dk, '_DSA', FakeDSA)
+
+        saved_storage_ids = []
+
+        def pack_hook(tensor):
+            saved_storage_ids.append(tensor.untyped_storage()._cdata)
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack_hook, lambda tensor: tensor):
+            output, loss = FusedCSAIndexerSparseAttnFromTopkFunc.apply(
+                *inputs.values(),
+                1.0,
+                1.0,
+                0.0,
+                float(total_q),
+                True,
+                2,
+                total_q,
+                (
+                    torch.tensor([0, total_q], dtype=torch.int32),
+                    torch.tensor([0, inputs['k_indexer'].shape[0]], dtype=torch.int32),
+                    torch.tensor([0], dtype=torch.int32),
+                ),
+                None,
+                None,
+                None,
+                None,
+                0,
+                None,
+                None,
+                None,
+                1,
+                kv_reconstruction_parts,
+            )
+            (output.sum() + loss).backward()
+
+        assert inputs['kv_full'].untyped_storage()._cdata not in saved_storage_ids
+        for part in kv_reconstruction_parts:
+            assert part.untyped_storage()._cdata in saved_storage_ids
+        torch.testing.assert_close(seen['backward_kv'], expected_kv)
+        torch.testing.assert_close(inputs['kv_full'].grad, expected_dkv)
+        expected_parts = expected_dkv.split((1, 3, 2), dim=0)
+        for part, expected_grad in zip(kv_reconstruction_parts, expected_parts):
+            torch.testing.assert_close(part.grad, expected_grad)
 
 
 # ---------------------------------------------------------------------------

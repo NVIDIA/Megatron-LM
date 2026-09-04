@@ -705,6 +705,38 @@ def build_flat_topk_idxs(
 # ---------------------------------------------------------------------------
 
 
+def _validate_kv_reconstruction_parts(
+    kv: Tensor, kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor]
+) -> None:
+    """Validate tensors used to rebuild a flat THD KV buffer in backward."""
+    if len(kv_reconstruction_parts) != 3:
+        raise ValueError(
+            "kv_reconstruction_parts must contain boundary, local, and compressed KV tensors"
+        )
+
+    part_names = ("boundary", "local", "compressed")
+    for name, part in zip(part_names, kv_reconstruction_parts):
+        if not isinstance(part, Tensor):
+            raise TypeError(f"{name} KV reconstruction part must be a torch.Tensor")
+        if part.device != kv.device or part.dtype != kv.dtype:
+            raise ValueError(
+                f"{name} KV reconstruction part must match kv device and dtype; "
+                f"got {part.device}/{part.dtype} and {kv.device}/{kv.dtype}"
+            )
+        if part.ndim != kv.ndim or part.shape[1:] != kv.shape[1:]:
+            raise ValueError(
+                f"{name} KV reconstruction part has incompatible shape {tuple(part.shape)} "
+                f"for kv shape {tuple(kv.shape)}"
+            )
+
+    reconstructed_rows = sum(part.shape[0] for part in kv_reconstruction_parts)
+    if reconstructed_rows != kv.shape[0]:
+        raise ValueError(
+            "KV reconstruction parts have an unexpected total row count: "
+            f"got {reconstructed_rows}, expected {kv.shape[0]}"
+        )
+
+
 class CSASparseAttnFunc(torch.autograd.Function):
     """Sparse attention fwd + bwd on flat tensors.
 
@@ -722,6 +754,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
         topk_length: Optional[Tensor],  # (total_sq,) int32 or None
         softmax_scale: float,
         indexer_topk: int,
+        kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
         out, lse, lse_indexer = _csa_fwd_flash_mla(
@@ -734,7 +767,12 @@ class CSASparseAttnFunc(torch.autograd.Function):
             indexer_topk=indexer_topk,
         )
 
-        ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
+        ctx.reconstruct_kv_for_backward = kv_reconstruction_parts is not None
+        if ctx.reconstruct_kv_for_backward:
+            _validate_kv_reconstruction_parts(kv, kv_reconstruction_parts)
+            ctx.save_for_backward(q, *kv_reconstruction_parts, attn_sink, topk_idxs, out, lse)
+        else:
+            ctx.save_for_backward(q, kv, attn_sink, topk_idxs, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.topk_length = topk_length
         return out, lse, lse_indexer
@@ -744,7 +782,13 @@ class CSASparseAttnFunc(torch.autograd.Function):
         """Compute sparse-attention backward via cuDNN DSA wrapper."""
         _ensure_dsa_namespace()
 
-        q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
+        if ctx.reconstruct_kv_for_backward:
+            q, boundary_kv, local_kv, compressed_kv, attn_sink, topk_idxs, out, lse = (
+                ctx.saved_tensors
+            )
+            kv = torch.cat((boundary_kv, local_kv, compressed_kv), dim=0)
+        else:
+            q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
 
         result = _DSA.sparse_attention_backward_wrapper(
             q,
@@ -758,7 +802,7 @@ class CSASparseAttnFunc(torch.autograd.Function):
             topk_length=ctx.topk_length,
         )
         dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
-        return dq, dkv, d_sink, None, None, None, None
+        return dq, dkv, d_sink, None, None, None, None, None
 
 
 def csa_sparse_attn(
@@ -770,6 +814,7 @@ def csa_sparse_attn(
     topk_length: Optional[Tensor] = None,
     indexer_topk: int = 0,
     is_thd: bool = False,
+    kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
 ) -> Tensor:
     """Sparse attention (Path A / Path C step 2).
 
@@ -797,6 +842,12 @@ def csa_sparse_attn(
         indexer_topk: int; ``0`` for Paths A/C, positive for Path B.
         is_thd: when True, treat ``query`` and ``kv`` as already-packed
             THD tensors and skip the SBHD reshape steps.
+        kv_reconstruction_parts: Optional ``(boundary_kv, local_kv, compressed_kv)``
+            tuple used only to reconstruct THD ``kv`` during backward. Supplying
+            the direct producer tensors lets selective MLA-up-projection
+            checkpointing release their storage instead of retaining the
+            concatenated ``kv`` allocation. ``kv`` remains the differentiable
+            Function input and receives the reconstructed buffer's gradient.
 
     Returns:
         SBHD ``(sq, b, np * d_v)`` or THD ``(total_sq, np * d_v)`` bf16.
@@ -818,13 +869,22 @@ def csa_sparse_attn(
             )
         q_flat, kv_flat = query, kv
     else:
+        if kv_reconstruction_parts is not None:
+            raise ValueError("kv_reconstruction_parts is supported only for THD inputs")
         sq, b, np_, d = query.shape
         skv = kv.shape[0]
         q_flat = query.reshape(sq * b, np_, d)
         kv_flat = kv.reshape(skv * b, d)
 
     out_flat, _lse, _lse_indexer = CSASparseAttnFunc.apply(
-        q_flat, kv_flat, attn_sink, topk_idxs, topk_length, softmax_scale, indexer_topk
+        q_flat,
+        kv_flat,
+        attn_sink,
+        topk_idxs,
+        topk_length,
+        softmax_scale,
+        indexer_topk,
+        kv_reconstruction_parts,
     )  # (rows, np, d_v)
 
     # Layout-specific output reshape: collapse (np, d_v) → (np * d_v),
@@ -2008,6 +2068,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         indexer_k_reduce_scatter_state: Optional[_DeferredReduceScatterState] = None,
         compressed_kv_reduce_scatter_state: Optional[_DeferredReduceScatterState] = None,
         logical_window_width: int | None = None,
+        kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None = None,
     ) -> Tuple[Tensor, Tensor]:
         """Run fused sparse attention using caller-supplied top-k indices."""
         _ensure_dsa_namespace()
@@ -2200,19 +2261,36 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         ctx.compressed_kv_reduce_scatter_state = compressed_kv_reduce_scatter_state
         ctx.indexer_grad_is_sequence_major = cp_group is not None and not sparse_loss
         ctx.num_forward_inputs = len(ctx.needs_input_grad)
-        ctx.save_for_backward(
-            query,
-            kv_full,
-            attn_sink,
-            topk_idxs,
-            topk_length,
-            out_flat,
-            lse,
-            saved_grad_q_indexer,
-            saved_grad_k_indexer,
-            saved_grad_weights,
-            indexer_rank_map,
-        )
+        ctx.reconstruct_kv_for_backward = kv_reconstruction_parts is not None
+        if ctx.reconstruct_kv_for_backward:
+            _validate_kv_reconstruction_parts(kv_full, kv_reconstruction_parts)
+            ctx.save_for_backward(
+                query,
+                *kv_reconstruction_parts,
+                attn_sink,
+                topk_idxs,
+                topk_length,
+                out_flat,
+                lse,
+                saved_grad_q_indexer,
+                saved_grad_k_indexer,
+                saved_grad_weights,
+                indexer_rank_map,
+            )
+        else:
+            ctx.save_for_backward(
+                query,
+                kv_full,
+                attn_sink,
+                topk_idxs,
+                topk_length,
+                out_flat,
+                lse,
+                saved_grad_q_indexer,
+                saved_grad_k_indexer,
+                saved_grad_weights,
+                indexer_rank_map,
+            )
         ctx.softmax_scale = softmax_scale
         ctx.q_padding_mask = q_padding_mask
 
@@ -2222,19 +2300,37 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
     def backward(ctx, grad_output, grad_loss):
         """Run sparse-attention and indexer-loss backward kernels."""
         _ensure_dsa_namespace()
-        (
-            query,
-            kv_full,
-            attn_sink,
-            topk_idxs,
-            topk_length,
-            out_flat,
-            lse,
-            saved_grad_q_indexer,
-            saved_grad_k_indexer,
-            saved_grad_weights,
-            indexer_rank_map,
-        ) = ctx.saved_tensors
+        if getattr(ctx, "reconstruct_kv_for_backward", False):
+            (
+                query,
+                boundary_kv,
+                local_kv,
+                compressed_kv,
+                attn_sink,
+                topk_idxs,
+                topk_length,
+                out_flat,
+                lse,
+                saved_grad_q_indexer,
+                saved_grad_k_indexer,
+                saved_grad_weights,
+                indexer_rank_map,
+            ) = ctx.saved_tensors
+            kv_full = torch.cat((boundary_kv, local_kv, compressed_kv), dim=0)
+        else:
+            (
+                query,
+                kv_full,
+                attn_sink,
+                topk_idxs,
+                topk_length,
+                out_flat,
+                lse,
+                saved_grad_q_indexer,
+                saved_grad_k_indexer,
+                saved_grad_weights,
+                indexer_rank_map,
+            ) = ctx.saved_tensors
 
         cp_group = ctx.cp_group
         grad_k_indexer = saved_grad_k_indexer * grad_loss
@@ -2349,6 +2445,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             None,
             grad_local_k_indexer,
             grad_local_compressed_kv,
+            None,
             None,
             None,
             None,
