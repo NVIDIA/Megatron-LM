@@ -2525,14 +2525,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         dtype_to_gbuf_idx = {}
-        uint8_dtype_keys = {
-            _get_dtype_param_grad_key(torch.uint8, buffer.grad_dtype) for buffer in self.buffers
-        }
         for key in state_dict.keys():
             if key != 'buckets_coalesced':
                 for dtype in state_dict[key].keys():
                     assert dtype not in dtype_to_gbuf_idx
-                    if dtype in uint8_dtype_keys:
+                    if isinstance(dtype, str) and dtype.startswith('dtype_param_torch:uint8_grad_'):
                         # If the `state_dict`` already contains a torch.uint8 buffer, we assumed
                         # that the fp8 weights and fp16/bf16 biases in the checkpoint are already
                         # separated. In this case, no action is required, so we can return directly.
