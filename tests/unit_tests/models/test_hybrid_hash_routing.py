@@ -319,6 +319,7 @@ def test_hybrid_model_passes_ids_to_decoder_only_for_hash_routing(
         moe_n_hash_layers=moe_n_hash_layers,
         hash_moe_vocab_size=128,
         sequence_parallel=False,
+        freeze_base_model_for_mtp=False,
     )
     model = SimpleNamespace(
         config=config,
@@ -369,6 +370,7 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch):
             moe_n_hash_layers=1,
             hash_moe_vocab_size=128,
             sequence_parallel=True,
+            freeze_base_model_for_mtp=False,
         ),
         decoder=decoder,
         position_embedding_type="none",
@@ -520,7 +522,11 @@ def test_hybrid_stack_marks_mtp_moe_and_propagates_mtp_depth(monkeypatch):
 
     monkeypatch.setattr(hybrid_block_module, "build_module", fake_build_module)
     config = SimpleNamespace(
-        fp8=False, fp4=None, enable_mhc_connections=False, cuda_graph_impl="none"
+        fp8=False,
+        fp4=None,
+        enable_mhc_connections=False,
+        cuda_graph_impl="none",
+        linear_cp_layout=None,
     )
 
     stack = HybridStack(
@@ -575,6 +581,7 @@ def test_mtp_layer_passes_its_depth_to_nested_hybrid_stack(monkeypatch):
         layernorm_epsilon=1e-5,
         init_method=lambda tensor: tensor,
         mtp_num_layers=2,
+        attention_cp_layout=None,
     )
     submodules = MultiTokenPredictionLayerSubmodules(
         enorm=_IdentityNorm,
