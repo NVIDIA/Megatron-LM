@@ -824,7 +824,7 @@ class TestMegatronMLAArgumentGeneration:
         assert config.experimental_attention_variant == 'dsa'
 
     def test_dsv4_hybrid_arguments_reach_mla_config(self):
-        """The D symbol must preserve DSv4 mode and its latent-norm epsilon."""
+        """The D symbol preserves DSv4 mode and propagates MLA-specific arguments."""
         argv = [
             'test_argument_utils.py',
             '--hybrid-layer-pattern',
@@ -837,6 +837,10 @@ class TestMegatronMLAArgumentGeneration:
             '[4]',
             '--q-lora-rank',
             '32',
+            '--output-projection-groups',
+            '4',
+            '--output-projection-lora-rank',
+            '64',
             '--hidden-size',
             '128',
             '--num-attention-heads',
@@ -855,6 +859,8 @@ class TestMegatronMLAArgumentGeneration:
 
         assert config.experimental_attention_variant == 'dsv4_hybrid'
         assert config.attention_latent_norm_epsilon == pytest.approx(1e-5)
+        assert config.output_projection_groups == 4
+        assert config.output_projection_lora_rank == 64
 
 
 class TestMegatronMixedPrecisionArguments:

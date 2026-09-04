@@ -3681,11 +3681,11 @@ def _add_mla_args(parser):
                        help="Mscale for YaRN RoPE in multi-latent attention.")
     group.add_argument('--mscale-all-dim', type=float, default=0.0,
                        help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
-    group.add_argument('--o-groups', type=int, default=8,
+    group.add_argument('--output-projection-groups', type=int, default=8,
                        help="Number of groups for grouped low-rank output projection (wo_a).")
-    group.add_argument('--o-lora-rank', type=int, default=1024,
+    group.add_argument('--output-projection-lora-rank', type=int, default=1024,
                        help="Low-rank dimension per group for grouped output (wo_a). "
-                            "Used when o-groups > 0.")
+                            "Used when --output-projection-groups > 0.")
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
                        help="If set caches the mla down projected latents with mla flash decode.")
     group.add_argument(
