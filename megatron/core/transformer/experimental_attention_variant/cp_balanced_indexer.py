@@ -31,14 +31,15 @@ removed.)
 
 Triage switch: ``MCORE_DSA_CP_BAL_DEBUG=1`` logs the eligibility decision once.
 
-CUDA-graph contract: the default mode is scoped to static pack compositions at PP=1 and is
-enforced through ``prebuild_balanced_layouts`` — under CUDA graphs it MUST be called every
-microbatch (as ``pretrain_gpt.get_batch`` does); frontends that skip it lose the
-composition-change detection and are protected only by the in-graph divisibility assert.
-The separate opt-in ``dsa_cp_balance_indexer_graph_dynamic_packs`` mode instead validates
-every padded pack and builds one fixed-capacity, two-hop equal-split A2A route in that hook.
-The same fixed-shape route plan is supplied as CUDA-graph tensor inputs to every DSA layer, so a
-replay can refresh metadata for a different pack without recapturing or repeating route sorts.
+CUDA-graph contract: static pack compositions at PP=1 are enforced through
+``prebuild_balanced_layouts`` — under CUDA graphs it MUST be called every microbatch (as
+``pretrain_gpt.get_batch`` does); frontends that skip it lose the composition-change detection
+and are protected only by the in-graph divisibility assert. When the balanced indexer is used
+with the ``dp_balanced`` scheduler and Transformer Engine CUDA graphs that capture attention,
+dynamic-pack mode is selected automatically. It validates every padded pack and builds one
+fixed-capacity, two-hop equal-split A2A route in that hook. The same fixed-shape route plan is
+supplied as CUDA-graph tensor inputs to every DSA layer, so replay can refresh metadata for a
+different pack without recapturing or repeating route sorts.
 """
 
 import logging
@@ -222,7 +223,7 @@ def dispatch_chunks_async(
     - ``"zzr"``: zigzag + prebuilt-route ``all_to_all_single`` — each rank exchanges
       only ~``l_local`` rows; splits/rows come from ``prebuild_balanced_layouts``
       (host ints), so the exchange is CUDA-graph capturable.
-    - ``"gdr"`` / ``"gdr2"``: opt-in replay-dynamic two-hop equal-split A2A;
+    - ``"gdr"`` / ``"gdr2"``: replay-dynamic two-hop equal-split A2A;
       metadata and invocation-owned staging buffers are captured with the graph.
     - ``"ag"``: zigzag fallback — no usable routed plan (never prebuilt, capacity
       mismatch, or plan lacks route fields): one static-shape S-row AllGather of the
@@ -1415,7 +1416,6 @@ def balanced_compute_cp_indexer_topk(
     topk,
     softmax_scale,
     max_seqlen_q,
-    use_fused=True,
     dispatch_handle=None,
     layout_cache=None,
     graph_dynamic_packs=False,
@@ -1432,11 +1432,13 @@ def balanced_compute_cp_indexer_topk(
     routes a pack with a sequence length not divisible by ``2 * cp_size`` to the
     contiguous reference path before dispatch; the internal check here still raises if
     a caller bypasses that routing and reaches the zigzag builders with an invalid pack.
+    Synthetic zigzag scoring is always fused; only ordinary-layout degenerate calls may
+    fall back to the unfused reference scorer when they exceed the fused safe-row limit.
     """
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils as _cu
 
     if graph_dynamic_packs:
-        # Defensive even for direct callers: the opt-in path has no host route/layout
+        # Defensive even for direct callers: the replay-dynamic path has no host route/layout
         # cache contract. All composition-dependent tensors come from the current
         # invocation's prebuilt source plan and are supplied as graph inputs.
         layout_cache = None
@@ -1464,7 +1466,7 @@ def balanced_compute_cp_indexer_topk(
             if gs_ == int(global_start) and rows_ == l_local:
                 return graph_plan["output_layout"]
             # Do not call cp_utils._build_cp_indexer_layout here: that helper is
-            # torch.compile'd, while this opt-in path intentionally records only
+            # torch.compile'd, while this replay-dynamic path intentionally records only
             # ordinary CUDA ops (the controlled GB200 toy exposed an Inductor
             # miscompile for the replay-dynamic builder). Degenerate subrange calls
             # still build their one-off layout here; the normal full-rank layout is
@@ -1503,10 +1505,10 @@ def balanced_compute_cp_indexer_topk(
         # Project -> per-chunk RoPE at the chunk's true global positions (the real ``cu_seqlens`` is
         # passed, so multi-sequence packs get correct per-segment positions) -> rotate -> reference
         # top-k. Delegating to ``compute_cp_indexer_topk`` reuses its multi-segment layout builder
-        # and its fused/unfused split, so ``use_fused=False`` is honored. A query's top-k depends
-        # only on its own position and K, so scoring a chunk matches the same rows of a full call
-        # (up to GEMM reduction order of the chunked projection: exact score ties may resolve
-        # differently; the output is integer indices with no gradient path).
+        # and fused scorer. A query's top-k depends only on its own position and K, so scoring a
+        # chunk matches the same rows of a full call (up to GEMM reduction order of the chunked
+        # projection: exact score ties may resolve differently; the output is integer indices
+        # with no gradient path).
         with _no_fp8_ctx():  # keep the loss path's FP8 amax stream reference-identical
             q, _ = indexer.linear_wq_b(qr_rows.reshape(sz, 1, q_lora))
         q = q.reshape(sz, n_heads, head_dim)
@@ -1540,7 +1542,7 @@ def balanced_compute_cp_indexer_topk(
         # _build_cp_indexer_layout result, so unfused masking is valid). Legacy
         # callers of compute_cp_indexer_topk are NOT rerouted (see the policy note
         # on FUSED_INDEXER_MAX_SAFE_ROWS).
-        use_fused_here = use_fused and sz <= _cu.FUSED_INDEXER_MAX_SAFE_ROWS
+        use_fused_here = sz <= _cu.FUSED_INDEXER_MAX_SAFE_ROWS
         # Exact causal need for this chunk, rounded UP to the shared width quantum
         # (see _KV_BOUND_QUANTUM/_KV_TIGHT_WIDTH_CEILING at module scope for the
         # kernel contract). Rounding up is always safe: the kernel's block count is
@@ -1549,12 +1551,9 @@ def balanced_compute_cp_indexer_topk(
         bound = min(gkv, (gs + sz) // int(ratio))
         q_ = _KV_BOUND_QUANTUM
         bound_q = max(q_, (bound + q_ - 1) // q_ * q_)
-        # Full width with the real layout beyond the tight-width ceiling: always
+        # Full width with the real layout beyond the tight-width ceiling is always
         # safe (width == declared per-sequence length, the reference call's
-        # contract shape). The former single-full-pack K-prefix special case died
-        # with the folding fallback — _chunk_topk now only serves the degenerate
-        # exits, where the kernel either never runs or the pack is far below the
-        # ceiling.
+        # contract shape).
         k_pass = k_seq_major
         layout_pass = _layout_at(gs, sz)
         if bound_q <= _KV_TIGHT_WIDTH_CEILING:
@@ -1671,8 +1670,8 @@ def balanced_compute_cp_indexer_topk(
         )
         return tk
 
-    # Per-call tight compressed-K bounds (K-slice generalized per segment); the
-    # capture-safe fallback plan carries no bounds and keeps the full width.
+    # Per-call tight compressed-K score widths; the capture-safe fallback plan
+    # carries no bounds and keeps the full width.
     # NOTE: this runtime fallback width (gkv = max_seqlen_q // ratio, the
     # reference call's contract shape) is narrower than prebuild's
     # _kv_bounds fallback (total // ratio): prebuild cannot trust
@@ -1681,19 +1680,14 @@ def balanced_compute_cp_indexer_topk(
     # differs.
     mkv_h = gkv if graph_dynamic_packs else int(plan.get("mkv_head", gkv))
     mkv_t = gkv if graph_dynamic_packs else int(plan.get("mkv_tail", gkv))
-    k_rows_total = k_seq_major.shape[0]
-    # Host-int invariants (free): a plan's K-slice end can never exceed the
-    # physical K buffer of the pack it was built for, and a prebuilt plan must
-    # have been built for this compress ratio; a violation means a stale or
-    # foreign plan is being consumed. Real raises, not asserts: these guard
-    # silent corruption and must survive ``python -O``. (mkv_* is a rounded-up
-    # score-buffer CAPACITY — floored at the width quantum — not a need, so it
-    # has no such bound.)
-    if (
-        plan.get("k_end_head", 0) > k_rows_total
-        or plan.get("k_end_tail", 0) > k_rows_total
-        or plan.get("_ratio", ratio) != ratio
-    ):
+    k_rows_total = int(k_seq_major.shape[0])
+    expected_k_rows = (int(cp_size) * int(l_local)) // int(ratio)
+    # Host-int invariants (free): the sequence-major K tensor is the full fixed-capacity
+    # buffer produced by ``prepare_cp_compressor_input`` and a prebuilt plan must use this
+    # compressor ratio. The valid count in ``cu_seqlens_compressed[-1]`` can be smaller
+    # than this physical buffer because capacity-padding rows are retained. Real raises,
+    # not asserts: these guard silent corruption and must survive ``python -O``.
+    if k_rows_total != expected_k_rows or plan.get("_ratio", ratio) != ratio:
         # Complete any in-flight dispatch first: an orphaned NCCL work could
         # see the persistent staging buffers rewritten during teardown. The
         # inputs to this check are per-rank host ints, so the raise itself
@@ -1705,25 +1699,10 @@ def balanced_compute_cp_indexer_topk(
             for work in dispatch_handle["works"]:
                 work.wait()
         raise RuntimeError(
-            "balanced CP indexer: stale or foreign zigzag plan (K-slice ends "
-            f"{plan.get('k_end_head')}/{plan.get('k_end_tail')} vs {k_rows_total} "
-            f"K rows, plan ratio {plan.get('_ratio')} vs {ratio})."
+            "balanced CP indexer: invalid full-K shape or stale zigzag plan "
+            f"({k_rows_total} vs expected {expected_k_rows} K rows, "
+            f"plan ratio {plan.get('_ratio')} vs {ratio})."
         )
-    # NOTE: k_h / k_t must stay prefix VIEWS of the full gathered buffer. The
-    # packed layouts may declare per-sequence K ranges past the slice end
-    # (mkv_* is a capacity, k_end_* the true causal need); reads past the
-    # slice land on valid full-buffer memory only while these are views — a
-    # .contiguous() here would turn them into real out-of-bounds reads.
-    k_h = (
-        k_seq_major[: plan["k_end_head"]]
-        if plan.get("k_end_head", k_rows_total) < k_rows_total
-        else k_seq_major
-    )
-    k_t = (
-        k_seq_major[: plan["k_end_tail"]]
-        if plan.get("k_end_tail", k_rows_total) < k_rows_total
-        else k_seq_major
-    )
 
     nvtx_range_push("Bal_Dispatch")
     if dispatch_handle is not None:
@@ -1803,11 +1782,11 @@ def balanced_compute_cp_indexer_topk(
 
     nvtx_range_push("BalancedIndexerScore")
     nvtx_range_push("Bal_Head")
-    tk_head = _packed_topk(qr_h, w_h, head_layout, plan["pos_head"], k_h, mkv_h)
+    tk_head = _packed_topk(qr_h, w_h, head_layout, plan["pos_head"], k_seq_major, mkv_h)
     del qr_h, w_h
     nvtx_range_pop("Bal_Head")
     nvtx_range_push("Bal_Tail")
-    tk_tail = _packed_topk(qr_t, w_t, tail_layout, plan["pos_tail"], k_t, mkv_t)
+    tk_tail = _packed_topk(qr_t, w_t, tail_layout, plan["pos_tail"], k_seq_major, mkv_t)
     del qr_t, w_t
     nvtx_range_pop("Bal_Tail")
     nvtx_range_pop("BalancedIndexerScore")
@@ -1933,7 +1912,7 @@ def prebuild_balanced_layouts(
         l_local = total // N if total > 0 else 0
 
     if graph_dynamic_packs:
-        # The opt-in graph path validates and builds one invocation-owned tensor
+        # The graph-dynamic path validates and builds one invocation-owned tensor
         # plan here. It deliberately publishes neither a host layout cache nor a
         # module-level verdict; TE receives the source plan through fixed-shape
         # per-callable input surfaces.
@@ -2055,8 +2034,9 @@ def prebuild_balanced_layouts(
             f"balanced CP indexer: per-rank pack capacity {l_local} would issue fused "
             f"indexer calls of {l_local // 2} rows, above the verified-safe limit of "
             f"{FUSED_INDEXER_MAX_SAFE_ROWS} for the current fused kernel package. "
-            "Increase the CP degree or reduce the pack capacity, or run the indexer "
-            "unfused."
+            "Increase the CP degree or reduce the pack capacity, or disable "
+            "dsa_cp_balance_indexer and use the contiguous reference path with an "
+            "unfused backend."
         )
 
     dev, dt = cu.device, cu.dtype
@@ -2138,34 +2118,28 @@ def prebuild_balanced_layouts(
     cmb_send_rows = disp_recv_rows
     cmb_recv_rows = torch.argsort(inv_idx, stable=True)
 
-    # ---- per-call tight compressed-K bounds (K-slice generalized per segment) --------
+    # ---- per-call tight compressed-K score widths -----------------------------
     gkv = max(1, total // ratio)
     comp_lens_list = [int(v) for v in comp_lens.tolist()] + [0]
-    cu_comp_list = [int(v) for v in cu_comp.tolist()]
 
     def _kv_bounds(chunk_idx):
-        spans, ends = [1], [1]
-        for i, (ci, cl) in enumerate(zip(c_list, comp_lens_list)):
+        spans = [1]
+        for ci, cl in zip(c_list, comp_lens_list):
             if ci == 0 or cl == 0:
                 continue
             span = min(cl, -(-((chunk_idx + 1) * ci) // ratio))
             spans.append(span)
-            ends.append(cu_comp_list[i] + span)
         span = max(spans)
         q_ = _KV_BOUND_QUANTUM
         bound = max(q_, ((span + q_ - 1) // q_) * q_)
         # Tight widths past the ceiling are unsafe (see the module-scope kernel
         # contract note); fall back to the full compressed width.
-        # max(1, ...): a degenerate pack whose every sequence is shorter than the
-        # compress ratio has zero compressed rows; k_end == 0 would slice an empty K.
-        # (The consumer's ``comp == 0`` early-exit fires first for truly empty
-        # buffers, so the clamp is pure defense.)
         if bound > _KV_TIGHT_WIDTH_CEILING or bound >= gkv:
-            return gkv, max(1, cu_comp_list[-1])
-        return bound, max(1, min(max(ends), cu_comp_list[-1]))
+            return gkv
+        return bound
 
-    mkv_head, k_end_head = _kv_bounds(r)
-    mkv_tail, k_end_tail = _kv_bounds(nch - 1 - r)
+    mkv_head = _kv_bounds(r)
+    mkv_tail = _kv_bounds(nch - 1 - r)
 
     plan = {
         "gather_idx": gather_idx.long(),
@@ -2182,9 +2156,7 @@ def prebuild_balanced_layouts(
         "cmb_send_rows": cmb_send_rows.long(),
         "cmb_recv_rows": cmb_recv_rows.long(),
         "mkv_head": mkv_head,
-        "k_end_head": k_end_head,
         "mkv_tail": mkv_tail,
-        "k_end_tail": k_end_tail,
         "_ratio": ratio,
         "_cu_list": cu_list,
     }
