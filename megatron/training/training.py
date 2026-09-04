@@ -3357,6 +3357,31 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
 
 
+def _get_indexer_logging_layer_counts(args) -> tuple[int, int | None]:
+    """Return tracker slots and active CSA indexer modules for loss logging."""
+    tracker_layers = args.num_layers + (args.mtp_num_layers or 0)
+    if args.csa_compress_ratios is None:
+        return tracker_layers, None
+
+    ratios = args.csa_compress_ratios
+    if is_hybrid_model(args):
+        from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
+
+        parsed_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+        mtp_pattern_layers = len(parsed_pattern.mtp_pattern or "")
+        tracker_layers = args.num_layers + mtp_pattern_layers
+        main_indexers = sum(ratio == 4 for ratio in ratios[: args.num_layers])
+        mtp_indexers_per_depth = sum(
+            ratio == 4 for ratio in ratios[args.num_layers : tracker_layers]
+        )
+        mtp_indexer_repeats = 1 if args.mtp_use_repeated_layer else parsed_pattern.mtp_num_depths
+        indexer_layers = main_indexers + (mtp_indexers_per_depth * mtp_indexer_repeats)
+    else:
+        indexer_layers = sum(ratio == 4 for ratio in ratios[:tracker_layers])
+
+    return tracker_layers, 0 if args.csa_dense_mode else indexer_layers
+
+
 def training_log(
     loss_dict,
     total_loss_dict,
@@ -3624,12 +3649,31 @@ def training_log(
     # Track sparse attention indexer loss.
     if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
         indexer_loss_scale = 1 / get_num_microbatches()
+        if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+            assert pg_collection.has_language_model(), (
+                "DSA indexer logging requires a language-model ProcessGroupCollection"
+            )
+            pg_collection = pg_collection.get_language_model_collection()
+        if pg_collection is None:
+            # Compatibility path for legacy training entrypoints such as tasks/finetune_utils.py.
+            # The core logger still receives explicit groups and does not read MPU globals.
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['pp', 'dp']
+            )
+        assert isinstance(
+            pg_collection, ProcessGroupCollection
+        ), "DSA indexer logging requires a ProcessGroupCollection"
+        indexer_tracker_layers, indexer_layer_count = _get_indexer_logging_layer_counts(args)
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
             iteration=iteration,
             writer=writer,
+            pg_collection=pg_collection,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
+            num_layers=indexer_tracker_layers,
+            num_indexer_layers=indexer_layer_count,
+            preserve_groups=args.cuda_graph_impl != "none",
         )
 
     # Dump memory snapshot and print metrics to stdout.
