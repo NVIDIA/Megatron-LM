@@ -60,6 +60,7 @@ class _MoKAutograd(torch.autograd.Function):
         top_experts: torch.Tensor,
         *parameters: torch.Tensor,
     ) -> torch.Tensor:
+        """Run MOK forward and retain the state needed by backward."""
         from mok import functional
 
         num_routed_parameters = len(module.autograd_routed_parameters)
@@ -119,6 +120,7 @@ class _MoKAutograd(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        """Run MOK backward and return gradients for its autograd inputs."""
         from mok import functional
 
         x, router_weights, *parameters = ctx.saved_tensors

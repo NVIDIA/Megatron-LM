@@ -156,18 +156,21 @@ class MoKMegakernel(MegakernelBackend):
 
     @property
     def routed_fc1_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return the MCore-owned routed FC1 parameters."""
         if self.native_single_grouped_weights:
             return (self.routed_fc1_weight,)
         return tuple(getattr(self, name) for name in self._routed_fc1_parameter_names)
 
     @property
     def routed_fc2_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return the MCore-owned routed FC2 parameters."""
         if self.native_single_grouped_weights:
             return (self.routed_fc2_weight,)
         return tuple(getattr(self, name) for name in self._routed_fc2_parameter_names)
 
     @property
     def autograd_routed_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return routed parameters tracked by the MOK autograd bridge."""
         return self.routed_fc1_parameters + self.routed_fc2_parameters
 
     def main_grad_arguments(self):
@@ -196,6 +199,7 @@ class MoKMegakernel(MegakernelBackend):
         return main_grads, self._split_main_grad_descriptor_cache[1]
 
     def finish_routed_weight_gradients(self) -> tuple[torch.Tensor, ...]:
+        """Finalize and return routed weight gradients."""
         return tuple(_finish_weight_gradient(param) for param in self.autograd_routed_parameters)
 
     @torch.no_grad()
