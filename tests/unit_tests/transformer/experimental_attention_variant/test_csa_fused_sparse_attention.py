@@ -3732,6 +3732,104 @@ class TestRealKernelFusedIndexerSparseAttnThd:
             f"abs diff = {(loss_thd - loss_sbhd).abs().item():.3e}"
         )
 
+    def test_raw_thd_tail_padding_backward_uses_dummy_tile(self, reset_lazy_kernel_state):
+        """Raw THD tail padding supplies a harmless tile to DSA backward.
+
+        CUDA graphs keep Q-side tensors at a static capacity, which may leave
+        physical rows beyond the last packed-sequence endpoint. Raw THD
+        lowering emits all ``-1`` indices for those rows, so FlashMLA forward
+        sees ``topk_length == 0``. DSA backward instead requires at least one
+        tile; the fused wrapper must pass length 1 after sanitizing the index.
+        """
+        _skip_if_real_kernels_unavailable(need_flash_mla=True)
+        s = self.SHAPES
+        torch.manual_seed(2)
+        dev = 'cuda'
+        real_q = s['sq']
+        tail_q = 128
+        total_q = real_q + tail_q
+        n_comp = 128
+        indexer_topk = 128
+        kv_offset = real_q
+
+        query = torch.randn(
+            total_q, s['np_'], s['d'], dtype=torch.bfloat16, device=dev, requires_grad=True
+        )
+        kv_full = torch.randn(
+            kv_offset + n_comp, s['d'], dtype=torch.bfloat16, device=dev, requires_grad=True
+        )
+        attn_sink = torch.zeros(s['np_'], dtype=torch.float32, device=dev, requires_grad=True)
+        q_indexer = torch.randn(total_q, s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, device=dev)
+        k_indexer = torch.randn(n_comp, s['idx_hd'], dtype=torch.bfloat16, device=dev)
+        weights = torch.randn(total_q, s['idx_nh'], dtype=torch.bfloat16, device=dev)
+
+        cu_q = _make_cu_seqlens([real_q], device=dev)
+        cu_q_unpadded = cu_q.clone()
+        cu_kv = _make_cu_seqlens([kv_offset], device=dev)
+        cu_comp_idx = _make_cu_seqlens([n_comp], device=dev)
+        compressed_kv = kv_full.detach()[kv_offset:]
+
+        _ensure_dsa_namespace()
+        _ensure_flash_mla()
+        real_sparse_attention_backward = dk._DSA.sparse_attention_backward_wrapper
+        real_flash_mla = dk._flash_mla_sparse_fwd
+        seen = {}
+
+        def capture_flash_mla(*args, **kwargs):
+            seen['forward_topk_length'] = kwargs['topk_length'].detach().clone()
+            return real_flash_mla(*args, **kwargs)
+
+        def capture_sparse_attention_backward(*args, **kwargs):
+            seen['backward_topk_length'] = kwargs['topk_length'].detach().clone()
+            seen['topk_idxs'] = args[6].detach().clone()
+            return real_sparse_attention_backward(*args, **kwargs)
+
+        with (
+            patch.object(dk, '_flash_mla_sparse_fwd', side_effect=capture_flash_mla),
+            patch.object(
+                dk._DSA,
+                'sparse_attention_backward_wrapper',
+                side_effect=capture_sparse_attention_backward,
+            ),
+        ):
+            output, _ = fused_csa_indexer_sparse_attn(
+                query,
+                kv_full,
+                attn_sink,
+                None,
+                q_indexer,
+                k_indexer,
+                weights,
+                indexer_topk=indexer_topk,
+                ratio=s['ratio'],
+                softmax_scale=s['softmax_scale'],
+                indexer_softmax_scale=s['indexer_softmax_scale'],
+                loss_coeff=0.0,
+                sparse_loss=True,
+                kv_offset=0,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_kv=cu_kv,
+                cu_seqlens_compressed_idx=cu_comp_idx,
+                max_seqlen_q=real_q,
+                max_seqlen_compressed_idx=n_comp,
+                compressed_kv=compressed_kv,
+                cu_seqlens_q_unpadded=cu_q_unpadded,
+                thd_window_size=s['win_topk'],
+                thd_compressed_is_sequence_major=True,
+            )
+            output.sum().backward()
+
+        expected_forward_tail_length = torch.zeros(tail_q, dtype=torch.int32, device=dev)
+        expected_tail_length = torch.ones(tail_q, dtype=torch.int32, device=dev)
+        assert torch.equal(seen['forward_topk_length'][real_q:], expected_forward_tail_length)
+        assert torch.equal(seen['backward_topk_length'][real_q:], expected_tail_length)
+        assert torch.all(seen['topk_idxs'] >= 0)
+        assert query.grad is not None
+        assert torch.all(query.grad[real_q:] == 0)
+        assert torch.isfinite(query.grad[:real_q]).all()
+        assert kv_full.grad is not None and torch.isfinite(kv_full.grad).all()
+        assert attn_sink.grad is not None and torch.isfinite(attn_sink.grad).all()
+
 
 # ---------------------------------------------------------------------------
 # THD padding-row masking: cu_seqlens_q_unpadded excludes padding from loss

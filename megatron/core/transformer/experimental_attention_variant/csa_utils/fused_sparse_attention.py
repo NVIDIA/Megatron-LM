@@ -1607,6 +1607,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             real_len_per_row = real_seg_lens[row_batch_ids].to(torch.int32)
             padding_row_mask = pos_in_seg >= real_len_per_row
 
+        if padding_row_mask is not None:
             # FlashMLA correctly treats a zero-length row as sink-only, but
             # cuDNN DSA backward requires at least one tile. The indices were
             # sanitized above, so make padding rows consume one harmless
