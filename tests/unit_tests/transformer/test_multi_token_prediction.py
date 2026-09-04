@@ -1362,6 +1362,60 @@ class TestMultiTokenPredictionLayer:
         assert output_weight.grad is not None
         assert torch.count_nonzero(output_weight.grad) == 0
 
+    @pytest.mark.parametrize(
+        ("normalize_by_main_tokens", "expected_valid_gradient"), [(False, 4.0 / 3.0), (True, 1.0)]
+    )
+    def test_process_mtp_loss_main_token_normalization_is_opt_in(
+        self, normalize_by_main_tokens, expected_valid_gradient
+    ):
+        """The opt-in path leaves MTP as a sum for global main-token finalization."""
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.0,
+            mtp_normalize_loss_by_main_tokens=normalize_by_main_tokens,
+            calculate_per_token_loss=True,
+            num_layers=2,
+            hidden_size=1,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        seq_len = 4
+        hidden_states = torch.ones(2 * seq_len, 1, 1, requires_grad=True)
+        mtp_module.MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+
+        result = process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=torch.arange(seq_len).unsqueeze(0),
+            loss_mask=torch.ones(1, seq_len),
+            output_layer=lambda hidden, **kwargs: (hidden, None),
+            output_weight=None,
+            is_training=False,
+            compute_language_model_loss=lambda labels, logits: logits.squeeze(-1).transpose(0, 1),
+            config=config,
+        )
+        result.sum().backward()
+
+        mtp_grad = hidden_states.grad[seq_len:, 0, 0]
+        expected = torch.tensor(
+            [expected_valid_gradient] * (seq_len - 1) + [0.0], dtype=mtp_grad.dtype
+        )
+        assert torch.allclose(mtp_grad, expected)
+
+    def test_main_token_mtp_normalization_requires_per_token_loss(self):
+        with pytest.raises(
+            ValueError,
+            match="mtp_normalize_loss_by_main_tokens=True requires calculate_per_token_loss=True",
+        ):
+            TransformerConfig(
+                mtp_num_layers=1,
+                mtp_normalize_loss_by_main_tokens=True,
+                calculate_per_token_loss=False,
+                num_layers=2,
+                hidden_size=1,
+                num_attention_heads=1,
+                use_cpu_initialization=True,
+            )
+
     def test_process_mtp_loss_masks_later_steps_after_invalid_input(self):
         """Mask an MTP prediction after its conditioning path reaches an invalid token."""
         config = TransformerConfig(

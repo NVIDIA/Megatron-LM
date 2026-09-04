@@ -1346,7 +1346,12 @@ def process_mtp_loss(
                 num_tokens=num_tokens if config.calculate_per_token_loss else None,
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
-        if config.calculate_per_token_loss:
+        if config.calculate_per_token_loss and config.mtp_normalize_loss_by_main_tokens:
+            # Preserve the loss as a sum. Gradient finalization divides the accumulated main
+            # and MTP gradients once by the global main-loss token count, making the result
+            # invariant to rank and microbatch partitioning.
+            mtp_loss_normalized = mtp_loss_scale * mtp_loss
+        elif config.calculate_per_token_loss:
             # finalize_model_grads divides by the global main-loss token count.
             # Use one main/MTP token ratio for this logical microbatch, independent
             # of its CP partition. Rolling and masking can leave different ratios
