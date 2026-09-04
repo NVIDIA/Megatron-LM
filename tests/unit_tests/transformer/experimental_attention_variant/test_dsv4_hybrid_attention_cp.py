@@ -843,10 +843,16 @@ class TestDSv4HybridAttentionTHDCP:
         del attn, full_hidden, full_grad, hidden, grad
         _clear_cuda_test_state()
 
-    @pytest.mark.parametrize("apply_rope_fusion", [True, False], ids=["fused", "unfused"])
-    def test_dynamic_cp_mla_up_proj_recompute_matches_eager(self, apply_rope_fusion):
+    @pytest.mark.parametrize(
+        "use_fused_kernels,apply_rope_fusion",
+        [(False, True), (False, False), (True, True)],
+        ids=["unfused-attn-fused-rope", "unfused-attn-unfused-rope", "fused-attn"],
+    )
+    def test_dynamic_cp_mla_up_proj_recompute_matches_eager(
+        self, use_fused_kernels, apply_rope_fusion
+    ):
         """Selective MLA recompute must retain the microbatch's dynamic CP group."""
-        if apply_rope_fusion and not self.fused_kernels_available:
+        if (use_fused_kernels or apply_rope_fusion) and not self.fused_kernels_available:
             pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
 
         packed, padded_tokens, local_idx = _make_ragged_cp_case(self.cp_size, self.cp_rank)
@@ -858,13 +864,13 @@ class TestDSv4HybridAttentionTHDCP:
         eager_config = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=0.0,
-            use_fused_kernels=False,
+            use_fused_kernels=use_fused_kernels,
             apply_rope_fusion=apply_rope_fusion,
         )
         recompute_config = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=0.0,
-            use_fused_kernels=False,
+            use_fused_kernels=use_fused_kernels,
             apply_rope_fusion=apply_rope_fusion,
         )
         recompute_config.recompute_granularity = "selective"
@@ -890,7 +896,7 @@ class TestDSv4HybridAttentionTHDCP:
             recompute_attn, hidden.detach().clone().requires_grad_(True), grad, packed
         )
 
-        mode = f"dynamic_cp:rope_fused={apply_rope_fusion}"
+        mode = f"dynamic_cp:attn_fused={use_fused_kernels}:rope_fused={apply_rope_fusion}"
         _assert_cp_tensor_match(recompute_result[0], eager_result[0], f"{mode}:output")
         _assert_cp_tensor_match(recompute_result[1], eager_result[1], f"{mode}:hidden_grad")
         assert recompute_result[2].keys() == eager_result[2].keys()

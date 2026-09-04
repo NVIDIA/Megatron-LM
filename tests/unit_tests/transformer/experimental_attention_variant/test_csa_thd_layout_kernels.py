@@ -6,13 +6,14 @@ import pytest
 import torch
 
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
-    cp_layout_kernels as csa_cp_layout_kernels,
+    thd_indexer_kernels,
+    thd_layout_kernels,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
     prepare_cp_compressor_input,
 )
 
-# This file guards only DSv4 CP layout/metadata kernels. Layer-level CUDA graph
+# This file guards only DSv4 THD layout/metadata kernels. Layer-level CUDA graph
 # tests guard graph capture/replay behavior.
 
 _E2E_RAGGED_PADDED_SEG_LENS = (1, 127, 1000, 23, 129, 900, 55, 257, 800, 95, 509, 200)
@@ -22,8 +23,15 @@ _E2E_CP_SIZE = 4
 def _require_cute_cuda():
     if not torch.cuda.is_available():
         pytest.skip("DSv4 CP CuTe kernels require CUDA.")
-    if not csa_cp_layout_kernels._CUTE_AVAILABLE:
+    if not thd_layout_kernels._CUTE_AVAILABLE:
         pytest.skip("DSv4 CP CuTe kernels are not available in this environment.")
+
+
+def _require_triton_cuda():
+    if not torch.cuda.is_available():
+        pytest.skip("DSv4 THD indexer glue kernels require CUDA.")
+    if not thd_indexer_kernels._TRITON_AVAILABLE:
+        pytest.skip("DSv4 THD indexer Triton kernels are not available in this environment.")
 
 
 def _make_e2e_like_cu_seqlens(device: str = "cuda") -> torch.Tensor:
@@ -132,6 +140,57 @@ def _native_compressor_input_compact(
     for slot, (_, comp_id) in enumerate(groups[:c_cap]):
         comp_ids[slot] = comp_id
     return hidden_compact, comp_ids
+
+
+def _native_cp_compressor_metadata(
+    cu_seqlens: torch.Tensor,
+    global_start: int,
+    l_local: int,
+    ratio: int,
+    d_comp: int,
+    c_cap: int,
+    cp_size: int,
+):
+    """Build a simple host reference for the metadata emitted during compaction."""
+    cu = [int(x) for x in cu_seqlens.cpu().tolist()]
+    groups = _compressed_groups(cu_seqlens, global_start, l_local, ratio, d_comp)
+
+    position_values = [comp_id * ratio for _, comp_id in groups[:c_cap]]
+    position_values.extend([0] * (c_cap - len(position_values)))
+    position_ids = torch.tensor(position_values, dtype=torch.int32, device=cu_seqlens.device)
+
+    local_counts = [0] * (len(cu) - 1)
+    for seq, _ in groups:
+        local_counts[seq] += 1
+    local_cuc_values = [0]
+    global_cuc_values = [0]
+    for seq, local_count in enumerate(local_counts):
+        local_cuc_values.append(local_cuc_values[-1] + local_count)
+        global_cuc_values.append(global_cuc_values[-1] + (cu[seq + 1] - cu[seq]) // ratio)
+    local_cuc = torch.tensor(local_cuc_values, dtype=torch.int32, device=cu_seqlens.device)
+    local_cu = local_cuc * ratio
+    global_cuc = torch.tensor(global_cuc_values, dtype=torch.int32, device=cu_seqlens.device)
+
+    rank_rows = []
+    for logical_row in range((l_local * cp_size) // ratio):
+        if logical_row >= global_cuc_values[-1]:
+            rank_rows.append(-1)
+            continue
+        seq_id = 0
+        while logical_row >= global_cuc_values[seq_id + 1]:
+            seq_id += 1
+        comp_id = logical_row - global_cuc_values[seq_id]
+        owner_rank = min(cp_size - 1, max(0, (cu[seq_id] + (comp_id + 1) * ratio - 1) // l_local))
+        rank_start = owner_rank * l_local
+        first_seq_id = 0
+        while first_seq_id + 1 < len(cu) - 1 and rank_start >= cu[first_seq_id + 1]:
+            first_seq_id += 1
+        first_numer = max(0, rank_start - d_comp - cu[first_seq_id])
+        first_comp_id = (first_numer + ratio - 1) // ratio
+        first_logical_row = global_cuc_values[first_seq_id] + first_comp_id
+        rank_rows.append(owner_rank * c_cap + logical_row - first_logical_row)
+    seq_to_rank_row = torch.tensor(rank_rows, dtype=torch.int32, device=cu_seqlens.device)
+    return position_ids, local_cu, local_cuc, global_cuc, seq_to_rank_row
 
 
 def _native_attention_indices(
@@ -251,6 +310,47 @@ def _native_indexer_loss_indices(
     return topk, rank_major
 
 
+@pytest.mark.parametrize("with_causal_offsets", [False, True])
+def test_build_indexer_seq_lens_matches_native(with_causal_offsets):
+    _require_triton_cuda()
+    cu_q = torch.tensor([0, 5, 5, 9], dtype=torch.int32, device="cuda")
+    cu_kv = torch.tensor([0, 2, 2, 5], dtype=torch.int32, device="cuda")
+    causal_offsets = (
+        torch.tensor([3, 0, 1], dtype=torch.int32, device="cuda") if with_causal_offsets else None
+    )
+    total_q = 12
+    ratio = 4
+
+    actual = thd_indexer_kernels.build_seq_lens(cu_q, cu_kv, total_q, ratio, causal_offsets)
+    expected = thd_indexer_kernels._build_seq_lens_fallback(
+        cu_q, cu_kv, total_q, ratio, causal_offsets
+    )
+    assert torch.equal(actual, expected)
+
+
+def test_sanitize_indexer_topk_matches_native():
+    _require_triton_cuda()
+    scores = torch.tensor(
+        [[0.0, 1.0, -torch.inf, 3.0], [0.0, torch.nan, 2.0, 3.0], [0.0, 1.0, torch.inf, 3.0]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    candidates = torch.tensor(
+        [[0, 1, 2, 4, -1], [1, 2, 3, 0, -1], [2, 3, 1, 0, -1]], dtype=torch.int32, device="cuda"
+    )
+    seq_lens = torch.tensor([4, 3, 4], dtype=torch.int32, device="cuda")
+
+    output_width = candidates.shape[1] + 2
+    actual = thd_indexer_kernels.sanitize_topk(
+        candidates, scores, seq_lens, output_width=output_width
+    )
+    expected = thd_indexer_kernels._sanitize_topk_fallback(
+        candidates, scores, seq_lens, output_width=output_width
+    )
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])
+
+
 def test_compressor_input_compact_matches_native_forward_backward():
     _require_cute_cuda()
     cu = _make_e2e_like_cu_seqlens()
@@ -286,12 +386,17 @@ def test_compressor_input_compact_matches_native_forward_backward():
     hidden.grad.zero_()
     boundary.grad.zero_()
 
-    fused = csa_cp_layout_kernels.CompressorInputCompact.apply(
-        hidden, boundary, cu, global_start, ratio, d_comp, c_cap
+    fused = thd_layout_kernels.CompressorInputCompact.apply(
+        hidden, boundary, cu, global_start, ratio, d_comp, c_cap, _E2E_CP_SIZE
+    )
+    metadata_ref = _native_cp_compressor_metadata(
+        cu, global_start, l_local, ratio, d_comp, c_cap, _E2E_CP_SIZE
     )
     fused[0].backward(grad)
     assert torch.equal(fused[0], ref[0])
     assert torch.equal(fused[1], ref[1])
+    for actual, expected in zip(fused[2:], metadata_ref):
+        assert torch.equal(actual, expected)
     assert torch.equal(hidden.grad, ref_hidden_grad)
     assert torch.equal(boundary.grad, ref_boundary_grad)
 
@@ -307,7 +412,7 @@ def test_build_attention_indices_matches_native():
     cu_comp = _compressed_cu_seqlens(cu, ratio)
     seq_to_rank_row = torch.arange(int(cu_comp[-1]), dtype=torch.int32, device="cuda").flip(0)
     compressed_base = d_window + l_local
-    fused = csa_cp_layout_kernels.build_attention_indices(
+    fused = thd_layout_kernels.build_attention_indices(
         cu,
         global_start,
         l_local,
@@ -317,6 +422,7 @@ def test_build_attention_indices_matches_native():
         compressed_width,
         cu_seqlens_compressed=cu_comp,
         seq_to_rank_row=seq_to_rank_row,
+        compressed_rows=seq_to_rank_row.shape[0],
     )
     expected = _native_attention_indices(
         cu,
@@ -334,7 +440,7 @@ def test_build_attention_indices_matches_native():
     assert torch.equal(fused[1], expected[1])
 
     logical_ids = torch.tensor([2, 0, -1], dtype=torch.int32, device="cuda").expand(l_local, -1)
-    fused_indexer = csa_cp_layout_kernels.build_attention_indices(
+    fused_indexer = thd_layout_kernels.build_attention_indices(
         cu,
         global_start,
         l_local,
@@ -345,6 +451,7 @@ def test_build_attention_indices_matches_native():
         logical_ids,
         cu_seqlens_compressed=cu_comp,
         seq_to_rank_row=seq_to_rank_row,
+        compressed_rows=seq_to_rank_row.shape[0],
     )
     expected_indexer = _native_attention_indices(
         cu,
@@ -362,7 +469,7 @@ def test_build_attention_indices_matches_native():
     assert torch.equal(fused_indexer[0], expected_indexer[0])
     assert torch.equal(fused_indexer[1], expected_indexer[1])
 
-    padded = csa_cp_layout_kernels.build_attention_indices(
+    padded = thd_layout_kernels.build_attention_indices(
         torch.tensor([0, 8], dtype=torch.int32, device="cuda"), 0, 10, 2, 2, 0, 0
     )
     # Padded THD query rows still need one in-range dummy KV id for fused DSA.
@@ -370,6 +477,54 @@ def test_build_attention_indices_matches_native():
         padded[0][8:10], torch.tensor([[0, -1], [0, -1]], dtype=torch.int32, device="cuda")
     )
     assert torch.equal(padded[1][8:10], torch.tensor([1, 1], dtype=torch.int32, device="cuda"))
+
+
+def test_build_attention_indices_writes_aligned_width():
+    _require_cute_cuda()
+    cu = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
+    cu_comp = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+    logical_ids = torch.tensor([[0, 1, -1], [1, 0, -1]], dtype=torch.int32, device="cuda").repeat(
+        4, 1
+    )
+
+    exact = thd_layout_kernels.build_attention_indices(
+        cu,
+        0,
+        8,
+        0,
+        3,
+        4,
+        logical_ids.shape[-1],
+        logical_ids,
+        cu_seqlens_compressed=cu_comp,
+        for_indexer_loss=True,
+        compressed_base=8,
+        compressed_rows=2,
+        compressed_is_sequence_major=True,
+    )
+    aligned = thd_layout_kernels.build_attention_indices(
+        cu,
+        0,
+        8,
+        0,
+        3,
+        4,
+        logical_ids.shape[-1],
+        logical_ids,
+        cu_seqlens_compressed=cu_comp,
+        for_indexer_loss=True,
+        compressed_base=8,
+        compressed_rows=2,
+        compressed_is_sequence_major=True,
+        output_alignment=8,
+    )
+
+    logical_width = 3 + logical_ids.shape[-1]
+    assert exact[0].shape == (8, logical_width)
+    assert aligned[0].shape == (8, 8)
+    assert torch.equal(aligned[0][:, :logical_width], exact[0])
+    assert torch.all(aligned[0][:, logical_width:] == -1)
+    assert torch.equal(aligned[2], exact[2])
 
 
 def test_build_attention_indices_indexer_loss_mode_matches_native():
@@ -389,7 +544,7 @@ def test_build_attention_indices_indexer_loss_mode_matches_native():
     logical_ids[1::5, -1] = -1
     seq_to_rank_row = torch.arange(int(cu_comp[-1]), dtype=torch.int32, device="cuda").flip(0)
     compressed_base = d_window + l_local
-    fused = csa_cp_layout_kernels.build_attention_indices(
+    fused = thd_layout_kernels.build_attention_indices(
         cu,
         global_start,
         l_local,
@@ -401,6 +556,7 @@ def test_build_attention_indices_indexer_loss_mode_matches_native():
         cu_seqlens_compressed=cu_comp,
         seq_to_rank_row=seq_to_rank_row,
         for_indexer_loss=True,
+        compressed_rows=seq_to_rank_row.shape[0],
     )
     expected = _native_indexer_loss_indices(
         cu,
@@ -418,6 +574,103 @@ def test_build_attention_indices_indexer_loss_mode_matches_native():
     assert torch.equal(fused[2], expected[1])
 
 
+def test_build_attention_indices_emits_padding_mask():
+    _require_cute_cuda()
+    cu_padded = torch.tensor([0, 4, 8, 12], dtype=torch.int32, device="cuda")
+    cu_unpadded = torch.tensor([0, 3, 7, 7], dtype=torch.int32, device="cuda")
+    cu_compressed = _compressed_cu_seqlens(cu_padded, ratio=4)
+    total_q = 14
+    logical_ids = torch.zeros((total_q, 1), dtype=torch.int32, device="cuda")
+
+    actual = thd_layout_kernels.build_attention_indices(
+        cu_padded,
+        0,
+        total_q,
+        2,
+        2,
+        4,
+        1,
+        logical_ids,
+        cu_seqlens_compressed=cu_compressed,
+        for_indexer_loss=True,
+        compressed_base=total_q + 2,
+        compressed_rows=int(cu_compressed[-1]),
+        compressed_is_sequence_major=True,
+        cu_seqlens_unpadded=cu_unpadded,
+    )
+    expected_mask = torch.tensor(
+        [False, False, False, True, False, False, False, False, True, True, True, True, True, True],
+        dtype=torch.bool,
+        device="cuda",
+    )
+    assert actual[3] is not None
+    assert torch.equal(actual[3], expected_mask)
+
+
+def test_build_attention_indices_sequence_major_matches_identity_mapping():
+    """CP=1 sequence-major lowering must not need a materialized identity map."""
+    _require_cute_cuda()
+    cu = _make_e2e_like_cu_seqlens()
+    ratio = 4
+    cu_comp = _compressed_cu_seqlens(cu, ratio)
+    l_local = int(cu[-1]) + 2
+    window = 16
+    compressed_width = 8
+    compressed_rows = int(cu_comp[-1]) + 7
+    compressed_base = l_local
+    identity_map = torch.arange(compressed_rows, dtype=torch.int32, device="cuda")
+    logical_ids = (
+        torch.arange(compressed_width, dtype=torch.int32, device="cuda")
+        .unsqueeze(0)
+        .repeat(l_local, 1)
+    )
+    logical_ids[1::5, -1] = -1
+
+    common_kwargs = dict(
+        cu_seqlens_compressed=cu_comp,
+        compressed_base=compressed_base,
+        compressed_rows=compressed_rows,
+    )
+    for compressed_topk, for_indexer_loss in (
+        (None, False),
+        (logical_ids, False),
+        (logical_ids, True),
+    ):
+        expected = thd_layout_kernels.build_attention_indices(
+            cu,
+            0,
+            l_local,
+            0,
+            window,
+            ratio,
+            compressed_width,
+            compressed_topk,
+            seq_to_rank_row=identity_map,
+            for_indexer_loss=for_indexer_loss,
+            **common_kwargs,
+        )
+        actual = thd_layout_kernels.build_attention_indices(
+            cu,
+            0,
+            l_local,
+            0,
+            window,
+            ratio,
+            compressed_width,
+            compressed_topk,
+            for_indexer_loss=for_indexer_loss,
+            compressed_is_sequence_major=True,
+            **common_kwargs,
+        )
+        assert torch.equal(actual[0], expected[0])
+        if for_indexer_loss:
+            assert actual[1] is None
+            assert torch.equal(actual[2], expected[2])
+        else:
+            assert torch.equal(actual[1], expected[1])
+            assert actual[2] is None
+
+
 def test_build_attention_indices_many_short_sequences_match_native():
     _require_cute_cuda()
     cu = torch.arange(0, 4097, 32, dtype=torch.int32, device="cuda")
@@ -431,7 +684,7 @@ def test_build_attention_indices_many_short_sequences_match_native():
     seq_to_rank_row = torch.arange(int(cu_comp[-1]), dtype=torch.int32, device="cuda").flip(0)
     compressed_base = d_window + l_local
 
-    actual = csa_cp_layout_kernels.build_attention_indices(
+    actual = thd_layout_kernels.build_attention_indices(
         cu,
         global_start,
         l_local,
@@ -441,6 +694,7 @@ def test_build_attention_indices_many_short_sequences_match_native():
         compressed_width,
         cu_seqlens_compressed=cu_comp,
         seq_to_rank_row=seq_to_rank_row,
+        compressed_rows=seq_to_rank_row.shape[0],
     )
     expected = _native_attention_indices(
         cu,
@@ -460,7 +714,7 @@ def test_build_attention_indices_many_short_sequences_match_native():
     logical_ids = torch.arange(compressed_width, dtype=torch.int32, device="cuda").expand(
         l_local, -1
     )
-    actual = csa_cp_layout_kernels.build_attention_indices(
+    actual = thd_layout_kernels.build_attention_indices(
         cu,
         global_start,
         l_local,
@@ -472,6 +726,7 @@ def test_build_attention_indices_many_short_sequences_match_native():
         cu_seqlens_compressed=cu_comp,
         seq_to_rank_row=seq_to_rank_row,
         for_indexer_loss=True,
+        compressed_rows=seq_to_rank_row.shape[0],
     )
     expected = _native_indexer_loss_indices(
         cu,
@@ -527,10 +782,18 @@ def test_composed_cp_layout_maps_every_index_and_gradient_to_its_source(ratio, l
                 hidden[max(0, start - d_window) : start],
             )
         )
-        compact, group_ids, row_map = prepare_cp_compressor_input(
-            local, boundary, cu, cu_compressed, start, cp_size, ratio
+        compact, group_ids, position_ids, local_cu, local_cuc, emitted_cu_compressed, row_map = (
+            prepare_cp_compressor_input(local, boundary, cu, start, cp_size, ratio)
         )
         grouped = compact.reshape(group_ids.shape[0], ratio, 1)
+        expected_metadata = _native_cp_compressor_metadata(
+            cu, start, local_rows, ratio, d_window, group_ids.shape[0], cp_size
+        )
+        assert torch.equal(position_ids, expected_metadata[0])
+        assert torch.equal(local_cu, expected_metadata[1])
+        assert torch.equal(local_cuc, expected_metadata[2])
+        assert torch.equal(emitted_cu_compressed, cu_compressed)
+        assert torch.equal(row_map, expected_metadata[4])
         boundaries.append(boundary)
         locals_.append(local)
         compact_values.append(grouped.sum(dim=1))
@@ -594,7 +857,7 @@ def test_composed_cp_layout_maps_every_index_and_gradient_to_its_source(ratio, l
                         selected, dtype=torch.int32, device="cuda"
                     )
 
-        actual = csa_cp_layout_kernels.build_attention_indices(
+        actual = thd_layout_kernels.build_attention_indices(
             cu,
             start,
             local_rows,
@@ -605,6 +868,7 @@ def test_composed_cp_layout_maps_every_index_and_gradient_to_its_source(ratio, l
             logical_topk,
             cu_seqlens_compressed=cu_compressed,
             seq_to_rank_row=expected_map,
+            compressed_rows=compressed_rank_major.shape[0],
         )
         expected = _native_attention_indices(
             cu,
@@ -623,7 +887,7 @@ def test_composed_cp_layout_maps_every_index_and_gradient_to_its_source(ratio, l
         assert torch.equal(actual[1], expected[1])
 
         if logical_topk is not None:
-            actual = csa_cp_layout_kernels.build_attention_indices(
+            actual = thd_layout_kernels.build_attention_indices(
                 cu,
                 start,
                 local_rows,
@@ -635,6 +899,7 @@ def test_composed_cp_layout_maps_every_index_and_gradient_to_its_source(ratio, l
                 cu_seqlens_compressed=cu_compressed,
                 seq_to_rank_row=expected_map,
                 for_indexer_loss=True,
+                compressed_rows=compressed_rank_major.shape[0],
             )
             expected_loss_indices = _native_indexer_loss_indices(
                 cu,

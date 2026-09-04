@@ -214,6 +214,72 @@ def _test_fused_mla_rope_inplace(
     )
 
 
+@pytest.mark.experimental
+@pytest.mark.internal
+@pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("inverse", [False, True])
+def test_mla_rope_contiguous_thd_global_start_matches_position_ids(inverse):
+    """Kernel-side THD row mapping must match explicit packed-sequence positions."""
+    assert fused_mla_rope_inplace is not None
+    torch.manual_seed(1234)
+
+    cu_seqlens = torch.tensor([0, 4, 12], dtype=torch.int32, device="cuda")
+    global_start = -2
+    local_rows = 16
+    global_rows = torch.arange(
+        global_start, global_start + local_rows, dtype=torch.int32, device="cuda"
+    )
+    sequence_ids = torch.bucketize(
+        global_rows, cu_seqlens[1:], out_int32=True, right=True
+    ).clamp_max(cu_seqlens.numel() - 2)
+    sequence_starts = cu_seqlens[sequence_ids]
+    sequence_ends = cu_seqlens[sequence_ids + 1]
+    valid_rows = (global_rows >= sequence_starts) & (global_rows < sequence_ends)
+    position_ids = torch.where(valid_rows, global_rows - sequence_starts, 0)
+
+    nope_dim = 4
+    emb_dim = 8
+    num_heads = 2
+    freqs = torch.randn(8, emb_dim, dtype=torch.float32, device="cuda")
+    cos = freqs.cos().contiguous()
+    sin = freqs.sin().contiguous()
+    values = torch.randn(
+        local_rows, num_heads, nope_dim + emb_dim, dtype=torch.float32, device="cuda"
+    )
+    position_input = values.clone().requires_grad_(True)
+    contiguous_input = values.clone().requires_grad_(True)
+
+    position_output = fused_mla_rope_inplace(
+        position_input,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens,
+        inverse=inverse,
+        remove_interleaving=True,
+        position_ids=position_ids,
+    )
+    contiguous_output = fused_mla_rope_inplace(
+        contiguous_input,
+        cos,
+        sin,
+        nope_dim,
+        emb_dim,
+        cu_seqlens_q=cu_seqlens,
+        inverse=inverse,
+        remove_interleaving=True,
+        thd_global_start=global_start,
+    )
+
+    torch.testing.assert_close(contiguous_output, position_output)
+    grad = torch.randn_like(position_output)
+    position_output.backward(grad.clone())
+    contiguous_output.backward(grad.clone())
+    torch.testing.assert_close(contiguous_input.grad, position_input.grad)
+
+
 def _test_fused_mla_rope_kv_split(input_format, remove_interleaving=False):
     assert fused_mla_rope_kv_split is not None
     num_heads = 32
