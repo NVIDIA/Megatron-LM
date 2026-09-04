@@ -1174,7 +1174,7 @@ class TestDSv4HybridMatchesStandard:
         assert hyb_flops == std_flops
 
 
-def _make_dsa_args(dsa_indexer_loss_coeff=0.01):
+def _make_dsa_args(dsa_indexer_loss_coeff=0.01, dsa_indexer_use_sparse_loss=False):
     """Minimal MLA + DSA args (GLM-5.2 style, small scale).
 
     Uses ``dsa_indexer_topk_freq=1`` and ``dsa_indexer_skip_topk_offset=0``
@@ -1185,6 +1185,8 @@ def _make_dsa_args(dsa_indexer_loss_coeff=0.01):
     ``dsa_indexer_loss_coeff`` drives the indexer's fwd/bwd expansion: the
     indexer only has a backward pass when its KL loss is enabled. The default
     here matches the in-tree functional test configs.
+    ``dsa_indexer_use_sparse_loss`` selects the sparse (top-k only) KL
+    variant, which shrinks the scoring backward to the selected pairs.
     """
     args = _make_gpt_args(
         num_layers=4,
@@ -1208,6 +1210,7 @@ def _make_dsa_args(dsa_indexer_loss_coeff=0.01):
     args.dsa_indexer_topk_freq = 1
     args.dsa_indexer_skip_topk_offset = 0
     args.dsa_indexer_loss_coeff = dsa_indexer_loss_coeff
+    args.dsa_indexer_use_sparse_loss = dsa_indexer_use_sparse_loss
     return args
 
 
@@ -1263,8 +1266,15 @@ def _dsa_golden_flops(args, total_tokens, seqlen_squared_sum, num_indexer_layers
     idx_core = num_indexer_layers * idx_dim / 2
     # The indexer only runs a backward pass when its KL loss is on, and its
     # inputs are detached: projections pay fwd + wgrad, scoring pays fwd + dq + dk.
+    # Forward scoring is always dense; with the sparse KL loss the score
+    # gradient is nonzero only on the top-k pairs, so dq + dk shrink by the
+    # same top-k / dense pair ratio as core attention.
     if (args.dsa_indexer_loss_coeff or 0.0) > 0:
-        idx_token_expansion, idx_core_expansion = 2, 3
+        idx_token_expansion = 2
+        if getattr(args, "dsa_indexer_use_sparse_loss", False):
+            idx_core_expansion = 1 + 2 * sparse_scale
+        else:
+            idx_core_expansion = 3
     else:
         idx_token_expansion, idx_core_expansion = 1, 1
     dsa_extra_token = idx_token_expansion * fma * idx_token
@@ -1333,6 +1343,47 @@ class TestDSA:
         # A frozen indexer must cost strictly less than a trained one.
         assert flops < num_floating_point_operations(_make_dsa_args(0.01), batch_size)
 
+    @pytest.mark.parametrize("seq_length", [256, 8192])
+    def test_sparse_indexer_loss_shrinks_scoring_backward(self, seq_length):
+        """``dsa_indexer_use_sparse_loss`` only back-propagates through the
+        top-k scores, so the indexer scoring backward must scale with the
+        top-k pair ratio instead of staying dense (3x).
+
+        With ``seq_length <= topk`` top-k selects everything and both loss
+        variants must agree exactly; past top-k the sparse variant must be
+        strictly cheaper and still match the golden calculator.
+        """
+        batch_size = 2
+        total_tokens = batch_size * seq_length
+        sum_sq = batch_size * seq_length**2
+
+        dense_args = _make_dsa_args(dsa_indexer_use_sparse_loss=False)
+        sparse_args = _make_dsa_args(dsa_indexer_use_sparse_loss=True)
+        dense_args.seq_length = sparse_args.seq_length = seq_length
+
+        dense = num_floating_point_operations(dense_args, batch_size)
+        sparse = num_floating_point_operations(sparse_args, batch_size)
+        assert sparse == _dsa_golden_flops(sparse_args, total_tokens, sum_sq)
+        if seq_length <= sparse_args.dsa_indexer_topk:
+            assert sparse == dense
+        else:
+            assert sparse < dense
+            # The sparse backward still costs more than a frozen indexer.
+            frozen = _make_dsa_args(dsa_indexer_loss_coeff=0.0, dsa_indexer_use_sparse_loss=True)
+            frozen.seq_length = seq_length
+            assert sparse > num_floating_point_operations(frozen, batch_size)
+
+    def test_sparse_loss_ignored_without_indexer_loss(self):
+        """Sparse vs dense KL is moot when the indexer loss is off: the
+        indexer is forward-only either way and the flag must not change the
+        count."""
+        batch_size = 2
+        off_dense = _make_dsa_args(dsa_indexer_loss_coeff=0.0, dsa_indexer_use_sparse_loss=False)
+        off_sparse = _make_dsa_args(dsa_indexer_loss_coeff=0.0, dsa_indexer_use_sparse_loss=True)
+        assert num_floating_point_operations(off_dense, batch_size) == (
+            num_floating_point_operations(off_sparse, batch_size)
+        )
+
     def test_cross_layer_index_sharing(self):
         """Only layers that compute their own top-k index pay for the indexer.
 
@@ -1394,8 +1445,42 @@ class TestDSAHelperEdgeCases:
             n_heads=4,
             head_dim=32,
             num_indexer_layers=0,
-            indexer_loss_coeff=0.01,
+            dsa_indexer_loss_coeff=0.01,
         ) == (0, 0)
+
+    def test_indexer_flops_sparse_loss_expansion(self):
+        """Direct check of the fwd/bwd expansion factors on the scoring term:
+        dense KL pays 3x, sparse KL pays ``1 + 2 * sparse_core_scale``, and a
+        frozen indexer pays 1x regardless of the loss variant."""
+        from megatron.training.training import _dsa_indexer_flops
+
+        common = dict(
+            hidden_size=512, q_lora_rank=128, n_heads=4, head_dim=32, num_indexer_layers=1
+        )
+        fma = 2
+        core = 4 * 32 / 2
+        _, off = _dsa_indexer_flops(**common, dsa_indexer_loss_coeff=0.0)
+        _, dense = _dsa_indexer_flops(**common, dsa_indexer_loss_coeff=0.01)
+        _, sparse = _dsa_indexer_flops(
+            **common,
+            dsa_indexer_loss_coeff=0.01,
+            dsa_indexer_use_sparse_loss=True,
+            sparse_core_scale=0.25,
+        )
+        _, sparse_dense_scale = _dsa_indexer_flops(
+            **common,
+            dsa_indexer_loss_coeff=0.01,
+            dsa_indexer_use_sparse_loss=True,
+            sparse_core_scale=1.0,
+        )
+        assert off == 1 * fma * core
+        assert dense == 3 * fma * core
+        assert sparse == (1 + 2 * 0.25) * fma * core
+        assert sparse_dense_scale == dense
+        # The flag is a no-op without the loss.
+        assert _dsa_indexer_flops(
+            **common, dsa_indexer_loss_coeff=0.0, dsa_indexer_use_sparse_loss=True
+        ) == _dsa_indexer_flops(**common, dsa_indexer_loss_coeff=0.0)
 
     def test_sparse_core_scale_degenerate_inputs(self):
         """Zero tokens or an unset top-k fall back to the dense scale of 1.0."""
