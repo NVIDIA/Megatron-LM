@@ -127,6 +127,7 @@ class TransformerLayerSchedulePlan:
         is_moe, num_local_experts = get_layer_moe_metadata(self.layer)
 
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
+        self.is_mtp = is_mtp
 
         extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe
@@ -229,10 +230,14 @@ class TransformerLayerSchedulePlan:
         )
         use_inner_fp4_context = self.layer.config.fp4
 
+        # MTP layer numbers are depth-local, so exclude them from the decoder-only
+        # first/last BF16 policy and keep MTP quantized.
+        layer_no = -1 if self.is_mtp else self.layer.layer_number - 1
+
         if use_inner_fp8_context:
-            low_precision_context = get_fp8_context(self.layer.config, self.layer.layer_number - 1)
+            low_precision_context = get_fp8_context(self.layer.config, layer_no)
         elif use_inner_fp4_context:
-            low_precision_context = get_fp4_context(self.layer.config, self.layer.layer_number - 1)
+            low_precision_context = get_fp4_context(self.layer.config, layer_no)
         else:
             low_precision_context = nullcontext()
         return low_precision_context
