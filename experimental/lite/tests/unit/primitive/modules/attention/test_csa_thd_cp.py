@@ -130,6 +130,152 @@ def test_overlap_transform_thd_layout():
     assert torch.equal(out[1, :ratio], tensor[0, :, :, :d])
 
 
+def test_thd_cp_uses_current_core_layout_interfaces(monkeypatch):
+    """Lite consumes the current Core compressor-prep and layout contracts."""
+    csa = _csa()
+    ratio, local_rows, d_window = 4, 8, 8
+    hidden_size, head_dim, group_capacity = 4, 4, 8
+    cu_seqlens = torch.tensor([0, local_rows], dtype=torch.int32)
+    cu_seqlens_compressed = torch.tensor([0, local_rows // ratio], dtype=torch.int32)
+    hidden_compact = torch.zeros(group_capacity * ratio, 1, hidden_size)
+    compressed_group_ids = torch.tensor([0, 1, -1, -1, -1, -1, -1, -1], dtype=torch.int32)
+    compressed_position_ids = torch.tensor([0, 4, 0, 0, 0, 0, 0, 0], dtype=torch.int32)
+    local_cu_seqlens = torch.tensor([0, local_rows], dtype=torch.int32)
+    local_cu_seqlens_compressed = cu_seqlens_compressed.clone()
+    seq_to_rank_row = torch.tensor([0, 1], dtype=torch.int32)
+    captured = {}
+
+    def fake_prepare_cp_compressor_input(
+        hidden_local, boundary_hidden, cu_seqlens_arg, global_start, cp_size, ratio_arg
+    ):
+        captured['prepare_args'] = (
+            hidden_local,
+            boundary_hidden,
+            cu_seqlens_arg,
+            global_start,
+            cp_size,
+            ratio_arg,
+        )
+        return (
+            hidden_compact,
+            compressed_group_ids,
+            compressed_position_ids,
+            local_cu_seqlens,
+            local_cu_seqlens_compressed,
+            cu_seqlens_compressed,
+            seq_to_rank_row,
+        )
+
+    class FakeCompressor:
+        def _forward_thd(
+            self,
+            compact,
+            cu_seqlens_arg,
+            *,
+            max_seqlen_q,
+            compressed_group_ids,
+            compressed_position_ids,
+        ):
+            captured['compressor_args'] = (
+                compact,
+                cu_seqlens_arg,
+                max_seqlen_q,
+                compressed_group_ids,
+                compressed_position_ids,
+            )
+            return torch.zeros(group_capacity, 1, head_dim), None
+
+    def fake_gather(tensor, *, group):
+        captured['gather_group'] = group
+        return tensor
+
+    def fake_build_attention_indices(
+        cu_seqlens_arg,
+        global_start,
+        local_rows_arg,
+        d_window_arg,
+        window_size,
+        ratio_arg,
+        compressed_width,
+        compressed_topk,
+        **kwargs,
+    ):
+        captured['layout_args'] = (
+            cu_seqlens_arg,
+            global_start,
+            local_rows_arg,
+            d_window_arg,
+            window_size,
+            ratio_arg,
+            compressed_width,
+            compressed_topk,
+            kwargs,
+        )
+        width = window_size + compressed_width
+        return (
+            torch.zeros(local_rows_arg, width, dtype=torch.int32),
+            torch.full((local_rows_arg,), width, dtype=torch.int32),
+            None,
+            None,
+        )
+
+    monkeypatch.setattr(
+        csa.cp_utils, 'prepare_cp_compressor_input', fake_prepare_cp_compressor_input
+    )
+    monkeypatch.setattr(csa, 'gather_from_sequence_parallel_region', fake_gather)
+    monkeypatch.setattr(
+        csa.csa_cp_layout_kernels, 'build_attention_indices', fake_build_attention_indices
+    )
+    monkeypatch.setattr(
+        csa, 'unfused_compressed_sparse_attn', lambda query, _kv, _sinks, _indices, _scale: query
+    )
+
+    ps = _ps()
+    module = SimpleNamespace(
+        ps=ps,
+        compressor=FakeCompressor(),
+        compress_ratio=ratio,
+        indexer=None,
+        dsa_indexer_loss_coeff=0.0,
+        training=False,
+        dsa_indexer_use_sparse_loss=False,
+        calculate_per_token_loss=False,
+        config=SimpleNamespace(sliding_window=4),
+        apply_dsa_kernel_fusion=False,
+        sinks=torch.zeros(1),
+        softmax_scale=1.0,
+        _thd_cu_seqlens=lambda packed: packed.cu_seqlens_q,
+    )
+    query = torch.randn(local_rows, 1, head_dim)
+    key = torch.randn(local_rows, 1, 1, head_dim)
+    hidden = torch.randn(local_rows, 1, hidden_size)
+    boundary_hidden = torch.randn(d_window, 1, hidden_size)
+    boundary_kv = torch.randn(d_window, 1, 1, head_dim)
+    packed = SimpleNamespace(cu_seqlens_q=cu_seqlens, max_seqlen_q=local_rows)
+
+    output = csa.CompressedSparseAttention._forward_thd_cp(
+        module,
+        query,
+        key,
+        hidden,
+        torch.empty(local_rows, 1, 0),
+        boundary_hidden,
+        boundary_kv,
+        packed,
+    )
+
+    assert output.shape == (local_rows, 1, 1, head_dim)
+    assert captured['prepare_args'][2] is cu_seqlens
+    assert captured['prepare_args'][3:] == (0, 1, ratio)
+    assert captured['compressor_args'][3] is compressed_group_ids
+    assert captured['compressor_args'][4] is compressed_position_ids
+    assert captured['gather_group'] is ps.cp_group
+    layout_kwargs = captured['layout_args'][-1]
+    assert layout_kwargs['cu_seqlens_compressed'] is cu_seqlens_compressed
+    assert layout_kwargs['seq_to_rank_row'] is seq_to_rank_row
+    assert layout_kwargs['compressed_rows'] == group_capacity
+
+
 # ---------------------------------------------------------------------------
 # THD dispatch + boundary-KV projection (one GPU with real TE; the
 # CuTeDSL-gated core is stubbed out).
