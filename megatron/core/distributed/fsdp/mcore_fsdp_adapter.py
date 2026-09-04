@@ -787,8 +787,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not currently support per-token loss normalization.")
         if config.fp8 or config.fp4 or ddp_config.fp8_param_gather or ddp_config.fp4_param_gather:
             raise ValueError("MFSDP v2 does not currently support FP8 or FP4.")
-        if config.cuda_graph_impl != "none" or ddp_config.megatron_fsdp_cuda_graph_mode:
-            raise ValueError("MFSDP v2 does not currently support CUDA graphs.")
 
         if ddp_config.fsdp_db_use_persist_buf_on_alloc_fail:
             raise ValueError(
