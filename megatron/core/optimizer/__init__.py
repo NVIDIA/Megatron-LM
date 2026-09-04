@@ -967,7 +967,12 @@ def _get_megatron_emerging_optimizer(
                             "to use the same one-dimensional data-parallel mesh."
                         )
 
-                optimizer = FsdpMuon(groups, inner_optimizer=optimizer, dp_mesh=dp_mesh)
+                optimizer = FsdpMuon(
+                    groups,
+                    inner_optimizer=optimizer,
+                    dp_mesh=dp_mesh,
+                    max_params_per_owner_chunk=config.muon_max_params_per_owner_chunk,
+                )
                 optimizer = FullyShardedOptimizer(
                     optimizer, config, None, init_state_fn, model_chunks=model_chunks
                 )

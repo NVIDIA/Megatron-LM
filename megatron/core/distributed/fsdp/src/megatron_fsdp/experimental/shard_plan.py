@@ -123,23 +123,49 @@ def compute_shard_plan(
     )
 
 
-def assign_owner_work(plans: Sequence[ShardPlan], num_ns_steps: int) -> dict[int, int]:
-    """Assign one owner rank to each boundary parameter, balanced by NS cost.
+def assign_owner_work(
+    plans: Sequence[ShardPlan],
+    num_ns_steps: int,
+    chunks: Sequence[Sequence[int]] | None = None,
+) -> dict[int, int]:
+    """Assign one owner rank to each parameter with chunk-local load balancing.
 
     Only ranks that own a non-empty shard of a parameter are eligible owners.
-    Assignment greedily gives each parameter to its eligible rank with the
-    smallest running cost total, where a parameter's cost is the Newton-Schulz
-    compute estimate `numel * (min(rows, cols) * num_steps + 1)`.
+    Parameters are processed in descending estimated Newton-Schulz cost. For
+    each chunk, assignment minimizes each rank's cumulative cost, including
+    fixed fully-local work and owner work from preceding chunks. The cost
+    estimate for an M x N matrix is
+    `M * N * (min(M, N) * num_ns_steps + 1)`.
 
     Args:
         plans: Shard plans indexed by their position in the input sequence.
         num_ns_steps: Newton-Schulz iteration count used in the cost estimate.
+        chunks: Parameter indices grouped by communication chunk. When omitted,
+            all parameters are balanced as one chunk.
 
     Returns:
         Mapping from parameter index (in `plans`) to owner rank.
     """
+    if not plans:
+        return {}
+
+    if chunks is None:
+        chunks = (tuple(range(len(plans))),)
+
+    costs: dict[int, float] = {}
+    for param_index, plan in enumerate(plans):
+        rows, cols = plan.full_shape
+        costs[param_index] = float(
+            plan.full_numel() * (min(rows, cols) * num_ns_steps + 1)
+        )
+
     assignments: dict[int, int] = {}
-    running: dict[int, float] = {r: 0.0 for r in range(plans[0].world_size)} if plans else {}
+    total_running = {rank: 0.0 for rank in range(plans[0].world_size)}
+
+    # Fully-local work cannot be reassigned, but it runs before boundary NS and
+    # therefore shifts when each rank can start producing boundary updates.
+    # Seed the owner loads with that fixed work so boundary assignment balances
+    # the actual per-rank critical path rather than boundary work in isolation.
     for param_index, plan in enumerate(plans):
         candidates = plan.owner_candidates()
         if not candidates:
@@ -147,16 +173,35 @@ def assign_owner_work(plans: Sequence[ShardPlan], num_ns_steps: int) -> dict[int
                 f"No eligible owner for parameter {param_index} with shape {plan.full_shape}; "
                 "no rank owns a shard."
             )
-        if not plan.is_boundary():
-            # Fully local: the single owning rank is the owner with no communication.
-            assignments[param_index] = candidates[0]
+        if plan.is_boundary():
             continue
-        rows, cols = plan.full_shape
-        short_dim = min(rows, cols)
-        cost = float(plan.full_numel() * (short_dim * num_ns_steps + 1))
-        owner = min(candidates, key=lambda r: (running[r], r))
+        owner = candidates[0]
         assignments[param_index] = owner
-        running[owner] += cost
+        total_running[owner] += costs[param_index]
+
+    for chunk in chunks:
+        chunk_running = {rank: 0.0 for rank in total_running}
+        ordered_params = sorted(
+            (index for index in chunk if plans[index].is_boundary()),
+            key=lambda index: (-costs[index], index),
+        )
+        for param_index in ordered_params:
+            plan = plans[param_index]
+            candidates = plan.owner_candidates()
+            owner = min(
+                candidates,
+                key=lambda rank: (
+                    total_running[rank] + chunk_running[rank],
+                    chunk_running[rank],
+                    rank,
+                ),
+            )
+            assignments[param_index] = owner
+            chunk_running[owner] += costs[param_index]
+
+        for rank, chunk_cost in chunk_running.items():
+            total_running[rank] += chunk_cost
+
     return assignments
 
 

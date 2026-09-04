@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import inspect
 import logging
 import warnings
@@ -59,8 +60,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 from torch.optim.optimizer import ParamsT
 
-from megatron.core.utils import nvtx_decorator
-
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .placement import Flat
 from .shard_plan import (
@@ -76,7 +75,23 @@ from .shard_plan import (
 )
 
 logger = logging.getLogger(__name__)
-_MAX_PARAMS_PER_OWNER_CHUNK = 16
+
+
+def _always_nvtx_decorator(message: str) -> Callable:
+    """Wrap a function in one NVTX range without enabling global Megatron ranges."""
+
+    def decorator(function: Callable) -> Callable:
+        @functools.wraps(function)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            torch.cuda.nvtx.range_push(message)
+            try:
+                return function(*args, **kwargs)
+            finally:
+                torch.cuda.nvtx.range_pop()
+
+        return wrapper
+
+    return decorator
 
 
 def _require_emerging_optimizers() -> None:
@@ -158,6 +173,9 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             since the standard Muon path does not read parameter values.
         num_ns_steps: Newton-Schulz iteration count, also used by the owner
             load-balancing cost heuristic. If None, defaults to 1.
+        max_params_per_owner_chunk: Maximum number of compatible parameters in
+            one owner-communication chunk. None places all compatible parameters
+            in one chunk.
     """
 
     # Shared across optimizer instances so a process that constructs several
@@ -175,6 +193,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         use_owner_comm_stream: bool = True,
         reconstruct_full_param: bool = False,
         num_ns_steps: int | None = None,
+        max_params_per_owner_chunk: int | None = 16,
     ) -> None:
         _require_emerging_optimizers()
 
@@ -185,6 +204,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
 
         self.dp_mesh = dp_mesh
         self._num_ns_steps: int = num_ns_steps
+        self._max_params_per_owner_chunk = max_params_per_owner_chunk
         # Owner P2P runs on a dedicated owner-comm stream so it overlaps local
         # Newton-Schulz on the default stream. Multi-rank-on-one-GPU dev boxes
         # cannot reliably run NCCL P2P on a separate stream, so this flag lets
@@ -446,8 +466,8 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         - same collective group
         - same dtype and device of orthogonalization input shards
         - same dtype of parameter
-        - at most 16 parameters per chunk, so later owner gathers can overlap
-          orthogonalization of earlier chunks
+        - at most max_params_per_owner_chunk parameters per chunk when configured,
+          so later owner gathers can overlap orthogonalization of earlier chunks
         """
         chunks: dict[tuple, list[list[int]]] = {}
         for index, (param, shard) in enumerate(zip(params, local_shards)):
@@ -455,22 +475,20 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             collective_group = group.mesh.get_group() if group is not None else None
             key = (id(collective_group), shard.device, shard.dtype, param.dtype)
             compatible_chunks = chunks.setdefault(key, [])
-            if not compatible_chunks or len(compatible_chunks[-1]) >= _MAX_PARAMS_PER_OWNER_CHUNK:
+            if (
+                not compatible_chunks
+                or self._max_params_per_owner_chunk is not None
+                and len(compatible_chunks[-1]) >= self._max_params_per_owner_chunk
+            ):
                 compatible_chunks.append([])
             compatible_chunks[-1].append(index)
         return [chunk for compatible_chunks in chunks.values() for chunk in compatible_chunks]
 
-    def _assign_owner_work(self, plans: Sequence[ShardPlan]) -> dict[int, int]:
-        """Assign the logical full, unsharded update tensor to one owner rank.
-
-        Assignment has two rules:
-        1. Only ranks that contain a non-empty part of the shard can be owners.
-        2. Assignment is balanced around estimated full-tensor orthogonalization and update work.
-           For an M x N matrix, with `num_steps` being the amount of iterations for the
-           orthogonalization approximation:
-           `M * N * (min(M, N) * num_steps + 1)`
-        """
-        return assign_owner_work(plans, self._num_ns_steps)
+    def _assign_owner_work(
+        self, plans: Sequence[ShardPlan], chunks: Sequence[Sequence[int]]
+    ) -> dict[int, int]:
+        """Assign owners by descending NS cost with per-chunk load balancing."""
+        return assign_owner_work(plans, self._num_ns_steps, chunks)
 
     # Owner-gather communication (P2P)
     # ================================
@@ -677,7 +695,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
     def step(self, closure: Callable[[], float]) -> float: ...
 
     @torch.no_grad()
-    @nvtx_decorator(message="mfsdp_muon_step")
+    @_always_nvtx_decorator(message="mfsdp_muon_step")
     @override
     def step(self, closure: Callable[[], float] | None = None) -> float | None:
         """Perform a single optimization step to update parameters.
@@ -744,8 +762,6 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             # Assert no non-matrix plans were indexed.
             assert len(matrix_plans) == len(matrix_indices)
             matrix_plans = cast(list[ShardPlan], matrix_plans)
-            owners = self._assign_owner_work(matrix_plans)
-            self._owners.update({matrix_indices[k]: v for k, v in owners.items()})
 
             # Phase 1: local pre-NS shards for all matrix params.
             local_shards: list[torch.Tensor] = []
@@ -756,6 +772,11 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                 local_shards.append(
                     self._compute_orthogonalization_inputs(param, param.grad, group, lr)
                 )
+
+            chunks = self._group_updates(matrix_params, local_shards)
+            owners = self._assign_owner_work(matrix_plans, chunks)
+            self._owners.update({matrix_indices[k]: v for k, v in owners.items()})
+
             # Separate fully-local and boundary params. Fully-local NS+update
             # overlaps the boundary owner gather.
             local_indices = [
@@ -774,7 +795,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             # single optimizer param group may span multiple FSDP groups and/or
             # mixed dtypes (e.g. FP32 + BF16).
             chunk_states: list[_BoundaryChunkState] = []
-            for chunk_indices in self._group_updates(matrix_params, local_shards):
+            for chunk_indices in chunks:
                 chunk_boundary = [i for i in chunk_indices if i in boundary_indices_set]
                 if not chunk_boundary:
                     continue
@@ -1016,6 +1037,7 @@ class FsdpMuon(FsdpOrthogonalizedOptimizer):
         dp_mesh: DeviceMesh,
         use_owner_comm_stream: bool = True,
         reconstruct_full_param: bool = False,
+        max_params_per_owner_chunk: int | None = 16,
     ) -> None:
         _require_emerging_optimizers()
 
@@ -1041,4 +1063,6 @@ class FsdpMuon(FsdpOrthogonalizedOptimizer):
             dp_mesh=dp_mesh,
             use_owner_comm_stream=use_owner_comm_stream,
             reconstruct_full_param=reconstruct_full_param,
+            num_ns_steps=self._num_ns_steps,
+            max_params_per_owner_chunk=max_params_per_owner_chunk,
         )
