@@ -85,6 +85,9 @@ class TransformerConfig(ModelParallelConfig):
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
+    freeze_base_model_for_mtp: bool = False
+    """Freeze every non-MTP parameter and avoid recording backbone activations."""
+
     mtp_detach_heads: bool = False
     """If True, detach MTP head inputs from the main model graph.
     This prevents MTP loss gradients from flowing back to the main model,
@@ -1593,6 +1596,12 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
+
+        if self.num_query_groups > 0 and self.num_attention_heads % self.num_query_groups != 0:
+            raise ValueError(
+                f"num_query_groups ({self.num_query_groups}) must be a divisor of "
+                f"num_attention_heads ({self.num_attention_heads})."
+            )
 
         if (
             self.num_query_groups % self.tensor_model_parallel_size != 0
@@ -3530,6 +3539,11 @@ class MLATransformerConfig(TransformerConfig):
     multi_latent_attention: bool = True
     """Whether to use Multi-Latent Attention."""
 
+    use_fused_mla_q_uproj: bool = False
+    """Use the cuDNN fused MLA Q up-proj + per-head RoPE + MXFP8-quant kernel (SM100 only).
+    Requires apply_rope_fusion=True, q_lora_rank set, TP=1, SBHD, MXFP8 DPA, and zero
+    attention dropout."""
+
     q_lora_rank: int = 512
     """Rank of Query tensor's low rank representation."""
 
@@ -3589,6 +3603,19 @@ class MLATransformerConfig(TransformerConfig):
         super().__post_init__()
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
+
+        if self.use_fused_mla_q_uproj and (
+            self.fp8 is None
+            or self.fp8_recipe != Fp8Recipe.mxfp8
+            or not self.fp8_dot_product_attention
+            or self.attention_dropout != 0.0
+        ):
+            raise ValueError(
+                "use_fused_mla_q_uproj requires FP8 with fp8_recipe='mxfp8' and "
+                "fp8_dot_product_attention=True so TE interprets the pre-quantized Q/K/V "
+                "scale layout correctly, plus attention_dropout=0.0 because MXFP8 attention "
+                "backward does not support dropout."
+            )
 
         if self.attention_output_gate:
             raise NotImplementedError("Output gate is not supported for MLA yet.")

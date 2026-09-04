@@ -55,6 +55,22 @@ class CapturingTransformerConfig:
         self.__dict__.update(kwargs)
 
 
+def _minimal_training_args(monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py', '--freeze-base-model-for-mtp'])
+    args = parse_args()
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 1024
+    args.seq_length = 1024
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = 'NullTokenizer'
+    args.vocab_size = 1024
+    return args
+
+
 def test_moe_norm_flag_reaches_transformer_config():
     """The generated LatentMoE norm flag should populate the model config."""
     parser = ArgumentParser()
@@ -93,6 +109,25 @@ def test_moe_norm_flag_requires_latent_size(monkeypatch):
     args.moe_latent_size = None
 
     with pytest.raises(AssertionError, match="--moe-use-norm-before-up-proj requires"):
+        validate_args(args)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"mtp_num_layers": None}, "requires --mtp-num-layers"),
+        (
+            {"mtp_num_layers": 1, "freeze_all_layers": True, "position_embedding_type": "rope"},
+            "cannot be combined with --freeze-all-layers",
+        ),
+    ],
+)
+def test_freeze_base_model_for_mtp_validation(monkeypatch, overrides, error):
+    args = _minimal_training_args(monkeypatch)
+    for name, value in overrides.items():
+        setattr(args, name, value)
+
+    with pytest.raises(AssertionError, match=error):
         validate_args(args)
 
 
