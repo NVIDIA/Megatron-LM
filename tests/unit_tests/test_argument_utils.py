@@ -55,6 +55,22 @@ class CapturingTransformerConfig:
         self.__dict__.update(kwargs)
 
 
+def _minimal_training_args(monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py', '--freeze-base-model-for-mtp'])
+    args = parse_args()
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 1024
+    args.seq_length = 1024
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = 'NullTokenizer'
+    args.vocab_size = 1024
+    return args
+
+
 def test_moe_norm_flag_reaches_transformer_config():
     """The generated LatentMoE norm flag should populate the model config."""
     parser = ArgumentParser()
@@ -93,6 +109,25 @@ def test_moe_norm_flag_requires_latent_size(monkeypatch):
     args.moe_latent_size = None
 
     with pytest.raises(AssertionError, match="--moe-use-norm-before-up-proj requires"):
+        validate_args(args)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"mtp_num_layers": None}, "requires --mtp-num-layers"),
+        (
+            {"mtp_num_layers": 1, "freeze_all_layers": True, "position_embedding_type": "rope"},
+            "cannot be combined with --freeze-all-layers",
+        ),
+    ],
+)
+def test_freeze_base_model_for_mtp_validation(monkeypatch, overrides, error):
+    args = _minimal_training_args(monkeypatch)
+    for name, value in overrides.items():
+        setattr(args, name, value)
+
+    with pytest.raises(AssertionError, match=error):
         validate_args(args)
 
 
@@ -709,6 +744,12 @@ class TestArgumentGroupFactoryArgparseMeta:
 class TestMegatronNetworkArgumentGeneration:
     """Test Megatron's TransformerConfig-derived argument group."""
 
+    @staticmethod
+    def _parser() -> ArgumentParser:
+        from megatron.training.arguments import _add_network_size_args
+
+        return _add_network_size_args(ArgumentParser(exit_on_error=False))
+
     def test_transformer_callback_fields_are_not_registered_as_cli_args(self):
         """Callback fields are runtime hooks, not CLI-provided values."""
         from megatron.training.arguments import _add_network_size_args
@@ -731,6 +772,17 @@ class TestMegatronNetworkArgumentGeneration:
         args = parser.parse_args([])
         for field_name in callback_fields:
             assert not hasattr(args, field_name)
+
+    def test_mhc_fused_backend_is_exposed_as_config_choice(self):
+        assert self._parser().parse_args([]).mhc_fused_backend == "auto"
+
+        args = self._parser().parse_args(["--mhc-fused-backend", "native"])
+
+        assert args.mhc_fused_backend == "native"
+
+    def test_mhc_fused_backend_rejects_unknown_choice(self):
+        with pytest.raises(ArgumentError, match="invalid choice"):
+            self._parser().parse_args(["--mhc-fused-backend", "cuda"])
 
 
 class TestMegatronMixedPrecisionArguments:

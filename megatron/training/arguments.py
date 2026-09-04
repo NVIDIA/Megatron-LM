@@ -80,6 +80,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_varlen_dataset_args(parser)
 
     parser = _add_fault_injector_args(parser)
 
@@ -447,6 +448,11 @@ def validate_args(args, defaults={}):
         * args.gtp_weight_remat_size
     )
     args.data_parallel_size = args.world_size // total_model_size
+
+    if args.refit_execution_batch_bytes is not None:
+        assert args.refit_execution_batch_bytes > 0, (
+            '--refit-execution-batch-bytes must be a positive integer'
+        )
 
     if args.perform_rl_step:
         assert args.refit_method != 'nccl_m2n', 'nccl_m2n is unsupported by the built-in RL loop'
@@ -888,6 +894,14 @@ def validate_args(args, defaults={}):
             + f"The supported position embedding types are rope and none."
         )
 
+    if args.freeze_base_model_for_mtp:
+        assert args.mtp_num_layers, (
+            "--freeze-base-model-for-mtp requires --mtp-num-layers to be set."
+        )
+        assert not args.freeze_all_layers, (
+            "--freeze-base-model-for-mtp cannot be combined with --freeze-all-layers."
+        )
+
     if args.mtp_hsm and not (args.mtp_num_layers and args.mtp_num_layers >= 2):
         warn_rank_0(
             "--mtp-hsm needs at least two MTP layers to mix anything, but "
@@ -1153,8 +1167,14 @@ def validate_args(args, defaults={}):
         assert args.optimizer in ('sgd', 'adam'), \
             f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
+        # Expert parameters may be sharded differently from non-expert parameters, in which
+        # case both strategies have to be considered by model-wide checks.
+        sharding_strategies = {args.data_parallel_sharding_strategy}
+        if args.expert_data_parallel_sharding_strategy is not None:
+            sharding_strategies.add(args.expert_data_parallel_sharding_strategy)
+
         if (
-            args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]
+            sharding_strategies & {"optim_grads_params", "optim_grads"}
             and args.gradient_accumulation_fusion
         ):
             warn_rank_0(
@@ -1162,7 +1182,7 @@ def validate_args(args, defaults={}):
                 args.rank,
             )
 
-        if args.data_parallel_sharding_strategy == "optim_grads_params":
+        if "optim_grads_params" in sharding_strategies:
             assert args.check_weight_hash_across_dp_replicas_interval is None, \
                 'check_weight_hash_across_dp_replicas_interval is not supported with optim_grads_params'
 
@@ -1183,7 +1203,7 @@ def validate_args(args, defaults={}):
             # MaxPoolAllocator is a type of FSDP double buffer.
             args.fsdp_double_buffer = True
 
-        if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
+        if args.init_model_with_meta_device and sharding_strategies == {"no_shard"}:
             raise ValueError(
                 "Meta device initialization (init_model_with_meta_device=True) is not "
                 "supported or necessary for the 'no_shard' / 0 sharding strategy."
@@ -1450,6 +1470,17 @@ def validate_args(args, defaults={}):
     # during pipeline parallelism, it should not be set if sequence length
     # is constant during training.
     args.variable_seq_lengths = False
+    if args.mock_data and args.sft and args.sft_mock_dataset_config_json is None:
+        args.sft_mock_dataset_config_json = json.dumps(
+            {
+                "mode": "distribution",
+                "type": "lognormal",
+                "min_seq_len": args.seq_length // 2,
+                "max_seq_len": args.seq_length,
+                "mean_seq_len": args.seq_length // 4 * 3,
+                "lognormal_sigma": 1.1,
+            }
+        )
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
     if (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
@@ -1677,7 +1708,36 @@ def validate_args(args, defaults={}):
     if args.ckpt_format == "fsdp_dtensor":
         assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
-    # Scheduler-name and max-seqlen validation live in
+    # --use-varlen-dataset: independent of --sft. Cannot be combined with --sft
+    # because they are mutually-exclusive top-level dataset selectors that both
+    # drive the packed-sequence (THD) path. These stay in validate_args: the
+    # selectors are CLI-level args, not core config fields.
+    if args.use_varlen_dataset:
+        assert not args.sft, (
+            "--use-varlen-dataset and --sft are mutually exclusive; both "
+            "select the packed-sequence dataset family. Pick one."
+        )
+        if args.varlen_sbhd_validation:
+            assert args.sequence_packing_scheduler is None, (
+                "--varlen-sbhd-validation does not use a sequence packing "
+                "scheduler; drop --sequence-packing-scheduler."
+            )
+            # SBHD validation is a real-data numerical-reference path only;
+            # MockVarlenDataset does not implement it.
+            assert not args.mock_data, (
+                "--varlen-sbhd-validation is not supported with --mock-data; "
+                "SBHD validation requires a real dataset."
+            )
+        else:
+            # VarlenDataset emits one unpacked sample per __getitem__; it
+            # relies on an upstream packing scheduler to group variable-length
+            # samples into THD batches. Auto-pick ``dp_balanced`` when the
+            # user did not request one explicitly.
+            if args.sequence_packing_scheduler is None:
+                args.sequence_packing_scheduler = 'dp_balanced'
+
+    # Runs after the varlen auto-select above so it sees the final resolved
+    # scheduler. Scheduler-name and max-seqlen validation live in
     # ModelParallelConfig.__post_init__; only the buffer-size check stays here
     # because seq_length is not a core config field. The None case for
     # max_seqlen_per_dp_cp_rank is rejected by the config check.
@@ -1762,6 +1822,13 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
+    assert not (
+        args.use_layer_wise_distributed_optimizer and args.moe_single_grouped_weight
+    ), (
+        "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "
+        "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
+        "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
+    )
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -2192,33 +2259,65 @@ def _add_inference_args(parser):
                        'When disabled, KV cache blocks cannot be shared between '
                        'requests with identical prompt prefixes.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-eviction-policy',
-                       type=str, default='ref_zero',
+                       type=str, default='lru',
                        choices=['ref_zero', 'lru'],
                        dest='inference_dynamic_batching_prefix_caching_eviction_policy',
                        help='Eviction policy for prefix caching blocks. '
-                       '"ref_zero" (default) immediately returns blocks to the '
-                       'free pool when ref_count hits 0. "lru" keeps blocks '
-                       'cached and evicts via LRU only when space is needed.')
+                       '"ref_zero" immediately returns blocks to the '
+                       'free pool when ref_count hits 0. "lru" (default) keeps '
+                       'blocks cached and evicts via LRU only when space is needed.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-coordinator-policy',
-                       type=str, default='load_balanced',
+                       type=str, default='longest_prefix',
                        choices=['longest_prefix', 'first_prefix_block', 'load_balanced'],
                        dest='inference_dynamic_batching_prefix_caching_coordinator_policy',
                        help='Coordinator routing policy for prefix caching. '
-                       '"load_balanced" (default) routes to the rank with the fewest '
+                       '"load_balanced" routes to the rank with the fewest '
                        'in-flight requests, ignoring prefix affinity. '
                        '"first_prefix_block" routes based on the first block hash only. '
-                       '"longest_prefix" routes to the rank with the longest matching '
-                       'prefix. "first_prefix_block" and "longest_prefix" both combine '
+                       '"longest_prefix" (default) routes to the rank with the longest '
+                       'matching prefix. "first_prefix_block" and "longest_prefix" both combine '
                        'prefix affinity with load balancing and fall back to '
                        'load-balanced routing when prefix caching is disabled or no '
                        'prefix match exists.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-routing-alpha',
-                       type=float, default=0.5,
+                       type=float, default=1.0,
                        dest='inference_dynamic_batching_prefix_caching_routing_alpha',
-                       help='Weight for prefix-aware routing score: '
-                       'score = alpha * match + (1 - alpha) * normalized_load. '
-                       'Higher alpha favors prefix cache hits; lower alpha '
-                       'favors load balance. Default: 0.5.')
+                       help='How hard to penalise load when routing on prefix '
+                       'affinity: score = cache_score - alpha * relative_load, where '
+                       'relative_load is a rank load measured against the fleet mean. '
+                       '0 is pure prefix affinity; higher values divert to idle ranks '
+                       'more readily as the fleet becomes lopsided. Dimensionless and '
+                       'not capped at 1. Default: 0.5.')
+    group.add_argument('--inference-dynamic-batching-prefix-cache-ttl-seconds',
+                       type=float, default=300.0,
+                       dest='inference_dynamic_batching_prefix_cache_ttl_seconds',
+                       help='How long the coordinator assumes an engine still holds a '
+                       'block it routed there. The coordinator never observes evictions, '
+                       'so entries untouched for this long are dropped rather than kept '
+                       'forever. Default: 300.0.')
+    group.add_argument('--inference-dynamic-batching-media-cache-coordinator-policy',
+                       type=str, default='affinity',
+                       choices=['affinity', 'load_balanced'],
+                       dest='inference_dynamic_batching_media_cache_coordinator_policy',
+                       help='Coordinator routing policy for media caching. '
+                       '"affinity" prefers a rank assigned the same media; '
+                       '"load_balanced" ignores standalone media affinity.')
+    group.add_argument('--inference-dynamic-batching-media-cache-routing-weight',
+                       type=float, default=1.0,
+                       dest='inference_dynamic_batching_media_cache_routing_weight',
+                       help='Media-cache hit weight in equivalent compact-prompt blocks. '
+                       'Default: 1.0.')
+    group.add_argument('--inference-dynamic-batching-vision-embedding-cache-max-bytes',
+                       type=int, default=0,
+                       dest='inference_dynamic_batching_vision_embedding_cache_max_bytes',
+                       help='Maximum GPU bytes retained per engine for reusable vision '
+                       'embeddings. Zero disables the cache. Default: 0.')
+    group.add_argument('--inference-dynamic-batching-allow-stale-multimodal-embeddings',
+                       action='store_true',
+                       dest='inference_dynamic_batching_allow_stale_multimodal_embeddings',
+                       help='Allow request-local and cached multimodal embeddings to survive '
+                       'suspend/resume and generation-epoch changes. Use only when model '
+                       'weights do not change across these boundaries.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-mamba-gb',
                        type=float, default=None,
                        dest='inference_dynamic_batching_prefix_caching_mamba_gb',
@@ -2236,12 +2335,15 @@ def _add_inference_args(parser):
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-sizing-distribution',
-                       type=str, default='exponential',
-                       choices=['exponential', 'linear'],
+                       type=str, default='hybrid',
+                       choices=['exponential', 'linear', 'hybrid'],
                        dest='inference_dynamic_batching_cuda_graph_sizing_distribution',
-                       help='Spacing of CUDA graph token counts. "exponential" (default) '
-                            'halves from cuda_graph_max_tokens down to tp_size, giving a '
-                            'log-spaced distribution with bounded relative padding. '
+                       help='Spacing of CUDA graph token counts. "hybrid" (default) uses '
+                            'exponential spacing for prefill/mixed graphs and linear spacing '
+                            'for decode-only graphs, whose token counts are capped at '
+                            'max_requests and are far too small for halving to cover well. '
+                            '"exponential" halves from cuda_graph_max_tokens down to tp_size, '
+                            'giving a log-spaced distribution with bounded relative padding. '
                             '"linear" uses varying linear strides across the range.')
     group.add_argument('--inference-dynamic-batching-sampling-backend',
                        type=str, default='torch',
@@ -2255,12 +2357,12 @@ def _add_inference_args(parser):
                        help='Use the same inference sampling seed on every data-parallel rank. '
                             '--deterministic-mode also uses the same seed on every DP rank.')
     group.add_argument('--inference-dynamic-batching-async-sched-mode',
-                       type=str, default='legacy',
-                       choices=['legacy', 'async'],
+                       type=str, default='async',
+                       choices=['async', 'legacy'],
                        help='Async scheduling mode for dynamic batching. '
-                            '"legacy" (default) preserves the existing resolve-before-prepare '
-                            'path. "async" overlaps asynchronous scheduling phases by reordering '
-                            'them to prepare-before-resolve.')
+                            '"async" (default) overlaps asynchronous scheduling phases by '
+                            'reordering them to prepare-before-resolve. Select "legacy" to '
+                            'disable async scheduling and use the resolve-before-prepare path.')
     group.add_argument('--inference-dynamic-batching-logprobs-mode',
                        type=str, default='raw_logprobs',
                        choices=['raw_logprobs', 'processed_logprobs'],
@@ -2398,6 +2500,9 @@ def _add_network_size_args(parser):
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
         "expert_gtp_weight_remat_size",
+        "max_seqlen_per_dp_cp_rank",
+        "hybrid_context_parallel",
+        "sequence_packing_scheduler",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -2873,6 +2978,16 @@ def _add_rl_args(parser):
                              'gloo: use GlooCopyService over CPU; '
                              'nvshmem: use NVSHMEMCopyService; '
                              'nixl: use NixlCopyService.'))
+    group.add_argument(
+        '--refit-execution-batch-bytes',
+        type=int,
+        default=None,
+        help=(
+            'Optional soft per-rank byte limit for ReFIT execution staging. '
+            'The default None preserves one model-wide generic submission and '
+            "NCCL M2N's existing 256 MiB default."
+        ),
+    )
     group.add_argument('--rl-verify-model-weights-swap', action=argparse.BooleanOptionalAction, default=False,
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')
@@ -3224,6 +3339,15 @@ def _add_distributed_args(parser):
     group.add_argument('--data-parallel-sharding-strategy', type=str, default='optim_grads_params',
                        choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
                        help='Sharding strategy of data parallelism.')
+    group.add_argument('--expert-data-parallel-sharding-strategy', type=str, default=None,
+                       choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
+                       help='Sharding strategy of data parallelism for expert (MoE) parameters. '
+                            'When set, --data-parallel-sharding-strategy only applies to '
+                            'non-expert parameters. Expert parameters are sharded over a narrower '
+                            'DP group than non-expert parameters when expert parallelism is '
+                            'enabled, so the two classes can warrant different communication / '
+                            'memory trade-offs. Defaults to None, which applies '
+                            '--data-parallel-sharding-strategy to every parameter.')
     group.add_argument('--outer-dp-sharding-strategy', type=str, default='no_shard',
                        choices=['no_shard', 'optim'],
                        help='Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode. '
@@ -3231,6 +3355,11 @@ def _add_distributed_args(parser):
                             'The "optim" option is only supported when --data-parallel-sharding-strategy is "optim_grads_params". '
                             'This option is only effective when Hybrid FSDP is enabled (i.e., when dp_outer_dim is not None). '
                             'Default: "no_shard".')
+    group.add_argument('--hfsdp-param-gather-overlap', action='store_true',
+                       help='Pipeline HFSDP parameter all-gathers across DP-Outer and DP-Inner. '
+                            'DP-Outer is prefetched one FSDP unit beyond the existing '
+                            'DP-Inner prefetch frontier. '
+                            'Only effective with --outer-dp-sharding-strategy=optim.')
     group.add_argument('--no-gradient-reduce-div-fusion', action='store_false', dest='gradient_reduce_div_fusion',
                        help='If not set, fuse the division in gradient reduce.')
     group.add_argument('--fsdp-double-buffer', action='store_true',
@@ -3815,6 +3944,52 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
+    group.add_argument('--sft-mock-dataset-config-json', type=str, default=None,
+                       help='This config provides the necessary information for the mock '
+                       'dataset. Accepts either an inline JSON literal or a path to a JSON '
+                       'file containing the same schema. You can either specify a CSV file '
+                       'that contains sequence lengths, where each line stores the length of '
+                       'a sequence, for example: {"mode":"file","path":"/path/to/file"}. '
+                       'Alternatively, you can specify a distribution (currently only '
+                       'supporting lognormal distribution) along with the required '
+                       'parameters, for example, {"mode":"distribution","type":"lognormal",'
+                       '"min_seq_len":1024,"max_seq_len":2048,"mean_seq_len":1536,'
+                       '"lognormal_sigma":1.1}, where sigma controls the variability of the '
+                       'lognormal distribution. If not specified and --mock-data is set, '
+                       'defaults to a lognormal distribution with min_seq_len=seq_length//2, '
+                       'max_seq_len=seq_length, mean_seq_len=seq_length*3//4, '
+                       'lognormal_sigma=1.1.')
+    return parser
+
+
+def _add_varlen_dataset_args(parser):
+    group = parser.add_argument_group(title='varlen dataset')
+    group.add_argument('--use-varlen-dataset', action="store_true",
+                       help='Train with VarlenDataset, a variable-length packed (THD) dataset '
+                       'that consumes instruction-tuning data from a HuggingFace Hub repo id, '
+                       'a local parquet file, or a local jsonl file. Schema (alpaca / sharegpt '
+                       '/ openai-messages) is auto-detected from the dataset columns. '
+                       'Mutually exclusive with --sft. Auto-picks a sequence packing '
+                       'scheduler when none is given: dp_balanced. '
+                       'Combine with --mock-data for a synthetic lognormal sequence-length '
+                       'distribution; see --varlen-mock-dataset-config-json.')
+    group.add_argument('--varlen-sbhd-validation', action="store_true",
+                       help='Reference SBHD mode for THD numerical verification. When set, '
+                       'VarlenDataset emits SBHD-style samples right-padded to '
+                       '--seq-length (no cu_seqlens, no packing scheduler), so the run can '
+                       'be compared against the THD path to validate correctness. '
+                       'Incompatible with --sequence-packing-scheduler.')
+    group.add_argument('--varlen-mock-dataset-config-json', type=str, default=None,
+                       help='Mock-dataset config for --use-varlen-dataset --mock-data. '
+                       'Accepts either an inline JSON literal or a path to a JSON file '
+                       'containing the same schema as --sft-mock-dataset-config-json: either '
+                       '{"mode":"file","path":"/path/to/lengths.csv"}, '
+                       '{"mode":"distribution","type":"lognormal","min_seq_len":1024,'
+                       '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, or '
+                       '{"mode":"verification","data_path":"/prefix/of/IndexedDataset"}. '
+                       'If not specified, defaults to a lognormal distribution with '
+                       'min_seq_len=seq_length//2, max_seq_len=seq_length, '
+                       'mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.')
     return parser
 
 def _add_logits_distillation_args(parser):

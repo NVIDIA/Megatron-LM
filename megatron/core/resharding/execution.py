@@ -15,7 +15,7 @@ from megatron.core.transformer.module import MegatronModule
 
 from .copy_services.base import CopyService
 from .transforms import ReshardTransform, _ensure_sendable
-from .utils import ReshardPlan, get_refit_tensor_dict
+from .utils import ReshardPlan, TransferOp, get_refit_tensor_dict
 
 logger = logging.getLogger(__name__)
 
@@ -109,59 +109,69 @@ def _native_gtp_load_context(module: torch.nn.Module | None, pending: dict[int, 
     return gtp_api.gtp_native_fp8_load_context(module)
 
 
-def execute_reshard_plan(
+def _validate_execution_batches(plan: ReshardPlan) -> None:
+    """Validate locally checkable invariants of a batched reshard plan."""
+    if plan.num_batches < 1:
+        raise ValueError(f"ReshardPlan.num_batches must be positive, got {plan.num_batches}")
+
+    recv_batch_by_param: dict[str, int] = {}
+    for op in (*plan.send_ops, *plan.recv_ops):
+        if not 0 <= op.batch_id < plan.num_batches:
+            raise ValueError(
+                f"Transfer task_id={op.task_id} has batch_id={op.batch_id}, but the plan has "
+                f"{plan.num_batches} batches"
+            )
+        if op.is_send:
+            continue
+        previous_batch = recv_batch_by_param.setdefault(op.param_name, op.batch_id)
+        if previous_batch != op.batch_id:
+            raise ValueError(
+                f"Receive operations for {op.param_name!r} span batches "
+                f"{previous_batch} and {op.batch_id}; complete parameters must stay together"
+            )
+
+
+def _get_execution_batches(
     plan: ReshardPlan,
-    src_module: torch.nn.Module,
-    dst_module: torch.nn.Module,
+) -> tuple[tuple[int, list[TransferOp], list[TransferOp]], ...]:
+    """Return the plan's validated batch grouping, building it only once."""
+    if plan._cached_execution_batches is None:
+        _validate_execution_batches(plan)
+        send_ops_by_batch: list[list[TransferOp]] = [[] for _ in range(plan.num_batches)]
+        recv_ops_by_batch: list[list[TransferOp]] = [[] for _ in range(plan.num_batches)]
+        for op in plan.send_ops:
+            send_ops_by_batch[op.batch_id].append(op)
+        for op in plan.recv_ops:
+            recv_ops_by_batch[op.batch_id].append(op)
+        plan._cached_execution_batches = tuple(
+            (batch_id, send_ops_by_batch[batch_id], recv_ops_by_batch[batch_id])
+            for batch_id in range(plan.num_batches)
+        )
+    return plan._cached_execution_batches
+
+
+def _execute_batch(
+    send_ops: list[TransferOp],
+    recv_ops: list[TransferOp],
+    src_params: dict[str, torch.Tensor],
+    dst_params: dict[str, torch.Tensor],
     service: CopyService,
-    group=None,
-    transform: Optional[ReshardTransform] = None,
-) -> None:
-    """
-    Execute a reshard plan (built locally on each rank).
-    A communication service must be provided to abstract transport.
-    Expected service API: submit_send(tensor, dest_rank, task_id),
-    submit_recv(tensor, src_rank, task_id), run().
-
-    Supports None for src_module and/or dst_module to allow ranks in non-collocated mode:
-    - src_module=None: Rank only receives data (destination-only)
-    - dst_module=None: Rank only sends data (source-only)
-    - Both provided: Rank participates in both send and recv (collocated mode)
-
-    When *transform* is provided, parameters for which
-    ``transform.should_transform(param_name)`` returns True use the
-    transform's prepare_send / prepare_recv / finalize_recv methods instead
-    of the default slice-and-copy logic.
-    """
-    service.set_plan(plan, transform=transform)
-
-    # Extract parameters and persistent buffers from models if present.
-    # Persistent buffers carry training state (e.g. MoE router expert_bias)
-    # and must be refit alongside parameters.  Cached on each module so the
-    # named_modules() walk happens once per model, not per refit.
-    src_params = get_refit_tensor_dict(src_module) if src_module is not None else {}
-    dst_params = get_refit_tensor_dict(dst_module) if dst_module is not None else {}
-
-    if service.execute_plan(plan, src_params, dst_params, transform=transform):
-        logger.info("Executing native reshard plan")
-        torch.cuda.synchronize()
-        if service.requires_process_group_barrier:
-            dist.barrier(group=group)
-        refresh_module_caches(dst_module)
-        torch.cuda.synchronize()
-        logger.info("Reshard complete")
-        return
-
+    dst_module: torch.nn.Module | None,
+    transform: Optional[ReshardTransform],
+    prefetch_stream: Optional[torch.cuda.Stream],
+) -> bool:
+    """Submit, execute, and finalize one memory-bounded operation batch."""
     # Cache dequantized BF16 views of quantized source params so that multiple
     # send ops for the same param reuse one dequant instead of repeating it.
     # Issue all dequants on a side stream and record per-param events so each
     # send op only waits on its own dequant (later dequants can overlap with
-    # earlier sends' slicing on the default stream).
+    # earlier sends' slicing on the default stream). The cache is scoped to
+    # this batch so it cannot grow to the full model.
     sendable_cache: dict[str, torch.Tensor] = {}
     sendable_events: dict[str, torch.cuda.Event] = {}
 
     quantized_param_names: set[str] = set()
-    for op in plan.send_ops:
+    for op in send_ops:
         if transform is not None and transform.should_transform(op.param_name):
             continue
         src_param = src_params.get(op.param_name)
@@ -169,7 +179,12 @@ def execute_reshard_plan(
             quantized_param_names.add(op.param_name)
 
     if quantized_param_names:
-        prefetch_stream = torch.cuda.Stream()
+        assert prefetch_stream is not None
+        # Dequantized buffers are allocated on the prefetch stream and consumed
+        # on the current stream. Order the next allocation round behind those
+        # consumers so the caching allocator cannot recycle storage too early.
+        # This is a device-side stream dependency, not a host synchronization.
+        prefetch_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(prefetch_stream):
             for param_name in quantized_param_names:
                 sendable_cache[param_name] = _ensure_sendable(src_params[param_name])
@@ -177,12 +192,12 @@ def execute_reshard_plan(
                 ev.record()
                 sendable_events[param_name] = ev
 
-    def get_sendable(param_name: str, param: torch.nn.Parameter) -> torch.Tensor:
+    def get_sendable(param_name: str, param: torch.Tensor) -> torch.Tensor:
         if param_name not in sendable_cache:
             sendable_cache[param_name] = _ensure_sendable(param)
         return sendable_cache[param_name]
 
-    for op in plan.send_ops:
+    for op in send_ops:
         src_param = src_params.get(op.param_name)
         if src_param is None:
             continue
@@ -200,15 +215,12 @@ def execute_reshard_plan(
                 src_view = src_view.contiguous()
             service.submit_send(src_view, op.peer_rank, task_id=op.task_id)
 
-    sendable_cache.clear()
-    sendable_events.clear()
-
     writebacks: list[_Writeback] = []
     # Quantized destinations are assembled in BF16 and quantized once all
     # logical slices have arrived.
     pending_quantized: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
 
-    for op in plan.recv_ops:
+    for op in recv_ops:
         if transform is not None and transform.should_transform(op.param_name):
             recv_bufs = transform.prepare_recv(op.param_name, op.my_slice)
             for buf in recv_bufs:
@@ -257,19 +269,18 @@ def execute_reshard_plan(
             )
         )
 
-    logger.info(f"Executing {len(plan.send_ops)} sends + {len(plan.recv_ops)} recvs")
     service.run()
-    torch.cuda.synchronize()
-    if service.requires_process_group_barrier:
-        dist.barrier(group=group)
+    sendable_cache.clear()
+    sendable_events.clear()
 
     # Write back received buffers into their destination parameter slices.
     #
     # For quantized destination params (fp8_param=true on receiver),
     # accumulate ALL BF16 slices per-param before calling quantize_() once.
-    # This avoids corrupting block scales through partial updates. A zeroed
-    # buffer also gives padded GTP rows neutral values without dequantizing the
-    # old weight.
+    # This avoids corrupting block scales through partial updates. The planner
+    # keeps all slices of a logical parameter in one batch, so its fresh BF16
+    # buffer can be released before the next batch. Padded GTP rows are zeroed
+    # to keep values outside the logical weight neutral during quantization.
     for i in range(len(writebacks)):
         wb = writebacks[i]
         writebacks[i] = None  # Drop reference eagerly so recv buffers can free.
@@ -277,6 +288,7 @@ def execute_reshard_plan(
             if wb.kind == 'direct':
                 continue
             if wb.kind == 'transform':
+                assert transform is not None
                 transform.finalize_recv(wb.param_name, wb.dst_slice, wb.recv_bufs)
                 continue
             # 'copy' — direct buffer copy, with deferred quantization if needed.
@@ -293,19 +305,108 @@ def execute_reshard_plan(
         for dst_param, full_bf16 in pending_quantized.values():
             dst_param.quantize_(full_bf16)
     pending_quantized.clear()
+    return had_quantized_staging
+
+
+def execute_reshard_plan(
+    plan: ReshardPlan,
+    src_module: torch.nn.Module,
+    dst_module: torch.nn.Module,
+    service: CopyService,
+    group=None,
+    transform: Optional[ReshardTransform] = None,
+) -> None:
+    """
+    Execute a reshard plan (built locally on each rank).
+    A communication service must be provided to abstract transport.
+    Expected service API: submit_send(tensor, dest_rank, task_id),
+    submit_recv(tensor, src_rank, task_id), run().
+
+    Supports None for src_module and/or dst_module to allow ranks in non-collocated mode:
+    - src_module=None: Rank only receives data (destination-only)
+    - dst_module=None: Rank only sends data (source-only)
+    - Both provided: Rank participates in both send and recv (collocated mode)
+
+    When *transform* is provided, parameters for which
+    ``transform.should_transform(param_name)`` returns True use the
+    transform's prepare_send / prepare_recv / finalize_recv methods instead
+    of the default slice-and-copy logic.
+    """
+    service.set_plan(plan, transform=transform)
+
+    # Extract parameters and persistent buffers from models if present.
+    # Persistent buffers carry training state (e.g. MoE router expert_bias)
+    # and must be refit alongside parameters.  Cached on each module so the
+    # named_modules() walk happens once per model, not per refit.
+    src_params = get_refit_tensor_dict(src_module) if src_module is not None else {}
+    dst_params = get_refit_tensor_dict(dst_module) if dst_module is not None else {}
+
+    if service.execute_plan(plan, src_params, dst_params, transform=transform):
+        logger.info("Executing native reshard plan")
+        torch.cuda.synchronize()
+        if service.requires_process_group_barrier:
+            dist.barrier(group=group)
+        refresh_module_caches(dst_module)
+        torch.cuda.synchronize()
+        logger.info("Reshard complete")
+        return
+
+    batches: tuple[tuple[int | None, list[TransferOp], list[TransferOp]], ...]
+    if service.supports_multiple_runs_per_plan and plan.num_batches > 1:
+        batches = _get_execution_batches(plan)
+    else:
+        # NIXL registers the complete receive address map once and requires the
+        # same map on later refits. The default one-batch path also avoids
+        # regrouping every operation on each refit.
+        batches = ((None, plan.send_ops, plan.recv_ops),)
+
+    # _execute_batch still selects only the quantized parameters used by that
+    # batch. Inspect the tensor dictionary here so large plans are not walked
+    # an extra time merely to decide whether a shared prefetch stream is needed.
+    prefetch_stream = (
+        torch.cuda.Stream()
+        if any(_requires_bf16_staging(param) for param in src_params.values())
+        else None
+    )
+
+    had_quantized_staging = False
+    for batch_id, send_ops, recv_ops in batches:
+        batch_label = "all" if batch_id is None else f"{batch_id + 1}/{plan.num_batches}"
+        logger.info(
+            "Executing reshard batch %s: %d sends + %d recvs",
+            batch_label,
+            len(send_ops),
+            len(recv_ops),
+        )
+        had_quantized_staging |= _execute_batch(
+            send_ops,
+            recv_ops,
+            src_params,
+            dst_params,
+            service,
+            dst_module,
+            transform,
+            prefetch_stream,
+        )
+
+    # Multiple-run services make each run visible to subsequent work on the
+    # current stream. Keep the device-wide synchronization outside the loop so
+    # each staging batch avoids a host sync.
+    torch.cuda.synchronize()
+    if service.requires_process_group_barrier:
+        dist.barrier(group=group)
 
     refresh_module_caches(dst_module)
 
-    # Ensure all writeback and cache-refresh copies are visible to subsequent CUDA
-    # ops (e.g. CUDA graph warmup).  The synchronize() above fires *before* the
-    # writeback loop, so without this second sync the .copy_() kernels are still async
-    # when execute_reshard_plan returns — creating a race with callers that immediately
-    # inspect or capture (via CUDA graphs) the destination parameters.
+    # Ensure all cache-refresh copies are visible to subsequent CUDA ops (e.g.
+    # CUDA graph warmup). The synchronize() above fires before cache refresh, so
+    # without this second sync those copies may still be async when
+    # execute_reshard_plan returns.
     torch.cuda.synchronize()
 
     # Release transient BF16 recv/accumulation buffers back to the CUDA driver.
     # Without this the caching allocator retains the peak allocation, which can
-    # be significant for quantized destinations (full model weight size in BF16).
+    # be significant for quantized destinations (one bounded batch in BF16).
     # Skip the (expensive) empty_cache walk when no staging happened.
     if had_quantized_staging:
         torch.cuda.empty_cache()
