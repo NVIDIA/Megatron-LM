@@ -337,12 +337,12 @@ def compute_cp_indexer_topk(
     ``prebuilt_layout`` optionally supplies a ``(cu_q, cu_k, q_causal_offsets)`` tuple from a
     previous ``_build_cp_indexer_layout(cu_seqlens_q, cu_seqlens_compressed, global_start,
     rows)`` call with identical arguments, skipping the rebuild (the layout is constant across
-    layers within a microbatch). NOTE: only the FUSED path consumes the layout for masking;
-    the unfused path recomputes its masking from ``(cu_seqlens_q, global_start)`` and returns
-    the tuple as metadata only — passing a synthetic layout that differs from that recomputation
-    together with ``use_fused=False`` silently mis-masks and is unsupported. Callers passing
-    such a synthetic layout (the balanced zigzag path) must set ``synthetic_layout=True`` so the
-    row-limit guard below knows the unfused path is not a valid alternative; an ordinary cached
+    layers within a microbatch). Only the fused path consumes the layout for masking; the
+    unfused path recomputes its masking from ``(cu_seqlens_q, global_start)`` and returns the
+    tuple as metadata only. Callers passing a synthetic layout that differs from that
+    recomputation (the balanced zigzag path) must set ``synthetic_layout=True`` and use the fused
+    path. Non-empty calls with ``synthetic_layout=True`` and ``use_fused=False`` raise
+    ``ValueError`` rather than silently mis-mask. An ordinary cached
     ``_build_cp_indexer_layout`` result keeps the default.
     """
     topk_width = int(topk_width)
@@ -351,6 +351,12 @@ def compute_cp_indexer_topk(
     max_seqlen_kv = int(max_seqlen_q) // int(ratio) if max_seqlen_kv is None else int(max_seqlen_kv)
     if max_seqlen_kv == 0:
         return None, None
+
+    if synthetic_layout and not use_fused:
+        raise ValueError(
+            "synthetic_layout=True requires use_fused=True because the unfused path "
+            "recomputes masking and ignores the synthetic layout."
+        )
 
     if use_fused and int(q_indexer_local.shape[0]) > FUSED_INDEXER_MAX_SAFE_ROWS:
         # See FUSED_INDEXER_MAX_SAFE_ROWS. Policy split (after the zero-work exits
@@ -371,7 +377,8 @@ def compute_cp_indexer_topk(
                 "unless first-in-process; verified on GB200 with cudnn-frontend 1.26.0, "
                 "no known-good version yet), and this synthetic layout cannot take the "
                 "unfused path. Reduce per-call rows (higher CP degree or smaller pack "
-                "capacity) or run the indexer unfused."
+                "capacity), or disable dsa_cp_balance_indexer and use the contiguous "
+                "reference path with an unfused backend."
             )
 
     global_start = int(global_start)

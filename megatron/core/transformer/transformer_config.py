@@ -412,28 +412,32 @@ class TransformerConfig(ModelParallelConfig):
     at recipe level, by this flag.
     Under FP8 recipes, eval/no-grad forwards skip the indexer's loss-path projection, so its amax
     history sees fewer recordings than the reference during eval (training forwards identical).
-    By default, CUDA-graph support is scoped to a static pack composition and PP/VPP is rejected
-    when the graph captures attention. Set ``dsa_cp_balance_indexer_graph_dynamic_packs`` to opt
-    into fixed-capacity routed all-to-all metadata that may be refreshed between graph replays.
-    When False, the indexer uses the contiguous CP split."""
-
-    dsa_cp_balance_indexer_graph_dynamic_packs: bool = False
-    """Opt into varying packed-sequence compositions for the CUDA-graphed balanced DSA indexer.
-
-    The opt-in keeps graph tensor shapes and communication sizes fixed. Data preparation builds
-    one fixed-shape source plan from each microbatch's ``cu_seqlens``. The decoder stack copies
-    its two typed metadata owners once into a fixed-address graph-slot arena shared by all of its
+    For Transformer Engine CUDA graphs that capture attention, fixed-capacity dynamic-pack routing
+    is enabled automatically when ``sequence_packing_scheduler="dp_balanced"``. Data preparation
+    then builds one fixed-shape source plan from each microbatch's ``cu_seqlens``. The decoder stack
+    copies its two typed metadata owners once into a fixed-address graph-slot arena shared by all
     captured DSA callables. Staged route inputs retain their originating slot so replay cannot
     follow mutable layer microbatch state; this does not change the existing CUDA-graph/recompute
-    compatibility matrix. It requires
-    ``dsa_cp_balance_indexer``, fixed context parallelism, ``sequence_packing_scheduler`` set to
-    ``"dp_balanced"``, and Transformer Engine CUDA graphs that capture attention. PP/VPP also
-    requires ``cuda_graph_dynamic_microbatches`` so a graph input slot cannot be reused while its
-    forward remains live. Dynamic CP, local CUDA graphs, and full-iteration CUDA graphs are
-    intentionally unsupported. A step batch-size schedule may not increase the source global
-    batch size after capture; doing so would require retaining graph instances sized for the
-    largest future schedule entry. The default is False so existing static-composition graph
-    behavior is unchanged."""
+    compatibility matrix. PP/VPP also requires ``cuda_graph_dynamic_microbatches`` so a graph input
+    slot cannot be reused while its forward remains live. Dynamic CP, local CUDA graphs, and
+    full-iteration CUDA graphs do not use dynamic-pack routing. A step batch-size schedule may not
+    increase the source global batch size after capture; doing so would require retaining graph
+    instances sized for the largest future schedule entry. Other graph configurations retain the
+    static-composition behavior."""
+
+    @property
+    def dsa_cp_balance_indexer_graph_dynamic_packs(self) -> bool:
+        """Whether CUDA-graphed balanced DSA routing supports varying pack compositions.
+
+        This is derived rather than user-configurable so data preparation, graph capture, and
+        replay always agree on whether fixed-capacity dynamic route metadata is required.
+        """
+        return bool(
+            self.dsa_cp_balance_indexer
+            and self.cuda_graph_impl == "transformer_engine"
+            and cuda_graph_captures_attention(self)
+            and self.sequence_packing_scheduler == "dp_balanced"
+        )
 
     ####################
     # DeepSeek-v4 hybrid attention
@@ -3521,47 +3525,24 @@ class TransformerConfig(ModelParallelConfig):
         graph_captures_attention = cuda_graph_captures_attention(self)
 
         if self.dsa_cp_balance_indexer_graph_dynamic_packs:
-            if not self.dsa_cp_balance_indexer:
-                raise ValueError(
-                    "dsa_cp_balance_indexer_graph_dynamic_packs requires "
-                    "dsa_cp_balance_indexer=True."
-                )
-            if self.cuda_graph_impl != "transformer_engine":
-                raise ValueError(
-                    "dsa_cp_balance_indexer_graph_dynamic_packs requires "
-                    "cuda_graph_impl='transformer_engine'; local and full-iteration "
-                    "CUDA graphs are not supported."
-                )
-            if not graph_captures_attention:
-                raise ValueError(
-                    "dsa_cp_balance_indexer_graph_dynamic_packs requires CUDA graph capture "
-                    "to include attention. Add 'attn' to cuda_graph_modules or capture the "
-                    "whole layer."
-                )
-            if self.sequence_packing_scheduler != "dp_balanced":
-                raise ValueError(
-                    "dsa_cp_balance_indexer_graph_dynamic_packs requires "
-                    "sequence_packing_scheduler='dp_balanced'."
-                )
             if self.dynamic_context_parallel or self.context_parallel_size <= 1:
                 raise ValueError(
-                    "dsa_cp_balance_indexer_graph_dynamic_packs requires fixed context "
-                    "parallelism with context_parallel_size > 1 and "
-                    "dynamic_context_parallel=False."
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires fixed context "
+                    "parallelism with context_parallel_size > 1 and dynamic_context_parallel=False."
                 )
             if self.max_seqlen_per_dp_cp_rank is None:
                 raise ValueError(
-                    "dsa_cp_balance_indexer_graph_dynamic_packs requires "
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires "
                     "max_seqlen_per_dp_cp_rank to define the fixed per-rank graph capacity."
                 )
             if self.max_seqlen_per_dp_cp_rank <= 0:
                 raise ValueError(
-                    "dsa_cp_balance_indexer_graph_dynamic_packs requires a positive "
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires a positive "
                     "max_seqlen_per_dp_cp_rank."
                 )
             if self.max_seqlen_per_dp_cp_rank % 2 != 0:
                 raise ValueError(
-                    "dsa_cp_balance_indexer_graph_dynamic_packs requires an even "
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires an even "
                     "max_seqlen_per_dp_cp_rank because every rank scores two fixed-size halves."
                 )
             from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
@@ -3570,7 +3551,8 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.max_seqlen_per_dp_cp_rank // 2 > FUSED_INDEXER_MAX_SAFE_ROWS:
                 raise ValueError(
-                    "dsa_cp_balance_indexer_graph_dynamic_packs would issue fused indexer calls "
+                    "CUDA-graphed balanced DSA dynamic-pack routing would issue fused "
+                    "indexer calls "
                     f"with {self.max_seqlen_per_dp_cp_rank // 2} rows, above the verified-safe "
                     f"limit of {FUSED_INDEXER_MAX_SAFE_ROWS}. Increase CP or reduce "
                     "max_seqlen_per_dp_cp_rank."
@@ -3581,13 +3563,13 @@ class TransformerConfig(ModelParallelConfig):
             )
             if graph_dynamic_pp_vpp and not self.cuda_graph_dynamic_microbatches:
                 raise ValueError(
-                    "dsa_cp_balance_indexer_graph_dynamic_packs with PP/VPP requires "
+                    "CUDA-graphed balanced DSA dynamic-pack routing with PP/VPP requires "
                     "cuda_graph_dynamic_microbatches=True so each in-flight forward owns a "
                     "distinct CUDA graph input slot until its backward completes."
                 )
             if self.overlap_moe_expert_parallel_comm or self.delay_wgrad_compute:
                 raise ValueError(
-                    "dsa_cp_balance_indexer_graph_dynamic_packs does not yet support "
+                    "CUDA-graphed balanced DSA dynamic-pack routing does not yet support "
                     "overlap_moe_expert_parallel_comm or delay_wgrad_compute: those modes force "
                     "CUDA graph capture back to the runtime microbatch count instead of the THD "
                     "packing upper bound, so a still-live graph input slot could be reused."
@@ -3605,9 +3587,10 @@ class TransformerConfig(ModelParallelConfig):
             # disambiguate the different PackedSeqParams views hosted by PP/VPP.
             raise ValueError(
                 "dsa_cp_balance_indexer with attention-capturing CUDA graphs currently "
-                "supports pipeline_model_parallel_size == 1 only unless "
-                "dsa_cp_balance_indexer_graph_dynamic_packs=True. Enable that opt-in, "
-                "disable attention capture, or disable pipeline parallelism."
+                "supports PP/VPP only when dynamic-pack routing is inferred from "
+                "cuda_graph_impl='transformer_engine' and "
+                "sequence_packing_scheduler='dp_balanced'. Use those settings, disable "
+                "attention capture, or disable pipeline parallelism."
             )
 
         cp_layout_conversion_required = is_gated_delta_net_variant(

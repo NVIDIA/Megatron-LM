@@ -1097,7 +1097,7 @@ def test_full_local_padding_mask_covers_every_non_preprocess_chunk(
 
 
 def _make_balanced_dynamic_pack_config(monkeypatch, **overrides):
-    """Build a minimal valid opt-in config while isolating optional backend probes."""
+    """Build a config that infers dynamic-pack routing while isolating backend probes."""
     from megatron.core.transformer import transformer_config as transformer_config_module
     from megatron.core.transformer.experimental_attention_variant import dsa_kernels
     from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
@@ -1118,7 +1118,6 @@ def _make_balanced_dynamic_pack_config(monkeypatch, **overrides):
         csa_dense_mode=False,
         dsa_kernel_backend="none",
         dsa_cp_balance_indexer=True,
-        dsa_cp_balance_indexer_graph_dynamic_packs=True,
         cuda_graph_impl="transformer_engine",
         cuda_graph_dynamic_microbatches=True,
         pipeline_model_parallel_size=2,
@@ -1130,7 +1129,7 @@ def _make_balanced_dynamic_pack_config(monkeypatch, **overrides):
 
 @pytest.mark.internal
 @pytest.mark.parametrize("virtual_pipeline_size", [None, 2])
-def test_balanced_dynamic_packs_opt_in_allows_attention_graph_with_pp_vpp(
+def test_balanced_dynamic_packs_are_inferred_for_attention_graph_with_pp_vpp(
     monkeypatch, virtual_pipeline_size
 ):
     config = _make_balanced_dynamic_pack_config(
@@ -1152,17 +1151,13 @@ def test_balanced_dynamic_packs_allows_verified_safe_row_limit_boundary(monkeypa
 
 @pytest.mark.internal
 def test_balanced_static_pack_graph_keeps_pp_rejection(monkeypatch):
-    with pytest.raises(ValueError, match="graph_dynamic_packs=True"):
-        _make_balanced_dynamic_pack_config(
-            monkeypatch, dsa_cp_balance_indexer_graph_dynamic_packs=False
-        )
+    with pytest.raises(ValueError, match="dynamic-pack routing is inferred"):
+        _make_balanced_dynamic_pack_config(monkeypatch, cuda_graph_impl="local")
 
 
 @pytest.mark.internal
 def test_balanced_static_pack_pp_allows_graph_scope_outside_attention(monkeypatch):
-    config = _make_balanced_dynamic_pack_config(
-        monkeypatch, dsa_cp_balance_indexer_graph_dynamic_packs=False, cuda_graph_modules=["mlp"]
-    )
+    config = _make_balanced_dynamic_pack_config(monkeypatch, cuda_graph_modules=["mlp"])
 
     assert config.pipeline_model_parallel_size == 2
     assert not config.dsa_cp_balance_indexer_graph_dynamic_packs
@@ -1170,16 +1165,37 @@ def test_balanced_static_pack_pp_allows_graph_scope_outside_attention(monkeypatc
 
 @pytest.mark.internal
 @pytest.mark.parametrize(
+    "overrides",
+    [
+        {"dsa_cp_balance_indexer": False},
+        {"cuda_graph_impl": "local"},
+        {"cuda_graph_modules": ["mlp"]},
+        {"sequence_packing_scheduler": "default_dynamic_cp"},
+    ],
+)
+def test_balanced_dynamic_packs_require_all_inferred_conditions(monkeypatch, overrides):
+    config = _make_balanced_dynamic_pack_config(
+        monkeypatch,
+        pipeline_model_parallel_size=1,
+        cuda_graph_dynamic_microbatches=False,
+        **overrides,
+    )
+
+    assert not config.dsa_cp_balance_indexer_graph_dynamic_packs
+
+
+@pytest.mark.internal
+def test_balanced_dynamic_packs_cannot_be_set_as_a_constructor_option(monkeypatch):
+    with pytest.raises(TypeError, match="dsa_cp_balance_indexer_graph_dynamic_packs"):
+        _make_balanced_dynamic_pack_config(
+            monkeypatch, dsa_cp_balance_indexer_graph_dynamic_packs=True
+        )
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
     "overrides,match",
     [
-        ({"dsa_cp_balance_indexer": False}, "requires dsa_cp_balance_indexer=True"),
-        ({"cuda_graph_impl": "local"}, "requires cuda_graph_impl='transformer_engine'"),
-        ({"cuda_graph_impl": "full_iteration"}, "requires cuda_graph_impl='transformer_engine'"),
-        ({"cuda_graph_modules": ["mlp"]}, "requires CUDA graph capture to include attention"),
-        (
-            {"sequence_packing_scheduler": "default_dynamic_cp"},
-            "requires sequence_packing_scheduler='dp_balanced'",
-        ),
         (
             {"dynamic_context_parallel": True},
             "Dynamic context parallelism requires sequence_packing_scheduler=default_dynamic_cp",
@@ -1187,6 +1203,10 @@ def test_balanced_static_pack_pp_allows_graph_scope_outside_attention(monkeypatc
         (
             {"cuda_graph_dynamic_microbatches": False},
             "with PP/VPP requires cuda_graph_dynamic_microbatches=True",
+        ),
+        (
+            {"max_seqlen_per_dp_cp_rank": None, "pad_packed_seq_alignment": None},
+            "requires max_seqlen_per_dp_cp_rank",
         ),
         ({"max_seqlen_per_dp_cp_rank": 127}, "requires an even max_seqlen_per_dp_cp_rank"),
         ({"max_seqlen_per_dp_cp_rank": 0}, "requires a positive max_seqlen_per_dp_cp_rank"),
@@ -1202,7 +1222,7 @@ def test_balanced_static_pack_pp_allows_graph_scope_outside_attention(monkeypatc
         ),
     ],
 )
-def test_balanced_dynamic_packs_validates_opt_in_contract(monkeypatch, overrides, match):
+def test_balanced_dynamic_packs_validate_inferred_contract(monkeypatch, overrides, match):
     with pytest.raises(ValueError, match=match):
         _make_balanced_dynamic_pack_config(monkeypatch, **overrides)
 

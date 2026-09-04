@@ -2638,8 +2638,9 @@ class CompressedSparseAttention(MegatronModule):
                         f"DSv4 THD CP indexer expects bsz=1, got {indexer_x.shape[1]}."
                     )
                 nvtx_range_push("indexer_total")
-                # Switch 1: enable per-pack balanced routing via the config flag.
-                # CP<=1 has nothing to balance.
+                # Enable per-pack balanced routing via the config flag. CP<=1 has
+                # nothing to balance. Dynamic-pack graph routing is derived once
+                # from the normalized TransformerConfig rather than selected here.
                 use_balance = self.config.dsa_cp_balance_indexer and cp_size > 1
                 graph_dynamic_packs = bool(
                     getattr(self.config, "dsa_cp_balance_indexer_graph_dynamic_packs", False)
@@ -2845,7 +2846,6 @@ class CompressedSparseAttention(MegatronModule):
                             indexer.index_topk,
                             indexer.softmax_scale,
                             max_seqlen_q,
-                            use_fused=self.use_fused_kernels,
                             dispatch_handle=bal_dispatch_handle,
                             layout_cache=bal_layout_cache,
                             graph_dynamic_packs=graph_dynamic_packs,

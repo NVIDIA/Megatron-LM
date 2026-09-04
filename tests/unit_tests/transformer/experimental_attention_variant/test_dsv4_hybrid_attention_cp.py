@@ -1299,13 +1299,13 @@ class TestDSv4HybridAttentionTHDCP:
             use_fused_kernels=True,
             apply_rope_fusion=True,
             dsa_cp_balance_indexer=True,
-            dsa_cp_balance_indexer_graph_dynamic_packs=True,
             cuda_graph_impl="transformer_engine",
             cuda_graph_modules=["attn"],
             max_seqlen_per_dp_cp_rank=total_rows // self.cp_size,
             pad_packed_seq_alignment="max",
             thd_max_packed_sequences=len(_DSV4_CP_BALANCED_CAPTURE_SEG_LENS),
         )
+        assert config.dsa_cp_balance_indexer_graph_dynamic_packs
         graph_attn = _build_attention(config, layer_number=2, pg_collection=self.pg).cuda()
         eager_attn = _build_attention(config, layer_number=2, pg_collection=self.pg).cuda()
         graph_attn.train()
@@ -1531,13 +1531,13 @@ class TestDSv4HybridAttentionTHDCP:
             use_fused_kernels=True,
             apply_rope_fusion=True,
             dsa_cp_balance_indexer=True,
-            dsa_cp_balance_indexer_graph_dynamic_packs=True,
             cuda_graph_impl="transformer_engine",
             cuda_graph_modules=["attn"],
             max_seqlen_per_dp_cp_rank=local_rows,
             pad_packed_seq_alignment="max",
             thd_max_packed_sequences=len(capture_seg_lens),
         )
+        assert config.dsa_cp_balance_indexer_graph_dynamic_packs
         graph_layer = _build_dsv4_moe_layer(config, layer_number=2, pg_collection=self.pg).cuda()
         eager_layer = _build_dsv4_moe_layer(config, layer_number=2, pg_collection=self.pg).cuda()
         graph_layer.self_attention = _RoutePlanEchoAttention(
