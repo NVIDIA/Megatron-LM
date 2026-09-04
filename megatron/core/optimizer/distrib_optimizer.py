@@ -65,6 +65,7 @@ from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
+    _assign_main_grad_helper,
     _zero_grad_group_helper,
     copy_optimizer_param_metadata,
     param_group_identifier_keys,
@@ -2841,7 +2842,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # the optimizer read gradients from ".decoupled_grad" instead of ".grad").
                         shard_main_param.decoupled_grad = shard_model_grad
                     else:
-                        shard_main_param.grad = shard_model_grad.float()
+                        # On torch >= 2.10 this points ".grad" straight at the grad-buffer shard
+                        # instead of materializing an extra fp32 copy of every sharded grad (only
+                        # relevant when the grad buffer is not already fp32, i.e.
+                        # grad_reduce_in_fp32=False; otherwise the fp32 cast is a no-op anyway).
+                        _assign_main_grad_helper(shard_main_param, shard_model_grad)
 
         # Copy model groups to shard groups.
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:

@@ -47,13 +47,39 @@ from ..dist_checkpointing.optimizer import (
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..fp8_utils import copy_back_gathered_bf16_into_fp8_param, is_float8tensor
 from ..transformer.module import param_is_not_shared
-from ..utils import log_single_rank
+from ..utils import is_torch_min_version, log_single_rank
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .cpu_offloading.chunked_optimizer_state_offload import ChunkedOptimizerStateOffloader
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
+
+# Torch 2.10 added ``Tensor.grad_dtype`` (pytorch/pytorch#164751), which allows a leaf tensor to
+# hold a gradient whose dtype differs from the tensor's own dtype. Before that, a param and its
+# ".grad" had to share a dtype, forcing the mixed-precision optimizers to upcast the model grad
+# to fp32 when copying it into the fp32 main params.
+HAVE_TORCH_GRAD_DTYPE = is_torch_min_version("2.10.0")
+
+
+def _assign_main_grad_helper(main_param: torch.Tensor, model_grad: torch.Tensor):
+    """
+    Bind ``model_grad`` to ``main_param.grad``, upcasting to fp32 only when necessary.
+
+    On torch >= 2.10 a (bf16/fp16) model grad can be attached to an fp32 main param as-is by
+    declaring ``main_param.grad_dtype``, which avoids materializing an extra fp32 copy of the
+    gradient. On older torch versions the grad is upcast to the main param dtype, as before.
+    """
+    if HAVE_TORCH_GRAD_DTYPE and model_grad.dtype != main_param.dtype:
+        if main_param.grad_dtype != model_grad.dtype:
+            # ``grad_dtype`` cannot be changed while a grad of another dtype is attached.
+            main_param.grad = None
+            main_param.grad_dtype = model_grad.dtype
+        main_param.grad = model_grad
+    else:
+        # Note: a no-op cast (fp32 grad, fp32 main param) returns the grad itself, so this does
+        # not copy in the ``grad_reduce_in_fp32=True`` case.
+        main_param.grad = model_grad.float()
 
 
 def _zero_grad_group_helper(
@@ -1070,10 +1096,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
                 if hasattr(model_param, 'main_grad'):
-                    main_param.grad = model_param.main_grad.float()
+                    _assign_main_grad_helper(main_param, model_param.main_grad)
                 else:
                     if model_param.grad is not None:
-                        main_param.grad = model_param.grad.float()
+                        _assign_main_grad_helper(main_param, model_param.grad)
 
                 # Safe to deallocate model's grad/main_grad after copying.
                 # (If using contiguous buffers, main_grad's memory should
