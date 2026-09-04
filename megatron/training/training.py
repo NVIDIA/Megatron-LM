@@ -3686,7 +3686,10 @@ def training_log(
             snapshot_filename = f"{base}_{rank}{ext}"
             torch.cuda.memory._dump_snapshot(snapshot_filename)
 
-        elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
+        # No barrier: the timer measures on device now, and each rank's own
+        # timeline already includes waiting inside the collectives. A barrier
+        # here would fence the whole loop every iteration for nothing.
+        elapsed_time = timers('interval-time').elapsed(barrier=False, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
         llm_world_size = getattr(args, 'mimo_llm_world_size', args.world_size)
 
