@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import (
     get_updated_expert_bias,
@@ -505,7 +506,6 @@ class TestAuxLossFreeTop2Router:
         self.router = cast(Router, self.moe_layer.router)
         assert self.router.expert_bias is not None
         assert self.router.local_tokens_per_expert is not None
-        assert self.router.local_tokens_per_expert.dtype == torch.int64
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -547,6 +547,13 @@ class TestAuxLossFreeTop2Router:
 
         expected = torch.tensor([-0.1, 0.1], dtype=torch.float32, device="cuda")
         torch.testing.assert_close(updated_bias, expected)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_expert_bias_token_counts_survive_float16_module(self):
+        wrapped = Float16Module(self.transformer_config, self.moe_layer.cuda())
+        router = cast(Router, wrapped.module.router)
+
+        assert router.local_tokens_per_expert.dtype == torch.int64
 
     @pytest.mark.internal
     @pytest.mark.skipif(
