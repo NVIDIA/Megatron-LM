@@ -536,12 +536,35 @@ class AttnResStageSources:
         return payload
 
 
-def _attn_res_fwd_math(pseudo_query, key_norm_weight, eps, values):
-    """Pure forward math: stats, fp32 depth softmax, weighted accumulation.
+def _attn_res_autograd_math(pseudo_query, key_norm_weight, eps, values):
+    """Plain PyTorch AttnRes used behind ``torch.compile``.
 
-    Kept as a standalone function so it can be wrapped by ``torch.compile``
-    (one specialization per source arity) without changing the custom
-    autograd Function's saved-tensor policy.
+    Keeping this as an ordinary differentiable function lets AOTAutograd build
+    and partition the backward graph. In eager mode that graph would retain
+    every fp32 value upcast until backward, so eager execution instead uses
+    :class:`_AttnResAggregation` and its explicit recomputation policy below.
+    """
+    q = (pseudo_query * key_norm_weight).float()  # [h]
+    values32 = [value.float() for value in values]
+    dots = torch.stack([torch.matmul(value, q) for value in values32])  # [n, ...]
+    rstds = torch.stack(
+        [torch.rsqrt(value.pow(2).mean(dim=-1) + eps) for value in values32]
+    )  # [n, ...]
+    alpha = torch.softmax(dots * rstds, dim=0)  # [n, ...] fp32
+
+    out32 = alpha[0].unsqueeze(-1) * values32[0]
+    for j in range(1, len(values32)):
+        out32 = out32 + alpha[j].unsqueeze(-1) * values32[j]
+    return out32.to(values[0].dtype)
+
+
+def _attn_res_fwd_math(pseudo_query, key_norm_weight, eps, values):
+    """Memory-lean custom-Function forward math and saved statistics.
+
+    Unlike :func:`_attn_res_autograd_math`, the fp32 upcasts are deliberately
+    consumed one source at a time. ``torch.autograd.Function.forward`` runs
+    without recording this internal graph, so only the returned scalar
+    statistics are retained for the explicit backward.
     """
     q = (pseudo_query * key_norm_weight).float()  # [h]
 
@@ -598,38 +621,37 @@ def _attn_res_bwd_math(pseudo_query, key_norm_weight, alpha, dots, rstds, grad_o
     return grad_query, grad_norm_weight, grad_values
 
 
-_COMPILED_MATH: dict = {}
+_COMPILED_AUTOGRAD = None
 _COMPILE_FAILED = False
 
 
-def _get_attn_res_math(use_compile: bool):
-    """Return (fwd_math, bwd_math), compiled when requested and available.
+def _get_compiled_attn_res():
+    """Return the compiled plain-autograd aggregation, or ``None`` on wrap failure.
 
     torch.compile specializes per source arity (the list length is a dynamo
-    guard), so the one-time compile cost is bounded by the number of distinct
-    depth arities (~N). Falls back to eager with a one-time warning if
-    compilation is unavailable or fails at wrap time; a runtime compile
-    failure inside the wrapped function is not caught.
+    guard), and AOTAutograd builds the matching backward graph. The one-time
+    compile cost is therefore bounded by the number of distinct depth arities
+    (~N). A failure to wrap falls back to the memory-lean eager custom Function;
+    a runtime compile failure inside the wrapped function is not caught.
     """
-    global _COMPILE_FAILED
-    if not use_compile or _COMPILE_FAILED:
-        return _attn_res_fwd_math, _attn_res_bwd_math
-    if not _COMPILED_MATH:
+    global _COMPILED_AUTOGRAD, _COMPILE_FAILED
+    if _COMPILE_FAILED:
+        return None
+    if _COMPILED_AUTOGRAD is None:
         try:
-            _COMPILED_MATH['fwd'] = torch.compile(_attn_res_fwd_math)
-            _COMPILED_MATH['bwd'] = torch.compile(_attn_res_bwd_math)
+            _COMPILED_AUTOGRAD = torch.compile(_attn_res_autograd_math)
         except Exception:  # pylint: disable=broad-except
             _COMPILE_FAILED = True
             logging.getLogger(__name__).warning(
                 "attn_res_impl='compile' unavailable (torch.compile failed to wrap); "
-                "falling back to the eager attention-residual aggregation."
+                "falling back to the memory-lean eager attention-residual aggregation."
             )
-            return _attn_res_fwd_math, _attn_res_bwd_math
-    return _COMPILED_MATH['fwd'], _COMPILED_MATH['bwd']
+            return None
+    return _COMPILED_AUTOGRAD
 
 
 class _AttnResAggregation(torch.autograd.Function):
-    """Depth-softmax aggregation with a memory-lean, recomputing backward.
+    """Eager depth-softmax aggregation with a memory-lean, recomputing backward.
 
     A naive autograd implementation retains O(n) fp32 [.., h] intermediates
     (upcast copies and normalized keys) per sublayer. This Function saves only
@@ -639,18 +661,18 @@ class _AttnResAggregation(torch.autograd.Function):
 
     All statistics, the softmax, and the weighted accumulation run in fp32;
     the output is cast back to the values' dtype so no fp32 ever leaks into
-    the residual stream. With ``use_compile`` the forward/backward math bodies
-    run as torch.compile-fused kernels (the eager loop is CPU-dispatch-bound:
-    ~30 python ops and a dozen small kernels per aggregation), while the
-    saved-tensor policy stays exactly the same.
+    the residual stream. This custom Function is intentionally retained for
+    eager execution: using plain autograd there would keep the fp32 hidden-size
+    intermediates alive. The compile backend bypasses this Function and lets
+    AOTAutograd generate a recomputing backward from the plain PyTorch forward.
     """
 
     @staticmethod
-    def forward(ctx, pseudo_query, key_norm_weight, eps, use_compile, *values):
+    def forward(ctx, pseudo_query, key_norm_weight, eps, *values):
         """Aggregate depth sources and save compact state for backward."""
-        fwd_math, _ = _get_attn_res_math(use_compile)
-        out, alpha, dots, rstds = fwd_math(pseudo_query, key_norm_weight, eps, list(values))
-        ctx.use_compile = use_compile
+        out, alpha, dots, rstds = _attn_res_fwd_math(
+            pseudo_query, key_norm_weight, eps, list(values)
+        )
         ctx.save_for_backward(pseudo_query, key_norm_weight, alpha, dots, rstds, *values)
         return out
 
@@ -659,12 +681,11 @@ class _AttnResAggregation(torch.autograd.Function):
         """Recompute aggregation intermediates and return input gradients."""
         nvtx_range_push(msg=f"attn_res.aggregate_bwd_n{len(ctx.saved_tensors) - 5}")
         pseudo_query, key_norm_weight, alpha, dots, rstds, *values = ctx.saved_tensors
-        _, bwd_math = _get_attn_res_math(ctx.use_compile)
-        grad_query, grad_norm_weight, grad_values = bwd_math(
+        grad_query, grad_norm_weight, grad_values = _attn_res_bwd_math(
             pseudo_query, key_norm_weight, alpha, dots, rstds, grad_output, list(values)
         )
         nvtx_range_pop(msg=f"attn_res.aggregate_bwd_n{len(values)}")
-        return (grad_query, grad_norm_weight, None, None, *grad_values)
+        return (grad_query, grad_norm_weight, None, *grad_values)
 
 
 class AttentionResidual(MegatronModule):
@@ -697,8 +718,12 @@ class AttentionResidual(MegatronModule):
         """Aggregate depth sources (+ optional partial sum) into the sublayer input."""
         assert len(values) >= 1, "AttentionResidual requires at least one depth source"
         nvtx_range_push(msg=f"attn_res.aggregate_n{len(values)}")
-        out = _AttnResAggregation.apply(
-            self.pseudo_query, self.key_norm_weight, self.eps, self.use_compile, *values
-        )
+        compiled_attn_res = _get_compiled_attn_res() if self.use_compile else None
+        if compiled_attn_res is None:
+            out = _AttnResAggregation.apply(
+                self.pseudo_query, self.key_norm_weight, self.eps, *values
+            )
+        else:
+            out = compiled_attn_res(self.pseudo_query, self.key_norm_weight, self.eps, list(values))
         nvtx_range_pop(msg=f"attn_res.aggregate_n{len(values)}")
         return out
