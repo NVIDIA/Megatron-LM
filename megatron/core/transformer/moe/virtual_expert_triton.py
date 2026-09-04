@@ -1,18 +1,18 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Triton kernels for replica planning and intra-node replica transport.
+"""Triton kernels for virtual-expert planning and intra-node virtual-expert transport.
 
-The planner kernels compact semantic routes and compute deterministic replica
+The planner kernels compact semantic routes and compute deterministic virtual-expert
 placement (route mapping is plain torch). The transport kernels move only
-weights and gradients: owners push weights straight into their peers' replica slots
-in symmetric memory and pull the replica gradients back into native wgrad staging.
+weights and gradients: owners push weights straight into their peers' virtual-expert slots
+in symmetric memory and pull the virtual-expert gradients back into native wgrad staging.
 Both are pure wire movement, and within the reserved SM budget only TMA saturates
 NVLink, so they are built on ``tl.make_tensor_descriptor`` over runtime peer addresses
 plus Triton's loop pipeliner.
 
 Ordering against the expert GEMMs is stream order plus the collectives already in the
 layer: the planner's histogram all-gather precedes every push, and the reduction's
-device-side rendezvous brackets every gradient exchange. Replica gradient slots are
+device-side rendezvous brackets every gradient exchange. Virtual-expert gradient slots are
 never cleared; the runtime parameters carry ``overwrite_main_grad`` so TE's wgrad GEMM
 rewrites them on every backward.
 """
@@ -24,8 +24,8 @@ import torch
 import triton
 import triton.language as tl
 
-MAX_REPLICA_WEIGHT_SMS = 32
-MAX_REPLICA_EP_RANKS = 64
+MAX_VIRTUAL_EXPERT_WEIGHT_SMS = 32
+MAX_VIRTUAL_EXPERT_EP_RANKS = 64
 
 # Constants a kernel reads must be ``tl.constexpr`` objects (``.value`` on the host).
 # A tiled TMA descriptor caps its innermost box at 256 elements, so a flat stream is
@@ -71,13 +71,13 @@ def _grid_sync(grid_barrier, TAG: tl.constexpr, NUM_SMS: tl.constexpr):
 
 
 @triton.jit(do_not_specialize=["source_rank"])
-def _plan_replica_placement_kernel(
+def _plan_virtual_expert_placement_kernel(
     gathered_tokens_per_expert,
     rank_load_balance,
     expert_rank_allocations,
     destination_boundaries,
     experts_to_copy,
-    expert_replica_slots,
+    virtual_expert_slots,
     grid_sync,
     source_rank,
     RANK_ROUTE_CAPACITY: tl.constexpr,
@@ -88,13 +88,13 @@ def _plan_replica_placement_kernel(
     BLOCK_NUM_EXPERTS_PER_GPU: tl.constexpr,
     BLOCK_NUM_EXPERTS: tl.constexpr,
 ):
-    """Compute deterministic replica placement in one cooperative launch.
+    """Compute deterministic virtual-expert placement in one cooperative launch.
 
     One program owns each EP rank. It computes native expert totals, replays
     the quota greedy, assigns quotas across its experts, and finally fills its
-    replica slots. Quotas and the local allocation tile remain in registers.
+    virtual-expert slots. Quotas and the local allocation tile remain in registers.
     Equal rank ties choose the lowest rank, expert allocation ties choose the
-    lowest expert, and replica-slot ties choose the highest expert.
+    lowest expert, and virtual-expert-slot ties choose the highest expert.
     """
     rank = tl.program_id(0)
     ranks = tl.arange(0, BLOCK_EP_SIZE)
@@ -125,7 +125,7 @@ def _plan_replica_placement_kernel(
     )
     if source_total != RANK_ROUTE_CAPACITY:
         tl.device_print(
-            "replica planner: a rank's route count differs from tokens * topk on rank", rank
+            "virtual-expert planner: a rank's route count differs from tokens * topk on rank", rank
         )
         _emit_on_every_thread("trap; mov.u32 $0, 0;", THREADS=1)
     tl.store(
@@ -138,7 +138,7 @@ def _plan_replica_placement_kernel(
     # receiver's whole deficit from that single sender. This can send more than
     # the sender's excess, but it gives every receiver exactly one sender, and
     # a sender owns NUM_EXPERTS_PER_GPU experts, so a receiver never needs more
-    # replica slots than it has. Moving only min(excess, deficit) would cut
+    # virtual-expert slots than it has. Moving only min(excess, deficit) would cut
     # traffic but let a receiver draw on several senders and overflow the slots.
     balances = tl.load(rank_load_balance + ranks, mask=valid_ranks, other=0)
     quotas = tl.zeros((BLOCK_EP_SIZE,), dtype=tl.int32)
@@ -204,13 +204,13 @@ def _plan_replica_placement_kernel(
         expert = tl.max(tl.where(valid_remote & (counts == maximum), experts, -1), axis=0)
         selected = tl.where(maximum > 0, expert, -1).to(tl.int32)
         tl.store(experts_to_copy + rank * NUM_EXPERTS_PER_GPU + slot, selected)
-        tl.store(expert_replica_slots + selected * EP_SIZE + rank, slot, mask=selected >= 0)
+        tl.store(virtual_expert_slots + selected * EP_SIZE + rank, slot, mask=selected >= 0)
         counts = tl.where(experts == expert, -1, counts)
     # Allocations name the destination of every route, so an expert allocated
     # here without a slot would map its routes to a stale slot id. The
     # single-sender rule above makes this unreachable; keep it loud anyway.
     if tl.max(tl.where(valid_remote, counts, -1), axis=0) > 0:
-        tl.device_print("replica placement needs more replica slots than experts on rank", rank)
+        tl.device_print("virtual-expert placement needs more virtual-expert slots than experts on rank", rank)
         _emit_on_every_thread("trap; mov.u32 $0, 0;", THREADS=1)
 
 
@@ -253,7 +253,7 @@ def _compact_routing_map_kernel(
         selections = tl.sum(selected, axis=1)
         tl.device_assert(
             (selections == ROUTER_TOPK) | (tokens >= program_end),
-            "replica planner requires exactly router_topk routes per token",
+            "virtual-expert planner requires exactly router_topk routes per token",
         )
         tl.store(
             token_indices + tokens[:, None] * ROUTER_TOPK + slots,
@@ -265,13 +265,13 @@ def _compact_routing_map_kernel(
     tl.atomic_add(tokens_per_expert + experts, histogram, mask=valid_experts)
 
 
-def launch_replica_placement(
+def launch_virtual_expert_placement(
     gathered_counts: torch.Tensor,
     balance: torch.Tensor,
     allocation: torch.Tensor,
     destination_boundaries: torch.Tensor,
     experts_to_copy: torch.Tensor,
-    expert_replica_slots: torch.Tensor,
+    virtual_expert_slots: torch.Tensor,
     grid_sync: torch.Tensor,
     *,
     rank_route_capacity: int,
@@ -280,14 +280,14 @@ def launch_replica_placement(
     num_experts: int,
     num_local_experts: int,
 ) -> None:
-    """Launch deterministic single-kernel replica placement."""
-    _plan_replica_placement_kernel[(ep_size,)](
+    """Launch deterministic single-kernel virtual-expert placement."""
+    _plan_virtual_expert_placement_kernel[(ep_size,)](
         gathered_counts,
         balance,
         allocation,
         destination_boundaries,
         experts_to_copy,
-        expert_replica_slots,
+        virtual_expert_slots,
         grid_sync,
         source_rank,
         RANK_ROUTE_CAPACITY=rank_route_capacity,
@@ -390,7 +390,7 @@ def _cross_rank_barrier(
             COMPARE=0,
             VALUE=1,
             SEM="release",
-            LABEL="replica transport send stalled on rank",
+            LABEL="virtual-expert transport send stalled on rank",
             TIMEOUT_NS=_BARRIER_TIMEOUT_NS,
         )
         _handshake(
@@ -401,7 +401,7 @@ def _cross_rank_barrier(
             COMPARE=1,
             VALUE=0,
             SEM="acquire",
-            LABEL="replica transport receive stalled on rank",
+            LABEL="virtual-expert transport receive stalled on rank",
             TIMEOUT_NS=_BARRIER_TIMEOUT_NS,
         )
     _grid_sync(grid_barrier, _GRID_SYNC_TAG, NUM_SMS)
@@ -427,7 +427,7 @@ def _push_projection(
     NUM_LOCAL_EXPERTS: tl.constexpr,
     NUM_SMS: tl.constexpr,
 ):
-    """Push this block's share of one component into every replica slot.
+    """Push this block's share of one component into every virtual-expert slot.
 
     Both descriptors span a whole member and stay fixed across the tile loop.
     That is a requirement, not a convenience: Triton cannot predicate a descriptor
@@ -436,18 +436,18 @@ def _push_projection(
     ROWS: tl.constexpr = MEMBER_BYTES // _ROW
     TILE_ROWS: tl.constexpr = TILE_BYTES // _ROW
     TILES: tl.constexpr = ROWS // TILE_ROWS
-    # Cut each replica into as many segments as it takes to occupy the grid, and
-    # give every block one contiguous run. Striping every replica across every
-    # block instead would refill the copy pipeline once per replica, which costs
+    # Cut each virtual-expert into as many segments as it takes to occupy the grid, and
+    # give every block one contiguous run. Striping every virtual-expert across every
+    # block instead would refill the copy pipeline once per virtual-expert, which costs
     # more than it saves once a member is small - as the MXFP8 scales are.
     segments = tl.maximum(NUM_SMS // tl.maximum(active, 1), 1)
     for unit in tl.range(block, active * segments, NUM_SMS, num_stages=1):
-        # Vary the replica fastest. Consecutive replicas have different
+        # Vary the virtual-expert fastest. Consecutive virtual experts have different
         # destinations, so this keeps the blocks running at any instant spread
         # over the peers instead of queued behind the one peer being swept.
-        replica = unit % active
+        virtual_expert = unit % active
         segment = unit // active
-        chosen = tl.sum(tl.where(mine & (ordinal == replica), entry, 0), 0)
+        chosen = tl.sum(tl.where(mine & (ordinal == virtual_expert), entry, 0), 0)
         destination = chosen // NUM_LOCAL_EXPERTS
         slot = (chosen - destination * NUM_LOCAL_EXPERTS).to(tl.int64)
         expert = tl.load(plan + chosen) - rank * NUM_LOCAL_EXPERTS
@@ -458,7 +458,7 @@ def _push_projection(
             [_ROW, 1],
             [TILE_ROWS, _ROW],
         )
-        replica_slot = tl.make_tensor_descriptor(
+        virtual_expert_slot = tl.make_tensor_descriptor(
             (arena + ARENA_BYTES + slot * MEMBER_BYTES).to(tl.pointer_type(tl.uint8)),
             [ROWS, _ROW],
             [_ROW, 1],
@@ -471,13 +471,13 @@ def _push_projection(
             num_stages=_NUM_STAGES,
         ):
             row = tile * TILE_ROWS
-            replica_slot.store([row, 0], source.load([row, 0]))
+            virtual_expert_slot.store([row, 0], source.load([row, 0]))
 
 
 # ``rank`` must not be specialized: Triton would otherwise compile a separate
 # kernel per rank value, and the ahead-of-time warmup could not cover them all.
 @triton.jit(do_not_specialize=["rank"])
-def _replica_weight_push_kernel(
+def _virtual_expert_weight_push_kernel(
     fc1_bases,
     fc2_bases,
     fc1_scale_bases,
@@ -501,7 +501,7 @@ def _replica_weight_push_kernel(
     NUM_SMS: tl.constexpr,
     THREADS: tl.constexpr,
 ):
-    """Push every owner-local expert into its replica slots and rendezvous.
+    """Push every owner-local expert into its virtual-expert slots and rendezvous.
 
     ``plan`` holds the destination-major ``[world, num_local_experts]`` table of
     globally numbered experts the planner wants materialized, so the entries this
@@ -610,7 +610,7 @@ def _symmetric_window(
     mapped = tl.load(bases + peer, mask=peer < WORLD, other=0)
     strided = (mapped == base + peer.to(tl.int64) * stride) | (peer >= WORLD)
     if tl.sum((~strided).to(tl.int32), 0) != 0:
-        tl.device_print("replica symmetric window is not uniformly strided on rank", rank)
+        tl.device_print("virtual-expert symmetric window is not uniformly strided on rank", rank)
         _emit_on_every_thread("trap; mov.u32 $0, 0;", THREADS=1)
     return tl.make_tensor_descriptor(
         base.to(tl.pointer_type(arena.dtype.element_ty)),
@@ -621,7 +621,7 @@ def _symmetric_window(
 
 
 @triton.jit(do_not_specialize=["rank"])
-def _replica_grad_reduce_kernel(
+def _virtual_expert_grad_reduce_kernel(
     arena,
     fc1_bases,
     fc2_bases,
@@ -645,7 +645,7 @@ def _replica_grad_reduce_kernel(
     NUM_SMS: tl.constexpr,
     THREADS: tl.constexpr,
 ):
-    """Reduce every peer's replica gradients into native wgrad staging.
+    """Reduce every peer's virtual-expert gradients into native wgrad staging.
 
     ``[TILE_BEGIN, TILE_END)`` selects the transport tiles of one launch: the FC1
     members, the FC2 members, or both. The bridge launches the projections
@@ -654,7 +654,7 @@ def _replica_grad_reduce_kernel(
     ``plan`` holds the destination-major ``[world, num_local_experts]`` table of
     globally numbered experts the planner materialized, so the sources of one
     owner-local expert are the entries naming it, one per peer that hosts it.
-    Every block sweeps every replicated expert but only its own contiguous slice
+    Every block sweeps every materialized expert but only its own contiguous slice
     of the tiles, which splits the payload evenly however sparse the plan is,
     and each block starts at a different expert so the blocks running at any
     instant are spread over the peers instead of queued behind one of them.
@@ -674,14 +674,14 @@ def _replica_grad_reduce_kernel(
     owner_expert = tl.load(plan + entry, mask=planned, other=-1) - rank * NUM_LOCAL_EXPERTS
     mine = planned & (owner_expert >= 0) & (owner_expert < NUM_LOCAL_EXPERTS)
 
-    # Compact the experts some peer replicated, and each of their sources, into
+    # Compact the experts some peer materialized, and each of their sources, into
     # a table the transport reads with scalar loads. Recovering a source inside
     # the transport with a masked reduction instead costs 6% of the wire,
     # because the reduction is block wide and its two barriers land in the
     # middle of the pipelined loop. Compacting the experts as well keeps a
     # sparse plan from starting every block on the same peer. The grid sync
     # inside the rendezvous below publishes the table.
-    replicas = sources + NUM_LOCAL_EXPERTS * WORLD
+    virtual_experts = sources + NUM_LOCAL_EXPERTS * WORLD
     if block == 0:
         found = 0
         for expert in tl.range(0, NUM_LOCAL_EXPERTS, num_stages=1):
@@ -689,9 +689,9 @@ def _replica_grad_reduce_kernel(
             tl.store(
                 sources + expert * WORLD + tl.cumsum(source.to(tl.int32), 0) - 1, entry, mask=source
             )
-            tl.store(replicas + found, expert)
+            tl.store(virtual_experts + found, expert)
             found += tl.minimum(tl.sum(source.to(tl.int32), 0), 1)
-        tl.store(replicas + NUM_LOCAL_EXPERTS, found)
+        tl.store(virtual_experts + NUM_LOCAL_EXPERTS, found)
 
     window = _symmetric_window(
         arena, peer_bases, rank, ARENA_ROWS, TILE_ROWS, ELEMENT_BYTES, WORLD, WORLD_POW2
@@ -699,12 +699,12 @@ def _replica_grad_reduce_kernel(
     _cross_rank_barrier(
         signal_bases, grid_barrier, dummy_signal, rank, WORLD, WORLD_POW2, NUM_SMS, THREADS
     )
-    replicated = tl.load(replicas + NUM_LOCAL_EXPERTS)
+    materialized = tl.load(virtual_experts + NUM_LOCAL_EXPERTS)
 
     low = TILE_BEGIN + block * (TILE_END - TILE_BEGIN) // NUM_SMS
     high = TILE_BEGIN + (block + 1) * (TILE_END - TILE_BEGIN) // NUM_SMS
-    for step in tl.range(0, replicated, num_stages=1):
-        expert = tl.load(replicas + (step + block) % tl.maximum(replicated, 1))
+    for step in tl.range(0, materialized, num_stages=1):
+        expert = tl.load(virtual_experts + (step + block) % tl.maximum(materialized, 1))
         count = tl.sum((mine & (owner_expert == expert)).to(tl.int32), 0)
         fc1 = _staging_pointer(arena, fc1_bases + expert, ELEMENT_BYTES)
         fc2 = _staging_pointer(arena, fc2_bases + expert, ELEMENT_BYTES)
@@ -749,20 +749,21 @@ def _transport_tile(limit: int, *components: int) -> int:
     tile = functools.reduce(math.gcd, components, limit)
     if tile % _ROW.value:
         raise ValueError(
-            f"Replica transport components must share a {_ROW.value}-aligned tile, "
+            f"Virtual-expert transport components must share a {_ROW.value}-aligned tile, "
             f"got {components} yielding {tile}."
         )
     return tile
 
 
 def _validate_transport_shape(world_size: int, num_local_experts: int, num_sms: int) -> None:
-    if not 0 < num_sms <= MAX_REPLICA_WEIGHT_SMS:
+    if not 0 < num_sms <= MAX_VIRTUAL_EXPERT_WEIGHT_SMS:
         raise ValueError(
-            f"Replica weight kernels are limited to {MAX_REPLICA_WEIGHT_SMS} SMs, got {num_sms}."
+            f"Virtual-expert weight kernels are limited to {MAX_VIRTUAL_EXPERT_WEIGHT_SMS} SMs, "
+            f"got {num_sms}."
         )
-    if not 0 < world_size <= MAX_REPLICA_EP_RANKS or num_local_experts <= 0:
+    if not 0 < world_size <= MAX_VIRTUAL_EXPERT_EP_RANKS or num_local_experts <= 0:
         raise ValueError(
-            f"Replica transport supports 1..{MAX_REPLICA_EP_RANKS} EP ranks with a positive "
+            f"Virtual-expert transport supports 1..{MAX_VIRTUAL_EXPERT_EP_RANKS} EP ranks with a positive "
             f"expert count, got world_size={world_size}, num_local_experts={num_local_experts}."
         )
 
@@ -770,7 +771,7 @@ def _validate_transport_shape(world_size: int, num_local_experts: int, num_sms: 
 def _validate_grad_dtype(grad_dtype: torch.dtype) -> None:
     if grad_dtype not in (torch.float32, torch.bfloat16):
         raise ValueError(
-            f"Replica gradients must use torch.float32 or torch.bfloat16, got {grad_dtype}."
+            f"Virtual-expert gradients must use torch.float32 or torch.bfloat16, got {grad_dtype}."
         )
 
 
@@ -783,7 +784,7 @@ def _pointer_table(table: torch.Tensor, num_local_experts: int) -> torch.Tensor:
         or not table.is_contiguous()
     ):
         raise ValueError(
-            "Replica pointer tables must be contiguous CUDA int64 tensors "
+            "Virtual-expert pointer tables must be contiguous CUDA int64 tensors "
             f"with {num_local_experts} entries."
         )
     return table
@@ -796,7 +797,8 @@ def _plan_table(experts_to_copy: torch.Tensor, world_size: int, num_local_expert
         or not experts_to_copy.is_contiguous()
     ):
         raise ValueError(
-            f"Replica plans must be contiguous int32 [{world_size}, {num_local_experts}] tensors."
+            f"Virtual-expert plans must be contiguous int32 "
+            f"[{world_size}, {num_local_experts}] tensors."
         )
     return experts_to_copy
 
@@ -830,7 +832,9 @@ class _DescriptorAllocator:
 
     def _allocate(self, size: int, alignment: int, stream) -> torch.Tensor:
         if size > self._scratch.numel():
-            raise RuntimeError(f"Replica transport needs {size} descriptor bytes; reserved less.")
+            raise RuntimeError(
+                f"Virtual-expert transport needs {size} descriptor bytes; reserved less."
+            )
         return self._scratch[:size]
 
     def __enter__(self) -> None:
@@ -890,7 +894,7 @@ def _grad_arguments(
     fc1_tiles, fc2_tiles = (numel // tile for numel in member_numels)
     if not projections or any(projection not in (0, 1) for projection in projections):
         raise ValueError(
-            f"Replica gradient projections must be a subset of (0, 1), got {projections}."
+            f"Virtual-expert gradient projections must be a subset of (0, 1), got {projections}."
         )
     return dict(
         FC1_ROWS=member_numels[0] // _ROW.value,
@@ -910,7 +914,7 @@ def _grad_arguments(
     )
 
 
-def compile_replica_weight_kernels(
+def compile_virtual_expert_weight_kernels(
     *,
     world_size: int,
     num_local_experts: int,
@@ -931,7 +935,7 @@ def compile_replica_weight_kernels(
     with _DescriptorAllocator(device_index), torch.cuda.device(device_index):
         table = torch.zeros(world_size * num_local_experts, dtype=torch.int64, device="cuda")
         plan = torch.zeros(world_size * num_local_experts, dtype=torch.int32, device="cuda")
-        _replica_weight_push_kernel.warmup(
+        _virtual_expert_weight_push_kernel.warmup(
             table,
             table,
             table,
@@ -948,7 +952,7 @@ def compile_replica_weight_kernels(
         # The bridge reduces FC2 and FC1 in separate launches; tests and benches
         # reduce both at once.
         for projections in ((1,), (0,), (0, 1)):
-            _replica_grad_reduce_kernel.warmup(
+            _virtual_expert_grad_reduce_kernel.warmup(
                 torch.zeros(1, dtype=grad_dtype, device="cuda"),
                 table,
                 table,
@@ -964,7 +968,7 @@ def compile_replica_weight_kernels(
             )
 
 
-def launch_replica_weight_prefetch(
+def launch_virtual_expert_weight_prefetch(
     *,
     sources: tuple[torch.Tensor, torch.Tensor],
     arena: torch.Tensor,
@@ -990,13 +994,15 @@ def launch_replica_weight_prefetch(
     _validate_transport_shape(world_size, num_local_experts, num_sms)
     mxfp8 = arena.dtype == torch.uint8
     if not mxfp8 and arena.dtype != torch.bfloat16:
-        raise ValueError(f"Replica weight arena must be uint8 or bfloat16, got {arena.dtype}.")
+        raise ValueError(
+            f"Virtual-expert weight arena must be uint8 or bfloat16, got {arena.dtype}."
+        )
     if mxfp8 != (scale_sources is not None):
-        raise ValueError("Replica MXFP8 weights require scale tables; BF16 weights forbid them.")
+        raise ValueError("Virtual-expert MXFP8 weights require scale tables; BF16 weights forbid them.")
     tables = [_pointer_table(table, num_local_experts) for table in sources]
     tables += [_pointer_table(table, num_local_experts) for table in scale_sources or tables]
     with _DescriptorAllocator(arena.device.index):
-        _replica_weight_push_kernel[(num_sms,)](
+        _virtual_expert_weight_push_kernel[(num_sms,)](
             *tables,
             int(peer_bases),
             int(signal_bases),
@@ -1014,7 +1020,7 @@ def launch_replica_weight_prefetch(
         )
 
 
-def launch_replica_grad_reduce(
+def launch_virtual_expert_grad_reduce(
     *,
     arena: torch.Tensor,
     native_grads: tuple[torch.Tensor, torch.Tensor],
@@ -1029,18 +1035,18 @@ def launch_replica_grad_reduce(
     num_sms: int,
     projections: tuple[int, ...] = (0, 1),
 ) -> None:
-    """Accumulate every peer's replica gradients into native wgrad staging.
+    """Accumulate every peer's virtual-expert gradients into native wgrad staging.
 
     ``native_grads`` are ``int64`` pointer tables with one FC1 or FC2 staging
     base per local expert; ``projections`` selects which of the two this launch
-    reduces. Used replica slots are left holding their partials; the next wgrad
+    reduces. Used virtual-expert slots are left holding their partials; the next wgrad
     GEMM overwrites them.
     """
     _validate_transport_shape(world_size, num_local_experts, num_sms)
     _validate_grad_dtype(arena.dtype)
     device_index = arena.device.index
     with _DescriptorAllocator(device_index):
-        _replica_grad_reduce_kernel[(num_sms,)](
+        _virtual_expert_grad_reduce_kernel[(num_sms,)](
             arena,
             *(_pointer_table(table, num_local_experts) for table in native_grads),
             int(peer_bases),

@@ -2507,10 +2507,10 @@ def destroy_model_parallel():
     """Set the groups to none."""
     try:
         from megatron.core.transformer.moe.virtual_expert_load_balancer import (
-            finalize_replica_weight_bridges,
+            finalize_virtual_expert_weight_bridges,
         )
 
-        finalize_replica_weight_bridges()
+        finalize_virtual_expert_weight_bridges()
     except Exception:  # finalization must never block process-group teardown
         pass
     # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the

@@ -1127,7 +1127,7 @@ class GTPShardedParam(torch.nn.Parameter):
     @property
     def _weights(self):
         """Individual weight shards (self for non-routed, weight_list for routed)."""
-        # Only the first routed-expert shard owns ``weight_list``. Replica
+        # Only the first routed-expert shard owns ``weight_list``. Virtual-expert
         # autograd intentionally connects every discrete optimizer parameter so
         # CUDA-graph/DDP bookkeeping can visit a non-leader shard directly.
         weights = (

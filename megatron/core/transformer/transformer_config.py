@@ -904,16 +904,7 @@ class TransformerConfig(ModelParallelConfig):
     Options are "deepep", "hybridep", and "ncclep"."""
 
     moe_virtual_expert_load_balance: bool = False
-    """Balance MoE routes by materializing virtual expert replicas over HybridEP."""
-
-    grad_reduce_in_bf16: bool = False
-    """Use BF16 gradient storage and communication instead of the default FP32."""
-
-    ddp_reduce_scatter_with_fp32_accumulation: bool = False
-    """Use BF16 wire traffic with local FP32 accumulation for DDP reduce-scatter."""
-
-    gtp_remat_reduce_scatter_with_fp32_accumulation: bool = False
-    """Use BF16 wire traffic with local FP32 accumulation for GTP reduce-scatter."""
+    """Balance MoE routes by materializing virtual experts over HybridEP."""
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
@@ -1805,7 +1796,7 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_virtual_expert_load_balance:
             if self.moe_expert_rank_capacity_factor is None:
                 self.moe_expert_rank_capacity_factor = 1.0
-            replica_mxfp8 = (
+            virtual_expert_mxfp8 = (
                 self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
             )
             fused_activation = (
@@ -1815,7 +1806,6 @@ class TransformerConfig(ModelParallelConfig):
                 and self.activation_func == squared_relu
                 and self.use_fused_weighted_squared_relu
             )
-            bf16_grads = self.grad_reduce_in_bf16
             required_values = {
                 "add_bias_linear": False,
                 "moe_grouped_gemm": True,
@@ -1846,21 +1836,11 @@ class TransformerConfig(ModelParallelConfig):
                     "--moe-token-dispatcher-type flex and --moe-flex-dispatcher-backend hybridep",
                 ),
                 (
-                    not bf16_grads or self.ddp_reduce_scatter_with_fp32_accumulation,
-                    "--ddp-reduce-scatter-with-fp32-accumulation with --grad-reduce-in-bf16",
-                ),
-                (
-                    not (bf16_grads and self.expert_gtp_weight_remat_size > 1)
-                    or self.gtp_remat_reduce_scatter_with_fp32_accumulation,
-                    "--gtp-remat-reduce-scatter-with-fp32-accumulation with expert GTP and "
-                    "--grad-reduce-in-bf16",
-                ),
-                (
                     self.bf16 and self.params_dtype == torch.bfloat16,
                     "BF16 execution and BF16 parameters",
                 ),
                 (
-                    (not self.fp8 or replica_mxfp8) and not self.fp4,
+                    (not self.fp8 or virtual_expert_mxfp8) and not self.fp4,
                     "quantization disabled or MXFP8 E4M3 with native FP8 parameters",
                 ),
                 (self.moe_router_topk <= 32, "moe_router_topk<=32"),
@@ -1878,13 +1858,13 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_expert_rank_capacity_factor>=1.0",
                 ),
                 (
-                    not self.moe_router_padding_for_quantization or replica_mxfp8,
+                    not self.moe_router_padding_for_quantization or virtual_expert_mxfp8,
                     "moe_router_padding_for_quantization=False",
                 ),
                 (
                     self.recompute_granularity != "selective"
                     or "moe" not in (self.recompute_modules or ()),
-                    "no MoE layer recompute (the replica hooks assume one forward per backward)",
+                    "no MoE layer recompute (the virtual-expert hooks assume one forward per backward)",
                 ),
             ]
             unmet = [message for satisfied, message in requirements if not satisfied]
@@ -2942,7 +2922,7 @@ class TransformerConfig(ModelParallelConfig):
                             'but not found in the model.'
                         )
                     if self.moe_virtual_expert_load_balance:
-                        # The replica planner keeps its routing metadata private to one
+                        # The virtual-expert planner keeps its routing metadata private to one
                         # forward, which only the whole-layer moe scope preserves.
                         assert not {
                             CudaGraphModule.moe_router,

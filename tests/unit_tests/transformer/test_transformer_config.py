@@ -63,7 +63,7 @@ def test_gdp_num_householder_accepts_positive_values():
     assert config.gdp_num_householder == 5
 
 
-def _replica_hybridep_config(**overrides):
+def _virtual_expert_hybridep_config(**overrides):
     """Build a minimal virtual-expert HybridEP config, then apply one override."""
     kwargs = dict(
         num_layers=1,
@@ -88,13 +88,14 @@ def _replica_hybridep_config(**overrides):
     return TransformerConfig(**kwargs)
 
 
-def test_replica_hybridep_defaults_a_dropless_rank_capacity():
+def test_virtual_expert_hybridep_defaults_a_dropless_rank_capacity():
     """The backend is dropless by construction and allows the whole-layer moe graph."""
-    config = _replica_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=["moe"])
+    config = _virtual_expert_hybridep_config(
+        cuda_graph_impl="local", cuda_graph_modules=["moe"]
+    )
 
     assert config.moe_expert_rank_capacity_factor == 1.0
     assert config.moe_single_grouped_weight is False
-    assert config.grad_reduce_in_bf16 is False
 
 
 @pytest.mark.parametrize(
@@ -129,38 +130,16 @@ def test_replica_hybridep_defaults_a_dropless_rank_capacity():
         # Only fused SwiGLU, quick-GeGLU and weighted squared-ReLU are supported.
         ({"activation_func": F.gelu}, "fused SwiGLU"),
         ({"params_dtype": torch.float32}, "BF16 execution and BF16 parameters"),
-        # BF16 grad transport needs FP32 accumulation on the DDP reduce-scatter.
-        ({"grad_reduce_in_bf16": True}, "ddp-reduce-scatter-with-fp32-accumulation"),
-        (
-            {
-                "grad_reduce_in_bf16": True,
-                "ddp_reduce_scatter_with_fp32_accumulation": True,
-                "expert_tensor_parallel_num_weight_shards": 2,
-            },
-            "gtp-remat-reduce-scatter-with-fp32-accumulation",
-        ),
     ],
 )
-def test_replica_hybridep_rejects_unsupported_configurations(overrides, message):
+def test_virtual_expert_hybridep_rejects_unsupported_configurations(overrides, message):
     with pytest.raises(ValueError, match=re.escape(message)):
-        _replica_hybridep_config(**overrides)
+        _virtual_expert_hybridep_config(**overrides)
 
 
-@pytest.mark.parametrize("expert_gtp", [False, True])
-def test_replica_hybridep_accepts_bf16_grad_reduce_with_fp32_accumulation(expert_gtp):
-    config = _replica_hybridep_config(
-        grad_reduce_in_bf16=True,
-        ddp_reduce_scatter_with_fp32_accumulation=True,
-        expert_tensor_parallel_num_weight_shards=2 if expert_gtp else 1,
-        gtp_remat_reduce_scatter_with_fp32_accumulation=expert_gtp,
-    )
-
-    assert config.grad_reduce_in_bf16 is True
-
-
-def test_replica_hybridep_accepts_native_mxfp8_with_router_padding():
+def test_virtual_expert_hybridep_accepts_native_mxfp8_with_router_padding():
     """Native MXFP8 parameters are the only quantized storage the push understands."""
-    config = _replica_hybridep_config(
+    config = _virtual_expert_hybridep_config(
         fp8="e4m3", fp8_recipe="mxfp8", fp8_param=True, moe_router_padding_for_quantization=True
     )
 
@@ -172,16 +151,18 @@ def test_replica_hybridep_accepts_native_mxfp8_with_router_padding():
     ("fp8", "fp8_recipe", "fp8_param"),
     [("e4m3", "mxfp8", False), ("e4m3", "tensorwise", True), ("hybrid", "mxfp8", True)],
 )
-def test_replica_hybridep_rejects_unsupported_fp8_parameter_storage(fp8, fp8_recipe, fp8_param):
+def test_virtual_expert_hybridep_rejects_unsupported_fp8_parameter_storage(
+    fp8, fp8_recipe, fp8_param
+):
     with pytest.raises(ValueError, match="MXFP8 E4M3 with native FP8 parameters"):
-        _replica_hybridep_config(fp8=fp8, fp8_recipe=fp8_recipe, fp8_param=fp8_param)
+        _virtual_expert_hybridep_config(fp8=fp8, fp8_recipe=fp8_recipe, fp8_param=fp8_param)
 
 
 @pytest.mark.parametrize("scope", ["moe_router", "moe_preprocess"])
-def test_replica_hybridep_rejects_partial_moe_cuda_graph_scopes(scope):
+def test_virtual_expert_hybridep_rejects_partial_moe_cuda_graph_scopes(scope):
     """Only the whole-layer moe scope preserves the planner's per-forward metadata."""
     with pytest.raises(AssertionError, match="moe CUDA graph scope only"):
-        _replica_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=[scope])
+        _virtual_expert_hybridep_config(cuda_graph_impl="local", cuda_graph_modules=[scope])
 
 
 @pytest.mark.parametrize("num_householder", [0, -1])

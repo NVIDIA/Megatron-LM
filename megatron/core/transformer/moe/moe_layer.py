@@ -350,8 +350,9 @@ class MoELayer(BaseMoELayer):
             name=(name + ".experts") if name is not None else None,
         )
 
-        if isinstance(self.token_dispatcher._comm_manager, VirtualExpertLoadBalancer):
-            self.token_dispatcher._comm_manager.bind_experts(self.experts)
+        comm_manager = getattr(self.token_dispatcher, "_comm_manager", None)
+        if isinstance(comm_manager, VirtualExpertLoadBalancer):
+            comm_manager.bind_experts(self.experts)
 
         # Initialize shared experts
         if self.use_shared_expert:

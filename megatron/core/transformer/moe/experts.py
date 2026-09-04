@@ -181,8 +181,8 @@ class GroupedMLPSubmodules:
     """
 
 
-class _ReplicaFC2WgradStore:
-    """Start the FC2 replica gradient reduction the moment TE enqueues FC2's wgrad GEMM.
+class _VirtualExpertFC2WgradStore:
+    """Start the FC2 virtual-expert gradient reduction when TE enqueues FC2's wgrad GEMM.
 
     Installed as the FC2 GroupedLinear op's ``wgrad_store``. TE's delayed-wgrad protocol
     hands the wgrad GEMM to ``put`` instead of launching it, from the basic op's backward
@@ -316,7 +316,7 @@ class TEGroupedMLP(MegatronModule):
             ), "Fused GroupedMLP is not supported for this configuration."
         self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
-        self._replica_weight_bridge = None
+        self._virtual_expert_weight_bridge = None
         self._fused_impl_parameters_prepared = False
         if (
             self.config.gated_linear_unit
@@ -341,11 +341,13 @@ class TEGroupedMLP(MegatronModule):
                 self.num_local_experts, align_size=align_size
             )
 
-    def set_replica_weight_bridge(self, bridge) -> None:
-        """Use bridge-owned native and replica weights for fused expert compute."""
+    def set_virtual_expert_weight_bridge(self, bridge) -> None:
+        """Use bridge-owned native and virtual-expert weights for fused expert compute."""
         if self._fused_ops is not None:
-            raise RuntimeError("Replica weights must be bound before the first expert forward.")
-        self._replica_weight_bridge = bridge
+            raise RuntimeError(
+                "Virtual-expert weights must be bound before the first expert forward."
+            )
+        self._virtual_expert_weight_bridge = bridge
 
     @staticmethod
     def _apply_packed_bias(intermediate_parallel, packed_bias, tokens_per_expert, permuted_probs):
@@ -522,8 +524,8 @@ class TEGroupedMLP(MegatronModule):
                 for idx in range(linear.num_gemms):
                     op.register_parameter(f"bias{idx}", linear.get_parameter(f"bias{idx}"))
 
-        def register_replica_weights(op: torch.nn.Module, runtime_weights) -> None:
-            """Attach the bridge's native-then-replica runtime weights to a TE op shell."""
+        def register_virtual_expert_weights(op: torch.nn.Module, runtime_weights) -> None:
+            """Attach native-then-virtual-expert runtime weights to a TE op shell."""
             assert len(runtime_weights) == op.num_groups
             op.register_parameter("weight", None)
             for idx, runtime_weight in enumerate(runtime_weights):
@@ -553,13 +555,15 @@ class TEGroupedMLP(MegatronModule):
         # for runs that enable it via overlap_dispatch_backward_with_experts_wgrad.
         fc1_delay_wgrad_compute = self.linear_fc1.delay_wgrad_compute
         fc2_delay_wgrad_compute = self.linear_fc2.delay_wgrad_compute
-        replica_bridge = self._replica_weight_bridge
-        replica_num_gemms = replica_bridge.num_runtime_experts if replica_bridge else None
+        virtual_expert_bridge = self._virtual_expert_weight_bridge
+        virtual_expert_num_gemms = (
+            virtual_expert_bridge.num_runtime_experts if virtual_expert_bridge else None
+        )
 
         # Create a parameterless op shell and then attach the existing GroupedLinear weights below.
         # Using meta avoids allocating duplicate weights for the fused wrapper.
         op = te.pytorch.ops.GroupedLinear(
-            replica_num_gemms or self.linear_fc1.num_gemms,
+            virtual_expert_num_gemms or self.linear_fc1.num_gemms,
             self.linear_fc1.in_features,
             self.linear_fc1.out_features,
             bias=self.linear_fc1.use_bias,
@@ -567,14 +571,14 @@ class TEGroupedMLP(MegatronModule):
             dtype=fc1_weight_dtype,
             accumulate_into_main_grad=self.linear_fc1.fuse_wgrad_accumulation,
             single_grouped_weight=(
-                False if replica_bridge is not None else fc1_single_grouped_weight
+                False if virtual_expert_bridge is not None else fc1_single_grouped_weight
             ),
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
         )
 
-        if replica_bridge is not None:
-            register_replica_weights(op, replica_bridge.runtime_fc1_weights)
+        if virtual_expert_bridge is not None:
+            register_virtual_expert_weights(op, virtual_expert_bridge.runtime_fc1_weights)
         else:
             register_grouped_linear_params(
                 op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
@@ -668,7 +672,7 @@ class TEGroupedMLP(MegatronModule):
         # FC2
         fc2_bias_kwargs = {"scale_bias": True} if self.linear_fc2.use_bias else {}
         op = te.pytorch.ops.GroupedLinear(
-            replica_num_gemms or self.linear_fc2.num_gemms,
+            virtual_expert_num_gemms or self.linear_fc2.num_gemms,
             self.linear_fc2.in_features,
             self.linear_fc2.out_features,
             bias=self.linear_fc2.use_bias,
@@ -676,7 +680,7 @@ class TEGroupedMLP(MegatronModule):
             dtype=fc2_weight_dtype,
             accumulate_into_main_grad=self.linear_fc2.fuse_wgrad_accumulation,
             single_grouped_weight=(
-                False if replica_bridge is not None else fc2_single_grouped_weight
+                False if virtual_expert_bridge is not None else fc2_single_grouped_weight
             ),
             single_grouped_bias=fc2_single_grouped_bias,
             delay_wgrad_compute=fc2_delay_wgrad_compute,
@@ -684,9 +688,9 @@ class TEGroupedMLP(MegatronModule):
             **fc2_bias_kwargs,
         )
 
-        if replica_bridge is not None:
-            register_replica_weights(op, replica_bridge.runtime_fc2_weights)
-            op.wgrad_store = _ReplicaFC2WgradStore(replica_bridge)
+        if virtual_expert_bridge is not None:
+            register_virtual_expert_weights(op, virtual_expert_bridge.runtime_fc2_weights)
+            op.wgrad_store = _VirtualExpertFC2WgradStore(virtual_expert_bridge)
         else:
             register_grouped_linear_params(
                 op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
@@ -720,8 +724,10 @@ class TEGroupedMLP(MegatronModule):
             self.prepare_fused_impl_parameters()
             # Hooks such as DDP/FSDP all-gathers must run once per fused invocation.
             self._fused_impl_parameters_prepared = False
-            if self._replica_weight_bridge is not None:
-                self._replica_weight_bridge.wait_prefetch(self._replica_weight_bridge.last_plan)
+            if self._virtual_expert_weight_bridge is not None:
+                self._virtual_expert_weight_bridge.wait_prefetch(
+                    self._virtual_expert_weight_bridge.last_plan
+                )
 
         return forward_pre_hook
 

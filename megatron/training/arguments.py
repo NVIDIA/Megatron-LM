@@ -1099,7 +1099,7 @@ def validate_args(args, defaults={}):
     if args.moe_virtual_expert_load_balance and args.fp8_recipe == 'mxfp8':
         assert args.fp8 == 'e4m3' and args.fp8_param_gather, (
             '--moe-virtual-expert-load-balance + mxfp8 requires --fp8-format e4m3 and '
-            '--fp8-param-gather so expert replicas use native MXFP8 storage.'
+            '--fp8-param-gather so virtual experts use native MXFP8 storage.'
         )
         assert args.reuse_grad_buf_for_mxfp8_param_ag, (
             '--moe-virtual-expert-load-balance + mxfp8 + --fp8-param-gather requires '
@@ -2375,10 +2375,6 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         "mamba_training_ssm_states_dtype",
-        # already defined manually by the mixed-precision/distributed argument groups
-        "grad_reduce_in_bf16",
-        "ddp_reduce_scatter_with_fp32_accumulation",
-        "gtp_remat_reduce_scatter_with_fp32_accumulation",
         # internal/derived: controlled only via --tensor-parallel-num-weight-shards
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
