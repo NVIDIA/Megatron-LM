@@ -7,6 +7,7 @@ from unittest import mock
 
 import torch
 
+from megatron.core.process_groups_config import MultiModuleProcessGroupCollection
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training import training as training_module
 from megatron.training.checkpointing import save_grads
@@ -212,6 +213,124 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
 
     assert " alignment loss: 6.000000E+00 |" in log_lines[-1]
     assert " alignment loss: 4.000000E+00 |" not in log_lines[-1]
+
+
+def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatch):
+    """DSA metrics use the stable parent and the actual indexer-layer divisor."""
+    parent_dp_cp_group = object()
+    pp_group = object()
+    dp_group = object()
+    encoder_pg_collection = SimpleNamespace(mp=None, pp=object(), dp=object(), dp_cp=object())
+    language_pg_collection = SimpleNamespace(
+        mp=object(), pp=pp_group, dp=dp_group, dp_cp=parent_dp_cp_group
+    )
+    schedule_pg_collection = MultiModuleProcessGroupCollection(
+        module_pgs={"language": language_pg_collection}, language_model_module_name="language"
+    )
+    recorded = []
+    args = SimpleNamespace(
+        calculate_per_token_loss=False,
+        consumed_train_samples=0,
+        context_parallel_size=4,
+        csa_compress_ratios=None,
+        cuda_graph_impl="none",
+        data_parallel_size=2,
+        dsa_indexer_loss_coeff=0.1,
+        dsa_indexer_skip_topk_offset=1,
+        dsa_indexer_topk_freq=4,
+        dynamic_context_parallel=True,
+        freeze_all_layers=False,
+        hybrid_layer_pattern=None,
+        log_interval=100,
+        micro_batch_size=1,
+        mtp_num_layers=None,
+        num_experts=None,
+        num_layers=8,
+        perform_rl_step=False,
+        seq_length=4096,
+        skipped_train_samples=0,
+        timing_log_level=0,
+        world_size=8,
+    )
+
+    monkeypatch.setattr(training_module, "get_args", lambda: args)
+    monkeypatch.setattr(training_module, "get_timers", mock.MagicMock)
+    monkeypatch.setattr(training_module, "get_tensorboard_writer", lambda: None)
+    monkeypatch.setattr(training_module, "get_wandb_writer", lambda: None)
+    monkeypatch.setattr(training_module, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training_module, "get_energy_monitor", lambda: None)
+    monkeypatch.setattr(training_module, "get_num_microbatches", lambda: 7)
+    monkeypatch.setattr(
+        training_module,
+        "reduce_max_stat_across_model_parallel_group",
+        lambda value, group=None: value,
+    )
+    monkeypatch.setattr(training_module.one_logger_utils, "track_app_tag", lambda *a: None)
+    monkeypatch.setattr(
+        training_module.DSAIndexerLossLoggingHelper,
+        "track_indexer_metrics",
+        lambda **kwargs: recorded.append(kwargs),
+    )
+    monkeypatch.setattr(
+        training_module.MTPLossLoggingHelper, "track_mtp_metrics", lambda *args, **kwargs: None
+    )
+
+    def run_training_log(schedule=schedule_pg_collection):
+        training_module.training_log(
+            {},
+            {},
+            learning_rate=1.0e-4,
+            iteration=1,
+            loss_scale=1.0,
+            report_memory_flag=False,
+            skipped_iter=0,
+            grad_norm=None,
+            params_norm=None,
+            num_zeros_in_grad=None,
+            max_attention_logit=None,
+            pg_collection=encoder_pg_collection,
+            schedule_pg_collection=schedule,
+        )
+
+    run_training_log()
+
+    assert len(recorded) == 1
+    assert recorded[0]["loss_scale"] == 1 / 7
+    assert recorded[0]["dynamic_cp_parent_group"] is parent_dp_cp_group
+    assert recorded[0]["pp_group"] is pp_group
+    assert recorded[0]["dp_group"] is dp_group
+    assert recorded[0]["configured_cp_size"] == 4
+    assert recorded[0]["num_layers"] == 8
+    assert recorded[0]["num_indexer_layers"] == 2
+
+    hybrid_cases = (
+        # Non-DSA symbols do not contribute to the divisor.
+        ("MD-", 3, None, None, 0, 1, 3, 1),
+        # Pipeline separators do not consume a global layer number.
+        ("D|D", 2, None, None, 1, 2, 2, 1),
+        # Every MTP depth reuses inner layer numbers N+1..N+K and executes its own loss.
+        ("D---/DD/DD/DD", 4, 3, None, 1, 4, 7, 4),
+        # DSv4 compression ratios take precedence over legacy hybrid D symbols.
+        ("CDD", 3, None, [4], 0, 1, 3, 1),
+    )
+    for pattern, num_layers, mtp_layers, ratios, offset, freq, tracked, indexers in hybrid_cases:
+        recorded.clear()
+        args.hybrid_layer_pattern = pattern
+        args.num_layers = num_layers
+        args.mtp_num_layers = mtp_layers
+        args.csa_compress_ratios = ratios
+        args.dsa_indexer_skip_topk_offset = offset
+        args.dsa_indexer_topk_freq = freq
+        run_training_log()
+        assert recorded[0]["num_layers"] == tracked
+        assert recorded[0]["num_indexer_layers"] == indexers
+
+    recorded.clear()
+    encoder_only_schedule = MultiModuleProcessGroupCollection(
+        module_pgs={"encoder": encoder_pg_collection}, language_model_module_name=None
+    )
+    run_training_log(encoder_only_schedule)
+    assert recorded == []
 
 
 class TestGetModelBucketSizingPgCollection:
