@@ -11,6 +11,8 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.transformer.moe.paged_stash import (
+    PagedStashBuffer,
+    PagedTensor,
     check_paged_stash_overflow,
     paged_stash_init_chunk_handler,
     paged_stash_reset,
@@ -54,6 +56,55 @@ def _pad_token_counts_to_align_size(
     """Round each count up to a multiple of ``pad_multiple`` (``n + (-n % m)`` like budget)."""
     t = tokens_per_expert.to(torch.int64)
     return t + (-t % pad_multiple)
+
+
+@pytest.mark.parametrize("is_scale_inv", [False, True])
+@pytest.mark.parametrize("hidden_size", [7, 2048])
+def test_feature_major_paged_tensor_round_trip(is_scale_inv, hidden_size):
+    """Feature-major saved state is packed directly and restored without touching its tail."""
+    logical_max_tokens = 128
+    logical_actual_tokens = 64
+    token_block = 32 if is_scale_inv else 1
+    max_tokens = logical_max_tokens // token_block
+    actual_tokens = logical_actual_tokens // token_block
+    page_size = 2
+    device = torch.device("cuda")
+
+    source = torch.arange(
+        hidden_size * max_tokens,
+        dtype=torch.float32,
+        device=device,
+    ).view(hidden_size, max_tokens)
+    paged = PagedTensor(
+        source.flatten(),
+        num_tokens_tensor=torch.tensor([logical_actual_tokens], dtype=torch.int64, device=device),
+        original_shape=source.shape,
+        is_columnwise_scale_inv=is_scale_inv,
+        token_axis=1,
+        max_num_tokens=logical_max_tokens,
+        hidden_size=hidden_size,
+        page_size=page_size,
+    )
+    overflow = torch.zeros(1, dtype=torch.int32, device=device)
+    host_spill = torch.zeros(1, dtype=torch.int32, device=device)
+    stash = PagedStashBuffer(
+        max_tokens,
+        hidden_size,
+        page_size,
+        device,
+        overflow,
+        host_spill,
+        source.dtype,
+    )
+
+    paged.offload_to_stash(stash)
+    restored = torch.full_like(source, -1)
+    paged._tensor = restored
+    paged.reload_from_stash(stash)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(restored[:, :actual_tokens], source[:, :actual_tokens])
+    assert torch.all(restored[:, actual_tokens:] == -1)
 
 
 class MoEModelTestContainer:

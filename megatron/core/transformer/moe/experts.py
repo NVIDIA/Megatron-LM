@@ -736,12 +736,24 @@ class TEGroupedMLP(MegatronModule):
                     "for the current device, recipe, weights, or MoE configuration."
                 )
 
+        if self.config.moe_paged_stash:
+            hidden_states = paged_stash_group_start(hidden_states)
+            stash_context = get_paged_stash_context(
+                name="fused_moe",
+                max_num_tokens=ep_config.recv_capacity_per_rank,
+            )
+        else:
+            stash_context = nullcontext()
+
         try:
-            output = ops(hidden_states, topk_idx, topk_weights.float())
+            with stash_context:
+                output = ops(hidden_states, topk_idx, topk_weights)
         except Exception:
             ensure_fused_moe_selected()
             raise
         ensure_fused_moe_selected()
+        if self.config.moe_paged_stash:
+            output = paged_stash_group_commit(output, name="fused_moe")
         return output
 
     def _make_fused_impl_pre_forward_hook(self) -> Callable:

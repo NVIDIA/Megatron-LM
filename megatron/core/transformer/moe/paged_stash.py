@@ -10,7 +10,9 @@ from megatron.core._rank_utils import log_single_rank
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer.moe.ops.paged_stash import (
+    FEATURE_BLOCK_SIZE,
     GLOBAL_BLOCK_SIZE,
+    TOKEN_BLOCK_SIZE,
     paged_stash_copy_kernel,
     paged_stash_pop_kernel,
 )
@@ -147,6 +149,7 @@ class PagedTensor:
         original_shape=None,
         schedule_layer_no=None,
         is_columnwise_scale_inv=None,
+        token_axis=0,
         max_num_tokens=None,
         hidden_size=None,
         page_size=64,
@@ -173,6 +176,7 @@ class PagedTensor:
         self.vp_stage = vp_stage
         self.schedule_layer_no = schedule_layer_no
         self.is_columnwise_scale_inv = is_columnwise_scale_inv
+        self.token_axis = token_axis
         self.max_num_tokens = max_num_tokens
         self.hidden_size = hidden_size
         self.page_size = page_size
@@ -213,7 +217,14 @@ class PagedTensor:
 
         tensor_to_copy = self._tensor
         BLOCK_SIZE = GLOBAL_BLOCK_SIZE
-        num_blocks = min(max_num_tokens, max_blocks)
+        num_blocks = min(
+            (
+                max_num_tokens
+                if self.token_axis == 0
+                else (self.hidden_size + FEATURE_BLOCK_SIZE - 1) // FEATURE_BLOCK_SIZE
+            ),
+            max_blocks,
+        )
         grid = (num_blocks,)
 
         new_free_list_head = torch.empty(2, dtype=torch.int64, device=self.device)
@@ -241,7 +252,11 @@ class PagedTensor:
             new_free_list_head,
             PAGE_SIZE=self.page_size,
             HIDDEN_SIZE=self.hidden_size,
+            MAX_TOKENS=max_num_tokens,
+            TOKEN_AXIS=self.token_axis,
             BLOCK_SIZE=BLOCK_SIZE,
+            FEATURE_BLOCK_SIZE=FEATURE_BLOCK_SIZE,
+            TOKEN_BLOCK_SIZE=TOKEN_BLOCK_SIZE,
             HAS_HOST_BUFFER=has_host,
         )
         paged_stash_buffer.free_list_head.copy_(new_free_list_head)
@@ -268,7 +283,14 @@ class PagedTensor:
             num_tokens_tensor = self.num_tokens_tensor
             max_num_tokens = self.max_num_tokens
         BLOCK_SIZE = GLOBAL_BLOCK_SIZE
-        num_blocks = min(max_num_tokens, max_blocks)
+        num_blocks = min(
+            (
+                max_num_tokens
+                if self.token_axis == 0
+                else (self.hidden_size + FEATURE_BLOCK_SIZE - 1) // FEATURE_BLOCK_SIZE
+            ),
+            max_blocks,
+        )
         grid = (num_blocks,)
 
         new_free_list_tail = torch.empty(2, dtype=torch.int64, device=self.device)
@@ -292,7 +314,11 @@ class PagedTensor:
             new_free_list_tail,
             PAGE_SIZE=self.page_size,
             HIDDEN_SIZE=self.hidden_size,
+            MAX_TOKENS=max_num_tokens,
+            TOKEN_AXIS=self.token_axis,
             BLOCK_SIZE=BLOCK_SIZE,
+            FEATURE_BLOCK_SIZE=FEATURE_BLOCK_SIZE,
+            TOKEN_BLOCK_SIZE=TOKEN_BLOCK_SIZE,
         )
 
         paged_stash_buffer.free_list_tail.copy_(new_free_list_tail)
@@ -687,23 +713,31 @@ class PagedStashManager:
         Returns a tag to identify the tensor later.
         """
         # Handle 0-dim tensors (torch.Size([])) - they have no size(0)
-        if (
-            self.max_num_tokens is None
-            or tensor.dim() == 0
-            or not hasattr(tensor, 'grouped_tensor_scale_inv')
-        ):
+        if tensor.dim() == 0 or not hasattr(tensor, 'grouped_tensor_scale_inv'):
             return tensor
 
         assert isinstance(tensor, torch.Tensor), f"tensor is not a torch.Tensor {type(tensor)}"
 
         original_shape = tensor.shape
         columnwise_scale_inv = tensor.grouped_tensor_scale_inv
+        token_axis = getattr(tensor, "grouped_tensor_token_axis", 0)
+        if token_axis not in (0, 1):
+            raise ValueError(f"Paged stash supports token_axis 0 or 1, got {token_axis}")
+        num_tokens_tensor = getattr(
+            tensor,
+            "grouped_tensor_num_tokens",
+            self.num_tokens_tensor,
+        )
+        max_num_tokens = self.max_num_tokens
         tensor = tensor.flatten()
         dtype = tensor.dtype
+        effective_max_num_tokens = (
+            max_num_tokens // SCALE_INV_BLOCK_SIZE
+            if columnwise_scale_inv
+            else max_num_tokens
+        )
         hidden_size = tensor.numel() // (
-            self.max_num_tokens
-            if not columnwise_scale_inv
-            else self.max_num_tokens // SCALE_INV_BLOCK_SIZE
+            effective_max_num_tokens
         )
 
         if self.max_tokens_across_vp_stages is None:
@@ -715,7 +749,7 @@ class PagedStashManager:
         avg_num_tokens = None
         if self.status == 'capture':
 
-            self.num_tokens = self.num_tokens_tensor.item()
+            self.num_tokens = num_tokens_tensor.item()
             actual_num_tokens = (
                 self.num_tokens // SCALE_INV_BLOCK_SIZE if columnwise_scale_inv else self.num_tokens
             )
@@ -748,16 +782,16 @@ class PagedStashManager:
 
             # Since capture stage does not use CUDA graph, we can truncate
             # the saved tensor to actual num_tokens
-            new_size = (actual_num_tokens * hidden_size,)
-
-            tensor_truncated = torch.empty(new_size, dtype=dtype, device=tensor.device)
-            tensor_truncated.copy_(tensor[: actual_num_tokens * hidden_size])
-            tensor = tensor_truncated
+            if token_axis == 0:
+                new_size = (actual_num_tokens * hidden_size,)
+                tensor_truncated = torch.empty(new_size, dtype=dtype, device=tensor.device)
+                tensor_truncated.copy_(tensor[: actual_num_tokens * hidden_size])
+                tensor = tensor_truncated
 
         tensor.grouped_tensor_scale_inv = columnwise_scale_inv
         paged_tensor = PagedTensor(
             tensor,
-            num_tokens_tensor=self.num_tokens_tensor,
+            num_tokens_tensor=num_tokens_tensor,
             avg_num_tokens=avg_num_tokens,
             vp_stage=self.current_vp_stage,
             original_shape=original_shape,
@@ -768,7 +802,8 @@ class PagedStashManager:
                 else None
             ),
             is_columnwise_scale_inv=columnwise_scale_inv,
-            max_num_tokens=self.max_num_tokens,
+            token_axis=token_axis,
+            max_num_tokens=max_num_tokens,
             hidden_size=hidden_size,
             page_size=self.page_size,
         )
@@ -808,16 +843,20 @@ class PagedStashManager:
                 if saved_state._tensor.element_size() == 1:
                     saved_state._tensor = saved_state._tensor.view(torch.uint8)
 
-                # Pad the tensor to the max number of tokens
-                # check if the tensor is 1D
-                assert (
-                    saved_state._tensor.ndim == 1
-                ), f"saved_state._tensor.ndim is not 1 {saved_state._tensor.ndim}"
-                npad = (self.max_num_tokens - num_tokens) * saved_state.hidden_size
-                if columnwise_scale_inv:
-                    npad = npad // SCALE_INV_BLOCK_SIZE
-                pad = (0, npad)
-                saved_state._tensor = torch.nn.functional.pad(saved_state._tensor, pad).view(dtype)
+                if saved_state.token_axis == 0:
+                    # Pad the contiguous token prefix back to its original capacity.
+                    assert (
+                        saved_state._tensor.ndim == 1
+                    ), f"saved_state._tensor.ndim is not 1 {saved_state._tensor.ndim}"
+                    npad = (
+                        saved_state.max_num_tokens - num_tokens
+                    ) * saved_state.hidden_size
+                    if columnwise_scale_inv:
+                        npad = npad // SCALE_INV_BLOCK_SIZE
+                    pad = (0, npad)
+                    saved_state._tensor = torch.nn.functional.pad(
+                        saved_state._tensor, pad
+                    ).view(dtype)
 
             assert (
                 saved_state._tensor is not None
@@ -866,9 +905,14 @@ def get_paged_stash_context(
         return nullcontext()
     stash_manager.max_num_tokens = max_num_tokens
     stash_manager.avg_num_tokens = avg_num_tokens
-    assert num_tokens_tensor is not None and isinstance(num_tokens_tensor, torch.Tensor)
-    # One clone per context; PagedTensor reuses this tensor (no per-instance clone).
-    stash_manager.num_tokens_tensor = num_tokens_tensor.clone()
+    if num_tokens_tensor is None:
+        # Some fused operators produce their dynamic token count on-device and
+        # attach it directly to each marked saved tensor.
+        stash_manager.num_tokens_tensor = None
+    else:
+        assert isinstance(num_tokens_tensor, torch.Tensor)
+        # One clone per context; PagedTensor reuses this tensor (no per-instance clone).
+        stash_manager.num_tokens_tensor = num_tokens_tensor.clone()
     stash_manager.set_current_layer_name(name) if name is not None else None
     pack_unpack_context = PagedStashContext(stash_manager)
     return pack_unpack_context
