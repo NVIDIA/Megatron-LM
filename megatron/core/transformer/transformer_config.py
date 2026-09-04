@@ -3269,6 +3269,62 @@ class TransformerConfig(ModelParallelConfig):
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
 
+        if (
+            self.fine_grained_activation_offloading
+            and self.offload_modules
+            and self.cuda_graph_impl == "transformer_engine"
+            and not self.cuda_graph_modules
+        ):
+            warnings.warn(
+                "Fine-grained activation offloading with Transformer Engine whole-layer "
+                "CUDA Graph capture (empty cuda_graph_modules) does not currently install "
+                "the per-module offload event boundary. This pre-existing limitation is "
+                "shared by GPTModel and HybridModel and may cause CUDA capture dependency "
+                "errors. Use explicit partial scopes containing the relevant region ('attn' "
+                "for attention-side offload or 'moe_router' for partial MoE expert offload) "
+                "until whole-layer offload integration is fixed.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        delayed_expert_modules = {"expert_fc1", "moe_act", "fused_group_mlp"} & set(
+            self.offload_modules or []
+        )
+        delayed_partial_expert_offload = (
+            self.fine_grained_activation_offloading
+            and self.delay_offload_until_cuda_graph
+            and self.cuda_graph_impl == "transformer_engine"
+            and CudaGraphModule.moe_router in self.cuda_graph_modules
+            and bool(delayed_expert_modules)
+        )
+        if (
+            delayed_partial_expert_offload
+            and self.is_hybrid_model
+            and self.enable_hyper_connections
+        ):
+            warnings.warn(
+                "HybridModel mHC wrappers do not currently support "
+                "delay_offload_until_cuda_graph for expert offloads "
+                f"{sorted(delayed_expert_modules)}. Their eager expert continuation "
+                "commits offloads immediately; captured attention offloads are unaffected. "
+                "Disable delay_offload_until_cuda_graph until the Hybrid delayed queue has "
+                "an explicit end-of-iteration drain.",
+                UserWarning,
+                stacklevel=2,
+            )
+        elif delayed_partial_expert_offload:
+            # TODO: replace this compatibility warning with a supported explicit
+            # end-of-iteration drain for the final delayed expert group.
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Delayed expert offload currently flushes only at a later Transformer Engine "
+                "CUDA Graph replay. The final eager expert group can remain queued and be "
+                "discarded by the pipeline reset without a D2H copy, reducing the intended "
+                "memory saving. Disable delay_offload_until_cuda_graph to commit every expert "
+                "group immediately until an explicit end-of-iteration drain is implemented.",
+            )
+
         # mHC selective recompute composes with CUDA graphs on two paths: the
         # opt-in attention-only split, and whole-range capture for everything
         # else. This gate must stay below the cuda_graph_modules normalization
