@@ -158,6 +158,90 @@ def test_nested_prefetch_orders_use_dfs(distributed_setup):
     assert list(context.backward_order) == [model, model.right, model.left, model.left.inner]
 
 
+def test_fully_shard_can_disable_execution_hooks(distributed_setup):
+    """An external scheduler can disable execution hooks without disabling load safety."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = NestedModel().to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model.inner, mesh=mesh, placements=_flat_placements(), register_hooks=False)
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), register_hooks=False)
+
+    for fsdp_module in (model, model.inner):
+        assert not fsdp_module._forward_pre_hooks
+        assert not fsdp_module._forward_hooks
+        assert not fsdp_module._backward_pre_hooks
+        assert not fsdp_module._backward_hooks
+        assert len(fsdp_module._load_state_dict_pre_hooks) == 1
+        for group in fsdp_module.parameter_groups:
+            for fsdp_parameter in group.fsdp_parameters:
+                assert not getattr(fsdp_parameter.unsharded, "_post_accumulate_grad_hooks", None)
+
+
+def test_register_post_backward_hook_waits_for_all_parameter_gradients(distributed_setup):
+    """An external scheduler callback should run once all owned gradients are ready."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Linear(4, 4).to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), register_hooks=False)
+
+    parameters = [
+        fsdp_parameter.unsharded
+        for group in model.parameter_groups
+        if group.requires_grad
+        for fsdp_parameter in group.fsdp_parameters
+    ]
+    assert len(parameters) == 2
+    callback_modules = []
+    model.register_post_backward_hook(callback_modules.append)
+
+    parameter_hooks = []
+    for parameter in parameters:
+        hooks = getattr(parameter, "_post_accumulate_grad_hooks", None)
+        assert hooks is not None and len(hooks) == 1
+        parameter_hooks.append(next(iter(hooks.values())))
+
+    for parameter, hook in zip(parameters[:-1], parameter_hooks[:-1]):
+        hook(parameter)
+    assert callback_modules == []
+
+    parameter_hooks[-1](parameters[-1])
+    assert callback_modules == [model]
+
+
+def test_register_post_backward_hook_rejects_duplicate_registration(distributed_setup):
+    """An FSDP unit should accept only one post-backward callback."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Linear(4, 4, bias=False).to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), register_hooks=False)
+
+    model.register_post_backward_hook(lambda _module: None)
+    with pytest.raises(RuntimeError, match="already has a post-backward hook registered"):
+        model.register_post_backward_hook(lambda _module: None)
+
+
+def test_register_post_backward_hook_handles_parameterless_module(distributed_setup):
+    """A parameterless FSDP unit should invoke the external scheduler callback."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Identity().to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements(), register_hooks=False)
+
+    callback_modules = []
+    model.register_post_backward_hook(callback_modules.append)
+    model(torch.ones(2, 4, device=device, requires_grad=True)).sum().backward()
+
+    assert callback_modules == [model]
+
+
 def test_nested_and_sibling_roots_use_cross_root_orders(distributed_setup):
     """Context orders should concatenate nested roots at construction boundaries."""
     device = distributed_setup.device
@@ -234,3 +318,33 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
             fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     assert model.inner.context is first_context
+
+
+def test_multiple_forwards_before_backwards_reset_gradient_readiness(
+    distributed_setup, monkeypatch
+):
+    """Consecutive pipeline backwards should each finalize gradient reduction."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Linear(4, 4, bias=False).to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    reduce_calls = []
+    original_reduce_gradient_groups = model._reduce_gradient_groups
+
+    def record_reduce_gradient_groups() -> None:
+        reduce_calls.append(None)
+        original_reduce_gradient_groups()
+
+    monkeypatch.setattr(model, "_reduce_gradient_groups", record_reduce_gradient_groups)
+
+    # Pipeline warmup may run multiple forwards before cooldown runs consecutive
+    # backwards. Each backward must reset the parameter-completion counter.
+    losses = [model(torch.ones(2, 4, device=device)).sum() for _ in range(2)]
+    for loss in reversed(losses):
+        loss.backward()
+
+    assert len(reduce_calls) == 2
+    assert model.phase is model.Phase.RESTING
