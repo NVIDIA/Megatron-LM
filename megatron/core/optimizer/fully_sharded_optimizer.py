@@ -214,9 +214,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         # Overriding rather than asserting: ChainedOptimizer forwards its own True
         # default positionally, so set_to_none is always True here regardless of
         # caller intent, and an assert would fire on every graphed step.
-        if any(
-            model_chunk.config.cuda_graph_impl != "none" for model_chunk in self.model_chunks
-        ):
+        if any(model_chunk.config.cuda_graph_impl != "none" for model_chunk in self.model_chunks):
             set_to_none = False
 
         if not self.is_stub_optimizer:
