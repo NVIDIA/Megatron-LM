@@ -961,13 +961,12 @@ class TransformerConfig(ModelParallelConfig):
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
-    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep', 'replica_hybridep', 'ncclep'] = (
-        "deepep"
-    )
+    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep', 'ncclep'] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
-    Options are "deepep", "hybridep", "replica_hybridep", and "ncclep". The replica backend
-    uses deterministic route placement and asynchronous runtime weight replication on top of
-    HybridEP."""
+    Options are "deepep", "hybridep", and "ncclep"."""
+
+    moe_virtual_expert_load_balance: bool = False
+    """Balance MoE routes by materializing virtual expert replicas over HybridEP."""
 
     grad_reduce_in_bf16: bool = False
     """Use BF16 gradient storage and communication instead of the default FP32."""
@@ -2047,11 +2046,10 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_pad_expert_input_to_capacity"
                 )
 
-        if self.moe_flex_dispatcher_backend in ("ncclep", "replica_hybridep"):
+        if self.moe_flex_dispatcher_backend == "ncclep":
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError(
-                    f"moe_flex_dispatcher_backend='{self.moe_flex_dispatcher_backend}' requires "
-                    "moe_token_dispatcher_type='flex'."
+                    "moe_flex_dispatcher_backend='ncclep' requires moe_token_dispatcher_type='flex'."
                 )
 
         if self.moe_dispatch_fwd_dtype != 'bf16' or self.moe_combine_bwd_dtype != 'bf16':
@@ -2073,7 +2071,7 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
             raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")
 
-        if self.moe_flex_dispatcher_backend == "replica_hybridep":
+        if self.moe_virtual_expert_load_balance:
             if self.moe_expert_rank_capacity_factor is None:
                 self.moe_expert_rank_capacity_factor = 1.0
             replica_mxfp8 = (
@@ -2111,6 +2109,11 @@ class TransformerConfig(ModelParallelConfig):
                 (getattr(self, name) == value, f"{name}={value!r}")
                 for name, value in required_values.items()
             ] + [
+                (
+                    self.moe_token_dispatcher_type == "flex"
+                    and self.moe_flex_dispatcher_backend == "hybridep",
+                    "--moe-token-dispatcher-type flex and --moe-flex-dispatcher-backend hybridep",
+                ),
                 (
                     not bf16_grads or self.ddp_reduce_scatter_with_fp32_accumulation,
                     "--ddp-reduce-scatter-with-fp32-accumulation with --grad-reduce-in-bf16",
@@ -2156,7 +2159,7 @@ class TransformerConfig(ModelParallelConfig):
             unmet = [message for satisfied, message in requirements if not satisfied]
             if unmet:
                 raise ValueError(
-                    "Replica-HybridEP flex dispatcher configuration is unsupported; require "
+                    "Virtual-expert load balancing configuration is unsupported; require "
                     + ", ".join(unmet)
                     + "."
                 )
@@ -2281,13 +2284,13 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_expert_rank_capacity_factor is not None:
-            if self.moe_flex_dispatcher_backend not in ("hybridep", "replica_hybridep", "ncclep"):
+            if self.moe_flex_dispatcher_backend not in ("hybridep", "ncclep"):
                 raise ValueError(
                     "moe_expert_rank_capacity_factor requires moe_flex_dispatcher_backend to be "
                     "'hybridep' or 'ncclep'."
                 )
             if (
-                self.moe_flex_dispatcher_backend in ("hybridep", "replica_hybridep")
+                self.moe_flex_dispatcher_backend == "hybridep"
                 and not self.use_transformer_engine_op_fuser
                 and not self.moe_use_grouped_tensor
             ):
@@ -3314,14 +3317,14 @@ class TransformerConfig(ModelParallelConfig):
                             'mlp cuda graph is only supported for dense layers, '
                             'but not found in the model.'
                         )
-                    if self.moe_flex_dispatcher_backend == "replica_hybridep":
+                    if self.moe_virtual_expert_load_balance:
                         # The replica planner keeps its routing metadata private to one
                         # forward, which only the whole-layer moe scope preserves.
                         assert not {
                             CudaGraphModule.moe_router,
                             CudaGraphModule.moe_preprocess,
                         } & set(self.cuda_graph_modules), (
-                            'replica_hybridep supports the moe CUDA graph scope only; '
+                            'virtual-expert load balancing supports the moe CUDA graph scope only; '
                             'moe_router and moe_preprocess are not supported.'
                         )
                     elif (

@@ -57,7 +57,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     )
     enable_hybridep = (
         layer.config.moe_token_dispatcher_type == "flex"
-        and layer.config.moe_flex_dispatcher_backend in ("hybridep", "replica_hybridep")
+        and layer.config.moe_flex_dispatcher_backend == "hybridep"
     )
     enable_ncclep = (
         layer.config.moe_token_dispatcher_type == "flex"
