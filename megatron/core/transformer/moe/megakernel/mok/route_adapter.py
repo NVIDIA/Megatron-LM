@@ -102,6 +102,7 @@ class RoutingMapToIndices(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, probs, routing_map, topk):
+        """Compact authoritative dense routes into fixed-width MOK inputs."""
         if not HAVE_TRITON:
             raise RuntimeError("routing_map_to_mok_inputs requires Triton")
         if probs.ndim != 2 or routing_map.ndim != 2:
@@ -142,6 +143,7 @@ class RoutingMapToIndices(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_probs_indices, grad_indices):
+        """Scatter compact routing-weight gradients back to the dense tensor."""
         del grad_indices
         (indices,) = ctx.saved_tensors
         num_tokens, topk = indices.shape
