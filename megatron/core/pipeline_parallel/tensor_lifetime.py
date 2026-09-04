@@ -230,8 +230,6 @@ class ScheduleTensorLifetimeManager:
         consumer_stream: Optional[torch.cuda.Stream],
         consumer_stream_key: Optional[StreamKey],
     ) -> None:
-        if not value:
-            return
         for tensor in _iter_unique_cuda_tensors(value):
             self._consume_tensor(tensor, action, consumer_stream, consumer_stream_key)
 
