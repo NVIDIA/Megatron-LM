@@ -15,6 +15,7 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
+    cuda_graph_captures_attention,
     get_deprecated_cuda_graph_modules_migration,
     is_whole_moe_cuda_graph_scope,
     normalize_cuda_graph_modules,
@@ -389,6 +390,54 @@ class TransformerConfig(ModelParallelConfig):
     path. FP32 uses a true FP32-output projection and is not compatible with the cuDNN DSA
     backend. The final index scores remain FP32 independently of this option. This option does
     not affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
+
+    dsa_cp_balance_indexer: bool = False
+    """Enable the load-balanced context-parallel DSA indexer path. The contiguous CP split makes the
+    causal indexer's per-query cost grow with rank, so later CP ranks become stragglers. When True,
+    each rank instead scores a balanced low-position + high-position chunk pair (two launches of the
+    existing indexer kernel) so every rank does ~constant work, then combines the top-k back to
+    contiguous order. Balancing requires the per-sequence zigzag and the fused indexer kernel
+    backend. Eligibility is decided from the actual microbatch: its per-rank row count must be
+    even, and every padded sequence length (including any capacity tail) must be divisible by
+    ``2 * cp_size``. ``pad_packed_seq_alignment`` only controls capacity rounding and may be
+    ``None``, ``"max"``, or an integer; it is not an eligibility guarantee. An ineligible eager
+    pack takes the contiguous reference path for that microbatch, so eager runs may switch paths
+    and capacities between packs. The current
+    fused kernel package silently corrupts any fused call above 32768 query rows that is
+    not the process's first fused call (verified on GB200, cudnn-frontend 1.26.0): the
+    balanced two-half-call path therefore fails closed above per-rank capacities of
+    2 * 32768 rows, balanced-run reference fallbacks above 32768 rows take the unfused
+    implementation, and pre-existing paths keep their behavior with a once-per-process
+    correctness warning. Whether balancing is worthwhile for a workload is decided once,
+    at recipe level, by this flag.
+    Under FP8 recipes, eval/no-grad forwards skip the indexer's loss-path projection, so its amax
+    history sees fewer recordings than the reference during eval (training forwards identical).
+    For Transformer Engine CUDA graphs that capture attention, fixed-capacity dynamic-pack routing
+    is enabled automatically when ``sequence_packing_scheduler="dp_balanced"``. Data preparation
+    then builds one fixed-shape source plan from each microbatch's ``cu_seqlens``. The decoder stack
+    copies its two typed metadata owners once into a fixed-address graph-slot arena shared by all
+    captured DSA callables. Staged route inputs retain their originating slot so replay cannot
+    follow mutable layer microbatch state; this does not change the existing CUDA-graph/recompute
+    compatibility matrix. PP/VPP also requires ``cuda_graph_dynamic_microbatches`` so a graph input
+    slot cannot be reused while its forward remains live. Dynamic CP, local CUDA graphs, and
+    full-iteration CUDA graphs do not use dynamic-pack routing. A step batch-size schedule may not
+    increase the source global batch size after capture; doing so would require retaining graph
+    instances sized for the largest future schedule entry. Other graph configurations retain the
+    static-composition behavior."""
+
+    @property
+    def dsa_cp_balance_indexer_graph_dynamic_packs(self) -> bool:
+        """Whether CUDA-graphed balanced DSA routing supports varying pack compositions.
+
+        This is derived rather than user-configurable so data preparation, graph capture, and
+        replay always agree on whether fixed-capacity dynamic route metadata is required.
+        """
+        return bool(
+            self.dsa_cp_balance_indexer
+            and self.cuda_graph_impl == "transformer_engine"
+            and cuda_graph_captures_attention(self)
+            and self.sequence_packing_scheduler == "dp_balanced"
+        )
 
     ####################
     # DeepSeek-v4 hybrid attention
@@ -1261,7 +1310,9 @@ class TransformerConfig(ModelParallelConfig):
     """Allow CUDA graph replay when runtime microbatch count varies across iterations.
     This option is only meaningful for cuda_graph_impl=transformer_engine. For THD sequence
     packing, capture uses a conservative upper bound on the packed microbatch count so graph
-    replay can cover iterations whose real packed microbatch count changes."""
+    replay can cover iterations whose real packed microbatch count changes at a fixed source
+    global batch size. Increasing the source global batch size with step_batch_size_schedule
+    after capture is rejected rather than retaining an unbounded number of graph instances."""
 
     ####################
     # Hyper-Connection Configuration
@@ -1723,6 +1774,13 @@ class TransformerConfig(ModelParallelConfig):
                         "cp_partition_mode='contiguous'."
                     )
 
+        if self.dsa_cp_balance_indexer and self.experimental_attention_variant != "dsv4_hybrid":
+            # The flag is consumed only by the CSA indexer; on any other model the
+            # data-step prebuild would burn per-microbatch host syncs for nothing.
+            raise ValueError(
+                "dsa_cp_balance_indexer requires " "experimental_attention_variant='dsv4_hybrid'."
+            )
+
         # Normalize the deprecated DSv4 kernel switch only after all deprecated attention
         # selectors have been folded into experimental_attention_variant, and immediately
         # before the centralized attention-variant validation consumes dsa_kernel_backend.
@@ -1777,6 +1835,39 @@ class TransformerConfig(ModelParallelConfig):
                 "Use dsa_kernel_backend='tilelang' or 'none'."
             )
 
+        if self.dsa_cp_balance_indexer:
+            # Startup preconditions for the flag to be meaningful. The per-pack verdict in
+            # cp_balanced_indexer does the actual routing; ineligible packs take the
+            # contiguous reference path. The alignment setting is intentionally absent
+            # here because it is only a capacity-rounding policy, not proof that the
+            # current pack's sequence boundaries are zigzag-representable.
+            # Evaluated after the deprecated apply_dsa_kernel_fusion switch is folded
+            # into dsa_kernel_backend above, so the predicate sees the final backend.
+            from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+                use_fused_dsa_kernels,
+            )
+
+            if not use_fused_dsa_kernels(self):
+                raise ValueError(
+                    "dsa_cp_balance_indexer requires the fused DSA indexer backend "
+                    "(dsa_kernel_backend != 'none' and attention_backend != unfused): "
+                    "the balanced zigzag scorer is fused-only."
+                )
+            if not (self.context_parallel_size > 1 or self.dynamic_context_parallel):
+                raise ValueError(
+                    "dsa_cp_balance_indexer requires active context parallelism "
+                    "(context_parallel_size > 1 or dynamic_context_parallel=True)."
+                )
+            ratios = self.csa_compress_ratios or []
+            if self.csa_dense_mode or 4 not in ratios:
+                raise ValueError(
+                    "dsa_cp_balance_indexer requires a DSA indexer to exist: "
+                    "CompressedSparseAttention builds one only for compress-ratio-4 "
+                    "layers with csa_dense_mode=False "
+                    f"(csa_dense_mode={self.csa_dense_mode}, "
+                    f"csa_compress_ratios={self.csa_compress_ratios}). Without one the "
+                    "flag would only add per-microbatch prebuild work."
+                )
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if not self.is_hybrid_model:
                 assert (
@@ -3431,18 +3522,87 @@ class TransformerConfig(ModelParallelConfig):
                         f"offload_modules, or clear mhc_recompute_attn_cuda_graph_split."
                     )
 
-        cuda_graph_captures_attention = self.cuda_graph_impl == "full_iteration" or (
-            self.cuda_graph_impl in ("local", "transformer_engine")
-            and (not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules)
-        )
+        graph_captures_attention = cuda_graph_captures_attention(self)
+
+        if self.dsa_cp_balance_indexer_graph_dynamic_packs:
+            if self.dynamic_context_parallel or self.context_parallel_size <= 1:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires fixed context "
+                    "parallelism with context_parallel_size > 1 and dynamic_context_parallel=False."
+                )
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires "
+                    "max_seqlen_per_dp_cp_rank to define the fixed per-rank graph capacity."
+                )
+            if self.max_seqlen_per_dp_cp_rank <= 0:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires a positive "
+                    "max_seqlen_per_dp_cp_rank."
+                )
+            if self.max_seqlen_per_dp_cp_rank % 2 != 0:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires an even "
+                    "max_seqlen_per_dp_cp_rank because every rank scores two fixed-size halves."
+                )
+            from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
+                FUSED_INDEXER_MAX_SAFE_ROWS,
+            )
+
+            if self.max_seqlen_per_dp_cp_rank // 2 > FUSED_INDEXER_MAX_SAFE_ROWS:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing would issue fused "
+                    "indexer calls "
+                    f"with {self.max_seqlen_per_dp_cp_rank // 2} rows, above the verified-safe "
+                    f"limit of {FUSED_INDEXER_MAX_SAFE_ROWS}. Increase CP or reduce "
+                    "max_seqlen_per_dp_cp_rank."
+                )
+            graph_dynamic_pp_vpp = (
+                self.pipeline_model_parallel_size > 1
+                or (self.virtual_pipeline_model_parallel_size or 1) > 1
+            )
+            if graph_dynamic_pp_vpp and not self.cuda_graph_dynamic_microbatches:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing with PP/VPP requires "
+                    "cuda_graph_dynamic_microbatches=True so each in-flight forward owns a "
+                    "distinct CUDA graph input slot until its backward completes."
+                )
+            if self.overlap_moe_expert_parallel_comm or self.delay_wgrad_compute:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing does not yet support "
+                    "overlap_moe_expert_parallel_comm or delay_wgrad_compute: those modes force "
+                    "CUDA graph capture back to the runtime microbatch count instead of the THD "
+                    "packing upper bound, so a still-live graph input slot could be reused."
+                )
+        if (
+            self.dsa_cp_balance_indexer
+            and not self.dsa_cp_balance_indexer_graph_dynamic_packs
+            and graph_captures_attention
+            and (
+                self.pipeline_model_parallel_size > 1
+                or (self.virtual_pipeline_model_parallel_size or 1) > 1
+            )
+        ):
+            # The legacy graph path pins one static pack composition and cannot
+            # disambiguate the different PackedSeqParams views hosted by PP/VPP.
+            raise ValueError(
+                "dsa_cp_balance_indexer with attention-capturing CUDA graphs currently "
+                "supports PP/VPP only when dynamic-pack routing is inferred from "
+                "cuda_graph_impl='transformer_engine' and "
+                "sequence_packing_scheduler='dp_balanced'. Use those settings, disable "
+                "attention capture, or disable pipeline parallelism."
+            )
 
         cp_layout_conversion_required = is_gated_delta_net_variant(
             self.experimental_attention_variant
         )
+        # (dsa_cp_balance_indexer does NOT belong in this predicate: the balanced DSA
+        # indexer operates natively on the contiguous layout and performs no
+        # module-local THD CP layout conversion.)
         if (
             (self.context_parallel_size > 1 or self.dynamic_context_parallel)
             and self.sequence_packing_scheduler is not None
-            and cuda_graph_captures_attention
+            and graph_captures_attention
             and cp_layout_conversion_required
         ):
             raise ValueError(

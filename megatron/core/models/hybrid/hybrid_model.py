@@ -512,6 +512,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if decoder_input is not None:
             pass
         elif self.pre_process:
+            if padding_mask is not None:
+                assert padding_mask.shape == input_ids.shape, (
+                    f"padding_mask shape {padding_mask.shape} does not match "
+                    f"input_ids shape {input_ids.shape}"
+                )
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
 
             # Clear the outputs for padding tokens when using dynamic batching with
@@ -529,6 +534,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 # (e.g. VLM LMs); scatter here so a standalone LM forward isn't double-gathered.
                 decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
                     decoder_input, group=self.pg_collection.tp
+                )
+            if padding_mask is not None and self.config.sequence_parallel:
+                padding_mask = (
+                    tensor_parallel.scatter_to_sequence_parallel_region(
+                        padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
                 )
         else:
             # intermediate stage of pipeline

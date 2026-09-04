@@ -2,6 +2,7 @@
 
 """Megatron Module."""
 
+from copy import copy as shallow_copy
 from functools import partial
 from typing import Optional, Tuple
 
@@ -21,6 +22,8 @@ from megatron.core.transformer.utils import (
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
+_TE_CUDA_GRAPH_ROUTE_MICROBATCH_ATTR = "_te_cuda_graph_route_microbatch_id"
+_TE_CUDA_GRAPH_ROUTE_SLOT_ATTR = "_te_cuda_graph_route_slot"
 
 
 def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
@@ -41,6 +44,307 @@ class MegatronModule(torch.nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
+
+    @staticmethod
+    def _validate_route_metadata_pair(layout_i32, route_i64, *, name):
+        """Validate one packed graph-route metadata owner pair."""
+        if not isinstance(layout_i32, torch.Tensor) or not isinstance(route_i64, torch.Tensor):
+            raise TypeError(f"{name} must contain two torch.Tensor owners")
+        if layout_i32.dtype != torch.int32 or route_i64.dtype != torch.int64:
+            raise TypeError(
+                f"{name} must be (int32 layout, int64 route), got "
+                f"({layout_i32.dtype}, {route_i64.dtype})"
+            )
+        if layout_i32.dim() != 1 or route_i64.dim() != 1:
+            raise ValueError(
+                f"{name} owners must be flat, got shapes "
+                f"{tuple(layout_i32.shape)} and {tuple(route_i64.shape)}"
+            )
+        if not layout_i32.is_contiguous() or not route_i64.is_contiguous():
+            raise ValueError(f"{name} owners must be contiguous")
+        if layout_i32.device != route_i64.device:
+            raise ValueError(
+                f"{name} owners must be on one device, got "
+                f"{layout_i32.device} and {route_i64.device}"
+            )
+        if layout_i32.numel() == 0 or route_i64.numel() == 0:
+            raise ValueError(f"{name} owners must be non-empty")
+        layout_range = (
+            layout_i32.data_ptr(),
+            layout_i32.data_ptr() + layout_i32.numel() * layout_i32.element_size(),
+        )
+        route_range = (
+            route_i64.data_ptr(),
+            route_i64.data_ptr() + route_i64.numel() * route_i64.element_size(),
+        )
+        if max(layout_range[0], route_range[0]) < min(layout_range[1], route_range[1]):
+            raise ValueError(f"{name} owners must not overlap in storage")
+
+    def set_te_cuda_graph_route_metadata_arenas(self, arenas, *, logical_route_numel, cp_rank=None):
+        """Retain one fixed-address DSA route-metadata pair per graph slot."""
+        arenas = tuple(tuple(pair) for pair in arenas)
+        if not arenas:
+            raise ValueError("TE CUDA Graph route-metadata arenas must contain at least one slot")
+        if not isinstance(logical_route_numel, int) or logical_route_numel <= 0:
+            raise ValueError("TE CUDA Graph logical route length must be a positive integer")
+        cp_size = self.config.context_parallel_size
+        cp_group = getattr(getattr(self, "pg_collection", None), "cp", None)
+        if cp_group is None or cp_group.size() != cp_size:
+            raise RuntimeError(
+                "TE CUDA Graph route-metadata arena requires the owning stack's explicit CP "
+                f"group to have size {cp_size}"
+            )
+        owner_cp_rank = cp_group.rank()
+        if cp_rank is None:
+            cp_rank = owner_cp_rank
+        elif cp_rank != owner_cp_rank:
+            raise ValueError(
+                "TE CUDA Graph route-metadata arena rank must match the owning stack's CP "
+                f"group: owner={owner_cp_rank}, requested={cp_rank}"
+            )
+        if not isinstance(cp_rank, int) or isinstance(cp_rank, bool) or not 0 <= cp_rank < cp_size:
+            raise ValueError(
+                f"TE CUDA Graph CP-local rank must be in [0, {cp_size}), got {cp_rank}"
+            )
+
+        reference_layout_schema = None
+        schemas = []
+        ptrs = []
+        seen_ptrs = set()
+        seen_ranges = []
+        seen_route_lengths = set()
+        for slot, pair in enumerate(arenas):
+            if len(pair) != 2:
+                raise ValueError(
+                    f"TE CUDA Graph route-metadata slot {slot} must contain exactly two owners"
+                )
+            layout_i32, route_i64 = pair
+            self._validate_route_metadata_pair(
+                layout_i32, route_i64, name=f"TE CUDA Graph route-metadata slot {slot}"
+            )
+            layout_schema = (tuple(layout_i32.shape), layout_i32.device, route_i64.device)
+            if reference_layout_schema is None:
+                reference_layout_schema = layout_schema
+            elif layout_schema != reference_layout_schema:
+                raise ValueError(
+                    "TE CUDA Graph route-metadata slots must have one fixed layout schema; "
+                    f"slot 0 has {reference_layout_schema}, slot {slot} has {layout_schema}"
+                )
+            if route_i64.numel() <= logical_route_numel:
+                raise ValueError(
+                    f"TE CUDA Graph route-metadata slot {slot} must have a positive signature "
+                    f"suffix after {logical_route_numel} logical entries"
+                )
+            pair_ptrs = (layout_i32.data_ptr(), route_i64.data_ptr())
+            if any(ptr in seen_ptrs for ptr in pair_ptrs):
+                raise ValueError(
+                    "TE CUDA Graph route-metadata owners must not alias across live slots"
+                )
+            pair_ranges = (
+                (
+                    layout_i32.data_ptr(),
+                    layout_i32.data_ptr() + layout_i32.numel() * layout_i32.element_size(),
+                ),
+                (
+                    route_i64.data_ptr(),
+                    route_i64.data_ptr() + route_i64.numel() * route_i64.element_size(),
+                ),
+            )
+            if any(
+                max(current[0], previous[0]) < min(current[1], previous[1])
+                for current in pair_ranges
+                for previous in seen_ranges
+            ):
+                raise ValueError(
+                    "TE CUDA Graph route-metadata owners must not overlap across live slots"
+                )
+            if route_i64.numel() in seen_route_lengths:
+                raise ValueError(
+                    "TE CUDA Graph route-metadata route lengths must be unique across live slots"
+                )
+            seen_route_lengths.add(route_i64.numel())
+            seen_ptrs.update(pair_ptrs)
+            seen_ranges.extend(pair_ranges)
+            ptrs.append(pair_ptrs)
+            schemas.append(
+                (
+                    tuple(layout_i32.shape),
+                    tuple(route_i64.shape),
+                    layout_i32.device,
+                    route_i64.device,
+                )
+            )
+
+        self._te_cuda_graph_route_metadata_arenas = arenas
+        self._te_cuda_graph_route_metadata_arena_ptrs = tuple(ptrs)
+        self._te_cuda_graph_route_metadata_arena_schemas = tuple(schemas)
+        self._te_cuda_graph_logical_route_numel = logical_route_numel
+        self._te_cuda_graph_cp_rank = cp_rank
+
+    def get_te_cuda_graph_route_metadata_arena(self, microbatch_idx=None):
+        """Return and validate the fixed-address pair selected by graph-slot modulo."""
+        arenas = getattr(self, "_te_cuda_graph_route_metadata_arenas", ())
+        arena_ptrs = getattr(self, "_te_cuda_graph_route_metadata_arena_ptrs", ())
+        if not arenas:
+            raise RuntimeError("TE CUDA Graph route-metadata arenas have not been attached")
+        if len(arenas) != len(arena_ptrs):
+            raise RuntimeError("TE CUDA Graph route-metadata arena slot bookkeeping is malformed")
+
+        if microbatch_idx is None:
+            microbatch_idx = getattr(self, "current_microbatch", 0)
+        if (
+            not isinstance(microbatch_idx, int)
+            or isinstance(microbatch_idx, bool)
+            or microbatch_idx < 0
+        ):
+            raise ValueError(
+                f"TE CUDA Graph route-metadata microbatch index must be non-negative, "
+                f"got {microbatch_idx!r}"
+            )
+        slot = microbatch_idx % len(arenas)
+        layout_i32, route_i64 = arenas[slot]
+        expected_layout_ptr, expected_route_ptr = arena_ptrs[slot]
+        actual_ptrs = (layout_i32.data_ptr(), route_i64.data_ptr())
+        if actual_ptrs != (expected_layout_ptr, expected_route_ptr):
+            raise RuntimeError(
+                f"TE CUDA Graph route-metadata slot {slot} changed address: expected "
+                f"({expected_layout_ptr}, {expected_route_ptr}), got {actual_ptrs}"
+            )
+        self._validate_route_metadata_pair(
+            layout_i32, route_i64, name=f"TE CUDA Graph route-metadata slot {slot}"
+        )
+        actual_schema = (
+            tuple(layout_i32.shape),
+            tuple(route_i64.shape),
+            layout_i32.device,
+            route_i64.device,
+        )
+        schemas = getattr(self, "_te_cuda_graph_route_metadata_arena_schemas", ())
+        if len(schemas) != len(arenas) or actual_schema != schemas[slot]:
+            raise RuntimeError(
+                f"TE CUDA Graph route-metadata slot {slot} changed schema: got {actual_schema}"
+            )
+        return layout_i32, route_i64
+
+    def clear_te_cuda_graph_route_metadata_arenas(self):
+        """Release fixed-address route owners after the corresponding graphs are reset."""
+        self._te_cuda_graph_route_metadata_arenas = ()
+        self._te_cuda_graph_route_metadata_arena_ptrs = ()
+        self._te_cuda_graph_route_metadata_arena_schemas = ()
+        self._te_cuda_graph_logical_route_numel = None
+        self._te_cuda_graph_cp_rank = None
+
+    def _stage_te_cuda_graph_route_metadata(self, packed_seq_params):
+        """Copy two eager owners into this chunk's selected graph arena exactly once."""
+        if not getattr(self, "_te_cuda_graph_route_metadata_arenas", ()):
+            return packed_seq_params
+        if not getattr(self.config, "dsa_cp_balance_indexer_graph_dynamic_packs", False):
+            raise RuntimeError(
+                "TE CUDA Graph route-metadata arenas are attached while the graph-dynamic "
+                "balanced-CP route mode is disabled"
+            )
+        if packed_seq_params is None:
+            raise RuntimeError(
+                "TE CUDA Graph replay with a route-metadata arena requires PackedSeqParams"
+            )
+
+        from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+        source_layout, source_route = cp_balanced_indexer.get_graph_dynamic_plan_buffers(
+            packed_seq_params
+        )
+        source_plan = cp_balanced_indexer.get_graph_dynamic_plan(packed_seq_params)
+        expected_cp_rank = getattr(self, "_te_cuda_graph_cp_rank", None)
+        expected_cp_size = self.config.context_parallel_size
+        expected_l_local = self.config.max_seqlen_per_dp_cp_rank
+        expected_contract = (expected_cp_size, expected_cp_rank, expected_l_local, 0)
+        actual_contract = (
+            None
+            if source_plan is None
+            else (
+                source_plan.get("cp_size"),
+                source_plan.get("cp_rank"),
+                source_plan.get("l_local"),
+                source_plan.get("route_padding", 0),
+            )
+        )
+        if actual_contract != expected_contract:
+            raise ValueError(
+                "Runtime graph-route metadata must be an exact rank-local source plan: "
+                f"expected=(cp={expected_cp_size}, rank={expected_cp_rank}, "
+                f"L={expected_l_local}, padding=0), got={actual_contract}"
+            )
+        self._validate_route_metadata_pair(
+            source_layout, source_route, name="runtime graph-route metadata"
+        )
+        arena_layout, arena_route = self.get_te_cuda_graph_route_metadata_arena()
+        logical_route_numel = getattr(self, "_te_cuda_graph_logical_route_numel", None)
+        if not isinstance(logical_route_numel, int) or logical_route_numel <= 0:
+            raise RuntimeError("TE CUDA Graph logical route length bookkeeping is malformed")
+        if (
+            source_layout.shape != arena_layout.shape
+            or source_route.numel() != logical_route_numel
+            or arena_route.numel() <= logical_route_numel
+            or source_layout.device != arena_layout.device
+            or source_route.device != arena_route.device
+        ):
+            raise ValueError(
+                "Runtime graph-route metadata does not match the captured arena schema: "
+                f"source=({tuple(source_layout.shape)}, {tuple(source_route.shape)}, "
+                f"{source_layout.device}, {source_route.device}), "
+                f"arena=({tuple(arena_layout.shape)}, {tuple(arena_route.shape)}, "
+                f"{arena_layout.device}, {arena_route.device})"
+            )
+
+        # These are the only eager-to-static metadata copies for the whole stack forward.
+        arena_layout.copy_(source_layout)
+        arena_route.narrow(0, 0, logical_route_numel).copy_(source_route)
+
+        staged_params = shallow_copy(packed_seq_params)
+        microbatch_idx = getattr(self, "current_microbatch", 0)
+        if (
+            not isinstance(microbatch_idx, int)
+            or isinstance(microbatch_idx, bool)
+            or microbatch_idx < 0
+        ):
+            raise ValueError(
+                "TE CUDA Graph route-metadata microbatch index must be a non-negative integer, "
+                f"got {microbatch_idx!r}"
+            )
+        setattr(staged_params, _TE_CUDA_GRAPH_ROUTE_MICROBATCH_ATTR, microbatch_idx)
+        setattr(
+            staged_params,
+            _TE_CUDA_GRAPH_ROUTE_SLOT_ATTR,
+            microbatch_idx % len(self._te_cuda_graph_route_metadata_arenas),
+        )
+        cp_balanced_indexer.attach_graph_dynamic_plan_buffers(
+            staged_params,
+            arena_layout,
+            arena_route,
+            self.config.context_parallel_size,
+            self.config.max_seqlen_per_dp_cp_rank,
+            route_padding=arena_route.numel() - logical_route_numel,
+            cp_rank=expected_cp_rank,
+        )
+        staged_layout, staged_route = cp_balanced_indexer.get_graph_dynamic_plan_buffers(
+            staged_params
+        )
+        if (
+            staged_layout.data_ptr() != arena_layout.data_ptr()
+            or staged_route.data_ptr() != arena_route.data_ptr()
+        ):
+            raise RuntimeError(
+                "Attaching graph-route metadata did not preserve the captured arena owners"
+            )
+        original_layout, original_route = cp_balanced_indexer.get_graph_dynamic_plan_buffers(
+            packed_seq_params
+        )
+        if (
+            original_layout.data_ptr() != source_layout.data_ptr()
+            or original_route.data_ptr() != source_route.data_ptr()
+        ):
+            raise RuntimeError("Staging graph-route metadata mutated the caller's PackedSeqParams")
+        return staged_params
 
     def state_dict_for_save_checkpoint(self, prefix: str = '', keep_vars: bool = False):
         """Override state dict for saving checkpoints Use this function to override the
@@ -203,6 +507,27 @@ class GraphableMegatronModule(MegatronModule):
             # calls wgrad computation in attention module (contains attn and shared expert)
             # according to CUDA graph scope.
             self.cuda_graph_backward_dw_wrapper = None
+
+    def _set_te_cuda_graph_route_replay_state(self, packed_seq_params):
+        """Pin replay to the graph slot retained by a checkpointed packed invocation."""
+        microbatch_idx = getattr(packed_seq_params, _TE_CUDA_GRAPH_ROUTE_MICROBATCH_ATTR, None)
+        slot = getattr(packed_seq_params, _TE_CUDA_GRAPH_ROUTE_SLOT_ATTR, None)
+        if microbatch_idx is None and slot is None:
+            self._te_cuda_graph_route_replay_state = None
+            return
+        if (
+            not getattr(self.config, "dsa_cp_balance_indexer_graph_dynamic_packs", False)
+            or not isinstance(microbatch_idx, int)
+            or isinstance(microbatch_idx, bool)
+            or microbatch_idx < 0
+            or not self.cuda_graphs
+            or slot != microbatch_idx % len(self.cuda_graphs)
+        ):
+            raise RuntimeError(
+                "TE CUDA Graph replay received malformed staged route-slot metadata: "
+                f"microbatch={microbatch_idx!r}, slot={slot!r}"
+            )
+        self._te_cuda_graph_route_replay_state = (microbatch_idx, slot)
 
     def set_te_cuda_graph_static_hidden_inputs(self, inputs):
         """Retain TE's fixed hidden-state input surface for each graph slot.
@@ -370,19 +695,29 @@ class GraphableMegatronModule(MegatronModule):
         However, CUDA graph accepts only Tensor inputs.
         Hence, check if the arguments are all tensors.
         """
-        for arg in args:
-            assert isinstance(arg, torch.Tensor), "CUDA graph accepts only Tensor inputs."
-        for _, v in kwargs.items():
-            assert v is None or isinstance(
-                v, torch.Tensor
-            ), "CUDA graph accepts only Tensor inputs."
+        try:
+            for arg in args:
+                assert isinstance(arg, torch.Tensor), "CUDA graph accepts only Tensor inputs."
+            for _, value in kwargs.items():
+                assert value is None or isinstance(
+                    value, torch.Tensor
+                ), "CUDA graph accepts only Tensor inputs."
 
-        cg_index = getattr(self, 'current_microbatch', 0) % len(self.cuda_graphs)
-        cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
+            replay_state = getattr(self, "_te_cuda_graph_route_replay_state", None)
+            microbatch_idx = (
+                replay_state[0]
+                if replay_state is not None
+                else getattr(self, 'current_microbatch', 0)
+            )
+            cg_index = microbatch_idx % len(self.cuda_graphs)
+            cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(*args, **kwargs)
+            cudagraph_kwargs['is_first_microbatch'] = microbatch_idx == 0
 
-        for hook, hook_args in self.cuda_graph_manual_hooks:
-            hook(*hook_args)
-        return self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+            for hook, hook_args in self.cuda_graph_manual_hooks:
+                hook(*hook_args)
+            return self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+        finally:
+            self._te_cuda_graph_route_replay_state = None
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
         """Helper function to get tensor arguments for TE CUDA graph."""

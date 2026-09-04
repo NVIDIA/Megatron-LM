@@ -16,7 +16,7 @@ from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inpla
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 
 from . import cp_layout_kernels
-from .fused_sparse_attention import indexer_topk
+from .fused_sparse_attention import FUSED_INDEXER_MAX_SAFE_ROWS, indexer_topk
 
 # =============================================================================
 # RoPE Wrappers
@@ -301,6 +301,15 @@ def _build_cp_indexer_layout(
     return cu_q_topk, cu_k_topk, q_causal_offsets
 
 
+# Verified fused-kernel row-limit defect: see FUSED_INDEXER_MAX_SAFE_ROWS in
+# dsa_fused_safety.py (single source of truth; re-exported here for the
+# balanced-indexer prebuild and tests). Policy at THIS wrapper: the balanced
+# synthetic-layout path fails closed above the limit; ordinary reference calls
+# proceed unchanged — the once-per-process correctness warning fires inside
+# the CSA _indexer_topk_core funnel. The neighboring DSv3.2 backend applies the
+# same shared warning in dsa_cudnn_kernels before each direct cuDNN invocation.
+
+
 def compute_cp_indexer_topk(
     q_indexer_local: torch.Tensor,
     weights_indexer_local: torch.Tensor,
@@ -313,14 +322,64 @@ def compute_cp_indexer_topk(
     indexer_softmax_scale: float,
     max_seqlen_q: int,
     use_fused: bool,
+    max_seqlen_kv: Optional[int] = None,
+    prebuilt_layout: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    synthetic_layout: bool = False,
 ) -> Tuple[Optional[torch.Tensor], Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]:
-    """Return local top-k and its local-Q/full-K packed layout."""
+    """Return local top-k and its local-Q/full-K packed layout.
+
+    ``max_seqlen_kv`` optionally overrides the score-matrix width capacity (default
+    ``max_seqlen_q // ratio``). The fused kernel materializes an fp32 ``(rows, max_seqlen_kv)``
+    score buffer, so callers whose rows can only see a bounded causal prefix (e.g. the balanced
+    CP indexer scoring one chunk at global offset ``gs``: visible width <= ``(gs + rows) //
+    ratio``) should pass the tight bound to avoid allocating and masking the full-sequence width.
+
+    ``prebuilt_layout`` optionally supplies a ``(cu_q, cu_k, q_causal_offsets)`` tuple from a
+    previous ``_build_cp_indexer_layout(cu_seqlens_q, cu_seqlens_compressed, global_start,
+    rows)`` call with identical arguments, skipping the rebuild (the layout is constant across
+    layers within a microbatch). Only the fused path consumes the layout for masking; the
+    unfused path recomputes its masking from ``(cu_seqlens_q, global_start)`` and returns the
+    tuple as metadata only. Callers passing a synthetic layout that differs from that
+    recomputation (the balanced zigzag path) must set ``synthetic_layout=True`` and use the fused
+    path. Non-empty calls with ``synthetic_layout=True`` and ``use_fused=False`` raise
+    ``ValueError`` rather than silently mis-mask. An ordinary cached
+    ``_build_cp_indexer_layout`` result keeps the default.
+    """
     topk_width = int(topk_width)
     if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
         return None, None
-    max_seqlen_kv = int(max_seqlen_q) // int(ratio)
+    max_seqlen_kv = int(max_seqlen_q) // int(ratio) if max_seqlen_kv is None else int(max_seqlen_kv)
     if max_seqlen_kv == 0:
         return None, None
+
+    if synthetic_layout and not use_fused:
+        raise ValueError(
+            "synthetic_layout=True requires use_fused=True because the unfused path "
+            "recomputes masking and ignores the synthetic layout."
+        )
+
+    if use_fused and int(q_indexer_local.shape[0]) > FUSED_INDEXER_MAX_SAFE_ROWS:
+        # See FUSED_INDEXER_MAX_SAFE_ROWS. Policy split (after the zero-work exits
+        # above, which never launch the kernel):
+        # - the balanced synthetic-layout path fails closed: it necessarily issues
+        #   multiple fused calls per microbatch, so a later above-limit call is the
+        #   verified-corrupt pattern, and a synthetic layout cannot take the unfused
+        #   path (the unfused arm treats layouts as metadata only);
+        # - pre-existing callers (reference CP path and non-CP paths) keep their
+        #   behavior and proceed fused; the once-per-process high-severity
+        #   correctness warning fires in the CSA _indexer_topk_core funnel;
+        #   DSv3.2 direct callers are guarded separately in dsa_cudnn_kernels.
+        if synthetic_layout:
+            raise RuntimeError(
+                f"fused indexer top-k with {int(q_indexer_local.shape[0])} query rows "
+                f"exceeds the verified-safe limit of {FUSED_INDEXER_MAX_SAFE_ROWS} for "
+                "the current fused kernel package (silent corruption of rows >= 32768 "
+                "unless first-in-process; verified on GB200 with cudnn-frontend 1.26.0, "
+                "no known-good version yet), and this synthetic layout cannot take the "
+                "unfused path. Reduce per-call rows (higher CP degree or smaller pack "
+                "capacity), or disable dsa_cp_balance_indexer and use the contiguous "
+                "reference path with an unfused backend."
+            )
 
     global_start = int(global_start)
     l_local = q_indexer_local.shape[0]
@@ -330,9 +389,12 @@ def compute_cp_indexer_topk(
             f"{l_local}, got {weights_indexer_local.shape[0]}."
         )
 
-    cu_q_topk, cu_k_topk, q_causal_offsets = _build_cp_indexer_layout(
-        cu_seqlens_q, cu_seqlens_compressed, global_start, l_local
-    )
+    if prebuilt_layout is not None:
+        cu_q_topk, cu_k_topk, q_causal_offsets = prebuilt_layout
+    else:
+        cu_q_topk, cu_k_topk, q_causal_offsets = _build_cp_indexer_layout(
+            cu_seqlens_q, cu_seqlens_compressed, global_start, l_local
+        )
 
     if not use_fused:
         global_rows = torch.arange(

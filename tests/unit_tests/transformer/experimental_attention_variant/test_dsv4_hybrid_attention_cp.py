@@ -25,6 +25,7 @@ from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
     _SEED,
     _build_attention,
+    _build_dsv4_moe_layer,
     _make_config,
 )
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_native_parity import (
@@ -73,6 +74,64 @@ _DSV4_CP_RAGGED_PADDED_SEG_LENS = (5, 127, 1000, 23, 129, 900, 55, 257, 800, 95,
 # change because the CP path rebuilds compressed-row metadata from device
 # cu_seqlens_padded rather than from capture-time host sizes.
 _DSV4_CP_REPLAY_PADDED_SEG_LENS = (8, 128, 1000, 32, 132, 904, 64, 260, 804, 96, 512, 156)
+
+# All compositions have the same fixed 4096-row capacity, sequence-count
+# capacity, and max sequence length. Every physical segment is divisible by
+# 2*CP for both CP2 and CP4, which is the balanced indexer's zigzag contract.
+_DSV4_CP_BALANCED_CAPTURE_SEG_LENS = (256, 768, 1024, 2048)
+_DSV4_CP_BALANCED_REPLAY_SEG_LENS = (512, 512, 1024, 2048)
+_DSV4_CP_BALANCED_THIRD_SEG_LENS = (384, 640, 1024, 2048)
+
+_DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS = ("dsa_cp_graph_layout_buffer", "dsa_cp_graph_route_buffer")
+
+# Probe the logical route schema, not its packed TE owner mapping. The packed
+# owner mapping intentionally has only two entries and is not a logical-field
+# inventory.
+_DSV4_CP_GRAPH_DYNAMIC_PROBE_KEYS = (
+    "validated_cu",
+    "pos_head",
+    "pos_tail",
+    "score_cu_q",
+    "score_cu_kv",
+    "head_offsets",
+    "tail_offsets",
+    "output_cu_q",
+    "output_cu_kv",
+    "output_offsets",
+    "src_slot",
+    "relay_perm",
+    "dst_slot",
+)
+
+
+class _RoutePlanEchoAttention(torch.nn.Module):
+    """Lightweight consumer for testing route metadata through TE graph kwargs."""
+
+    def __init__(self, probe_points, hidden_size):
+        super().__init__()
+        # TransformerLayer uses this attribute to recognize a DSA-bearing attention module.
+        self.indexer = torch.nn.Identity()
+        self.probe_points = tuple(probe_points)
+        self.hidden_size = hidden_size
+
+    def forward(self, hidden_states, packed_seq_params=None, **_kwargs):
+        from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+        plan = cp_balanced_indexer.get_graph_dynamic_plan(packed_seq_params)
+        assert plan is not None
+        torch._assert_async((plan["validated_cu"] == packed_seq_params.cu_seqlens_q_padded).all())
+
+        values = [plan[key].reshape(-1)[index].to(torch.int32) for key, index in self.probe_points]
+        # Preserve integer differences when encoding route metadata into BF16 output.
+        low_digits = torch.stack([torch.remainder(value, 128) for value in values])
+        high_digits = torch.stack(
+            [torch.div(value, 128, rounding_mode="floor") for value in values]
+        )
+        fingerprint = torch.cat((low_digits, high_digits)).to(hidden_states.dtype)
+        route_bias = F.pad(fingerprint, (0, self.hidden_size - fingerprint.numel())).view(
+            1, 1, self.hidden_size
+        )
+        return hidden_states + route_bias, None
 
 
 def _dsv4_cp_fused_kernels_available():
@@ -274,10 +333,11 @@ def _make_dsv4_cp_config(
     dsa_indexer_use_sparse_loss=True,
     use_fused_kernels=True,
     apply_rope_fusion=True,
+    **extra_config_kwargs,
 ):
     """Build the DSv4 flash attention config used by CP tests."""
     shape = _DSV4_VARIANTS[_DSV4_CP_TEST_VARIANT]
-    return _make_config(
+    config_kwargs = dict(
         hidden_size=shape["hidden_size"],
         num_attention_heads=shape["num_attention_heads"],
         v_head_dim=shape["v_head_dim"],
@@ -305,6 +365,8 @@ def _make_dsv4_cp_config(
         dsa_kernel_backend="cudnn" if use_fused_kernels else "none",
         apply_rope_fusion=apply_rope_fusion,
     )
+    config_kwargs.update(extra_config_kwargs)
+    return _make_config(**config_kwargs)
 
 
 def _copy_module_parameters(src, dst):
@@ -439,7 +501,18 @@ def _measure_cuda_graph_time(attn, static_hidden, static_grad, packed_seq_params
         end_event.record()
         torch.cuda.synchronize()
         timings.append(float(start_event.elapsed_time(end_event)))
-    return _max_float_across_world(statistics.median(timings))
+    measured = _max_float_across_world(statistics.median(timings))
+
+    # A CUDAGraph private pool is not an ordinary caching-allocator segment.
+    # Tear down the executable and every tensor that can keep the pool alive
+    # before this helper returns; later tests in the same pytest worker include
+    # a long-sequence attention case whose workspace nearly fills an H100.
+    graph.reset()
+    attn.zero_grad(set_to_none=True)
+    static_hidden.grad = None
+    del graph, _graph_output, start_event, end_event
+    _clear_cuda_test_state()
+    return measured
 
 
 def _format_scale_report(metric, layer_number, cp_size, baseline, measured, scale, limit):
@@ -491,10 +564,24 @@ class TestDSv4HybridAttentionTHDCP:
         cls.ref_pg.cp = _ReferenceCPGroup()
         cls._cp1_memory_delta_cache = {}
         cls._cp1_graph_time_cache = {}
+        cp_group = cls.pg.cp
 
         yield
         _clear_cuda_test_state()
         Utils.destroy_model_parallel()
+        # The balanced CUDA graph captures NCCL all-to-all on this subgroup. MCore's
+        # model-parallel teardown only drops its Python references to NCCL groups, so
+        # explicitly destroy the test-owned CP communicator to release graph-registered
+        # buffers before later near-capacity attention tests run in this pytest worker.
+        if cp_group is dist.group.WORLD:
+            raise RuntimeError("DSv4 CP tests unexpectedly reused the default process group")
+        if dist.distributed_c10d._world.pg_map.get(cp_group) is not None:
+            dist.destroy_process_group(cp_group)
+        cls.pg = None
+        cls.ref_pg = None
+        cls._cp1_memory_delta_cache.clear()
+        cls._cp1_graph_time_cache.clear()
+        _clear_cuda_test_state()
 
     @pytest.fixture(autouse=True)
     def clear_cuda_test_case(self):
@@ -1024,6 +1111,7 @@ class TestDSv4HybridAttentionTHDCP:
             }
             # The unfused graph pool is large on H100. Its results are cloned, so
             # release it before allocating the eager reference's backward buffers.
+            graph.reset()
             del graph, graph_output, graph_attn, full_hidden, test_hidden
             del static_hidden, static_grad
             _clear_cuda_test_state()
@@ -1163,9 +1251,475 @@ class TestDSv4HybridAttentionTHDCP:
                 f"layer={layer_number}:metadata_replay:param_grad:{name}",
             )
 
+        graph.reset()
         del graph, graph_output, graph_attn, eager_attn, capture_full_hidden, replay_full_hidden
         del capture_hidden, replay_hidden, capture_grad, replay_grad, static_hidden, static_grad
         del graph_out, graph_hidden_grad, eager_hidden
+        _clear_cuda_test_state()
+
+    def run_balanced_dynamic_pack_graph_replays_30_iterations(self):
+        """The raw graph refreshes two fixed-shape route owners for 30 A/B/C replays."""
+        if not self.fused_kernels_available:
+            pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
+
+        from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+        segment_compositions = (
+            _DSV4_CP_BALANCED_CAPTURE_SEG_LENS,
+            _DSV4_CP_BALANCED_REPLAY_SEG_LENS,
+            _DSV4_CP_BALANCED_THIRD_SEG_LENS,
+        )
+        source_packs = tuple(_make_thd_packed_seq_params(lens) for lens in segment_compositions)
+        # Keep the graph input separate from the immutable A/B/C sources. In-place
+        # replay refreshes must never overwrite the source used to restore pack A.
+        graph_packed = _make_thd_packed_seq_params(_DSV4_CP_BALANCED_CAPTURE_SEG_LENS)
+        total_rows = sum(_DSV4_CP_BALANCED_CAPTURE_SEG_LENS)
+        for packed in source_packs:
+            assert total_rows == int(packed.cu_seqlens_q_padded[-1].item())
+            assert packed.cu_seqlens_q.shape == graph_packed.cu_seqlens_q.shape
+            assert packed.max_seqlen_q == graph_packed.max_seqlen_q
+        assert all(
+            not torch.equal(source_packs[index].cu_seqlens_q, source_packs[index + 1].cu_seqlens_q)
+            for index in range(len(source_packs) - 1)
+        )
+
+        for packed in (*source_packs, graph_packed):
+            cp_balanced_indexer.prebuild_balanced_layouts(
+                packed,
+                cp_group=self.pg.cp,
+                capacity=total_rows,
+                graphs_enabled=True,
+                graph_dynamic_packs=True,
+            )
+
+        torch.manual_seed(_SEED + 1152)
+        model_parallel_cuda_manual_seed(_SEED + 1152)
+        config = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            use_fused_kernels=True,
+            apply_rope_fusion=True,
+            dsa_cp_balance_indexer=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=["attn"],
+            max_seqlen_per_dp_cp_rank=total_rows // self.cp_size,
+            pad_packed_seq_alignment="max",
+            thd_max_packed_sequences=len(_DSV4_CP_BALANCED_CAPTURE_SEG_LENS),
+        )
+        assert config.dsa_cp_balance_indexer_graph_dynamic_packs
+        graph_attn = _build_attention(config, layer_number=2, pg_collection=self.pg).cuda()
+        eager_attn = _build_attention(config, layer_number=2, pg_collection=self.pg).cuda()
+        graph_attn.train()
+        eager_attn.train()
+        _copy_module_parameters(graph_attn, eager_attn)
+
+        local_rows = total_rows // self.cp_size
+        local_idx = torch.arange(
+            self.cp_rank * local_rows, (self.cp_rank + 1) * local_rows, device="cuda"
+        )
+        full_hidden, full_grad = _make_hidden_and_grad(total_rows, config.hidden_size)
+        local_hidden = full_hidden.index_select(0, local_idx)
+        local_grad = full_grad.index_select(0, local_idx)
+        static_hidden = local_hidden.detach().clone().requires_grad_(True)
+        static_grad = local_grad.detach().clone()
+
+        graph, graph_output = _capture_dsv4_attention_forward_backward(
+            graph_attn, static_hidden, static_grad, graph_packed
+        )
+
+        def _owner_kwargs(packed):
+            kwargs = {}
+            cp_balanced_indexer.add_graph_dynamic_plan_to_kwargs(packed, kwargs, required=True)
+            assert set(kwargs) == set(_DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS)
+            plan = cp_balanced_indexer.get_graph_dynamic_plan(packed)
+            assert plan is not None
+            assert kwargs["dsa_cp_graph_layout_buffer"] is plan["layout_i32"]
+            assert kwargs["dsa_cp_graph_route_buffer"] is plan["route_i64"]
+            assert kwargs["dsa_cp_graph_layout_buffer"].dtype == torch.int32
+            assert kwargs["dsa_cp_graph_route_buffer"].dtype == torch.int64
+            assert all(kwargs[name].is_contiguous() for name in kwargs)
+            torch.testing.assert_close(
+                plan["validated_cu"], packed.cu_seqlens_q_padded, rtol=0, atol=0
+            )
+            return kwargs
+
+        def _load_metadata(source):
+            with torch.no_grad():
+                graph_packed.cu_seqlens_q.copy_(source.cu_seqlens_q)
+                graph_packed.cu_seqlens_kv.copy_(source.cu_seqlens_kv)
+                graph_packed.cu_seqlens_q_padded.copy_(source.cu_seqlens_q_padded)
+                graph_packed.cu_seqlens_kv_padded.copy_(source.cu_seqlens_kv_padded)
+                cp_balanced_indexer.copy_graph_dynamic_plan_(graph_packed, source)
+
+        source_owner_kwargs = tuple(_owner_kwargs(packed) for packed in source_packs)
+        for owner_name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS:
+            assert len({kwargs[owner_name].data_ptr() for kwargs in source_owner_kwargs}) == 3
+        graph_owner_ptrs = tuple(
+            _owner_kwargs(graph_packed)[name].data_ptr()
+            for name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS
+        )
+
+        # Eager execution is deterministic for a fixed pack, so cache one full
+        # forward/backward reference per composition and compare every replay to
+        # its corresponding eager result.
+        eager_results = tuple(
+            _run_dsv4_attention_forward_backward(
+                eager_attn, local_hidden.detach().clone().requires_grad_(True), local_grad, packed
+            )
+            for packed in source_packs
+        )
+        first_graph_outputs = {}
+        for replay_index in range(30):
+            pack_index = replay_index % len(source_packs)
+            source = source_packs[pack_index]
+            source_kwargs = source_owner_kwargs[pack_index]
+            _load_metadata(source)
+
+            graph_kwargs = _owner_kwargs(graph_packed)
+            assert (
+                tuple(graph_kwargs[name].data_ptr() for name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS)
+                == graph_owner_ptrs
+            )
+            for owner_name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS:
+                torch.testing.assert_close(
+                    graph_kwargs[owner_name], source_kwargs[owner_name], rtol=0, atol=0
+                )
+
+            _zero_existing_grads(graph_attn, static_hidden)
+            graph.replay()
+            torch.cuda.synchronize()
+            graph_result = (
+                graph_output.detach().clone(),
+                static_hidden.grad.detach().clone(),
+                {
+                    name: param.grad.detach().clone()
+                    for name, param in graph_attn.named_parameters()
+                    if param.grad is not None
+                },
+            )
+            eager_result = eager_results[pack_index]
+            label = f"replay_{replay_index:02d}_pack_{pack_index}"
+            _assert_cp_graph_bitwise_match(
+                graph_result[0], eager_result[0], f"balanced_dynamic:{label}:output"
+            )
+            _assert_cp_graph_fused_grad_match(
+                graph_result[1], eager_result[1], f"balanced_dynamic:{label}:hidden_grad"
+            )
+            assert graph_result[2].keys() == eager_result[2].keys()
+            for name, graph_grad in graph_result[2].items():
+                _assert_cp_graph_fused_grad_match(
+                    graph_grad, eager_result[2][name], f"balanced_dynamic:{label}:param_grad:{name}"
+                )
+
+            # Neither the in-place metadata refresh nor graph replay may replace
+            # either graph-owned storage allocation.
+            assert (
+                tuple(
+                    _owner_kwargs(graph_packed)[name].data_ptr()
+                    for name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS
+                )
+                == graph_owner_ptrs
+            )
+            if pack_index in first_graph_outputs:
+                _assert_cp_graph_bitwise_match(
+                    graph_result[0],
+                    first_graph_outputs[pack_index],
+                    f"balanced_dynamic:{label}:repeat_restore",
+                )
+            else:
+                first_graph_outputs[pack_index] = graph_result[0]
+
+        assert len(first_graph_outputs) == 3
+        # Some compositions only change boundaries on another CP rank, so CP
+        # ranks that own the unchanged final sequence may legitimately see
+        # identical local outputs.  Require a difference somewhere globally.
+        assert (
+            _max_int_across_world(
+                int(not torch.equal(first_graph_outputs[0], first_graph_outputs[1]))
+            )
+            == 1
+        )
+
+        graph.reset()
+        del graph, graph_output, graph_attn, eager_attn, static_hidden, static_grad
+        del full_hidden, full_grad, local_hidden, local_grad
+        _clear_cuda_test_state()
+
+    def run_balanced_dynamic_pack_te_layer_graph_replays_30_iterations(self):
+        """The direct TE layer fallback refreshes two owner kwargs for 30 A/B/C replays."""
+        # The real-TE plumbing is topology-independent once the route tensors reach the
+        # TransformerLayer kwarg boundary, so capture it once under CP2.  The raw graph
+        # test above exercises the balanced route itself under both CP2 and CP4; repeating
+        # TE's warmup/capture/JIT cycle under CP4 makes this integration gate needlessly
+        # expensive on a four-rank worker.
+        if self.cp_size != 2:
+            pytest.skip("real TE graph-dynamic route plumbing is covered under CP2")
+        if not self.fused_kernels_available:
+            pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
+
+        from transformer_engine.pytorch.graph import make_graphed_callables
+
+        from megatron.core.transformer.cuda_graphs import _set_capture_end, _set_capture_start
+        from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
+            prebuild_balanced_layouts,
+        )
+        from megatron.core.utils import is_te_min_version
+
+        # The raw graph test above owns fused A2A/top-k/attention forward-backward parity.
+        # This test isolates the real TransformerLayer -> TE kwargs copy -> reconstruction
+        # boundary with compact, fixed-capacity route plans. The full
+        # TransformerBlock graph-slot arena is covered separately; a directly
+        # captured layer intentionally exercises the per-layer fallback.
+        segment_compositions = ((32, 96, 128, 256), (64, 64, 128, 256), (48, 80, 128, 256))
+        source_packs = tuple(_make_thd_packed_seq_params(lens) for lens in segment_compositions)
+        capture_seg_lens = segment_compositions[0]
+        total_rows = sum(capture_seg_lens)
+        local_rows = total_rows // self.cp_size
+        for packed in source_packs:
+            prebuild_balanced_layouts(
+                packed,
+                cp_group=self.pg.cp,
+                capacity=total_rows,
+                graphs_enabled=True,
+                graph_dynamic_packs=True,
+            )
+
+        from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+        plans = tuple(cp_balanced_indexer.get_graph_dynamic_plan(packed) for packed in source_packs)
+        assert all(plan is not None for plan in plans)
+        probe_points = []
+        changed_keys = []
+        for key in _DSV4_CP_GRAPH_DYNAMIC_PROBE_KEYS:
+            values = tuple(plan[key].reshape(-1) for plan in plans)
+            assert all(value.shape == values[0].shape for value in values[1:])
+            changed = torch.nonzero(
+                torch.stack(tuple(value != values[0] for value in values[1:])).any(dim=0)
+            ).flatten()
+            index = int(changed[0].item()) if changed.numel() else 0
+            probe_points.append((key, index))
+            if changed.numel():
+                changed_keys.append(key)
+        assert "validated_cu" in changed_keys
+        assert any(key != "validated_cu" for key in changed_keys)
+        probe_signatures = {
+            tuple(int(plan[key].reshape(-1)[index].item()) for key, index in probe_points)
+            for plan in plans
+        }
+        assert len(probe_signatures) == 3
+
+        torch.manual_seed(_SEED + 1153)
+        model_parallel_cuda_manual_seed(_SEED + 1153)
+        config = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=8,
+            v_head_dim=64,
+            qk_pos_emb_head_dim=32,
+            q_lora_rank=64,
+            o_groups=8,
+            o_lora_rank=64,
+            csa_compress_ratios=[0, 4],
+            csa_window_size=64,
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=128,
+            ffn_hidden_size=256,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            dsa_indexer_loss_coeff=0.0,
+            use_fused_kernels=True,
+            apply_rope_fusion=True,
+            dsa_cp_balance_indexer=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=["attn"],
+            max_seqlen_per_dp_cp_rank=local_rows,
+            pad_packed_seq_alignment="max",
+            thd_max_packed_sequences=len(capture_seg_lens),
+        )
+        assert config.dsa_cp_balance_indexer_graph_dynamic_packs
+        graph_layer = _build_dsv4_moe_layer(config, layer_number=2, pg_collection=self.pg).cuda()
+        eager_layer = _build_dsv4_moe_layer(config, layer_number=2, pg_collection=self.pg).cuda()
+        graph_layer.self_attention = _RoutePlanEchoAttention(
+            probe_points, config.hidden_size
+        ).cuda()
+        eager_layer.self_attention = _RoutePlanEchoAttention(
+            probe_points, config.hidden_size
+        ).cuda()
+        graph_layer.train()
+        eager_layer.train()
+        _copy_module_parameters(graph_layer, eager_layer)
+        assert graph_layer._uses_graph_dynamic_dsa_route()
+
+        local_idx = torch.arange(
+            self.cp_rank * local_rows, (self.cp_rank + 1) * local_rows, device="cuda"
+        )
+        full_hidden, full_grad = _make_hidden_and_grad(total_rows, config.hidden_size)
+        local_hidden = full_hidden.index_select(0, local_idx)
+        local_grad = full_grad.index_select(0, local_idx)
+        padding_mask = torch.zeros((1, local_rows), dtype=torch.bool, device="cuda")
+
+        # Use the same public static-input builder and TE capture API as
+        # TECudaGraphHelper.  This is intentionally not a raw torch.cuda.CUDAGraph:
+        # the test must traverse TransformerLayer's PackedSeqParams
+        # decompose/reconstruct boundary and TE's kwarg-copy input surface.
+        static_inputs = graph_layer.get_layer_static_inputs(
+            seq_length=total_rows, micro_batch_size=1
+        )
+        static_hidden = static_inputs.pop("hidden_states")
+        assert static_hidden.shape == local_hidden.shape
+        assert {key for key in static_inputs if key.startswith("dsa_cp_graph_")} == set(
+            _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS
+        )
+        graph_static_owners = tuple(
+            static_inputs[name] for name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS
+        )
+        graph_static_owner_ptrs = tuple(owner.data_ptr() for owner in graph_static_owners)
+        capture_kwargs = {
+            "sample_kwargs": (static_inputs,),
+            "allow_unused_input": True,
+            "num_warmup_iters": 1,
+            "_order": [1, -1],
+            "retain_graph_in_backward": False,
+            "fp8_enabled": False,
+        }
+        if is_te_min_version("2.6.0"):
+            capture_kwargs["_num_layers_per_chunk"] = [1]
+        if is_te_min_version("2.7.0"):
+            capture_kwargs["_reuse_graph_input_output_buffers"] = True
+
+        _set_capture_start()
+        try:
+            graphed = make_graphed_callables((graph_layer,), ((static_hidden,),), **capture_kwargs)
+        finally:
+            _set_capture_end()
+        graph_layer.cuda_graphs = [graphed[0]]
+        graph_layer.current_microbatch = 0
+
+        def _source_owner_kwargs(packed):
+            kwargs = {}
+            cp_balanced_indexer.add_graph_dynamic_plan_to_kwargs(packed, kwargs, required=True)
+            assert set(kwargs) == set(_DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS)
+            plan = cp_balanced_indexer.get_graph_dynamic_plan(packed)
+            assert kwargs["dsa_cp_graph_layout_buffer"] is plan["layout_i32"]
+            assert kwargs["dsa_cp_graph_route_buffer"] is plan["route_i64"]
+            assert kwargs["dsa_cp_graph_layout_buffer"].dtype == torch.int32
+            assert kwargs["dsa_cp_graph_route_buffer"].dtype == torch.int64
+            assert all(kwargs[name].is_contiguous() for name in kwargs)
+            torch.testing.assert_close(
+                plan["validated_cu"], packed.cu_seqlens_q_padded, rtol=0, atol=0
+            )
+            return kwargs
+
+        source_owner_kwargs = tuple(_source_owner_kwargs(packed) for packed in source_packs)
+        source_owner_snapshots = tuple(
+            {name: kwargs[name].detach().clone() for name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS}
+            for kwargs in source_owner_kwargs
+        )
+        for owner_name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS:
+            assert len({kwargs[owner_name].data_ptr() for kwargs in source_owner_kwargs}) == 3
+
+        def _run_layer(layer, packed, microbatch_idx, reset_parameter_grads):
+            hidden = local_hidden.detach().clone().requires_grad_(True)
+            layer.current_microbatch = microbatch_idx
+            if reset_parameter_grads:
+                _zero_existing_grads(layer, hidden)
+            output, context = layer(
+                hidden_states=hidden,
+                attention_mask=None,
+                packed_seq_params=packed,
+                padding_mask=padding_mask,
+            )
+            assert context is None
+            output.backward(local_grad)
+            return (
+                output.detach().clone(),
+                hidden.grad.detach().clone(),
+                {
+                    name: param.grad.detach().clone()
+                    for name, param in layer.named_parameters()
+                    # The attention graph owns captured-parameter accumulation, whose
+                    # in-place lifecycle is intentionally opaque to this plumbing test.
+                    # MLP parameters stay eager and verify that route-dependent graph
+                    # output and backward gradients feed the ordinary layer tail.
+                    if name.startswith("mlp.") and param.grad is not None
+                },
+            )
+
+        # Model one optimizer step with 30 A/B/C microbatches. TE graph backward
+        # accumulates parameter gradients across microbatches, so the eager
+        # reference follows the same lifecycle and is checked after every replay.
+        first_graph_outputs = {}
+        for replay_index in range(30):
+            pack_index = replay_index % len(source_packs)
+            packed = source_packs[pack_index]
+            source_kwargs = _source_owner_kwargs(packed)
+            assert tuple(
+                source_kwargs[name].data_ptr() for name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS
+            ) == tuple(
+                source_owner_kwargs[pack_index][name].data_ptr()
+                for name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS
+            )
+            for owner_name in _DSV4_CP_GRAPH_DYNAMIC_OWNER_KWARGS:
+                torch.testing.assert_close(
+                    source_kwargs[owner_name],
+                    source_owner_snapshots[pack_index][owner_name],
+                    rtol=0,
+                    atol=0,
+                )
+
+            graph_result = _run_layer(
+                graph_layer, packed, replay_index, reset_parameter_grads=replay_index == 0
+            )
+            assert (
+                tuple(owner.data_ptr() for owner in graph_static_owners) == graph_static_owner_ptrs
+            )
+            eager_result = _run_layer(
+                eager_layer, packed, replay_index, reset_parameter_grads=replay_index == 0
+            )
+            label = f"te_replay_{replay_index:02d}_pack_{pack_index}"
+            _assert_cp_graph_bitwise_match(
+                graph_result[0], eager_result[0], f"balanced_dynamic:{label}:output"
+            )
+            _assert_cp_graph_fused_grad_match(
+                graph_result[1], eager_result[1], f"balanced_dynamic:{label}:hidden_grad"
+            )
+            assert graph_result[2].keys() == eager_result[2].keys()
+            assert graph_result[2], "expected eager MLP parameter gradients"
+            for name, graph_grad in graph_result[2].items():
+                _assert_cp_graph_fused_grad_match(
+                    graph_grad, eager_result[2][name], f"balanced_dynamic:{label}:param_grad:{name}"
+                )
+
+            if pack_index in first_graph_outputs:
+                _assert_cp_graph_bitwise_match(
+                    graph_result[0],
+                    first_graph_outputs[pack_index],
+                    f"balanced_dynamic:{label}:repeat_restore",
+                )
+            else:
+                first_graph_outputs[pack_index] = graph_result[0]
+
+        assert len(first_graph_outputs) == 3
+        assert (
+            _max_int_across_world(
+                int(not torch.equal(first_graph_outputs[0], first_graph_outputs[1]))
+            )
+            == 1
+        )
+
+        if hasattr(graph_layer.cuda_graphs[0], "reset"):
+            graph_layer.cuda_graphs[0].reset()
+        graph_layer.cuda_graphs.clear()
+        del (
+            graph_layer,
+            eager_layer,
+            static_hidden,
+            full_hidden,
+            full_grad,
+            local_hidden,
+            local_grad,
+        )
         _clear_cuda_test_state()
 
     @pytest.mark.parametrize(

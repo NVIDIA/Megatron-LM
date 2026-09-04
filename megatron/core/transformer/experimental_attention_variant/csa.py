@@ -1792,6 +1792,16 @@ class CompressedSparseAttention(MegatronModule):
             )
         else:
             self.indexer = None
+        if (
+            config.dsa_cp_balance_indexer
+            and self.compress_ratio == 4
+            and not config.csa_dense_mode
+            and self.indexer is None
+        ):
+            raise ValueError(
+                "dsa_cp_balance_indexer requires an indexer submodule on every "
+                "compress-ratio-4 CSA layer; the selected module spec provides none."
+            )
 
     def backward_dw(self):
         """Compute the deferred weight gradients of the optional compressor/indexer submodules.
@@ -2627,6 +2637,33 @@ class CompressedSparseAttention(MegatronModule):
                     raise RuntimeError(
                         f"DSv4 THD CP indexer expects bsz=1, got {indexer_x.shape[1]}."
                     )
+                nvtx_range_push("indexer_total")
+                # Enable per-pack balanced routing via the config flag. CP<=1 has
+                # nothing to balance. Dynamic-pack graph routing is derived once
+                # from the normalized TransformerConfig rather than selected here.
+                use_balance = self.config.dsa_cp_balance_indexer and cp_size > 1
+                graph_dynamic_packs = bool(
+                    getattr(self.config, "dsa_cp_balance_indexer_graph_dynamic_packs", False)
+                )
+                if use_balance and not graph_dynamic_packs:
+                    from megatron.core.transformer.experimental_attention_variant import (
+                        cp_balanced_indexer,
+                    )
+
+                    # Per-pack routing: a pack the zigzag builders cannot represent
+                    # (raw-cu middle stages and non-scheduler frontends can produce
+                    # one regardless of the configured capacity alignment) takes the
+                    # original contiguous reference path for this microbatch. The
+                    # verdict comes from prebuild's cache (no probe),
+                    # the module registry under capture (raises without an eager
+                    # warmup), or one cached D2H probe for frontends that never
+                    # prebuild.
+                    use_balance = cp_balanced_indexer.pack_eligible_for_zigzag(
+                        packed_seq_params, cu_seqlens, cp_group, cp_size, l_local
+                    )
+                # Layout precondition (contiguous) is enforced module-wide above:
+                # CompressedSparseAttention raises for any CP run whose
+                # PackedSeqParams.cp_partition_mode is not "contiguous".
 
                 nvtx_range_push("dsv4_cp_indexer_k_compressor")
                 indexer_compressed_local, _ = indexer.compressor._forward_thd(
@@ -2683,41 +2720,88 @@ class CompressedSparseAttention(MegatronModule):
                 # (their backward nodes must be newer than the edges) and while
                 # the Indexer-K all-gather is still in flight.
                 nvtx_range_push("dsv4_cp_indexer_q_weights")
-                q_indexer_cp, _ = indexer.linear_wq_b(indexer_qr)
-                q_indexer_cp = q_indexer_cp.reshape(
-                    l_local, indexer.index_n_heads, indexer.index_head_dim
-                )
-                if self.config.apply_rope_fusion:
-                    rotary_pos_cos, rotary_pos_sin = indexer.rotary_pos_emb.get_cached_cos_sin(
-                        max_seqlen_q, dtype=q_indexer_cp.dtype, packed_seq=True, mscale=1.0
-                    )
-                    q_indexer_cp = cp_utils.apply_thd_cp_local_rope_fused(
-                        q_indexer_cp,
-                        rotary_pos_cos,
-                        rotary_pos_sin,
-                        indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
-                        indexer.qk_pos_emb_head_dim,
-                        cu_seqlens,
-                        global_start,
-                    )
+                # q_indexer_cp (projected + roped) feeds the contiguous top-k and the train-time
+                # fused sparse-attn + indexer-loss path (which consumes it regardless of
+                # indexer_loss_coeff); the balanced path re-projects per chunk. Skip this
+                # projection only when neither consumer runs: balanced path in eval/no-grad.
+                if use_balance and not training_with_grad:
+                    q_indexer_cp = None
                 else:
-                    rope_result = indexer.rotary_pos_emb(max_seqlen_q, packed_seq=True)
-                    rotary_pos_emb = (
-                        rope_result[0] if isinstance(rope_result, tuple) else rope_result
+                    q_indexer_cp, _ = indexer.linear_wq_b(indexer_qr)
+                    q_indexer_cp = q_indexer_cp.reshape(
+                        l_local, indexer.index_n_heads, indexer.index_head_dim
                     )
-                    q_indexer_cp = cp_utils.apply_thd_cp_local_rope_unfused(
-                        q_indexer_cp,
-                        rotary_pos_emb,
-                        indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
-                        indexer.qk_pos_emb_head_dim,
-                        cu_seqlens,
-                        global_start,
-                        self.config,
-                    )
-                q_indexer_cp = rotate_activation(q_indexer_cp)
+                    if self.config.apply_rope_fusion:
+                        rotary_pos_cos, rotary_pos_sin = indexer.rotary_pos_emb.get_cached_cos_sin(
+                            max_seqlen_q, dtype=q_indexer_cp.dtype, packed_seq=True, mscale=1.0
+                        )
+                        q_indexer_cp = cp_utils.apply_thd_cp_local_rope_fused(
+                            q_indexer_cp,
+                            rotary_pos_cos,
+                            rotary_pos_sin,
+                            indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
+                            indexer.qk_pos_emb_head_dim,
+                            cu_seqlens,
+                            global_start,
+                        )
+                    else:
+                        rope_result = indexer.rotary_pos_emb(max_seqlen_q, packed_seq=True)
+                        rotary_pos_emb = (
+                            rope_result[0] if isinstance(rope_result, tuple) else rope_result
+                        )
+                        q_indexer_cp = cp_utils.apply_thd_cp_local_rope_unfused(
+                            q_indexer_cp,
+                            rotary_pos_emb,
+                            indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
+                            indexer.qk_pos_emb_head_dim,
+                            cu_seqlens,
+                            global_start,
+                            self.config,
+                        )
+                    q_indexer_cp = rotate_activation(q_indexer_cp)
                 weights_indexer_cp, _ = indexer.linear_weights_proj(indexer_x)
                 weights_indexer_cp = weights_indexer_cp.squeeze(1) * (indexer.index_n_heads**-0.5)
                 nvtx_range_pop("dsv4_cp_indexer_q_weights")
+
+                bal_dispatch_handle = None
+                if use_balance:
+                    from megatron.core.transformer.experimental_attention_variant import (
+                        cp_balanced_indexer,
+                    )
+
+                    # The default path creates its per-microbatch host cache before
+                    # layer 1's dispatch. Dynamic-graph mode deliberately creates no
+                    # host cache: data prep attaches one fixed-shape tensor route to
+                    # PackedSeqParams, and every captured DSA layer consumes those
+                    # refreshed route inputs.
+                    if (
+                        not graph_dynamic_packs
+                        and getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None) is None
+                    ):
+                        packed_seq_params._dsa_cp_balance_layout_cache = {}
+                    # Issue the chunk dispatch now (async) so the transfer overlaps with the
+                    # in-flight compressed-K/KV all-gathers instead of sitting on the
+                    # critical path right before the top-k.
+                    bal_dispatch_handle = cp_balanced_indexer.dispatch_chunks_async(
+                        indexer_qr,
+                        weights_indexer_cp,
+                        cp_group,
+                        cp_size,
+                        l_local,
+                        layout_cache=(
+                            None
+                            if graph_dynamic_packs
+                            else getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None)
+                        ),
+                        cu_seqlens=cu_seqlens,
+                        cu_seqlens_compressed=cu_seqlens_compressed,
+                        graph_dynamic_packs=graph_dynamic_packs,
+                        graph_dynamic_plan=(
+                            cp_balanced_indexer.get_graph_dynamic_plan(packed_seq_params)
+                            if graph_dynamic_packs
+                            else None
+                        ),
+                    )
 
                 nvtx_range_push("dsv4_cp_indexer_k_all_gather_wait")
                 k_indexer_rank_major = k_indexer_gather.wait()
@@ -2730,21 +2814,73 @@ class CompressedSparseAttention(MegatronModule):
                     k_indexer_rank_major, 0, seq_to_rank_row.clamp_min(0)
                 )
                 # Each top-k entry is still a logical compressed id within that
-                # query's sequence here.
-                compressed_topk, indexer_layout = cp_utils.compute_cp_indexer_topk(
-                    q_indexer_cp,
-                    weights_indexer_cp,
-                    k_indexer_seq_major,
-                    cu_seqlens,
-                    cu_seqlens_compressed,
-                    global_start,
-                    ratio,
-                    indexer.index_topk,
-                    indexer.softmax_scale,
-                    max_seqlen_q=max_seqlen_q,
-                    use_fused=self.use_fused_kernels,
-                )
+                # query's sequence (on both the balanced and the reference path).
+                if use_balance:
+                    # Load-balanced CP indexer: process a head chunk + tail chunk per rank so each
+                    # rank does ~constant work, then combine the top-k back to contiguous order (a
+                    # drop-in for compute_cp_indexer_topk, same contiguous layout downstream).
+                    # cu_seqlens is constant across layers within a microbatch, so the chunk
+                    # layouts are cached on this microbatch's PackedSeqParams.
+                    bal_layout_cache = (
+                        None
+                        if graph_dynamic_packs
+                        else getattr(packed_seq_params, "_dsa_cp_balance_layout_cache", None)
+                    )
+                    if bal_layout_cache is None and not graph_dynamic_packs:
+                        bal_layout_cache = {}
+                        packed_seq_params._dsa_cp_balance_layout_cache = bal_layout_cache
+                    compressed_topk, indexer_layout = (
+                        cp_balanced_indexer.balanced_compute_cp_indexer_topk(
+                            indexer_qr,
+                            weights_indexer_cp,
+                            indexer,
+                            k_indexer_seq_major,
+                            cu_seqlens,
+                            cu_seqlens_compressed,
+                            self.config,
+                            cp_group,
+                            cp_size,
+                            l_local,
+                            global_start,
+                            ratio,
+                            indexer.index_topk,
+                            indexer.softmax_scale,
+                            max_seqlen_q,
+                            dispatch_handle=bal_dispatch_handle,
+                            layout_cache=bal_layout_cache,
+                            graph_dynamic_packs=graph_dynamic_packs,
+                        )
+                    )
+                else:
+                    # Inside a balanced run (flag on, this pack merely ineligible)
+                    # other fused calls have already been issued, so an above-limit
+                    # fused call here is the verified-corrupt pattern: take the
+                    # unfused path (ordinary layout, exact). With the flag off this
+                    # is the pre-existing path and keeps its behavior (the shared
+                    # guard warns once instead; see FUSED_INDEXER_MAX_SAFE_ROWS).
+                    ref_use_fused = self.use_fused_kernels
+                    if (
+                        self.config.dsa_cp_balance_indexer
+                        and cp_size > 1
+                        and l_local > cp_utils.FUSED_INDEXER_MAX_SAFE_ROWS
+                    ):
+                        ref_use_fused = False
+                    compressed_topk, indexer_layout = cp_utils.compute_cp_indexer_topk(
+                        q_indexer_cp,
+                        weights_indexer_cp,
+                        k_indexer_seq_major,
+                        cu_seqlens,
+                        cu_seqlens_compressed,
+                        global_start,
+                        ratio,
+                        indexer.index_topk,
+                        indexer.softmax_scale,
+                        max_seqlen_q=max_seqlen_q,
+                        use_fused=ref_use_fused,
+                    )
                 nvtx_range_pop("dsv4_cp_indexer_topk")
+
+                nvtx_range_pop("indexer_total")
 
                 nvtx_range_push("dsv4_cp_attention_kv_all_gather_wait")
                 compressed_kv_rank_major = compressed_kv_gather.wait()

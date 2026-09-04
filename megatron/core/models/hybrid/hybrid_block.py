@@ -177,8 +177,12 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         )
         return static_inputs
 
-    @staticmethod
-    def _decompose_packed_seq_params_to_kwargs(kwargs):
+    def _uses_graph_dynamic_dsa_route(self):
+        """Whether the wrapped layer's captured attention consumes route inputs."""
+        predicate = getattr(self.inner_layer, "_uses_graph_dynamic_dsa_route", None)
+        return bool(predicate is not None and predicate())
+
+    def _decompose_packed_seq_params_to_kwargs(self, kwargs):
         """Decompose PackedSeqParams into tensor kwargs for TE CUDA graphs."""
         packed_seq_params = kwargs.pop('packed_seq_params', None)
         if packed_seq_params is None:
@@ -187,12 +191,36 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         kwargs['cu_seqlens_kv'] = packed_seq_params.cu_seqlens_kv
         kwargs['cu_seqlens_q_padded'] = packed_seq_params.cu_seqlens_q_padded
         kwargs['cu_seqlens_kv_padded'] = packed_seq_params.cu_seqlens_kv_padded
+        from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+        if self._uses_graph_dynamic_dsa_route():
+            cp_group = self.inner_layer.pg_collection.cp
+            if cp_group is None or cp_group.size() != self.config.context_parallel_size:
+                raise RuntimeError(
+                    "graph-dynamic balanced CP route requires the wrapped layer's explicit CP "
+                    f"group to have size {self.config.context_parallel_size}"
+                )
+            cp_balanced_indexer.validate_graph_dynamic_plan_contract(
+                packed_seq_params,
+                self.config.context_parallel_size,
+                cp_group.rank(),
+                self.config.max_seqlen_per_dp_cp_rank,
+            )
+            cp_balanced_indexer.add_graph_dynamic_plan_to_kwargs(
+                packed_seq_params, kwargs, required=True
+            )
+            self._set_te_cuda_graph_route_replay_state(packed_seq_params)
 
     def _reconstruct_packed_seq_params_from_kwargs(self, kwargs):
         """Reconstruct THD PackedSeqParams from tensor kwargs in the graph capture path."""
         if 'cu_seqlens_q' not in kwargs:
             return
         max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+        graph_dynamic_plan = cp_balanced_indexer.pop_graph_dynamic_plan_from_kwargs(
+            kwargs, self.config.context_parallel_size, self.config.max_seqlen_per_dp_cp_rank
+        )
         packed_seq_params = PackedSeqParams(
             qkv_format='thd',
             cp_partition_mode=self.config.cp_partition_mode,
@@ -206,6 +234,12 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             # between replay batches. Use the conservative THD-safe branch.
             pad_between_seqs=True,
         )
+        if graph_dynamic_plan is not None:
+            cp_balanced_indexer.attach_graph_dynamic_plan(packed_seq_params, graph_dynamic_plan)
+        elif self._uses_graph_dynamic_dsa_route():
+            raise RuntimeError(
+                "TE CUDA graph input is missing graph-dynamic balanced CP route metadata."
+            )
         kwargs['packed_seq_params'] = packed_seq_params
 
     def __call__(self, *args, **kwargs):
@@ -1042,6 +1076,7 @@ class HybridStack(MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        packed_seq_params = self._stage_te_cuda_graph_route_metadata(packed_seq_params)
 
         if not self.pre_process:
             # See set_input_tensor()

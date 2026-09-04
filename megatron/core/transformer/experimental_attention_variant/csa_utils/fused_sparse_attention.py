@@ -22,6 +22,7 @@ Public API (same shape as the old ``dsa_kernels`` package):
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from typing import Optional, Tuple
 
@@ -29,6 +30,10 @@ import torch
 from torch import Tensor
 
 from megatron.core.tensor_parallel.mappings import async_reduce_scatter_along_first_dim
+from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
+    FUSED_INDEXER_MAX_SAFE_ROWS,
+    warn_fused_indexer_row_limit_once,
+)
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 from .csa_teacher_lse import can_use_fused_csa_teacher_lse, fused_csa_teacher_lse
@@ -834,6 +839,10 @@ def csa_sparse_attn(
 # ---------------------------------------------------------------------------
 
 
+# The balanced CP path fails closed above the shared limit before reaching this
+# compatibility warning; see cp_utils.compute_cp_indexer_topk.
+
+
 def _indexer_topk_core(
     q: Tensor,
     k: Tensor,
@@ -904,6 +913,12 @@ def _indexer_topk_core(
         )
         if q_causal_offsets is not None:
             forward_kwargs["q_causal_offsets"] = q_causal_offsets
+        total_q_rows = int(q.shape[0])
+        if total_q_rows > FUSED_INDEXER_MAX_SAFE_ROWS:
+            # Warn only after validation and backend resolution, immediately before
+            # an affected fused invocation. Invalid/no-op calls must not consume the
+            # process-wide warning or imply that the kernel actually ran.
+            warn_fused_indexer_row_limit_once(total_q_rows, logger=logging.getLogger(__name__))
         scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(1), w, ratio=ratio, **forward_kwargs)[
             "scores"
         ]  # (total_q, max_seqlen_kv) fp32, -inf on masked positions
@@ -930,6 +945,9 @@ def _indexer_topk_core(
 
         _ensure_dsa_namespace()
         # Kernel wants k as 4-D ``(b, sk, h_kv, idx_hd)``.
+        total_q_rows = int(q.shape[0] * q.shape[1])
+        if total_q_rows > FUSED_INDEXER_MAX_SAFE_ROWS:
+            warn_fused_indexer_row_limit_once(total_q_rows, logger=logging.getLogger(__name__))
         scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(2), w, ratio=ratio)[
             "scores"
         ]  # (b, sq, sk) fp32, -inf on masked positions
