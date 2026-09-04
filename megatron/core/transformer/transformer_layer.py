@@ -339,10 +339,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         is_mtp_layer: bool = False,
         add_layer_offset: bool = True,
         pp_layer_offset: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
     ):
         """
         Args:
+            hash_moe_layer_threshold (int, optional): Explicit layer-number threshold passed
+                to an MoE router when constructing a HybridStack layer.
             name (str | None): module instance name passed top-down from its paranet module
         """
         self.submodules_config = submodules
@@ -465,15 +468,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "Consider migrating the `mlp` submodule spec to a direct call of the "
                 "`as_mlp_submodule` classmethod instead.",
             )
+        mlp_kwargs: Dict[str, Any] = {
+            "config": self.config,
+            "pg_collection": pg_collection,
+            "is_mtp_layer": self.is_mtp_layer,
+            "layer_number": self.layer_number,
+            "name": (name + ".mlp") if name is not None else None,
+        }
+        if hash_moe_layer_threshold is not None:
+            mlp_kwargs["hash_moe_layer_threshold"] = hash_moe_layer_threshold
         try:
-            self.mlp = submodules.mlp(
-                config=self.config,
-                pg_collection=pg_collection,
-                is_mtp_layer=self.is_mtp_layer,
-                layer_number=self.layer_number,
-                name=(name + ".mlp") if name is not None else None,
-            )
+            self.mlp = submodules.mlp(**mlp_kwargs)
         except TypeError:
+            if hash_moe_layer_threshold is not None:
+                raise
             # Fallback for MLP builders that don't accept layer_number (dense MLP, TEFusedMLP).
             self.mlp = submodules.mlp(
                 config=self.config,
@@ -488,6 +496,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.mlp_bda = build_module(submodules.mlp_bda)
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
+
+        # Cache whether these optional layernorms are materialized. The split hybrid mHC
+        # recompute and fine-grained activation-offloading paths share these predicates.
+        self.mhc_checkpoint_input_layernorm = not isinstance(self.input_layernorm, IdentityOp)
+        self.mhc_checkpoint_pre_mlp_layernorm = not isinstance(self.pre_mlp_layernorm, IdentityOp)
 
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
@@ -657,6 +670,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -664,8 +678,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
-        if self.recompute_input_layernorm:
-            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+        checkpoint_input_layernorm = self.recompute_input_layernorm or (
+            mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
+        )
+        if checkpoint_input_layernorm:
+            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                ckpt_manager=mhc_recompute_manager
+            )
             with attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
                     apply_module(self.input_layernorm), hidden_states
@@ -709,7 +728,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         nvtx_range_pop(suffix="self_attention")
 
-        if self.recompute_input_layernorm:
+        if checkpoint_input_layernorm:
             self.input_layernorm_checkpoint.discard_output_and_register_recompute(
                 attention_output_with_bias[0]
             )
@@ -930,11 +949,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return output, context
 
-    def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
+    def _forward_pre_mlp_layernorm(
+        self, hidden_states: Tensor, mhc_recompute_manager: Optional['MHCCheckpointManager'] = None
+    ):
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
+<<<<<<< HEAD
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
                 retain_input_tensors=self._pre_mlp_layernorm_returns_residual
+=======
+        checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
+            mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
+        )
+        if checkpoint_pre_mlp_layernorm:
+            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                ckpt_manager=mhc_recompute_manager
+>>>>>>> origin/dev
             )
             with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
@@ -992,9 +1022,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         padding_mask: Tensor | None = None,
         input_ids: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
     ) -> tuple[tuple[Tensor, Tensor | None], Tensor]:
         """Run pre-MLP norm + MLP/MoE and return the raw output before BDA."""
-        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(
+            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+        )
 
         if isinstance(pre_mlp_layernorm_output, tuple):
             if len(pre_mlp_layernorm_output) != 2:
@@ -1900,14 +1933,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     def _set_offload_modules(self):
         """Set the offload modules for the transformer layer."""
         if self.config.fine_grained_activation_offloading:
-            self.offload_attn_norm = "attn_norm" in self.config.offload_modules and not isinstance(
-                self.input_layernorm, IdentityOp
+            self.offload_attn_norm = (
+                "attn_norm" in self.config.offload_modules and self.mhc_checkpoint_input_layernorm
             )
             self.offload_qkv_linear = "qkv_linear" in self.config.offload_modules
             self.offload_core_attn = "core_attn" in self.config.offload_modules
             self.offload_attn_proj = "attn_proj" in self.config.offload_modules
-            self.offload_mlp_norm = "mlp_norm" in self.config.offload_modules and not isinstance(
-                self.pre_mlp_layernorm, IdentityOp
+            self.offload_mlp_norm = (
+                "mlp_norm" in self.config.offload_modules and self.mhc_checkpoint_pre_mlp_layernorm
             )
             self.offload_expert_fc1 = "expert_fc1" in self.config.offload_modules
             self.offload_moe_act = "moe_act" in self.config.offload_modules
@@ -2041,11 +2074,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         self.mlp_hyper_connection = build_module(
             submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
         )
-
-        # When mHC recompute is active, skip checkpointing if the layernorm
-        # is IdentityOp (fused into TE linear) — there is nothing to recompute.
-        self.mhc_checkpoint_input_layernorm = not isinstance(self.input_layernorm, IdentityOp)
-        self.mhc_checkpoint_pre_mlp_layernorm = not isinstance(self.pre_mlp_layernorm, IdentityOp)
 
         self._validate_mhc_recompute_attn_cuda_graph_split()
 

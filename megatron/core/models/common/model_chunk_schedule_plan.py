@@ -169,8 +169,7 @@ class TransformerLayerSchedulePlan:
     MLP, MoE dispatch and combine, optional mHC recomputation, and MTP post-processing nodes.
 
     layer (TransformerLayerSchedulePlan)
-    ├── pre_dispatch_computation (TransformerLayerNode):
-    │     attention -> layernorm -> router -> dispatch preprocess
+    ├── attn (TransformerLayerNode): attention -> layernorm -> router -> dispatch preprocess
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All
@@ -183,15 +182,13 @@ class TransformerLayerSchedulePlan:
     └── mtp_post_process (PostProcessNode): mtp post process
 
     Note that MTP layer has the same operation and execution order with TransformerLayer regarding
-    moe_dispatch, mlp, moe_combine, but contains extra operations in
-    pre_dispatch_computation and mtp_post_process:
-    * mtp.pre_dispatch_computation wraps around transformer_layer.pre_dispatch_computation with
-      extra norm, proj and embedding operations.
+    moe_dispatch, mlp, moe_combine, but contains extra operations in attn and mtp_post_process:
+    * mtp.attn wraps around transformer_layer.attn with extra norm, proj and embedding operations.
     * mtp.mtp_post_process contains output_layer, mtp loss operations, whereas
       transformer_layer.mtp_post_process is empty.
     """
 
-    pre_dispatch_computation = None
+    attn = None
     moe_dispatch = None
     mlp = None
     moe_combine = None
@@ -215,10 +212,10 @@ class TransformerLayerSchedulePlan:
         The event and chunk_state are binded to the TransformerModelChunkSchedulePlan
         and shared across all layers in the model chunk.
         """
-        from megatron.core.models.common.utils import LayerState
+        from megatron.core.models.gpt.fine_grained_callables import TransformerLayerState
 
         self.config = layer.config
-        self.layer_state = LayerState()
+        self.layer_state = TransformerLayerState()
         self.chunk_state = chunk_state
         self.layer = layer
         self.event = event
@@ -283,17 +280,21 @@ class TransformerLayerSchedulePlan:
         Builds the callable nodes for the transformer/mtp layer:
             attn, mlp, moe_dispatch, moe_combine, and mtp_post_process.
         """
-        from megatron.core.models.common.fine_grained_callables import (
+        from megatron.core.models.gpt.fine_grained_callables import (
+            TransformerLayerNode,
             build_layer_callables,
-            get_layer_moe_metadata,
         )
-        from megatron.core.models.common.utils import TransformerLayerNode
+        from megatron.core.transformer.moe.moe_layer import MoELayer
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 
+        # build the forward and backward callables for the transformer/mtp layer
         fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
-        is_moe, num_local_experts = get_layer_moe_metadata(self.layer)
 
+        # get flags for latter use
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
+        transformer_layer = self.layer.mtp_model_layer if is_mtp else self.layer
+        is_moe = isinstance(transformer_layer.mlp, MoELayer)
+        num_local_experts = transformer_layer.mlp.num_local_experts if is_moe else None
 
         extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe
@@ -316,7 +317,7 @@ class TransformerLayerSchedulePlan:
             )
 
         (
-            pre_dispatch_module,
+            attn_module,
             moe_dispatch_module,
             mlp_module,
             moe_combine_module,
@@ -326,9 +327,7 @@ class TransformerLayerSchedulePlan:
 
         # Create nodes for different operations in the layer
         # Each node type has a predefined name that determines its memory strategy
-        self.pre_dispatch_computation = create_node(
-            comp_stream, pre_dispatch_module, "pre_dispatch_computation"
-        )
+        self.attn = create_node(comp_stream, attn_module, "attn")
         self.mlp = create_node(comp_stream, mlp_module, "mlp")
         if is_moe:
             self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
@@ -390,25 +389,21 @@ class TransformerLayerSchedulePlan:
             post_backward_hook: Callable(module) that releases backward-pass params
                 (bwd=True). Typically ``fsdp_wrapper.post_backward_release_module``.
         """
-        from megatron.core.models.hybrid.hybrid_block import HybridStack
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
-        assert isinstance(self.layer, (TransformerLayer, HybridStack, MultiTokenPredictionLayer)), (
+        assert isinstance(self.layer, (TransformerLayer, MultiTokenPredictionLayer)), (
             f"Megatron FSDP with EP Overlap only supports TransformerLayer, "
-            f"HybridStack and MultiTokenPredictionLayer, "
             f"but got {type(self.layer).__name__}."
         )
 
-        if isinstance(self.layer, (TransformerLayer, HybridStack)):
+        if isinstance(self.layer, TransformerLayer):
             hook_module = self.layer
         else:
             hook_module = self.layer.mtp_model_layer
 
-        # After the last backward op (pre_dispatch_computation), release backward-pass params.
-        self.pre_dispatch_computation.set_post_backward_hook(
-            lambda: post_backward_hook(hook_module)
-        )
+        # After the last backward op (attn), release backward-pass params.
+        self.attn.set_post_backward_hook(lambda: post_backward_hook(hook_module))
 
         # Determine the last node in forward order. mHC post-processing runs after
         # the combine, so releasing forward-pass params at the combine would pull
@@ -511,7 +506,7 @@ class TransformerLayerSchedulePlan:
         """Schedule one-forward-one-backward operations for a single transformer layer.
 
         This function interleaves forward and backward operations, overlapping the communications
-        (dispatch or combine) of one with the computations (pre_dispatch or mlp) of the other
+        (dispatch or combine) of one with the computations (att or mlp) of the other
         to maximize parallelism and efficiency.
 
         When f_layer and b_layer are not None, forward and backward pass are overlapped as follows:
@@ -552,7 +547,7 @@ class TransformerLayerSchedulePlan:
             if f_layer.recompute_segment is not None:
                 f_layer.recompute_segment.capture(f_layer, f_input)
             with f_layer.get_fp8_context():
-                f_input = f_layer.pre_dispatch_computation.forward(f_input)
+                f_input = f_layer.attn.forward(f_input)
 
         if b_layer is not None:
             b_grad = b_layer.mlp.backward(b_grad)
@@ -566,7 +561,7 @@ class TransformerLayerSchedulePlan:
             b_grad = b_layer.moe_dispatch.backward(b_grad)
 
         if b_layer is not None and b_layer.config.ep_overlap_early_attn_memory_release:
-            b_grad = b_layer.pre_dispatch_computation.backward(b_grad)
+            b_grad = b_layer.attn.backward(b_grad)
 
         if f_layer is not None:
             with f_layer.get_fp8_context():
@@ -581,7 +576,7 @@ class TransformerLayerSchedulePlan:
                 f_input = f_layer.mhc_post.forward(f_input)
 
         if b_layer is not None and not b_layer.config.ep_overlap_early_attn_memory_release:
-            b_grad = b_layer.pre_dispatch_computation.backward(b_grad)
+            b_grad = b_layer.attn.backward(b_grad)
 
         if f_layer is not None:
             with f_layer.get_fp8_context():
@@ -595,10 +590,10 @@ class TransformerLayerSchedulePlan:
                 if not f_input.requires_grad:
                     f_input.requires_grad_(True)
 
-        # Delay the last pre_dispatch_computation wgrad in backward pass (wgrad
-        # of the first layer) for overlapping with the p2p comm.
+        # Delay the last attn_dw in backward pass (attn_dw of the first layer)
+        # for overlapping with the p2p comm
         if b_layer is not None and not is_last_layer_in_bwd:
-            b_layer.pre_dispatch_computation.backward_dw()
+            b_layer.attn.backward_dw()
 
         if b_layer is not None and b_layer.recompute_segment is not None:
             # The replay has run and its gradient is past this layer; drop the input.
@@ -620,26 +615,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     │   ├── layer[1]: TransformerLayerSchedulePlan
     │   └── ...
     └── post_process: PostProcessNode
-
-    Subclasses can swap the per-layer schedule plan by overriding the
-    ``LAYER_SCHEDULE_PLAN_CLASS`` class attribute (e.g. HybridStack uses a
-    layer plan that understands grouped/inferred layer types). They can also
-    swap the pre/post-process node classes via ``PRE_PROCESS_NODE_CLASS`` /
-    ``POST_PROCESS_NODE_CLASS`` so each model owns its own embedding / output
-    layer node implementations.
     """
-
-    #: The TransformerLayerSchedulePlan-compatible class used to build per-layer
-    #: schedule plans. Subclasses override this to inject a layer-plan variant.
-    LAYER_SCHEDULE_PLAN_CLASS = None
-
-    #: Pre/post-process node classes. Defaults below pull in the GPT-side
-    #: ``PreProcessNode`` / ``PostProcessNode`` (which call ``GPTModel._preprocess`` /
-    #: ``GPTModel._postprocess``). Subclasses set these to model-specific node
-    #: classes so the node calls the right model's ``_preprocess`` /
-    #: ``_postprocess`` methods.
-    PRE_PROCESS_NODE_CLASS = None
-    POST_PROCESS_NODE_CLASS = None
 
     def __init__(
         self,
@@ -682,10 +658,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         Returns:
             The model chunk schedule plan.
         """
-        from megatron.core.models.common.utils import PostProcessNode, PreProcessNode
-
-        pre_process_cls = self.PRE_PROCESS_NODE_CLASS or PreProcessNode
-        post_process_cls = self.POST_PROCESS_NODE_CLASS or PostProcessNode
+        from megatron.core.models.gpt.fine_grained_callables import PostProcessNode, PreProcessNode
 
         self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
@@ -724,7 +697,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.attention_bias = None
 
         # build preprocess
-        self.pre_process = pre_process_cls(
+        self.pre_process = PreProcessNode(
             model, self._model_chunk_state, self._event, get_comp_stream
         )
 
@@ -742,7 +715,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # build post process
         if model.post_process:
-            self.post_process = post_process_cls(
+            self.post_process = PostProcessNode(
                 model, self._model_chunk_state, self._event, get_comp_stream
             )
 
@@ -998,22 +971,22 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         if f_schedule_plan is not None and post_forward is not None:
             # post_forward()/send_forward_recv_forward() is running in the communication stream,
-            # so the p2p comm could be overlapped with the pre_dispatch backward
+            # so the p2p comm could be overlapped with the attn backward
             with torch.cuda.stream(get_comm_stream()):
                 f_schedule_plan.wait_current_stream()
                 post_forward(f_input, f_schedule_plan.vp_stage)
 
         # post_backward()/send_backward_recv_backward() is running in the computation stream,
-        # so the p2p comm could be overlapped with the wgrad of pre_dispatch backward
+        # so the p2p comm could be overlapped with the wgrad of attn backward
         if b_schedule_plan is not None and post_backward is not None:
             b_schedule_plan.wait_current_stream()
             post_backward(b_grad, b_schedule_plan.vp_stage)
 
-        # Delay the last pre_dispatch_computation wgrad in backward pass (wgrad
-        # of the first layer) for overlapping with the p2p comm.
+        # Delay the last attn_dw in backward pass (attn_dw of the first layer)
+        # for overlapping with the p2p comm
         if b_num_layers > 0:
             assert b_layer is not None
-            b_layer.pre_dispatch_computation.backward_dw()
+            b_layer.attn.backward_dw()
             b_layer.release_state()
 
         # post process forward

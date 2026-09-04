@@ -87,12 +87,6 @@ products:
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
 
-  - test_case: [hybrid_mr_mcore_te_tp1_pp2_dsv4_hybrid_mhc_mtp]
-    products:
-      - environment: [dev]
-        scope: [mr, mr-github, mr-github-slim]
-        platforms: [dgx_h100]
-
   - test_case: [hybrid_mr_mcore_te_tp2_pp1_cp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -109,9 +103,16 @@ products:
       # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
 
+<<<<<<< HEAD
   - test_case: [hybrid_mr_mcore_te_tp1_pp1_ep8_cp2_kda_gated_mla_1N8G]
     products:
       # Enable after the official H100 functional run produces golden values.
       - environment: [dev]
         scope: [mr, mr-github, mr-github-slim]
+=======
+  - test_case: [hybrid_nemotron_v3_pico_7b_a1b_tp1_ep8_QAD_dgx_h100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+>>>>>>> origin/dev
         platforms: [dgx_h100]

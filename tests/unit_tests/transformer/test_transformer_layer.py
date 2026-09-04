@@ -105,9 +105,80 @@ class TestParallelTransformerLayer:
         parallel_transformer_layer = self.parallel_transformer_layer
         assert isinstance(parallel_transformer_layer, TransformerLayer)
         assert parallel_transformer_layer.layer_number == 1
+        # The TE dense spec fuses both norms into their following linears, leaving
+        # IdentityOp placeholders that must not be checkpointed independently.
+        assert not parallel_transformer_layer.mhc_checkpoint_input_layernorm
+        assert not parallel_transformer_layer.mhc_checkpoint_pre_mlp_layernorm
 
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])
         assert num_weights == 1884
+
+    def test_split_branch_norms_join_mhc_recompute_manager(self, monkeypatch):
+        """Explicit norms in split hybrid branches use the unified mHC manager."""
+        from contextlib import nullcontext
+
+        import megatron.core.transformer.transformer_layer as transformer_layer_module
+
+        def build_layernorm(config, hidden_size, eps):
+            del config
+            return torch.nn.LayerNorm(hidden_size, eps=eps)
+
+        submodules = transformer_layer_module.TransformerLayerSubmodules(
+            input_layernorm=build_layernorm, pre_mlp_layernorm=build_layernorm
+        )
+        layer = TransformerLayer(self.parallel_transformer_layer.config, submodules)
+        assert layer.mhc_checkpoint_input_layernorm
+        assert layer.mhc_checkpoint_pre_mlp_layernorm
+        assert not layer.recompute_input_layernorm
+        assert not layer.recompute_pre_mlp_layernorm
+        layer.off_interface = lambda _enabled, hidden_states, _name: nullcontext(hidden_states)
+
+        class IdentityBranch(torch.nn.Module):
+            def forward(self, hidden_states, **_kwargs):
+                return hidden_states, None
+
+        layer.self_attention = IdentityBranch()
+        layer.mlp = IdentityBranch()
+        layer.is_moe_layer = False
+
+        seen_managers = []
+        discarded_outputs = []
+
+        class RecordingCheckpoint:
+            def __init__(self, fp8=False, ckpt_manager=None):
+                del fp8
+                seen_managers.append(ckpt_manager)
+
+            def checkpoint(self, function, *args):
+                return function(*args)
+
+            def discard_output_and_register_recompute(self, hook_tensor):
+                discarded_outputs.append(hook_tensor)
+
+        monkeypatch.setattr(
+            transformer_layer_module.tensor_parallel, "CheckpointWithoutOutput", RecordingCheckpoint
+        )
+        monkeypatch.setattr(transformer_layer_module, "nvtx_range_push", lambda **_kwargs: None)
+        monkeypatch.setattr(transformer_layer_module, "nvtx_range_pop", lambda **_kwargs: None)
+
+        hidden_states = torch.randn(4, 2, layer.config.hidden_size)
+
+        layer._forward_self_attention_output_with_bias(hidden_states)
+        layer._forward_mlp_output_with_bias(hidden_states)
+        assert seen_managers == []
+
+        manager = MHCCheckpointManager()
+        attention_output, _, _ = layer._forward_self_attention_output_with_bias(
+            hidden_states, mhc_recompute_manager=manager
+        )
+        mlp_output, _ = layer._forward_mlp_output_with_bias(
+            hidden_states, mhc_recompute_manager=manager
+        )
+
+        assert seen_managers == [manager, manager]
+        assert len(discarded_outputs) == 1
+        assert discarded_outputs[0] is attention_output[0]
+        assert mlp_output[0].shape == hidden_states.shape
 
     def test_gpu_forward(self):
         parallel_transformer_layer = self.parallel_transformer_layer

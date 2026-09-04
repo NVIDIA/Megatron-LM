@@ -45,13 +45,16 @@ def collect_train_test_metrics(
         if golden_value_key
         in [
             "iteration-time",
-            "grad-norm",
             "mem-allocated-bytes",
             "mem-max-allocated-bytes",
             "lm loss",
             "num-zeros",
             "mtp_1 loss",
+<<<<<<< HEAD
             "z_loss",
+=======
+            "total loss",
+>>>>>>> origin/dev
         ]
     }
 

@@ -2769,6 +2769,7 @@ class TextGenerationController:
 
         # Clone the transient D2H view before the next step can reuse its buffer.
         range_push("active_request_mask")
+<<<<<<< HEAD
         sampled_tokens_cpu = sample_result.sampled_tokens_cpu_view.clone()
         accepted_tokens_cpu = (
             sample_result.accepted_tokens_cpu_view.clone()
@@ -2777,6 +2778,12 @@ class TextGenerationController:
         )
         active_request_ids, finished_request_ids, active_request_mask = (
             self._build_async_sched_request_state(sampled_tokens_cpu, resolved_sequence_lengths)
+=======
+        sampled_tokens_cpu = sampled_tokens_cpu_view.clone()
+        context.commit_sampled_tokens(sampled_tokens_cpu)
+        active_request_ids, finished_request_ids, active_request_mask, survivor_idxs = (
+            self._build_async_sched_request_state(sampled_tokens_cpu)
+>>>>>>> origin/dev
         )
         range_pop()
 

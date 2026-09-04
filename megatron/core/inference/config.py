@@ -80,6 +80,7 @@ class MambaInferenceStateConfig:
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
+<<<<<<< HEAD
         recurrent_symbols = (Symbols.MAMBA, Symbols.GDN)
         if layer_type_list is not None and any(
             symbol in layer_type_list for symbol in recurrent_symbols
@@ -98,6 +99,9 @@ class MambaInferenceStateConfig:
                 and model.config.experimental_attention_variant == "gdn2"
             ):
                 raise NotImplementedError("GDN2 does not support dynamic inference.")
+=======
+        if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
+>>>>>>> origin/dev
             mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
             )

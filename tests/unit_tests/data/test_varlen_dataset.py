@@ -20,7 +20,11 @@ import torch
 # Import via the public module path so this test gets discovered through the
 # regular pytest entry point. The functions under test are pure Python and do
 # not require torch.distributed.
-from megatron.training.datasets.sft_dataset import IGNORE_INDEX
+from megatron.training.datasets.sft_dataset import (
+    IGNORE_INDEX,
+    MockSFTDataset,
+    MockSFTLowLevelDataset,
+)
 from megatron.training.datasets.varlen_dataset import (
     MockVarlenDataset,
     VarlenDataset,
@@ -436,9 +440,10 @@ class _FakeTokenizer:
     with ``IGNORE_INDEX`` in the targets.
     """
 
-    def __init__(self, eod: int = 0, pad=None):
+    def __init__(self, eod: int = 0, pad=None, vocab_size: int | None = 128):
         self._eod = eod
         self._pad = pad
+        self._vocab_size = vocab_size
 
     @property
     def eod(self):
@@ -447,6 +452,10 @@ class _FakeTokenizer:
     @property
     def pad(self):
         return self._pad
+
+    @property
+    def vocab_size(self):
+        return self._vocab_size
 
     def tokenize(self, text):
         return [ord(c) % 100 + 1 for c in text]  # always >= 1, never eod (0)
@@ -490,6 +499,101 @@ def _make_mock_varlen(token_arrays, config):
     ds.dataset = token_arrays  # each item exposes .tolist()
     ds.indices = np.arange(len(token_arrays))
     return ds
+
+
+@pytest.mark.parametrize(
+    ("dataset_cls", "mock_config_attr"),
+    [
+        (MockSFTDataset, "sft_mock_dataset_config_json"),
+        (MockVarlenDataset, "varlen_mock_dataset_config_json"),
+    ],
+)
+def test_generated_mock_tokens_stay_within_tokenizer_vocab(
+    monkeypatch, dataset_cls, mock_config_attr
+):
+    """Long generated mock sequences must wrap before exceeding the tokenizer vocabulary."""
+    monkeypatch.setattr(MockSFTLowLevelDataset, "size", 1)
+    tokenizer = _FakeTokenizer(eod=0, pad=None, vocab_size=8)
+    config = _make_config(tokenizer, seq_length=20)
+    setattr(
+        config,
+        mock_config_attr,
+        json.dumps(
+            {
+                "mode": "distribution",
+                "type": "lognormal",
+                "min_seq_len": 20,
+                "max_seq_len": 20,
+                "mean_seq_len": 20,
+                "lognormal_sigma": 1.1,
+            }
+        ),
+    )
+
+    low_level_dataset = dataset_cls.build_low_level_dataset("", config)
+    tokens = low_level_dataset[0]
+
+    assert tokens.size == 19
+    assert tokens.min() >= 1
+    assert tokens.max() < tokenizer.vocab_size
+    assert tokens[:9].tolist() == [1, 2, 3, 4, 5, 6, 7, 1, 2]
+
+
+@pytest.mark.parametrize(
+    ("dataset_cls", "mock_config_attr"),
+    [
+        (MockSFTDataset, "sft_mock_dataset_config_json"),
+        (MockVarlenDataset, "varlen_mock_dataset_config_json"),
+    ],
+)
+@pytest.mark.parametrize("tokenizer_vocab_size", [None, 32])
+def test_mock_config_vocab_size_takes_precedence(
+    monkeypatch, dataset_cls, mock_config_attr, tokenizer_vocab_size
+):
+    """An explicit JSON vocabulary works without, and overrides, the tokenizer value."""
+    monkeypatch.setattr(MockSFTLowLevelDataset, "size", 1)
+    tokenizer = _FakeTokenizer(eod=0, pad=None, vocab_size=tokenizer_vocab_size)
+    config = _make_config(tokenizer, seq_length=20)
+    setattr(
+        config,
+        mock_config_attr,
+        json.dumps(
+            {
+                "mode": "distribution",
+                "type": "lognormal",
+                "min_seq_len": 20,
+                "max_seq_len": 20,
+                "mean_seq_len": 20,
+                "lognormal_sigma": 1.1,
+                "vocab_size": 8,
+            }
+        ),
+    )
+
+    tokens = dataset_cls.build_low_level_dataset("", config)[0]
+
+    assert tokens.min() >= 1
+    assert tokens.max() < 8
+    assert tokens[:9].tolist() == [1, 2, 3, 4, 5, 6, 7, 1, 2]
+
+
+def test_generated_mock_data_requires_available_vocab_size():
+    """Missing tokenizer and JSON vocabulary values produce an actionable error."""
+    tokenizer = _FakeTokenizer(eod=0, pad=None, vocab_size=None)
+    config = _make_config(tokenizer, seq_length=20)
+    config.sft_mock_dataset_config_json = json.dumps(
+        {
+            "mode": "distribution",
+            "type": "lognormal",
+            "min_seq_len": 20,
+            "max_seq_len": 20,
+            "mean_seq_len": 20,
+            "lognormal_sigma": 1.1,
+        }
+    )
+
+    with pytest.raises(ValueError, match="set vocab_size in the mock dataset config JSON"):
+        MockSFTDataset.build_low_level_dataset("", config)
 
 
 def test_getitem_thd_pretrain_text_keys_and_shapes():

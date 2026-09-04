@@ -48,11 +48,14 @@ if [[ -n "$TE_GIT_REF" ]]; then
     ADDITIONAL_PARAMS+=("--build-arg TE_COMMIT=${TE_GIT_REF}")
 fi
 
+<<<<<<< HEAD
 if [[ "$FILE" == "Dockerfile.linting" ]]; then
     ADDITIONAL_PARAMS+=("--build-arg CI_SERVER_URL=${CI_SERVER_URL}")
     ADDITIONAL_PARAMS+=("--secret id=CERNO_TOKEN,env=PAT")
 fi
 
+=======
+>>>>>>> origin/dev
 echo $(git rev-parse HEAD)
 
 JET_API_VERSION=$(curl -s -u "$ARTIFACTORY_USER:$ARTIFACTORY_TOKEN" "https://sc-hw-artf.nvidia.com/artifactory/api/pypi/hw-joc-pypi/simple/jet-api/" | grep -o 'href="../../jet-api/[0-9.]*/' | sed 's|href="../../jet-api/||;s|/||' | sort -V -r | head -n1)

@@ -12,6 +12,11 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+from transformer_engine.pytorch.optimizers import (  # pyright: ignore[reportMissingImports]
+    multi_tensor_applier,
+    multi_tensor_l2norm,
+)
+
 try:  # pragma: no cover - import availability is PyTorch-version dependent.
     from torch.distributed.tensor import DTensor, Partial, Replicate
 except ImportError:  # pragma: no cover
@@ -23,7 +28,6 @@ def sharded_grad_sq_sum(
     *,
     accum_dtype: str | torch.dtype = torch.float32,
     default_device: torch.device | None = None,
-    chunk_size_numel: int = 0,
     scalar_all_reduce: (
         Callable[[torch.Tensor, dist.ProcessGroup, dist.ReduceOp], None] | None
     ) = None,
@@ -40,7 +44,7 @@ def sharded_grad_sq_sum(
     groups = _group_grads(params)
     total: torch.Tensor | None = None
     for group in groups.values():
-        local_sq = _group_local_sq_sum(group, dtype=dtype, chunk_size_numel=chunk_size_numel)
+        local_sq = _group_local_sq_sum(group, dtype=dtype)
         meta = group[0][2]
         if meta is not None and not _has_partial_placement(meta) and dist.is_initialized():
             _reduce_dtensor_scalar_(
@@ -184,34 +188,48 @@ def _group_grads(
     return groups
 
 
-def _group_local_sq_sum(
-    group: list[tuple[nn.Parameter, torch.Tensor, Any | None]],
-    *,
-    dtype: torch.dtype,
-    chunk_size_numel: int = 0,
+def fused_sq_sum(
+    tensors: Iterable[torch.Tensor], *, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
-    device = _local_grad(group[0][1], group[0][2]).device
+    """Sum of squares accumulated in ``dtype``, without a full-size cast of any input."""
+
     total = torch.zeros((), device=device, dtype=dtype)
-    for _param, grad, meta in group:
-        local_grad = _local_grad(grad, meta)
-        total += _tensor_sq_sum(local_grad.detach(), dtype=dtype, chunk_size_numel=chunk_size_numel)
+    # multi_tensor_applier dispatches on the list's scalar type, so bucket by dtype.
+    buckets: dict[tuple[torch.dtype, torch.device], list[torch.Tensor]] = defaultdict(list)
+    for tensor in tensors:
+        if tensor.numel() == 0:
+            continue
+        if _is_fused_eligible(tensor):
+            buckets[(tensor.dtype, tensor.device)].append(tensor)
+        else:
+            total += torch.linalg.vector_norm(tensor, 2.0, dtype=dtype).pow_(2).to(device)
+    for (_bucket_dtype, bucket_device), bucket in buckets.items():
+        noop_flag = torch.zeros(1, dtype=torch.int, device=bucket_device)
+        norm, _ = multi_tensor_applier(multi_tensor_l2norm, noop_flag, [bucket], False)
+        total += norm.reshape(()).to(device=device, dtype=dtype).pow(2)
     return total
 
 
-def _tensor_sq_sum(
-    tensor: torch.Tensor, *, dtype: torch.dtype, chunk_size_numel: int = 0
+def _is_fused_eligible(tensor: torch.Tensor) -> bool:
+    # The kernel needs contiguous CUDA input, and a contiguous() copy here would cost
+    # the allocation we are avoiding. Tests patch this to reach the bucket path on CPU.
+    return tensor.is_cuda and tensor.is_contiguous()
+
+
+def _group_local_sq_sum(
+    group: list[tuple[nn.Parameter, torch.Tensor, Any | None]], *, dtype: torch.dtype
 ) -> torch.Tensor:
-    if chunk_size_numel <= 0 or tensor.numel() <= chunk_size_numel:
-        return tensor.to(dtype).pow(2).sum()
-    try:
-        flat = tensor.view(-1)
-    except RuntimeError:
-        flat = tensor.reshape(-1)
-    total = torch.zeros((), device=tensor.device, dtype=dtype)
-    for start in range(0, flat.numel(), chunk_size_numel):
-        chunk = flat.narrow(0, start, min(chunk_size_numel, flat.numel() - start))
-        total += chunk.to(dtype).pow(2).sum()
-    return total
+    meta = group[0][2]
+    device = _local_grad(group[0][1], meta).device
+    if meta is not None and _has_partial_placement(meta):
+        # _local_grad() materializes the global-shaped grad here; keep one alive at a time.
+        total = torch.zeros((), device=device, dtype=dtype)
+        for _param, grad, grad_meta in group:
+            local = _local_grad(grad, grad_meta).detach()
+            total += fused_sq_sum([local], dtype=dtype, device=device)
+        return total
+    locals_ = [_local_grad(grad, grad_meta).detach() for _param, grad, grad_meta in group]
+    return fused_sq_sum(locals_, dtype=dtype, device=device)
 
 
 def _group_local_abs_max(
@@ -222,7 +240,9 @@ def _group_local_abs_max(
     for _param, grad, meta in group:
         local_grad = _local_grad(grad, meta)
         if local_grad.numel() > 0:
-            total = torch.maximum(total, local_grad.detach().to(dtype).abs().max())
+            # vector_norm(inf) is abs().max() without the intermediate tensors.
+            local_max = torch.linalg.vector_norm(local_grad.detach(), float("inf"), dtype=dtype)
+            total = torch.maximum(total, local_max.to(device))
     return total
 
 
@@ -320,6 +340,7 @@ def _process_group_backend(group: dist.ProcessGroup) -> str:
 __all__ = [
     "all_reduce_scalar_",
     "clip_grads_with_sharded_norm_",
+    "fused_sq_sum",
     "resolve_torch_dtype",
     "sharded_grad_abs_max",
     "sharded_grad_norm",

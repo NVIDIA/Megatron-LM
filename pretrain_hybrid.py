@@ -89,7 +89,10 @@ try:
     from megatron.post_training.utils import maybe_enable_modelopt
 
     has_nvidia_modelopt = True
-except ImportError:
+except ImportError as error:
+    missing_module = error.name or ""
+    if missing_module != "modelopt" and not missing_module.startswith("modelopt."):
+        raise
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()

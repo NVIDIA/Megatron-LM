@@ -13,12 +13,15 @@ from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import PARAM_READY_CALLBACK_ATTR, log_single_rank
+<<<<<<< HEAD
 
 try:
     from nemo.lens.helpers import trace_fn as _otel_trace_fn
 except ImportError:
     from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
 
+=======
+>>>>>>> origin/dev
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers, partition_buckets
@@ -27,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 class _BucketParamReadyCallback:
+<<<<<<< HEAD
     """Publishes one bucket group's parameters on demand.
 
     DDP's side of ``megatron.core.utils.ensure_params_ready``: one instance is stored on every
@@ -38,6 +42,9 @@ class _BucketParamReadyCallback:
     group weakly; the callback outlives this DDP on re-wrap. No-ops under CUDA-graph capture, so
     a consumer that captures its reads must replay this itself.
     """
+=======
+    """Publish one bucket group's parameters before a direct parameter read."""
+>>>>>>> origin/dev
 
     def __init__(self, ddp: 'DistributedDataParallel', bucket_group) -> None:
         self._ddp = weakref.ref(ddp)
@@ -48,12 +55,17 @@ class _BucketParamReadyCallback:
         if bucket_group is None:
             return
 
+<<<<<<< HEAD
         # HOT PATH: already published. True for every microbatch after the first one of an
         # iteration, so it precedes the DDP deref and the graph-capture query.
+=======
+        # This is the hot path for every microbatch after the first one in an iteration.
+>>>>>>> origin/dev
         if bucket_group.param_gather_dispatched and bucket_group.param_gather_handle is None:
             return
 
         ddp = self._ddp()
+<<<<<<< HEAD
         if ddp is None:
             # Weakref is dead: the DDP object was garbage-collected while this callback lived on
             # (it is stored on the parameters, which outlive the wrapper). Its buffers are gone.
@@ -73,13 +85,25 @@ class _BucketParamReadyCallback:
             # waited on. finish_param_sync() does two things: wait for THIS bucket, then start
             # the NEXT bucket's gather. The wait is mandatory; starting the next bucket is a
             # scheduling decision, so only let it happen while DDP still owns the schedule.
+=======
+        if ddp is None or is_graph_capturing():
+            return
+
+        # With forward pre-hooks removed, the caller owns the gather schedule. An in-flight
+        # gather still has to finish, but this callback must not dispatch another bucket.
+        ddp_owns_schedule = bool(ddp.remove_forward_pre_hook_handles)
+        if bucket_group.param_gather_handle is not None:
+>>>>>>> origin/dev
             if ddp_owns_schedule:
                 ddp._finish_param_sync_for_bucket_group(bucket_group)
             else:
                 bucket_group.finish_param_sync(skip_next_bucket_dispatch=True)
         elif ddp_owns_schedule:
+<<<<<<< HEAD
             # No handle and not published (the hot path returned above) => never dispatched, so
             # publishing STARTS a gather. Only safe while DDP owns the schedule.
+=======
+>>>>>>> origin/dev
             assert not bucket_group.param_gather_dispatched
             ddp._finish_param_sync_for_bucket_group(bucket_group)
 
@@ -407,9 +431,12 @@ class DistributedDataParallel(_BaseDataParallel):
         # Create map from param to bucket group, used in pre_hook.
         for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
             for bucket_group in bucket_groups:
+<<<<<<< HEAD
                 # One readiness callback per bucket group, stamped on all its params, so a
                 # consumer reading param.data outside the owning module's pre-hook can publish it
                 # first. Backend-agnostic: DDP never learns which consumers use it.
+=======
+>>>>>>> origin/dev
                 ready_callback = (
                     _BucketParamReadyCallback(self, bucket_group)
                     if self.ddp_config.overlap_param_gather
@@ -421,9 +448,13 @@ class DistributedDataParallel(_BaseDataParallel):
                         if ready_callback is not None:
                             setattr(param, PARAM_READY_CALLBACK_ATTR, ready_callback)
                         elif hasattr(param, PARAM_READY_CALLBACK_ATTR):
+<<<<<<< HEAD
                             # Re-wrapping a model chunk: a previous DDP may have left a marker
                             # pointing at ITS bucket group. This DDP owns the parameter now and
                             # publishes nothing, so the stale callback must go.
+=======
+                            # A re-wrapped model must not retain the previous DDP's callback.
+>>>>>>> origin/dev
                             delattr(param, PARAM_READY_CALLBACK_ATTR)
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
@@ -548,11 +579,15 @@ class DistributedDataParallel(_BaseDataParallel):
         return hook
 
     def _finish_param_sync_for_bucket_group(self, bucket_group):
+<<<<<<< HEAD
         """Drain one bucket group's param all-gather and run its post-all-gather processing."""
         # If aligning param all-gather across pipeline stages, all-gather is dispatched
         # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
         # If overlapping param all-gather with optimizer step, then all-gather has
         # already been dispatched in optimizer step.
+=======
+        """Drain one bucket group's param all-gather and run its post-processing."""
+>>>>>>> origin/dev
         skip_next_bucket_dispatch = (
             self.ddp_config.align_param_gather or self.overlap_param_gather_with_optimizer_step
         )

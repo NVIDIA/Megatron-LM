@@ -17,9 +17,11 @@ from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
     get_deprecated_cuda_graph_modules_migration,
+    is_whole_moe_cuda_graph_scope,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
     validate_deprecated_cuda_graph_modules_migration_inputs,
+    validate_moe_cuda_graph_support,
 )
 from megatron.core.transformer.enums import (
     AttnBackend,
@@ -393,6 +395,18 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
+
+    dsa_indexer_weights_proj_use_quantization: bool = True
+    """Whether ``DSAIndexer`` weights projection follows the enclosing FP8/FP4
+    quantization context. Disable this to keep the projection parameter outside FP8/FP4;
+    ``dsa_indexer_weights_proj_output_dtype`` then controls its BF16 or FP32 output contract.
+    This option does not affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
+
+    dsa_indexer_weights_proj_output_dtype: Literal["bf16", "fp32"] = "bf16"
+    """Output dtype of the ``DSAIndexer`` weights projection. BF16 preserves the existing
+    path. FP32 uses a true FP32-output projection and is not compatible with the cuDNN DSA
+    backend. The final index scores remain FP32 independently of this option. This option does
+    not affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
 
     ####################
     # DeepSeek-v4 hybrid attention
@@ -825,9 +839,8 @@ class TransformerConfig(ModelParallelConfig):
     for each individual sample.
     - "global_aux_loss": Load balancing loss calculated at global batch level.
     - "sinkhorn": Balancing algorithm used in S-BASE.
-    - "quantile_balancing": Dual coordinate-descent quantile balancing (QB). Load balance is
-    handled entirely by an internal per-expert bias update; auxiliary losses must be disabled
-    (`moe_aux_loss_coeff` = 0) when QB is selected.
+    - "quantile_balancing": Kimi K3 histogram Quantile Balancing. The histogram is accumulated
+    across the global batch and converted into the next-step per-expert routing bias.
     - "none": No load balancing.
     A list of strings can be provided to combine multiple aux-loss load balancing types.
     The default is "aux_loss".
@@ -903,11 +916,15 @@ class TransformerConfig(ModelParallelConfig):
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
 
-    moe_router_quantile_balancing_ema: float = 0.0
-    """EMA coefficient for the quantile-balancing per-expert bias (`qb_beta`), used only when
-    `moe_router_load_balancing_type` is "quantile_balancing". At each global batch the bias is
-    updated as `qb_beta = ema * qb_beta + (1 - ema) * local_quantile`. The default 0.0 means
-    no memory: the bias is replaced by the latest global-batch quantile estimate each step."""
+    moe_router_quantile_balancing_estimation_scope: Literal['global_batch'] = "global_batch"
+    """Population used to estimate the Quantile Balancing bias.
+
+    The ``dev`` implementation provides Kimi K3's ``global_batch`` histogram estimator. The
+    identically named option on ``main`` also accepts ``micro_batch`` for its older exact estimator.
+    """
+
+    moe_router_qb_num_bins: int = 1000
+    """Number of persistent uniform histogram bins per expert for global-batch QB."""
 
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
@@ -921,9 +938,10 @@ class TransformerConfig(ModelParallelConfig):
     This is an experimental feature for benchmarking purposes."""
 
     moe_n_hash_layers: int = 0
-    """Number of leading transformer layers that use hash-based MoE routing.
-    Layers with layer_number <= moe_n_hash_layers use a pre-computed tid2eid
-    lookup table for expert selection instead of learned top-k routing."""
+    """Number of leading layers that use hash-based MoE routing. Standard transformer
+    stacks compare this value with layer_number; hybrid stacks count only MoE positions
+    in the hybrid layer pattern. Hash layers use a pre-computed tid2eid lookup table for
+    expert selection instead of learned top-k routing."""
 
     actual_vocab_size: Optional[int] = None
     """Padded actual vocabulary size. Required when moe_n_hash_layers > 0 for the
@@ -964,7 +982,7 @@ class TransformerConfig(ModelParallelConfig):
     moe_single_grouped_weight: bool = False
     """When using TE GroupedLinear for MoE experts, store expert weights as a single grouped
     parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True`` and
-    ``use_transformer_engine_op_fuser=True``.
+    ``moe_use_grouped_tensor=True``.
     """
 
     moe_single_grouped_bias: bool = False
@@ -1059,6 +1077,7 @@ class TransformerConfig(ModelParallelConfig):
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
+<<<<<<< HEAD
     gtp_remat_opt_in_modules: list[str] = field(default_factory=list)
     """Extra modules to apply GTP_remat weight sharding to, beyond the default set (attention,
     Mamba, MLP, expert linears, embeddings). Allowed values:
@@ -1067,6 +1086,10 @@ class TransformerConfig(ModelParallelConfig):
         projections, ``parallel_mode="duplicated"``). Only beneficial when ``moe_latent_size``
         is large enough for the all-gather to amortize.
     """
+=======
+    moe_latent_up_projection_rmsnorm: bool = False
+    """Apply RMSNorm immediately before the duplicated MoE latent up-projection."""
+>>>>>>> origin/dev
 
     moe_flex_dispatcher_num_sms: Optional[int] = None
     """Number of SMs for the flex token dispatcher's dispatch/combine communication, for all
@@ -1766,6 +1789,12 @@ class TransformerConfig(ModelParallelConfig):
                 self.experimental_attention_variant
             )
 
+        if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
+            self.moe_use_grouped_tensor = True
+
+        if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
+            raise ValueError("moe_use_grouped_tensor=True requires moe_grouped_gemm=True.")
+
         if self.cp_partition_mode not in ("zigzag", "contiguous"):
             raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
 
@@ -1852,6 +1881,30 @@ class TransformerConfig(ModelParallelConfig):
                     f"release; use dsa_kernel_backend={legacy_backend!r} instead.",
                 )
                 self.dsa_kernel_backend = legacy_backend
+
+        if self.dsa_indexer_weights_proj_output_dtype not in ("bf16", "fp32"):
+            raise ValueError(
+                "dsa_indexer_weights_proj_output_dtype must be either 'bf16' or 'fp32', got "
+                f"{self.dsa_indexer_weights_proj_output_dtype!r}."
+            )
+        if (
+            self.dsa_indexer_weights_proj_use_quantization
+            and self.dsa_indexer_weights_proj_output_dtype == "fp32"
+        ):
+            raise ValueError(
+                "dsa_indexer_weights_proj_output_dtype='fp32' requires "
+                "dsa_indexer_weights_proj_use_quantization=False because quantized "
+                "TELinear does not guarantee a true-FP32 output for this projection."
+            )
+        if (
+            self.dsa_indexer_weights_proj_output_dtype == "fp32"
+            and self.dsa_kernel_backend == "cudnn"
+        ):
+            raise ValueError(
+                "dsa_indexer_weights_proj_output_dtype='fp32' is not supported by "
+                "dsa_kernel_backend='cudnn', which requires a BF16 indexer weights tensor. "
+                "Use dsa_kernel_backend='tilelang' or 'none'."
+            )
 
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if not self.is_hybrid_model:
@@ -1950,7 +2003,6 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
-            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
             if self.context_parallel_size > 1:
                 cp_comm_types = (
                     self.cp_comm_type
@@ -2211,6 +2263,9 @@ class TransformerConfig(ModelParallelConfig):
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
 
+        if self.moe_latent_up_projection_rmsnorm and self.moe_latent_size is None:
+            raise ValueError("moe_latent_up_projection_rmsnorm requires moe_latent_size to be set.")
+
         if self.num_moe_experts is not None and self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size
             warnings.warn("moe_ffn_hidden_size is not set, using ffn_hidden_size instead.")
@@ -2256,19 +2311,21 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_single_grouped_weight is currently supported with high-precision "
                     "primary weights, fp8_recipe='mxfp8', or fp4_recipe='nvfp4'."
                 )
-            if not self.use_transformer_engine_op_fuser:
-                raise ValueError(
-                    "moe_single_grouped_weight requires "
-                    "use_transformer_engine_op_fuser=True. The non-op-fuser TE GroupedLinear "
-                    "path splits the grouped parameter into per-expert tensors and does not "
-                    "support single-grouped-weight training."
-                )
             if self.fp4 and not self.fp4_param:
                 raise ValueError(
                     "moe_single_grouped_weight with FP4 compute requires fp4_param=True "
                     "(--fp4-param-gather). Without FP4 parameter gather, Transformer Engine "
                     "uses a split-quantize fallback that is being deprecated."
                 )
+<<<<<<< HEAD
+            if self.fp4 and not self.fp4_param:
+                raise ValueError(
+                    "moe_single_grouped_weight with FP4 compute requires fp4_param=True "
+                    "(--fp4-param-gather). Without FP4 parameter gather, Transformer Engine "
+                    "uses a split-quantize fallback that is being deprecated."
+                )
+=======
+>>>>>>> origin/dev
             if not self.moe_use_grouped_tensor:
                 raise ValueError("moe_single_grouped_weight requires moe_use_grouped_tensor=True.")
         if self.moe_single_grouped_bias and not self.add_bias_linear:
@@ -2308,6 +2365,7 @@ class TransformerConfig(ModelParallelConfig):
                     "not yet supported with the NCCL-EP dispatcher. Use the TE op-fuser path "
                     "or select the alltoall, DeepEP, or HybridEP dispatcher."
                 )
+<<<<<<< HEAD
 
         if self.moe_dispatch_fwd_dtype != 'bf16' or self.moe_combine_bwd_dtype != 'bf16':
             if (
@@ -2324,6 +2382,8 @@ class TransformerConfig(ModelParallelConfig):
                     "use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
                     "grouped GEMM path consumes the pre-quantized MXFP8 GroupedTensor payload."
                 )
+=======
+>>>>>>> origin/dev
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
         # moe_flex_dispatcher_num_sms. If either is set, route it (an explicit
@@ -2361,6 +2421,16 @@ class TransformerConfig(ModelParallelConfig):
                     f"moe_shared_expert_overlap only works with alltoall or flex token dispatcher."
                 )
 
+        if self.moe_router_load_balancing_type == ["quantile_balancing"]:
+            assert (
+                isinstance(self.moe_aux_loss_coeff, list) and len(self.moe_aux_loss_coeff) == 1
+            ), (
+                "moe_aux_loss_coeff must be a list of the same length as "
+                "moe_router_load_balancing_type"
+            )
+            self.moe_router_load_balancing_type = "quantile_balancing"
+            self.moe_aux_loss_coeff = self.moe_aux_loss_coeff[0]
+
         if isinstance(self.moe_router_load_balancing_type, list):
             assert isinstance(self.moe_aux_loss_coeff, list) and len(
                 self.moe_aux_loss_coeff
@@ -2368,6 +2438,54 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_aux_loss_coeff must be a list of the same length as "
                 "moe_router_load_balancing_type"
             )
+
+        if (
+            isinstance(self.moe_router_load_balancing_type, list)
+            and "quantile_balancing" in self.moe_router_load_balancing_type
+        ):
+            raise ValueError("quantile_balancing must be the sole moe_router_load_balancing_type.")
+        if self.moe_router_load_balancing_type == "quantile_balancing":
+            aux_coeffs = (
+                self.moe_aux_loss_coeff
+                if isinstance(self.moe_aux_loss_coeff, list)
+                else [self.moe_aux_loss_coeff]
+            )
+            if any(float(coeff) != 0.0 for coeff in aux_coeffs):
+                raise ValueError(
+                    "quantile_balancing requires moe_aux_loss_coeff=0 because it replaces "
+                    "the auxiliary load-balancing loss."
+                )
+            if self.moe_router_quantile_balancing_estimation_scope != "global_batch":
+                raise ValueError(
+                    "Megatron-LM dev supports only "
+                    "moe_router_quantile_balancing_estimation_scope='global_batch'."
+                )
+            if self.moe_router_score_function != "sigmoid":
+                raise ValueError("quantile_balancing requires moe_router_score_function='sigmoid'.")
+            if self.moe_router_pre_softmax:
+                raise ValueError("quantile_balancing does not use pre-softmax routing.")
+            if self.moe_router_enable_expert_bias:
+                raise ValueError(
+                    "quantile_balancing selects the expert-bias update rule; do not also enable "
+                    "the DeepSeek-style moe_router_enable_expert_bias."
+                )
+            if self.moe_router_num_groups is not None or self.moe_router_group_topk is not None:
+                raise ValueError("quantile_balancing does not support group-limited routing.")
+            if self.moe_enable_routing_replay:
+                raise ValueError("quantile_balancing does not support routing replay.")
+            if self.moe_expert_capacity_factor is not None and self.moe_expert_capacity_factor >= 0:
+                raise ValueError("quantile_balancing does not support per-expert token dropping.")
+            if self.moe_expert_rank_capacity_factor is not None and not self.moe_paged_stash:
+                raise ValueError(
+                    "quantile_balancing with expert-rank capacity requires moe_paged_stash "
+                    "so an over-budget attempt can be retried without token dropping."
+                )
+            if self.num_moe_experts is None or not 0 < self.moe_router_topk < self.num_moe_experts:
+                raise ValueError(
+                    "quantile_balancing requires 0 < moe_router_topk < num_moe_experts."
+                )
+            if self.moe_router_qb_num_bins <= 1:
+                raise ValueError("moe_router_qb_num_bins must be greater than one.")
 
         if self.moe_expert_capacity_factor is not None:
             if self.moe_expert_capacity_factor < 0:
@@ -2389,7 +2507,10 @@ class TransformerConfig(ModelParallelConfig):
                 "seq_aux_loss",
                 "global_aux_loss",
                 "none",
-            ]:
+            ] and not (
+                self.moe_router_load_balancing_type == "quantile_balancing"
+                and self.moe_expert_capacity_factor is None
+            ):
                 raise ValueError(
                     "moe_expert_capacity_factor only works with aux_loss, "
                     "seq_aux_loss, global_aux_loss or none load balancing"
@@ -3594,9 +3715,8 @@ class TransformerConfig(ModelParallelConfig):
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
                     ):
-                        assert (
-                            CudaGraphModule.moe not in self.cuda_graph_modules
-                        ), 'moe cuda graph is only supported with drop-padding MoE.'
+                        if CudaGraphModule.moe in self.cuda_graph_modules:
+                            validate_moe_cuda_graph_support(self)
                         if self.moe_token_dispatcher_type == 'alltoall' and (
                             self.moe_expert_capacity_factor is not None
                             or self.moe_router_padding_for_fp8
@@ -3605,6 +3725,27 @@ class TransformerConfig(ModelParallelConfig):
                                 'moe_preprocess cuda graph is not supported when there are '
                                 'DtoH copies and synchronizations in the preprocess step.'
                             )
+
+            te_whole_moe_paged_stash = (
+                self.cuda_graph_impl == "transformer_engine"
+                and is_whole_moe_cuda_graph_scope(self.cuda_graph_modules)
+                and self.moe_paged_stash
+            )
+            if te_whole_moe_paged_stash:
+                if not is_te_min_version("2.19.0"):
+                    raise ValueError(
+                        "Transformer Engine whole-MoE CUDA graphs with paged stash require "
+                        f"Transformer Engine >= 2.19.0, but found {get_te_version()}."
+                    )
+                assert not self.cuda_graph_dynamic_microbatches, (
+                    "Transformer Engine whole-MoE CUDA graphs with paged stash require a fixed "
+                    "runtime microbatch schedule; cuda_graph_dynamic_microbatches is not "
+                    "supported."
+                )
+                assert self.cuda_graph_warmup_steps >= 2, (
+                    "Transformer Engine whole-MoE CUDA graphs with paged stash require at least "
+                    "2 cuda_graph_warmup_steps to record the pipeline schedule before capture."
+                )
 
             if self.recompute_granularity:
                 if self.recompute_granularity != "selective":
@@ -4174,6 +4315,10 @@ class MLATransformerConfig(TransformerConfig):
     """Rank of Key and Value tensors' low rank representation.
        This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
 
+    attention_latent_norm_epsilon: float | None = None
+    """Epsilon for the primary query and key-value latent norms in attention.
+       If unset, inherit ``layernorm_epsilon`` for backward compatibility."""
+
     qk_head_dim: int = 128
     """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim
        This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
@@ -4232,13 +4377,8 @@ class MLATransformerConfig(TransformerConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        if (
-            self.multi_latent_attention
-            and self.apply_rope_fusion
-            and self.rope_type != "yarn"
-            and self.experimental_attention_variant != "dsv4_hybrid"
-        ):
-            raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
+        if self.attention_latent_norm_epsilon is None:
+            self.attention_latent_norm_epsilon = self.layernorm_epsilon
 
         if self.attention_output_gate and self.mla_down_proj_fusion:
             # Fused MLA hides the post-input-LayerNorm activation inside the fused

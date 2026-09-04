@@ -64,9 +64,13 @@ except ImportError:
     HAVE_TRITON = False
 
 if HAVE_TE:
-    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
+    from megatron.core.extensions.transformer_engine import (
+        TELinear,
+        TERMSNormDuplicatedLinear,
+        te_checkpoint,
+    )
 else:
-    TELinear, te_checkpoint = None, None
+    TELinear, TERMSNormDuplicatedLinear, te_checkpoint = None, None, None
 
 
 class ExpertsInterface(Protocol):
@@ -149,7 +153,14 @@ class RouterBuilder(Protocol):
     """Protocol for building a Router."""
 
     def __call__(
-        self, /, *, config: TransformerConfig, pg_collection: ProcessGroupCollection | None
+        self,
+        /,
+        *,
+        config: TransformerConfig,
+        pg_collection: ProcessGroupCollection | None,
+        is_mtp_layer: bool = False,
+        layer_number: int | None = None,
+        hash_moe_layer_threshold: int | None = None,
     ) -> RouterInterface: ...
 
 
@@ -230,10 +241,13 @@ class MoELayer(BaseMoELayer):
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
+        hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
     ):
         """
         Args:
+            hash_moe_layer_threshold (int, optional): Explicit layer-number threshold for
+                selecting hash-routed MoE layers.
             name (str | None): module instance name passed top-down from its paranet module
         """
         self.submodules = not_none(submodules)
@@ -262,23 +276,32 @@ class MoELayer(BaseMoELayer):
         self.tp_ep_group = pg_collection.tp_ep
 
         # Initialize router.
-        self.router = self.submodules.router(
-            config=self.config,
-            pg_collection=pg_collection,
-            is_mtp_layer=is_mtp_layer,
-            layer_number=layer_number,
-        )
+        router_kwargs = {
+            "config": self.config,
+            "pg_collection": pg_collection,
+            "is_mtp_layer": is_mtp_layer,
+            "layer_number": layer_number,
+        }
+        if hash_moe_layer_threshold is not None:
+            router_kwargs["hash_moe_layer_threshold"] = hash_moe_layer_threshold
+        self.router = self.submodules.router(**router_kwargs)
         self.tp_group = pg_collection.tp
 
         # Initialize latent projections.
         if self.config.moe_latent_size:
             assert HAVE_TE, "TransformerEngine is required for MoE latent projections."
             if self.config.transformer_impl == "inference_optimized":
+                if self.config.moe_latent_up_projection_rmsnorm:
+                    raise NotImplementedError(
+                        "The inference-optimized latent projection does not support "
+                        "RMSNorm followed by Linear."
+                    )
                 from megatron.core.tensor_parallel.inference_layers import InferenceLinear
 
                 linear_cls = InferenceLinear
             else:
                 linear_cls = TELinear
+<<<<<<< HEAD
             gtp_remat_group = (
                 resolve_gtp_remat_group(pg_collection, is_expert=False)
                 if "moe_latent_proj" in self.config.gtp_remat_opt_in_modules
@@ -290,6 +313,11 @@ class MoELayer(BaseMoELayer):
                     "gtp_remat_group": gtp_remat_group,
                     "gtp_replica_group": pg_collection.dp_cp,
                 }
+=======
+            # TODO: When LatentMoE gains GTP plumbing on dev, resolve the non-expert GTP
+            # rematerialization group when `moe_latent_proj` is opted in, and pass that group
+            # plus `pg_collection.dp_cp` as the replica group to both latent projections.
+>>>>>>> origin/dev
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,
                 self.config.moe_latent_size,
@@ -303,7 +331,19 @@ class MoELayer(BaseMoELayer):
                 name=(name + ".fc1_latent_proj") if name is not None else None,
                 **linear_gtp_kwargs,
             )
-            self.fc2_latent_proj = linear_cls(
+            fc2_linear_cls = (
+                TERMSNormDuplicatedLinear
+                if self.config.moe_latent_up_projection_rmsnorm
+                else linear_cls
+            )
+            fc2_extra_kwargs = (
+                {"tp_group": pg_collection.tp}
+                if fc2_linear_cls is TERMSNormDuplicatedLinear
+                else {}
+            )
+            # TODO: When those GTP kwargs are added, carry them into this wrapper together with
+            # its owning TP group; TE tensor-parallel execution remains local with `tp_size=1`.
+            self.fc2_latent_proj = fc2_linear_cls(
                 self.config.moe_latent_size,
                 self.config.hidden_size,
                 parallel_mode="duplicated",
@@ -314,7 +354,11 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
+<<<<<<< HEAD
                 **linear_gtp_kwargs,
+=======
+                **fc2_extra_kwargs,
+>>>>>>> origin/dev
             )
             if linear_cls is TELinear:
                 # The duplicated operation has no TP execution group. TELinear uses

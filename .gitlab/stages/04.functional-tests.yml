@@ -87,7 +87,6 @@ functional:configure:
         "--record-checkpoints ${RECORD_CHECKPOINTS}"
         "--slurm-account ${CI_SLURM_ACCOUNT}"
         "--no-enable-warmup"
-        "--enable-error-extraction"
       )
     - |
       SMOKE_ARGS=(
@@ -102,7 +101,6 @@ functional:configure:
         "--record-checkpoints false"
         "--slurm-account ${CI_SLURM_ACCOUNT}"
         "--no-enable-warmup"
-        "--enable-error-extraction"
       )
     - |
       export PYTHONPATH=$(pwd)
@@ -462,7 +460,7 @@ functional:x_notify:
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
     - export CONTEXT=$FUNCTIONAL_TEST_SCOPE
-    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" || "$CI_COMMIT_BRANCH" == "dev" ]] && echo "1" || "0")
+    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || "0")
     - export TEAM_SLUG=$SLACK_ADMIN
     - export PYTHONPATH=$(pwd)
     - |
@@ -485,7 +483,7 @@ functional:x_notify:
       - inference_metrics.json
       - agent_formatter_debug.txt
   rules:
-    - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "dev") && $FUNCTIONAL_TEST == "yes"
+    - if: ($CI_PIPELINE_SOURCE == "schedule" || $CI_COMMIT_BRANCH == "main") && $FUNCTIONAL_TEST == "yes"
       when: always
     - when: never
 

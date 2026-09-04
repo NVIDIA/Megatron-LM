@@ -39,6 +39,7 @@ from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
 )
@@ -751,15 +752,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # CUDA graph token budget for prefill/mixed graphs. Decode graphs are always
-        # capped at max_requests * (num_speculative_tokens + 1) inside the helper. By
-        # default the prefill/mixed range is bounded by `cuda_graph_max_tokens`, clamped
-        # to never fall below that decode bound nor exceed `max_tokens`; setting
-        # `cuda_graph_all_prefills` widens the range to the full `max_tokens`.
-        decode_bound = self.max_requests * (self.num_speculative_tokens + 1)
+        # capped at max_requests * (num_speculative_tokens + 1) inside the helper; this
+        # only widens the prefill/mixed range when `cuda_graph_all_prefills` is set.
         cuda_graph_max_tokens = (
             self.max_tokens
             if inference_config.cuda_graph_all_prefills
-            else min(max(inference_config.cuda_graph_max_tokens, decode_bound), self.max_tokens)
+            else self.max_requests * (self.num_speculative_tokens + 1)
         )
 
         # CUDA graph config list.
@@ -780,6 +778,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
+<<<<<<< HEAD
         if get_pg_size(self.expert_model_parallel_group) > 1:
             if self._nccl_ep_dispatcher:
                 NCCLAllGatherDispatcher.allocate_buffers()
@@ -793,6 +792,26 @@ class DynamicInferenceContext(BaseInferenceContext):
                     hidden_size=moe_hidden_size,
                     ep_group=self.expert_model_parallel_group,
                 )
+=======
+        #
+        # The shared _valid_tokens_tensor scalar is read as a pointer by both fused
+        # MoE backends (mcore_fused_moe and vllm_fused_moe) regardless of EP size, so
+        # allocate it unconditionally (covers EP=1, where no dispatcher comm buffers
+        # exist). The EP>1 dispatchers below reallocate it as part of their own buffer
+        # setup, which is harmless.
+        InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
+        if self._nccl_ep_dispatcher:
+            NCCLAllGatherDispatcher.allocate_buffers()
+        elif self._nvls_dispatcher:
+            # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
+            moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
+            NVLSAllGatherVDispatcher.allocate_buffers(
+                per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens) // tp_size,
+                topk=model_config.moe_router_topk,
+                hidden_size=moe_hidden_size,
+                ep_group=self.expert_model_parallel_group,
+            )
+>>>>>>> origin/dev
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -1133,9 +1152,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         _tok_int32_bytes = self.max_tokens * 4
         # Request-level fields are all 4 bytes wide (5 int32 + 2 float32 = 7 fields).
         _req_4byte_bytes = self.max_requests * 4
-        # Scalar: real (unpadded) token count for the current step. Refreshed
-        # in transfer_bookkeeping_to_gpu(); read on GPU via
-        # `gpu_view.real_token_count` (MoE routing masks padding tokens).
+        # Scalar real-token count shared with ContextGPUView. MoE inference uses
+        # this fixed-address value to exclude CUDA-graph padding tokens.
         _real_token_count_bytes = 4
         # MHA section: 5 fields (int32) shared between GraphedMHAMetadata and
         # NonGraphedMHAMetadata. max_bs == max_requests.
@@ -1302,9 +1320,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         ].view(torch.int32)
         _off += _req_4byte_bytes
 
-        # Scalar staging slot for the real (unpadded) token count. Refreshed
-        # from `self.batch_dimensions.token_count` in transfer_bookkeeping_to_gpu()
-        # and read on GPU via `gpu_view.real_token_count`.
         self._staging_real_token_count = self._cpu_bookkeeping_buf[
             _off : _off + _real_token_count_bytes
         ].view(torch.int32)
@@ -2281,7 +2296,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         Returns:
             Optional[torch.cuda.Event]: Event marking bookkeeping H2D
-                completion, or `None` when no event was requested or no
+                completion, or ``None`` when no event was requested or no
                 transfer was performed.
         """
         # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
@@ -2530,9 +2545,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # No-op when the queue is already empty (regular non-warmup steps).
         self._execute_pending_mamba_ops()
 
-        # Record whether this step produces real output — false on CUDA-graph
-        # capture (warmup) or dummy EP steps. Used by transfer_bookkeeping_to_gpu
-        # to publish real_token_count=0 so MoE routing masks all padding tokens.
+        # CUDA-graph capture and dummy EP steps do not produce real output, so
+        # publish a zero real-token count and mask every padded routing row.
         self._bookkeeping_no_real_work = (
             construct_graph_dimensions is not None or is_expert_parallel_dummy_cuda_graph_step
         )
@@ -2571,27 +2585,21 @@ class DynamicInferenceContext(BaseInferenceContext):
     ) -> Optional[torch.cuda.Event]:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
-        Legacy steps call this from initialize_attention_state(). Async
-        scheduling instead delays publication until after preparation and the
-        GPU sample-to-input copy. Legacy transfers block because the pinned CPU
-        source is re-staged in place. Async scheduling requests an event-tracked
-        non-blocking copy and synchronizes that event before reusing the source.
-
-        The bookkeeping fields are backed by one contiguous pinned CPU buffer
-        and one contiguous GPU buffer; a single memcpy covers the whole
-        transfer. Request-level staging slots are refreshed from the persistent
-        CPU tensors immediately before the H2D (GPU reads them at `[:n_active]`
-        while CPU bookkeeping keeps them at `[paused_count:total_count)`).
+        Legacy steps call this from ``initialize_attention_state``. Async
+        scheduling delays publication until after preparation and the GPU
+        sample-to-input copy. Legacy transfers block because the pinned CPU
+        source is re-staged in place; async callers request an event-tracked
+        non-blocking copy and synchronize that event before reusing the source.
 
         Args:
             skip_token_input_ids (bool): If true, leave
-                `gpu_view.token_to_input_ids` unchanged while copying the rest
+                ``gpu_view.token_to_input_ids`` unchanged while copying the rest
                 of the bookkeeping buffer.
             record_done_event (bool): Whether to record and return an event after
                 an asynchronous bookkeeping transfer.
 
         Returns:
-            Optional[torch.cuda.Event]: Event marking H2D completion, or `None`
+            Optional[torch.cuda.Event]: Event marking H2D completion, or ``None``
                 when no event was requested.
         """
         n_active = self.total_request_count - self.paused_request_count
@@ -2626,29 +2634,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._staging_request_query_lengths[n_active:padded_active] = 0
             self._staging_request_kv_length_offsets[n_active:padded_active] = 0
 
-        # Real (unpadded) token count for this step. CUDA-graph replay pads
-        # the token dim to a captured size; MoE routing reads this on GPU and
-        # rewrites padding rows' routing entries to -1 so they don't go to
-        # any expert. Set to 0 on CUDA-graph capture / dummy EP steps so
-        # every row gets masked out.
-        self._staging_real_token_count[0] = (
+        self._staging_real_token_count.fill_(
             0 if self._bookkeeping_no_real_work else self.batch_dimensions.token_count
         )
 
-        # Coalesced H2D: one copy for the entire bookkeeping buffer.
-        # Copying the whole (max_tokens + max_requests)-sized buffer including
-        # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
-        # redundant launch overheads vs. per-field copies. Async scheduling
-        # decode steps skip token_to_input_ids here because sampled tokens are
-        # already GPU-resident and copied directly into the GPU input buffer.
-        if skip_token_input_ids:
-            token_to_input_ids_offset = (
-                self.token_to_input_ids.numel() * self.token_to_input_ids.element_size()
-            )
-        else:
-            token_to_input_ids_offset = 0
-        # Only event-tracked callers may leave the copy in flight; legacy callers
-        # block before the pinned CPU source can be re-staged.
+        # Coalesced H2D: one copy for the entire bookkeeping buffer. Async
+        # decode steps preserve the GPU-resident sampled token IDs. Only
+        # event-tracked callers may leave the copy in flight.
+        token_to_input_ids_offset = (
+            self.token_to_input_ids.numel() * self.token_to_input_ids.element_size()
+            if skip_token_input_ids
+            else 0
+        )
         self.gpu_view._buf[token_to_input_ids_offset:].copy_(
             self._cpu_bookkeeping_buf[token_to_input_ids_offset:], non_blocking=record_done_event
         )
@@ -2666,7 +2663,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         if record_done_event:
             done_event = self._bookkeeping_h2d_done_event
             done_event.record(torch.cuda.current_stream())
-
         return done_event
 
     def copy_async_sched_sample_to_forward(
@@ -3137,14 +3133,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_matched_blocks = len(matched_block_ids)
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 
-        # Track prefix cache hits. num_cached_tokens accumulates across prefill
-        # chunks: each chunk matches a disjoint block range (start advances with
-        # finished_chunk_token_count), so a long cached prefix is discovered
-        # incrementally and must be summed, not overwritten.
+        # Track prefix cache hits.
         if num_matched_blocks > 0:
             self.prefix_cache_hits += 1
             self.prefix_cache_blocks_matched += num_matched_blocks
-            req.num_cached_tokens += num_matched_blocks * self.block_size_tokens
 
         # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:prefill_chunk_length]
@@ -3321,22 +3313,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 self._pending_mamba_zeros.append(mamba_idx)
 
-        # compute_and_store_offsets sets CPU state + GPU staging buffers that
-        # commit_intermediate_states() consumes after the forward pass. Run it for
-        # EVERY prefill chunk (not just the first): the last complete block of a
-        # multi-chunk prompt falls in a continuation chunk, and caching its Mamba
-        # state is precisely what lets a later turn skip prefill on a hybrid model.
-        # Mamba slot allocation / state restore above stays first-chunk-only.
-        if self.is_hybrid_model and self.mamba_slot_allocator is not None:
-            self.mamba_slot_allocator.compute_and_store_offsets(
-                req,
-                current_id,
-                prefix_skip_tokens,
-                prefill_chunk_length,
-                num_matched_blocks,
-                matched_block_ids,
-                overall_required_blocks,
-            )
+            # compute_and_store_offsets sets both CPU state (hash_to_block_id,
+            # _eos_cache_block_id_gpu) and GPU staging buffers.  Runs immediately
+            # because commit_intermediate_states() reads the CPU state after the
+            # forward pass.
+            if self.mamba_slot_allocator is not None:
+                self.mamba_slot_allocator.compute_and_store_offsets(
+                    req,
+                    current_id,
+                    prefix_skip_tokens,
+                    prefill_chunk_length,
+                    num_matched_blocks,
+                    matched_block_ids,
+                    overall_required_blocks,
+                )
 
         self.active_token_count += effective_prefill_chunk_length
         self.lifetime_prefill_token_count += effective_prefill_chunk_length

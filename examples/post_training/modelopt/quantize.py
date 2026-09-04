@@ -21,7 +21,6 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.abspath(os.path.join(_SCRIPT_DIR, "../../../")))
 
 import modelopt.torch.quantization as mtq
-from modelopt.recipe import ModelOptPTQRecipe, load_recipe
 from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.quantization.config import _default_disabled_quantizer_cfg
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
@@ -266,32 +265,32 @@ def check_arguments():
                 )
 
 
+def _add_quant_cfg_entry(quant_cfg, quantizer_name, config):
+    if isinstance(quant_cfg, dict):
+        quant_cfg[quantizer_name] = {**config.get("cfg", {}), "enable": config["enable"]}
+    else:
+        quant_cfg.append({"quantizer_name": quantizer_name, **config})
+
+
+def _megatron_prefill_for_calibration(model, input_ids):
+    prefill_kwargs = {}
+    if "skip_return_logits" in inspect.signature(megatron_prefill).parameters:
+        prefill_kwargs["skip_return_logits"] = True
+    return megatron_prefill(model, input_ids, **prefill_kwargs)
+
+
 def get_modelopt_torch_quantization_config():
     """Return a quantization config."""
     args = get_args()
-
-    if args.recipe is not None:
-        # YAML recipe is authoritative: skip predefined-config customizations and KV
-        # cache override; the recipe encodes quant_cfg + algorithm + KV cache directly.
-        print_rank_0(f"Use recipe {args.recipe} for quantization")
-        recipe = load_recipe(args.recipe)
-        if not isinstance(recipe, ModelOptPTQRecipe):
-            raise TypeError(
-                f"Expected PTQ recipe, but got {type(recipe).__name__} from {args.recipe}"
-            )
-        if args.export_kv_cache_quant != "none":
-            print_rank_0(
-                f"Ignoring --export-kv-cache-quant={args.export_kv_cache_quant} since you passed in a YAML recipe."
-            )
-        return recipe.quantize.model_dump()
 
     if args.export_quant_cfg not in QUANT_CFG_CHOICES:
         raise ValueError(f"Unsupported quantization config {args.export_quant_cfg}.")
     mtq_config = QUANT_CFG_CHOICES[args.export_quant_cfg]
 
     if isinstance(mtq_config["quant_cfg"], dict):
-        # Normalize old dict format to new list format
-        mtq_config["quant_cfg"] = mtq.normalize_quant_cfg_list(mtq_config["quant_cfg"])
+        normalize_quant_cfg_list = getattr(mtq, "normalize_quant_cfg_list", None)
+        if normalize_quant_cfg_list is not None:
+            mtq_config["quant_cfg"] = normalize_quant_cfg_list(mtq_config["quant_cfg"])
 
     fp8_config = {"enable": True, "cfg": {"num_bits": (4, 3), "axis": None}}
     fp4_config = {
@@ -304,10 +303,10 @@ def get_modelopt_torch_quantization_config():
     }
     if args.export_quant_cfg == "FP8_DEFAULT_CFG":
         # Enable Medusa heads and kv-cache quantization
-        mtq_config["quant_cfg"].append({"quantizer_name": "*medusa_heads**", **fp8_config})
+        _add_quant_cfg_entry(mtq_config["quant_cfg"], "*medusa_heads**", fp8_config)
     if "FP4" in args.export_quant_cfg:
         # Enable Medusa heads and kv-cache quantization
-        mtq_config["quant_cfg"].append({"quantizer_name": "*medusa_heads**", **fp4_config})
+        _add_quant_cfg_entry(mtq_config["quant_cfg"], "*medusa_heads**", fp4_config)
     if "AWQ" in args.export_quant_cfg:
         try:
             weight_quantizer = mtq.find_quant_cfg_entry_by_path(
@@ -318,7 +317,7 @@ def get_modelopt_torch_quantization_config():
             weight_quantizer = None
     # Customization
     if args.disable_qkv_quant:
-        mtq_config["quant_cfg"].append({"quantizer_name": "*self_attention*", "enable": False})
+        _add_quant_cfg_entry(mtq_config["quant_cfg"], "*self_attention*", {"enable": False})
 
     # KV Cache Quantization
     enable_quant_kv_cache = args.export_kv_cache_quant != "none"
@@ -330,7 +329,7 @@ def get_modelopt_torch_quantization_config():
 
     # Weight Only Quantization
     if args.weight_only:
-        mtq_config["quant_cfg"].append({"quantizer_name": "*input_quantizer", "enable": False})
+        _add_quant_cfg_entry(mtq_config["quant_cfg"], "*input_quantizer", {"enable": False})
     return mtq_config
 
 
@@ -593,7 +592,7 @@ if __name__ == "__main__":
                 sample = get_batch_on_this_cp_rank(
                     sample, is_hybrid_cp=False, cp_group=get_context_parallel_group()
                 )
-                megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
+                _megatron_prefill_for_calibration(model, sample["input_ids"])
 
     unwrapped_model = unwrap_model(model)[0]
 

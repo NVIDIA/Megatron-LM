@@ -13,8 +13,14 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
+<<<<<<< HEAD
 from megatron.core.pipeline_parallel.utils import ScheduleNode, StageDispatchBwdGrad
 from megatron.core.transformer.module import GraphableMegatronModule
+=======
+from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
+from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
+>>>>>>> origin/dev
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
@@ -587,11 +593,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
     Returns:
         A tuple containing:
-        - forward_funcs: List of 5 callables, one per slot in the schedule plan
-          (pre_dispatch_computation, moe_dispatch, mlp, moe_combine,
-          mtp_post_process=None).
-        - backward_dw: Dict mapping slot name to the delayed-wgrad callable
-          (keys: "pre_dispatch_computation", "mlp").
+        - forward_funcs: List of callable functions for the layer
+        - backward_dw: Dict of weight gradient functions for the layer
     """
     is_moe = isinstance(layer.mlp, MoELayer)
     enable_deepep = (
@@ -609,9 +612,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
     is_hyper_connection_layer = isinstance(layer, HyperConnectionTransformerLayer)
     is_mhc_layer = is_moe and is_hyper_connection_layer
 
-    def submodule_pre_dispatch_forward(node: ScheduleNode, hidden_states: torch.Tensor):
+    def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
-        Performs the same attention forward logic as GPTModel and the forward pass for
+        Performs same attnention forward logic as GPT Model and forward pass for
         computations between attention and dispatch:
             pre mlp layernorm->router->dispatch preprocess
         """
@@ -777,7 +780,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         token_dispatcher = layer.mlp.token_dispatcher
         if enable_deepep or enable_hybridep or enable_ncclep:
             # update token_probs to be the detached version, prevents
-            # backward graph from connecting to pre_dispatch_computation submodule
+            # backward graph from connecting to attn submodule
             token_dispatcher._comm_manager.token_probs = probs
 
         dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
@@ -936,7 +939,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         raise NotImplementedError("This callable is not implemented for Dense layer.")
 
     # Build forward and backward callable functions
-    pre_dispatch_func = submodule_pre_dispatch_forward
+    attn_func = submodule_attn_forward
     dispatch_func = submodule_dispatch_forward if is_moe else raise_not_implemented
     mlp_func = submodule_moe_forward if is_moe else mlp_wrapper
     combine_func = submodule_combine_forward if is_moe else raise_not_implemented

@@ -96,9 +96,9 @@ def make_test_packed_seq_params_with_padding(
     return packed_seq_params
 
 
-def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
+def get_mla_self_attn_submodules(linear_qkv_down_proj=None, qk_layernorm=False):
     submodules = get_gpt_layer_with_transformer_engine_submodules(
-        multi_latent_attention=True
+        multi_latent_attention=True, qk_layernorm=qk_layernorm
     ).self_attention.submodules
     assert isinstance(submodules, MLASelfAttentionSubmodules)
     if linear_qkv_down_proj is not None:
@@ -107,10 +107,10 @@ def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
     return submodules
 
 
-def get_fused_mla_submodules():
+def get_fused_mla_submodules(qk_layernorm=False):
     """Get submodules for FusedMLASelfAttention via the mla_down_proj_fusion spec path."""
     submodules = get_gpt_layer_with_transformer_engine_submodules(
-        multi_latent_attention=True, mla_down_proj_fusion=True
+        multi_latent_attention=True, mla_down_proj_fusion=True, qk_layernorm=qk_layernorm
     ).self_attention.submodules
     assert isinstance(submodules, MLASelfAttentionSubmodules)
     assert submodules.linear_qkv_down_proj is not None
@@ -221,6 +221,31 @@ class TestParallelMLAAttention:
 
         num_weights = sum([p.numel() for p in self.parallel_attention.parameters()])
         assert num_weights == 65036
+
+    def test_attention_latent_norm_epsilon_on_fused_projections(self):
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            qk_layernorm=True,
+            layernorm_epsilon=1.0e-5,
+            attention_latent_norm_epsilon=1.0e-6,
+        )
+        attention = MLASelfAttention(
+            config,
+            get_mla_self_attn_submodules(qk_layernorm=True),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+        assert attention.linear_q_up_proj.eps == pytest.approx(1.0e-6)
+        assert attention.linear_kv_up_proj.eps == pytest.approx(1.0e-6)
 
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
@@ -641,11 +666,7 @@ class TestTensorParallelMLAAttention:
 )
 @pytest.mark.parametrize(
     ("rope_type", "apply_rope_fusion"),
-    (
-        ('rope', False),
-        ('yarn', False),
-        ('yarn', True),  # apply_rope_fusion for MLA only works with YARN RoPE.
-    ),
+    (('rope', False), ('rope', True), ('yarn', False), ('yarn', True)),
 )
 class TestContextParallelMLAAttention:
 
@@ -1077,11 +1098,7 @@ class TestParallelMLAAttentionPrecision:
 )
 @pytest.mark.parametrize(
     ("rope_type", "apply_rope_fusion"),
-    (
-        ('rope', False),
-        ('yarn', False),
-        ('yarn', True),  # apply_rope_fusion for MLA only works with YARN RoPE.
-    ),
+    (('rope', False), ('rope', True), ('yarn', False), ('yarn', True)),
 )
 class TestContextParallelMLAAttentionPrecision:
 
@@ -1613,11 +1630,7 @@ class TestMLAClipQK:
 @pytest.mark.experimental
 @pytest.mark.parametrize(
     ("rope_type", "apply_rope_fusion"),
-    [
-        ("rope", False),
-        ("yarn", False),
-        ("yarn", True),  # apply_rope_fusion for MLA only works with YARN RoPE.
-    ],
+    [("rope", False), ("rope", True), ("yarn", False), ("yarn", True)],
 )
 @pytest.mark.parametrize(
     ("tp", "sp", "cp", "output_gate", "gate_granularity"),
@@ -1891,6 +1904,31 @@ class TestFusedMLASelfAttention:
         assert isinstance(self.fused_attention, MLASelfAttention)
         assert self.fused_attention.layer_number == 1
         assert hasattr(self.fused_attention, 'linear_qkv_down_proj')
+
+    def test_attention_latent_norm_epsilon_on_fused_projections(self):
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            qk_layernorm=True,
+            layernorm_epsilon=1.0e-5,
+            attention_latent_norm_epsilon=1.0e-6,
+        )
+        attention = FusedMLASelfAttention(
+            config,
+            get_fused_mla_submodules(qk_layernorm=True),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+        assert attention.linear_q_up_proj.eps == pytest.approx(1.0e-6)
+        assert attention.linear_kv_up_proj.eps == pytest.approx(1.0e-6)
 
     def test_fused_weight_shape(self):
         config = self.transformer_config

@@ -55,6 +55,44 @@ def reset_full_cuda_graph_state():
 
 
 @pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="StaticBufferLoader stages inputs on the GPU"
+)
+def test_static_buffer_loader_isolates_cached_batch_structure():
+    loader = StaticBufferLoader()
+    first_inputs = {
+        'tokens': torch.ones(2, 4),
+        'labels': torch.ones(2, 4),
+        'loss_mask': torch.ones(2, 4),
+    }
+
+    first_batch = loader(first_inputs, 'training', 0)
+    cached_batch = StaticBufferLoader.static_buffers['training'][0]
+
+    assert first_batch is not cached_batch
+    assert first_batch['labels'] is cached_batch['labels']
+    assert first_batch['loss_mask'] is cached_batch['loss_mask']
+
+    # Pipeline stages replace unused fields in place. This must not replace the
+    # corresponding tensors in the loader's static buffer.
+    first_batch['labels'] = None
+    first_batch['loss_mask'] = None
+
+    second_inputs = {
+        'tokens': torch.full((2, 4), 2.0),
+        'labels': torch.full((2, 4), 3.0),
+        'loss_mask': torch.full((2, 4), 4.0),
+    }
+    second_batch = loader(second_inputs, 'training', 0)
+
+    assert second_batch is not cached_batch
+    assert second_batch['labels'] is cached_batch['labels']
+    assert second_batch['loss_mask'] is cached_batch['loss_mask']
+    torch.testing.assert_close(second_batch['tokens'], second_inputs['tokens'].cuda())
+    torch.testing.assert_close(second_batch['labels'], second_inputs['labels'].cuda())
+    torch.testing.assert_close(second_batch['loss_mask'], second_inputs['loss_mask'].cuda())
+
+
+@pytest.mark.skipif(
     not (HAVE_TE and is_te_min_version("1.5.0")),
     reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
 )

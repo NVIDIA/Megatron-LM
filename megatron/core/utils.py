@@ -3248,11 +3248,18 @@ PARAM_READY_CALLBACK_ATTR = "_ensure_param_ready_callback"
 def ensure_params_ready(params: Iterable[Any]) -> None:
     """Make ``params`` readable now, finishing any outstanding backend publication.
 
+<<<<<<< HEAD
     A parameter-sharding backend (DDP with ``overlap_param_gather``, FSDP, ...) publishes values
     asynchronously, so only the owning module's forward pre-hook makes ``param.data`` valid. Any
     consumer reading it earlier -- ahead of that module, or from another stream -- calls this
     first. Backends mark their params with :data:`PARAM_READY_CALLBACK_ATTR`; unmarked params
     no-op, so neither side needs to know about the other.
+=======
+    A parameter-sharding backend publishes values asynchronously, so only the owning module's
+    forward pre-hook normally makes ``param.data`` valid. Consumers that read a parameter without
+    invoking its owning module call this first. Backends mark their parameters with
+    :data:`PARAM_READY_CALLBACK_ATTR`; unmarked parameters are already readable.
+>>>>>>> origin/dev
 
     Callbacks are shared per communication bucket, so each fires once, not once per parameter.
     """

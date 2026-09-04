@@ -35,13 +35,22 @@ env:
   container-registry-gb200: 766267172432.dkr.ecr.us-east-2.amazonaws.com
 
 jobs:
+  ephemeral-runner-routing:
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_ephemeral_runner_routing.yml@d0878a142525ff79366ca96fbc0b306cd8d64670 # v1.9.0
+    with:
+      lane: ${{ vars.NEMO_CI_EPHEMERAL_LANE }}
+      legacy_label: nvidia-ci-aws-gpu-x8-ephemeral
+      run_id: ${{ github.run_id }}
+      run_attempt: ${{ github.run_attempt }}
+
   is-not-external-contributor:
+    needs: [ephemeral-runner-routing]
     runs-on: ubuntu-latest
     if: github.repository == 'NVIDIA/Megatron-LM'
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
       is_maintainer: ${{ steps.check-membership.outputs.is_maintainer }}
-      selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || 'nvidia-ci-aws-gpu-x8-ephemeral' }}
+      selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || needs.ephemeral-runner-routing.outputs.runner_label }}
       selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-use2-gpu-x4' || 'ubuntu-latest' }}
     permissions:
       issues: write
@@ -168,7 +177,11 @@ jobs:
   pre-flight:
     needs: [is-not-external-contributor]
     if: github.repository == 'NVIDIA/Megatron-LM'
+<<<<<<< HEAD
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@c1a0837f362a1a696e647238ab1cf916b2a7cf4a # v1.8.6
+=======
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@d0878a142525ff79366ca96fbc0b306cd8d64670 # v1.9.0
+>>>>>>> origin/dev
 
   configure:
     runs-on: ubuntu-latest
@@ -1362,26 +1375,6 @@ jobs:
               issue_number: prNumber,
               body: `🔄 Merge queue validation started!\n\nYou can track the progress here: ${runUrl}`
             });
-
-  cleanup-taint-node:
-    runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
-    needs:
-      - is-not-external-contributor
-      - cicd-container-build
-      - cicd-unit-tests-latest
-      - cicd-integration-tests-latest-h100
-      - cicd-integration-tests-latest-gb200
-      - Coverage
-      - Coverage_Fake
-    if: |
-      always()
-      && !cancelled()
-      && contains(needs.is-not-external-contributor.outputs.selected_runner, 'ephemeral')
-      && !needs.pre-flight.outputs.is_deployment_workflow == 'true'
-    steps:
-      - name: Taint node for cleanup
-        shell: bash
-        run: taint-node.sh
 
   DCO_merge_group:
     name: DCO

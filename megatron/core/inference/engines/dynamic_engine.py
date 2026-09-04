@@ -483,8 +483,6 @@ class DynamicInferenceEngine(AbstractEngine):
         # Prefix caching tracking.
         self._prefix_cache_hits = 0
         self._prefix_cache_blocks_matched = 0
-        self._prefill_tokens_computed = 0
-        self._prefill_tokens_skipped = 0
         self._prefix_coordination_waits = 0
 
         # Coordinator state.
@@ -2605,12 +2603,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.context.enable_prefix_caching:
             self._prefix_cache_hits += self.context.prefix_cache_hits
             self._prefix_cache_blocks_matched += self.context.prefix_cache_blocks_matched
-            self._prefill_tokens_computed += self.context.prefix_cache_prefill_computed_tokens
-            self._prefill_tokens_skipped += self.context.prefix_cache_prefill_skipped_tokens
             self.context.prefix_cache_hits = 0
             self.context.prefix_cache_blocks_matched = 0
-            self.context.prefix_cache_prefill_computed_tokens = 0
-            self.context.prefix_cache_prefill_skipped_tokens = 0
 
         # Log KV cache utilization stats to W&B
         nvtx_range_push("wandb_logging")
@@ -2744,6 +2738,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._prefix_cache_hits,
                     self._prefix_cache_blocks_matched,
                 )
+<<<<<<< HEAD
             if self.context.enable_prefix_caching:
                 # Prefill compute actually saved by prefix caching (cumulative).
                 # computed = prompt tokens run through the model; skipped = prompt
@@ -2775,6 +2770,9 @@ class DynamicInferenceEngine(AbstractEngine):
                         msa.max_slots,
                     )
             if color_decode_only:
+=======
+            if context_state["is_decode_only"]:
+>>>>>>> origin/dev
                 output_str = f"\033[94m{output_str}\033[0m"
             logger.info(output_str)
 
@@ -3003,12 +3001,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
-            elif header == Headers.START_CUDA_PROFILER:
-                # Side-effect, not a state transition: apply immediately on every
-                # rank so an outer nsys --capture-range=cudaProfilerApi starts here.
-                torch.cuda.cudart().cudaProfilerStart()
-            elif header == Headers.STOP_CUDA_PROFILER:
-                torch.cuda.cudart().cudaProfilerStop()
             else:
                 # Control signal: queue for second pass.
                 self._pending_signals.append(message)

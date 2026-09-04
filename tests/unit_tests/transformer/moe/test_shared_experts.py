@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from megatron.core.models.gpt import moe_module_specs
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.parallel_state import get_tensor_model_parallel_world_size
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import shared_experts as shared_experts_module
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.shared_experts import FusedSharedExpertMLP, SharedExpertMLP
