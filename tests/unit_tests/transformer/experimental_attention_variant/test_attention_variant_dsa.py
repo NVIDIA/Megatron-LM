@@ -449,6 +449,7 @@ def test_absorbed_mla_qkv_rope_uses_microbatch_cp_group(
         _get_kv_up_weights=lambda: (k_up_weight, None),
         recompute_up_proj=recompute_up_proj,
         cache_mla_latents=False,
+        core_attention=SimpleNamespace(mtp_latent_kv_share=False),
     )
     reference = copy.copy(attention)
     reference.config = make_config(effective_cp_size, False)

@@ -138,11 +138,6 @@ def test_cross_depth_shared_components_reject_invalid_lists(shared_components, m
         ({"mtp_use_repeated_layer": False}, "requires mtp_use_repeated_layer"),
         ({"mtp_num_layers": 1}, "requires mtp_num_layers > 1"),
         (
-            {"recompute_granularity": "full", "recompute_method": "uniform"},
-            "does not support full activation recomputation",
-        ),
-        ({"recompute_granularity": "selective"}, "does not support core_attn recompute"),
-        (
             {"cuda_graph_impl": "transformer_engine", "cuda_graph_modules": ["attn"]},
             "does not support CUDA graph capture that includes attention",
         ),
@@ -189,15 +184,23 @@ def test_index_sharing_accepts_selective_recompute_outside_dsa(modules):
 
 
 @pytest.mark.parametrize("modules", [None, ["core_attn"], ["mlp", "core_attn"]])
-def test_index_sharing_rejects_selective_recompute_that_reenters_dsa(modules):
-    with pytest.raises(ValueError, match="does not support core_attn recompute"):
-        _make_config(recompute_granularity="selective", recompute_modules=modules)
+def test_index_sharing_accepts_selective_core_attention_recompute(modules):
+    config = _make_config(recompute_granularity="selective", recompute_modules=modules)
+    assert "core_attn" in config.recompute_modules
 
 
+@pytest.mark.parametrize(
+    "shared_components", [[LATENT_KV], [SPARSE_ATTENTION_INDEX], BOTH_SHARED_COMPONENTS]
+)
 @pytest.mark.parametrize("method", ["uniform", "block"])
-def test_index_sharing_rejects_full_recompute(method):
-    with pytest.raises(ValueError, match="does not support full activation recomputation"):
-        _make_config(recompute_granularity="full", recompute_method=method, recompute_num_layers=1)
+def test_sharing_accepts_full_recompute(shared_components, method):
+    config = _make_config(
+        mtp_repeated_layer_shared_components=shared_components,
+        recompute_granularity="full",
+        recompute_method=method,
+        recompute_num_layers=1,
+    )
+    assert config.recompute_method == method
 
 
 @pytest.mark.parametrize(
@@ -306,49 +309,35 @@ def test_latent_kv_sharing_accepts_selective_recompute_outside_shared_producer(
 
 
 @pytest.mark.parametrize("shared_components", [[LATENT_KV], BOTH_SHARED_COMPONENTS])
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        (
-            {"recompute_granularity": "full", "recompute_method": "uniform"},
-            "does not support full activation recomputation",
-        ),
-        (
-            {"recompute_granularity": "full", "recompute_method": "block"},
-            "does not support full activation recomputation",
-        ),
-        ({"recompute_granularity": "selective"}, "does not support core_attn recompute"),
-        (
-            {"recompute_granularity": "selective", "recompute_modules": ["mlp", "core_attn"]},
-            "does not support core_attn recompute",
-        ),
-        (
-            {"recompute_granularity": "selective", "recompute_modules": ["mla_up_proj"]},
-            "does not support mla_up_proj recompute",
-        ),
-        (
-            {
-                "recompute_granularity": "selective",
-                "recompute_modules": ["layernorm", "mla_up_proj"],
-            },
-            "does not support mla_up_proj recompute",
-        ),
-    ],
-)
-def test_latent_kv_sharing_rejects_conflicting_recompute(shared_components, overrides, message):
-    with pytest.raises(ValueError, match=message):
-        _make_config(mtp_repeated_layer_shared_components=shared_components, **overrides)
+@pytest.mark.parametrize("modules", [None, ["core_attn"], ["mlp", "core_attn"]])
+def test_latent_kv_sharing_rejects_selective_core_attention(shared_components, modules):
+    with pytest.raises(ValueError, match="does not support selective core_attn"):
+        _make_config(
+            mtp_repeated_layer_shared_components=shared_components,
+            recompute_granularity="selective",
+            recompute_modules=modules,
+        )
 
 
-def test_latent_kv_runtime_rejects_discarding_shared_source_storage():
+@pytest.mark.parametrize("shared_components", [[LATENT_KV], BOTH_SHARED_COMPONENTS])
+@pytest.mark.parametrize("modules", [["mla_up_proj"], ["layernorm", "mla_up_proj"]])
+def test_latent_kv_sharing_accepts_up_projection_recompute(shared_components, modules):
+    config = _make_config(
+        mtp_repeated_layer_shared_components=shared_components,
+        recompute_granularity="selective",
+        recompute_modules=modules,
+    )
+    assert config.recompute_modules == modules
+
+
+def test_latent_kv_runtime_rejects_selective_core_attention():
     attention = SimpleNamespace(
         training=True,
         cache_mla_latents=False,
         core_attention=SimpleNamespace(mtp_cross_depth_share=True, mtp_latent_kv_share=True),
-        checkpoint_core_attention=False,
-        recompute_up_proj=True,
+        checkpoint_core_attention=True,
     )
-    with pytest.raises(RuntimeError, match="source KV storage would be discarded"):
+    with pytest.raises(RuntimeError, match="does not support selective core_attn"):
         AbsorbedMLASelfAttention.forward(
             attention, hidden_states=torch.zeros(1, 1, 4), attention_mask=None
         )
