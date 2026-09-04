@@ -836,6 +836,66 @@ class TestGetTopkAlignment:
 
 
 # ---------------------------------------------------------------------------
+# Sparse-loss preparation
+# ---------------------------------------------------------------------------
+
+
+def _sparse_loss_preparation_reference(scores, topk, padding_mask=None, physical=None):
+    if padding_mask is not None:
+        row_mask = padding_mask.unsqueeze(-1)
+        topk = topk.masked_fill(row_mask, -1)
+        if physical is not None:
+            physical = physical.masked_fill(row_mask, -1)
+    safe_topk = topk.clamp(min=0).long()
+    selected = torch.gather(scores, -1, safe_topk)
+    selected = torch.where(topk >= 0, selected, torch.finfo(torch.float32).min)
+    return torch.softmax(selected, -1), topk, physical
+
+
+def test_sparse_loss_preparation_cpu_fallback():
+    scores = torch.tensor([[0.5, -1.0, 2.0, 1.0], [3.0, 2.0, 1.0, 0.0]])
+    topk = torch.tensor([[2, 0, -1], [3, 1, 0]], dtype=torch.int32)
+    physical = torch.tensor([[12, 10, -1], [23, 21, 20]], dtype=torch.int32)
+    padding_mask = torch.tensor([False, True])
+
+    actual = dk.csa_indexer_loss_kernels.prepare_sparse_loss(scores, topk, padding_mask, physical)
+    expected = _sparse_loss_preparation_reference(scores, topk, padding_mask, physical)
+    torch.testing.assert_close(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])
+    assert torch.equal(actual[2], expected[2])
+    torch.testing.assert_close(actual[0][1], torch.full((3,), 1.0 / 3.0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_sparse_loss_preparation_triton_matches_eager():
+    if not dk.csa_indexer_loss_kernels._TRITON_AVAILABLE:
+        pytest.skip("Triton is not available")
+    scores = torch.randn(7, 11, dtype=torch.float32, device="cuda")
+    topk = torch.tensor(
+        [
+            [2, 7, 1, -1, -1],
+            [8, 0, 3, 5, -1],
+            [-1, -1, -1, -1, -1],
+            [10, 9, 4, 2, 1],
+            [6, 5, 4, 3, 2],
+            [1, 0, -1, -1, -1],
+            [7, 3, 8, 6, 0],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    physical = torch.where(topk >= 0, topk + 100, topk)
+    padding_mask = torch.tensor([False, True, False, False, True, False, False], device="cuda")
+
+    actual = dk.csa_indexer_loss_kernels.prepare_sparse_loss(scores, topk, padding_mask, physical)
+    expected = _sparse_loss_preparation_reference(scores, topk, padding_mask, physical)
+    torch.testing.assert_close(actual[0], expected[0], atol=2e-6, rtol=2e-6)
+    assert torch.equal(actual[1], expected[1])
+    assert torch.equal(actual[2], expected[2])
+    torch.testing.assert_close(actual[0][2], torch.full((5,), 0.2, device="cuda"))
+
+
+# ---------------------------------------------------------------------------
 # _csa_fwd_flash_mla — wrapper around flash_mla.flash_mla_sparse_fwd
 # ---------------------------------------------------------------------------
 
@@ -957,6 +1017,9 @@ class TestDsaFwdFlashMla:
         # (b) indexer_topk == 0
         _, _, lse_idx_b = _csa_fwd_flash_mla(q, kv, topk_idxs_aligned, 0.5, indexer_topk=0)
         assert lse_idx_b is None, "(b) indexer_topk=0 must yield lse_indexer=None"
+        assert (
+            stub.call_args.args[2].data_ptr() == topk_idxs_aligned.data_ptr()
+        ), "(b) aligned indices should reach FlashMLA without a padding allocation"
 
         # (c) 0 < indexer_topk < TopK
         _, lse_c, lse_idx_c = _csa_fwd_flash_mla(
@@ -2218,6 +2281,10 @@ class TestFusedIndexerSparseAttnFromTopk:
     def test_dense_loss_passes_recomputed_full_teacher_lse(self, monkeypatch):
         inputs = self._inputs()
         total_q, num_heads, _ = inputs['query'].shape
+        logical_window_width = inputs['topk_idxs'].shape[-1] - inputs['indexer_topk_idxs'].shape[-1]
+        inputs['topk_idxs'] = torch.cat(
+            (inputs['topk_idxs'], torch.full((total_q, 2), -1, dtype=torch.int32)), dim=-1
+        )
         max_seqlen_k = 2
         sentinel_lse = torch.full((total_q, num_heads), 37.0)
         seen = {}
@@ -2228,7 +2295,9 @@ class TestFusedIndexerSparseAttnFromTopk:
 
         def fake_non_compressed(query, kv_full, sink, window_indices, scale):
             del query, kv_full, sink, scale
-            torch.testing.assert_close(window_indices, inputs['topk_idxs'][:, 1:])
+            torch.testing.assert_close(
+                window_indices, inputs['topk_idxs'][:, 1 : 1 + logical_window_width]
+            )
             return torch.full((total_q, num_heads), 5.0)
 
         def fake_dense_teacher(query, compressed_kv, non_compressed_lse, *args, **kwargs):
@@ -2285,6 +2354,14 @@ class TestFusedIndexerSparseAttnFromTopk:
                 torch.tensor([0], dtype=torch.int32),
             ),
             None,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            logical_window_width,
         )
 
         assert seen['dense_teacher_called']

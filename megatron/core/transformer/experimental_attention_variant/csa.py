@@ -32,6 +32,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sp
     csa_sparse_attn,
     defer_reduce_scatter_wait,
     fused_csa_indexer_sparse_attn,
+    get_flash_mla_topk_alignment,
     indexer_topk,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
@@ -2352,6 +2353,7 @@ class CompressedSparseAttention(MegatronModule):
             compressed_base=compressed_base,
             compressed_rows=compressed_rows,
             compressed_is_sequence_major=True,
+            output_alignment=get_flash_mla_topk_alignment(),
         )
 
         output = csa_sparse_attn(
@@ -2422,6 +2424,7 @@ class CompressedSparseAttention(MegatronModule):
             compressed_base=compressed_base,
             compressed_rows=compressed_rows,
             compressed_is_sequence_major=True,
+            output_alignment=get_flash_mla_topk_alignment(),
         )
         output = csa_sparse_attn(
             query,
@@ -2787,6 +2790,7 @@ class CompressedSparseAttention(MegatronModule):
                 for_indexer_loss=use_indexer_loss,
                 compressed_rows=compressed_kv_rank_major.shape[0],
                 cu_seqlens_unpadded=cu_seqlens_q_unpadded,
+                output_alignment=(get_flash_mla_topk_alignment() if self.use_fused_kernels else 1),
             )
         )
         if use_indexer_loss:
@@ -2840,6 +2844,7 @@ class CompressedSparseAttention(MegatronModule):
                     seq_to_rank_row if not sparse_indexer_loss else None,
                     indexer_k_rs_state,
                     compressed_kv_rs_state,
+                    self.window_size,
                 )
             else:
                 output, indexer_loss = _unfused_indexer_sparse_attn_from_topk(

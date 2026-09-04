@@ -814,6 +814,7 @@ def build_attention_indices(
     compressed_rows: int | None = None,
     compressed_is_sequence_major: bool = False,
     cu_seqlens_unpadded: Optional[torch.Tensor] = None,
+    output_alignment: int = 1,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Build final sparse-attention and optional indexer-loss indices.
 
@@ -835,9 +836,13 @@ def build_attention_indices(
             order, so logical rows address them directly without an identity map.
         cu_seqlens_unpadded: optional true sequence lengths when ``cu_seqlens``
             describes CUDA-graph-padded rows.
+        output_alignment: pad the final attention-index width to this multiple.
+            The logical window/compressed widths and ``topk_length`` are unchanged.
 
     Outputs:
-        ``topk_idxs`` int32, shape ``(l_local, window_size + compressed_width)``;
+        ``topk_idxs`` int32, shape ``(l_local, padded_width)`` where
+        ``padded_width`` rounds ``window_size + compressed_width`` up to
+        ``output_alignment``;
         optional ``topk_length`` int32, shape ``(l_local,)``; and optional
         ``indexer_physical_rows`` int32, shape ``(l_local, compressed_width)``.
         The fourth result is an optional bool padding-row mask, shape ``(l_local,)``.
@@ -858,6 +863,9 @@ def build_attention_indices(
         raise ValueError("padded and unpadded cumulative lengths must have the same shape")
     global_start, l_local = int(global_start), int(l_local)
     compressed_width = int(compressed_width)
+    output_alignment = int(output_alignment)
+    if output_alignment <= 0:
+        raise ValueError(f"output_alignment must be positive, got {output_alignment}")
     compressed_is_sequence_major = bool(compressed_is_sequence_major)
     if compressed_width > 0 and compressed_rows is None:
         raise RuntimeError("DSv4 THD final indices require the compressed-buffer capacity.")
@@ -881,7 +889,12 @@ def build_attention_indices(
         compressed_base = int(d_window) + int(l_local)
     compressed_base = int(compressed_base)
 
-    total_width = window_size + compressed_width
+    logical_width = int(window_size) + compressed_width
+    total_width = (
+        (logical_width + output_alignment - 1) // output_alignment * output_alignment
+        if logical_width > 0
+        else 0
+    )
     topk_idxs = torch.empty((l_local, total_width), dtype=torch.int32, device=cu_seqlens.device)
     index_mode = 2 if for_indexer_loss else int(compressed_topk is None)
     if compressed_topk is None:
