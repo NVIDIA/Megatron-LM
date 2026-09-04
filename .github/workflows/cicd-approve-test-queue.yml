@@ -217,12 +217,12 @@ jobs:
 
           # Get current running and queued workflows
           print("Fetching workflow runs...")
-          queued_resp = make_request("actions/workflows/cicd-main.yml/runs?status=queued&per_page=100")
+          queued_resp = make_request("actions/runs?status=queued")
           if queued_resp is None:
               print("Failed to fetch queued workflow runs after retries, exiting")
               exit(1)
           queued_workflow_runs = queued_resp.get("workflow_runs", [])
-          in_progress_resp = make_request("actions/workflows/cicd-main.yml/runs?status=in_progress&per_page=100")
+          in_progress_resp = make_request("actions/runs?status=in_progress")
           if in_progress_resp is None:
               print("Failed to fetch in-progress workflow runs after retries, exiting")
               exit(1)
