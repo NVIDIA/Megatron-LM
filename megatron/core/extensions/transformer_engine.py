@@ -3718,11 +3718,13 @@ try:
         out: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
         grad: bool = False,
+        accumulate: bool = False,
     ) -> List[torch.Tensor]:
         """
         Wrapper for TE's general_gemm function.
         It supports fp32, bf16, fp16, and fp8 GEMMs with TN, NN, and NT layouts.
         The output dtype can be specified by `out_dtype`.
+        When `accumulate` is True, the GEMM result is accumulated into `out`.
         Note: not all combinations of these settings are supported. If not supported,
         cublaslt will throw an error.
         """
@@ -3731,7 +3733,7 @@ try:
             quantization_params=None,
             gelu=None,
             gelu_in=None,
-            accumulate=False,
+            accumulate=accumulate,
             layout=layout,
             out=out,
             bias=bias,

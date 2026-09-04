@@ -616,6 +616,50 @@ def test_router_gating_linear(router_dtype):
 
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("overwrite_main_grad", [False, True])
+def test_router_gating_linear_gradient_accumulation_fusion(overwrite_main_grad):
+    from megatron.core.extensions.transformer_engine import te_general_gemm
+
+    if te_general_gemm is None:
+        pytest.skip("TE general GEMM is not available")
+
+    num_tokens = 64
+    hidden_size = 128
+    num_experts = 32
+    weight = torch.randn(
+        (num_experts, hidden_size), dtype=torch.bfloat16, device="cuda", requires_grad=True
+    )
+    weight.main_grad = torch.randn_like(weight, dtype=torch.float32)
+    expected_main_grad = (
+        torch.zeros_like(weight.main_grad) if overwrite_main_grad else weight.main_grad.clone()
+    )
+    weight.grad_added_to_main_grad = False
+    if overwrite_main_grad:
+        weight.__fsdp_param__ = True
+        weight.overwrite_main_grad = True
+        weight.get_main_grad = lambda: weight.main_grad
+
+    for _ in range(2):
+        inp = torch.randn(
+            (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda", requires_grad=True
+        )
+        grad_output = torch.randn((num_tokens, num_experts), dtype=torch.float32, device="cuda")
+        expected_main_grad.add_(grad_output.t().matmul(inp.float()))
+
+        output = router_gating_linear(
+            inp, weight, bias=None, router_dtype=torch.float32, gradient_accumulation_fusion=True
+        )
+        output.backward(grad_output)
+
+        assert weight.grad_added_to_main_grad
+        weight.grad = None
+
+    assert not getattr(weight, "overwrite_main_grad", False)
+    torch.testing.assert_close(weight.main_grad, expected_main_grad, rtol=2.0e-3, atol=2.0e-2)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("router_dtype", [torch.bfloat16, torch.float32, torch.float64])
 def test_router_gating_linear_bias(router_dtype):
     tols = dict(rtol=2.0e-2, atol=1.0e-3)

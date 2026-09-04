@@ -33,6 +33,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecated, internal_api, is_te_min_version
 
 if HAVE_TE:
+    from transformer_engine.pytorch.module.base import get_dummy_wgrad
+
     from megatron.core.extensions.transformer_engine import (
         fused_compute_score_for_moe_aux_loss,
         fused_moe_aux_loss,
@@ -58,6 +60,7 @@ else:
         fused_unpermute,
         te_general_gemm,
     ) = (None, None, None, None, None, None, None, None, None, None)
+    get_dummy_wgrad = None
 
 
 def switch_load_balancing_loss_func(
@@ -1366,6 +1369,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
         router_dtype: torch.dtype,
+        gradient_accumulation_fusion: bool,
     ) -> torch.Tensor:
         """
         Forward pass of the RouterGatingLinearFunction function.
@@ -1375,6 +1379,8 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             weight (torch.Tensor): The weight tensor.
             bias (torch.Tensor): The bias tensor. Could be None.
             router_dtype (torch.dtype): The router dtype.
+            gradient_accumulation_fusion (bool): Whether to accumulate the weight gradient
+                directly into the parameter's main gradient buffer.
 
         Returns:
             torch.Tensor: The output tensor.
@@ -1383,6 +1389,14 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         ctx.router_dtype = router_dtype
         ctx.input_dtype = inp.dtype
         ctx.weight_dtype = weight.dtype
+        main_grad = getattr(weight, "main_grad", None)
+        ctx.gradient_accumulation_fusion = (
+            gradient_accumulation_fusion
+            and te_general_gemm is not None
+            and router_dtype == torch.float32
+            and (main_grad is not None or hasattr(weight, "__fsdp_param__"))
+        )
+        ctx.main_grad = main_grad if ctx.gradient_accumulation_fusion else None
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
 
@@ -1405,7 +1419,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx, grad_output: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], None, None]:
         """
         Backward pass of the RouterGatingLinearFunction function.
 
@@ -1413,8 +1427,9 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             grad_output (torch.Tensor): The gradient output.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None]:
-                The gradient input, gradient weight, gradient bias, and None.
+            Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], None, None]:
+                The input, weight, and bias gradients, followed by placeholders for the router
+                dtype and gradient accumulation fusion arguments.
         """
         inp, weight, bias = ctx.saved_tensors
         inp_shape = inp.shape
@@ -1426,22 +1441,57 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             grad_input = te_general_gemm(
                 weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
             )
-            grad_weight = te_general_gemm(
-                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
-            )
             grad_input = grad_input[0].to(ctx.input_dtype)
-            grad_weight = grad_weight[0].to(ctx.weight_dtype)
+            if ctx.gradient_accumulation_fusion:
+                if hasattr(weight, "__fsdp_param__"):
+                    weight.main_grad = weight.get_main_grad()
+                else:
+                    weight.main_grad = ctx.main_grad
+                te_general_gemm(
+                    inp.to(ctx.router_dtype),
+                    grad_output,
+                    out_dtype=weight.main_grad.dtype,
+                    layout="NT",
+                    out=weight.main_grad,
+                    grad=True,
+                    accumulate=not getattr(weight, "overwrite_main_grad", False),
+                )
+                if hasattr(weight, "overwrite_main_grad"):
+                    weight.overwrite_main_grad = False
+                if hasattr(weight, "grad_added_to_main_grad"):
+                    # Trigger the DDP post-hook so the parameter is registered as ready without
+                    # accumulating the gradient twice.
+                    if getattr(weight, "zero_out_wgrad", False):
+                        grad_weight = get_dummy_wgrad(
+                            list(weight.main_grad.shape), ctx.weight_dtype, zero=True
+                        )
+                    else:
+                        grad_weight = get_dummy_wgrad(
+                            list(weight.main_grad.shape), ctx.weight_dtype
+                        )
+                    weight.grad_added_to_main_grad = True
+                else:
+                    grad_weight = None
+            else:
+                grad_weight = te_general_gemm(
+                    inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
+                )
+                grad_weight = grad_weight[0].to(ctx.weight_dtype)
         else:
             grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
             grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
 
         grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)
-        return grad_input, grad_weight, grad_bias, None
+        return grad_input, grad_weight, grad_bias, None, None
 
 
 def router_gating_linear(
-    inp: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], router_dtype: torch.dtype
+    inp: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    router_dtype: torch.dtype,
+    gradient_accumulation_fusion: bool = False,
 ) -> torch.Tensor:
     """
     Customized linear layer for router gating.
@@ -1453,11 +1503,15 @@ def router_gating_linear(
         weight (torch.Tensor): The weight tensor.
         bias (torch.Tensor): The bias tensor. Could be None.
         router_dtype (torch.dtype): The router dtype.
+        gradient_accumulation_fusion (bool): Whether to accumulate the weight gradient directly
+            into the parameter's main gradient buffer.
 
     Returns:
         torch.Tensor: The output tensor.
     """
-    return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
+    return RouterGatingLinearFunction.apply(
+        inp, weight, bias, router_dtype, gradient_accumulation_fusion
+    )
 
 
 def get_align_size_for_quantization(config: TransformerConfig) -> int:
