@@ -117,6 +117,12 @@ class _GDNBase(MegatronModule):
 
     gated_delta_rule: GatedDeltaRuleInterface
 
+    uses_attention_mask: bool = False
+    """GDN occupies the ``self_attention`` slot but is a linear-attention variant: it
+    accepts ``attention_mask`` only for signature compatibility with
+    ``TransformerLayer`` and never reads it, and it has no ``attn_mask_type``. See
+    ``Attention.uses_attention_mask`` for the contract."""
+
     def __init__(
         self,
         config: TransformerConfig,
