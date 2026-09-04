@@ -1333,11 +1333,12 @@ class TransformerConfig(ModelParallelConfig):
     trailing partial block); the paper finds ~8-10 sources recover most of the quality gain."""
 
     attn_res_impl: str = "eager"
-    """Implementation of the AttnRes depth aggregation: 'eager' (plain torch ops) or 'compile'
-    (the forward/backward math bodies wrapped in torch.compile, one specialization per depth
-    arity; falls back to eager with a warning if compilation is unavailable). The eager loop is
-    CPU-dispatch-bound — measured ~3-4 ms of CPU wall per aggregation on GB200 at small hidden
-    sizes — so 'compile' is strongly recommended for training runs."""
+    """Implementation of the AttnRes depth aggregation: 'eager' (a memory-lean custom autograd
+    Function built from plain PyTorch ops) or 'compile' (a plain PyTorch forward wrapped in
+    torch.compile, with AOTAutograd generating its backward and one specialization per depth
+    arity; falls back to the eager custom Function with a warning if compilation is unavailable).
+    The eager loop is CPU-dispatch-bound — measured ~3-4 ms of CPU wall per aggregation on GB200
+    at small hidden sizes — so 'compile' is strongly recommended for training runs."""
 
     hybrid_layer_pattern: Optional[str] = None
     """Unified hybrid layer pattern string (mirrors --hybrid-layer-pattern; populated
