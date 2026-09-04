@@ -17,6 +17,14 @@ pytestmark = [
 ]
 
 
+def _owner_bindings(manager):
+    return list(manager._owners.values())
+
+
+def _pending_releases(manager):
+    return [entry for entries in manager._pending.values() for entry in entries]
+
+
 def _publish(manager, tensor, owner, node="producer"):
     manager.consume_inputs_and_publish_outputs(
         (), tensor, stream=owner, node=node, retire_consumed=False
@@ -40,10 +48,10 @@ def _consume_output_grads_and_publish_input_grads(
     )
 
 
-def _wait_and_drain(manager, event, stream, node="owner acquire"):
+def _wait_and_drain(manager, event, stream):
     event.wait(stream)
     with torch.cuda.stream(stream):
-        manager.drain(stream, node)
+        manager.drain(stream)
 
 
 def test_same_stream_empty_storage_is_immediate():
@@ -55,9 +63,8 @@ def test_same_stream_empty_storage_is_immediate():
     _consume_inputs_and_publish_outputs(manager, tensor, (), owner)
 
     assert tensor.untyped_storage().nbytes() == 0
-    assert not manager.owners
-    assert not manager.pending
-    assert manager.stats["same_stream"] == 1
+    assert not _owner_bindings(manager)
+    assert not _pending_releases(manager)
 
 
 def test_cross_stream_release_waits_for_owner_acquire():
@@ -76,13 +83,12 @@ def test_cross_stream_release_waits_for_owner_acquire():
     _consume_inputs_and_publish_outputs(manager, tensor, (), consumer)
 
     assert tensor.untyped_storage().nbytes() > 0
-    assert not manager.owners
-    assert len(manager.pending) == 1
+    assert not _owner_bindings(manager)
+    assert len(_pending_releases(manager)) == 1
 
     _wait_and_drain(manager, event, owner)
     assert tensor.untyped_storage().nbytes() == 0
-    assert not manager.pending
-    assert manager.last_release_node == "owner acquire"
+    assert not _pending_releases(manager)
 
 
 def test_non_retiring_consumer_replaces_input_binding_with_output_binding():
@@ -97,12 +103,12 @@ def test_non_retiring_consumer_replaces_input_binding_with_output_binding():
 
     _consume_inputs_and_publish_outputs(manager, tensor, output, consumer, retire=False)
 
+    owners = _owner_bindings(manager)
     assert tensor.untyped_storage().nbytes() > 0
-    assert not manager.pending
-    assert len(manager.owners) == 1
-    assert manager.owners[0].tensor is output
-    assert manager.owners[0].stream.cuda_stream == consumer.cuda_stream
-    assert manager.owners[0].stream_key == (consumer.device, int(consumer.cuda_stream))
+    assert not _pending_releases(manager)
+    assert len(owners) == 1
+    assert owners[0].tensor is output
+    assert owners[0].stream == consumer
     manager.export(output)
 
 
@@ -122,9 +128,10 @@ def test_forward_rejects_partial_slice_alias_output(retire_consumed):
         )
 
     # Alias validation must happen before ownership or storage is mutated.
-    assert len(manager.owners) == 1
-    assert manager.owners[0].tensor is tensor
-    assert manager.owners[0].stream.cuda_stream == owner.cuda_stream
+    owners = _owner_bindings(manager)
+    assert len(owners) == 1
+    assert owners[0].tensor is tensor
+    assert owners[0].stream == owner
     assert tensor.untyped_storage().nbytes() > 0
     manager.export(tensor)
 
@@ -149,10 +156,9 @@ def test_structured_tensors_are_deduplicated():
 
     _publish(manager, (tensor, None, tensor), stream, "structured producer")
 
-    assert len(manager.owners) == 1
-    assert manager.stats["published"] == 1
+    assert len(_owner_bindings(manager)) == 1
     manager.export((tensor, tensor))
-    assert not manager.owners
+    assert not _owner_bindings(manager)
 
 
 def test_two_managers_do_not_drain_another_microbatch():
@@ -176,13 +182,13 @@ def test_two_managers_do_not_drain_another_microbatch():
     # microbatch plan.  It must not release B's tensor or add a B -> F edge.
     with torch.cuda.stream(owner):
         forward_event.record(owner)
-    _wait_and_drain(forward, forward_event, owner, "F dispatch")
+    _wait_and_drain(forward, forward_event, owner)
     assert tensor.untyped_storage().nbytes() > 0
-    assert len(backward.pending) == 1
+    assert len(_pending_releases(backward)) == 1
 
-    _wait_and_drain(backward, backward_event, owner, "B dispatch")
+    _wait_and_drain(backward, backward_event, owner)
     assert tensor.untyped_storage().nbytes() == 0
-    assert not backward.pending
+    assert not _pending_releases(backward)
 
 
 def test_terminal_hand_back_drains_all_owner_streams():
@@ -203,9 +209,7 @@ def test_terminal_hand_back_drains_all_owner_streams():
     manager.finalize_phase(event, "test")
 
     assert tensor.untyped_storage().nbytes() == 0
-    assert not manager.pending
-    assert manager.stats["released_terminal"] == 1
-    assert manager.last_release_node == "test:phase_finalize"
+    assert not _pending_releases(manager)
 
 
 def test_finalize_exports_phase_output():
@@ -220,10 +224,7 @@ def test_finalize_exports_phase_output():
     manager.finalize_phase(event, "test", outputs=output)
 
     assert output.untyped_storage().nbytes() > 0
-    assert not manager.owners
-    assert manager.stats["owners_before_finalize"] == 1
-    assert manager.stats["owners_at_finalize"] == 0
-    assert manager.stats["exported"] == 1
+    assert not _owner_bindings(manager)
 
 
 def test_finalize_rejects_unconsumed_owner_binding():
@@ -264,47 +265,77 @@ def test_cross_stream_drop_reference_holds_gradient_until_owner_acquire():
     assert grad_ref() is None
 
 
-def test_unknown_external_gradient_uses_record_stream_fallback():
+def test_unknown_external_gradient_uses_record_stream_fallback(monkeypatch):
     consumer = torch.cuda.Stream()
     manager = ScheduleTensorLifetimeManager()
     grad = torch.empty(16, device="cuda")
+    recorded = []
+    original_record_stream = torch.Tensor.record_stream
+
+    def track_record_stream(tensor, stream):
+        recorded.append((tensor, stream))
+        return original_record_stream(tensor, stream)
+
+    monkeypatch.setattr(torch.Tensor, "record_stream", track_record_stream)
 
     _consume_output_grads_and_publish_input_grads(manager, grad, (), consumer)
 
-    assert not manager.owners
-    assert not manager.pending
-    assert manager.stats["record_stream_fallback"] == 1
+    assert len(recorded) == 1
+    assert recorded[0][0] is grad
+    assert recorded[0][1] == consumer
+    assert not _owner_bindings(manager)
+    assert not _pending_releases(manager)
 
 
-def test_unknown_external_forward_input_preserves_record_stream_fallback():
+def test_unknown_external_forward_input_preserves_record_stream_fallback(monkeypatch):
     consumer = torch.cuda.Stream()
     manager = ScheduleTensorLifetimeManager()
     tensor = torch.empty(16, device="cuda")
+    recorded = []
+    original_record_stream = torch.Tensor.record_stream
+
+    def track_record_stream(value, stream):
+        recorded.append((value, stream))
+        return original_record_stream(value, stream)
+
+    monkeypatch.setattr(torch.Tensor, "record_stream", track_record_stream)
 
     _consume_inputs_and_publish_outputs(manager, tensor, (), consumer)
 
     assert tensor.untyped_storage().nbytes() == 0
-    assert not manager.owners
-    assert not manager.pending
-    assert manager.stats["record_stream_fallback"] == 1
+    assert len(recorded) == 1
+    assert recorded[0][0] is tensor
+    assert recorded[0][1] == consumer
+    assert not _owner_bindings(manager)
+    assert not _pending_releases(manager)
 
 
-def test_backward_consumes_recompute_output_binding_and_publishes_gradient():
+def test_backward_consumes_recompute_output_binding_and_publishes_gradient(monkeypatch):
     stream = torch.cuda.Stream()
     manager = ScheduleTensorLifetimeManager()
     forward_output = torch.empty(16, device="cuda")
     incoming_grad = torch.empty_like(forward_output)
     produced_grad = torch.empty_like(forward_output)
     _publish(manager, forward_output, stream, node="recompute forward")
+    recorded = []
+    original_record_stream = torch.Tensor.record_stream
+
+    def track_record_stream(tensor, consumer_stream):
+        recorded.append((tensor, consumer_stream))
+        return original_record_stream(tensor, consumer_stream)
+
+    monkeypatch.setattr(torch.Tensor, "record_stream", track_record_stream)
 
     _consume_output_grads_and_publish_input_grads(
         manager, incoming_grad, produced_grad, stream, forward_outputs=forward_output
     )
 
-    assert len(manager.owners) == 1
-    assert manager.owners[0].tensor is produced_grad
-    assert manager.stats["consumed"] == 1
-    assert manager.stats["record_stream_fallback"] == 1
+    owners = _owner_bindings(manager)
+    assert len(owners) == 1
+    assert owners[0].tensor is produced_grad
+    assert len(recorded) == 1
+    assert recorded[0][0] is incoming_grad
+    assert recorded[0][1] == stream
     manager.export(produced_grad)
 
 
@@ -320,9 +351,10 @@ def test_backward_rejects_output_and_input_grad_storage_alias():
     with pytest.raises(RuntimeError, match="does not support storage aliases"):
         _consume_output_grads_and_publish_input_grads(manager, output_grad, input_grad, consumer)
 
-    assert len(manager.owners) == 1
-    assert manager.owners[0].tensor is output_grad
-    assert manager.owners[0].stream.cuda_stream == owner.cuda_stream
+    owners = _owner_bindings(manager)
+    assert len(owners) == 1
+    assert owners[0].tensor is output_grad
+    assert owners[0].stream == owner
     manager.export(output_grad)
 
 
@@ -336,9 +368,9 @@ def test_noop_preserves_tensor_binding_until_real_consumer():
     assert NoopScheduleNode().backward(tensor) is tensor
     _consume_output_grads_and_publish_input_grads(manager, tensor, (), consumer)
 
-    assert not manager.owners
-    assert len(manager.pending) == 1
-    assert manager.pending[0].owner_stream.cuda_stream == owner.cuda_stream
+    assert not _owner_bindings(manager)
+    assert len(_pending_releases(manager)) == 1
+    assert tuple(manager._pending) == (owner,)
 
 
 def test_external_consumed_grad_records_stream_in_schedule_node(monkeypatch):
@@ -379,9 +411,8 @@ def test_external_consumed_grad_records_stream_in_schedule_node(monkeypatch):
     assert len(recorded) == 1
     assert recorded[0][0] is external_grad
     assert recorded[0][1].cuda_stream == consumer.cuda_stream
-    assert manager.stats["record_stream_fallback"] == 0
-    assert not manager.owners
-    assert not manager.pending
+    assert not _owner_bindings(manager)
+    assert not _pending_releases(manager)
 
 
 def test_no_external_consumed_grad_skips_record_stream(monkeypatch):
@@ -411,8 +442,9 @@ def test_no_external_consumed_grad_skips_record_stream(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "record_stream", unexpected_record_stream)
 
     assert node.backward(output_grad) is input_grad
-    assert len(manager.owners) == 1
-    assert manager.owners[0].tensor is input_grad
+    owners = _owner_bindings(manager)
+    assert len(owners) == 1
+    assert owners[0].tensor is input_grad
     manager.export(input_grad)
 
 
@@ -469,16 +501,16 @@ def test_full_graph_capture_drains_during_capture_not_replay():
             output = tensor + 1
             event.record(consumer)
         _consume_inputs_and_publish_outputs(manager, tensor, output, consumer)
-        _wait_and_drain(manager, event, capture_stream, "captured owner hand-back")
+        _wait_and_drain(manager, event, capture_stream)
         manager.finalize_phase(event, "capture", outputs=output)
 
-    assert not manager.pending
-    assert not manager.owners
-    capture_stats = manager.stats.copy()
+    assert not _pending_releases(manager)
+    assert not _owner_bindings(manager)
     for _ in range(3):
         graph.replay()
     torch.cuda.synchronize()
 
     assert torch.all(output == 8)
     # Python owner bookkeeping only ran during capture, not during replay.
-    assert manager.stats == capture_stats
+    assert not _pending_releases(manager)
+    assert not _owner_bindings(manager)

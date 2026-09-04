@@ -1,5 +1,28 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+"""Combined 1F1B schedules for fine-grained expert-parallel overlap.
+
+The schedule decomposes a model chunk into nodes and co-schedules forward and
+backward nodes from different microbatches on compute and communication streams.
+
+Tensor lifetime optimization
+----------------------------
+When ``ep_overlap_use_scheduled_tensor_lifetime`` is enabled, every model-chunk
+plan tracks the producer stream of CUDA tensors passed between its real schedule
+nodes.  A same-stream consumer can release a retired tensor immediately.  A
+cross-stream consumer instead keeps a strong reference until the producer stream
+next acquires the plan's shared event; that existing wait orders the producer
+after the consumer, so storage can become reusable without adding another event
+edge or relying on the caching allocator's longer ``record_stream`` lifetime.
+
+The tracking is deliberately plan-local.  Inputs and detached gradients that
+enter outside the managed node chain keep the conservative ``record_stream``
+path.  Phase finalization hands remaining deferred tensors back to their producer
+streams and exports outputs leaving the plan.  Distinct edge tensors sharing one
+storage are rejected because tensor-object ownership cannot safely represent
+aliases when an input's entire storage may be released.
+"""
+
 import contextlib
 from contextlib import nullcontext
 from typing import List, Union

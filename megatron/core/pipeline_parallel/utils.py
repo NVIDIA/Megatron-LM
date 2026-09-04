@@ -345,7 +345,7 @@ class ScheduleNode:
                 # The wait above transfers every previously consumed tensor owned by
                 # this plan back to its creation stream before storage becomes reusable.
                 if self.lifetime_manager is not None:
-                    self.lifetime_manager.drain(self.stream, name or self.name)
+                    self.lifetime_manager.drain(self.stream)
                 yield
         finally:
             if name:
