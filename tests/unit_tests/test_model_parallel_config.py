@@ -29,6 +29,45 @@ def test_invalid_thd_tail_padding_policy_is_rejected_during_config_initializatio
         ModelParallelConfig(thd_tail_padding_policy="bogus")
 
 
+def test_pipeline_p2p_fixed_shape_requires_sequence_packing():
+    with pytest.raises(ValueError, match="requires a sequence_packing_scheduler"):
+        ModelParallelConfig(
+            pipeline_p2p_fixed_shape=True,
+            max_seqlen_per_dp_cp_rank=2048,
+            pad_packed_seq_alignment="max",
+        )
+
+
+def test_pipeline_p2p_fixed_shape_requires_max_padding():
+    with pytest.raises(ValueError, match="requires pad_packed_seq_alignment='max'"):
+        ModelParallelConfig(
+            pipeline_p2p_fixed_shape=True,
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=2048,
+            pad_packed_seq_alignment=128,
+        )
+
+
+def test_pipeline_p2p_fixed_shape_rejects_dynamic_context_parallel():
+    with pytest.raises(ValueError, match="not supported with dynamic_context_parallel"):
+        ModelParallelConfig(
+            pipeline_p2p_fixed_shape=True,
+            dynamic_context_parallel=True,
+            max_seqlen_per_dp_cp_rank=2048,
+            pad_packed_seq_alignment="max",
+        )
+
+
+def test_pipeline_p2p_fixed_shape_accepts_static_max_padding():
+    config = ModelParallelConfig(
+        pipeline_p2p_fixed_shape=True,
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=2048,
+        pad_packed_seq_alignment="max",
+    )
+    assert config.pipeline_p2p_fixed_shape
+
+
 def test_contiguous_context_parallel_rejects_bshd_inputs():
     with pytest.raises(
         ValueError,
