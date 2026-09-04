@@ -515,6 +515,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self._reset_pending_kv_imports()
         self.clear_vision_embedding_cache()
         self.context.reset()
+        self.controller._async_sched_logits.clear()
 
         # Request state.
         self.request_counter = Counter()
@@ -1211,6 +1212,7 @@ class DynamicInferenceEngine(AbstractEngine):
         waiting_request_ids = list(self.waiting_request_ids)
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
         if self.context.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
+            self.controller._async_sched_logits.clear()
             recompute_active_ids = active_request_ids
 
             # Reset any partially prefilled requests so they recompute from the start
@@ -2181,14 +2183,17 @@ class DynamicInferenceEngine(AbstractEngine):
                 if top_n_logprobs is not None and req_idx in top_n_logprobs:
                     top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
 
-            # Process log_probs if available (unified for both regular and chunked prefill)
+            # Process requested log_probs (unified for both regular and chunked prefill)
             # Skip for requests being finished due to stop words — tokens are not
             # appended for these requests, so log probs must also be skipped to keep
             # the two lists in sync.
             if (
-                request_log_probs is not None
+                request.sampling_params.return_log_probs
                 and request_id not in self.stop_word_being_finished_ids
             ):
+                assert (
+                    request_log_probs is not None
+                ), f"Request {request_id} requested log probs, but none were produced."
                 # Initialize lists if they don't exist
                 if not request.prompt_log_probs:
                     request.prompt_log_probs = []
