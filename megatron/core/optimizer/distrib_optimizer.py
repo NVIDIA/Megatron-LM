@@ -74,6 +74,9 @@ from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end,
 
 logger = getLogger(__name__)
 
+_FQN_SAFE_DTYPE_KEY_VERSION = 3.1
+_LOADED_CHECKPOINT_VERSION_KEY = '_loaded_checkpoint_version'
+
 
 def _get_dtype_param_grad_key(param_dtype, grad_dtype):
     """Return the checkpoint-safe key for a parameter/gradient dtype pair."""
@@ -135,67 +138,50 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         'fsdp_dtensor',
     }
 
-    def _back_compat_normalize_loaded_dtype_keys(
-        self, state_dict: Optional[dict], checkpoint_version: Optional[float] = None
+    def _back_compat_rewrite_loaded_dtype_fqns(
+        self, state_dict: Optional[dict], checkpoint_version: Optional[float]
     ) -> None:
-        """Adapt legacy dtype FQNs and normalize loaded tuple keys.
-
-        Before loading a checkpoint older than version 3.1, rewrite the loading template's
-        ShardedTensor keys to the legacy dtype FQNs stored in that checkpoint. After loading,
-        normalize any tuple dtype keys in the loaded state to the current string format.
-        """
-        if state_dict is None:
+        """Use the legacy dtype FQNs when loading a checkpoint older than version 3.1."""
+        if (
+            state_dict is None
+            or checkpoint_version is None
+            or checkpoint_version >= _FQN_SAFE_DTYPE_KEY_VERSION
+        ):
             return
 
-        if checkpoint_version is not None and checkpoint_version < 3.1:
-            dtype_fqn_replacements = {
-                f'.dtype_{_get_dtype_param_grad_key(buffer.param_dtype, buffer.grad_dtype)}.': (
-                    f'.dtype_{(buffer.param_dtype, buffer.grad_dtype)}.'
-                )
-                for buffer in self.buffers
-            }
-            for value in nested_values(state_dict):
-                if not isinstance(value, ShardedTensor):
-                    continue
-                for current_dtype_fqn, legacy_dtype_fqn in dtype_fqn_replacements.items():
-                    if current_dtype_fqn in value.key:
-                        value.key = value.key.replace(current_dtype_fqn, legacy_dtype_fqn, 1)
-                        break
-
-        def normalize_dtype_keys(dtype_state):
-            if not isinstance(dtype_state, dict):
-                return
-            for dtype in list(dtype_state):
-                if isinstance(dtype, (str, int)):
-                    continue
-                if not isinstance(dtype, tuple):
-                    raise TypeError(
-                        'Optimizer checkpoint dtype key must be a string, integer, or tuple, '
-                        f'got {type(dtype).__name__}: {dtype!r}'
-                    )
-                if len(dtype) != 2:
-                    raise TypeError(
-                        'Legacy optimizer checkpoint dtype tuple must contain parameter and '
-                        f'gradient dtypes, got {dtype!r}'
-                    )
-                checkpoint_key = _get_dtype_param_grad_key(*dtype)
-                if checkpoint_key in dtype_state:
-                    raise ValueError(
-                        f'Optimizer state contains both legacy dtype key {dtype!r} and '
-                        f'checkpoint dtype key {checkpoint_key!r}'
-                    )
-                dtype_state[checkpoint_key] = dtype_state.pop(dtype)
-
-        for gbuf_idx, dtype_state in state_dict.items():
-            if isinstance(gbuf_idx, int):
-                normalize_dtype_keys(dtype_state)
-
-        for per_bucket_key in ('per_bucket_numel', 'per_bucket_numel_unpadded'):
-            per_bucket_values = state_dict.get(per_bucket_key)
-            if not isinstance(per_bucket_values, list):
+        dtype_fqn_replacements = {
+            f'.dtype_{_get_dtype_param_grad_key(buffer.param_dtype, buffer.grad_dtype)}.': (
+                f'.dtype_{(buffer.param_dtype, buffer.grad_dtype)}.'
+            )
+            for buffer in self.buffers
+        }
+        for value in nested_values(state_dict):
+            if not isinstance(value, ShardedTensor):
                 continue
-            for dtype_state in per_bucket_values:
-                normalize_dtype_keys(dtype_state)
+            for current_dtype_fqn, legacy_dtype_fqn in dtype_fqn_replacements.items():
+                if current_dtype_fqn in value.key:
+                    value.key = value.key.replace(current_dtype_fqn, legacy_dtype_fqn, 1)
+                    break
+
+    @staticmethod
+    def _back_compat_loaded_dtype_key(
+        dtype_state: dict,
+        current_dtype_key: str,
+        param_dtype: torch.dtype,
+        grad_dtype: torch.dtype,
+        checkpoint_version: Optional[float],
+    ):
+        """Select the dtype key present in a current or legacy loaded state dictionary."""
+        if current_dtype_key in dtype_state:
+            return current_dtype_key
+
+        legacy_dtype_key = (param_dtype, grad_dtype)
+        if (
+            checkpoint_version is None or checkpoint_version < _FQN_SAFE_DTYPE_KEY_VERSION
+        ) and legacy_dtype_key in dtype_state:
+            return legacy_dtype_key
+
+        return current_dtype_key
 
     @classmethod
     def _build_model_gbuf_param_range_map(
@@ -1157,7 +1143,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 f'Loading distributed optimizer sharded state of type {sharding_type}',
             )
             if sharding_type == 'dp_zero_gather_scatter':
-                self.load_parameter_state_from_dp_zero(param_state)
+                checkpoint_version = state_dict.pop(_LOADED_CHECKPOINT_VERSION_KEY, None)
+                self.load_parameter_state_from_dp_zero(
+                    param_state, checkpoint_version=checkpoint_version
+                )
             elif sharding_type == 'fully_reshardable':
                 self.load_parameter_state_from_fully_reshardable(param_state)
             elif sharding_type == 'dp_reshardable':
@@ -1659,6 +1648,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         state_dict['param_state'] = param_state
         state_dict['param_state_sharding_type'] = sharding_type
+        if is_loading and sharding_type == 'dp_zero_gather_scatter':
+            state_dict[_LOADED_CHECKPOINT_VERSION_KEY] = LocalNonpersistentObject(
+                (metadata or {}).get('checkpoint_version')
+            )
         return state_dict
 
     def _param_groups_to_param2group_meta(
@@ -2064,7 +2057,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 replica_id=(self.distributed_optimizer_instance_id, 0, 0),
                             )
         if is_loading:
-            self._back_compat_normalize_loaded_dtype_keys(
+            self._back_compat_rewrite_loaded_dtype_fqns(
                 state, checkpoint_version=(metadata or {}).get('checkpoint_version')
             )
         return state
@@ -2157,10 +2150,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Inverse of the `get_parameter_state_dp_reshardable` method.
         """
-        self._back_compat_normalize_loaded_dtype_keys(state_dict)
         if state_dict is not None and "per_bucket_numel_unpadded" in state_dict:
             per_bucket_numel_unpadded_in_checkpoint = state_dict["per_bucket_numel_unpadded"]
-            assert self.per_bucket_numel_unpadded == per_bucket_numel_unpadded_in_checkpoint, (
+            assert all(
+                len(dtype_state) == 1 for dtype_state in per_bucket_numel_unpadded_in_checkpoint
+            )
+            current_numel_unpadded = [
+                next(iter(dtype_state.values())) for dtype_state in self.per_bucket_numel_unpadded
+            ]
+            checkpoint_numel_unpadded = [
+                next(iter(dtype_state.values()))
+                for dtype_state in per_bucket_numel_unpadded_in_checkpoint
+            ]
+            assert current_numel_unpadded == checkpoint_numel_unpadded, (
                 f"Number of unpadded elements in each bucket need to be the same in current run "
                 f"({self.per_bucket_numel_unpadded}) and checkpoint "
                 f"({per_bucket_numel_unpadded_in_checkpoint})"
@@ -2346,7 +2348,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 recv_tensor[gbuf_local_start:gbuf_local_end]
                             )
 
-    def load_parameter_state_from_dp_zero(self, state_dict, *, update_legacy_format=False):
+    def load_parameter_state_from_dp_zero(
+        self, state_dict, *, update_legacy_format=False, checkpoint_version: Optional[float] = None
+    ):
         """Load parameter state (i.e., parameter & optimizer tensors) from DP 0 rank,
         using the new checkpoint format with coalesced state across buckets.
 
@@ -2363,8 +2367,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if update_legacy_format:
             return self.load_parameter_state_from_dp_zero_legacy(state_dict)
 
-        self._back_compat_normalize_loaded_dtype_keys(state_dict)
-
         # Data parallelism variables.
         assert self.data_parallel_group_gloo is not None
         data_parallel_world_size = self.data_parallel_group_gloo.size()
@@ -2376,14 +2378,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         if data_parallel_rank == 0:
             # Do nothing if "--fp8-param-gather" is not used.
-            self.split_state_dict_if_needed(state_dict)
+            self.split_state_dict_if_needed(state_dict, checkpoint_version=checkpoint_version)
 
         # Scatter tensors to all DP ranks.
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
             for dtype, gbuf_range_map_for_all_buckets in gbuf_range_maps.items():
                 if data_parallel_rank == 0:
+                    buffer = self.buffers[gbuf_idx]
+                    checkpoint_dtype = self._back_compat_loaded_dtype_key(
+                        state_dict[gbuf_idx],
+                        dtype,
+                        buffer.param_dtype,
+                        buffer.grad_dtype,
+                        checkpoint_version,
+                    )
+                    checkpoint_dtype_state = state_dict[gbuf_idx][checkpoint_dtype]
                     buffer_numel_unpadded = self.buffers[gbuf_idx].numel_unpadded
-                    checkpoint_numel_unpadded = state_dict[gbuf_idx][dtype]["numel_unpadded"]
+                    checkpoint_numel_unpadded = checkpoint_dtype_state["numel_unpadded"]
                     assert buffer_numel_unpadded == checkpoint_numel_unpadded, (
                         f"Number of unpadded elements must be same in current run "
                         f"({buffer_numel_unpadded}) and checkpoint ({checkpoint_numel_unpadded})"
@@ -2410,7 +2421,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                         # Scatter tensor list.
                         if data_parallel_rank == 0:
-                            world_tensors = state_dict[gbuf_idx][dtype][key]
+                            world_tensors = checkpoint_dtype_state[key]
 
                             start = offset_in_world_tensors
                             end = offset_in_world_tensors + gbuf_world_numel_unpadded
@@ -2503,7 +2514,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer._sync_hdo_state_to_sub_optimizers()
 
-    def split_state_dict_if_needed(self, state_dict):
+    def split_state_dict_if_needed(self, state_dict, checkpoint_version: Optional[float] = None):
         """
         When "--fp8-param-gather" is disabled, weights and biases are stored in the same
         `_ParamAndGradBuffer`. So, when saving a checkpoint, the optimizer's main parameters are
@@ -2529,7 +2540,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             if key != 'buckets_coalesced':
                 for dtype in state_dict[key].keys():
                     assert dtype not in dtype_to_gbuf_idx
-                    if isinstance(dtype, str) and dtype.startswith('dtype_param_torch:uint8_grad_'):
+                    legacy_uint8_key = (
+                        isinstance(dtype, tuple) and len(dtype) == 2 and dtype[0] == torch.uint8
+                    )
+                    current_uint8_key = isinstance(dtype, str) and dtype.startswith(
+                        'dtype_param_torch:uint8_grad_'
+                    )
+                    if legacy_uint8_key or current_uint8_key:
                         # If the `state_dict`` already contains a torch.uint8 buffer, we assumed
                         # that the fp8 weights and fp16/bf16 biases in the checkpoint are already
                         # separated. In this case, no action is required, so we can return directly.
@@ -2542,7 +2559,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
             for dtype, _ in gbuf_range_maps.items():
                 if not self._is_distopt_quantized_param(self.buffers[gbuf_idx].params[0]):
-                    new_state_dict[gbuf_idx] = state_dict[dtype_to_gbuf_idx[dtype]]
+                    buffer = self.buffers[gbuf_idx]
+                    checkpoint_dtype = self._back_compat_loaded_dtype_key(
+                        dtype_to_gbuf_idx,
+                        dtype,
+                        buffer.param_dtype,
+                        buffer.grad_dtype,
+                        checkpoint_version,
+                    )
+                    new_state_dict[gbuf_idx] = state_dict[dtype_to_gbuf_idx[checkpoint_dtype]]
 
         for fp8_gbuf_idx in fp8_gbuf_indices:
             # Note that `self.buffers[fp8_gbuf_idx].params[0].dtype` is the dummy dtype of
@@ -2558,6 +2583,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     if dtype == non_fp8_param_and_grad_dtype:
                         non_fp8_gbuf_idx = gbuf_idx
             assert non_fp8_gbuf_idx is not None
+            checkpoint_non_fp8_dtype = self._back_compat_loaded_dtype_key(
+                state_dict[non_fp8_gbuf_idx],
+                non_fp8_param_and_grad_dtype,
+                self.buffers[fp8_gbuf_idx].params[0].dtype,
+                self.buffers[fp8_gbuf_idx].grad_dtype,
+                checkpoint_version,
+            )
 
             # We need the fp8_flags to determine the order of weight (fp8) and bias (fp16/bf16) in
             # the buffer.
@@ -2602,7 +2634,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Split the target buffer into two separate buffers.
             fp8_state_dict, non_fp8_state_dict = {}, {}
             for key in ('param',) + self.optimizer_state_keys:
-                tensor = state_dict[non_fp8_gbuf_idx][non_fp8_param_and_grad_dtype][key]
+                tensor = state_dict[non_fp8_gbuf_idx][checkpoint_non_fp8_dtype][key]
                 fp8_tensor = torch.empty([fp8_offsets[-1]], dtype=tensor.dtype)
                 non_fp8_tensor = torch.empty([non_fp8_offsets[-1]], dtype=tensor.dtype)
 
@@ -2626,9 +2658,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             non_fp8_state_dict['numel_unpadded'] = non_fp8_offsets[-1]
 
             # Add the two separate buffers into `new_state_dict`.
-            new_state_dict[fp8_gbuf_idx] = {}
-            new_state_dict[fp8_gbuf_idx][(torch.uint8, fp8_buffer.grad_dtype)] = fp8_state_dict
-            new_state_dict[non_fp8_gbuf_idx][non_fp8_param_and_grad_dtype] = non_fp8_state_dict
+            fp8_param_and_grad_dtype = _get_dtype_param_grad_key(torch.uint8, fp8_buffer.grad_dtype)
+            new_state_dict[fp8_gbuf_idx] = {fp8_param_and_grad_dtype: fp8_state_dict}
+            new_state_dict[non_fp8_gbuf_idx] = {non_fp8_param_and_grad_dtype: non_fp8_state_dict}
 
         # Inplace update state_dict
         state_dict.clear()
