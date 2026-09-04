@@ -46,7 +46,10 @@ from megatron.core.transformer.moe.moe_utils import (
     unpermute,
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
-from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
+from megatron.core.transformer.moe.virtual_expert_load_balancer import (
+    VirtualExpertLoadBalancer,
+    VirtualExpertPlan,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 """ We use the following notation throughout this file:
@@ -1246,7 +1249,7 @@ class _HybridEPManager(_DispatchManager):
         return self.tokens_per_expert
 
 
-class _ReplicaHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager):
+class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager):
     """Glue virtual-expert load balancing onto the HybridEP transport."""
 
     def __init__(self, group, num_local_experts: int, router_topk: int, num_experts: int, config):
@@ -1267,21 +1270,40 @@ class _ReplicaHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager):
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         self.setup_virtual_expert_metadata(routing_map, probs)
 
+    @staticmethod
+    def map_virtual_expert_plan_to_hybridep(
+        plan: VirtualExpertPlan, topk_probs: torch.Tensor, num_experts: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Scatter compact virtual routes into HybridEP's dense routing metadata."""
+        if plan.virtual_experts.shape != topk_probs.shape:
+            raise ValueError(
+                "Virtual-expert routes and top-k probabilities must have the same shape, got "
+                f"{tuple(plan.virtual_experts.shape)} and {tuple(topk_probs.shape)}."
+            )
+        dense_shape = (int(plan.virtual_experts.shape[0]), num_experts)
+        routing_map = torch.zeros(
+            dense_shape, dtype=torch.bool, device=plan.virtual_experts.device
+        )
+        dense_probs = torch.zeros(dense_shape, dtype=torch.float32, device=topk_probs.device)
+        routing_map.scatter_(1, plan.virtual_experts, True)
+        dense_probs.scatter_(1, plan.virtual_experts, topk_probs.to(torch.float32))
+        return routing_map, dense_probs
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
-        hidden_states, routing_map, token_probs, num_permuted_tokens = (
-            self.prepare_virtual_expert_dispatch(
-                hidden_states,
-                num_runtime_experts=self.num_local_experts,
-                alignment=self._quantization_alignment(),
-            )
+        hidden_states, plan, self.num_permuted_tokens = self.prepare_virtual_expert_dispatch(
+            hidden_states,
+            num_runtime_experts=self.num_local_experts,
+            alignment=self._quantization_alignment(),
+        )
+        routing_map, token_probs = self.map_virtual_expert_plan_to_hybridep(
+            plan, self.semantic_token_probs, num_experts=self.num_experts
         )
         super().setup_metadata(routing_map, token_probs)
-        self.num_permuted_tokens = num_permuted_tokens
         return super().dispatch(
             hidden_states,
             async_finish=async_finish,
@@ -1925,7 +1947,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
         elif self.config.moe_flex_dispatcher_backend == "hybridep":
             if self.config.moe_virtual_expert_load_balance:
-                self._comm_manager = _ReplicaHybridEPManager(
+                self._comm_manager = _VirtualExpertHybridEPManager(
                     group=self.tp_ep_group,
                     num_local_experts=self.num_local_experts,
                     router_topk=self.config.moe_router_topk,

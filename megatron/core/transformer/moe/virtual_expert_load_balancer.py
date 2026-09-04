@@ -1,18 +1,18 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Virtual-expert load balancing, replica planning, and runtime weight movement.
+"""Virtual-expert load balancing, virtual-expert planning, and runtime weight movement.
 
 Every EP rank exposes ``2 * L`` runtime experts to HybridEP: its ``L`` native
-experts followed by ``L`` replica slots. Each rank gathers the per-rank expert
+experts followed by ``L`` virtual-expert slots. Each rank gathers the per-rank expert
 histogram and independently derives the same placement. ``experts_to_copy[d, s]``
 names the semantic expert whose weights destination ``d`` must hold in slot
 ``s`` (``-1`` if unused), and ``virtual_experts[token, k]`` rewrites each
-semantic route to a rank-major runtime id: native ``d * 2L + local`` or replica
+semantic route to a rank-major runtime id: native ``d * 2L + local`` or virtual-expert
 ``d * 2L + L + slot``.
 
 The weight bridge materializes a plan. Before expert compute every owner pushes
-its selected weights into the peers' replica slots (MXFP8: rowwise storage in
-forward, columnwise in backward); after expert backward the replica gradients
+its selected weights into the peers' virtual-expert slots (MXFP8: rowwise storage in
+forward, columnwise in backward); after expert backward the virtual-expert gradients
 are reduced back into the owners' native wgrad staging, which autograd then
 hands to the optimizer parameters. The runtime parameters TE executes against
 alias the optimizer parameters (or their GTP gathers) for the natives and a
@@ -36,22 +36,22 @@ from megatron.core.jit import jit_fuser
 
 try:
     from megatron.core.transformer.moe.virtual_expert_triton import (
-        MAX_REPLICA_WEIGHT_SMS,
-        compile_replica_weight_kernels,
+        MAX_VIRTUAL_EXPERT_WEIGHT_SMS,
+        compile_virtual_expert_weight_kernels,
         launch_compact_routing_map,
-        launch_replica_grad_reduce,
-        launch_replica_placement,
-        launch_replica_weight_prefetch,
+        launch_virtual_expert_grad_reduce,
+        launch_virtual_expert_placement,
+        launch_virtual_expert_weight_prefetch,
     )
 
     _TRITON_AVAILABLE = True
 except ImportError:
-    MAX_REPLICA_WEIGHT_SMS = 32
-    compile_replica_weight_kernels = None
+    MAX_VIRTUAL_EXPERT_WEIGHT_SMS = 32
+    compile_virtual_expert_weight_kernels = None
     launch_compact_routing_map = None
-    launch_replica_grad_reduce = None
-    launch_replica_placement = None
-    launch_replica_weight_prefetch = None
+    launch_virtual_expert_grad_reduce = None
+    launch_virtual_expert_placement = None
+    launch_virtual_expert_weight_prefetch = None
     _TRITON_AVAILABLE = False
 from megatron.core.utils import nvtx_decorator
 
@@ -74,7 +74,7 @@ _MXFP8_COMPONENTS = (
 
 
 @dataclass(slots=True)
-class ReplicaPlan:
+class VirtualExpertPlan:
     """``virtual_experts``: int64 ``[num_tokens, router_topk]`` runtime ids;
     ``experts_to_copy``: int32 ``[ep_size, num_local_experts]`` semantic ids, ``-1`` if unused."""
 
@@ -83,7 +83,7 @@ class ReplicaPlan:
 
 
 @dataclass(slots=True)
-class ReplicaPlannerWorkspace:
+class VirtualExpertPlannerWorkspace:
     """Placement scratch for one ``(num_experts, ep_size)`` shape; every plan overwrites it."""
 
     num_experts: int
@@ -96,7 +96,7 @@ class ReplicaPlannerWorkspace:
     # Per-expert destination segment ends in this rank's local ordinal space, padded to a
     # power of two columns.
     destination_boundaries: torch.Tensor
-    expert_replica_slots: torch.Tensor  # [num_experts, ep_size] slot holding an expert on a rank
+    virtual_expert_slots: torch.Tensor  # [num_experts, ep_size] slot holding an expert on a rank
     experts_to_copy: torch.Tensor  # [ep_size, num_local_experts]
 
     @classmethod
@@ -104,7 +104,7 @@ class ReplicaPlannerWorkspace:
         """Allocate the scratch for one expert layout on ``device``."""
         if min(num_experts, ep_size) <= 0 or num_experts % ep_size:
             raise ValueError(
-                "Replica planner needs a positive, even expert distribution, got "
+                "Virtual-expert planner needs a positive, even expert distribution, got "
                 f"num_experts={num_experts}, ep_size={ep_size}."
             )
         int32 = dict(dtype=torch.int32, device=device)
@@ -119,7 +119,7 @@ class ReplicaPlannerWorkspace:
             destination_boundaries=torch.empty(
                 (num_experts, 1 << (ep_size - 1).bit_length()), **int32
             ),
-            expert_replica_slots=torch.empty((num_experts, ep_size), **int32),
+            virtual_expert_slots=torch.empty((num_experts, ep_size), **int32),
             experts_to_copy=torch.empty((ep_size, num_experts // ep_size), **int32),
         )
 
@@ -133,7 +133,7 @@ def get_planner_workspace(*, num_experts: int, ep_size: int, device: torch.devic
     key = (num_experts, ep_size, device.index)
     workspace = _planner_workspaces.get(key)
     if workspace is None:
-        workspace = _planner_workspaces[key] = ReplicaPlannerWorkspace.allocate(
+        workspace = _planner_workspaces[key] = VirtualExpertPlannerWorkspace.allocate(
             num_experts=num_experts, ep_size=ep_size, device=device
         )
     return workspace
@@ -144,7 +144,7 @@ def _map_routes(
     topk_indices: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     destination_boundaries: torch.Tensor,
-    expert_replica_slots: torch.Tensor,
+    virtual_expert_slots: torch.Tensor,
     num_local_experts: int,
     ep_size: int,
 ) -> torch.Tensor:
@@ -162,7 +162,7 @@ def _map_routes(
     ends = (bucket_start[:, None] + boundaries).reshape(-1)
     positions = torch.arange(flat.numel(), device=flat.device, dtype=torch.int64)
     destination = torch.searchsorted(ends, positions, right=True) - experts * ep_size
-    slot = expert_replica_slots.view(-1)[experts * ep_size + destination]
+    slot = virtual_expert_slots.view(-1)[experts * ep_size + destination]
     runtime_local = torch.where(
         destination == experts // num_local_experts,
         experts % num_local_experts,
@@ -174,21 +174,21 @@ def _map_routes(
 
 
 def map_routes_to_runtime_experts(
-    topk_indices: torch.Tensor, tokens_per_expert: torch.Tensor, workspace: ReplicaPlannerWorkspace
+    topk_indices: torch.Tensor, tokens_per_expert: torch.Tensor, workspace: VirtualExpertPlannerWorkspace
 ) -> torch.Tensor:
     """Turn this rank's semantic routes into rank-major runtime expert ids under the
     placement held by ``workspace``.
 
     A route's stable ordinal among this rank's routes to its expert, offset by the routes
     earlier ranks send that expert (already folded into ``destination_boundaries``), selects
-    the destination segment; a remote destination runs it in the replica slot the placement
+    the destination segment; a remote destination runs it in the virtual-expert slot the placement
     assigned that expert there.
     """
     return _map_routes(
         topk_indices,
         tokens_per_expert,
         workspace.destination_boundaries,
-        workspace.expert_replica_slots,
+        workspace.virtual_expert_slots,
         workspace.num_local_experts,
         workspace.ep_size,
     )
@@ -222,15 +222,15 @@ def extract_semantic_routes(
     return torch.gather(probs, 1, token_indices.long()), token_indices, tokens_per_expert
 
 
-def plan_replica_routes(
+def plan_virtual_expert_routes(
     topk_indices: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     ep_group: dist.ProcessGroup,
-    workspace: ReplicaPlannerWorkspace,
+    workspace: VirtualExpertPlannerWorkspace,
     *,
-    on_placement_ready: Callable[[ReplicaPlan], None] | None = None,
-) -> ReplicaPlan:
-    """Plan deterministic replica placement for one EP group.
+    on_placement_ready: Callable[[VirtualExpertPlan], None] | None = None,
+) -> VirtualExpertPlan:
+    """Plan deterministic virtual-expert placement for one EP group.
 
     ``topk_indices`` (int32/int64 ``[num_tokens, router_topk]``) and ``tokens_per_expert``
     (int32 ``[num_experts]``) are this rank's semantic routes and histogram; every rank must
@@ -244,18 +244,18 @@ def plan_replica_routes(
         or tokens_per_expert.dtype != torch.int32
         or not (topk_indices.is_contiguous() and tokens_per_expert.is_contiguous())
     ):
-        raise ValueError("Replica planner inputs do not match the workspace shape or dtypes.")
+        raise ValueError("Virtual-expert planner inputs do not match the workspace shape or dtypes.")
     # The only cross-rank input; from here every rank computes the same placement.
     dist.all_gather_into_tensor(
         workspace.gathered_counts.view(-1), tokens_per_expert, group=ep_group
     )
-    launch_replica_placement(
+    launch_virtual_expert_placement(
         workspace.gathered_counts,
         workspace.balance,
         workspace.allocation,
         workspace.destination_boundaries,
         workspace.experts_to_copy,
-        workspace.expert_replica_slots,
+        workspace.virtual_expert_slots,
         workspace.placement_grid_sync,
         rank_route_capacity=topk_indices.numel(),
         source_rank=dist.get_rank(group=ep_group),
@@ -265,29 +265,11 @@ def plan_replica_routes(
     )
     # A plan owns its outputs: the backward push and reduction read experts_to_copy and
     # autograd saves virtual_experts, possibly past another forward of the same layer.
-    plan = ReplicaPlan(None, workspace.experts_to_copy.clone())
+    plan = VirtualExpertPlan(None, workspace.experts_to_copy.clone())
     if on_placement_ready is not None:
         on_placement_ready(plan)
     plan.virtual_experts = map_routes_to_runtime_experts(topk_indices, tokens_per_expert, workspace)
     return plan
-
-
-def map_replica_plan_to_hybridep(
-    plan: ReplicaPlan, topk_probs: torch.Tensor, num_experts: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Scatter compact virtual routes into HybridEP's dense ``[num_tokens, num_experts]``
-    boolean routing map and float32 probabilities (``num_experts`` = runtime experts)."""
-    if plan.virtual_experts.shape != topk_probs.shape:
-        raise ValueError(
-            "Replica virtual experts and top-k probabilities must have the same shape, got "
-            f"{tuple(plan.virtual_experts.shape)} and {tuple(topk_probs.shape)}."
-        )
-    dense_shape = (int(plan.virtual_experts.shape[0]), num_experts)
-    routing_map = torch.zeros(dense_shape, dtype=torch.bool, device=plan.virtual_experts.device)
-    dense_probs = torch.zeros(dense_shape, dtype=torch.float32, device=topk_probs.device)
-    routing_map.scatter_(1, plan.virtual_experts, True)
-    dense_probs.scatter_(1, plan.virtual_experts, topk_probs.to(torch.float32))
-    return routing_map, dense_probs
 
 
 # --------------------------------------------------------------------------------------
@@ -318,13 +300,13 @@ def _wrap_mxfp8(template, shape, views, device) -> tuple[torch.Tensor, ...]:
     )
 
 
-class _ReplicaWeightWorkspace:
-    """Symmetric arenas and streams shared by every replica MoE layer of one EP group.
+class _VirtualExpertWeightWorkspace:
+    """Symmetric arenas and streams shared by every virtual-expert MoE layer of one EP group.
 
     The weight arena holds ``fc1 data, fc1 scales, fc2 data, fc2 scales`` with ``L``
     members per section (the scale sections are empty for BF16; MXFP8 keeps one because
     only one GEMM orientation is live at a time). The gradient arena holds ``fc1, fc2``.
-    One layer's replicas are live at a time: the planner's histogram all-gather orders
+    One layer's virtual experts are live at a time: the planner's histogram all-gather orders
     every push after the expert GEMMs that read the previous contents, and the
     reduction's exit rendezvous orders every slot rewrite after the owners' reads.
     """
@@ -362,7 +344,7 @@ class _ReplicaWeightWorkspace:
             self.grad_handle = symm_mem.rendezvous(self.grad_arena, group)
         except RuntimeError as exc:
             raise RuntimeError(
-                "Replica weights could not allocate NCCL symmetric memory for the EP group; "
+                "Virtual-expert weights could not allocate NCCL symmetric memory for the EP group; "
                 "the EP group must lie within one NVLink domain."
             ) from exc
         self.weight_arena.zero_()
@@ -374,12 +356,12 @@ class _ReplicaWeightWorkspace:
         self.weight_streams = (torch.cuda.Stream(device=device), torch.cuda.Stream(device=device))
         self.grad_stream = torch.cuda.Stream(device=device)
         # Full native wgrad staging per projection: TE's GEMM overwrites it, the
-        # reduction adds the replica partials, autograd hands it to the optimizer.
+        # reduction adds the virtual-expert partials, autograd hands it to the optimizer.
         self.native_grads = tuple(
             torch.empty((num_local_experts, *shape), dtype=grad_dtype, device=device)
             for shape in member_shapes
         )
-        compile_replica_weight_kernels(
+        compile_virtual_expert_weight_kernels(
             world_size=world_size,
             num_local_experts=num_local_experts,
             member_numels=self.member_numels,
@@ -410,7 +392,7 @@ class _ReplicaWeightWorkspace:
         return data, scales.view(count, scale_numel)
 
     def grad_slots(self, projection: int) -> torch.Tensor:
-        """Return the ``[L, *shape]`` replica gradient slots of one projection."""
+        """Return the ``[L, *shape]`` virtual-expert gradient slots of one projection."""
         count, numel = self.num_local_experts, self.member_numels[projection]
         offset = count * sum(self.member_numels[:projection])
         return self.grad_arena.narrow(0, offset, count * numel).view(
@@ -428,21 +410,21 @@ _workspaces: dict = {}
 _bridges = weakref.WeakSet()
 
 
-def _get_workspace(group, device, config: tuple) -> _ReplicaWeightWorkspace:
+def _get_workspace(group, device, config: tuple) -> _VirtualExpertWeightWorkspace:
     key = (id(group), device.index)
     workspace = _workspaces.get(key)
     if workspace is None:
-        workspace = _workspaces[key] = _ReplicaWeightWorkspace(group, device, config)
+        workspace = _workspaces[key] = _VirtualExpertWeightWorkspace(group, device, config)
     elif workspace.config != config:
         raise ValueError(
-            "All replica MoE layers on an EP group must share one weight shape and launch "
+            "All virtual-expert MoE layers on an EP group must share one weight shape and launch "
             f"configuration; expected {workspace.config}, got {config}."
         )
     return workspace
 
 
-def finalize_replica_weight_bridges() -> None:
-    """Release every replica arena before its process group is destroyed."""
+def finalize_virtual_expert_weight_bridges() -> None:
+    """Release every virtual-expert arena before its process group is destroyed."""
     for bridge in list(_bridges):
         bridge.destroy()
     for workspace in _workspaces.values():
@@ -457,16 +439,16 @@ def _drop_grad(parameter: torch.nn.Parameter) -> None:
     parameter.grad = None
 
 
-class _ReplicaProjection:
+class _VirtualExpertProjection:
     """One projection's optimizer parameters, runtime parameters and pointer tables.
 
-    The ``2L`` runtime parameters are the natives followed by the replica slots. Their
+    The ``2L`` runtime parameters are the natives followed by the virtual-expert slots. Their
     ``main_grad`` is the native staging or the slot's gradient arena member and carries
     ``overwrite_main_grad``, so TE's wgrad GEMM rewrites every member on each backward
     and the slots never need clearing (a planned slot always receives tokens).
     """
 
-    def __init__(self, name, parameters, workspace: _ReplicaWeightWorkspace, index: int):
+    def __init__(self, name, parameters, workspace: _VirtualExpertWeightWorkspace, index: int):
         self.name = name
         self.parameters = parameters
         self.index = index
@@ -567,7 +549,7 @@ class _ReplicaProjection:
                     or storage.dtype != dtype
                 ):
                     raise ValueError(
-                        f"{self.name} replica source {name} must be contiguous {dtype} with "
+                        f"{self.name} virtual-expert source {name} must be contiguous {dtype} with "
                         f"{count} elements, got {storage.dtype} {tuple(storage.shape)}."
                     )
         for parameter, source in zip(self.runtime_parameters, sources):
@@ -588,8 +570,8 @@ class _ReplicaProjection:
             parameter.main_grad = None
 
 
-class ReplicaWeightBridge:
-    """Asynchronous replica weight push and gradient reduction for one MoE layer."""
+class VirtualExpertWeightBridge:
+    """Asynchronous virtual-expert weight push and gradient reduction for one MoE layer."""
 
     def __init__(
         self,
@@ -628,11 +610,11 @@ class ReplicaWeightBridge:
             member_shapes,
             is_mxfp8tensor(parameters[0][0]),
             grad_dtype,
-            min(32 if num_sms is None else int(num_sms), MAX_REPLICA_WEIGHT_SMS),
+            min(32 if num_sms is None else int(num_sms), MAX_VIRTUAL_EXPERT_WEIGHT_SMS),
         )
         self.workspace = _get_workspace(group, self.device, config)
         self.projections = [
-            _ReplicaProjection(f"FC{i + 1}", parameters[i], self.workspace, i) for i in range(2)
+            _VirtualExpertProjection(f"FC{i + 1}", parameters[i], self.workspace, i) for i in range(2)
         ]
         # CUDA events are created lazily on first record; materialize them before
         # training or graph capture.
@@ -644,12 +626,12 @@ class ReplicaWeightBridge:
 
     @property
     def runtime_fc1_weights(self) -> tuple[torch.nn.Parameter, ...]:
-        """Native-then-replica FC1 runtime parameters."""
+        """Native-then-virtual-expert FC1 runtime parameters."""
         return self.projections[0].runtime_parameters
 
     @property
     def runtime_fc2_weights(self) -> tuple[torch.nn.Parameter, ...]:
-        """Native-then-replica FC2 runtime parameters."""
+        """Native-then-virtual-expert FC2 runtime parameters."""
         return self.projections[1].runtime_parameters
 
     @property
@@ -658,11 +640,11 @@ class ReplicaWeightBridge:
         return tuple(parameter for p in self.projections for parameter in p.parameters)
 
     @torch.no_grad()
-    @nvtx_decorator(message="replica_weight_push_start")
-    def start_prefetch(self, plan: ReplicaPlan, direction: int = FORWARD) -> None:
+    @nvtx_decorator(message="virtual_expert_weight_push_start")
+    def start_prefetch(self, plan: VirtualExpertPlan, direction: int = FORWARD) -> None:
         """Enqueue the owner push of the plan's FC1/FC2 weights on the weight stream."""
         if self._prefetch_plan is not None:
-            raise RuntimeError("Replica weight prefetch is already outstanding.")
+            raise RuntimeError("Virtual-expert weight prefetch is already outstanding.")
         if direction == FORWARD:
             # DDP/FSDP parameter hooks (all-gathers) must run before the push reads them.
             self._experts_ref().prepare_fused_impl_parameters()
@@ -675,7 +657,7 @@ class ReplicaWeightBridge:
         weight_stream.wait_stream(current_stream)
         tables = tuple(projection.tables[direction] for projection in self.projections)
         with torch.cuda.stream(weight_stream):
-            launch_replica_weight_prefetch(
+            launch_virtual_expert_weight_prefetch(
                 sources=tuple(table[0] for table in tables),
                 scale_sources=tuple(table[1] for table in tables) if workspace.mxfp8 else None,
                 arena=workspace.weight_arena,
@@ -693,35 +675,37 @@ class ReplicaWeightBridge:
         self._prefetch_plan = plan
 
     @torch.no_grad()
-    @nvtx_decorator(message="replica_weight_push_wait")
-    def wait_prefetch(self, plan: ReplicaPlan) -> None:
+    @nvtx_decorator(message="virtual_expert_weight_push_wait")
+    def wait_prefetch(self, plan: VirtualExpertPlan) -> None:
         """Make the current stream wait for the push of ``plan``."""
         if self._prefetch_plan is None:
             # Waiting again for the resident plan is a no-op; anything else never started.
             if plan is None or plan is not self._completed_plan:
-                raise RuntimeError("Replica weights require a started prefetch before use.")
+                raise RuntimeError("Virtual-expert weights require a started prefetch before use.")
         elif self._prefetch_plan is not plan:
-            raise RuntimeError("Replica weight prefetch plan changed while outstanding.")
+            raise RuntimeError("Virtual-expert weight prefetch plan changed while outstanding.")
         torch.cuda.current_stream(self.device).wait_event(self.prefetch_done)
         self._completed_plan, self._prefetch_plan = plan, None
 
-    def wait_prefetch_for_backward(self, plan: ReplicaPlan) -> None:
+    def wait_prefetch_for_backward(self, plan: VirtualExpertPlan) -> None:
         """Wait for the backward push and remember the plan the expert backward reduces."""
         self.wait_prefetch(plan)
         self._backward_plan = plan
 
     @torch.no_grad()
-    @nvtx_decorator(message="replica_grad_reduce_start")
+    @nvtx_decorator(message="virtual_expert_grad_reduce_start")
     def start_grad_reduce(self, projection: int) -> None:
-        """Enqueue the replica-gradient reduction of one projection (0 = FC1, 1 = FC2)."""
+        """Enqueue the virtual-expert-gradient reduction of one projection (0 = FC1, 1 = FC2)."""
         if self._backward_plan is None:
-            raise RuntimeError("Replica gradient reduction needs the backward plan.")
+            raise RuntimeError("Virtual-expert gradient reduction needs the backward plan.")
         if projection in self._reduced:
-            raise RuntimeError(f"Replica gradient reduction of FC{projection + 1} started twice.")
+            raise RuntimeError(
+                f"Virtual-expert gradient reduction of FC{projection + 1} started twice."
+            )
         workspace = self.workspace
         workspace.grad_stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(workspace.grad_stream):
-            launch_replica_grad_reduce(
+            launch_virtual_expert_grad_reduce(
                 arena=workspace.grad_arena,
                 native_grads=tuple(p.native_grad_bases for p in self.projections),
                 peer_bases=workspace.grad_handle.buffer_ptrs_dev,
@@ -742,28 +726,28 @@ class ReplicaWeightBridge:
         """Start FC2's reduction from the expert backward, right behind FC2's wgrad GEMM."""
         self.start_grad_reduce(1)
 
-    def start_pending_grad_reduces(self, plan: ReplicaPlan) -> None:
+    def start_pending_grad_reduces(self, plan: VirtualExpertPlan) -> None:
         """Start every reduction not yet started, FC2 first, once dispatch backward is done.
 
         FC2 normally starts from the FC2 op's wgrad store; FC1 starts here and hides behind
         the latent, shared-expert and router backward.
         """
         if plan is not self._backward_plan:
-            raise RuntimeError("Replica gradient reduction is outstanding for another plan.")
+            raise RuntimeError("Virtual-expert gradient reduction is outstanding for another plan.")
         for projection in (1, 0):
             if projection not in self._reduced:
                 self.start_grad_reduce(projection)
 
     @torch.no_grad()
-    @nvtx_decorator(message="replica_grad_reduce_wait")
-    def wait_grad_reduce(self, plan: ReplicaPlan) -> tuple[torch.Tensor | None, ...]:
+    @nvtx_decorator(message="virtual_expert_grad_reduce_wait")
+    def wait_grad_reduce(self, plan: VirtualExpertPlan) -> tuple[torch.Tensor | None, ...]:
         """Finish both reductions and return one full wgrad per source parameter.
 
         GTP parameters reduce-scatter the staging themselves (FC2 first, as their linked
         reduce-scatter chain expects) and return what their protocol returns.
         """
         if plan is not self._backward_plan or self._reduced != {0, 1}:
-            raise RuntimeError("Replica gradient reduction of both projections must be started.")
+            raise RuntimeError("Virtual-expert gradient reduction of both projections must be started.")
         current_stream = torch.cuda.current_stream(self.device)
         for event in self.grad_reduce_done:
             current_stream.wait_event(event)
@@ -784,7 +768,7 @@ class ReplicaWeightBridge:
         experts = self._experts_ref()
         if experts is not None:
             experts._fused_ops = None
-            experts._replica_weight_bridge = None
+            experts._virtual_expert_weight_bridge = None
         for projection in self.projections:
             projection.destroy()
         self.projections.clear()
@@ -793,7 +777,7 @@ class ReplicaWeightBridge:
         _bridges.discard(self)
 
 
-class _ReplicaBackwardHook(torch.autograd.Function):
+class _VirtualExpertBackwardHook(torch.autograd.Function):
     """Run ``hook()`` when the gradient passes this point; the gradient itself is unchanged."""
 
     @staticmethod
@@ -807,8 +791,8 @@ class _ReplicaBackwardHook(torch.autograd.Function):
         return grad, None
 
 
-class _ReplicaWaitGradReduce(torch.autograd.Function):
-    """Finish the replica reductions and hand the wgrads to the source parameters.
+class _VirtualExpertWaitGradReduce(torch.autograd.Function):
+    """Finish the virtual-expert reductions and hand the wgrads to the source parameters.
 
     Applied to the MoE layer input so its backward runs after every consumer of the
     input (router, shared experts, latent projection). ``context.plan`` is filled in
@@ -850,9 +834,8 @@ class VirtualExpertLoadBalancer:
     """Mixin that plans virtual experts and manages their runtime weights.
 
     Dispatch managers provide the transport-specific glue: they feed semantic routes into
-    :meth:`setup_virtual_expert_metadata`, install the mapped routes returned by
-    :meth:`prepare_virtual_expert_dispatch`, and bracket their combine operation with the
-    corresponding pre/post helpers.
+    :meth:`setup_virtual_expert_metadata`, map the resulting plan into transport metadata,
+    and bracket their combine operation with the corresponding pre/post helpers.
     """
 
     def initialize_virtual_expert_load_balancer(
@@ -882,28 +865,60 @@ class VirtualExpertLoadBalancer:
         self.semantic_token_probs = None
         self.semantic_token_indices = None
         self.semantic_tokens_per_expert = None
+        self._experts_ref = None
         self._bridge = None
         self._plan = None
         self._context = None
 
     def bind_experts(self, experts: torch.nn.Module) -> None:
-        """Bind the expert module and its optimizer-owned weights to runtime expert slots."""
-        self._bridge = ReplicaWeightBridge(
+        """Remember the expert module; runtime slots are bound after main-grad initialization."""
+        self._experts_ref = weakref.ref(experts)
+
+    def _ensure_experts_bound(self) -> VirtualExpertWeightBridge:
+        """Bind runtime slots using the optimizer-owned main-gradient dtype."""
+        if self._bridge is not None:
+            return self._bridge
+        experts = self._experts_ref() if self._experts_ref is not None else None
+        if experts is None:
+            raise RuntimeError("Virtual-expert load balancer has no bound expert module.")
+
+        source_parameters = tuple(
+            linear.get_parameter(f"weight{index}")
+            for linear in (experts.linear_fc1, experts.linear_fc2)
+            for index in range(self.num_owned_experts)
+        )
+        main_grads = tuple(getattr(parameter, "main_grad", None) for parameter in source_parameters)
+        initialized_main_grads = tuple(grad for grad in main_grads if grad is not None)
+        if initialized_main_grads and len(initialized_main_grads) != len(main_grads):
+            raise RuntimeError(
+                "Virtual-expert source main gradients must be initialized for every expert weight."
+            )
+        grad_dtypes = {grad.dtype for grad in initialized_main_grads}
+        if len(grad_dtypes) > 1:
+            raise RuntimeError(
+                f"Virtual-expert source main gradients must have one dtype, got {grad_dtypes}."
+            )
+        # A no-DDP inference caller has no main gradients. Preserve the historical FP32 arena
+        # default in that case; training derives the dtype from DDP's initialized buffers.
+        grad_dtype = next(iter(grad_dtypes), torch.float32)
+        self._bridge = VirtualExpertWeightBridge(
             experts=experts,
             group=self.group,
             num_local_experts=self.num_owned_experts,
-            grad_dtype=torch.bfloat16 if self.config.grad_reduce_in_bf16 else torch.float32,
+            grad_dtype=grad_dtype,
             num_sms=self.config.moe_flex_dispatcher_num_sms,
         )
-        experts.set_replica_weight_bridge(self._bridge)
+        experts.set_virtual_expert_weight_bridge(self._bridge)
+        return self._bridge
 
     def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Attach the replica-gradient completion hook to the whole MoE layer input."""
+        """Attach the virtual-expert-gradient completion hook to the whole MoE layer input."""
+        bridge = self._ensure_experts_bound()
         if self._context is not None:
             raise RuntimeError("Virtual-expert layer input wrapped twice without a combine.")
         self._context = SimpleNamespace(plan=None)
-        return _ReplicaWaitGradReduce.apply(
-            hidden_states, *self._bridge.source_parameters, self._bridge, self._context
+        return _VirtualExpertWaitGradReduce.apply(
+            hidden_states, *bridge.source_parameters, bridge, self._context
         )
 
     def setup_virtual_expert_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> None:
@@ -931,7 +946,7 @@ class VirtualExpertLoadBalancer:
             ep_size=torch.distributed.get_world_size(group=self.group),
             device=hidden_states.device,
         )
-        self._plan = self._context.plan = plan_replica_routes(
+        self._plan = self._context.plan = plan_virtual_expert_routes(
             self.semantic_token_indices,
             self.semantic_tokens_per_expert,
             self.group,
@@ -945,14 +960,11 @@ class VirtualExpertLoadBalancer:
 
     def prepare_virtual_expert_dispatch(
         self, hidden_states: torch.Tensor, *, num_runtime_experts: int, alignment: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """Map planned routes to runtime experts and attach dispatch-backward work."""
+    ) -> tuple[torch.Tensor, VirtualExpertPlan, int]:
+        """Attach dispatch-backward work and calculate the transport capacity."""
         plan = self._plan
         if plan is None:
             raise RuntimeError("Virtual-expert dispatch requires plan_dispatch to run first.")
-        routing_map, token_probs = map_replica_plan_to_hybridep(
-            plan, self.semantic_token_probs, num_experts=self.semantic_num_experts * 2
-        )
         num_permuted_tokens = self._get_rank_capacity(
             num_tokens=self.num_local_tokens,
             router_topk=self.router_topk,
@@ -960,16 +972,16 @@ class VirtualExpertLoadBalancer:
             num_runtime_experts=num_runtime_experts,
             alignment=alignment,
         )
-        hidden_states = _ReplicaBackwardHook.apply(
+        hidden_states = _VirtualExpertBackwardHook.apply(
             hidden_states, functools.partial(self._bridge.start_pending_grad_reduces, plan)
         )
-        return hidden_states, routing_map, token_probs, num_permuted_tokens
+        return hidden_states, plan, num_permuted_tokens
 
     def prepare_virtual_expert_combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Attach the backward weight-push wait before transport combine."""
         if self._plan is None:
             raise RuntimeError("Virtual-expert combine requires a matching dispatch plan.")
-        return _ReplicaBackwardHook.apply(
+        return _VirtualExpertBackwardHook.apply(
             hidden_states, functools.partial(self._bridge.wait_prefetch_for_backward, self._plan)
         )
 
@@ -983,7 +995,7 @@ class VirtualExpertLoadBalancer:
         plan, self._plan, self._context = self._plan, None, None
         if plan is None:
             raise RuntimeError("Virtual-expert output finalization requires a combined plan.")
-        return _ReplicaBackwardHook.apply(
+        return _VirtualExpertBackwardHook.apply(
             output, functools.partial(self._bridge.start_prefetch, plan, BACKWARD)
         )
 
