@@ -3343,8 +3343,14 @@ def training_log(
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
-
-    should_reset = _should_reset_logging_interval(is_first_iteration, args.log_interval)
+    
+    # Determine whether the current iteration completes the logging window.
+    if args.log_interval == 1:
+        # Every iteration is a complete logging window, including the startup iteration.
+        should_reset = True
+    else:
+        # Keep the startup iteration in the first regular logging window.
+        should_reset = not is_first_iteration
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
