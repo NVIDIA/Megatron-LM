@@ -371,6 +371,42 @@ class MegatronOptimizer(ABC):
                 self.grad_norms_by_group[grad_norm_group] = group_grad_norm
         return self.grad_norms_by_group
 
+    def _uses_decoupled_grad(self, param_list) -> bool:
+        """Whether clip_grad_norm/count_zeros should read `.decoupled_grad` instead of `.grad`.
+
+        Megatron-FSDP v2 (`megatron_fsdp/experimental/`) always reduces directly into
+        `.grad`, precision-aware optimizer or not -- see `FullyShardedOptimizer.get_grad_norm`.
+        `_mfsdp_parameter_group` is v2's own marker for "this param is in one of my
+        parameter groups" (set in `experimental/parameter_group.py`, read via
+        `get_containing_parameter_group`); checking it here directly, the same way
+        `__fsdp_param__` below is duck-typed rather than imported, answers "is this a v2
+        param" without a dependency on the experimental FSDP module, and leaves the
+        heuristic below untouched for everything else (v1 Megatron-FSDP, plain
+        DistributedOptimizer, no FSDP at all).
+
+        `use_precision_aware_optimizer_no_fp8_or_ds_fp8` is `distrib_optimizer.py`'s own
+        flag for whether *its* precision-aware path (no FP8 / no delayed-scaling FP8) uses
+        `param.grad` or `param.decoupled_grad`; it has no notion of Megatron-FSDP and is
+        `True` for any non-FP8 precision-aware run. The `__fsdp_param__` fallback is
+        v1-only: only v1's `MegatronFSDP` (`megatron_fsdp/fully_shard.py`) tags params
+        with it.
+
+        Left unchecked, `clip_grad_by_total_norm_fp32`/`count_zeros_fp32` silently skip
+        any param whose `decoupled_grad` is unset rather than raising, so wrongly
+        returning True here no-ops clipping/zero-counting instead of erroring.
+        """
+        if hasattr(param_list[0], "_mfsdp_parameter_group"):
+            # Megatron-FSDP v2 always reduces directly into `.grad`.
+            return False
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            return True
+        if self.config.use_precision_aware_optimizer and getattr(
+            param_list[0], "__fsdp_param__", False
+        ):
+            # Megatron-FSDP v1 always uses decoupled_grad with FusedAdam.
+            return True
+        return False
+
     def clip_grad_norm(self, clip_grad: float) -> float:
         """Compute and return grad norm, also clip grads.
 
@@ -385,13 +421,6 @@ class MegatronOptimizer(ABC):
             # Only reduce group grad norms when clipping can use them.
             self._compute_grad_norms_by_group()
 
-            def use_decoupled_grad(param_list):
-                return self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 or (
-                    # Megatron-FSDP always uses decoupled_grad with FusedAdam.
-                    self.config.use_precision_aware_optimizer
-                    and getattr(param_list[0], "__fsdp_param__", False)
-                )
-
             main_params = []
             params_by_grad_norm_group = {}
             for p in params:
@@ -405,7 +434,7 @@ class MegatronOptimizer(ABC):
                     main_params,
                     clip_grad,
                     grad_norm,
-                    use_decoupled_grad=use_decoupled_grad(main_params),
+                    use_decoupled_grad=self._uses_decoupled_grad(main_params),
                 )
             for grad_norm_group, grouped_params in params_by_grad_norm_group.items():
                 group_grad_norm = self.grad_norms_by_group.get(grad_norm_group)
@@ -415,7 +444,7 @@ class MegatronOptimizer(ABC):
                     grouped_params,
                     clip_grad,
                     group_grad_norm,
-                    use_decoupled_grad=use_decoupled_grad(grouped_params),
+                    use_decoupled_grad=self._uses_decoupled_grad(grouped_params),
                 )
         return grad_norm
 
@@ -425,12 +454,7 @@ class MegatronOptimizer(ABC):
         return count_zeros_fp32(
             params,
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
-            use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-            or (
-                # Megatron-FSDP always uses decoupled_grad with FusedAdam.
-                self.config.use_precision_aware_optimizer
-                and getattr(params[0], "__fsdp_param__", False)
-            ),
+            use_decoupled_grad=self._uses_decoupled_grad(params),
             tp_group=getattr(self, 'tp_group', None),
             expert_tp_group=getattr(self, 'expert_tp_group', None),
         )
