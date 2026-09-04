@@ -49,6 +49,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.module import is_first_microbatch_tracked
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -1375,7 +1376,10 @@ class TELinear(te.pytorch.Linear):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
         _is_first_microbatch = (
-            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+            None
+            if self.disable_parameter_transpose_cache
+            or not is_first_microbatch_tracked(self.config)
+            else self.is_first_microbatch
         )
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
@@ -1624,7 +1628,10 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     def forward(self, x):
         """Forward."""
         _is_first_microbatch = (
-            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+            None
+            if self.disable_parameter_transpose_cache
+            or not is_first_microbatch_tracked(self.config)
+            else self.is_first_microbatch
         )
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
@@ -2763,7 +2770,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
         def forward(self, x, m_splits):
             """Forward."""
             _is_first_microbatch = (
-                None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+                None
+                if self.disable_parameter_transpose_cache
+                or not is_first_microbatch_tracked(self.config)
+                else self.is_first_microbatch
             )
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 

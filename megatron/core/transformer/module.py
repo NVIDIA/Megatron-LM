@@ -27,6 +27,31 @@ def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
     return not hasattr(param, 'shared') or not param.shared
 
 
+def is_first_microbatch_tracked(config) -> bool:
+    """Whether ``is_first_microbatch`` is maintained across iterations for this config.
+
+    :meth:`MegatronModule.set_is_first_microbatch` re-arms the flag only for quantized configs,
+    because its purpose is refreshing TE's quantized parameter cache. Outside those configs the
+    flag is set once at module construction and cleared after the first forward, so it is stale
+    for the rest of the process and carries no meaning.
+
+    This predicate is the definition, not a heuristic: ``set_is_first_microbatch`` consults it to
+    re-arm the flag and TE call sites consult it before reading, so the two cannot drift. Its body
+    is quantization-shaped only because re-arming exists to refresh TE's quantized parameter cache.
+
+    Callers must consult this before passing the flag to TE. It is not merely an optimization
+    hint: TE derives the weight-gradient accumulation mode from it --
+    ``accumulate = fuse_wgrad_accumulation and not is_first_microbatch`` -- so a stale ``True``
+    makes a wgrad GEMM OVERWRITE ``main_grad`` instead of accumulating into it.
+    """
+    return (
+        config.fp8 is not None
+        or config.fp4 is not None
+        or getattr(config, 'use_kitchen', False)
+        or getattr(config, 'quant_recipe', None) is not None
+    )
+
+
 class MegatronModule(torch.nn.Module):
     """Base Megatron module inhertied by all Models.
 
@@ -117,12 +142,7 @@ class MegatronModule(torch.nn.Module):
         If kitchen is being used, kitchen controls quantization level.
         A quant_recipe (e.g. from --te-precision-config-file) also enables the flag.
         """
-        if (
-            self.config.fp8 is not None
-            or self.config.fp4 is not None
-            or getattr(self.config, 'use_kitchen', False)
-            or getattr(self.config, 'quant_recipe', None) is not None
-        ):
+        if is_first_microbatch_tracked(self.config):
             if not hasattr(self, "modules_with_is_first_microbatch"):
                 self.modules_with_is_first_microbatch = []
                 for m in self.modules():
