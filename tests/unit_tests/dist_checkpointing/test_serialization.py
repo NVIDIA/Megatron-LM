@@ -564,9 +564,7 @@ class TestSerialization:
             )
             # separation_hint is only supported by the nvrx async writer, so this must
             # go through the async save path (executed synchronously here).
-            async_request = save(
-                state_dict, ckpt_dir, save_strategy, async_sharded_save=True
-            )
+            async_request = save(state_dict, ckpt_dir, save_strategy, async_sharded_save=True)
             async_request.execute_sync()
 
             files = os.listdir(ckpt_dir)
