@@ -60,7 +60,11 @@ except ImportError:
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "expert_tp": False,
     "is_qkv": False,
+    "qkv_layout": None,
     "qkv_split_shapes": None,
+    "qkv_split_shapes_global": None,
+    "qkv_split_groups_are_complete": False,
+    "qkv_split_heads_are_complete": False,
     "tensor_model_parallel": False,
     "partition_dim": -1,
     "partition_stride": 1,
@@ -235,7 +239,7 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.tp_group = get_tensor_model_parallel_group_if_none(self.tp_group)
 
-        (self.vocab_start_index, self.vocab_end_index) = (
+        self.vocab_start_index, self.vocab_end_index = (
             VocabUtility.vocab_range_from_global_vocab_size(
                 self.num_embeddings, get_pg_rank(self.tp_group), get_pg_size(self.tp_group)
             )
