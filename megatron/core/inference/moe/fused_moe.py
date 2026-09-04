@@ -5,6 +5,7 @@ Supports BF16, MCore MXFP8, and native Transformer Engine MXFP8 weights.
 All permutation logic is handled internally — callers invoke a single function.
 """
 
+import os
 from enum import Enum
 from functools import partial
 from typing import Any, Callable, Dict, Optional
@@ -23,6 +24,9 @@ from megatron.core.inference.moe.permute import (
 )
 from megatron.core.inference.quantization.mxfp8_quantize import MXFP8_SCALE_ROW_BLOCK
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    get_unrestricted_te_workspace_size_bytes,
+)
 
 from . import batch_invariant
 
@@ -46,10 +50,12 @@ try:
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.cpp_extensions.gemm import (
         general_grouped_gemm_for_grouped_tensor,
+        get_grouped_gemm_setup_workspace_size,
     )
     from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor as TEGroupedTensor
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer as TEMXFP8Quantizer
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor as TEMXFP8Tensor
+    from transformer_engine.pytorch.utils import get_sm_count as _get_te_sm_count
 
     HAVE_TE_GROUPED_MXFP8 = all(
         hasattr(tex, name)
@@ -65,10 +71,14 @@ except (ImportError, AttributeError):
     TEMXFP8Quantizer = ()
     TEMXFP8Tensor = ()
     general_grouped_gemm_for_grouped_tensor = None
+    get_grouped_gemm_setup_workspace_size = None
+    _get_te_sm_count = None
     HAVE_TE_GROUPED_MXFP8 = False
 
 
 _TE_MXFP8_ACTIVATION_QUANTIZER = None
+_TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE = 256
+_TE_MXFP8_BATCH_INVARIANT_WEIGHT_CACHE = "_mcore_batch_invariant_gemm_weight"
 
 
 class ActivationType(Enum):
@@ -168,6 +178,108 @@ def _te_weight_out_features(normalized) -> int:
     raise ValueError("Unable to infer the output width of the TE grouped expert weight.")
 
 
+def _te_mxfp8_batch_invariant_grouped_gemm(
+    weight,
+    grouped_input,
+    grouped_output,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    workspace_setup: torch.Tensor,
+    workspace_cublas: torch.Tensor,
+) -> None:
+    """Launch grouped MXFP8 GEMM without inheriting te_native's starved workspace.
+
+    The te_native batch-invariant backend restricts ordinary TE GEMMs to a 1 KiB
+    workspace to disqualify split-K algorithms. TE's device-metadata grouped
+    MXFP8 kernel requires its normal cuBLASLt workspace even when every GEMM has
+    a fixed M. Recover the unrestricted size and call the device-metadata API
+    directly for this fixed-shape path only.
+    """
+    sm_count = _get_te_sm_count()
+    sm_count -= int(os.getenv("NVTE_EXT_MARGIN_SM", str(sm_count)))
+    grouped_gemm_impl = (
+        tex.te_general_grouped_gemm_for_discrete_in
+        if isinstance(weight, list)
+        else tex.te_general_grouped_gemm_for_grouped_tensor
+    )
+    grouped_gemm_impl(
+        weight,
+        True,
+        grouped_input,
+        False,
+        grouped_output,
+        None,
+        alpha,
+        beta,
+        workspace_setup,
+        workspace_cublas,
+        False,
+        sm_count,
+    )
+
+
+def _get_te_mxfp8_batch_invariant_weight(normalized_weight):
+    """Return graph-stable, GEMM-swizzled expert views for the fixed-M path."""
+    if isinstance(normalized_weight, list):
+        return normalized_weight
+
+    cached = getattr(normalized_weight, _TE_MXFP8_BATCH_INVARIANT_WEIGHT_CACHE, None)
+    if cached is not None:
+        return cached[1]
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "Batch-invariant TE MXFP8 requires GroupedTensor GEMM views to be "
+            "materialized before CUDA graph capture."
+        )
+
+    original_members = normalized_weight.quantized_tensors
+    if original_members is None:
+        original_members = normalized_weight.split_into_quantized_tensors()
+        normalized_weight.quantized_tensors = original_members
+    grouped_for_gemm = normalized_weight.copy()
+    tex.grouped_swizzle_for_gemm(grouped_for_gemm, rowwise=True, columnwise=False)
+    swizzled_members = grouped_for_gemm.split_into_quantized_tensors()
+    gemm_members = [
+        TEMXFP8Tensor(
+            shape=original.shape,
+            dtype=original.dtype,
+            rowwise_data=original._rowwise_data,
+            rowwise_scale_inv=swizzled._rowwise_scale_inv,
+            columnwise_data=None,
+            columnwise_scale_inv=None,
+            fp8_dtype=original._fp8_dtype,
+            quantizer=original._quantizer,
+            requires_grad=False,
+            with_gemm_swizzled_scales=True,
+        )
+        for original, swizzled in zip(original_members, swizzled_members)
+    ]
+    cache = (grouped_for_gemm, gemm_members)
+    setattr(normalized_weight, _TE_MXFP8_BATCH_INVARIANT_WEIGHT_CACHE, cache)
+    return gemm_members
+
+
+def prepare_te_mxfp8_batch_invariant_weight(weight) -> None:
+    """Materialize graph-stable GEMM views for a native TE MXFP8 weight."""
+    _get_te_mxfp8_batch_invariant_weight(_normalize_te_mxfp8_weight(weight))
+
+
+@torch.no_grad()
+def refresh_te_mxfp8_batch_invariant_weight(weight) -> bool:
+    """Refresh a cached grouped-weight scale layout in place after model refit."""
+    normalized_weight = _normalize_te_mxfp8_weight(weight)
+    if isinstance(normalized_weight, list):
+        return False
+    cached = getattr(normalized_weight, _TE_MXFP8_BATCH_INVARIANT_WEIGHT_CACHE, None)
+    if cached is None:
+        return False
+
+    grouped_for_gemm = normalized_weight.copy()
+    tex.grouped_swizzle_for_gemm(grouped_for_gemm, rowwise=True, columnwise=False)
+    cached[0].scale_inv.copy_(grouped_for_gemm.scale_inv)
+    return True
+
+
 def _te_mxfp8_grouped_mm(x_bf16: torch.Tensor, weight, first_dims: torch.Tensor) -> torch.Tensor:
     """TE MXFP8 grouped GEMM initialized entirely from CUDA split metadata."""
     assert HAVE_TE_GROUPED_MXFP8, (
@@ -217,6 +329,143 @@ def _te_mxfp8_grouped_mm(x_bf16: torch.Tensor, weight, first_dims: torch.Tensor)
         normalized_weight, grouped_input, grouped_output, layout="TN"
     )
     return grouped_output.rowwise_data.view(x_bf16.shape[0], out_features)
+
+
+def _te_mxfp8_batch_invariant_grouped_mm(
+    x_bf16: torch.Tensor, weight, first_dims: torch.Tensor, *, num_chunks: int
+) -> torch.Tensor:
+    """Run identical fixed-M grouped GEMMs for each expert-token chunk.
+
+    ``x_bf16`` is chunk-major with ``num_experts * 256`` rows per chunk.
+    Launching chunks separately keeps an expert at the same grouped-GEMM index;
+    TE can otherwise select a different FC2 reduction recipe for the same shape
+    when that expert's data moves to another group index.
+    """
+    assert x_bf16.dtype == torch.bfloat16, f"Expected bf16 input, got {x_bf16.dtype}"
+    normalized_weight = _normalize_te_mxfp8_weight(weight)
+    normalized_weight = _get_te_mxfp8_batch_invariant_weight(normalized_weight)
+    num_experts = first_dims.numel()
+    weight_experts = (
+        len(normalized_weight)
+        if isinstance(normalized_weight, list)
+        else normalized_weight.num_tensors
+    )
+    if weight_experts != num_experts:
+        raise ValueError(
+            f"Expert split count ({num_experts}) does not match weight count ({weight_experts})."
+        )
+    rows_per_chunk = num_experts * _TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE
+    if x_bf16.shape[0] != num_chunks * rows_per_chunk:
+        raise ValueError(
+            "Batch-invariant TE MXFP8 input has an invalid chunked row count: "
+            f"got {x_bf16.shape[0]}, expected {num_chunks * rows_per_chunk}."
+        )
+
+    out_features = _te_weight_out_features(normalized_weight)
+    output_data = torch.empty(
+        x_bf16.shape[0] * out_features, dtype=torch.bfloat16, device=x_bf16.device
+    )
+    tensor_offsets = torch.arange(num_experts, dtype=first_dims.dtype, device=first_dims.device) * (
+        _TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE * out_features
+    )
+    alpha = torch.ones(num_experts, dtype=torch.float32, device=x_bf16.device)
+    beta = torch.zeros(num_experts, dtype=torch.float32, device=x_bf16.device)
+    output_rows_per_chunk = rows_per_chunk * out_features
+    launch_state = []
+    for chunk in range(num_chunks):
+        row_start = chunk * rows_per_chunk
+        row_end = row_start + rows_per_chunk
+        grouped_input = tex.group_quantize(
+            x_bf16[row_start:row_end], _get_te_mxfp8_activation_quantizer(), num_experts, first_dims
+        )
+        output_start = chunk * output_rows_per_chunk
+        grouped_output = TEGroupedTensor(
+            shape=(rows_per_chunk, out_features),
+            dtype=torch.bfloat16,
+            num_tensors=num_experts,
+            shapes=None,
+            quantizer=None,
+            data=output_data[output_start : output_start + output_rows_per_chunk],
+            first_dims=first_dims,
+            tensor_offsets=tensor_offsets,
+            requires_grad=False,
+        )
+        # TE may execute grouped GEMMs on auxiliary streams. Keep workspaces distinct
+        # across chunk launches just like its public wrapper does; reusing them here
+        # introduces a cross-stream race between consecutive chunks.
+        workspace_setup = torch.empty(
+            get_grouped_gemm_setup_workspace_size(num_experts),
+            dtype=torch.uint8,
+            device=x_bf16.device,
+        )
+        workspace_cublas = torch.empty(
+            get_unrestricted_te_workspace_size_bytes(), dtype=torch.uint8, device=x_bf16.device
+        )
+        # The implementation may consume its input and workspaces on auxiliary
+        # streams. Retain each chunk's state until every launch has been queued;
+        # otherwise the caching allocator can recycle an earlier chunk while a
+        # later one is being prepared.
+        launch_state.append((grouped_input, workspace_setup, workspace_cublas))
+        _te_mxfp8_batch_invariant_grouped_gemm(
+            normalized_weight,
+            grouped_input,
+            grouped_output,
+            alpha,
+            beta,
+            workspace_setup,
+            workspace_cublas,
+        )
+    return output_data.view(x_bf16.shape[0], out_features)
+
+
+def _te_mxfp8_batch_invariant_reorder(
+    hidden_states: torch.Tensor,
+    permuted_probs: torch.Tensor,
+    inverse_map: torch.Tensor,
+    num_chunks: int,
+):
+    """Place each token/expert pair in a deterministic chunk-major row.
+
+    The regular permutation compacts rows with atomics. Although its inverse map
+    restores token order, a token can land at a different row inside the FC2
+    matrix when the co-batch changes, and the MXFP8 kernel's reduction can then
+    change bits. Assign row ``token % 256`` in chunk ``token // 256`` instead.
+    """
+    num_tokens, num_experts = inverse_map.shape
+    chunk_size = _TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE
+    rows = torch.arange(chunk_size, dtype=torch.int64, device=inverse_map.device)
+    hidden_chunks = []
+    prob_chunks = []
+    map_chunks = []
+    for chunk in range(num_chunks):
+        token_rows = chunk * chunk_size + rows
+        in_token_buffer = token_rows < num_tokens
+        safe_token_rows = torch.where(in_token_buffer, token_rows, 0)
+        source_rows = inverse_map[safe_token_rows].transpose(0, 1)
+        valid_rows = in_token_buffer[None, :] & (source_rows >= 0)
+        safe_source_rows = torch.where(valid_rows, source_rows, 0).to(torch.int64)
+        hidden_chunks.append(
+            torch.where(valid_rows[..., None], hidden_states[safe_source_rows], 0.0).flatten(0, 1)
+        )
+        prob_chunks.append(torch.where(valid_rows, permuted_probs[safe_source_rows], 0.0).flatten())
+        map_chunks.append(
+            torch.where(valid_rows, safe_token_rows.to(inverse_map.dtype)[None, :], -1).flatten()
+        )
+
+    expert_ids = torch.arange(num_experts, dtype=inverse_map.dtype, device=inverse_map.device)
+    token_ids = torch.arange(num_tokens, dtype=inverse_map.dtype, device=inverse_map.device)[
+        :, None
+    ]
+    chunked_inverse_map = (
+        torch.div(token_ids, chunk_size, rounding_mode="floor") * num_experts + expert_ids
+    ) * chunk_size + torch.remainder(token_ids, chunk_size)
+    chunked_inverse_map = torch.where(inverse_map >= 0, chunked_inverse_map, -1)
+    return (
+        torch.cat(hidden_chunks),
+        torch.cat(prob_chunks),
+        torch.cat(map_chunks),
+        chunked_inverse_map,
+    )
 
 
 def _get_activation_func(
@@ -316,11 +565,20 @@ def mcore_fused_moe(
     use_fused_quant = use_mcore_mxfp8 and not disable_fused_quant_kernels
     batch_invariant_mode = batch_invariant.enabled()
 
-    if batch_invariant_mode:
-        # The MXFP8 path uses scaled_grouped_mm and is not batch invariant.
-        assert not use_mxfp8, (
-            "batch_invariant_mode requires the bf16 grouped GEMM path; got "
-            "MXFP8 weights. Disable mxfp8 or batch_invariant_mode."
+    if batch_invariant_mode and use_te_mxfp8:
+        # Launch each 256-row token chunk separately so an expert always has the same
+        # grouped-GEMM index and M, independent of routing counts and graph bucket size.
+        num_te_chunks = max(
+            1,
+            (max_tokens + _TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE - 1)
+            // _TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE,
+        )
+        mm_fn = partial(_te_mxfp8_batch_invariant_grouped_mm, num_chunks=num_te_chunks)
+        expert_alignment = _TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE
+    elif batch_invariant_mode:
+        assert not use_mcore_mxfp8, (
+            "batch_invariant_mode does not support MCore MXFP8 weights. Use native "
+            "TE MXFP8 weights or disable mxfp8."
         )
         mm_fn = batch_invariant.grouped_mm
         expert_alignment = batch_invariant.grouped_mm_alignment()
@@ -391,16 +649,25 @@ def mcore_fused_moe(
     # produces MXFP8Tensor directly).
     if use_mcore_mxfp8 and not isinstance(hidden_states, MXFP8Tensor):
         hidden_states = MXFP8Tensor.from_bf16(hidden_states, backend="triton")
+    # offs[-1:] normally points to the dynamic used prefix. The fixed-chunk TE path
+    # replaces it below with the complete chunk-major row count.
+    n_used = offs[-1:]
     if use_te_mxfp8:
         first_dims = torch.cat((offs[:1], offs[1:] - offs[:-1])).to(torch.int64)
+        if batch_invariant_mode:
+            hidden_states, permuted_probs, permutation_map, batch_invariant_inverse_map = (
+                _te_mxfp8_batch_invariant_reorder(
+                    hidden_states, permuted_probs, batch_invariant_inverse_map, num_te_chunks
+                )
+            )
+            first_dims = first_dims.new_full(
+                (num_local_experts,), _TE_MXFP8_BATCH_INVARIANT_CHUNK_SIZE
+            )
+            n_used = offs.new_full((1,), hidden_states.shape[0])
         fc1_output = mm_fn(hidden_states, fc1_weight, first_dims)
     else:
         fc1_output = mm_fn(hidden_states, fc1_weight, offs)
 
-    # offs[-1:] is a 1-element view pointing to inclusive_expert_offsets[-1] — the total
-    # number of rows actually used by experts this iteration (valid tokens + alignment
-    # padding within expert blocks). Passed to activation and unpermute to skip unused rows.
-    n_used = offs[-1:]
     if batch_invariant_mode:
         # Match training: BF16 activation, FP32 probability multiply, then BF16 before FC2.
         if activation_type == ActivationType.SWIGLU:
@@ -409,11 +676,16 @@ def mcore_fused_moe(
                 "the gated form (SiTU-GLU) has no inference kernel yet."
             )
             activation_out = batch_invariant.swiglu_with_probs(
-                fc1_output, permutation_map, n_used, permuted_probs
+                fc1_output, permutation_map, n_used, permuted_probs, zero_padding=use_te_mxfp8
             )
         else:
             activation_out = batch_invariant.squared_relu_with_probs(
-                fc1_output, permutation_map, n_used, permuted_probs, activation_clamp_scale
+                fc1_output,
+                permutation_map,
+                n_used,
+                permuted_probs,
+                activation_clamp_scale,
+                zero_padding=use_te_mxfp8,
             )
     else:
         if use_te_mxfp8:
