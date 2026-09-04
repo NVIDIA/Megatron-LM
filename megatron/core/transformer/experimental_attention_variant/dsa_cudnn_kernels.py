@@ -1318,6 +1318,7 @@ def _resolve_scoring_plan_for_call(
     use_local_indexer_varlen: bool,
     single_packed_thd_sequence: bool,
     packed_metadata_available: bool,
+    explicit_key_positions: bool,
     segment_kernel_applicable: bool = True,
 ) -> IndexerScoringDecision:
     """Map this call's layout facts onto a scoring plan.
@@ -1342,7 +1343,7 @@ def _resolve_scoring_plan_for_call(
         # non-packed reason. The dispatch outcome (UNFUSED_BOUNDS) is the same in
         # every such case; only the diagnostic wording is generic.
         mask_is_causal=use_local_indexer_varlen or not packed_thd,
-        explicit_key_positions=False,
+        explicit_key_positions=explicit_key_positions,
         single_sequence_pack=single_packed_thd_sequence,
         packed_metadata_available=packed_metadata_available,
         segment_kernel_applicable=segment_kernel_applicable,
@@ -1411,9 +1412,6 @@ def _indexer_topk_bshd(
             sk=sk,
             device=device,
         )
-        if not use_local_indexer_varlen and explicit_key_positions:
-            raise RuntimeError("cuDNN fused DSA varlen path expects identity key positions")
-
     k_bshd = k_bsd.unsqueeze(2)  # (b, sk, 1, idx_hd)
 
     scoring_plan = _resolve_scoring_plan_for_call(
@@ -1432,6 +1430,7 @@ def _indexer_topk_bshd(
         packed_thd=use_local_indexer_varlen or packed_cu_seqlens_q is not None,
         cp_size=packed_cp_size,
         use_local_indexer_varlen=use_local_indexer_varlen,
+        explicit_key_positions=explicit_key_positions,
         single_packed_thd_sequence=single_packed_thd_sequence,
         packed_metadata_available=_packed_thd_kernel_applicable(
             b=b,
@@ -1775,8 +1774,8 @@ def run_fused_qk_topk_with_loss(
         loss_coeff,
         calculate_per_token_loss,
         latent_v_channels,
-        starts.contiguous() if starts is not None else None,
-        ends.contiguous() if ends is not None else None,
+        starts.contiguous(),
+        ends.contiguous(),
         query_valid_rows,
         use_local_indexer_varlen,
         single_packed_thd_sequence,
@@ -2471,8 +2470,8 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         sparse_loss: bool,
         calculate_per_token_loss: bool,
         d_v: int,
-        varlen_starts: Optional[Tensor],
-        varlen_ends: Optional[Tensor],
+        varlen_starts: Tensor,
+        varlen_ends: Tensor,
         key_positions: Optional[Tensor],
         query_valid_rows: Optional[Tensor],
         use_local_indexer_varlen: bool,
@@ -2732,8 +2731,8 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         loss_coeff: float,
         calculate_per_token_loss: bool,
         d_v: int,
-        varlen_starts: Optional[Tensor],
-        varlen_ends: Optional[Tensor],
+        varlen_starts: Tensor,
+        varlen_ends: Tensor,
         query_valid_rows: Optional[Tensor],
         use_local_indexer_varlen: bool,
         single_packed_thd_sequence: bool,

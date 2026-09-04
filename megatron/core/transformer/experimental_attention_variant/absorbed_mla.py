@@ -831,6 +831,8 @@ class AbsorbedMLASelfAttention(Attention):
     ):
         """Forward method with selective activation checkpointing."""
 
+        effective_cp_group = self.pg_collection.cp
+
         def custom_forward(*inputs):
             q_absorbed = inputs[0]
             k_compressed = inputs[1]
@@ -840,19 +842,23 @@ class AbsorbedMLASelfAttention(Attention):
             up_v_weight = inputs[5]
             attn_mask_type = inputs[6]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = self.core_attention(
-                q_absorbed,
-                k_compressed,
-                value=None,
-                attention_mask=attention_mask,
-                x=hidden_states,
-                qr=q_compressed,
-                up_v_weight=up_v_weight,
-                position_ids=position_ids,
-                attn_mask_type=attn_mask_type,
-                packed_seq_params=packed_seq_params,
-            )
-            return output_
+            original_cp_group = self.pg_collection.cp
+            self.pg_collection.cp = effective_cp_group
+            try:
+                return self.core_attention(
+                    q_absorbed,
+                    k_compressed,
+                    value=None,
+                    attention_mask=attention_mask,
+                    x=hidden_states,
+                    qr=q_compressed,
+                    up_v_weight=up_v_weight,
+                    position_ids=position_ids,
+                    attn_mask_type=attn_mask_type,
+                    packed_seq_params=packed_seq_params,
+                )
+            finally:
+                self.pg_collection.cp = original_cp_group
 
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type

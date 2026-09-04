@@ -94,6 +94,33 @@ def test_bytes_to_chunk_rows_stays_within_budget_below_alignment():
     assert chunk_rows * bytes_per_row <= max_bytes
 
 
+def test_cudnn_indexer_dispatch_declines_explicit_key_positions(monkeypatch):
+    """The production dispatcher routes explicit positions through the scoring plan."""
+
+    class UnusedDSA:
+        @staticmethod
+        def indexer_forward_wrapper(*_args, **_kwargs):
+            raise AssertionError("a declined scoring plan must not launch the cuDNN scorer")
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", UnusedDSA)
+
+    with pytest.raises(
+        RuntimeError,
+        match="invalid DSA scoring dispatch: custom key positions are not expressible as bounds",
+    ):
+        dsa_cudnn_kernels._indexer_topk_bshd(
+            torch.ones((1, 4, 1, 1)),
+            torch.ones((1, 4, 1)),
+            torch.ones((1, 4, 1)),
+            topk=2,
+            varlen_starts=torch.zeros(4, dtype=torch.int64),
+            varlen_ends=torch.arange(1, 5, dtype=torch.int64),
+            key_positions=torch.tensor([0, 2, 1, 3], dtype=torch.int64),
+            return_scores=False,
+        )
+
+
 class _SingleRankTensorParallel:
     def size(self) -> int:
         return 1
@@ -706,6 +733,21 @@ def _pure_torch_packed_indexer_reference(
     return selected_indices, selected_valid.sum(dim=-1, dtype=torch.int32), loss
 
 
+def _independent_packed_cp_query_positions(sequence_lengths, *, cp_size, cp_rank, device):
+    """Construct the packed zigzag rows directly from the CP partition definition."""
+    positions = []
+    sequence_start = 0
+    for sequence_length in sequence_lengths:
+        assert sequence_length % (2 * cp_size) == 0
+        chunk = sequence_length // (2 * cp_size)
+        front = sequence_start + cp_rank * chunk
+        back = sequence_start + (2 * cp_size - cp_rank - 1) * chunk
+        positions.extend(range(front, front + chunk))
+        positions.extend(range(back, back + chunk))
+        sequence_start += sequence_length
+    return torch.tensor(positions, device=device, dtype=torch.int64)
+
+
 def _assert_packed_indexer_gradient_parity(label, actual, expected):
     """Check BF16 fused gradients with aggregate, scale-independent metrics."""
     assert torch.isfinite(actual).all()
@@ -844,6 +886,133 @@ def test_cudnn_indexer_topk_multi_packed_cp1_real_kernel_matches_pytorch_gradien
     )
 
     # FlashMLA consumes sorted indices, while the pure top-k is score ordered.
+    sentinel = total_tokens
+    canonical_fused = torch.where(fused_indices >= 0, fused_indices, sentinel).sort(dim=-1).values
+    canonical_ref = (
+        torch.where(ref_indices >= 0, ref_indices, sentinel)
+        .sort(dim=-1)
+        .values.to(dtype=canonical_fused.dtype)
+    )
+    torch.testing.assert_close(canonical_fused, canonical_ref, rtol=0, atol=0)
+    torch.testing.assert_close(fused_lengths, ref_lengths, rtol=0, atol=0)
+    torch.testing.assert_close(fused_loss, ref_loss, rtol=1.0e-4, atol=1.0e-7)
+
+    fused_loss.backward()
+    ref_loss.backward()
+    for name, fused_grad, ref_grad in (
+        ("q_indexer", q_fused.grad, q_ref.grad),
+        ("k_indexer", k_fused.grad, k_ref.grad),
+        ("weights", w_fused.grad, w_ref.grad),
+    ):
+        _assert_packed_indexer_gradient_parity(name, fused_grad, ref_grad)
+
+
+@pytest.mark.parametrize("seed", [6210, 6211, 6212])
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_cudnn_indexer_topk_multi_packed_cp2_real_kernel_matches_pytorch_gradients(seed, cp_rank):
+    """Both CP2 zigzag ranks match an independent multi-sequence PyTorch scorer."""
+    _skip_if_fused_dsa_unavailable()
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    device = torch.device("cuda")
+    cp_size = 2
+    sequence_lengths = (128, 128)
+    total_tokens = sum(sequence_lengths)
+    query_positions = _independent_packed_cp_query_positions(
+        sequence_lengths, cp_size=cp_size, cp_rank=cp_rank, device=device
+    )
+    local_tokens = query_positions.numel()
+    batch = 1
+    indexer_heads = 64
+    indexer_dim = 128
+    attention_heads = 64
+    attention_dim = 576
+    topk = 64
+    softmax_scale = attention_dim**-0.5
+    loss_coeff = 0.01
+
+    q_base = (
+        torch.randn(
+            local_tokens, batch, indexer_heads, indexer_dim, device=device, dtype=torch.bfloat16
+        )
+        * 0.125
+    )
+    k_base = (
+        torch.randn(total_tokens, batch, indexer_dim, device=device, dtype=torch.bfloat16) * 0.125
+    )
+    w_base = torch.randn(local_tokens, batch, indexer_heads, device=device, dtype=torch.bfloat16)
+    q_fused, q_ref = (q_base.clone().requires_grad_() for _ in range(2))
+    k_fused, k_ref = (k_base.clone().requires_grad_() for _ in range(2))
+    w_fused, w_ref = (w_base.clone().requires_grad_() for _ in range(2))
+
+    query = (
+        torch.randn(
+            local_tokens, batch, attention_heads, attention_dim, device=device, dtype=torch.bfloat16
+        )
+        * 0.125
+    )
+    key = (
+        torch.randn(total_tokens, batch, 1, attention_dim, device=device, dtype=torch.bfloat16)
+        * 0.125
+    )
+    sequence_starts = torch.tensor([0, sequence_lengths[0]], device=device, dtype=torch.int64)
+    query_sequence_ids = (query_positions >= sequence_lengths[0]).long()
+    starts = sequence_starts.index_select(0, query_sequence_ids)
+    ends = query_positions + 1
+    cu_seqlens = torch.tensor(
+        [0, sequence_lengths[0], total_tokens], device=device, dtype=torch.int32
+    )
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens,
+        cu_seqlens_kv_padded=cu_seqlens,
+        max_seqlen_q=max(sequence_lengths),
+        max_seqlen_kv=max(sequence_lengths),
+    )
+
+    fused_result = dsa_cudnn_kernels.run_fused_qk_topk_with_loss(
+        q=q_fused,
+        k=k_fused,
+        weights=w_fused,
+        index_topk=topk,
+        starts=starts,
+        ends=ends,
+        block_size=128,
+        query=query,
+        key=key,
+        softmax_scale=softmax_scale,
+        loss_coeff=loss_coeff,
+        pg_collection=_SingleRankProcessGroups(),
+        query_valid_rows=torch.ones((batch, local_tokens), dtype=torch.bool, device=device),
+        calculate_per_token_loss=False,
+        use_relu=True,
+        config=_PackedCpCudnnConfig(calculate_per_token_loss=False),
+        use_local_indexer_varlen=True,
+        single_packed_thd_sequence=False,
+        local_packed_cp_rank=cp_rank,
+        local_packed_cp_query_start=0,
+        local_packed_cp_query_len=local_tokens,
+        packed_seq_params=packed_seq_params,
+        cp_size=cp_size,
+    )
+    assert fused_result is not None
+    fused_indices, fused_lengths, fused_loss = fused_result
+    ref_indices, ref_lengths, ref_loss = _pure_torch_packed_indexer_reference(
+        q_ref,
+        k_ref,
+        w_ref,
+        query,
+        key,
+        starts,
+        ends,
+        topk=topk,
+        softmax_scale=softmax_scale,
+        loss_coeff=loss_coeff,
+    )
+
     sentinel = total_tokens
     canonical_fused = torch.where(fused_indices >= 0, fused_indices, sentinel).sort(dim=-1).values
     canonical_ref = (
