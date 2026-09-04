@@ -52,11 +52,24 @@ logger = logging.getLogger(__name__)
 
 
 def _has_extra_state_data(sharded_entry) -> bool:
-    """True when a sharded ``_extra_state`` entry carries a payload."""
+    """True when a sharded ``_extra_state`` entry carries a payload.
+
+    Deliberately avoids ``bool(data)``: array-likes raise on an ambiguous truth value, which is
+    the failure this function exists to prevent. An unrecognized payload counts as data, since
+    dropping state silently is worse than keeping a placeholder.
+    """
     data = getattr(sharded_entry, 'data', sharded_entry)
+    if data is None:
+        return False
     if isinstance(data, torch.Tensor):
         return data.numel() > 0
-    return data is not None and bool(data)
+    numel = getattr(data, 'size', None)  # numpy-style .size
+    if isinstance(numel, int):
+        return numel > 0
+    try:
+        return len(data) > 0
+    except TypeError:
+        return True
 
 
 class GPTModel(LanguageModule, GraphableMegatronModule):

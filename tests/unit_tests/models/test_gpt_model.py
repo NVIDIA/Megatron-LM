@@ -6,6 +6,7 @@ import os
 from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -649,6 +650,14 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
         (None, False),
         (torch.empty(0), False),
         (torch.frombuffer(bytearray(b'quantizer-state'), dtype=torch.uint8), True),
+        # Payloads whose truth value is ambiguous must not raise.
+        (np.zeros(0), False),
+        (np.zeros(4), True),
+        (b'', False),
+        (b'quantizer-state', True),
+        ([], False),
+        ([0, 0], True),
+        (object(), True),  # opaque payload: keep rather than silently drop
     ],
 )
 def test_has_extra_state_data(data, expected):
