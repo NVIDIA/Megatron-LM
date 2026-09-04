@@ -102,6 +102,12 @@ class DistributedInitConfig:
     groups and thread group cluster size of each communicator can be configured by setting
     `min_ctas`, `max_ctas`, and `cga_cluster_size`."""
 
+    use_local_synchronization: bool = False
+    """Enable PyTorch group-local synchronization when creating eligible process groups.
+    This can reduce initialization time for large jobs with small process groups, but requires
+    consistent group creation order and is unsupported by MPI.
+    """
+
     use_tp_pp_dp_mapping: bool = False
     """If set, distributed ranks initialize order is changed from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp.
     """

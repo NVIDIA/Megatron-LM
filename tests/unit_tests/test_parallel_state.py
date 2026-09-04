@@ -159,6 +159,7 @@ def test_local_sync_group_name_alignment(tp, pp, ep):
         tensor_model_parallel_size=tp,
         pipeline_model_parallel_size=pp,
         expert_model_parallel_size=ep,
+        use_local_synchronization=True,
     )
 
     groups = {
@@ -192,6 +193,31 @@ def test_local_sync_group_name_alignment(tp, pp, ep):
         torch.distributed.barrier()
 
     Utils.destroy_model_parallel()
+
+
+def test_local_sync_rejects_mpi(monkeypatch):
+    """The opt-in local synchronization path must fail before creating MPI subgroups."""
+    Utils.destroy_model_parallel()
+    Utils.initialize_distributed()
+    monkeypatch.setattr(torch.distributed, 'get_backend', lambda: 'mpi')
+
+    try:
+        with pytest.raises(ValueError, match="MPI backend doesn't support"):
+            ps.initialize_model_parallel(use_local_synchronization=True)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_local_sync_all_gather_groups_reject_mpi(monkeypatch):
+    """The standalone AG/RS communicator path must apply the same MPI guard."""
+    Utils.initialize_model_parallel()
+    monkeypatch.setattr(torch.distributed, 'get_backend', lambda: 'mpi')
+
+    try:
+        with pytest.raises(ValueError, match="MPI backend doesn't support"):
+            ps.create_all_gather_groups(use_local_synchronization=True)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize('order', test_parallel_order)
@@ -663,13 +689,18 @@ def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     Utils.destroy_model_parallel()
 
 
-def test_separate_all_gather_group():
+@pytest.mark.parametrize('use_local_synchronization', (False, True))
+def test_separate_all_gather_group(use_local_synchronization):
     """AG/RS overlap communicators live on ProcessGroupCollection (via create_all_gather_groups)."""
-    Utils.initialize_model_parallel(context_parallel_size=world_size)
+    Utils.initialize_model_parallel(
+        context_parallel_size=world_size, use_local_synchronization=use_local_synchronization
+    )
 
     dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
     dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
-    dp_cp_ag_group, _expt_ag = ps.create_all_gather_groups(for_expert_parallelism=False)
+    dp_cp_ag_group, _expt_ag = ps.create_all_gather_groups(
+        for_expert_parallelism=False, use_local_synchronization=use_local_synchronization
+    )
     assert dp_cp_ag_group is not None
     ag_ranks = torch.distributed.get_process_group_ranks(dp_cp_ag_group)
     assert ag_ranks == dp_cp_ranks, "AG group should have same ranks as dp-cp group"
