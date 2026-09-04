@@ -285,20 +285,6 @@ def get_param_state_dp_zero(optimizer):
     return optim_param_state_A
 
 
-def strip_dp_zero_dtype_keys(state_dict):
-    """Remove the dtype-key level so legacy and current state values can be compared."""
-    if state_dict is None:
-        return None
-
-    stripped_state_dict = {}
-    for key, value in state_dict.items():
-        if isinstance(key, int):
-            assert len(value) == 1
-            value = next(iter(value.values()))
-        stripped_state_dict[key] = value
-    return stripped_state_dict
-
-
 class TestOptimizer:
     def setup_method(self, method):
         pass
@@ -645,18 +631,24 @@ class TestDistributedOptimizer:
             optimizer_B.load_state_dict(loaded_state_dict['optimizer'])
             optim_param_state_B = get_param_state_dp_zero(optimizer_B)
 
-            # Loading consumes legacy tuple keys directly; it does not rewrite the loaded object.
+            # The compatibility boundary normalizes old state before the regular loader sees it.
             loaded_has_tuple_key = torch.tensor(
                 any(isinstance(key, tuple) for _, key in iter_state_dict_keys(loaded_state_dict)),
                 device='cuda',
                 dtype=torch.int,
             )
             torch.distributed.all_reduce(loaded_has_tuple_key, op=torch.distributed.ReduceOp.MAX)
-            assert bool(loaded_has_tuple_key.item()) == legacy_keys
+            assert not bool(loaded_has_tuple_key.item())
+
+            if legacy_keys:
+                distributed_optimizer_A = self._unwrap_distributed_optimizer(optimizer_A)
+                distributed_optimizer_A._back_compat_normalize_loaded_dtype_keys(
+                    optim_param_state_A, checkpoint_version
+                )
 
             assert self.check_equal_dp_zero_state(
-                strip_dp_zero_dtype_keys(optim_param_state_A),
-                strip_dp_zero_dtype_keys(optim_param_state_B),
+                optim_param_state_A,
+                optim_param_state_B,
                 same_dp_group=True,
                 raise_if_different=True,
             )
