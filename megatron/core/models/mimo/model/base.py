@@ -13,6 +13,7 @@ from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridg
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
+from megatron.core.models.mimo.submodules.base import build_named_module
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.transformer import MegatronModule
@@ -326,7 +327,10 @@ class MimoModel(MegatronModule):
 
             # Pass stage info to from_spec so projections are only built when needed
             submodule = submodule_class.from_spec(
-                submodule_spec, is_first_stage=is_first_stage, is_last_stage=is_last_stage
+                submodule_spec,
+                is_first_stage=is_first_stage,
+                is_last_stage=is_last_stage,
+                name=f"modality_submodules.{modality_name}",
             )
 
             self.modality_submodules[modality_name] = submodule
@@ -356,7 +360,14 @@ class MimoModel(MegatronModule):
 
         input_projections = torch.nn.ModuleDict()
         if self.role.is_first_stage(MIMO_LANGUAGE_MODULE_KEY):
-            input_projections.update({name: build_module(spec) for name, spec in specs.items()})
+            input_projections.update(
+                {
+                    name: build_named_module(
+                        spec, f"modality_submodules.{name}.input_projections.0"
+                    )
+                    for name, spec in specs.items()
+                }
+            )
         setattr(
             unwrap_model(self.language_model), _LANGUAGE_INPUT_PROJECTIONS_ATTR, input_projections
         )

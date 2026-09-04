@@ -62,6 +62,7 @@ from megatron.core.tensor_parallel.random import (
 )
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import is_first_microbatch_tracked
 from megatron.core.transformer.torch_norm import LayerNormInterface
@@ -486,6 +487,23 @@ def _emit_quantization_log(message: str) -> None:
 def is_log_quantization_types_enabled() -> bool:
     """Whether the per-layer quantization log is currently on."""
     return _log_quantization_types
+
+
+def describe_layer(layer: torch.nn.Module) -> str:
+    """Name a hybrid layer by its class and its mixer.
+
+    The forward dispatch groups layers by base class rather than by pattern symbol, and
+    the two do not line up: MoETransformerLayer and MLPLayer both subclass
+    TransformerLayer, and a 'G' layer is a TransformerLayer whose self_attention is a
+    GatedDeltaNet. Naming a layer from its own mixer keeps the label specific to the
+    symbol that built it, and survives the dispatch being reordered.
+    """
+    mixer = getattr(layer, "self_attention", None)
+    if mixer is None:
+        mixer = getattr(layer, "mixer", None)
+    if mixer is None or isinstance(mixer, IdentityOp):
+        return type(layer).__name__
+    return f"{type(layer).__name__}/{type(mixer).__name__}"
 
 
 def qtype_debug_note(text: str) -> None:

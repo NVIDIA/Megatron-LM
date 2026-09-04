@@ -20,6 +20,7 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import (
     TENorm,
+    describe_layer,
     is_log_quantization_types_enabled,
     qtype_debug_note,
 )
@@ -58,23 +59,6 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
-
-
-def _describe_layer(layer: torch.nn.Module) -> str:
-    """Name a hybrid layer by its class and its mixer.
-
-    The forward dispatch groups layers by base class rather than by pattern symbol, and
-    the two do not line up: MoETransformerLayer and MLPLayer both subclass
-    TransformerLayer, and a 'G' layer is a TransformerLayer whose self_attention is a
-    GatedDeltaNet. Naming a layer from its own mixer keeps the label specific to the
-    symbol that built it, and survives the dispatch being reordered.
-    """
-    mixer = getattr(layer, "self_attention", None)
-    if mixer is None:
-        mixer = getattr(layer, "mixer", None)
-    if mixer is None or isinstance(mixer, IdentityOp):
-        return type(layer).__name__
-    return f"{type(layer).__name__}/{type(mixer).__name__}"
 
 
 @dataclass
@@ -624,6 +608,27 @@ class HybridStack(MegatronModule):
                     )
 
                     if isinstance(layer, ShortcutMoEBlock):
+                        compute_layer_index = physical_layer_index
+                        moe_layer_index = physical_layer_index + 1
+                        compute_layer = layer.compute_layer
+                        moe_layer = layer.moe_layer
+                        # This branch returns before the header below, so a shortcut block
+                        # announces the two layers it fuses itself. Both are named: their
+                        # linears interleave here, since the MoE runs against an activation
+                        # the compute layer produced partway through.
+                        if log_structure:
+                            for index, fused in (
+                                (compute_layer_index, compute_layer),
+                                (moe_layer_index, moe_layer),
+                            ):
+                                where = (
+                                    f"{self.name}.layers.{index}"
+                                    if self.name is not None
+                                    else f"[{index}]"
+                                )
+                                qtype_debug_note(
+                                    f"{where} ({describe_layer(fused)}, shortcut-fused)"
+                                )
                         hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
