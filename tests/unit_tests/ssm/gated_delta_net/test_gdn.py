@@ -841,3 +841,29 @@ class TestGDNCuSeqlensResolve:
         actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
         with pytest.raises(ValueError, match="does not match"):
             mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
+
+
+def test_deterministic_mode_covers_the_qk_l2_norm():
+    """deterministic_mode must not leave a Triton kernel in the GDN forward path.
+
+    Regression guard. deterministic_mode swaps the gated delta rule for its torch
+    implementation but historically left the q/k L2 norm as fla's Triton kernel.
+    torch.use_deterministic_algorithms cannot see inside Triton, so every determinism
+    check in the training script passed while training was not reproducible run to run:
+    on one node, one session, the unfixed path deviated in 7 of 7 repeats and the fixed
+    one in 0 of 14 (~1e-4, growing to 1.6e-02 over 20 iterations).
+
+    This asserts the source text rather than running the layer, because building a GDN
+    module needs a process group and the point is only that no ``l2norm(`` call survives
+    outside a deterministic_mode branch -- a cheap check that fails loudly if someone
+    reintroduces one.
+    """
+    from megatron.core.ssm.gated_delta_net.common import _GDNBase
+
+    src = inspect.getsource(_GDNBase._prepare_input_for_gated_delta_rule)
+    assert "l2norm(" in src, "test is stale: the q/k L2 norm call moved or was renamed"
+    assert "deterministic_mode" in src, (
+        "the q/k L2 norm no longer consults deterministic_mode: fla's Triton l2norm is "
+        "back on the deterministic path, which makes training irreproducible while every "
+        "torch-level determinism check still passes"
+    )
