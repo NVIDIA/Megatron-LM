@@ -591,10 +591,14 @@ def reshard_model_weights(
     if tgt_core is not None and isinstance(transform, MXFP8ReshardTransform):
         refreshed = False
         for module in tgt_core.modules():
-            refresh = getattr(module, "refresh_flashinfer_mxfp8_weights", None)
-            if refresh is not None:
-                refreshed = bool(refresh()) or refreshed
+            for refresh_name in (
+                "refresh_flashinfer_mxfp8_weights",
+                "refresh_te_mxfp8_batch_invariant_weights",
+            ):
+                refresh = getattr(module, refresh_name, None)
+                if refresh is not None:
+                    refreshed = bool(refresh()) or refreshed
         if refreshed:
-            # Repacking is asynchronous. Synchronize before another stream replays graphs
-            # that read these derived weight buffers.
+            # Derived-weight refreshes are asynchronous. Synchronize before another
+            # stream replays graphs that read these buffers.
             torch.cuda.synchronize()

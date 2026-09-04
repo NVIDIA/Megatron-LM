@@ -88,6 +88,8 @@ from megatron.core.inference.moe import (
     InferenceGroupedGemmBackend,
     is_te_mxfp8_weight,
     mcore_fused_moe,
+    prepare_te_mxfp8_batch_invariant_weight,
+    refresh_te_mxfp8_batch_invariant_weight,
     vllm_fused_moe,
 )
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
@@ -1351,6 +1353,22 @@ class InferenceGroupedMLP(TEGroupedMLP):
             # The source parameters remain registered on the TE GroupedLinear. Keep only
             # non-owning references here so state_dict and parameter traversal stay unchanged.
             object.__setattr__(self, buf_name, weight)
+            if getattr(getattr(self, "config", None), "batch_invariant_mode", False):
+                prepare_te_mxfp8_batch_invariant_weight(weight)
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def refresh_te_mxfp8_batch_invariant_weights(self) -> bool:
+        """Refresh graph-stable TE grouped-weight scales in place after refit."""
+        if (
+            not self._concatenated_weights_built
+            or self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.TE
+        ):
+            return False
+        refreshed = False
+        for weight in (self._fc1_weight, self._fc2_weight):
+            refreshed = refresh_te_mxfp8_batch_invariant_weight(weight) or refreshed
+        return refreshed
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):

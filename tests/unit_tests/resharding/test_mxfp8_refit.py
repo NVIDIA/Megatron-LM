@@ -617,9 +617,14 @@ class TestTENativeMxfp8Refit:
         self, monkeypatch, source_single_grouped, destination_single_grouped
     ):
         import transformer_engine.pytorch as te
+        import transformer_engine_torch as tex
         from transformer_engine.common.recipe import MXFP8BlockScaling
 
         from megatron.core.fp8_utils import get_grouped_quantized_members
+        from megatron.core.inference.moe import (
+            prepare_te_mxfp8_batch_invariant_weight,
+            refresh_te_mxfp8_batch_invariant_weight,
+        )
         from megatron.core.resharding.utils import named_refit_tensors
 
         class LoopbackCopyService(CopyService):
@@ -700,6 +705,21 @@ class TestTENativeMxfp8Refit:
                     assert tensor.tensor_model_parallel is True
                     assert tensor.partition_dim == 1
 
+        destination_weight = (
+            destination.weight
+            if destination_single_grouped
+            else [destination.weight0, destination.weight1]
+        )
+        prepare_te_mxfp8_batch_invariant_weight(destination_weight)
+        cached_scale = None
+        cached_scale_before = None
+        cached_scale_ptr = None
+        if destination_single_grouped:
+            cached_storage, _ = getattr(destination.weight, "_mcore_batch_invariant_gemm_weight")
+            cached_scale = cached_storage.scale_inv
+            cached_scale_before = cached_scale.clone()
+            cached_scale_ptr = cached_scale.data_ptr()
+
         expected = {name: tensor.dequantize().clone() for name, tensor in source_tensors.items()}
         pointers_before = storage_pointers(destination_tensors)
         full_slice = (slice(None), slice(None))
@@ -720,3 +740,12 @@ class TestTENativeMxfp8Refit:
         assert storage_pointers(actual) == pointers_before
         for name, tensor in actual.items():
             torch.testing.assert_close(tensor.dequantize(), expected[name], atol=0, rtol=0)
+
+        refreshed = refresh_te_mxfp8_batch_invariant_weight(destination_weight)
+        assert refreshed is destination_single_grouped
+        if destination_single_grouped:
+            expected_storage = destination.weight.copy()
+            tex.grouped_swizzle_for_gemm(expected_storage, rowwise=True, columnwise=False)
+            assert cached_scale.data_ptr() == cached_scale_ptr
+            assert not torch.equal(cached_scale, cached_scale_before)
+            assert torch.equal(cached_scale, expected_storage.scale_inv)
