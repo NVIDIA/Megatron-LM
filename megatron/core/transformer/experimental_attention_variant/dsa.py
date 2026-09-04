@@ -2098,6 +2098,50 @@ class DSAttention(MegatronModule):
             raise RuntimeError("MTP sharing consumer requires published source indices.")
         return payload
 
+    def get_mtp_checkpoint_tensors(
+        self, packed_seq_params: PackedSeqParams | None, attention_mask: torch.Tensor | None
+    ) -> tuple[torch.Tensor, ...]:
+        """Export this layer's shared tensors as explicit checkpoint outputs/inputs.
+
+        The tuple layout is private to DSA. Empty top-k lengths encode an absent
+        optional tensor, since checkpoint outputs must be tensors.
+        """
+        payload = self._require_mtp_sharing_payload(packed_seq_params, attention_mask)
+        tensors = []
+        if self.mtp_latent_kv_share:
+            tensors.append(payload.latent_kv_by_layer[self.layer_number])
+        if self.mtp_sparse_attention_index_share:
+            indices = payload.topk_by_layer[self.layer_number]
+            lengths = payload.topk_length_by_layer.get(self.layer_number)
+            tensors.extend((indices, lengths if lengths is not None else indices.new_empty(0)))
+        return tuple(tensors)
+
+    def set_mtp_checkpoint_tensors(
+        self,
+        tensors: tuple[torch.Tensor, ...],
+        packed_seq_params: PackedSeqParams | None,
+        attention_mask: torch.Tensor | None,
+    ) -> None:
+        """Bind graph-connected checkpoint outputs or detached replay inputs."""
+        state = self._get_forward_sharing_state(packed_seq_params, attention_mask)
+        payload = state.get_or_create(_DSAMTPRepeatedSharingPayload)
+        expected = int(self.mtp_latent_kv_share) + 2 * int(self.mtp_sparse_attention_index_share)
+        if len(tensors) != expected:
+            raise ValueError(
+                f"Expected {expected} repeated-MTP checkpoint tensors, got {len(tensors)}"
+            )
+        offset = 0
+        if self.mtp_latent_kv_share:
+            payload.latent_kv_by_layer[self.layer_number] = tensors[0]
+            offset = 1
+        if self.mtp_sparse_attention_index_share:
+            indices, lengths = tensors[offset:]
+            payload.topk_by_layer[self.layer_number] = indices
+            if lengths.numel():
+                payload.topk_length_by_layer[self.layer_number] = lengths
+            else:
+                payload.topk_length_by_layer.pop(self.layer_number, None)
+
     def should_reuse_mtp_latent_kv(
         self,
         packed_seq_params: Optional[PackedSeqParams],
