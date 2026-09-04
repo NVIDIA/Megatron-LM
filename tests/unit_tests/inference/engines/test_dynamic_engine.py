@@ -395,6 +395,21 @@ class DynamicEngineTestConfig:
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
     num_speculative_tokens: int = 0
+    # A repeated (rather than per-depth) MTP head is one of the gates on
+    # DynamicInferenceContext.enable_mtp_kv_cache; set it to exercise the MTP draft KV cache.
+    mtp_use_repeated_layer: bool = False
+    # Required by TextGenerationController when cuda_graph_impl == "local" and EP > 1: the
+    # graphs are captured with expert padding enabled, so the router must keep it on.
+    moe_pad_experts_for_cuda_graph_inference: bool = False
+    # Layer block for ONE MTP depth in the hybrid pattern ("<main>/<mtp>/<mtp>/..."); every
+    # depth section must be identical. "M" (recurrent) is the historical default. A head that
+    # is exactly one attention layer -- e.g. "*-" -- is what enables the MTP draft KV cache;
+    # a recurrent head has no KV to append, so the gate stays off. See
+    # DynamicInferenceContext.enable_mtp_kv_cache.
+    mtp_layer_pattern: str = "M"
+    # Required by transformer_config validation when transformer_impl == "inference_optimized"
+    # and num_moe_experts is set: fp32 routing avoids dtype conversions during decode.
+    moe_router_dtype: Optional[str] = None
     position_embedding_type: str = "learned_absolute"
     use_flashinfer_fused_rope: Optional[bool] = None
     sampling_backend: str = 'torch'
@@ -610,6 +625,11 @@ class DynamicInferenceEngineTestBase:
                 params_dtype=torch.bfloat16,
                 num_layers=4,
                 mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
+                moe_pad_experts_for_cuda_graph_inference=(
+                    test_config.moe_pad_experts_for_cuda_graph_inference
+                ),
+                moe_router_dtype=test_config.moe_router_dtype,
                 hidden_size=(
                     test_config.hidden_size
                     if test_config.hidden_size is not None
@@ -709,6 +729,11 @@ class DynamicInferenceEngineTestBase:
                     3 if pp_size == 1 else 6
                 ),  # 1 Mamba layer, 1 attention layer, 1 MLP layer
                 mtp_num_layers=test_config.num_speculative_tokens,
+                mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
+                moe_pad_experts_for_cuda_graph_inference=(
+                    test_config.moe_pad_experts_for_cuda_graph_inference
+                ),
+                moe_router_dtype=test_config.moe_router_dtype,
                 hidden_size=256,  # The Mamba layer places several constraints on this
                 **hybrid_mixer_kwargs(test_config.ssm_mixer),
                 num_attention_heads=16,
@@ -759,7 +784,7 @@ class DynamicInferenceEngineTestBase:
             # Hybrid model.
             # When speculative tokens are configured, append MTP depth sections
             # to the hybrid layer pattern so the model creates MTP blocks.
-            mtp_suffix = "/M" * test_config.num_speculative_tokens
+            mtp_suffix = ("/" + test_config.mtp_layer_pattern) * test_config.num_speculative_tokens
             recurrent_symbol = "G" if is_gdn else "M"
             if pp_size == 1:
                 mamba_pattern = recurrent_symbol + "*-" + mtp_suffix

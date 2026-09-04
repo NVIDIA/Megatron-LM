@@ -48,6 +48,7 @@ from megatron.core.utils import (
 
 if TYPE_CHECKING:
     from megatron.core.context_parallel import CPLayout, THDCPLayoutPlan
+    from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 
 if is_torch_min_version("1.13.0"):
@@ -1649,7 +1650,13 @@ class MultiTokenPredictionLayer(MegatronModule):
                         rotary_pos_cos=rotary_pos_cos,
                         rotary_pos_sin=rotary_pos_sin,
                         attention_bias=attention_bias,
-                        inference_params=inference_params,
+                        # Pass the modern kwarg, matching the hybrid branch above. The
+                        # deprecated `inference_params=` alias is only normalized INSIDE
+                        # `TransformerLayer.forward`, but `_should_call_local_cudagraph`
+                        # inspects the raw kwargs before that and dereferences
+                        # `kwargs['inference_context']` -> KeyError. Harmless while MTP always
+                        # passed None; the MTP KV cache passes a real context here.
+                        inference_context=inference_params,
                         packed_seq_params=packed_seq_params,
                         sequence_len_offset=sequence_len_offset,
                         padding_mask=padding_mask,
@@ -1696,6 +1703,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         rotary_pos_sin: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        inference_context: Optional["BaseInferenceContext"] = None,
     ) -> Tensor:
         """Forward for single positions without roll_tensor (speculative decoding).
 
@@ -1726,6 +1734,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             rotary_pos_sin=rotary_pos_sin,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            inference_params=inference_context,
         )
         return hidden_states
 

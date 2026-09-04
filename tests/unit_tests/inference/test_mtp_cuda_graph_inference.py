@@ -1110,6 +1110,261 @@ class TestMTPCudaGraphExpertParallel:
 
 
 # --------------------------------------------------------------------------- #
+#  TestMtpKvCacheIdleExpertParallelRank (EP = 2, MTP KV cache ON)
+# --------------------------------------------------------------------------- #
+
+# The engine-level MTP KV cache tests (tests/unit_tests/inference/engines/) drive requests
+# through `_run_test`, which seeds `random.seed(...)` so every EP rank builds an IDENTICAL
+# request list. Real MoE all-to-alls happen there, but no rank is ever idle, so
+# `_run_dummy_serial_mtp_forward` never executes.
+#
+# That path is where the KV cache is most fragile. With the cache on, a rank with work issues
+# D+2 MTP forwards (commit pass, D depths, extra append) while a rank without work must issue
+# exactly D+2 matching ones -- and it must replay the CACHE-FREE ("mtp", ...) graphs, never
+# the KV-aware ("mtp_kv", ...) ones, whose append would target an idle rank's KV cache with no
+# valid block table. A mismatch in count or graph/eager mode does not raise; the MoE
+# all-to-all blocks. These tests therefore assert by COMPLETING.
+#
+# Driving is context + controller directly, matching `TestMTPCudaGraphExpertParallel` above:
+# no engine, no ZMQ consensus, no asyncio -- just the two mixin entry points the production
+# run loop dispatches between, run concurrently on different ranks.
+
+
+@pytest.mark.internal
+class TestMtpKvCacheIdleExpertParallelRank:
+    """Idle vs active EP ranks running the MTP KV cache paths against real collectives."""
+
+    HIDDEN_SIZE = 32
+    VOCAB_SIZE = 100
+    MAX_SEQ_LEN = 128
+    NUM_LAYERS = 2
+    NUM_ATTN_HEADS = 4
+    NUM_MOE_EXPERTS = 2
+    NUM_SPECULATIVE_TOKENS = 2
+
+    @classmethod
+    def setup_class(cls):
+        if Utils.world_size < _EP_SIZE:
+            pytest.skip(f"EP test requires at least {_EP_SIZE} GPUs")
+        if Utils.world_size % _EP_SIZE != 0:
+            pytest.skip(
+                f"world_size ({Utils.world_size}) must be divisible by EP size ({_EP_SIZE})"
+            )
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=_EP_SIZE,
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self):
+        torch.cuda.synchronize()
+        dist.barrier()
+        delete_cuda_graphs()
+        InferenceMode.unset_active()
+
+    # ---- helpers ---------------------------------------------------------- #
+
+    def _build_model(self):
+        """MoE + MTP model whose head is a single REPEATED attention layer."""
+        model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
+        config = TransformerConfig(
+            num_layers=self.NUM_LAYERS,
+            hidden_size=self.HIDDEN_SIZE,
+            num_attention_heads=self.NUM_ATTN_HEADS,
+            use_cpu_initialization=True,
+            attention_backend=AttnBackend.local,
+            params_dtype=torch.bfloat16,
+            expert_model_parallel_size=_EP_SIZE,
+            num_moe_experts=self.NUM_MOE_EXPERTS,
+            moe_token_dispatcher_type="alltoall",
+            add_bias_linear=False,
+            mtp_num_layers=1,
+            mtp_use_repeated_layer=True,
+            cuda_graph_impl="local",
+            # Required by TextGenerationController for local graphs + EP > 1.
+            moe_pad_experts_for_cuda_graph_inference=True,
+            inference_moe_token_dispatcher_type='nccl',
+        )
+        layer_spec = get_gpt_layer_local_spec(num_experts=self.NUM_MOE_EXPERTS)
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=layer_spec, use_transformer_engine=False
+        )
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=layer_spec,
+            vocab_size=self.VOCAB_SIZE,
+            max_sequence_length=self.MAX_SEQ_LEN,
+            parallel_output=True,
+            pre_process=True,
+            post_process=True,
+            mtp_block_spec=mtp_block_spec,
+        ).cuda()
+        for param in model.parameters():
+            param.data = param.data.to(config.params_dtype)
+        model.eval()
+        return model
+
+    def _build_controller(self, model, *, num_cuda_graphs=None):
+        context = DynamicInferenceContext(
+            model_config=model.config,
+            inference_config=InferenceConfig(
+                max_sequence_length=self.MAX_SEQ_LEN,
+                buffer_size_gb=0.5,
+                block_size_tokens=256,
+                materialize_only_last_token_logits=False,
+                num_speculative_tokens=self.NUM_SPECULATIVE_TOKENS,
+                num_cuda_graphs=num_cuda_graphs,
+                max_requests=16,
+                sampling_backend='torch',
+            ),
+        )
+        assert context.enable_mtp_kv_cache, (
+            "MTP KV cache is OFF for this config, so these tests would pass vacuously; check "
+            "the mtp_use_repeated_layer / mtp_num_layers / num_speculative_tokens gates"
+        )
+        wrapped = GPTInferenceWrapper(model, context)
+        wrapped.model_is_pipeline_parallel = False
+        InferenceMode.set_active()
+        controller = TextGenerationController(
+            inference_wrapped_model=wrapped, tokenizer=mock.Mock()
+        )
+        return controller, context
+
+    def _prepare_active_rank(self, controller, context, state):
+        """Give this rank real requests and the decoder hidden states MTP consumes."""
+        context.add_dummy_requests_for_cudagraph_capture(_STATE_DIMS[state])
+        context.initialize_attention_state()
+
+        active_request_count = context.total_request_count - context.paused_request_count
+        controller._init_mtp_sampling_tensors()
+        controller._sampled_tokens_cuda[:active_request_count] = torch.remainder(
+            torch.arange(active_request_count, device='cuda'), self.VOCAB_SIZE
+        )
+        # Greedy sampling keeps the draft loop deterministic.
+        context.active_request_metadata["temperature"][:active_request_count] = 1.0
+        context.active_request_metadata["top_k"][:active_request_count] = 1
+        context.active_request_metadata["top_p"][:active_request_count] = 0.0
+
+        token_count = context.padded_active_token_count
+        context.mtp_decoder_hidden_states = torch.randn(
+            token_count, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16
+        )
+        controller._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
+        return active_request_count
+
+    def _prepare_idle_rank(self, controller, context):
+        """Mirror what the engine run loop does on a rank with no schedulable work."""
+        context.initialize_attention_state(is_expert_parallel_dummy_cuda_graph_step=True)
+        controller._init_mtp_sampling_tensors()
+
+    # ---- tests ------------------------------------------------------------ #
+
+    @pytest.mark.parametrize(
+        "peer_state", [DECODE, PREFILL, MIXED], ids=[f"peer={s}" for s in [DECODE, PREFILL, MIXED]]
+    )
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_idle_rank_matches_active_rank(self, peer_state):
+        """Even EP ranks idle, odd ranks run the real MTP KV cache path.
+
+        The idle rank runs `_run_dummy_serial_mtp_forward`; the active rank runs the commit
+        pass, the draft loop, and the extra append. Their MoE all-to-alls must line up.
+        """
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        is_idle = ep_rank % 2 == 0
+
+        model = self._build_model()
+        controller, context = self._build_controller(model)
+
+        if is_idle:
+            self._prepare_idle_rank(controller, context)
+            controller._run_dummy_serial_mtp_forward()
+        else:
+            self._prepare_active_rank(controller, context, peer_state)
+            # base_position=None exercises the legacy derivation from post-rewind CPU state.
+            controller._compute_serial_mtp_and_sample()
+            active = context.total_request_count - context.paused_request_count
+            sampled = controller._sampled_mtp_tokens_cuda[:, :active]
+            assert sampled.shape == (controller.num_mtp_depths, active)
+            assert torch.all(sampled >= 0) and torch.all(sampled < self.VOCAB_SIZE)
+
+        torch.cuda.synchronize()
+        dist.barrier()
+
+    @pytest.mark.parametrize("rank_states", _STATE_COMBOS, ids=[",".join(s) for s in _STATE_COMBOS])
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_idle_active_cross_product(self, rank_states):
+        """Every assignment of per-rank load, including all-idle and all-active."""
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        my_state = rank_states[ep_rank]
+        is_idle = my_state == NONE
+
+        model = self._build_model()
+        controller, context = self._build_controller(model)
+
+        # EP ranks must agree on the CUDA-graph decision before either MTP path runs; that
+        # agreement is what keeps the two paths' graph/eager modes matched.
+        if is_idle:
+            self._prepare_idle_rank(controller, context)
+        else:
+            self._prepare_active_rank(controller, context, my_state)
+
+        uses_graph = torch.tensor(
+            [int(context.using_cuda_graph_this_step())], device='cuda', dtype=torch.int32
+        )
+        lo, hi = uses_graph.clone(), uses_graph.clone()
+        ep_group = parallel_state.get_expert_model_parallel_group()
+        dist.all_reduce(lo, op=dist.ReduceOp.MIN, group=ep_group)
+        dist.all_reduce(hi, op=dist.ReduceOp.MAX, group=ep_group)
+        assert lo.item() == hi.item(), (
+            f"EP ranks disagree on CUDA graph usage (rank_states={rank_states}); the real and "
+            f"dummy MTP paths would run in different modes"
+        )
+
+        if is_idle:
+            controller._run_dummy_serial_mtp_forward()
+        else:
+            controller._compute_serial_mtp_and_sample()
+
+        torch.cuda.synchronize()
+        dist.barrier()
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_idle_rank_matches_active_rank_with_cuda_graphs(self):
+        """Same parity contract with MTP CUDA graphs captured by the engine warmup.
+
+        Graphed is the harder case: the active rank replays the KV-aware ("mtp_kv", ...)
+        graphs while the idle rank must replay the cache-free ("mtp", ...) ones, and both
+        families have to have been captured at the same batch size.
+        """
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        is_idle = ep_rank % 2 == 0
+
+        model = self._build_model()
+        controller, context = self._build_controller(model, num_cuda_graphs=-1)
+        # Engine construction runs create_cuda_graphs(), capturing both MTP graph families
+        # exactly as production warmup does.
+        DynamicInferenceEngine(controller, context)
+
+        if is_idle:
+            self._prepare_idle_rank(controller, context)
+            controller._run_dummy_serial_mtp_forward()
+        else:
+            self._prepare_active_rank(controller, context, DECODE)
+            controller._compute_serial_mtp_and_sample()
+
+        torch.cuda.synchronize()
+        dist.barrier()
+
+
+# --------------------------------------------------------------------------- #
 #  TestMTPBlockScopeCudaGraph (TP = 1)
 # --------------------------------------------------------------------------- #
 

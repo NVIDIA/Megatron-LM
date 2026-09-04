@@ -371,6 +371,7 @@ class LanguageModule(MegatronModule):
         depth: Optional[int] = None,
         eager: bool = False,
         cache_key=None,
+        mtp_inference_context=None,
     ) -> tuple:
         """Compute a single MTP depth for speculative decoding.
 
@@ -400,6 +401,7 @@ class LanguageModule(MegatronModule):
             next_token_ids=next_token_ids,
             position_ids=position_ids,
             embedding=self.embedding,
+            inference_context=mtp_inference_context,
         )
 
         output_weight = None

@@ -28,6 +28,9 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.mtp_inference_mixin import (
+    MTPInferenceMixin,
+)
 from megatron.core.inference.utils import (
     InferenceMode,
     get_attention_mask,
@@ -61,9 +64,6 @@ except ImportError:
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.sampling import FlashInferSampling, Sampling, TorchSampling
-from megatron.core.inference.text_generation_controllers.mtp_inference_mixin import (
-    MTPInferenceMixin,
-)
 from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import rewind_kv_cache
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
     mamba_state_selective_copy,
@@ -272,6 +272,14 @@ class TextGenerationController(MTPInferenceMixin):
                 self.num_mtp_depths = min(
                     self.num_speculative_tokens, self.model_config.mtp_num_layers
                 )
+
+        # MTP KV cache + chunked prefill: the last main hidden state of the in-flight chunked
+        # request's most recent chunk, carried one step so the next chunk can seed the position
+        # straddling the two chunks (f(h_{off+c-1} + emb(t_{off+c}))). There is at most one chunked
+        # request at a time and it is never paused, so a single tensor keyed by its request id
+        # suffices. None when no chunk is in flight; see `_mtp_commit_pass`.
+        self._mtp_chunk_boundary_hidden = None
+        self._mtp_chunk_boundary_req_id = -1
 
         if (
             self.model_config.cuda_graph_impl == "local"
@@ -2957,7 +2965,13 @@ class TextGenerationController(MTPInferenceMixin):
                 nvtx_range_pop("mtp-spec-decoding/verify")
                 # Phase 2: Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
+                # Snapshot the block table BEFORE rewind releases the rejected-draft blocks;
+                # the MTP draft loop reuses it so its speculative writes land on valid blocks.
+                if getattr(context, "enable_mtp_kv_cache", False):
+                    context._mtp_snapshot_prerewind_block_table()
                 blocks_to_release, remove_mask = self._rewind_kv_cache()
+                # No separate MTP rewind: the draft loop re-derives its start from the (rewound)
+                # main KV offsets, so rejected drafts are naturally overwritten next step.
                 nvtx_range_pop("mtp-spec-decoding/rewind-kv-cache")
 
                 # Disable MoE padding for MTP computation, unless CUDA graphs

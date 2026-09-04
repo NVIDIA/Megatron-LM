@@ -499,6 +499,59 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
+        # MTP KV cache (v2): reserve one extra attention-layer plane in the shared KV `memory_buffer`
+        # for the repeated MTP draft attention. Main KV position i and MTP KV position i are
+        # position-aligned and MTP length <= main length, so the MTP layer reuses main's block
+        # table; only its per-request length offset is tracked separately. The MTP forward routes
+        # its append/read to this slot via the `_mtp_forward_active` flag (see
+        # append_key_value_cache / key_value_cache), so no attention-layer renumbering is needed.
+        #
+        # Always on wherever it is implementable -- there is no opt-in flag. The draft KV is an
+        # acceptance-rate optimization that cannot change verified output, so the only gate is
+        # whether this model/config can populate it: speculative decoding must be active, the
+        # head must be the repeated-layer kind (a per-depth head has no single `mtp.layers[0]`
+        # to seed through), and the head itself must be exactly one attention layer.
+        #
+        # The gate is on the MTP HEAD, not the main decoder. A hybrid main decoder is fine: the
+        # reserved slot bypasses `layer_map` on both append and read (see append_key_value_cache
+        # / key_value_cache), so the main model's Mamba/GDN layers never interact with it. What
+        # does not work is a recurrent MTP head (no KV to append) or a multi-attention-layer head
+        # (its layers would collide on the single reserved slot). Hybrid models state the two
+        # patterns independently as "<main>/<mtp>/...", so only the MTP half is consulted here.
+        mtp_head_layer_types = (
+            mamba_inference_state_config.mtp_layer_type_list
+            if mamba_inference_state_config is not None
+            else None
+        )
+        if mtp_head_layer_types is None:
+            # No hybrid MTP pattern to inspect: either a pure-Transformer model, whose MTP head is
+            # a single attention TransformerLayer by construction, or a hybrid head whose pattern
+            # could not be read -- in which case assume it matches the main decoder's recurrence.
+            mtp_head_is_single_attention = not self.is_hybrid_model
+        else:
+            attention_symbols = (Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MLA)
+            num_head_attention = sum(t in attention_symbols for t in mtp_head_layer_types)
+            head_has_recurrent = any(
+                t in (Symbols.MAMBA, Symbols.GDN) for t in mtp_head_layer_types
+            )
+            mtp_head_is_single_attention = num_head_attention == 1 and not head_has_recurrent
+        self.enable_mtp_kv_cache = bool(
+            self.num_speculative_tokens > 0
+            and getattr(model_config, "mtp_num_layers", None)
+            and getattr(model_config, "mtp_use_repeated_layer", False)
+            and mtp_head_is_single_attention
+        )
+        self._mtp_forward_active = False
+        # Whether the current MTP draft loop is replaying captured CUDA graphs (True) or running
+        # eager (False). Seeded by `_mtp_begin_decode` from the main decode step's graph decision;
+        # `_mtp_setup_decode_step` reads it to route to graph vs non-graph attention metadata.
+        self._mtp_graphed = False
+        if self.enable_mtp_kv_cache:
+            self.mtp_kv_layer_slot = self.num_attention_layers
+            self.num_attention_layers += 1
+        else:
+            self.mtp_kv_layer_slot = None
+
         if self.num_attention_layers == 0:
             raise NotImplementedError(
                 f"Using `DynamicInferenceContext` with no attention is not supported."
@@ -1808,7 +1861,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             key (Tensor): Key tensor.
             value (Tensor): Value tensor.
         """
-        attention_layer_number = self.layer_map[layer_number - 1]
+        if self._mtp_forward_active:
+            # Redirect the MTP draft attention to its reserved KV-buffer slot regardless of the
+            # inner layer's layer_number (which reuses decoder numbering for router/aux-loss).
+            attention_layer_number = self.mtp_kv_layer_slot
+        else:
+            attention_layer_number = self.layer_map[layer_number - 1]
 
         if triton_append_key_value_cache is not None and not self.cache_mla_latent:
             # currently does not support MLA latent cache
@@ -1860,7 +1918,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             (Tuple[Tensor, Tensor, Tensor]) The key and value pointer tensors that point
             to blocks within the block-level memory buffer as well as the block table.
         """
-        attention_layer_number = self.layer_map[layer_number - 1]
+        if self._mtp_forward_active:
+            attention_layer_number = self.mtp_kv_layer_slot
+        else:
+            attention_layer_number = self.layer_map[layer_number - 1]
 
         assert self.active_attn_metadata is not None
 
@@ -1876,6 +1937,288 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.memory_buffer[1, attention_layer_number],
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
+
+    # ------------------------------------------------------------------
+    # MTP KV cache (v1) — decode-step bookkeeping.
+    #
+    # The MTP draft attention reuses this context's KV `memory_buffer` (extra slot
+    # `mtp_kv_layer_slot`) and main's block table. Each MTP draft depth is a decode-style
+    # forward: every active request contributes exactly one token, written at its own MTP
+    # position and attending over its own MTP history (write-then-attend).
+    #
+    # There is NO persistent per-request MTP length. The MTP write position for depth 0 is
+    # DERIVED each step as `base_position - 1` (roll-by-one), where `base_position` is the
+    # main model's next-token position (`request_kv_length_offsets + request_query_lengths`).
+    # Because the main KV offsets are maintained by the context through compaction, pause/
+    # resume, and speculative rewind, the derived MTP position can never desync — and no
+    # separate MTP rewind is needed (rejected drafts are simply overwritten next step, since
+    # `base_position` advances by exactly 1 + accepted).
+    #
+    # For the eager draft loop we drive the attention metadata directly on the GPU (bypassing
+    # the coalesced CPU->GPU bookkeeping transfer) so the MTP forwards do not disturb the main
+    # step's Mamba/H2D state. `_mtp_begin_decode` seeds the GPU scratch from the caller's start
+    # positions + block table; `_mtp_setup_decode_step` populates the write maps + MHA read
+    # metadata for one depth; `_mtp_advance_decode_step` bumps the positions; `_mtp_end_decode`
+    # restores non-MTP mode. RoPE is assumed absent (v1).
+    # ------------------------------------------------------------------
+    def _mtp_begin_decode(
+        self,
+        active_request_count: int,
+        padded_count: int,
+        start_positions: Tensor,
+        graphed: bool = False,
+    ) -> None:
+        """Enter MTP-forward mode.
+
+        `start_positions[r] == base_position[r] - 1` is the MTP write position for depth 0 of
+        request r (derived from the main KV offsets by the caller), advanced by one per depth.
+
+        `graphed` mirrors the main decode step's CUDA-graph decision (the caller passes it from the
+        EP-synced `_mtp_resolved_padded_count`, NOT the live `_using_cuda_graph_this_step` which the
+        commit pass has already clobbered). When True, `_mtp_setup_decode_step` routes to the graph
+        attention metadata so the captured KV-aware MTP graph is replayed.
+        """
+        assert self.enable_mtp_kv_cache
+        self._mtp_graphed = graphed
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        device = self.gpu_view.token_to_block_idx.device
+        self._mtp_active_request_count = active_request_count
+        self._mtp_padded_count = padded_count
+        # Depth-0 write positions on the GPU, advanced per depth. Clone so the advance does not
+        # mutate the caller's tensor.
+        self._mtp_offsets_gpu = (
+            start_positions[:active_request_count].to(device, non_blocking=True).to(torch.int32)
+        ).clone()
+        # Block table for the active requests. MUST use the PRE-REWIND snapshot: the MTP draft
+        # loop writes D+1 speculative positions (up to committed-1+D), which extend past the
+        # accepted range into blocks that `_rewind_kv_cache` releases (and clears to -1) when a
+        # draft crosses a block boundary. Using the post-rewind `request_to_kv_block_ids` would
+        # send the deepest drafts to block -1 (corrupt), decaying acceptance with draft depth.
+        # The pre-rewind table (captured right after the main forward, before rewind) still holds
+        # every block the main model allocated for its own D+1 forward positions.
+        block_table_src = (
+            self._mtp_prerewind_block_table
+            if getattr(self, "_mtp_prerewind_block_table", None) is not None
+            else self.request_to_kv_block_ids
+        )
+        self._mtp_block_table_gpu = (
+            block_table_src[active_slice][:active_request_count]
+            .to(device, non_blocking=True)
+            .to(self.gpu_view.mha_block_table.dtype)
+        )
+        self._mtp_forward_active = True
+
+    def _mtp_begin_decode_for_capture(self, padded_count: int) -> None:
+        """Set up synthetic (safe) graphed MTP decode metadata for CUDA-graph CAPTURE at warmup.
+
+        Unlike `_mtp_begin_decode` (which reads real per-request block tables), this points every
+        row at the scratch `dummy_block_idx` at position 0, so the captured append/attend touch only
+        scratch KV memory. Graph replay overwrites all of this from `gpu_view` each step, so the
+        capture-time values are irrelevant to correctness — only the shapes and the fixed launch
+        bounds (padded_count, max_seqlen) matter, and those match the runtime graphed step.
+        """
+        assert self.enable_mtp_kv_cache
+        device = self.gpu_view.token_to_block_idx.device
+        self._mtp_active_request_count = padded_count
+        self._mtp_padded_count = padded_count
+        self._mtp_offsets_gpu = torch.zeros(padded_count, dtype=torch.int32, device=device)
+        max_blocks = self.gpu_view.mha_block_table.shape[1]
+        self._mtp_block_table_gpu = torch.full(
+            (padded_count, max_blocks),
+            self.kv_block_allocator.dummy_block_idx,
+            dtype=self.gpu_view.mha_block_table.dtype,
+            device=device,
+        )
+        self._mtp_graphed = True
+        self._mtp_forward_active = True
+
+    def _mtp_snapshot_prerewind_block_table(self) -> None:
+        """Capture the block table before `_rewind_kv_cache` releases draft blocks.
+
+        Called right after the main forward and before the rewind. The MTP draft loop later
+        reuses this snapshot so its speculative writes/reads land on the blocks the main model
+        allocated for its own base+draft forward, not on blocks rewind has since released.
+        """
+        if self.enable_mtp_kv_cache:
+            self._mtp_prerewind_block_table = self.request_to_kv_block_ids.clone()
+
+    def _mtp_setup_decode_step(self) -> None:
+        """Populate token write maps + MHA read metadata for one MTP draft depth."""
+        gv = self.gpu_view
+        device = gv.token_to_block_idx.device
+        n = self._mtp_active_request_count
+        padded = self._mtp_padded_count
+        block_size = self.block_size_tokens
+
+        positions = self._mtp_offsets_gpu  # [n] int, MTP write position P_r for this depth
+        block_within = (positions // block_size).to(torch.long)
+        local = positions % block_size
+        rows = torch.arange(n, device=device)
+
+        # Token write maps (one token per active request).
+        gv.token_to_block_idx[:n] = self._mtp_block_table_gpu[rows, block_within].to(
+            gv.token_to_block_idx.dtype
+        )
+        gv.token_to_local_position_within_kv_block[:n] = local.to(
+            gv.token_to_local_position_within_kv_block.dtype
+        )
+        gv.token_to_request_idx[:n] = rows.to(gv.token_to_request_idx.dtype)
+        gv.token_to_position_in_request[:n] = positions.to(gv.token_to_position_in_request.dtype)
+        gv.token_to_pos_ids[:n] = positions.to(gv.token_to_pos_ids.dtype)
+
+        # MHA read metadata: query_length=1 per request, kv_length = P_r + 1 (write-then-attend).
+        kv_len = positions + 1
+        gv.mha_query_lengths[:n] = 1
+        gv.mha_cu_query_seq_lengths[: n + 1] = torch.arange(
+            0, n + 1, device=device, dtype=gv.mha_cu_query_seq_lengths.dtype
+        )
+        gv.mha_kv_seq_lengths[:n] = kv_len.to(gv.mha_kv_seq_lengths.dtype)
+        gv.mha_cu_kv_seq_lengths[0] = 0
+        gv.mha_cu_kv_seq_lengths[1 : n + 1] = torch.cumsum(kv_len, dim=0).to(
+            gv.mha_cu_kv_seq_lengths.dtype
+        )
+        gv.mha_block_table[:n] = self._mtp_block_table_gpu
+
+        # Zero/sentinel-pad the padding rows so padded slots never index real KV.
+        if padded > n:
+            gv.token_to_block_idx[n:padded] = self.kv_block_allocator.dummy_block_idx
+            gv.token_to_local_position_within_kv_block[n:padded] = 0
+            gv.mha_query_lengths[n:padded] = 0
+            gv.mha_cu_query_seq_lengths[n + 1 : padded + 1] = gv.mha_cu_query_seq_lengths[n]
+            gv.mha_kv_seq_lengths[n:padded] = 0
+            gv.mha_cu_kv_seq_lengths[n + 1 : padded + 1] = gv.mha_cu_kv_seq_lengths[n]
+            gv.mha_block_table[n:padded] = -1
+
+        # The metadata fills above wrote the fixed-address `gpu_view` buffers that the append/attend
+        # kernels read; those buffers are shared by the graph and non-graph MHA metadata objects,
+        # so a captured MTP graph replays correctly against whatever positions we just wrote. The
+        # per-step `_mtp_block_table_gpu`/`_mtp_offsets_gpu` are freshly cloned each step, but the
+        # graph never reads them directly (only `gpu_view`), so that is graph-safe.
+        if self._mtp_graphed:
+            # Graphed: route to the graph metadata and use the FIXED capture-time sequence-length
+            # bound (baked into the flash-attn kernel launch at capture) rather than a per-step
+            # `.item()` sync. `kv_len = position + 1 <= max_sequence_length`, so `max_seqlen` is a
+            # safe upper bound; the actual per-request lengths come from the GPU cu_kv tensors.
+            mha = self.graph_attn_metadata["mha_metadata"]
+            mha.set_state_data(
+                padded_active_request_count=padded, max_seqlen_q=1, max_seqlen_k=mha.max_seqlen
+            )
+            self.active_attn_metadata = self.graph_attn_metadata
+            self.active_token_count = n
+            self.padded_active_token_count = padded
+            self._using_cuda_graph_this_step = True
+        else:
+            # Eager: tight per-step max via a GPU->CPU sync, non-graph metadata, graphs disabled.
+            max_seqlen_k = int(kv_len.max().item()) if n > 0 else 1
+            mha = self.non_graph_attn_metadata["mha_metadata"]
+            mha.set_state_data(
+                padded_active_request_count=padded, max_seqlen_q=1, max_seqlen_k=max_seqlen_k
+            )
+            self.active_attn_metadata = self.non_graph_attn_metadata
+            self.active_token_count = n
+            self.padded_active_token_count = padded
+            self._using_cuda_graph_this_step = False
+
+    def _mtp_setup_prefill_step(
+        self,
+        append_counts: Tensor,
+        block_table_prefill: Tensor,
+        padded_token_count: Optional[int] = None,
+        padded_request_count: Optional[int] = None,
+        request_start_positions: Optional[Tensor] = None,
+    ) -> None:
+        """Populate token write maps + MHA metadata for a varlen roll-by-one MTP write forward.
+
+        Used for two cases, both roll-by-one over main hidden states (K/V = f(input), independent
+        of the attention window since there is no RoPE, so only the write positions must be right):
+          - PROMPT SEED (prefill requests): each request writes positions 0..L-2 into empty KV
+            (request_start_positions=None -> start at 0).
+          - COMMIT REFRESH (decode requests): rewrite the accepted-draft positions' KV from the
+            MAIN hidden each step (a per-step "first pass"), so committed KV never carries a stale
+            chained-draft-hidden value. Here each request writes at its own committed offset via
+            `request_start_positions[r]` (the MTP position of the request's first refreshed token).
+        `append_counts`/`block_table_prefill` are GPU tensors for the P requests (active-slice order).
+        """
+        assert self.enable_mtp_kv_cache
+        gv = self.gpu_view
+        device = gv.token_to_block_idx.device
+        block_size = self.block_size_tokens
+        num_prefill = append_counts.numel()
+        total = int(append_counts.sum().item())
+        padded_total = total if padded_token_count is None else padded_token_count
+        padded_p = num_prefill if padded_request_count is None else padded_request_count
+
+        # Per-token request row and within-request index (0..count-1); then shift each request's
+        # write positions by its start offset (0 for prompt seed; committed offset for refresh).
+        rows = torch.repeat_interleave(torch.arange(num_prefill, device=device), append_counts)
+        seg_start = torch.cumsum(append_counts, 0) - append_counts
+        positions = torch.arange(total, device=device) - seg_start[rows]
+        if request_start_positions is not None:
+            positions = positions + request_start_positions.to(device)[rows]
+
+        gv.token_to_block_idx[:total] = block_table_prefill[
+            rows, (positions // block_size).to(torch.long)
+        ].to(gv.token_to_block_idx.dtype)
+        gv.token_to_local_position_within_kv_block[:total] = (positions % block_size).to(
+            gv.token_to_local_position_within_kv_block.dtype
+        )
+        gv.token_to_request_idx[:total] = rows.to(gv.token_to_request_idx.dtype)
+        gv.token_to_position_in_request[:total] = positions.to(
+            gv.token_to_position_in_request.dtype
+        )
+        gv.token_to_pos_ids[:total] = positions.to(gv.token_to_pos_ids.dtype)
+
+        # MHA metadata: fresh causal prefill, so per-request kv_length == query_length.
+        p = num_prefill
+        gv.mha_query_lengths[:p] = append_counts.to(gv.mha_query_lengths.dtype)
+        gv.mha_cu_query_seq_lengths[0] = 0
+        cu = torch.cumsum(append_counts, 0).to(gv.mha_cu_query_seq_lengths.dtype)
+        gv.mha_cu_query_seq_lengths[1 : p + 1] = cu
+        gv.mha_kv_seq_lengths[:p] = append_counts.to(gv.mha_kv_seq_lengths.dtype)
+        gv.mha_cu_kv_seq_lengths[0] = 0
+        gv.mha_cu_kv_seq_lengths[1 : p + 1] = cu
+        gv.mha_block_table[:p] = block_table_prefill
+
+        if padded_total > total:
+            gv.token_to_block_idx[total:padded_total] = self.kv_block_allocator.dummy_block_idx
+            gv.token_to_local_position_within_kv_block[total:padded_total] = 0
+        if padded_p > p:
+            gv.mha_query_lengths[p:padded_p] = 0
+            gv.mha_cu_query_seq_lengths[p + 1 : padded_p + 1] = gv.mha_cu_query_seq_lengths[p]
+            gv.mha_kv_seq_lengths[p:padded_p] = 0
+            gv.mha_cu_kv_seq_lengths[p + 1 : padded_p + 1] = gv.mha_cu_kv_seq_lengths[p]
+            gv.mha_block_table[p:padded_p] = -1
+
+        max_seqlen = int(append_counts.max().item()) if p > 0 else 1
+        mha = self.non_graph_attn_metadata["mha_metadata"]
+        mha.set_state_data(
+            padded_active_request_count=padded_p, max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen
+        )
+        self.active_attn_metadata = self.non_graph_attn_metadata
+        self.active_token_count = total
+        self.padded_active_token_count = padded_total
+        self._using_cuda_graph_this_step = False
+        self._mtp_forward_active = True
+        # This is a VARLEN forward (per-request query lengths differ). Force the attention onto
+        # the prefill/varlen path: on a pure-decode step num_prefill_requests==0 would make
+        # is_decode_only() True, routing to the decode kernel whose uniform
+        # `q.reshape(num_requests, tokens_per_request, ...)` fails on ragged input. Restored in
+        # _mtp_finalize_prefill_step.
+        self._mtp_saved_num_prefill_requests = self.num_prefill_requests
+        self.num_prefill_requests = max(1, num_prefill)
+
+    def _mtp_finalize_prefill_step(self) -> None:
+        """Exit MTP-forward mode after the commit-pass (varlen) forward."""
+        self._mtp_forward_active = False
+        self.num_prefill_requests = self._mtp_saved_num_prefill_requests
+
+    def _mtp_advance_decode_step(self) -> None:
+        """Advance each active request's MTP write position by one after a depth forward."""
+        self._mtp_offsets_gpu += 1
+
+    def _mtp_end_decode(self) -> None:
+        """Exit MTP-forward mode. No persistent MTP length state to write back."""
+        self._mtp_forward_active = False
 
     def mamba_states_cache(
         self, layer_number: int, intermediate: bool = False

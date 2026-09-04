@@ -840,6 +840,35 @@ class DynamicInferenceEngine(AbstractEngine):
                                 cache_key=("mtp", n, depth),
                             )
 
+                        # KV-aware MTP graph: when the MTP KV cache is enabled, ALSO capture a graph
+                        # that includes the draft-attention KV append+attend (the cache-free graph
+                        # above does not), under a distinct ("mtp_kv", n, depth) key that the real
+                        # spec-decode path replays. The EP dummy path keeps the cache-free graph.
+                        # Uses synthetic scratch metadata (all dummy_block_idx / position 0); graph
+                        # replay overwrites it from gpu_view each step, so only shapes/bounds count.
+                        if context.enable_mtp_kv_cache:
+                            context._mtp_begin_decode_for_capture(n)
+                            for depth in mtp_warmup_depths:
+                                context._mtp_setup_decode_step()
+                                unwrapped.compute_mtp_single_step(
+                                    hidden_states=torch.zeros(
+                                        (batch_dim, 1, model_config.hidden_size),
+                                        device=device,
+                                        dtype=model_config.params_dtype,
+                                    ),
+                                    next_token_ids=torch.zeros(
+                                        (1, n), device=device, dtype=torch.long
+                                    ),
+                                    position_ids=torch.zeros(
+                                        (1, n), device=device, dtype=torch.int64
+                                    ),
+                                    depth=depth,
+                                    mtp_inference_context=context,
+                                    cache_key=("mtp_kv", n, depth),
+                                )
+                                context._mtp_advance_decode_step()
+                            context._mtp_end_decode()
+
                 context.reset()
 
             # Per-iteration memory accounting, scoped to the CUDA-graph mempool.
