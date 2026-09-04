@@ -12,6 +12,7 @@ import torch
 
 from megatron.core.transformer.attention_residual import (
     AttentionResidual,
+    _get_fla_fused_attnres,
     attn_res_final_num_sources,
     attn_res_num_payload_slices,
     attn_res_num_sources,
@@ -19,6 +20,8 @@ from megatron.core.transformer.attention_residual import (
     pack_attn_res_payload,
     unpack_attn_res_payload,
 )
+
+HAVE_FLA_ATTNRES = _get_fla_fused_attnres() is not None
 
 
 def _reference_attn_res(pseudo_query, key_norm_weight, eps, values):
@@ -177,6 +180,64 @@ class TestAttnResCompileParity:
             torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-5)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAVE_FLA_ATTNRES,
+    reason="FLA fused AttnRes parity requires CUDA and flash-linear-attention",
+)
+class TestAttnResFlaParity:
+    """attn_res_impl='fla' must match the independent PyTorch reference."""
+
+    @pytest.mark.parametrize("n_sources", [1, 3, 6])
+    def test_fla_matches_reference(self, n_sources):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        torch.manual_seed(29)
+        eps = 1e-6
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            enable_attention_residuals=True,
+            attn_res_block_layers=1,
+            attn_res_impl="fla",
+            layernorm_epsilon=eps,
+        )
+        module = AttentionResidual(config).cuda()
+        with torch.no_grad():
+            module.pseudo_query.copy_(torch.randn(32, device="cuda") * 0.05)
+            module.key_norm_weight.copy_(
+                torch.ones(32, device="cuda") + torch.randn(32, device="cuda") * 0.1
+            )
+
+        values = [
+            (torch.randn(4, 2, 32, device="cuda", dtype=torch.bfloat16) * (0.5 + index))
+            .detach()
+            .requires_grad_(True)
+            for index in range(n_sources)
+        ]
+        reference_query = module.pseudo_query.detach().double().requires_grad_(True)
+        reference_weight = module.key_norm_weight.detach().double().requires_grad_(True)
+        reference_values = [value.detach().double().requires_grad_(True) for value in values]
+        grad_output = torch.randn(4, 2, 32, device="cuda", dtype=torch.bfloat16)
+
+        output = module(values)
+        grads = torch.autograd.grad(
+            output, [module.pseudo_query, module.key_norm_weight, *values], grad_output
+        )
+        reference_output = _reference_attn_res(
+            reference_query, reference_weight, eps, reference_values
+        )
+        reference_grads = torch.autograd.grad(
+            reference_output,
+            [reference_query, reference_weight, *reference_values],
+            grad_output.double(),
+        )
+
+        torch.testing.assert_close(output.float(), reference_output.float(), rtol=2e-2, atol=5e-3)
+        for got, want in zip(grads, reference_grads):
+            torch.testing.assert_close(got.float(), want.float(), rtol=2e-2, atol=5e-3)
+
+
 class TestAttnResSchedule:
 
     def test_block_start_and_source_counts_16_layers_k2(self):
@@ -238,7 +299,7 @@ class TestAttnResSchedule:
 
 class TestAttentionResidualModule:
 
-    def _make_config(self):
+    def _make_config(self, attn_res_impl="eager"):
         from megatron.core.transformer.transformer_config import TransformerConfig
 
         return TransformerConfig(
@@ -247,6 +308,7 @@ class TestAttentionResidualModule:
             num_attention_heads=4,
             enable_attention_residuals=True,
             attn_res_block_layers=2,
+            attn_res_impl=attn_res_impl,
             layernorm_epsilon=1e-6,
         )
 
@@ -266,6 +328,34 @@ class TestAttentionResidualModule:
         values = [torch.randn(4, 2, 16) for _ in range(3)]
         out = module(values)
         torch.testing.assert_close(out, torch.stack(values).mean(dim=0), rtol=1e-6, atol=1e-6)
+
+    def test_fla_backend_dispatches_with_memory_lean_policy(self, monkeypatch):
+        from megatron.core.transformer import attention_residual
+
+        calls = {}
+
+        def fake_fused_attnres(query, residuals, rms_weight, **kwargs):
+            calls.update(query=query, residuals=residuals, rms_weight=rms_weight, kwargs=kwargs)
+            return torch.stack(list(residuals)).mean(dim=0)
+
+        monkeypatch.setattr(
+            attention_residual, "_get_fla_fused_attnres", lambda: fake_fused_attnres
+        )
+        module = attention_residual.AttentionResidual(self._make_config(attn_res_impl="fla"))
+        values = [torch.randn(4, 2, 16) for _ in range(3)]
+        output = module(values)
+
+        torch.testing.assert_close(output, torch.stack(values).mean(dim=0))
+        assert calls["query"] is module.pseudo_query
+        assert calls["residuals"] is values
+        assert calls["rms_weight"] is module.key_norm_weight
+        assert calls["kwargs"] == {
+            "output_rms_weight": None,
+            "rms_eps": module.eps,
+            "scale": 1.0,
+            "return_weights": False,
+            "checkpoint_level": 1,
+        }
 
 
 class TestAttnResInitEquivalence:
@@ -368,6 +458,76 @@ class TestAttnResConfigValidation:
         from megatron.core.transformer.transformer_config import TransformerConfig
 
         TransformerConfig(**self._base_kwargs())
+
+    @pytest.mark.parametrize(
+        "offload_modules,attn_res_impl",
+        [
+            (["qkv_linear"], "eager"),
+            (["core_attn"], "eager"),
+            (["core_attn", "attn_proj"], "eager"),
+            (["qkv_linear", "core_attn", "attn_proj"], "compile"),
+            (["qkv_linear", "core_attn", "attn_proj"], "fla"),
+        ],
+    )
+    def test_attention_offload_modules_supported(self, offload_modules, attn_res_impl):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        TransformerConfig(
+            **self._base_kwargs(
+                attn_res_impl=attn_res_impl,
+                fine_grained_activation_offloading=True,
+                offload_modules=offload_modules,
+            )
+        )
+
+    @pytest.mark.parametrize(
+        "offload_module", ["attn_norm", "mlp_norm", "expert_fc1", "fused_group_mlp", "moe_act"]
+    )
+    def test_non_attention_offload_modules_rejected(self, offload_module):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(ValueError, match=offload_module):
+            TransformerConfig(
+                **self._base_kwargs(
+                    fine_grained_activation_offloading=True, offload_modules=[offload_module]
+                )
+            )
+
+    def test_mixed_attention_and_non_attention_offload_modules_rejected(self):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(ValueError, match="attn_norm"):
+            TransformerConfig(
+                **self._base_kwargs(
+                    fine_grained_activation_offloading=True,
+                    offload_modules=["qkv_linear", "attn_norm"],
+                )
+            )
+
+    def test_attn_proj_offload_still_requires_core_attn(self):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(ValueError, match="attn_proj cannot be set"):
+            TransformerConfig(
+                **self._base_kwargs(
+                    fine_grained_activation_offloading=True, offload_modules=["attn_proj"]
+                )
+            )
+
+    def test_invalid_implementation_rejected(self):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(ValueError, match="attn_res_impl"):
+            TransformerConfig(**self._base_kwargs(attn_res_impl="unknown"))
+
+    def test_fla_implementation_requires_dependency(self, monkeypatch):
+        from megatron.core.transformer import attention_residual
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        config = TransformerConfig(**self._base_kwargs(attn_res_impl="fla"))
+        monkeypatch.setattr(attention_residual, "_get_fla_fused_attnres", lambda: None)
+        with pytest.raises(ImportError, match="flash-linear-attention"):
+            attention_residual.AttentionResidual(config)
 
     def test_block_layers_required(self):
         from megatron.core.transformer.transformer_config import TransformerConfig

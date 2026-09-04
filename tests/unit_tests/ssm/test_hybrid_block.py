@@ -18,12 +18,17 @@ from megatron.core.models.hybrid.hybrid_model import (
     _get_hash_moe_layer_threshold,
     _validate_hash_moe_pipeline_placement,
 )
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import PipelineOffloadManager
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, GatedDeltaNet, KimiDeltaAttention
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.attention_residual import _get_fla_fused_attnres
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
 )
@@ -877,9 +882,15 @@ class TestAttnResHybridBlock:
     def get_pg_collection(self):
         return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
 
-    def _make_config(self, num_layers, block_layers=1, enable=True, eps=1e-6):
+    def _make_config(
+        self, num_layers, block_layers=1, enable=True, eps=1e-6, attn_res_impl="eager", **kwargs
+    ):
         attn_res_kwargs = (
-            {"enable_attention_residuals": True, "attn_res_block_layers": block_layers}
+            {
+                "enable_attention_residuals": True,
+                "attn_res_block_layers": block_layers,
+                "attn_res_impl": attn_res_impl,
+            }
             if enable
             else {}
         )
@@ -892,6 +903,7 @@ class TestAttnResHybridBlock:
             attention_dropout=0.0,
             layernorm_epsilon=eps,
             **attn_res_kwargs,
+            **kwargs,
         )
 
     def _make_stack(self, config, layer_type_list, pp_layer_offset=0, pre=True, post=True):
@@ -944,6 +956,126 @@ class TestAttnResHybridBlock:
         )
         output = block(hidden_states, attention_mask=attention_mask)
         assert output.shape == (sequence_length, micro_batch_size, config.hidden_size)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    @pytest.mark.parametrize(
+        "attn_res_impl",
+        [
+            "eager",
+            pytest.param(
+                "fla",
+                marks=pytest.mark.skipif(
+                    _get_fla_fused_attnres() is None, reason="FLA fused AttnRes is not installed"
+                ),
+            ),
+        ],
+    )
+    def test_attention_activation_offloading_forward_backward(self, attn_res_impl):
+        """Attention-scope offloading preserves AttnRes hybrid outputs and gradients."""
+        layer_type_list = validate_segment_layers(
+            Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION + Symbols.MLP
+        )
+        offload_modules = ["qkv_linear", "core_attn", "attn_proj"]
+
+        baseline_config = self._make_config(
+            len(layer_type_list), block_layers=2, attn_res_impl=attn_res_impl
+        )
+        offload_config = self._make_config(
+            len(layer_type_list),
+            block_layers=2,
+            attn_res_impl=attn_res_impl,
+            fine_grained_activation_offloading=True,
+            offload_modules=offload_modules,
+            min_offloaded_tensor_size=1,
+        )
+
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(123)
+        baseline = self._make_stack(baseline_config, layer_type_list).cuda().train()
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(123)
+        offloaded = self._make_stack(offload_config, layer_type_list).cuda().train()
+        offloaded.load_state_dict(baseline.state_dict())
+
+        sequence_length, micro_batch_size = 32, 2
+        torch.manual_seed(7)
+        hidden_data = torch.randn(
+            (sequence_length, micro_batch_size, baseline_config.hidden_size), device="cuda"
+        )
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool, device="cuda"
+        )
+
+        def init_offload_iteration():
+            off_interface.reset()
+            off_interface.init_chunk_handler(
+                pp_rank=0,
+                vp_size=None,
+                vp_stage=None,
+                min_offloaded_tensor_size=offload_config.min_offloaded_tensor_size,
+                delta_offload_bytes_across_pp_ranks=(
+                    offload_config.delta_offload_bytes_across_pp_ranks
+                ),
+                activation_offload_fraction=offload_config.activation_offload_fraction,
+                max_inflight_offloads=offload_config.fine_grained_offloading_max_inflight_offloads,
+            )
+
+        def run_iteration(model, enable_offload):
+            if enable_offload:
+                init_offload_iteration()
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
+            hidden_states = hidden_data.detach().clone().requires_grad_(True)
+            output = model(hidden_states, attention_mask=attention_mask)
+            output.float().sum().backward()
+            torch.cuda.synchronize()
+            grads = {
+                name: param.grad.detach().float().cpu() if param.grad is not None else None
+                for name, param in model.named_parameters()
+            }
+            return output.detach().float().cpu(), hidden_states.grad.detach().float().cpu(), grads
+
+        off_interface.reset_instance()
+        try:
+            # Warm up both paths, then finalize the offload manager's warmup bookkeeping.
+            run_iteration(baseline, enable_offload=False)
+            run_iteration(offloaded, enable_offload=True)
+            off_interface.reset()
+
+            manager = PipelineOffloadManager.get_instance()
+            for module in offload_modules:
+                assert manager.offload_summary_bytes.get(module, 0) > 0, (
+                    f"Expected {module} to offload at least one activation, got "
+                    f"{manager.offload_summary_bytes.get(module, 0)} bytes"
+                )
+
+            baseline_output, baseline_input_grad, baseline_grads = run_iteration(
+                baseline, enable_offload=False
+            )
+            offload_output, offload_input_grad, offload_grads = run_iteration(
+                offloaded, enable_offload=True
+            )
+
+            torch.testing.assert_close(offload_output, baseline_output, rtol=1e-4, atol=1e-4)
+            torch.testing.assert_close(
+                offload_input_grad, baseline_input_grad, rtol=1e-4, atol=1e-4
+            )
+            assert set(offload_grads) == set(baseline_grads)
+            for name, baseline_grad in baseline_grads.items():
+                offload_grad = offload_grads[name]
+                if baseline_grad is None or offload_grad is None:
+                    assert baseline_grad is None and offload_grad is None, name
+                    continue
+                torch.testing.assert_close(
+                    offload_grad,
+                    baseline_grad,
+                    rtol=1e-4,
+                    atol=1e-4,
+                    msg=lambda msg: f"{name}: {msg}",
+                )
+        finally:
+            off_interface.reset_instance()
 
     @pytest.mark.parametrize(
         "layer_pattern",
