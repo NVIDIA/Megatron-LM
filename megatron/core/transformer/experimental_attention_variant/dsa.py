@@ -30,7 +30,10 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
-from megatron.core.transformer.forward_sharing import get_forward_sharing_state
+from megatron.core.transformer.forward_sharing import (
+    get_forward_sharing_state,
+    is_mtp_repeated_sharing_source,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -38,6 +41,7 @@ from megatron.core.utils import ensure_params_ready, get_pg_size
 
 logger = logging.getLogger(__name__)
 _DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED = False
+_warned_mtp_index_sharing_fused_bypass = False
 
 try:
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
@@ -1941,6 +1945,22 @@ class _DSAIndexSharingPayload:
         return type(self)(dict(self.topk_by_layer), dict(self.topk_length_by_layer))
 
 
+@dataclass
+class _DSAMTPRepeatedSharingPayload:
+    """DSA's repeated-MTP tensors indexed by physical, global layer number.
+
+    Separate from ordinary IndexShare. Source calls replace only their layer's
+    entries; consumers use MTP's explicit source/consumer flag. The enclosing
+    forward owns tensor cleanup, while snapshots retain independent dictionaries.
+    """
+
+    topk_by_layer: dict[int, torch.Tensor] = field(default_factory=dict)
+    topk_length_by_layer: dict[int, torch.Tensor] = field(default_factory=dict)
+
+    def __copy__(self):
+        return type(self)(dict(self.topk_by_layer), dict(self.topk_length_by_layer))
+
+
 class DSAttention(MegatronModule):
     """
     This module implements sparse attention mechanism using an DSA Indexer to compute top-k
@@ -1978,6 +1998,27 @@ class DSAttention(MegatronModule):
         self.skip_topk = self.index_share and is_dsa_skip_topk_layer(
             self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
         )
+        mtp_shared_components = frozenset(self.config.mtp_repeated_layer_shared_components or ())
+        self.mtp_sparse_attention_index_share = (
+            "sparse_attention_index" in mtp_shared_components and is_mtp_layer
+        )
+        self.mtp_cross_depth_share = self.mtp_sparse_attention_index_share
+        global _warned_mtp_index_sharing_fused_bypass
+        if (
+            self.mtp_sparse_attention_index_share
+            and dsa_kernels.use_fused_dsa_kernels(self.config)
+            and not _warned_mtp_index_sharing_fused_bypass
+        ):
+            _warned_mtp_index_sharing_fused_bypass = True
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "MTP sparse_attention_index sharing requires reusable top-k indices, which the "
+                "combined fused DSA kernel does not expose. The repeated MTP layer therefore "
+                "uses the separable top-k and sparse-attention path; configured fused kernels "
+                "for those operations remain eligible. Benchmark this tradeoff for the target "
+                "MTP depth.",
+            )
         self.source_layer = (
             source_dsa_compute_layer(
                 self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
@@ -2019,6 +2060,35 @@ class DSAttention(MegatronModule):
             _DSAIndexSharingPayload
         )
 
+    def _prepare_mtp_sharing_payload(
+        self, packed_seq_params: Optional[PackedSeqParams], attention_mask: Optional[torch.Tensor]
+    ) -> Tuple[Optional[bool], Optional[_DSAMTPRepeatedSharingPayload]]:
+        """Clear this source layer's old tensors or require its published tensors."""
+        if not self.mtp_cross_depth_share:
+            return None, None
+        state = self._get_forward_sharing_state(packed_seq_params, attention_mask)
+        is_source = is_mtp_repeated_sharing_source(state, self.layer_number)
+        if is_source:
+            payload = state.get_or_create(_DSAMTPRepeatedSharingPayload)
+            payload.topk_by_layer.pop(self.layer_number, None)
+            payload.topk_length_by_layer.pop(self.layer_number, None)
+        else:
+            payload = self._require_mtp_sharing_payload(packed_seq_params, attention_mask)
+        return is_source, payload
+
+    def _require_mtp_sharing_payload(
+        self, packed_seq_params: Optional[PackedSeqParams], attention_mask: Optional[torch.Tensor]
+    ) -> _DSAMTPRepeatedSharingPayload:
+        """Require the tensors published by this physical layer's source call."""
+        state = self._get_forward_sharing_state(packed_seq_params, attention_mask)
+        is_mtp_repeated_sharing_source(state, self.layer_number)
+        payload = state.get(_DSAMTPRepeatedSharingPayload)
+        if payload is None:
+            raise RuntimeError("MTP sharing consumer requires published source tensors.")
+        if self.mtp_sparse_attention_index_share and self.layer_number not in payload.topk_by_layer:
+            raise RuntimeError("MTP sharing consumer requires published source indices.")
+        return payload
+
     def backward_dw(self):
         """Compute the deferred weight gradients (delay_wgrad_compute) of the indexer."""
         if self.indexer is not None:
@@ -2056,6 +2126,12 @@ class DSAttention(MegatronModule):
         Returns:
             output: Output tensor [sq, b, hidden_size]
         """
+        is_mtp_source, mtp_payload = self._prepare_mtp_sharing_payload(
+            packed_seq_params, attention_mask
+        )
+        reuse_sparse_attention_index = bool(
+            self.mtp_sparse_attention_index_share and mtp_payload is not None and not is_mtp_source
+        )
         query, _ = dsa_layout.ensure_sbhd(query, "query")
         key, _ = dsa_layout.ensure_sbhd(key, "key")
         if value is not None:
@@ -2288,7 +2364,7 @@ class DSAttention(MegatronModule):
         qr = qr.detach()
 
         indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
-        computes_topk = not self.skip_topk
+        computes_topk = not self.skip_topk and not reuse_sparse_attention_index
         use_indexer_loss = (
             self.training and torch.is_grad_enabled() and indexer_loss_coeff > 0 and computes_topk
         )
@@ -2353,7 +2429,11 @@ class DSAttention(MegatronModule):
             local_packed_cp_query_start = sequence_parallel_tp_row_start
             local_packed_cp_query_len = sequence_parallel_tp_full_rows
 
-        if self.skip_topk:
+        if reuse_sparse_attention_index:
+            assert mtp_payload is not None
+            topk_indices = mtp_payload.topk_by_layer[self.layer_number]
+            topk_length = mtp_payload.topk_length_by_layer.get(self.layer_number)
+        elif self.skip_topk:
             assert index_payload is not None
             if self.source_layer not in index_payload.topk_by_layer:
                 raise RuntimeError(
@@ -2428,7 +2508,7 @@ class DSAttention(MegatronModule):
             )
 
         fused_output = None
-        if use_fused_kernels and not self.index_share:
+        if use_fused_kernels and not self.index_share and not self.mtp_sparse_attention_index_share:
             assert q is not None and k is not None and weights is not None
             fused_output = dsa_kernels.run_fused_dsa_attention(
                 config=self.config,
@@ -2611,11 +2691,22 @@ class DSAttention(MegatronModule):
                     del index_scores
             slice_topk_to_local_sequence_parallel_rows()
 
-        if self.index_share and computes_topk:
+        publish_ordinary_topk = self.index_share and computes_topk
+        publish_mtp_topk = bool(
+            self.mtp_sparse_attention_index_share and mtp_payload is not None and is_mtp_source
+        )
+        if publish_ordinary_topk:
             assert index_payload is not None and topk_indices is not None
             index_payload.topk_by_layer[self.layer_number] = topk_indices
-            if topk_length is not None:
+            if topk_length is None:
+                index_payload.topk_length_by_layer.pop(self.layer_number, None)
+            else:
                 index_payload.topk_length_by_layer[self.layer_number] = topk_length
+        if publish_mtp_topk:
+            assert mtp_payload is not None and topk_indices is not None
+            mtp_payload.topk_by_layer[self.layer_number] = topk_indices
+            if topk_length is not None:
+                mtp_payload.topk_length_by_layer[self.layer_number] = topk_length
 
         # ===================================
         # Run sparse attention kernel

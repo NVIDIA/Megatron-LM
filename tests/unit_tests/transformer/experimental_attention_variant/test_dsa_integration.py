@@ -35,7 +35,11 @@ from megatron.training.arguments import _add_experimental_attention_variant_args
 
 def _index_share_config():
     return SimpleNamespace(
-        dsa_indexer_topk=8, dsa_indexer_topk_freq=4, dsa_indexer_skip_topk_offset=1, kv_channels=16
+        dsa_indexer_topk=8,
+        dsa_indexer_topk_freq=4,
+        dsa_indexer_skip_topk_offset=1,
+        mtp_repeated_layer_shared_components=None,
+        kv_channels=16,
     )
 
 
@@ -70,6 +74,7 @@ def test_mtp_layer_number_offsets_index_share_schedule():
         dsa_indexer_topk=4,
         dsa_indexer_topk_freq=4,
         dsa_indexer_skip_topk_offset=1,
+        mtp_repeated_layer_shared_components=None,
         kv_channels=16,
     )
     pg_collection = SimpleNamespace(tp=object(), cp=object())

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from copy import copy
+from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Callable, Iterator, TypeVar
 
@@ -197,3 +198,49 @@ def preserve_forward_sharing_for_checkpoint(
             replay_state.clear()
 
     return wrapped
+
+
+@dataclass
+class _MTPRepeatedSharingPayload:
+    """Source/consumer flags indexed by physical, global MTP layer number."""
+
+    is_source_by_layer: dict[int, bool | None] = field(default_factory=dict)
+
+    def __copy__(self):
+        return type(self)(dict(self.is_source_by_layer))
+
+
+@contextmanager
+def mtp_repeated_sharing_lifetime(
+    state: ForwardSharingState, layer_number: int
+) -> Iterator[dict[int, bool | None]]:
+    """Publish one physical MTP layer's source/consumer flags for its repeated loop.
+
+    Set the yielded dictionary's ``layer_number`` entry before each call; consumers
+    query it through ``is_mtp_repeated_sharing_source``, not the private payload.
+    Exit removes only this layer's flag, including on exceptions. Backend tensor
+    payloads follow the enclosing forward lifetime, not this flag scope.
+    """
+    payload = state.get_or_create(_MTPRepeatedSharingPayload)
+    if layer_number in payload.is_source_by_layer:
+        raise RuntimeError("Repeated-MTP sharing layer is already active")
+    payload.is_source_by_layer[layer_number] = None
+    try:
+        yield payload.is_source_by_layer
+    finally:
+        del payload.is_source_by_layer[layer_number]
+        if not payload.is_source_by_layer:
+            state.clear(_MTPRepeatedSharingPayload)
+
+
+def is_mtp_repeated_sharing_source(state: ForwardSharingState, layer_number: int) -> bool:
+    """Require an active loop flag and return whether this call produces shared tensors."""
+    payload = state.get(_MTPRepeatedSharingPayload)
+    is_source = payload.is_source_by_layer.get(layer_number) if payload is not None else None
+    if not isinstance(is_source, bool):
+        raise RuntimeError(
+            "Repeated-MTP sharing requires an active layer with an explicit is_source flag. "
+            "Serial compute_mtp_single_step does not establish one; disable repeated-layer "
+            "sharing for speculative decoding."
+        )
+    return is_source
