@@ -6,7 +6,10 @@ from typing import List, Union
 
 import torch
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp
+from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
+    any_sharding_strategy_in,
+    find_megatron_fsdp,
+)
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import (
@@ -391,12 +394,12 @@ def combined_forward_backward_step(
         # Wire per-layer FSDP parameter release callbacks.  The EP overlap
         # schedule bypasses normal FSDP forward/backward hooks, so we release
         # each layer's all-gathered parameters explicitly after its compute.
-        # Only needed for optim_grads_params strategy (where params are sharded).
+        # Only needed for optim_grads_params strategy (where params are sharded), which
+        # may apply to expert parameters only. The release callbacks skip any parameter
+        # whose weights are not sharded.
         forward_fsdp_wrapper = find_megatron_fsdp(f_model)
-        if (
-            forward_fsdp_wrapper is not None
-            and forward_fsdp_wrapper.ddp_config.data_parallel_sharding_strategy
-            == "optim_grads_params"
+        if forward_fsdp_wrapper is not None and any_sharding_strategy_in(
+            forward_fsdp_wrapper.ddp_config, ["optim_grads_params"]
         ):
             for i in range(f_schedule_plan.num_layers()):
                 layer_plan = f_schedule_plan.get_layer(i)

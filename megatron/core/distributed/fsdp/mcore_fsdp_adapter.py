@@ -52,8 +52,13 @@ try:
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
         Placements,
+        SchedulePolicy,
         fully_shard,
         fully_shard_context,
+    )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
+        all_sharding_strategies_in,
+        any_sharding_strategy_in,
     )
 
     HAVE_MEGATRON_FSDP = True
@@ -62,6 +67,43 @@ except ImportError as import_megatron_fsdp_error:
     HAVE_MEGATRON_FSDP = False
 
 logger = logging.getLogger(__name__)
+
+
+def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> None:
+    """Materialize and initialize one module's direct meta parameters."""
+    # Container modules may have parameterized children but no direct parameters or
+    # reset_parameters() method; their children are materialized separately.
+    if not any(parameter.is_meta for parameter in module.parameters(recurse=False)):
+        return
+
+    if device is None:
+        device = torch.device("cpu")
+
+    def materialize_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.is_meta:
+            return torch.empty_like(tensor, device=device)
+        return tensor
+
+    reset_parameters = getattr(module, "reset_parameters", None)
+    if reset_parameters is None:
+        raise ValueError(
+            f"Meta parameter module {type(module).__qualname__} does not have a "
+            "reset_parameters method."
+        )
+
+    module._apply(materialize_tensor, recurse=False)
+    reset_parameters()
+
+
+def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | None) -> None:
+    """Materialize meta parameters reachable from one FSDP unit.
+
+    PyTorch and Transformer Engine differ in reset_parameters(): PyTorch typically initializes
+    existing Parameters in place, while TE may replace a Parameter via setattr(). Run resets
+    before fully_shard() so FSDP sees the final Parameter objects.
+    """
+    for submodule in module.modules():
+        _materialize_meta_module(submodule, device)
 
 
 class FullyShardedDataParallelV1(_BaseDataParallel):
@@ -100,9 +142,8 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
         config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> Tuple[Type[nn.Module], ...]:
         """Module classes needing ``parameters(recurse=True)`` for fine-grained hooks."""
-        if (
-            config.overlap_moe_expert_parallel_comm
-            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        if config.overlap_moe_expert_parallel_comm and any_sharding_strategy_in(
+            ddp_config, ["optim_grads_params"]
         ):
             # Lazy import to avoid circular chain.
             from megatron.core.transformer.moe.experts import TEGroupedMLP
@@ -168,7 +209,9 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
             # "optim": Reduce-scatter communication groups on the final microbatch.
             # "optim_grads": Additionally, RS communication groups on all microbatches.
             # "optim_grads_params": RS & AG communication groups on all microbatches.
-            if self.ddp_config.data_parallel_sharding_strategy != "no_shard":
+            # Units are worth forming if either parameter class shards anything, so both
+            # strategies have to be consulted.
+            if not all_sharding_strategies_in(self.ddp_config, ["no_shard"]):
                 self.fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
             else:
                 self.fsdp_unit_modules = []
@@ -187,9 +230,8 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 "(cuda_graph_impl='none')."
             )
 
-        if (
-            config.overlap_moe_expert_parallel_comm
-            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        if config.overlap_moe_expert_parallel_comm and any_sharding_strategy_in(
+            ddp_config, ["optim_grads_params"]
         ):
             supported_fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
             assert self.fsdp_unit_modules and all(
@@ -226,7 +268,7 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 ),
                 enable_fine_grained_param_gather_backward_hook=(
                     config.overlap_moe_expert_parallel_comm
-                    and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+                    and any_sharding_strategy_in(ddp_config, ["optim_grads_params"])
                 ),
                 fine_grained_recurse_module_types=self._fine_grained_recurse_module_types(
                     config, ddp_config
@@ -602,6 +644,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
+        schedule_policy = SchedulePolicy(
+            forward_prefetch_size=ddp_config.suggested_communication_unit_size,
+            backward_prefetch_size=ddp_config.suggested_communication_unit_size,
+        )
         with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
@@ -609,12 +655,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 # contributions after dispatch from every EP rank.
                 for submodule in module.modules():
                     if isinstance(submodule, MoELayer):
+                        if config.init_model_with_meta_device:
+                            _materialize_owned_meta_modules(submodule.experts, device)
                         fully_shard(
                             submodule.experts,
                             mesh=expert_dp_mesh,
                             placements=expert_placements,
                             mixed_precision_policy=self.mp_policy,
                             grad_divisor=config.expert_model_parallel_size,
+                            schedule_policy=schedule_policy,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -622,17 +671,23 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     # wrapped twice when its type also appears in fsdp_unit_modules.
                     continue
                 if any(isinstance(submodule, module_type) for module_type in fsdp_unit_modules):
+                    if config.init_model_with_meta_device:
+                        _materialize_owned_meta_modules(submodule, device)
                     fully_shard(
                         submodule,
                         mesh=dp_mesh,
                         placements=dense_placements,
                         mixed_precision_policy=self.mp_policy,
+                        schedule_policy=schedule_policy,
                     )
+            if config.init_model_with_meta_device:
+                _materialize_owned_meta_modules(module, device)
             fully_shard(
                 module,
                 mesh=dp_mesh,
                 placements=dense_placements,
                 mixed_precision_policy=self.mp_policy,
+                schedule_policy=schedule_policy,
             )
         super().__init__(config=config, module=module)
 
@@ -746,8 +801,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
         if ddp_config.delay_wgrad_compute:
             raise ValueError("MFSDP v2 does not support delay_wgrad_compute.")
-        if ddp_config.suggested_communication_unit_size is not None:
-            raise ValueError("MFSDP v2 does not support suggested_communication_unit_size.")
         if ddp_config.num_buckets is not None:
             raise ValueError("MFSDP v2 does not support num_buckets.")
         if ddp_config.megatron_fsdp_use_decoupled_grad:
