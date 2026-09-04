@@ -58,7 +58,7 @@ def test_mxfp8_scale_layout_and_single_grouped_storage_contract(monkeypatch):
     monkeypatch.setattr(
         fp8_utils, "get_grouped_quantized_members", lambda _: separate_members
     )
-    with pytest.raises(RuntimeError, match="does not share grouped backing storage"):
+    with pytest.raises(RuntimeError, match="not packed expert-major"):
         mok_weights._single_grouped_mxfp8_scale_view(
             object(), "_rowwise_scale_inv", (2, *member_shape), name="test rowwise"
         )
