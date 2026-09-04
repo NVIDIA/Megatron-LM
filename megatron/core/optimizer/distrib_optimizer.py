@@ -3083,6 +3083,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 key_map = getattr(cfg, 'sharded_state_dict_keys_map', None)
                 if not key_map:
                     continue
+                # Match the "module." stripping applied to parameter names below.
+                while layer_path.startswith("module."):
+                    layer_path = layer_path[len("module.") :]
                 layer_prefix = f"{layer_path}." if layer_path else ""
                 canonical_rewrites.append((layer_prefix, list(key_map.items())))
 
