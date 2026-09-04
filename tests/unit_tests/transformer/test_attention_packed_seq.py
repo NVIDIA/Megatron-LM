@@ -284,10 +284,7 @@ class TestAttentionDynamicContextParallel:
         packed_seq_params.cp_group = runtime_group
         packed_seq_params.local_cp_size = 2
         self.parallel_attention(
-            hidden_states,
-            None,
-            rotary_pos_emb=rotary_pos_emb,
-            packed_seq_params=packed_seq_params,
+            hidden_states, None, rotary_pos_emb=rotary_pos_emb, packed_seq_params=packed_seq_params
         )
         assert captured and all(group is runtime_group for group in captured)
         assert self.parallel_attention.pg_collection.cp is runtime_group
@@ -297,10 +294,7 @@ class TestAttentionDynamicContextParallel:
         captured.clear()
         packed_seq_params = make_test_packed_seq_params(sequence_length)
         self.parallel_attention(
-            hidden_states,
-            None,
-            rotary_pos_emb=rotary_pos_emb,
-            packed_seq_params=packed_seq_params,
+            hidden_states, None, rotary_pos_emb=rotary_pos_emb, packed_seq_params=packed_seq_params
         )
         assert captured and all(group is build_time_group for group in captured)
         assert self.parallel_attention.pg_collection.cp is build_time_group
