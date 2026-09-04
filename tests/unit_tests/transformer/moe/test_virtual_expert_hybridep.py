@@ -5,13 +5,13 @@
 Run on one four-GPU NVLink node::
 
     uv run python -m torch.distributed.run --nproc-per-node 4 -m pytest -q \
-      tests/unit_tests/transformer/moe/test_replica_hybridep.py
+      tests/unit_tests/transformer/moe/test_virtual_expert_hybridep.py
 
 Each case builds the same MoE layer twice -- once on a reference dispatcher and
-once with virtual-expert load balancing -- loads identical weights, and compares the output and
-every training gradient. Planner and bridge internals are covered
-process-locally in ``test_replica_planner.py``; the transport kernels in
-``test_replica_weight_triton.py``.
+once with virtual-expert load balancing -- loads identical weights, and compares the output
+and every training gradient. Planner and bridge internals are covered
+process-locally in ``test_virtual_expert_planner.py``; the transport kernels in
+``test_virtual_expert_triton.py``.
 
 A bare ``MoELayer`` carries no DDP-time GTP wrapper, so the bridge's GTP gather and
 reduce-scatter path is exercised only by the training recipe with
@@ -211,14 +211,11 @@ def _run_full_layer_parity(
             else {"moe_token_dispatcher_type": "flex", "moe_flex_dispatcher_backend": "hybridep"}
         ),
     )
-    replica_config = TransformerConfig(
+    virtual_expert_config = TransformerConfig(
         **common,
         moe_token_dispatcher_type="flex",
         moe_flex_dispatcher_backend="hybridep",
         moe_virtual_expert_load_balance=True,
-        grad_reduce_in_bf16=bf16_grads,
-        ddp_reduce_scatter_with_fp32_accumulation=bf16_grads,
-        gtp_remat_reduce_scatter_with_fp32_accumulation=bf16_grads and gtp,
     )
     mlp_spec = get_gpt_layer_with_transformer_engine_spec(
         num_experts=4, moe_grouped_gemm=True
@@ -240,8 +237,8 @@ def _run_full_layer_parity(
                 return MoELayer(config, submodules).cuda()
 
         ref_layer = build(reference_config)
-        replica_layer = build(replica_config)
-        for layer in (ref_layer, replica_layer):
+        virtual_expert_layer = build(virtual_expert_config)
+        for layer in (ref_layer, virtual_expert_layer):
             assert not layer.experts.linear_fc1.single_grouped_weight
             assert not layer.experts.linear_fc2.single_grouped_weight
         if mxfp8 and moe_latent_size is not None:
@@ -249,24 +246,24 @@ def _run_full_layer_parity(
             # through its distributed-weight wrapper. This focused MoELayer test
             # has no DDP wrapper, so let the two ordinary latent linears return
             # wgrads through autograd; expert wgrads stay fused and exercise the
-            # replica reduction.
-            for layer in (ref_layer, replica_layer):
+            # virtual-expert reduction.
+            for layer in (ref_layer, virtual_expert_layer):
                 layer.fc1_latent_proj.fuse_wgrad_accumulation = False
                 layer.fc2_latent_proj.fuse_wgrad_accumulation = False
-        replica_layer.load_state_dict(ref_layer.state_dict())
-        assert replica_layer.state_dict().keys() == ref_layer.state_dict().keys()
+        virtual_expert_layer.load_state_dict(ref_layer.state_dict())
+        assert virtual_expert_layer.state_dict().keys() == ref_layer.state_dict().keys()
         _set_main_grads(ref_layer, grad_dtype)
-        _set_main_grads(replica_layer, grad_dtype)
+        _set_main_grads(virtual_expert_layer, grad_dtype)
 
-        bridge = replica_layer.token_dispatcher._comm_manager._bridge
+        bridge = virtual_expert_layer.token_dispatcher._comm_manager._ensure_experts_bound()
         _assert_bridge_layout(bridge, grad_dtype=grad_dtype, mxfp8=mxfp8)
         if mxfp8:
             # A state_dict load does not carry the quantized component storage,
             # so mirror it explicitly before comparing the two layers.
-            for linear, replica in zip(
+            for linear, virtual_expert in zip(
                 (ref_layer.experts.linear_fc1, ref_layer.experts.linear_fc2), bridge.projections
             ):
-                for index, destination in enumerate(replica.parameters):
+                for index, destination in enumerate(virtual_expert.parameters):
                     source = linear.get_parameter(f"weight{index}")
                     for component in MXFP8_COMPONENTS:
                         getattr(destination, component).copy_(getattr(source, component))
@@ -274,14 +271,14 @@ def _run_full_layer_parity(
         torch.manual_seed(1234)
         test_input = torch.randn(2, 4, 1024, device="cuda", dtype=torch.bfloat16)
 
-        def run(layer, *, replica_bridge=None):
+        def run(layer, *, virtual_expert_bridge=None):
             hidden = test_input.detach().clone().requires_grad_(True)
             output, _ = layer(hidden)
-            if replica_bridge is not None and mxfp8:
-                _assert_mxfp8_prefetch_exact(replica_bridge, "rowwise")
+            if virtual_expert_bridge is not None and mxfp8:
+                _assert_mxfp8_prefetch_exact(virtual_expert_bridge, "rowwise")
             output.float().sum().backward()
-            if replica_bridge is not None:
-                for projection in replica_bridge.projections:
+            if virtual_expert_bridge is not None:
+                for projection in virtual_expert_bridge.projections:
                     for parameter in projection.parameters:
                         if projection.gtp_leader is None:
                             # The bridge hands the reduced wgrad to the optimizer
@@ -291,11 +288,11 @@ def _run_full_layer_parity(
                         parameter.grad = None
                 assert all(
                     runtime_parameter.grad is None
-                    for projection in replica_bridge.projections
+                    for projection in virtual_expert_bridge.projections
                     for runtime_parameter in projection.runtime_parameters
                 )
                 if mxfp8:
-                    _assert_mxfp8_prefetch_exact(replica_bridge, "columnwise")
+                    _assert_mxfp8_prefetch_exact(virtual_expert_bridge, "columnwise")
             values = [
                 output.detach(),
                 hidden.grad.detach(),
@@ -316,15 +313,15 @@ def _run_full_layer_parity(
         ref_values = run(ref_layer)
         if reference_dispatcher == "hybridep":
             # HybridEP owns one process-global buffer for a fixed local-expert
-            # count. Baseline and replica layouts use N and 2N respectively, so
+            # count. Baseline and virtual-expert layouts use N and 2N respectively, so
             # reinitialize it between the two sequential comparisons.
             torch.cuda.synchronize()
             torch.distributed.barrier()
             fused_a2a.reset_hybrid_ep_buffer()
             torch.distributed.barrier()
-        replica_values = run(replica_layer, replica_bridge=bridge)
+        virtual_expert_values = run(virtual_expert_layer, virtual_expert_bridge=bridge)
 
-        manager = replica_layer.token_dispatcher._comm_manager
+        manager = virtual_expert_layer.token_dispatcher._comm_manager
         assert manager.moe_expert_rank_capacity_factor == 1.0
         assert not manager.over_budget.item()
         if mxfp8:
@@ -337,23 +334,23 @@ def _run_full_layer_parity(
             assert num_dispatched > num_routes
             dispatched_probs = manager.dispatched_probs[:num_dispatched]
             assert torch.count_nonzero(dispatched_probs).item() == num_routes
-        # A run in which no expert was replicated would compare nothing.
-        active_replica = torch.any(bridge.last_plan.experts_to_copy >= 0).to(torch.int32)
-        torch.distributed.all_reduce(active_replica, op=torch.distributed.ReduceOp.MAX)
-        assert active_replica.item(), "parity must exercise an active replica"
+        # A run in which no expert was materialized would compare nothing.
+        active_virtual_expert = torch.any(bridge.last_plan.experts_to_copy >= 0).to(torch.int32)
+        torch.distributed.all_reduce(active_virtual_expert, op=torch.distributed.ReduceOp.MAX)
+        assert active_virtual_expert.item(), "parity must exercise an active virtual-expert"
 
         names = ["output", "input grad", "router grad", "FC1 main_grad", "FC2 main_grad"]
         if moe_latent_size is not None:
             names += ["latent FC1 main_grad", "latent FC2 main_grad"]
-        for name, actual, expected in zip(names, replica_values, ref_values):
+        for name, actual, expected in zip(names, virtual_expert_values, ref_values):
             if bitwise and "main_grad" not in name:
                 tolerance = dict(rtol=0, atol=0)
             elif bitwise:
-                # A replicated expert's wgrad sums independently rounded FP32
+                # A materialized expert's wgrad sums independently rounded FP32
                 # partials. That changes addition order, not the gradient.
                 tolerance = dict(rtol=2e-7, atol=2e-6)
             elif mxfp8:
-                # Replica placement changes the token population of each MX
+                # Virtual-expert placement changes the token population of each MX
                 # quantization block, so per-element absolute tolerances are not
                 # stable across those block boundaries. Bound execution noise
                 # while the raw weights and scales stay byte-exact above; these
@@ -363,13 +360,13 @@ def _run_full_layer_parity(
                 tolerance = dict(rtol=0.2, atol=atol)
             else:
                 # Different dispatchers may reorder BF16 reductions even when
-                # replica planning leaves the mathematical result unchanged.
+                # virtual-expert planning leaves the mathematical result unchanged.
                 tolerance = dict(rtol=2e-2, atol=2e-2)
             torch.testing.assert_close(
                 actual, expected, **tolerance, msg=lambda msg: f"{name}: {msg}"
             )
     finally:
-        # Replica bridges own CUDA work that can reference the HybridEP
+        # Virtual-expert bridges own CUDA work that can reference the HybridEP
         # execution context. Finalize them first, then destroy the
         # process-global buffer in lockstep across ranks.
         Utils.destroy_model_parallel()
@@ -474,7 +471,7 @@ def _run_repeated_mtp_parity(monkeypatch):
     labels = torch.randint(0, 128, (batch, sequence), generator=generator, device="cuda")
     position_ids = torch.arange(sequence, device="cuda").unsqueeze(0).expand(batch, -1)
     loss_mask = torch.ones((batch, sequence), device="cuda")
-    reference_model = replica_model = None
+    reference_model = virtual_expert_model = None
 
     def forward(model):
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -484,17 +481,17 @@ def _run_repeated_mtp_parity(monkeypatch):
 
     try:
         reference_model = build(False)
-        replica_model = build(True)
-        replica_model.load_state_dict(reference_model.state_dict())
-        assert replica_model.state_dict().keys() == reference_model.state_dict().keys()
+        virtual_expert_model = build(True)
+        virtual_expert_model.load_state_dict(reference_model.state_dict())
+        assert virtual_expert_model.state_dict().keys() == reference_model.state_dict().keys()
         initialize_main_grads(reference_model)
-        initialize_main_grads(replica_model)
+        initialize_main_grads(virtual_expert_model)
 
         reference_loss = forward(reference_model)
         reference_loss.sum().backward()
         reference_gradients = snapshot(reference_model)
 
-        # Baseline and replica layouts use N and 2N local runtime experts, so
+        # Baseline and virtual-expert layouts use N and 2N local runtime experts, so
         # reinitialize HybridEP's process-global transport buffer between them.
         torch.cuda.synchronize()
         torch.distributed.barrier()
@@ -503,7 +500,7 @@ def _run_repeated_mtp_parity(monkeypatch):
 
         moe_layers = [
             module
-            for module in replica_model.mtp.layers[0].mtp_model_layer.modules()
+            for module in virtual_expert_model.mtp.layers[0].mtp_model_layer.modules()
             if isinstance(module, MoELayer)
         ]
         assert len(moe_layers) == 1, "repeated MTP must exercise one shared MoE layer"
@@ -518,51 +515,51 @@ def _run_repeated_mtp_parity(monkeypatch):
             plans.append(manager._plan)
 
         manager.plan_dispatch = record_plan
-        replica_loss = forward(replica_model)
+        virtual_expert_loss = forward(virtual_expert_model)
         assert len(plans) == 2
         assert plans[0].experts_to_copy.data_ptr() != plans[1].experts_to_copy.data_ptr()
-        active_replica = torch.stack([torch.any(plan.experts_to_copy >= 0) for plan in plans]).any()
-        torch.distributed.all_reduce(active_replica, op=torch.distributed.ReduceOp.MAX)
-        assert active_replica.item(), "repeated MTP parity must exercise an active replica"
+        active_virtual_expert = torch.stack([torch.any(plan.experts_to_copy >= 0) for plan in plans]).any()
+        torch.distributed.all_reduce(active_virtual_expert, op=torch.distributed.ReduceOp.MAX)
+        assert active_virtual_expert.item(), "repeated MTP parity must exercise an active virtual-expert"
 
-        replica_loss.sum().backward()
-        replica_gradients = snapshot(replica_model)
+        virtual_expert_loss.sum().backward()
+        virtual_expert_gradients = snapshot(virtual_expert_model)
         assert manager._plan is None and manager._context is None
 
         torch.testing.assert_close(
-            replica_loss,
+            virtual_expert_loss,
             reference_loss,
             rtol=0,
             atol=0,
             msg=lambda msg: f"repeated MTP loss must be bitwise equal: {msg}",
         )
-        assert replica_gradients.keys() == reference_gradients.keys()
-        for name in replica_gradients:
-            replica_grad, replica_main_grad, replica_fused = replica_gradients[name]
+        assert virtual_expert_gradients.keys() == reference_gradients.keys()
+        for name in virtual_expert_gradients:
+            virtual_expert_grad, virtual_expert_main_grad, virtual_expert_fused = virtual_expert_gradients[name]
             reference_grad, reference_main_grad, reference_fused = reference_gradients[name]
-            assert replica_fused == reference_fused, name
-            assert (replica_grad is None) == (reference_grad is None), name
-            if replica_grad is not None:
+            assert virtual_expert_fused == reference_fused, name
+            assert (virtual_expert_grad is None) == (reference_grad is None), name
+            if virtual_expert_grad is not None:
                 torch.testing.assert_close(
-                    replica_grad,
+                    virtual_expert_grad,
                     reference_grad,
                     rtol=0,
                     atol=0,
                     msg=lambda msg, name=name: f"{name} autograd gradient: {msg}",
                 )
-            # Replica expert wgrads sum independently rounded FP32 partials in a
+            # Virtual-expert expert wgrads sum independently rounded FP32 partials in a
             # different order while retaining the same mathematical result.
             rtol, atol = (2e-7, 2e-6) if ".experts." in name else (0, 0)
-            assert torch.isfinite(replica_main_grad).all(), name
+            assert torch.isfinite(virtual_expert_main_grad).all(), name
             torch.testing.assert_close(
-                replica_main_grad,
+                virtual_expert_main_grad,
                 reference_main_grad,
                 rtol=rtol,
                 atol=atol,
                 msg=lambda msg, name=name: f"{name} main_grad: {msg}",
             )
     finally:
-        del reference_model, replica_model
+        del reference_model, virtual_expert_model
         Utils.destroy_model_parallel()
         torch.cuda.synchronize()
         torch.distributed.barrier()
@@ -573,7 +570,7 @@ def _run_repeated_mtp_parity(monkeypatch):
 
 @pytest.mark.internal
 @requires_four_ranks
-def test_replica_hybridep_production_recipe_matches_alltoall(monkeypatch):
+def test_virtual_expert_hybridep_production_recipe_matches_alltoall(monkeypatch):
     """Cover the production combination: MXFP8 weights, GTP experts, BF16 grads, latent MoE."""
     try:
         from transformer_engine.pytorch.ops import ScaledSReLU  # noqa: F401
@@ -591,20 +588,20 @@ def test_replica_hybridep_production_recipe_matches_alltoall(monkeypatch):
 
 @pytest.mark.internal
 @requires_four_ranks
-def test_replica_hybridep_bf16_semantics_match_hybridep(monkeypatch):
+def test_virtual_expert_hybridep_bf16_semantics_match_hybridep(monkeypatch):
     """Require bitwise HybridEP semantics and tightly bounded expert wgrad reduction noise."""
     _run_full_layer_parity(monkeypatch, reference_dispatcher="hybridep", bitwise=True)
 
 
 @pytest.mark.internal
 @requires_four_ranks
-def test_replica_hybridep_mxfp8_matches_hybridep(monkeypatch):
+def test_virtual_expert_hybridep_mxfp8_matches_hybridep(monkeypatch):
     """Bound MX execution noise while requiring byte-exact MXFP8 weight transport."""
     _run_full_layer_parity(monkeypatch, mxfp8=True, reference_dispatcher="hybridep")
 
 
 @pytest.mark.internal
 @requires_four_ranks
-def test_replica_hybridep_repeated_mtp_semantics_match_hybridep(monkeypatch):
+def test_virtual_expert_hybridep_repeated_mtp_semantics_match_hybridep(monkeypatch):
     """Preserve two-depth tied-layer MTP loss and every model gradient."""
     _run_repeated_mtp_parity(monkeypatch)
