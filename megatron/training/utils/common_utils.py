@@ -8,7 +8,7 @@ import warnings
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
@@ -345,8 +345,9 @@ def average_losses_across_data_parallel_group(
 
 
 def reduce_max_stat_across_model_parallel_group(
-    stat: float, group: Optional[torch.distributed.ProcessGroup] = None
-) -> float | None:
+    stat: Union[float, torch.Tensor, None],
+    group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Union[float, torch.Tensor, None]:
     """
     Ranks without an optimizer will have no grad_norm or num_zeros_in_grad stats.
     We need to ensure the logging and writer rank has those values.
@@ -354,10 +355,22 @@ def reduce_max_stat_across_model_parallel_group(
 
     We use an all_reduce max since the values have already been summed across optimizer ranks where possible
 
+    The return follows the input's kind. A device tensor in gives a device tensor
+    out, with the -1.0 "no rank had this stat" sentinel still encoded, so the host
+    read defers to the log point; decode it there with `_to_host_or_none`. A float
+    or None in behaves as before and resolves here.
+
     group: model-parallel process group; defaults to mpu.get_model_parallel_group().
     """
     if group is None:
         group = mpu.get_model_parallel_group()
+    if torch.is_tensor(stat):
+        # Match the float branch's (1,) float32 signature exactly: ranks without
+        # trainable params take that branch in the same collective. copy=True so
+        # the in-place all-reduce never lands in the caller's buffer.
+        stat = stat.reshape(1).to(torch.float32, copy=True)
+        torch.distributed.all_reduce(stat, op=torch.distributed.ReduceOp.MAX, group=group)
+        return stat
     if stat is None:
         stat = -1.0
     stat = torch.tensor([stat], dtype=torch.float32, device=torch.cuda.current_device())

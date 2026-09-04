@@ -3357,6 +3357,36 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
 
 
+def _read_logging_stats(stats):
+    """Read every deferred logging stat to the host in one device-to-host copy.
+
+    Each stat is a device tensor or an already-host value; host values pass
+    through untouched, so this is idempotent. Batching matters: one `.item()` per
+    stat is one cudaStreamSynchronize per stat, and the whole point of deferring
+    them is to pay for the log line once.
+
+    Args:
+        stats: Sequence of 1-element device tensors and/or host values.
+
+    Returns:
+        list: The same sequence with every tensor replaced by a Python float.
+    """
+    out = list(stats)
+    slots = [i for i, stat in enumerate(out) if torch.is_tensor(stat)]
+    if not slots:
+        return out
+    # fp64 so a float32 stat reads back the exact value .item() would have given.
+    packed = torch.cat([out[i].detach().reshape(1).double() for i in slots]).tolist()
+    for slot, value in zip(slots, packed):
+        out[slot] = value
+    return out
+
+
+def _none_if_absent(stat):
+    """Decode reduce_max_stat's -1.0 'no rank had this stat' sentinel back to None."""
+    return None if stat == -1.0 else stat
+
+
 def training_log(
     loss_dict,
     total_loss_dict,
@@ -3402,7 +3432,7 @@ def training_log(
     for key in loss_dict:
         if not skipped_iter:
             total_loss_dict[key] = (
-                total_loss_dict.get(key, torch.tensor([0.0], dtype=torch.float, device='cuda'))
+                total_loss_dict.get(key, torch.zeros(1, dtype=torch.float, device='cuda'))
                 + loss_dict[key]
             )
         else:
@@ -3471,6 +3501,15 @@ def training_log(
         learning_rate = 0.0
     # Tensorboard values.
     if writer and (iteration % args.tensorboard_log_interval == 0):
+        # Runs before the log block below, so it pays for the read; still one copy.
+        # Only reached when a writer is configured.
+        loss_scale, params_norm, grad_norm, num_zeros_in_grad = _read_logging_stats(
+            [loss_scale, params_norm, grad_norm, num_zeros_in_grad]
+        )
+        # calc_params_l2_norm returned the SQUARED norm; root it here.
+        params_norm = None if params_norm is None else params_norm**0.5
+        grad_norm = _none_if_absent(grad_norm)
+        num_zeros_in_grad = _none_if_absent(num_zeros_in_grad)
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples}, iteration)
         if learning_rate is not None:
@@ -3645,6 +3684,26 @@ def training_log(
         elapsed_time_per_iteration = elapsed_time / total_iterations
         llm_world_size = getattr(args, 'mimo_llm_world_size', args.world_size)
 
+        # The one host read of the iteration: every logged stat, including the loss
+        # averages below, in a single copy. Idempotent -- the tensorboard block
+        # above may have already resolved them.
+        loss_keys = [
+            key
+            for key in total_loss_dict
+            if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]
+        ]
+        loss_scale, params_norm, grad_norm, num_zeros_in_grad, *loss_totals = (
+            _read_logging_stats(
+                [loss_scale, params_norm, grad_norm, num_zeros_in_grad]
+                + [total_loss_dict[key] for key in loss_keys]
+            )
+        )
+        loss_totals = dict(zip(loss_keys, loss_totals))
+        # calc_params_l2_norm returned the SQUARED norm; root it here.
+        params_norm = None if params_norm is None else params_norm**0.5
+        grad_norm = _none_if_absent(grad_norm)
+        num_zeros_in_grad = _none_if_absent(num_zeros_in_grad)
+
         throughput = num_floating_point_operations(
             args,
             batch_size,
@@ -3701,29 +3760,24 @@ def training_log(
         # point sees 0.0 loss and 0 skipped iterations on EVERY export, which is exactly
         # what the metrics emission (further below, where the other emission inputs like
         # `throughput` are in scope) used to do. Take the values here and emit them there.
-        # The .item() is a device sync, so it stays inside the telemetry guard and is not
-        # paid at all when telemetry is off -- the same guard the emission itself uses.
+        # Reads loss_totals, already resolved by the batched host read above, so the
+        # telemetry path no longer costs a device sync of its own.
         _otel_telemetry_log = get_telemetry()
         _otel_loss_snapshot = None
         _otel_skipped_iters_snapshot = 0
         if _otel_telemetry_log is not None and _otel_telemetry_log.is_exporting:
-            _meta_keys = (advanced_iters_key, skipped_iters_key, nan_iters_key)
-            _loss_keys = [k for k in total_loss_dict if k not in _meta_keys]
-            if _loss_keys:
-                _otel_loss_snapshot = total_loss_dict[_loss_keys[0]].item() / float(
+            if loss_keys:
+                _otel_loss_snapshot = loss_totals[loss_keys[0]] / float(
                     max(1, total_loss_dict.get(advanced_iters_key, 1))
                 )
             _otel_skipped_iters_snapshot = int(total_loss_dict.get(skipped_iters_key, 0))
 
-        for key in total_loss_dict:
-            if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]:
-                avg = total_loss_dict[key].item() / float(
-                    max(1, total_loss_dict[advanced_iters_key])
-                )
-                if avg >= 0.0:
-                    log_string += ' {}: {:.6E} |'.format(key, avg)
-                if should_reset:
-                    total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
+        for key in loss_keys:
+            avg = loss_totals[key] / float(max(1, total_loss_dict[advanced_iters_key]))
+            if avg >= 0.0:
+                log_string += ' {}: {:.6E} |'.format(key, avg)
+            if should_reset:
+                total_loss_dict[key] = torch.zeros(1, dtype=torch.float, device='cuda')
         if args.num_experts is not None and moe_log_string:
             log_string += moe_log_string
         log_string += f' loss scale: {loss_scale:.1f} |'
@@ -4966,9 +5020,8 @@ def train(
 
             # Logging.
             if optimizer is not None and not optimizer.is_stub_optimizer:
-                # First .item() after the train_step: a device sync draining the
-                # iteration's pending GPU queue (captured under iteration_report).
-                loss_scale = optimizer.get_loss_scale().item()
+                # A device tensor by contract; training_log reads it past its fence.
+                loss_scale = optimizer.get_loss_scale()
             else:
                 loss_scale = 1.0
             params_norm = None
@@ -4979,7 +5032,12 @@ def train(
                 # (~1.5s cold on the first iteration, ~10ms steady). Kept as a real
                 # cost span (it stalls the critical path), unlike passive monitors.
                 with _otel_managed_span('step', 'megatron.train.params_norm', is_goodput_span=True):
-                    params_norm = calc_params_l2_norm(model, pg_collection=pg_collection)
+                    # return_squared_tensor keeps it on device; training_log takes the
+                    # square root on the host after the batched read, which is exactly
+                    # what norm_2.item() ** 0.5 did.
+                    params_norm = calc_params_l2_norm(
+                        model, pg_collection=pg_collection, return_squared_tensor=True
+                    )
             if optimizer is not None:
                 learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
             else:

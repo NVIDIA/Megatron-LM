@@ -419,8 +419,8 @@ class MegatronOptimizer(ABC):
                 )
         return grad_norm
 
-    def count_zeros(self) -> float:
-        """Count number of zeros in model's gradients."""
+    def count_zeros(self) -> torch.Tensor:
+        """Count number of zeros in model's gradients, left on device for logging."""
         params = self.get_parameters()
         return count_zeros_fp32(
             params,
