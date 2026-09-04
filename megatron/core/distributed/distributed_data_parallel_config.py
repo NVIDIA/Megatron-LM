@@ -40,6 +40,11 @@ class DistributedDataParallelConfig:
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.
     """
 
+    expert_num_distributed_optimizer_instances: int | None = None
+    """Number of optimizer instances across the expert-DP domain for MFSDP v2.
+       When unset, expert HSDP is disabled.
+    """
+
     check_for_nan_in_grad: bool = False
     """
     If true, check for NaNs and Infs in gradients _before_ communication collective.
@@ -180,6 +185,11 @@ class DistributedDataParallelConfig:
     """
     Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP) mode.
     Valid values are 'no_shard', 'optim'. This option is only effective when Hybrid FSDP is enabled.
+    """
+
+    expert_outer_dp_sharding_strategy: str = 'no_shard'
+    """Sharding strategy for the outer expert data-parallel group in MFSDP v2.
+    Valid values are ``'no_shard'`` and ``'optim'``.
     """
 
     disable_symmetric_registration: bool = False
