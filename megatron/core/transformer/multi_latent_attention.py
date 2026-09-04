@@ -70,6 +70,8 @@ if HAVE_TE:
             mxfp8_quantize_only,
             mxfp8_transpose_swizzle,
         )
+        from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
     except ImportError:
         # Older TE lacks the fused MLA Q up-proj kernel and its MXFP8 quantize/swizzle
         # helpers. Stub them all together so this module still imports; the fused path is
@@ -78,8 +80,8 @@ if HAVE_TE:
         FusedMLAQUpProjRopeQuant = None
         mxfp8_quantize_only = None
         mxfp8_transpose_swizzle = None
-    from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
-    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+        QuantizedTensor = None
+        MXFP8Quantizer = None
 
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
@@ -502,7 +504,7 @@ class MultiLatentAttention(Attention):
             forced = [
                 t
                 for t in [query, key, value]
-                if t is not None and not isinstance(t, QuantizedTensor)
+                if t is not None and (QuantizedTensor is None or not isinstance(t, QuantizedTensor))
             ]
             core_attn_out = core_attn_manager.group_offload(
                 core_attn_out, forced_released_tensors=forced
