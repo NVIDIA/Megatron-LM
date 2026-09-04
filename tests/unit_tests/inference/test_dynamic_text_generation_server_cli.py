@@ -11,6 +11,7 @@ import pytest
 import examples.inference.launch_inference_server as high_level_server
 import tools.run_dynamic_text_generation_server as legacy_server
 from examples.inference.launch_inference_server import add_serve_args
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from tools.run_dynamic_text_generation_server import add_text_generation_server_args
 
 
@@ -133,6 +134,15 @@ async def test_legacy_runner_forwards_sampling_config_and_stops_frontend(monkeyp
             ),
         ),
         engine_loop_task=finished_engine_loop(),
+        # The frontend hashes on the engine's block boundaries, so the runner reads
+        # both off the engine's context rather than taking them as flags.
+        context=SimpleNamespace(
+            block_size_tokens=256,
+            prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        ),
+        # The runner sizes the frontend from the engine's DP group. A None group
+        # reads as size 1, so this exercises the floor on the replica count.
+        pg_collection=SimpleNamespace(dp=None),
     )
 
     monkeypatch.setattr(legacy_server.torch.distributed, "get_rank", lambda: 0)
@@ -171,6 +181,7 @@ async def test_legacy_runner_forwards_sampling_config_and_stops_frontend(monkeyp
         "rank": 0,
         "server_port": 4321,
         "verbose": True,
+        "num_replicas": 4,
         "hostname": "127.0.0.1",
         "chat_template": "template",
         "multimodal_prompt_config": multimodal_prompt_config,
@@ -178,5 +189,9 @@ async def test_legacy_runner_forwards_sampling_config_and_stops_frontend(monkeyp
         "default_top_p": 0.8,
         "default_top_k": 5,
         "eval_mode": True,
+        # Read off the engine's context so the frontend hashes on the same block
+        # boundaries the engine caches on.
+        "block_size_tokens": 256,
+        "prefix_caching_coordinator_policy": PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
         "frontend_stopped": True,
     }
