@@ -374,26 +374,17 @@ class MegatronOptimizer(ABC):
     def _uses_decoupled_grad(self, param_list) -> bool:
         """Whether clip_grad_norm/count_zeros should read `.decoupled_grad` instead of `.grad`.
 
-        Megatron-FSDP v2 (`megatron_fsdp/experimental/`) always reduces directly into
-        `.grad`, precision-aware optimizer or not -- see `FullyShardedOptimizer.get_grad_norm`.
-        `_mfsdp_parameter_group` is v2's own marker for "this param is in one of my
-        parameter groups" (set in `experimental/parameter_group.py`, read via
-        `get_containing_parameter_group`); checking it here directly, the same way
-        `__fsdp_param__` below is duck-typed rather than imported, answers "is this a v2
-        param" without a dependency on the experimental FSDP module, and leaves the
-        heuristic below untouched for everything else (v1 Megatron-FSDP, plain
-        DistributedOptimizer, no FSDP at all).
+        Megatron-FSDP v2 always reduces into `.grad`, never `.decoupled_grad`, regardless of
+        `use_precision_aware_optimizer`. `_mfsdp_parameter_group` (set in
+        `experimental/parameter_group.py`) marks v2-owned params; checking it directly, like
+        `__fsdp_param__` below, avoids importing the experimental module.
 
-        `use_precision_aware_optimizer_no_fp8_or_ds_fp8` is `distrib_optimizer.py`'s own
-        flag for whether *its* precision-aware path (no FP8 / no delayed-scaling FP8) uses
-        `param.grad` or `param.decoupled_grad`; it has no notion of Megatron-FSDP and is
-        `True` for any non-FP8 precision-aware run. The `__fsdp_param__` fallback is
-        v1-only: only v1's `MegatronFSDP` (`megatron_fsdp/fully_shard.py`) tags params
-        with it.
-
-        Left unchecked, `clip_grad_by_total_norm_fp32`/`count_zeros_fp32` silently skip
-        any param whose `decoupled_grad` is unset rather than raising, so wrongly
-        returning True here no-ops clipping/zero-counting instead of erroring.
+        The heuristic below predates v2 and misfires for it:
+        `use_precision_aware_optimizer_no_fp8_or_ds_fp8` is a `distrib_optimizer.py` flag
+        with no FSDP awareness, and `__fsdp_param__` is v1-only (only v1's `MegatronFSDP`
+        sets it). Wrongly returning True here silently drops v2 params from
+        clipping/zero-counting instead of erroring (`clip_grad_by_total_norm_fp32`/
+        `count_zeros_fp32` skip params with no `decoupled_grad`).
         """
         if hasattr(param_list[0], "_mfsdp_parameter_group"):
             # Megatron-FSDP v2 always reduces directly into `.grad`.
