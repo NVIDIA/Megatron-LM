@@ -374,7 +374,7 @@ class MegatronOptimizer(ABC):
     def _uses_decoupled_grad(self, param_list) -> bool:
         """Whether clip_grad_norm/count_zeros should read `.decoupled_grad` instead of `.grad`.
 
-        Megatron-FSDP v2 always reduces into `.grad`, never `.decoupled_grad`, regardless of
+        MFSDP v2 always reduces into `.grad`, never `.decoupled_grad`, regardless of
         `use_precision_aware_optimizer`. `_mfsdp_parameter_group` (set in
         `experimental/parameter_group.py`) marks v2-owned params; checking it directly, like
         `__fsdp_param__` below, avoids importing the experimental module.
@@ -387,14 +387,14 @@ class MegatronOptimizer(ABC):
         `count_zeros_fp32` skip params with no `decoupled_grad`).
         """
         if hasattr(param_list[0], "_mfsdp_parameter_group"):
-            # Megatron-FSDP v2 always reduces directly into `.grad`.
+            # MFSDP v2 always reduces directly into `.grad`.
             return False
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             return True
         if self.config.use_precision_aware_optimizer and getattr(
             param_list[0], "__fsdp_param__", False
         ):
-            # Megatron-FSDP v1 always uses decoupled_grad with FusedAdam.
+            # MFSDP v1 always uses decoupled_grad with FusedAdam.
             return True
         return False
 
