@@ -854,10 +854,13 @@ def test_prebuild_refresh_preserves_old_plan_objects():
 
 
 @pytest.mark.parametrize("name,cu_list,cp_size,capacity", _CASES)
-def test_kv_bounds_cover_every_visible_key(name, cu_list, cp_size, capacity):
-    """The tight per-call compressed-K bounds must cover, for every owned row, the
-    full causally visible compressed prefix (a clipped visible key would silently
-    change the top-k). Ground truth is recomputed from first principles."""
+def test_kv_width_bounds_cover_every_visible_key(name, cu_list, cp_size, capacity):
+    """Each tight score width must cover every causally visible compressed key.
+
+    The scorer always receives the full K tensor; only ``max_seqlen_kv`` is
+    narrowed. Ground truth is recomputed from first principles so this test pins
+    the optimization without depending on a prefix-view storage trick.
+    """
     ratio = 4
     for r in range(cp_size):
         psp = _packed_params(cu_list, capacity)
@@ -872,17 +875,14 @@ def test_kv_bounds_cover_every_visible_key(name, cu_list, cp_size, capacity):
         real = gather < cu[-1]
         comp_len = comp[1:] - comp[:-1]
         visible = torch.minimum((pos + 1) // ratio, comp_len[seq_of])
-        need_end = comp[seq_of] + visible  # absolute compressed-row end per row
-        for which, mkv_key, kend_key, sl in (
-            ("head", "mkv_head", "k_end_head", slice(0, half)),
-            ("tail", "mkv_tail", "k_end_tail", slice(half, None)),
+        for which, mkv_key, sl in (
+            ("head", "mkv_head", slice(0, half)),
+            ("tail", "mkv_tail", slice(half, None)),
         ):
             v = visible[sl][real[sl]]
-            e = need_end[sl][real[sl]]
             if v.numel() == 0:
                 continue
             assert int(v.max()) <= plan[mkv_key], (name, r, which, int(v.max()), plan[mkv_key])
-            assert int(e.max()) <= plan[kend_key], (name, r, which, int(e.max()), plan[kend_key])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="indexer scoring runs on device")
@@ -960,13 +960,13 @@ def test_prebuild_capacity_probe_for_raw_cu():
     plan = psp._dsa_cp_balance_layout_cache[("zigzag", 0)]
     assert plan["half"] * 2 == l_local
     assert psp._dsa_cp_balance_layout_cache["zz_pack_ok"] == (l_local, True)
-    # [raw_total, capacity) is the zero-K pseudo-sequence: the compressed-K
-    # geometry must match the K buffer the forward builds from the RAW cu
-    # (1024//4 + 1976//4 = 750 physical rows) — merging the tail into the last
-    # sequence would inflate k_end past it and trip the consume-side guard.
+    # [raw_total, capacity) is the zero-K pseudo-sequence. Its layout keeps the
+    # true logical compressed extent even though the forward supplies a
+    # capacity-sized full K tensor (capacity // ratio rows, with padding slots).
     raw_comp_total = 1024 // 4 + (3000 - 1024) // 4
-    assert plan["k_end_head"] <= raw_comp_total
-    assert plan["k_end_tail"] <= raw_comp_total
+    assert int(plan["head_layout"][1][-1]) == raw_comp_total
+    assert int(plan["tail_layout"][1][-1]) == raw_comp_total
+    assert raw_comp_total < 4096 // 4
     # Pseudo-sequence rows carry RoPE position 0 (their top-k is discarded).
     pos = torch.cat((plan["pos_head"], plan["pos_tail"]))
     assert bool((pos[plan["gather_idx"] >= 3000] == 0).all())
@@ -983,11 +983,14 @@ def test_prebuild_capacity_probe_for_raw_cu():
 
 
 def test_balanced_compute_smoke_runs_production_path(monkeypatch):
-    """Invoke the PRODUCTION balanced_compute_cp_indexer_topk (unfused, CPU): the
-    cp_size <= 1 exit still runs the real projection -> _no_fp8_ctx -> RoPE ->
-    reference-delegation pipeline, so module-level integration failures (e.g. a
-    missing global read inside _no_fp8_ctx) surface here rather than only on
-    GPU. Verified against the reference call on the same inputs."""
+    """Invoke the production helper's degenerate path on CPU.
+
+    The public helper no longer exposes a fused/unfused override: it requests
+    fused scoring for a safe-sized ordinary layout. A test proxy records that
+    request and delegates to the unfused implementation so the projection ->
+    _no_fp8_ctx -> RoPE -> scorer integration can still run on CPU and be
+    compared exactly with the reference.
+    """
     from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer as M
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 
@@ -1021,6 +1024,14 @@ def test_balanced_compute_smoke_runs_production_path(monkeypatch):
     # wiring (projection/_no_fp8_ctx/RoPE/delegation), so make rotation identity
     # on BOTH the production call and the reference reproduction below.
     monkeypatch.setattr(M, "rotate_activation", lambda x: x)
+    real_compute_topk = cp_utils.compute_cp_indexer_topk
+    fused_requests = []
+
+    def _cpu_compute_proxy(*args, **kwargs):
+        fused_requests.append(kwargs["use_fused"])
+        return real_compute_topk(*args, **{**kwargs, "use_fused": False})
+
+    monkeypatch.setattr(cp_utils, "compute_cp_indexer_topk", _cpu_compute_proxy)
     idx = _Indexer()
     qr = torch.randint(-2, 3, (rows, 1, q_lora)).to(torch.bfloat16)
     w = (torch.rand(rows, heads) + 0.5).to(torch.bfloat16)
@@ -1044,9 +1055,9 @@ def test_balanced_compute_smoke_runs_production_path(monkeypatch):
         topk,
         dim**-0.5,
         rows,
-        use_fused=False,
     )
     assert tk is not None and tk.shape == (rows, topk)
+    assert fused_requests == [True]
     # The cp1 exit is the reference call over own rows: reproduce it directly.
     from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
         apply_thd_cp_local_rope_unfused,
@@ -1057,12 +1068,105 @@ def test_balanced_compute_smoke_runs_production_path(monkeypatch):
     q_ref = apply_thd_cp_local_rope_unfused(
         q_ref, idx.rotary_pos_emb(rows), dim - pos_dim, pos_dim, cu, 0, _Cfg()
     )
-    ref, _ = cp_utils.compute_cp_indexer_topk(
+    ref, _ = real_compute_topk(
         q_ref, w, k, cu, cu_comp, 0, ratio, topk, dim**-0.5, max_seqlen_q=rows, use_fused=False
     )
     fs, _ = torch.sort(tk, dim=-1)
     rs, _ = torch.sort(ref, dim=-1)
     assert torch.equal(fs, rs)
+
+
+def test_balanced_compute_uses_fused_full_k_with_tight_widths(monkeypatch):
+    """The production zigzag consumer passes full K plus a tight score width.
+
+    This directly guards both API invariants behind the balanced helper: callers
+    cannot select an unfused synthetic-layout scorer, and neither head nor tail
+    relies on a prefix view whose logical extent is shorter than its layout.
+    Communication and scoring are replaced with CPU spies; the real plan and
+    production helper wiring are exercised.
+    """
+    from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer as M
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+
+    cp_size, rank, capacity, ratio = 4, 0, 65536, 4
+    l_local = capacity // cp_size
+    q_lora, heads, dim, topk = 16, 4, 8, 8
+    group = _StubGroup(cp_size, rank)
+    cu_list = [0, 40960, capacity]
+    packed = _packed_params(cu_list, capacity)
+    prebuild_balanced_layouts(packed, cp_group=group)
+    cache = packed._dsa_cp_balance_layout_cache
+    plan = cache[("zigzag", rank)]
+
+    class _Indexer:
+        index_n_heads = heads
+        index_head_dim = dim
+        qk_pos_emb_head_dim = 4
+
+        @staticmethod
+        def linear_wq_b(x):
+            return x.new_zeros((x.shape[0], 1, heads * dim)), None
+
+    class _Cfg:
+        apply_rope_fusion = False
+        cuda_graph_impl = "none"
+        rotary_interleaved = False
+
+    # Keep this test CPU-only: it verifies the production argument wiring, not
+    # the fused kernel implementation (covered by the isolated GPU tests below).
+    monkeypatch.setattr(M, "_rope_positions", lambda q, *_args, **_kwargs: q)
+    monkeypatch.setattr(M, "rotate_activation", lambda q: q)
+    monkeypatch.setattr(M, "nvtx_range_push", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(M, "nvtx_range_pop", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        M.dist, "all_to_all_single", lambda output, input, **_kwargs: output.copy_(input)
+    )
+
+    score_calls = []
+
+    def _score_spy(*args, **kwargs):
+        score_calls.append((args[2], kwargs))
+        return torch.zeros((args[0].shape[0], topk), dtype=torch.int32), kwargs["prebuilt_layout"]
+
+    monkeypatch.setattr(cp_utils, "compute_cp_indexer_topk", _score_spy)
+
+    qr = torch.zeros((l_local, 1, q_lora), dtype=torch.bfloat16)
+    weights = torch.ones((l_local, heads), dtype=torch.bfloat16)
+    k_full = torch.zeros((capacity // ratio, dim), dtype=torch.bfloat16)
+    gathered = torch.zeros((capacity, q_lora + heads), dtype=torch.bfloat16)
+    dispatch = {"kind": "ag", "works": [], "g": gathered, "q_lora": q_lora}
+    cu = torch.tensor(cu_list, dtype=torch.int32)
+    cu_comp = _comp_cu(cu)
+
+    result, _ = M.balanced_compute_cp_indexer_topk(
+        qr,
+        weights,
+        _Indexer(),
+        k_full,
+        cu,
+        cu_comp,
+        _Cfg(),
+        group,
+        cp_size,
+        l_local,
+        0,
+        ratio,
+        topk,
+        dim**-0.5,
+        capacity,
+        dispatch_handle=dispatch,
+        layout_cache=cache,
+    )
+
+    assert result.shape == (l_local, topk)
+    assert len(score_calls) == 2
+    expected_widths = [plan["mkv_head"], plan["mkv_tail"]]
+    for (k_arg, kwargs), expected_width in zip(score_calls, expected_widths):
+        assert k_arg is k_full
+        assert kwargs["synthetic_layout"] is True
+        assert kwargs["use_fused"] is True
+        assert kwargs["max_seqlen_kv"] == expected_width
+    assert min(expected_widths) < k_full.shape[0]
 
 
 def test_prebuild_routes_ineligible_above_limit_pack():
@@ -1099,8 +1203,7 @@ def test_prebuild_rejects_capacity_above_fused_row_limit():
 
 def test_row_limit_guard_in_compute_cp_indexer_topk():
     """Above FUSED_INDEXER_MAX_SAFE_ROWS the policy splits: a synthetic layout
-    (balanced path) fails closed, while zero-work exits still run first so no-op
-    calls never trip the guard. Legacy above-limit calls proceed fused with a
+    (balanced path) fails closed. Legacy above-limit calls proceed fused with a
     once-per-process correctness warning (exercised by the GPU suite), so they
     are not run here on CPU."""
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
@@ -1129,20 +1232,67 @@ def test_row_limit_guard_in_compute_cp_indexer_topk():
             prebuilt_layout=fake_layout,
             synthetic_layout=True,
         )
-    # Zero-work exits run before the guard: a no-op call never raises even with
-    # the synthetic flag set (topk_width == 0 -> (None, None)).
+
+
+def test_synthetic_layout_rejects_unfused_nonempty_work():
+    """Unfused scoring ignores synthetic layouts, so reject instead of mis-masking."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+
+    rows, heads, dim, ratio = 8, 4, 8, 4
+    q = torch.zeros((rows, heads, dim), dtype=torch.bfloat16)
+    w = torch.ones((rows, heads), dtype=torch.bfloat16)
+    k = torch.zeros((rows // ratio, dim), dtype=torch.bfloat16)
+    cu = torch.tensor([0, rows], dtype=torch.int32)
+    cc = torch.tensor([0, rows // ratio], dtype=torch.int32)
+    fake_layout = (cu, cc, torch.tensor([0, 0], dtype=torch.int32))
+
+    with pytest.raises(ValueError, match="synthetic_layout=True requires use_fused=True"):
+        cp_utils.compute_cp_indexer_topk(
+            q,
+            w,
+            k,
+            cu,
+            cc,
+            0,
+            ratio,
+            1,
+            1.0,
+            max_seqlen_q=rows,
+            use_fused=False,
+            prebuilt_layout=fake_layout,
+            synthetic_layout=True,
+        )
+
+
+@pytest.mark.parametrize("zero_case", ["topk", "k", "max_seqlen_kv"])
+def test_synthetic_unfused_zero_work_returns_none(zero_case):
+    """All no-op exits remain valid before the synthetic/unfused guard."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+
+    rows, heads, dim, ratio = 8, 4, 8, 4
+    q = torch.zeros((rows, heads, dim), dtype=torch.bfloat16)
+    w = torch.ones((rows, heads), dtype=torch.bfloat16)
+    k = torch.zeros((rows // ratio, dim), dtype=torch.bfloat16)
+    cu = torch.tensor([0, rows], dtype=torch.int32)
+    cc = torch.tensor([0, rows // ratio], dtype=torch.int32)
+    fake_layout = (cu, cc, torch.tensor([0, 0], dtype=torch.int32))
+    topk = 0 if zero_case == "topk" else 1
+    k_arg = k[:0] if zero_case == "k" else k
+    max_seqlen_kv = 0 if zero_case == "max_seqlen_kv" else None
+
     tk, layout = cp_utils.compute_cp_indexer_topk(
         q,
         w,
-        k,
+        k_arg,
         cu,
         cc,
         0,
         ratio,
-        0,
+        topk,
         1.0,
         max_seqlen_q=rows,
-        use_fused=True,
+        use_fused=False,
+        max_seqlen_kv=max_seqlen_kv,
         prebuilt_layout=fake_layout,
         synthetic_layout=True,
     )
@@ -1181,7 +1331,6 @@ def test_row_limit_guard_in_compute_cp_indexer_topk():
 _FUSED_ISOLATED_TESTS = (
     "test_fused_multi_offset_packed_layout",
     "test_fused_tight_width_smoke",
-    "test_fused_sliced_k_prefix_view_smoke",
     "test_fused_tight_width_ceiling_smoke",
     "test_fused_reduced_mq_matches_full_mq",
 )
@@ -1196,7 +1345,7 @@ _fused_kernel_test = pytest.mark.skipif(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused indexer kernel required")
 def test_fused_kernel_suite_isolated():
-    """Run the five fused-kernel tests in a fresh process (see WORKSPACE NOTE)."""
+    """Run the fused-kernel tests in a fresh process (see WORKSPACE NOTE)."""
     env = dict(os.environ)
     env["MCORE_DSA_FUSED_CHILD"] = "1"
     # The child is a plain single-process pytest: drop the launcher's
@@ -1236,18 +1385,18 @@ def test_fused_kernel_suite_isolated():
 def test_fused_multi_offset_packed_layout():
     """The production zigzag path feeds the fused kernel synthetic packed layouts in
     which EVERY real segment carries a non-zero q_causal_offset (r*c_i per sequence)
-    plus per-sequence K ranges and a K-prefix view — an input regime the reference
-    layout builder can never produce (it emits at most one non-zero offset). Verify
-    on the REAL kernel, with tie-free signature data, that a plan's head/tail packed
-    calls select exactly the same keys as one full fused reference call."""
+    plus per-sequence K ranges, while supplying the full physical K tensor with a
+    tight score width. Verify on the REAL kernel, with tie-free signature data, that
+    a plan's head/tail packed calls select exactly the same keys as one full fused
+    reference call."""
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils as _cu
 
     torch.manual_seed(29)
     dev = torch.device("cuda")
     cp_size, cap = 4, 65536
     cu_list = [0, 40960, 65536]  # both sequences 2N-divisible; large enough that
-    # the head chunks get TIGHT quantized widths (mkv < gkv) and K-PREFIX slices
-    # (k_end < comp) — the exact production regime of the K-bound optimization.
+    # the head chunks get TIGHT quantized widths (mkv < gkv) while retaining the
+    # full K tensor — the exact production regime of the width optimization.
     heads, dim, ratio, topk = 64, 128, 4, 64  # PRODUCTION head shape (see _signature_qkw)
     l_local, half = cap // cp_size, cap // cp_size // 2
     cu = torch.tensor(cu_list, dtype=torch.int32, device=dev)
@@ -1269,31 +1418,25 @@ def test_fused_multi_offset_packed_layout():
         prebuild_balanced_layouts(psp, cp_group=_StubGroup(cp_size, r))
         plans.append(psp._dsa_cp_balance_layout_cache[("zigzag", r)])
     gkv = max(1, cap // ratio)
-    comp_total = int(cu_comp[-1])
     # Guard against this test silently degenerating to full-width calls again:
-    # at least one packed call must exercise a tight width AND a K-prefix slice.
+    # at least one packed call must exercise a tight width.
     assert any(
         p[m] < gkv for p in plans for m in ("mkv_head", "mkv_tail")
     ), "no tight width engaged — enlarge the case"
-    assert any(
-        p[e] < comp_total for p in plans for e in ("k_end_head", "k_end_tail")
-    ), "no K-prefix slice engaged — enlarge the case"
     mq = max(1, min(cap, half))
     for r in range(cp_size):
         plan = plans[r]
         rows_q = q.index_select(0, plan["gather_idx"])
         rows_w = w.index_select(0, plan["gather_idx"])
         parts = []
-        for sl, lay, mkv_k, kend_k in (
-            (slice(0, half), "head_layout", "mkv_head", "k_end_head"),
-            (slice(half, None), "tail_layout", "mkv_tail", "k_end_tail"),
+        for sl, lay, mkv_k in (
+            (slice(0, half), "head_layout", "mkv_head"),
+            (slice(half, None), "tail_layout", "mkv_tail"),
         ):
-            k_end = plan[kend_k]
-            k_pass = k[:k_end] if k_end < comp else k
             tk, _ = _cu.compute_cp_indexer_topk(
                 rows_q[sl],
                 rows_w[sl],
-                k_pass,
+                k,
                 cu,
                 cu_comp,
                 0,
@@ -1336,7 +1479,7 @@ def test_fused_tight_width_smoke():
     """Exercise the empirical tight-width kernel contract (_KV_TIGHT_WIDTH_CEILING):
     a fused call whose score width (16384) is narrower than the declared per-sequence
     compressed KV length must complete without an illegal memory access and return
-    causally valid indices. Guards the contract the K-bound optimization rests on."""
+    causally valid indices. Guards the contract the score-width optimization rests on."""
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils as _cu
 
     torch.manual_seed(7)
@@ -1370,52 +1513,11 @@ def test_fused_tight_width_smoke():
 
 
 @_fused_kernel_test
-def test_fused_sliced_k_prefix_view_smoke():
-    """The zigzag consumer feeds the fused kernel a PREFIX VIEW of the gathered K
-    (k_seq_major[:k_end]) together with a layout whose declared per-sequence K
-    ranges may extend past the slice (mkv is a capacity, k_end the causal need).
-    Reads past the slice must land on valid full-buffer memory — exercise that
-    combination end to end and check the indices stay causally bounded."""
-    from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils as _cu
-
-    torch.manual_seed(11)
-    dev = torch.device("cuda")
-    T, heads, dim, ratio, topk = 65536, 64, 128, 4, 64  # production head shape
-    gs, sz = 16384, 1024  # rows see at most (gs+sz)//ratio = 4352 keys
-    cu = torch.tensor([0, T], dtype=torch.int32, device=dev)
-    cu_comp = _comp_cu(cu.cpu()).to(dev)
-    k_full = torch.randn(int(cu_comp[-1]), dim, dtype=torch.bfloat16, device=dev)
-    k_end = 8192
-    k_slice = k_full[:k_end]  # prefix view, NOT contiguous-ized
-    assert k_slice.data_ptr() == k_full.data_ptr()
-    q = torch.randn(sz, heads, dim, dtype=torch.bfloat16, device=dev)
-    w = (torch.rand(sz, heads, dtype=torch.float32, device=dev) + 0.5).to(torch.bfloat16)
-    tk, _ = _cu.compute_cp_indexer_topk(
-        q,
-        w,
-        k_slice,
-        cu,
-        cu_comp,
-        gs,
-        ratio,
-        topk,
-        dim**-0.5,
-        max_seqlen_q=T,
-        use_fused=True,
-        max_seqlen_kv=8192,
-    )
-    torch.cuda.synchronize()
-    assert tk.shape == (sz, topk)
-    assert int(tk.max()) < (gs + sz) // ratio
-    assert int(tk.min()) >= 0
-
-
-@_fused_kernel_test
 def test_fused_tight_width_ceiling_smoke():
     """Boundary case of the empirical kernel contract: a tight score width EXACTLY at
     _KV_TIGHT_WIDTH_CEILING (65536), narrower than the declared per-sequence compressed
     KV length, must complete without an illegal memory access. Guards the exact edge
-    the K-bound optimization is allowed to reach."""
+    the score-width optimization is allowed to reach."""
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils as _cu
 
     torch.manual_seed(13)
@@ -1726,14 +1828,12 @@ def test_zigzag_scoring_matches_reference():
         rows_q = qr.index_select(0, plan["gather_idx"])
         rows_w = w.index_select(0, plan["gather_idx"])
         parts = []
-        for sl, lay, pos, kend_k in (
-            (slice(0, half), "head_layout", "pos_head", "k_end_head"),
-            (slice(half, None), "tail_layout", "pos_tail", "k_end_tail"),
+        for sl, lay, pos in (
+            (slice(0, half), "head_layout", "pos_head"),
+            (slice(half, None), "tail_layout", "pos_tail"),
         ):
-            k_end = plan[kend_k]
-            k_pass = k[:k_end] if k_end < comp else k
             q_c = _project_rope(rows_q[sl], plan[pos], plan[lay])
-            parts.append(_layout_topk(q_c, rows_w[sl], k_pass, plan[lay]))
+            parts.append(_layout_topk(q_c, rows_w[sl], k, plan[lay]))
         Z[r * l_local : (r + 1) * l_local] = torch.cat(parts)
     for r in range(cp_size):
         mine = Z.index_select(0, plans[r]["inv_idx"])
