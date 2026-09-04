@@ -582,13 +582,24 @@ class AbsorbedMLASelfAttention(Attention):
         # QKV up projection and RoPE apply
         # =========================================
 
-        def qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb):
-            """
-            Apply the up projection and RoPE to the query and key.
-            When sequence packing enabled, the input tensors adopt a packed shape of [t, ...];
-            otherwise, they maintain the unpacked shape [s, b, ...]. In subsequent code comments,
-            we uniformly use [num_tokens, ...] to denote [s, b, ...] or [t, ...] for two cases.
-            """
+        # Capture the active group by value because dynamic CP restores
+        # self.pg_collection.cp before checkpoint recomputation runs in backward.
+        active_cp_group = self.pg_collection.cp
+
+        def select_rotary_pos_emb(rotary_pos_emb, num_tokens):
+            """Select the RoPE rows used by both the query and key branches."""
+            if inference_context is not None:
+                sequence_start = inference_context.sequence_len_offset
+                sequence_end = sequence_start + num_tokens
+                return rotary_pos_emb[sequence_start:sequence_end]
+            if not thd_packed_seq or self.config.context_parallel_size == 1:
+                # Packed CP keeps the full embedding so every local segment can address its
+                # original positions. Other layouts use the local query length.
+                return rotary_pos_emb[:num_tokens]
+            return rotary_pos_emb
+
+        def q_up_proj_and_rope_apply(q_compressed, rotary_pos_emb):
+            """Apply Q up projection, K-weight absorption, and query RoPE."""
             if self.config.q_lora_rank is not None:
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
@@ -600,13 +611,6 @@ class AbsorbedMLASelfAttention(Attention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-
-            if not reuse_mtp_latent_kv:
-                # [num_tokens, kv_lora_rank] -> [num_tokens, 1, kv_lora_rank]
-                kv_compressed = torch.unsqueeze(kv_compressed, -2)
-                # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
-                k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
-
             k_up_weight, _ = self._get_kv_up_weights()
 
             if use_fused_rope:
@@ -623,8 +627,8 @@ class AbsorbedMLASelfAttention(Attention):
                 assert q_absorbed.shape[:-1] == q.shape[:-1]
                 assert q_absorbed.size(-1) == self.config.kv_lora_rank
 
-                cp_rank = self.pg_collection.cp.rank()
-                cp_size = self.pg_collection.cp.size()
+                cp_rank = active_cp_group.rank()
+                cp_size = active_cp_group.size()
                 q_absorbed = fused_mla_rope_concat(
                     q_absorbed,
                     q_pos_emb,
@@ -634,37 +638,7 @@ class AbsorbedMLASelfAttention(Attention):
                     cp_rank,
                     cp_size,
                 )
-                if not reuse_mtp_latent_kv:
-                    kv_compressed = fused_mla_rope_concat(
-                        kv_compressed,
-                        k_pos_emb,
-                        rotary_pos_cos,
-                        rotary_pos_sin,
-                        cu_seqlens_kv,
-                        cp_rank,
-                        cp_size,
-                    )
-                else:
-                    # DSAttention resolves the canonical depth-0 key from its sharing state.
-                    kv_compressed = None
             else:
-                q_len = q.size()[0]
-                if inference_context is not None:
-                    # add offset to the sequence start for inference
-                    sequence_start = inference_context.sequence_len_offset
-                    sequence_end = sequence_start + q_len
-                    rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif not thd_packed_seq or self.config.context_parallel_size == 1:
-                    # Shorten rotary_pos_emb to the sequence length when inference_params
-                    # is not provided. This makes sure we can run forward directly with
-                    # any sequence length. During training, the sequence length is always
-                    # the full rotary_pos_emb length, except for sequence packing + CP.
-                    # When sequence packing and context parallel are both enabled, the
-                    # position embedding will not split rotary_pos_emb, so it may exceed
-                    # the sequence length on this CP rank, but we need the full rotary_pos_emb
-                    # to cover the full sequence, so we do not shorten it here.
-                    rotary_pos_emb = rotary_pos_emb[0:q_len]
-
                 # q_no_pe: [num_tokens, n, qk_head_dim]
                 # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
                 q_no_pe, q_pos_emb = torch.split(
@@ -682,37 +656,64 @@ class AbsorbedMLASelfAttention(Attention):
                 # Apply RoPE to q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
                 q_pos_emb = apply_rotary_pos_emb(
                     q_pos_emb,
-                    rotary_pos_emb,
+                    select_rotary_pos_emb(rotary_pos_emb, q.size(0)),
                     config=self.config,
                     cu_seqlens=cu_seqlens_q,
                     mscale=mscale,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=active_cp_group,
                     mla_rotary_interleaved=True,
                     max_seqlen=rope_max_seqlen_q,
                 )
+
                 # query: [num_tokens, n, (kv_lora_rank + qk_pos_emb_head_dim)]
                 q_absorbed = torch.cat([q_absorbed, q_pos_emb], dim=-1)
 
-                if not reuse_mtp_latent_kv:
-                    # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
-                    k_pos_emb = apply_rotary_pos_emb(
-                        k_pos_emb,
-                        rotary_pos_emb,
-                        config=self.config,
-                        cu_seqlens=cu_seqlens_kv,
-                        mscale=mscale,
-                        cp_group=self.pg_collection.cp,
-                        mla_rotary_interleaved=True,
-                        max_seqlen=rope_max_seqlen_kv,
-                    )
-                    # key: [num_tokens, 1, (kv_lora_rank + qk_pos_emb_head_dim)]
-                    kv_compressed = torch.cat([kv_compressed, k_pos_emb], dim=-1)
-                else:
-                    # DSAttention resolves the canonical depth-0 key from its sharing state.
-                    kv_compressed = None
-
             assert q_absorbed.is_contiguous()
-            assert kv_compressed is None or kv_compressed.is_contiguous()
+            return q_absorbed
+
+        def key_rope_apply(kv_compressed, k_pos_emb, rotary_pos_emb, num_query_tokens):
+            """Assemble the latent attention key and apply key RoPE."""
+            # [num_tokens, dim] -> [num_tokens, 1, dim]
+            kv_compressed = torch.unsqueeze(kv_compressed, -2)
+            k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
+
+            if use_fused_rope:
+                cp_rank = active_cp_group.rank()
+                cp_size = active_cp_group.size()
+                kv_compressed = fused_mla_rope_concat(
+                    kv_compressed,
+                    k_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    cu_seqlens_kv,
+                    cp_rank,
+                    cp_size,
+                )
+            else:
+                k_pos_emb = apply_rotary_pos_emb(
+                    k_pos_emb,
+                    select_rotary_pos_emb(rotary_pos_emb, num_query_tokens),
+                    config=self.config,
+                    cu_seqlens=cu_seqlens_kv,
+                    mscale=mscale,
+                    cp_group=active_cp_group,
+                    mla_rotary_interleaved=True,
+                    max_seqlen=rope_max_seqlen_kv,
+                )
+                kv_compressed = torch.cat([kv_compressed, k_pos_emb], dim=-1)
+
+            assert kv_compressed.is_contiguous()
+            return kv_compressed
+
+        def qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb):
+            """Compose the ordinary joint Q/K checkpoint path from shared primitives."""
+            q_absorbed = q_up_proj_and_rope_apply(q_compressed, rotary_pos_emb)
+            if not reuse_mtp_latent_kv:
+                kv_compressed = key_rope_apply(
+                    kv_compressed, k_pos_emb, rotary_pos_emb, q_absorbed.size(0)
+                )
+            else:
+                kv_compressed = None
 
             return q_absorbed, kv_compressed
 
@@ -725,14 +726,35 @@ class AbsorbedMLASelfAttention(Attention):
             # and therefore identical between the forward pass and the replay.
             quantization = self.config.fp8 or self.config.fp4
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
-            q_absorbed, kv_compressed = self.qkv_up_checkpoint.checkpoint(
-                qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
-            )
+            if getattr(self.core_attention, "mtp_latent_kv_share", False):
+                # With latent-KV sharing, the source K must outlive this attention call.
+                # Including it in CheckpointWithoutOutput would clear its storage after
+                # forward, so every depth checkpoints Q only and constructs/reuses K outside.
+                q_absorbed = self.qkv_up_checkpoint.checkpoint(
+                    q_up_proj_and_rope_apply, q_compressed, rotary_pos_emb
+                )
+                if not reuse_mtp_latent_kv:
+                    kv_compressed = key_rope_apply(
+                        kv_compressed, k_pos_emb, rotary_pos_emb, q_absorbed.size(0)
+                    )
+                else:
+                    kv_compressed = None
+            else:
+                q_absorbed, kv_compressed = self.qkv_up_checkpoint.checkpoint(
+                    qkv_up_proj_and_rope_apply,
+                    q_compressed,
+                    kv_compressed,
+                    k_pos_emb,
+                    rotary_pos_emb,
+                )
         else:
             assert not self.cache_mla_latents, "cache_mla_latents is not supported for AbsorbedMLA"
             q_absorbed, kv_compressed = qkv_up_proj_and_rope_apply(
                 q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
             )
+
+        assert q_absorbed.is_contiguous()
+        assert kv_compressed is None or kv_compressed.is_contiguous()
 
         return q_absorbed, kv_compressed, q_compressed
 
@@ -928,22 +950,12 @@ class AbsorbedMLASelfAttention(Attention):
             inference_context is None and inference_params is None
         ), "Inference is not supported for AbsorbedMLA"
         if (
-            getattr(self.core_attention, "mtp_cross_depth_share", False)
+            getattr(self.core_attention, "mtp_latent_kv_share", False)
             and self.checkpoint_core_attention
             and self.training
         ):
             raise RuntimeError(
-                "Repeated-MTP cross-depth sharing does not support core_attn recompute."
-            )
-
-        if (
-            getattr(self.core_attention, "mtp_latent_kv_share", False)
-            and self.recompute_up_proj
-            and self.training
-        ):
-            raise RuntimeError(
-                "Repeated-MTP latent_kv sharing does not support mla_up_proj recompute: "
-                "the source KV storage would be discarded before later depths consume it."
+                "Repeated-MTP latent_kv sharing does not support selective core_attn recompute."
             )
 
         # Set the right cp group for dynamic-cp. Downstream RoPE and CSA core

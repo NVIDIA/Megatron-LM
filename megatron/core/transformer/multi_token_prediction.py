@@ -32,6 +32,7 @@ from megatron.core.transformer.forward_sharing import (
     forward_sharing_lifetime,
     get_forward_sharing_state,
     is_forward_sharing_enabled,
+    is_mtp_repeated_sharing_source,
     mtp_repeated_sharing_lifetime,
     preserve_forward_sharing_for_checkpoint,
 )
@@ -2413,6 +2414,21 @@ class MultiTokenPredictionLayer(MegatronModule):
             self.mtp_layer_pattern is None
         ), "Hybrid MTP delegates full activation recomputation to its nested HybridStack."
 
+        # Source shared tensors must leave checkpoint as outputs and enter consumers as
+        # explicit inputs. Capturing only their payload would bypass checkpoint's
+        # autograd boundary and lose the consumer-to-source KV gradient path.
+        shared_attention = None
+        is_source = False
+        shared_inputs = ()
+        if getattr(self.config, "mtp_repeated_layer_shared_components", None):
+            shared_attention = self.mtp_model_layer.self_attention.core_attention
+            state = get_forward_sharing_state(packed_seq_params, attention_mask, self.config)
+            is_source = is_mtp_repeated_sharing_source(state, shared_attention.layer_number)
+            if not is_source:
+                shared_inputs = shared_attention.get_mtp_checkpoint_tensors(
+                    packed_seq_params, attention_mask
+                )
+
         def custom_forward(
             hidden_states,
             decoder_input,
@@ -2425,8 +2441,13 @@ class MultiTokenPredictionLayer(MegatronModule):
             rotary_pos_cos,
             rotary_pos_sin,
             sequence_len_offset,
+            *shared_tensors,
         ):
-            return self._proj_and_transformer_layer(
+            if shared_attention is not None and not is_source:
+                shared_attention.set_mtp_checkpoint_tensors(
+                    shared_tensors, packed_seq_params, attention_mask
+                )
+            outputs = self._proj_and_transformer_layer(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
                 input_ids=input_ids,
@@ -2442,6 +2463,13 @@ class MultiTokenPredictionLayer(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
             )
+
+            if shared_attention is not None and is_source:
+                return (
+                    outputs,
+                    *shared_attention.get_mtp_checkpoint_tensors(packed_seq_params, attention_mask),
+                )
+            return outputs
 
         if is_forward_sharing_enabled(self.config):
             custom_forward = preserve_forward_sharing_for_checkpoint(
@@ -2491,6 +2519,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     rotary_pos_cos,
                     rotary_pos_sin,
                     sequence_len_offset,
+                    *shared_inputs,
                 )
             else:
                 # tensor_parallel.checkpoint stashes args via autograd's
@@ -2512,6 +2541,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     rotary_pos_cos,
                     rotary_pos_sin,
                     sequence_len_offset,
+                    *shared_inputs,
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -2521,6 +2551,11 @@ class MultiTokenPredictionLayer(MegatronModule):
             ), "recompute_num_layers must be 1 for MTP recompute"
             with outer_quantization_context:
                 outputs = checkpoint_handler()
+            if shared_attention is not None and is_source:
+                outputs, shared_tensors = outputs[0], outputs[1:]
+                shared_attention.set_mtp_checkpoint_tensors(
+                    shared_tensors, packed_seq_params, attention_mask
+                )
         elif self.config.recompute_method == 'block':
             # TODO: implement block-based recompute for MTP
             warnings.warn(
@@ -2616,11 +2651,6 @@ class MultiTokenPredictionLayer(MegatronModule):
             and self.mtp_layer_pattern is None
         )
         if use_outer_recompute:
-            if self.config.mtp_repeated_layer_shared_components:
-                raise RuntimeError(
-                    "Repeated-MTP cross-depth sharing does not support "
-                    "full activation recomputation."
-                )
             hidden_states = self._checkpointed_forward(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
