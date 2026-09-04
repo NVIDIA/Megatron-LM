@@ -48,6 +48,16 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
+@functools.lru_cache(maxsize=1)
+def _get_fla_fused_attnres():
+    """Import FLA's fused operator only when that backend is selected."""
+    try:
+        from fla.ops.attnres import fused_attnres
+    except ImportError:
+        return None
+    return fused_attnres
+
+
 def is_attn_res_block_start(global_layer_number: int, block_layers: int) -> bool:
     """Whether this layer opens a new depth block.
 
@@ -706,7 +716,13 @@ class AttentionResidual(MegatronModule):
     def __init__(self, config: TransformerConfig, layer_number: Optional[int] = None):
         super().__init__(config)
         self.eps = config.layernorm_epsilon
-        self.use_compile = getattr(config, 'attn_res_impl', 'eager') == 'compile'
+        self.impl = getattr(config, 'attn_res_impl', 'eager')
+        self._fla_fused_attnres = _get_fla_fused_attnres() if self.impl == 'fla' else None
+        if self.impl == 'fla' and self._fla_fused_attnres is None:
+            raise ImportError(
+                "attn_res_impl='fla' requires FLA with fused AttnRes support. "
+                "Install it with `pip install flash-linear-attention==0.5.1`."
+            )
         # Zero init is mandatory: uniform initial attention weights.
         self.pseudo_query = mark_keep_in_fp32(nn.Parameter(torch.zeros(config.hidden_size)))
         self.key_norm_weight = mark_keep_in_fp32(nn.Parameter(torch.ones(config.hidden_size)))
@@ -718,12 +734,31 @@ class AttentionResidual(MegatronModule):
         """Aggregate depth sources (+ optional partial sum) into the sublayer input."""
         assert len(values) >= 1, "AttentionResidual requires at least one depth source"
         nvtx_range_push(msg=f"attn_res.aggregate_n{len(values)}")
-        compiled_attn_res = _get_compiled_attn_res() if self.use_compile else None
-        if compiled_attn_res is None:
+        if self.impl == 'fla':
+            assert self._fla_fused_attnres is not None
+            out = self._fla_fused_attnres(
+                self.pseudo_query,
+                values,
+                self.key_norm_weight,
+                output_rms_weight=None,
+                rms_eps=self.eps,
+                scale=1.0,
+                return_weights=False,
+                checkpoint_level=1,
+            )
+        elif self.impl == 'compile':
+            compiled_attn_res = _get_compiled_attn_res()
+            if compiled_attn_res is None:
+                out = _AttnResAggregation.apply(
+                    self.pseudo_query, self.key_norm_weight, self.eps, *values
+                )
+            else:
+                out = compiled_attn_res(
+                    self.pseudo_query, self.key_norm_weight, self.eps, list(values)
+                )
+        else:
             out = _AttnResAggregation.apply(
                 self.pseudo_query, self.key_norm_weight, self.eps, *values
             )
-        else:
-            out = compiled_attn_res(self.pseudo_query, self.key_norm_weight, self.eps, list(values))
         nvtx_range_pop(msg=f"attn_res.aggregate_n{len(values)}")
         return out

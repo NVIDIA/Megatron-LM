@@ -92,6 +92,9 @@ def _build_gpt_model(
     enable_hyper_connections: bool = False,
     num_residual_streams: int = 4,
     mhc_recompute_layer_num: Optional[int] = None,
+    enable_attention_residuals: bool = False,
+    attn_res_block_layers: int = 2,
+    attn_res_impl: str = "eager",
 ) -> GPTModel:
     """Build a GPTModel that uses TE-based transformer layer spec."""
     model_parallel_cuda_manual_seed(seed)
@@ -122,6 +125,10 @@ def _build_gpt_model(
         enable_hyper_connections=enable_hyper_connections,
         num_residual_streams=num_residual_streams,
         mhc_recompute_layer_num=mhc_recompute_layer_num,
+        # Attention Residual settings
+        enable_attention_residuals=enable_attention_residuals,
+        attn_res_block_layers=attn_res_block_layers if enable_attention_residuals else None,
+        attn_res_impl=attn_res_impl,
     )
     gpt_model = GPTModel(
         config=transformer_config,
@@ -130,6 +137,7 @@ def _build_gpt_model(
             moe_grouped_gemm=num_experts is not None,
             multi_latent_attention=is_mla,
             enable_hyper_connection=enable_hyper_connections,
+            enable_attention_residual=enable_attention_residuals,
         ),
         vocab_size=vocab_size,
         max_sequence_length=seq_length,
@@ -206,21 +214,31 @@ def _run_one_iter_and_capture(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.parametrize(
-    "is_moe, is_mla, offload_modules",
+    "is_moe, is_mla, offload_modules, enable_attention_residuals, attn_res_impl",
     [
         # Dense GPT modules
-        (False, True, ["attn_norm"]),
-        (True, False, ["qkv_linear"]),
-        (True, False, ["core_attn"]),
+        (False, True, ["attn_norm"], False, "eager"),
+        (True, False, ["qkv_linear"], False, "eager"),
+        (True, False, ["core_attn"], False, "eager"),
         # # attn_proj depends on core_attn (validated in TransformerConfig.__post_init__)
-        (True, True, ["core_attn", "attn_proj"]),
-        (True, False, ["mlp_norm"]),
-        (True, False, ["expert_fc1"]),
-        (True, False, ["moe_act"]),
+        (True, True, ["core_attn", "attn_proj"], False, "eager"),
+        (True, False, ["mlp_norm"], False, "eager"),
+        (True, False, ["expert_fc1"], False, "eager"),
+        (True, False, ["moe_act"], False, "eager"),
+        # Attention Residuals with attention-scope activation offloading.
+        (False, False, ["qkv_linear"], True, "eager"),
+        (False, False, ["core_attn"], True, "eager"),
+        (False, False, ["qkv_linear", "core_attn", "attn_proj"], True, "eager"),
+        (False, False, ["qkv_linear", "core_attn", "attn_proj"], True, "compile"),
+        (False, False, ["qkv_linear", "core_attn", "attn_proj"], True, "fla"),
     ],
 )
 def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
-    is_moe: bool, is_mla: bool, offload_modules: List[str]
+    is_moe: bool,
+    is_mla: bool,
+    offload_modules: List[str],
+    enable_attention_residuals: bool,
+    attn_res_impl: str,
 ):
     """
     Initialize a GPTModel and verify:
@@ -228,6 +246,12 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
     - backward gradient correctness (subset)
     - peak GPU memory is reduced roughly as expected (based on recorded offload bytes)
     """
+    if attn_res_impl == "fla":
+        from megatron.core.transformer.attention_residual import _get_fla_fused_attnres
+
+        if _get_fla_fused_attnres() is None:
+            pytest.skip("FLA fused AttnRes is not installed")
+
     # setup distributed/model-parallel (same pattern as other UTs)
     os.environ.pop("NVTE_FUSED_ATTN", None)
     os.environ.pop("NVTE_FLASH_ATTN", None)
@@ -269,6 +293,8 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             offload_modules=None,
             min_offloaded_tensor_size=1024 * 1024,
             is_mla=is_mla,
+            enable_attention_residuals=enable_attention_residuals,
+            attn_res_impl=attn_res_impl,
         ).cuda()
         base_model.train()
         base_params = _capture_params(base_model)
@@ -306,6 +332,8 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             offload_modules=offload_modules,
             min_offloaded_tensor_size=1024,  # force offloading for UT determinism
             is_mla=is_mla,
+            enable_attention_residuals=enable_attention_residuals,
+            attn_res_impl=attn_res_impl,
         ).cuda()
         _restore_params(off_model, base_params)
         off_model.train()
@@ -326,6 +354,11 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         )
 
         mgr = PipelineOffloadManager.get_instance()
+        for module in offload_modules:
+            assert mgr.offload_summary_bytes.get(module, 0) > 0, (
+                f"Expected {module} to offload at least one activation, got "
+                f"{mgr.offload_summary_bytes.get(module, 0)} bytes"
+            )
         expected_offload_bytes = int(
             sum(mgr.offload_summary_bytes.get(k, 0) for k in offload_modules)
         )

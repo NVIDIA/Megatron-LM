@@ -47,6 +47,8 @@ from ..utils import (
 
 logger = logging.getLogger(__name__)
 
+_ATTN_RES_SUPPORTED_OFFLOAD_MODULES = frozenset({"qkv_linear", "core_attn", "attn_proj"})
+
 try:
     from packaging.version import Version as PkgVersion
 
@@ -1336,9 +1338,11 @@ class TransformerConfig(ModelParallelConfig):
     """Implementation of the AttnRes depth aggregation: 'eager' (a memory-lean custom autograd
     Function built from plain PyTorch ops) or 'compile' (a plain PyTorch forward wrapped in
     torch.compile, with AOTAutograd generating its backward and one specialization per depth
-    arity; falls back to the eager custom Function with a warning if compilation is unavailable).
-    The eager loop is CPU-dispatch-bound — measured ~3-4 ms of CPU wall per aggregation on GB200
-    at small hidden sizes — so 'compile' is strongly recommended for training runs."""
+    arity; falls back to the eager custom Function with a warning if compilation is unavailable),
+    or 'fla' (FLA's three-kernel fused training implementation with checkpoint_level=1; requires
+    flash-linear-attention). The eager loop is CPU-dispatch-bound — measured ~3-4 ms of CPU wall
+    per aggregation on GB200 at small hidden sizes — so 'fla' is recommended when the optional
+    dependency is installed, with 'compile' as the dependency-free optimized path."""
 
     hybrid_layer_pattern: Optional[str] = None
     """Unified hybrid layer pattern string (mirrors --hybrid-layer-pattern; populated
@@ -1563,12 +1567,14 @@ class TransformerConfig(ModelParallelConfig):
         uniform width plus a rank-local source cache — see
         attention_residual.AttnResStageSources), selective recompute of modules
         that live inside a sublayer (e.g. core_attn), MoE (incl. shared-expert
-        overlap), and MTP in the standard last-stage placement. Everything
-        rejected below either has no mechanism yet (CUDA graphs, full
-        recompute, EP-overlap fine-grained schedule, offloading, zero-layer
-        virtual chunks) or would silently bypass the AttnRes residual
-        interception (fused residual norms, fp32 residual connection) or the
-        static payload-width reasoning (variable sequence lengths).
+        overlap), attention-scope fine-grained activation offloading
+        (qkv_linear, core_attn, and attn_proj), and MTP in the standard
+        last-stage placement. Everything rejected below either has no mechanism
+        yet (CUDA graphs, full recompute, EP-overlap fine-grained schedule,
+        non-attention activation offloading, zero-layer virtual chunks) or
+        would silently bypass the AttnRes residual interception (fused residual
+        norms, fp32 residual connection) or the static payload-width reasoning
+        (variable sequence lengths).
         """
         if not self.enable_attention_residuals:
             if self.attn_res_block_layers is not None:
@@ -1589,9 +1595,10 @@ class TransformerConfig(ModelParallelConfig):
                 "enable_attention_residuals requires attn_res_block_layers to be a "
                 f"positive integer, got {self.attn_res_block_layers!r}."
             )
-        if self.attn_res_impl not in ("eager", "compile"):
+        if self.attn_res_impl not in ("eager", "compile", "fla"):
             raise ValueError(
-                f"attn_res_impl must be 'eager' or 'compile', got {self.attn_res_impl!r}."
+                "attn_res_impl must be 'eager', 'compile', or 'fla', "
+                f"got {self.attn_res_impl!r}."
             )
         unsupported = []
         if self.variable_seq_lengths:
@@ -1622,8 +1629,15 @@ class TransformerConfig(ModelParallelConfig):
             unsupported.append(
                 "cpu_offloading (depth sources outlive the per-layer lifetime model)"
             )
-        if self.offload_modules:
-            unsupported.append("fine-grained activation offloading (offload_modules)")
+        unsupported_offload_modules = set(self.offload_modules or ()) - (
+            _ATTN_RES_SUPPORTED_OFFLOAD_MODULES
+        )
+        if unsupported_offload_modules:
+            unsupported.append(
+                "fine-grained activation offloading for unsupported modules "
+                f"{sorted(unsupported_offload_modules)}; supported AttnRes offload modules are "
+                f"{sorted(_ATTN_RES_SUPPORTED_OFFLOAD_MODULES)}"
+            )
         if self.heterogeneous_block_specs:
             unsupported.append("heterogeneous_block_specs")
         if self.pipeline_model_parallel_layout is not None:
