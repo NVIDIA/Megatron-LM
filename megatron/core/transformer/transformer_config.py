@@ -1887,7 +1887,6 @@ class TransformerConfig(ModelParallelConfig):
             incompatible = {
                 "overlap_moe_expert_parallel_comm": self.overlap_moe_expert_parallel_comm,
                 "moe_shared_expert_overlap": self.moe_shared_expert_overlap,
-                "moe_paged_stash": self.moe_paged_stash,
                 "moe_latent_size": self.moe_latent_size is not None,
                 "overlap_dispatch_backward_with_experts_wgrad": (
                     self.overlap_dispatch_backward_with_experts_wgrad

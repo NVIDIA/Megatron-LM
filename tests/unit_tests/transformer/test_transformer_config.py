@@ -138,7 +138,6 @@ def test_fused_moe_mxfp8_enables_mxfp8_wire_dtypes():
         ({"moe_single_grouped_weight": False}, "moe_single_grouped_weight=True"),
         ({"bf16": False}, "bf16=True"),
         ({"moe_shared_expert_overlap": True}, "moe_shared_expert_overlap"),
-        ({"moe_paged_stash": True}, "moe_paged_stash"),
         ({"delay_wgrad_compute": True}, "delay_wgrad_compute"),
         ({"fp4": "nvfp4"}, "fp4 and fp8 cannot be used simultaneously"),
     ],
@@ -153,6 +152,12 @@ def test_fused_moe_config_accepts_cuda_graphs(cuda_graph_impl):
     config = _fused_moe_config(cuda_graph_impl=cuda_graph_impl)
 
     assert config.cuda_graph_impl == cuda_graph_impl
+
+
+def test_fused_moe_config_accepts_paged_stash():
+    config = _fused_moe_config(moe_paged_stash=True)
+
+    assert config.moe_paged_stash
 
 
 def test_mxfp8_wire_dtypes_accept_valid_ncclep_config():
