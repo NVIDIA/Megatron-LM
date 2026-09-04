@@ -505,6 +505,7 @@ class TestAuxLossFreeTop2Router:
         self.router = cast(Router, self.moe_layer.router)
         assert self.router.expert_bias is not None
         assert self.router.local_tokens_per_expert is not None
+        assert self.router.local_tokens_per_expert.dtype == torch.int64
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -534,6 +535,18 @@ class TestAuxLossFreeTop2Router:
 
         # Print some debug info
         print("Updated bias after first forward pass:", updated_bias)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_expert_bias_update_preserves_large_integer_count_ordering(self):
+        counts = torch.tensor([2**24 + 1, 2**24], dtype=torch.int64, device="cuda")
+        bias = torch.zeros(2, dtype=torch.float32, device="cuda")
+
+        updated_bias = get_updated_expert_bias(
+            counts, bias, self.router.config.moe_router_bias_update_rate
+        )
+
+        expected = torch.tensor([-0.1, 0.1], dtype=torch.float32, device="cuda")
+        torch.testing.assert_close(updated_bias, expected)
 
     @pytest.mark.internal
     @pytest.mark.skipif(
