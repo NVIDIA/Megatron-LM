@@ -16,9 +16,11 @@ from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
     get_deprecated_cuda_graph_modules_migration,
+    is_whole_moe_cuda_graph_scope,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
     validate_deprecated_cuda_graph_modules_migration_inputs,
+    validate_moe_cuda_graph_support,
 )
 from megatron.core.transformer.enums import (
     AttnBackend,
@@ -375,6 +377,18 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
+
+    dsa_indexer_weights_proj_use_quantization: bool = True
+    """Whether ``DSAIndexer`` weights projection follows the enclosing FP8/FP4
+    quantization context. Disable this to keep the projection parameter outside FP8/FP4;
+    ``dsa_indexer_weights_proj_output_dtype`` then controls its BF16 or FP32 output contract.
+    This option does not affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
+
+    dsa_indexer_weights_proj_output_dtype: Literal["bf16", "fp32"] = "bf16"
+    """Output dtype of the ``DSAIndexer`` weights projection. BF16 preserves the existing
+    path. FP32 uses a true FP32-output projection and is not compatible with the cuDNN DSA
+    backend. The final index scores remain FP32 independently of this option. This option does
+    not affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
 
     ####################
     # DeepSeek-v4 hybrid attention
@@ -807,6 +821,8 @@ class TransformerConfig(ModelParallelConfig):
     for each individual sample.
     - "global_aux_loss": Load balancing loss calculated at global batch level.
     - "sinkhorn": Balancing algorithm used in S-BASE.
+    - "quantile_balancing": Kimi K3 histogram Quantile Balancing. The histogram is accumulated
+    across the global batch and converted into the next-step per-expert routing bias.
     - "none": No load balancing.
     A list of strings can be provided to combine multiple aux-loss load balancing types.
     The default is "aux_loss".
@@ -879,6 +895,16 @@ class TransformerConfig(ModelParallelConfig):
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
 
+    moe_router_quantile_balancing_estimation_scope: Literal['global_batch'] = "global_batch"
+    """Population used to estimate the Quantile Balancing bias.
+
+    The ``dev`` implementation provides Kimi K3's ``global_batch`` histogram estimator. The
+    identically named option on ``main`` also accepts ``micro_batch`` for its older exact estimator.
+    """
+
+    moe_router_qb_num_bins: int = 1000
+    """Number of persistent uniform histogram bins per expert for global-batch QB."""
+
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
@@ -891,9 +917,10 @@ class TransformerConfig(ModelParallelConfig):
     This is an experimental feature for benchmarking purposes."""
 
     moe_n_hash_layers: int = 0
-    """Number of leading transformer layers that use hash-based MoE routing.
-    Layers with layer_number <= moe_n_hash_layers use a pre-computed tid2eid
-    lookup table for expert selection instead of learned top-k routing."""
+    """Number of leading layers that use hash-based MoE routing. Standard transformer
+    stacks compare this value with layer_number; hybrid stacks count only MoE positions
+    in the hybrid layer pattern. Hash layers use a pre-computed tid2eid lookup table for
+    expert selection instead of learned top-k routing."""
 
     actual_vocab_size: Optional[int] = None
     """Padded actual vocabulary size. Required when moe_n_hash_layers > 0 for the
@@ -1028,6 +1055,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_latent_size: Optional[int] = None
     """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
+
+    moe_latent_up_projection_rmsnorm: bool = False
+    """Apply RMSNorm immediately before the duplicated MoE latent up-projection."""
 
     moe_flex_dispatcher_num_sms: Optional[int] = None
     """Number of SMs for the flex token dispatcher's dispatch/combine communication, for all
@@ -1276,6 +1306,27 @@ class TransformerConfig(ModelParallelConfig):
 
     If ``None``, all local layers in the transformer block share one recompute group. The value must
     be a positive integer when set.
+    """
+
+    mhc_recompute_attn_cuda_graph_split: bool = False
+    """Opt into the attention-only Transformer Engine CUDA Graph split for mHC recompute.
+
+    Off by default, in which case an mHC layer captures the same range as any other layer --
+    the whole ``_forward_attention``, mHC aggregate and post-processing included. The MLP-side
+    mHC recompute group then works as it does without CUDA graphs; checkpoints inside the
+    captured attention range are inert, as for any checkpoint a graph captures.
+
+    When set, the captured callable shrinks to input-layernorm plus self-attention, leaving the
+    mHC producer and post-processing eager so their per-microbatch checkpoint registration is
+    not swallowed by the capture. The eager producer then writes its aggregate directly into
+    the graph's captured input buffer through ``MHCRecomputeArena``, so forward and recompute
+    land at the same fixed address.
+
+    This buys the aggregate checkpoint's activation back -- one ``[s, b, C]`` per layer in the
+    recompute group -- at the cost of a smaller captured region. The rest of the mHC recompute
+    group is outside the attention graph either way and is unaffected. The split additionally
+    constrains the configuration (see ``__post_init__``), which is why it is opt-in rather than
+    implied by ``recompute_modules=[mhc]``.
     """
 
     ####################
@@ -1702,6 +1753,30 @@ class TransformerConfig(ModelParallelConfig):
                 )
                 self.dsa_kernel_backend = legacy_backend
 
+        if self.dsa_indexer_weights_proj_output_dtype not in ("bf16", "fp32"):
+            raise ValueError(
+                "dsa_indexer_weights_proj_output_dtype must be either 'bf16' or 'fp32', got "
+                f"{self.dsa_indexer_weights_proj_output_dtype!r}."
+            )
+        if (
+            self.dsa_indexer_weights_proj_use_quantization
+            and self.dsa_indexer_weights_proj_output_dtype == "fp32"
+        ):
+            raise ValueError(
+                "dsa_indexer_weights_proj_output_dtype='fp32' requires "
+                "dsa_indexer_weights_proj_use_quantization=False because quantized "
+                "TELinear does not guarantee a true-FP32 output for this projection."
+            )
+        if (
+            self.dsa_indexer_weights_proj_output_dtype == "fp32"
+            and self.dsa_kernel_backend == "cudnn"
+        ):
+            raise ValueError(
+                "dsa_indexer_weights_proj_output_dtype='fp32' is not supported by "
+                "dsa_kernel_backend='cudnn', which requires a BF16 indexer weights tensor. "
+                "Use dsa_kernel_backend='tilelang' or 'none'."
+            )
+
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if not self.is_hybrid_model:
                 assert (
@@ -1799,7 +1874,6 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
-            assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
             if self.context_parallel_size > 1:
                 cp_comm_types = (
                     self.cp_comm_type
@@ -2036,6 +2110,9 @@ class TransformerConfig(ModelParallelConfig):
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
 
+        if self.moe_latent_up_projection_rmsnorm and self.moe_latent_size is None:
+            raise ValueError("moe_latent_up_projection_rmsnorm requires moe_latent_size to be set.")
+
         if self.num_moe_experts is not None and self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size
             warnings.warn("moe_ffn_hidden_size is not set, using ffn_hidden_size instead.")
@@ -2163,6 +2240,16 @@ class TransformerConfig(ModelParallelConfig):
                     f"moe_shared_expert_overlap only works with alltoall or flex token dispatcher."
                 )
 
+        if self.moe_router_load_balancing_type == ["quantile_balancing"]:
+            assert (
+                isinstance(self.moe_aux_loss_coeff, list) and len(self.moe_aux_loss_coeff) == 1
+            ), (
+                "moe_aux_loss_coeff must be a list of the same length as "
+                "moe_router_load_balancing_type"
+            )
+            self.moe_router_load_balancing_type = "quantile_balancing"
+            self.moe_aux_loss_coeff = self.moe_aux_loss_coeff[0]
+
         if isinstance(self.moe_router_load_balancing_type, list):
             assert isinstance(self.moe_aux_loss_coeff, list) and len(
                 self.moe_aux_loss_coeff
@@ -2170,6 +2257,54 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_aux_loss_coeff must be a list of the same length as "
                 "moe_router_load_balancing_type"
             )
+
+        if (
+            isinstance(self.moe_router_load_balancing_type, list)
+            and "quantile_balancing" in self.moe_router_load_balancing_type
+        ):
+            raise ValueError("quantile_balancing must be the sole moe_router_load_balancing_type.")
+        if self.moe_router_load_balancing_type == "quantile_balancing":
+            aux_coeffs = (
+                self.moe_aux_loss_coeff
+                if isinstance(self.moe_aux_loss_coeff, list)
+                else [self.moe_aux_loss_coeff]
+            )
+            if any(float(coeff) != 0.0 for coeff in aux_coeffs):
+                raise ValueError(
+                    "quantile_balancing requires moe_aux_loss_coeff=0 because it replaces "
+                    "the auxiliary load-balancing loss."
+                )
+            if self.moe_router_quantile_balancing_estimation_scope != "global_batch":
+                raise ValueError(
+                    "Megatron-LM dev supports only "
+                    "moe_router_quantile_balancing_estimation_scope='global_batch'."
+                )
+            if self.moe_router_score_function != "sigmoid":
+                raise ValueError("quantile_balancing requires moe_router_score_function='sigmoid'.")
+            if self.moe_router_pre_softmax:
+                raise ValueError("quantile_balancing does not use pre-softmax routing.")
+            if self.moe_router_enable_expert_bias:
+                raise ValueError(
+                    "quantile_balancing selects the expert-bias update rule; do not also enable "
+                    "the DeepSeek-style moe_router_enable_expert_bias."
+                )
+            if self.moe_router_num_groups is not None or self.moe_router_group_topk is not None:
+                raise ValueError("quantile_balancing does not support group-limited routing.")
+            if self.moe_enable_routing_replay:
+                raise ValueError("quantile_balancing does not support routing replay.")
+            if self.moe_expert_capacity_factor is not None and self.moe_expert_capacity_factor >= 0:
+                raise ValueError("quantile_balancing does not support per-expert token dropping.")
+            if self.moe_expert_rank_capacity_factor is not None and not self.moe_paged_stash:
+                raise ValueError(
+                    "quantile_balancing with expert-rank capacity requires moe_paged_stash "
+                    "so an over-budget attempt can be retried without token dropping."
+                )
+            if self.num_moe_experts is None or not 0 < self.moe_router_topk < self.num_moe_experts:
+                raise ValueError(
+                    "quantile_balancing requires 0 < moe_router_topk < num_moe_experts."
+                )
+            if self.moe_router_qb_num_bins <= 1:
+                raise ValueError("moe_router_qb_num_bins must be greater than one.")
 
         if self.moe_expert_capacity_factor is not None:
             if self.moe_expert_capacity_factor < 0:
@@ -2191,7 +2326,10 @@ class TransformerConfig(ModelParallelConfig):
                 "seq_aux_loss",
                 "global_aux_loss",
                 "none",
-            ]:
+            ] and not (
+                self.moe_router_load_balancing_type == "quantile_balancing"
+                and self.moe_expert_capacity_factor is None
+            ):
                 raise ValueError(
                     "moe_expert_capacity_factor only works with aux_loss, "
                     "seq_aux_loss, global_aux_loss or none load balancing"
@@ -2430,50 +2568,16 @@ class TransformerConfig(ModelParallelConfig):
         # enable_cuda_graph/external_cuda_graph migration, so that string module
         # forms and legacy flags reach the same gate.
 
-        # The attention-only Transformer Engine split keeps the mHC producer and
-        # its checkpoint registration eager per microbatch (only input-layernorm
-        # + self-attention are captured), so it composes with EP a2a overlap:
-        # the captured attention backward reads the fixed arena slot that the
-        # group-end recompute node repopulates by direct kernel output.
-        # Full-iteration capture is also valid because it records the explicit
-        # schedule barrier and its fixed-address recompute kernels as part of
-        # the iteration graph. Other per-layer graph forms remain rejected.
-        # Normalize locally: cuda_graph_modules is only normalized in bulk further
-        # down in __post_init__, so a config built directly (rather than through
-        # megatron/training/arguments.py) still holds string forms like ["attn"]
-        # here. Comparing them raw would reject a combination the later gate
-        # accepts, and the string form is part of this field's declared type.
-        normalized_graph_modules, _, _ = normalize_cuda_graph_modules(self.cuda_graph_modules)
-        is_te_attn_split = (
-            self.cuda_graph_impl == "transformer_engine"
-            and not self.enable_cuda_graph
-            and not self.external_cuda_graph
-            and list(normalized_graph_modules or []) == [CudaGraphModule.attn]
-            and list(self.recompute_modules) == ["mhc"]
-        )
-        is_full_iteration = (
-            self.cuda_graph_impl == "full_iteration"
-            and not self.enable_cuda_graph
-            and not self.external_cuda_graph
-        )
-        if (
-            self.overlap_moe_expert_parallel_comm
-            and use_mhc_recompute
-            and not is_te_attn_split
-            and not is_full_iteration
-            and (
-                self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
-            )
-        ):
-            raise ValueError(
-                "mHC recompute with overlap_moe_expert_parallel_comm requires CUDA graphs "
-                "to be disabled, except for the attention-only Transformer Engine split "
-                "(cuda_graph_impl='transformer_engine', cuda_graph_modules=[attn], "
-                "recompute_modules=[mhc]) or full-iteration capture "
-                "(cuda_graph_impl='full_iteration', hidden_dropout=0, "
-                "attention_dropout=0), because other graph scopes cannot represent the "
-                "explicit schedule-owned recompute barrier."
-            )
+        # There is deliberately no mHC-recompute/EP-overlap/CUDA-graph gate here.
+        # #5841 inherited one asserting that "explicit group replay is eager-only",
+        # then exempted the shapes it had validated. Measured on 4xGB200 against the
+        # pre-#5841 tree with that check patched out, EP overlap plus an attn-scope
+        # TE graph plus mHC recompute trains cleanly over 15 iterations, with and
+        # without VPP (grad norms 4.5-6.7; loss 11.962 -> 11.850 on the PP1 run and
+        # 11.964 -> 11.838 on the PP2/VPP2 run). The assertion
+        # was false, so the exemptions it needed are gone with it. What the split
+        # itself requires is checked further down, under
+        # mhc_recompute_attn_cuda_graph_split.
 
         if self.enable_hyper_connections and not use_mhc_recompute:
             warnings.warn(
@@ -3183,93 +3287,166 @@ class TransformerConfig(ModelParallelConfig):
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
 
-        # mHC selective recompute couples with CUDA graphs only through the guarded
-        # attention-only Transformer Engine split. This gate must stay below the
-        # cuda_graph_modules normalization and the deprecated flag migration above:
+        # mHC selective recompute composes with CUDA graphs on two paths: the
+        # opt-in attention-only split, and whole-range capture for everything
+        # else. This gate must stay below the cuda_graph_modules normalization
+        # and the deprecated flag migration above:
         # earlier placement would compare unnormalized string module forms and let
         # enable_cuda_graph/external_cuda_graph bypass the gate entirely.
-        if use_mhc_recompute and self.cuda_graph_impl != "none":
-            if self.cuda_graph_impl == "local":
-                # Intentionally fail-closed even for inference-only local-graph
-                # configs that carry leftover training recompute args: mHC
-                # recompute is inert outside training, but silently accepting
-                # the combination would mask misconfigured training runs.
+        # Two things about mHC recompute depend on CUDA graphs regardless of the
+        # split, and both are wrong-result mechanisms rather than lost savings, so
+        # they fail closed whether or not the split is on.
+        #
+        # full_iteration with dropout: RNG state cannot be rewound inside stream
+        # capture, so a captured recompute replays a different dropout mask than
+        # its forward.
+        if (
+            use_mhc_recompute
+            and self.cuda_graph_impl == "full_iteration"
+            and (self.hidden_dropout != 0.0 or self.attention_dropout != 0.0)
+        ):
+            raise ValueError(
+                "mHC recompute with cuda_graph_impl='full_iteration' requires "
+                "hidden_dropout=0 and attention_dropout=0: RNG state cannot be "
+                "rewound inside CUDA graph capture, so a captured recompute "
+                "would replay a different dropout mask than its forward pass."
+            )
+
+        # local per-layer capture: CheckpointWithoutOutput.checkpoint() bypasses
+        # only under is_graph_warmup(), not is_graph_capturing(), so the local
+        # implementation records the checkpoint bodies and their registration into
+        # the layer graph. Replays run no Python, so nothing re-registers while the
+        # group-end discard still runs eagerly -- and the local backward graph
+        # captures torch.autograd.grad, so a recompute hook recorded there fires
+        # under stream capture, where the RNG rewind either raises (cloned
+        # snapshot) or silently replays a different dropout mask (live snapshot).
+        # That is the same failure full_iteration fails closed on above. Nothing is
+        # forfeited by rejecting: a captured checkpoint recovers no memory either
+        # way, so this combination has no upside to preserve.
+        if use_mhc_recompute and self.cuda_graph_impl == "local":
+            raise ValueError(
+                "mHC recompute is not supported with cuda_graph_impl='local': the "
+                "local per-layer capture records the mHC checkpoints and their "
+                "recompute hooks into the layer graphs, where the backward-time "
+                "RNG rewind cannot run. Use cuda_graph_impl='transformer_engine', "
+                "cuda_graph_impl='full_iteration' with dropout disabled, or "
+                "disable CUDA graphs."
+            )
+
+        # Everything else #5841 gated is a property of the attention-only split, so
+        # it is checked only when the split is asked for. With the switch off an mHC
+        # layer captures the same range as any other layer and behaves as it did
+        # before the split existed -- the configurations that reaches were running
+        # then, and rejecting them was the regression this PR undoes.
+        if (
+            use_mhc_recompute
+            and not self.mhc_recompute_attn_cuda_graph_split
+            and not self.is_hybrid_model  # hybrid cannot take the switch this
+            # message recommends (rejected above); hybrid_block emits its own
+            # capture-scope warning instead
+            and self.cuda_graph_impl == "transformer_engine"
+            and list(self.cuda_graph_modules or []) == [CudaGraphModule.attn]
+            and list(self.recompute_modules) == ["mhc"]
+        ):
+            # Exactly the shape that ran the #5841 split implicitly: such configs
+            # hit this branch when they omit the new switch, and whole-attention
+            # capture -- while correct -- is not equivalent: the mHC producer is
+            # captured (its checkpoint no longer pays) and the static hidden input
+            # grows from [s, b, C] to [s, b, n*C]. Say so once at config time,
+            # since the alternative is a silent memory regression relative to the
+            # split. Deliberately narrow: broader attn-containing shapes (extra
+            # graph scopes, extra recompute modules) never ran the split, and the
+            # switch this message recommends is rejected for them.
+            warnings.warn(
+                "mHC recompute with an attn-scope Transformer Engine CUDA Graph is "
+                "capturing the whole attention range: the captured mHC producer's "
+                "checkpoint is not recovered and the static graph input is "
+                "[s, b, n*C]. Set mhc_recompute_attn_cuda_graph_split=True for the "
+                "attention-only split, which keeps the producer eager and shrinks "
+                "the captured input to [s, b, C]. (The split's replay does not yet "
+                "forward THD captured kwargs; on packed sequences keep the switch "
+                "off.)",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        if self.mhc_recompute_attn_cuda_graph_split and not use_mhc_recompute:
+            # The split exists to keep the eager mHC recompute producer outside the
+            # captured consumer; without mHC recompute there is nothing to split
+            # and the flag changes nothing. Warn rather than reject so a config
+            # that toggles recompute off for an ablation does not have to also
+            # remember this flag.
+            warnings.warn(
+                "mhc_recompute_attn_cuda_graph_split has no effect without mHC "
+                "selective recompute (recompute_granularity='selective' with 'mhc' "
+                "in recompute_modules).",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        if use_mhc_recompute and self.mhc_recompute_attn_cuda_graph_split:
+            if self.is_hybrid_model:
                 raise ValueError(
-                    "mHC recompute is not supported with cuda_graph_impl='local': "
-                    "eager mHC recompute and its per-microbatch checkpoint "
-                    "registration need host execution between captured segments, "
-                    "which the local per-layer implementation does not provide. Use "
-                    "cuda_graph_impl='transformer_engine' with "
-                    "cuda_graph_modules=['attn'], cuda_graph_impl='full_iteration' "
-                    "with dropout disabled, or disable CUDA graphs."
+                    "mhc_recompute_attn_cuda_graph_split is not implemented for "
+                    "HybridStack mHC layers: HyperConnectionHybridLayer always "
+                    "captures the whole wrapper (mHC aggregate included) with an "
+                    "[s, b, n*C] static input and has no attention-consumer split "
+                    "path, so the switch would silently change nothing while the "
+                    "config claims the split is on. Keep the switch off for "
+                    "hybrid models."
                 )
-            if self.cuda_graph_impl == "full_iteration":
-                # Full-iteration capture records the whole eager iteration —
-                # including mHC checkpoint registration, recompute kernels, and
-                # storage rebinding — into one graph, so replays re-execute the
-                # recompute at fixed addresses by construction (no partial-graph
-                # bridge involved). The one mechanical hazard is RNG-consuming
-                # ops inside a checkpointed region: the recompute-time RNG rewind
-                # cannot run under stream capture, so a captured recompute would
-                # replay a different dropout mask than its captured forward.
-                if self.hidden_dropout != 0.0 or self.attention_dropout != 0.0:
-                    raise ValueError(
-                        "mHC recompute with cuda_graph_impl='full_iteration' requires "
-                        "hidden_dropout=0 and attention_dropout=0: RNG state cannot be "
-                        "rewound inside CUDA graph capture, so a captured recompute "
-                        "would replay a different dropout mask than its forward pass."
-                    )
-            elif list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
+            if self.cuda_graph_impl != "transformer_engine":
+                raise ValueError(
+                    "mhc_recompute_attn_cuda_graph_split requires "
+                    f"cuda_graph_impl='transformer_engine', got "
+                    f"{self.cuda_graph_impl!r}: the split is a Transformer Engine "
+                    "per-layer capture."
+                )
+            if list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
                 self.recompute_modules
             ) != ["mhc"]:
                 raise ValueError(
-                    "mHC recompute with Transformer Engine CUDA Graphs currently supports "
-                    "only the initial attention-only split: cuda_graph_modules=[attn] and "
-                    "recompute_modules=[mhc]. The eager mHC producer must remain outside "
-                    "the captured consumer."
+                    "mhc_recompute_attn_cuda_graph_split requires "
+                    "cuda_graph_modules=[attn] with recompute_modules=[mhc]: the split "
+                    "captures input-layernorm plus self-attention only, so the eager mHC "
+                    "producer stays outside the captured consumer. Clear "
+                    "mhc_recompute_attn_cuda_graph_split to capture the whole attention "
+                    "range instead."
                 )
-            if (
-                self.cuda_graph_impl == "transformer_engine"
-                and self.fine_grained_activation_offloading
-            ):
+            if self.sequence_packing_scheduler is not None:
+                raise ValueError(
+                    "mhc_recompute_attn_cuda_graph_split does not support packed "
+                    "(THD) sequences: THD capture takes cu_seqlens_*/padding_mask "
+                    "as captured kwargs and the split's replay does not forward "
+                    "them, so the first replay fails at the Transformer Engine "
+                    "boundary. Keep the switch off on packed-sequence runs to "
+                    "capture the whole attention range instead."
+                )
+            if self.fine_grained_activation_offloading:
                 # HyperConnectionTransformerLayer._te_cuda_graph_capture replaces
-                # TransformerLayer's implementation rather than extending it, so it
-                # never plants the offload synchronization edges the full-layer
+                # TransformerLayer's implementation for the split rather than extending
+                # it, so it never plants the offload synchronization edges the full-layer
                 # capture plants -- backward_record() on the graph input and
-                # forward_record() after capture. _set_offload_modules plants those
-                # exactly for the attention-scope modules under an attn-scope graph,
-                # so without them the offload copies race the captured attention.
+                # forward_record() after capture. _set_offload_modules turns on
+                # offload_module_in_cuda_graph for exactly these modules without
+                # consulting the split predicate, so replay still hands TE the offload
+                # stream and event while capture planted no edges, and the copies race
+                # the captured attention. The failure is silent activation corruption,
+                # so fail closed. Without the split the override falls through to the
+                # parent, which does plant them -- hence this lives under the switch.
+                # (The replay half of the same gap is fixed rather than rejected: see
+                # _replay_mhc_attention_consumer.)
                 attn_scope_offload = {"qkv_linear", "core_attn", "attn_proj"} & set(
                     self.offload_modules or []
                 )
                 if attn_scope_offload:
                     raise ValueError(
-                        f"mHC recompute with attention-only TE CUDA Graphs is incompatible "
-                        f"with offload_modules {sorted(attn_scope_offload)}. The split "
-                        f"capture path omits the offload stream synchronization the "
-                        f"full-layer capture path performs, so the offload copies can race "
-                        f"the captured attention. Remove {sorted(attn_scope_offload)} from "
-                        f"offload_modules, or drop 'attn' from cuda_graph_modules."
-                    )
-                # The replay half of the same gap is fixed, not rejected: see
-                # _replay_mhc_attention_consumer.
-            if self.virtual_pipeline_model_parallel_size is not None:
-                # VPP is admitted only together with EP overlap. Interleaving used
-                # to diverge here (grad norms ~1e8 from the first iteration) on a
-                # caching-allocator use-after-free: mHC post-processing ran inside
-                # the communication-stream combine node, so the recompute subgraph
-                # was allocated on the compute stream and read from another, a
-                # window the allocator cannot track. The fix -- the post node owning
-                # a compute-stream schedule node -- lives in the overlap schedule,
-                # so the non-overlap VPP path has never carried it and stays
-                # unvalidated. StaticBufferLoader itself is VPP-safe, since only the
-                # pre_process chunk carries a data iterator.
-                if not self.overlap_moe_expert_parallel_comm:
-                    raise ValueError(
-                        "mHC recompute supports interleaved pipeline (VPP) "
-                        "schedules only together with "
-                        "overlap_moe_expert_parallel_comm: the non-overlap VPP "
-                        "path is unvalidated."
+                        f"mhc_recompute_attn_cuda_graph_split is incompatible with "
+                        f"offload_modules {sorted(attn_scope_offload)}: the split capture "
+                        f"path omits the offload stream synchronization the full-layer "
+                        f"capture path performs, so the offload copies can race the "
+                        f"captured attention. Drop {sorted(attn_scope_offload)} from "
+                        f"offload_modules, or clear mhc_recompute_attn_cuda_graph_split."
                     )
 
         cuda_graph_captures_attention = self.cuda_graph_impl == "full_iteration" or (
@@ -3345,9 +3522,8 @@ class TransformerConfig(ModelParallelConfig):
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
                     ):
-                        assert (
-                            CudaGraphModule.moe not in self.cuda_graph_modules
-                        ), 'moe cuda graph is only supported with drop-padding MoE.'
+                        if CudaGraphModule.moe in self.cuda_graph_modules:
+                            validate_moe_cuda_graph_support(self)
                         if self.moe_token_dispatcher_type == 'alltoall' and (
                             self.moe_expert_capacity_factor is not None
                             or self.moe_router_padding_for_fp8
@@ -3356,6 +3532,27 @@ class TransformerConfig(ModelParallelConfig):
                                 'moe_preprocess cuda graph is not supported when there are '
                                 'DtoH copies and synchronizations in the preprocess step.'
                             )
+
+            te_whole_moe_paged_stash = (
+                self.cuda_graph_impl == "transformer_engine"
+                and is_whole_moe_cuda_graph_scope(self.cuda_graph_modules)
+                and self.moe_paged_stash
+            )
+            if te_whole_moe_paged_stash:
+                if not is_te_min_version("2.19.0"):
+                    raise ValueError(
+                        "Transformer Engine whole-MoE CUDA graphs with paged stash require "
+                        f"Transformer Engine >= 2.19.0, but found {get_te_version()}."
+                    )
+                assert not self.cuda_graph_dynamic_microbatches, (
+                    "Transformer Engine whole-MoE CUDA graphs with paged stash require a fixed "
+                    "runtime microbatch schedule; cuda_graph_dynamic_microbatches is not "
+                    "supported."
+                )
+                assert self.cuda_graph_warmup_steps >= 2, (
+                    "Transformer Engine whole-MoE CUDA graphs with paged stash require at least "
+                    "2 cuda_graph_warmup_steps to record the pipeline schedule before capture."
+                )
 
             if self.recompute_granularity:
                 if self.recompute_granularity != "selective":
@@ -3594,13 +3791,19 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.cuda_graph_impl != "none":
                 if self.cuda_graph_impl == "transformer_engine":
+                    # Empty cuda_graph_modules means whole-layer capture, which
+                    # covers the MoE/MLP part just like an explicit moe/mlp
+                    # scope does, so it must be rejected here too — the replay
+                    # asserts the same condition at runtime.
                     assert (
-                        self.cuda_graph_impl == "transformer_engine"
+                        self.cuda_graph_modules
                         and CudaGraphModule.moe not in self.cuda_graph_modules
                         and CudaGraphModule.mlp not in self.cuda_graph_modules
                     ), (
-                        'CUDA graph scope on moe and mlp is not '
-                        'supported with overlap_moe_expert_parallel_comm'
+                        'CUDA graph capture covering the MoE/MLP part (scope moe '
+                        'or mlp, or empty cuda_graph_modules meaning whole-layer '
+                        'capture) is not supported with '
+                        'overlap_moe_expert_parallel_comm'
                     )
 
         # Check delay_wgrad_compute compatibility
@@ -3827,6 +4030,10 @@ class MLATransformerConfig(TransformerConfig):
     """Rank of Key and Value tensors' low rank representation.
        This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
 
+    attention_latent_norm_epsilon: float | None = None
+    """Epsilon for the primary query and key-value latent norms in attention.
+       If unset, inherit ``layernorm_epsilon`` for backward compatibility."""
+
     qk_head_dim: int = 128
     """Dimension of the head in the QK projection. q_head_dim = qk_head_dim + qk_pos_emb_head_dim
        This is not used for DSv4 Hybrid Attention and will be overridden automatically."""
@@ -3885,13 +4092,8 @@ class MLATransformerConfig(TransformerConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        if (
-            self.multi_latent_attention
-            and self.apply_rope_fusion
-            and self.rope_type != "yarn"
-            and self.experimental_attention_variant != "dsv4_hybrid"
-        ):
-            raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
+        if self.attention_latent_norm_epsilon is None:
+            self.attention_latent_norm_epsilon = self.layernorm_epsilon
 
         if self.attention_output_gate and self.mla_down_proj_fusion:
             # Fused MLA hides the post-input-LayerNorm activation inside the fused

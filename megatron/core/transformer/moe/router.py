@@ -52,6 +52,7 @@ class Router(ABC, MegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
         layer_number: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
     ) -> None:
         """
         Initialize the Router module.
@@ -60,6 +61,8 @@ class Router(ABC, MegatronModule):
             config (TransformerConfig): Configuration object for the Transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
             is_mtp_layer (bool): Flag indicating if this router is part of an MTP layer.
+            hash_moe_layer_threshold (int, optional): Explicit layer-number threshold for
+                hash routing. When omitted, use config.moe_n_hash_layers.
         """
         super().__init__(config)
         self.config = config
@@ -67,6 +70,11 @@ class Router(ABC, MegatronModule):
         self.moe_aux_loss_func = None
         self.layer_number = layer_number
         self.is_mtp_layer = is_mtp_layer
+        self.hash_moe_layer_threshold = (
+            self.config.moe_n_hash_layers
+            if hash_moe_layer_threshold is None
+            else hash_moe_layer_threshold
+        )
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
@@ -176,6 +184,7 @@ class TopKRouter(Router):
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
         layer_number: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
     ) -> None:
         """Initialize the zero token dropping router.
 
@@ -183,12 +192,15 @@ class TopKRouter(Router):
             config (TransformerConfig): The configuration for the transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
             is_mtp_layer (bool): Flag indicating if this router is part of an MTP layer.
+            hash_moe_layer_threshold (int, optional): Explicit layer-number threshold for
+                hash routing. Hybrid models use this to translate a MoE-position count.
         """
         super().__init__(
             config=config,
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
             layer_number=layer_number,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
         )
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
@@ -197,12 +209,12 @@ class TopKRouter(Router):
         self.mtp_layer_number: Optional[int] = None
         self.frozen_expert_bias = False
 
-        if self.config.moe_n_hash_layers > 0:
+        if self.hash_moe_layer_threshold > 0:
             assert layer_number is not None, "layer_number is required for the hash-based router."
         self.is_hash_layer = (
             not self.is_mtp_layer
-            and self.config.moe_n_hash_layers > 0
-            and layer_number <= self.config.moe_n_hash_layers
+            and self.hash_moe_layer_threshold > 0
+            and layer_number <= self.hash_moe_layer_threshold
         )
         if self.is_hash_layer:
             # DSv4-Pro ships a pre-trained tid2eid table in its inference checkpoint;
@@ -218,6 +230,9 @@ class TopKRouter(Router):
         else:
             self.tid2eid = None
 
+        self.use_quantile_balancing = (
+            self.routing_type == "quantile_balancing" and not self.is_hash_layer
+        )
         self.enable_expert_bias = (
             self.config.moe_router_enable_expert_bias and not self.is_hash_layer
         )
@@ -231,6 +246,10 @@ class TopKRouter(Router):
                 ),
                 persistent=False,
             )
+        else:
+            self.local_tokens_per_expert = None
+
+        if self.enable_expert_bias or self.use_quantile_balancing:
             self.register_buffer(
                 'expert_bias',
                 torch.zeros(
@@ -240,8 +259,26 @@ class TopKRouter(Router):
                 ),
             )
         else:
-            self.local_tokens_per_expert = None
             self.expert_bias = None
+
+        if self.use_quantile_balancing:
+            self.register_buffer(
+                'qb_histogram',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    self.config.moe_router_qb_num_bins,
+                    dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'qb_bin_bounds',
+                torch.tensor([-1.0, 1.0], dtype=torch.float32, device=torch.cuda.current_device()),
+            )
+        else:
+            self.qb_histogram = None
+            self.qb_bin_bounds = None
 
         # Initialize global tokens per expert for global aux loss
         if self.get_aux_loss_coeff("global_aux_loss") > 0:
@@ -277,6 +314,9 @@ class TopKRouter(Router):
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+        if hasattr(self, 'qb_bin_bounds') and self.qb_bin_bounds is not None:
+            if self.qb_bin_bounds.dtype != torch.float32:
+                self.qb_bin_bounds.data = self.qb_bin_bounds.data.to(torch.float32)
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -810,6 +850,19 @@ class TopKRouter(Router):
         elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         else:
+            # Activation checkpointing runs the original forward under no-grad and its
+            # recompute under enable-grad, so this gate records each token exactly once.
+            accumulate_qb_histogram = (
+                self.use_quantile_balancing
+                and self.training
+                and torch.is_grad_enabled()
+                and not self.frozen_expert_bias
+            )
+            if accumulate_qb_histogram and padding_mask is not None:
+                raise RuntimeError(
+                    "Quantile Balancing does not yet support padding masks because the "
+                    "histogram APIs do not accept a valid-token mask."
+                )
             probs, routing_map = topk_routing_with_score_function(
                 logits,
                 self.topk,
@@ -821,6 +874,8 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
+                qb_histogram=self.qb_histogram if accumulate_qb_histogram else None,
+                qb_bin_bounds=self.qb_bin_bounds if accumulate_qb_histogram else None,
             )
 
         # Dropless HybridEP consumes the sparse routing map directly, so exclude padding
@@ -964,6 +1019,7 @@ class InferenceTopKRouter(TopKRouter):
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
         layer_number: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
     ) -> None:
         """Initialize the specialized inference top-k router.
 
@@ -986,6 +1042,7 @@ class InferenceTopKRouter(TopKRouter):
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
             layer_number=layer_number,
+            hash_moe_layer_threshold=hash_moe_layer_threshold,
         )
 
     @staticmethod

@@ -60,6 +60,17 @@ except ImportError as import_megatron_fsdp_error:
 logger = logging.getLogger(__name__)
 
 
+def _get_default_fsdp_unit_modules(overlap_moe_expert_parallel_comm: bool) -> List[torch.nn.Module]:
+    fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+
+    if overlap_moe_expert_parallel_comm:
+        return fsdp_unit_modules
+
+    from megatron.core.models.bagel.transformer_mot_layer import MoTTransformerLayer
+
+    return [*fsdp_unit_modules, MoTTransformerLayer]
+
+
 class FullyShardedDataParallel(_BaseDataParallel):
     """
     Fully Sharded Data Parallel (FSDP) wrapper for the Megatron model.
@@ -97,6 +108,16 @@ class FullyShardedDataParallel(_BaseDataParallel):
         config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> Tuple[Type[nn.Module], ...]:
         """Module classes needing ``parameters(recurse=True)`` for fine-grained hooks."""
+        recurse_types: List[Type[nn.Module]] = []
+
+        if config.dsa_indexer_weights_proj_output_dtype == "fp32":
+            # DSAttention calls DSAIndexer.forward_before_topk directly, bypassing the indexer's
+            # module hooks and the weights projection's module call. Gather its nested parameters
+            # at the DSAttention boundary for both forward and backward.
+            from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+
+            recurse_types.append(DSAttention)
+
         if (
             config.overlap_moe_expert_parallel_comm
             and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
@@ -105,8 +126,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
             from megatron.core.transformer.moe.experts import TEGroupedMLP
             from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 
-            return (TEGroupedMLP, SharedExpertMLP)
-        return ()
+            recurse_types.extend((TEGroupedMLP, SharedExpertMLP))
+        return tuple(recurse_types)
 
     def __init__(
         self,
@@ -160,7 +181,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
             if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                self.fsdp_unit_modules = [TransformerLayer, MoETransformerLayer, MambaLayer]
+                self.fsdp_unit_modules = _get_default_fsdp_unit_modules(
+                    config.overlap_moe_expert_parallel_comm
+                )
             else:
                 self.fsdp_unit_modules = []
 

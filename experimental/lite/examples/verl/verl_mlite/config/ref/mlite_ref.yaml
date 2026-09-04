@@ -39,3 +39,6 @@ engine:
   param_offload: ${oc.select:actor_rollout_ref.ref.param_offload,True}
   impl_cfg:
     use_thd: ${oc.select:actor_rollout_ref.actor.engine.impl_cfg.use_thd,true}
+    # Runtime plugins may change process-group initialization. A colocated ref
+    # must use the actor's exact plugin settings rather than building another mesh.
+    runtime_plugins: ${oc.select:actor_rollout_ref.actor.engine.impl_cfg.runtime_plugins,{}}

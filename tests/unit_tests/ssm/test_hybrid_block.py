@@ -1,11 +1,23 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from copy import deepcopy
+
 import pytest
 import torch
 
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelLinear,
+    TEDotProductAttention,
+    TENorm,
+)
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HyperConnectionHybridLayer
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import (
+    HybridModel,
+    _get_hash_moe_layer_threshold,
+    _validate_hash_moe_pipeline_placement,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, GatedDeltaNet, KimiDeltaAttention
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -17,9 +29,16 @@ from megatron.core.transformer.experimental_attention_variant.absorbed_mla impor
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.mlp import MLP
+from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize("n_hash_layers", [-3, -1, 0])
+def test_non_positive_hash_moe_count_has_disabled_threshold(n_hash_layers):
+    """Non-positive hash-MoE counts normalize to the disabled threshold."""
+    assert _get_hash_moe_layer_threshold(Symbols.MOE, n_hash_layers) == 0
 
 
 @pytest.mark.internal
@@ -30,7 +49,37 @@ class TestHybridBlock:
         model_parallel_cuda_manual_seed(123)
 
     def get_pg_collection(self):
-        return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+        return ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=[
+                'tp',
+                'pp',
+                'embd',
+                'cp',
+                'dp_cp',
+                'ep',
+                'expt_tp',
+                'expt_dp',
+                'tp_ep',
+                'tp_cp',
+                'tp_dp_cp',
+            ]
+        )
+
+    @staticmethod
+    def _non_fused_norm_submodules():
+        """Un-fuse the TE layernorm+linear pairs so the explicit norm modules exist.
+
+        The default dense hybrid spec folds each norm into the following TE linear,
+        leaving IdentityOp placeholders that cannot exercise the norm checkpoints.
+        """
+        submodules = deepcopy(hybrid_stack_spec.submodules)
+        attention_submodules = submodules.attention_layer.submodules
+        attention_submodules.input_layernorm = TENorm
+        attention_submodules.self_attention.submodules.linear_qkv = TEColumnParallelLinear
+        mlp_submodules = submodules.mlp_layer.submodules
+        mlp_submodules.pre_mlp_layernorm = TENorm
+        mlp_submodules.mlp.keywords["submodules"].linear_fc1 = TEColumnParallelLinear
+        return submodules
 
     def get_mamba_block(self, layer_pattern, enable_hyper_connections=False):
         layer_type_list = validate_segment_layers(layer_pattern)
@@ -111,6 +160,32 @@ class TestHybridBlock:
         return HybridStack(
             transformer_config,
             modules,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=0,
+            pg_collection=self.get_pg_collection(),
+        )
+
+    def get_mla_hybrid_block(self, layer_pattern):
+        layer_type_list = validate_segment_layers(layer_pattern)
+        transformer_config = MLATransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_type_list),
+            num_attention_heads=16,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            q_lora_rank=64,
+            kv_lora_rank=64,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=32,
+            v_head_dim=64,
+            rope_type='rope',
+            rotary_base=10000,
+            rotary_percent=1.0,
+        )
+        return HybridStack(
+            transformer_config,
+            hybrid_stack_spec.submodules,
             layer_type_list=layer_type_list,
             pp_layer_offset=0,
             pg_collection=self.get_pg_collection(),
@@ -228,6 +303,160 @@ class TestHybridBlock:
             gb, gr = base_grads[name], rec_grads[name]
             assert torch.equal(gr, gb), f"Grad should be bitwise matched for {name}"
 
+    @pytest.mark.timeout(60)
+    def test_hash_moe_hyper_connection_full_recompute(self):
+        """Full recompute preserves input IDs through the hybrid mHC wrapper."""
+        block = self.get_hybrid_block(
+            Symbols.MOE,
+            enable_hyper_connections=True,
+            hidden_dropout=0.0,
+            mhc_sinkhorn_iterations=5,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+            num_moe_experts=4,
+            moe_ffn_hidden_size=64,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_aux_loss_coeff=0.0,
+            moe_router_dtype="fp32",
+            moe_n_hash_layers=1,
+            actual_vocab_size=128,
+            add_bias_linear=False,
+        ).cuda()
+        block.train()
+
+        sequence_length, micro_batch_size = 8, 2
+        hidden_states = torch.randn(
+            sequence_length,
+            micro_batch_size,
+            block.config.hidden_size,
+            device="cuda",
+            requires_grad=True,
+        )
+        input_ids = torch.randint(
+            0, block.config.actual_vocab_size, (micro_batch_size, sequence_length), device="cuda"
+        )
+
+        assert isinstance(block.layers[0], HyperConnectionHybridLayer)
+        assert block.layers[0].inner_layer.mlp.router.is_hash_layer
+
+        output = block(hidden_states, attention_mask=None, input_ids=input_ids)
+        assert output.shape == hidden_states.shape
+        assert torch.isfinite(output).all()
+
+        output.float().sum().backward()
+        assert hidden_states.grad is not None
+        assert torch.isfinite(hidden_states.grad).all()
+
+    def test_hash_moe_counts_only_moe_layers(self):
+        """Hash routing derives a global layer threshold from the MoE positions."""
+        layer_pattern = (Symbols.MLP + Symbols.MOE) * 4
+        mtp_pattern = Symbols.MOE
+        config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_pattern),
+            mtp_num_layers=1,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            num_moe_experts=4,
+            moe_ffn_hidden_size=64,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_aux_loss_coeff=0.0,
+            moe_router_dtype="fp32",
+            moe_n_hash_layers=3,
+            actual_vocab_size=128,
+            add_bias_linear=False,
+        )
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=8,
+            hybrid_layer_pattern=f"{layer_pattern}/{mtp_pattern}",
+            pg_collection=self.get_pg_collection(),
+        )
+        block = model.decoder
+
+        moe_layers = [
+            layer
+            for layer_type, layer in zip(block.layer_type_list, block.layers)
+            if layer_type == Symbols.MOE
+        ]
+        routers = [layer.mlp.router for layer in moe_layers]
+
+        assert [layer.layer_number for layer in moe_layers] == [2, 4, 6, 8]
+        assert [router.is_hash_layer for router in routers] == [True, True, True, False]
+        assert [router.hash_moe_layer_threshold for router in routers] == [6, 6, 6, 6]
+        mtp_router = model.mtp.layers[0].mtp_model_layer.layers[0].mlp.router
+        assert mtp_router.hash_moe_layer_threshold == 6
+        assert not mtp_router.is_hash_layer
+        assert model.config.moe_n_hash_layers == 3
+
+    def test_hash_moe_pipeline_placement_validation(self):
+        """A stage without the embedding cannot own a hash-routed MoE layer."""
+        layer_pattern = Symbols.MAMBA + Symbols.MOE
+        config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_pattern),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            is_hybrid_model=True,
+            num_moe_experts=4,
+            moe_ffn_hidden_size=64,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_aux_loss_coeff=0.0,
+            moe_router_dtype="fp32",
+            moe_n_hash_layers=1,
+            actual_vocab_size=128,
+            add_bias_linear=False,
+        )
+
+        with pytest.raises(ValueError, match="same pipeline/virtual-pipeline stage"):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=128,
+                max_sequence_length=8,
+                hybrid_layer_pattern=layer_pattern,
+                pre_process=False,
+                pg_collection=self.get_pg_collection(),
+            )
+
+    def test_hash_moe_pipeline_placement_allows_non_hash_stage(self):
+        """A later stage from a pipe-free split is valid when its MoE is not hash-routed."""
+        _validate_hash_moe_pipeline_placement(
+            [Symbols.MAMBA, Symbols.MOE],
+            layer_offset=2,
+            hash_moe_layer_threshold=2,
+            pre_process=False,
+        )
+
+    def test_hybrid_mtp_rejects_expert_parallel_overlap_before_build(self, monkeypatch):
+        """Reject overlap before constructing any HybridModel submodule."""
+        config = TransformerConfig(
+            hidden_size=256, num_layers=1, num_attention_heads=4, use_cpu_initialization=True
+        )
+        # Mutate after generic config validation to exercise the pattern-specific guard.
+        config.overlap_moe_expert_parallel_comm = True
+
+        def fail_build(*args, **kwargs):
+            pytest.fail("HybridModel submodule construction must not begin")
+
+        monkeypatch.setattr("megatron.core.models.hybrid.hybrid_model.build_module", fail_build)
+
+        with pytest.raises(ValueError, match="Hybrid MTP does not support"):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=128,
+                max_sequence_length=8,
+                hybrid_layer_pattern=f"{Symbols.MAMBA}/{Symbols.MAMBA}",
+                pg_collection=self.get_pg_collection(),
+            )
+
     def test_layer_types(self):
         """
         Make sure that the layer types specified with layer_pattern
@@ -282,6 +511,124 @@ class TestHybridBlock:
         assert len(managers) == len(block.layers)
         assert all(manager is not None for manager in managers)
         assert block_ends[-1] is True
+
+    @pytest.mark.timeout(60)
+    def test_hyper_connection_mhc_recompute_bitwise(self):
+        """mHC selective recompute is bitwise identical to the eager path."""
+        seed = 123
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
+        layer_type_list = validate_segment_layers(layer_pattern)
+        arch_kwargs = dict(
+            enable_hyper_connections=True,
+            hidden_dropout=0.0,
+            mhc_sinkhorn_iterations=5,
+            add_bias_linear=False,
+        )
+
+        def build_block(**recompute_kwargs):
+            model_parallel_cuda_manual_seed(seed)
+            torch.manual_seed(seed)
+            config = TransformerConfig(
+                hidden_size=256,
+                num_layers=len(layer_type_list),
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                **arch_kwargs,
+                **recompute_kwargs,
+            )
+            return HybridStack(
+                config,
+                self._non_fused_norm_submodules(),
+                layer_type_list=layer_type_list,
+                pp_layer_offset=0,
+                pg_collection=self.get_pg_collection(),
+            ).cuda()
+
+        torch.manual_seed(seed)
+        hidden_states = torch.randn(32, 2, 256, device="cuda")
+        attention_mask = torch.ones((2, 1, 32, 32), dtype=bool, device="cuda")
+
+        def run(block, inputs):
+            block.train()
+            output = block(inputs, attention_mask=attention_mask)
+            output.float().sum().backward()
+            grads = {
+                name: param.grad.detach().float().cpu()
+                for name, param in block.named_parameters()
+                if param.grad is not None
+            }
+            return output.detach().float().cpu(), grads
+
+        baseline = build_block()
+        baseline_output, baseline_grads = run(
+            baseline, hidden_states.detach().clone().requires_grad_()
+        )
+        del baseline
+        torch.cuda.empty_cache()
+
+        recomputed = build_block(recompute_granularity="selective", recompute_modules=["mhc"])
+        attention_layer = recomputed.layers[1].inner_layer
+        mlp_layer = recomputed.layers[2].inner_layer
+        assert attention_layer.mhc_checkpoint_input_layernorm
+        assert mlp_layer.mhc_checkpoint_pre_mlp_layernorm
+
+        recomputed_output, recomputed_grads = run(
+            recomputed, hidden_states.detach().clone().requires_grad_()
+        )
+
+        assert torch.equal(recomputed_output, baseline_output)
+        assert set(recomputed_grads) == set(baseline_grads)
+        for name, baseline_grad in baseline_grads.items():
+            assert torch.equal(recomputed_grads[name], baseline_grad), name
+
+        for checkpoint in (
+            attention_layer.input_layernorm_checkpoint,
+            mlp_layer.pre_mlp_norm_checkpoint,
+        ):
+            assert checkpoint in checkpoint.ckpt_manager.checkpoints
+            assert checkpoint.ctx is None
+            assert checkpoint.outputs is None
+
+    @pytest.mark.timeout(60)
+    def test_hyper_connection_mlp_fast_path_discards_layernorm_checkpoint(self):
+        """The hybrid mHC MLP fast path releases selective layernorm activations."""
+        layer_type_list = validate_segment_layers(Symbols.MLP)
+        config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_type_list),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            enable_hyper_connections=True,
+            hidden_dropout=0.0,
+            mhc_sinkhorn_iterations=5,
+            recompute_granularity="selective",
+            recompute_modules=["layernorm"],
+        )
+        block = HybridStack(
+            config,
+            self._non_fused_norm_submodules(),
+            layer_type_list=layer_type_list,
+            pp_layer_offset=0,
+            pg_collection=self.get_pg_collection(),
+        ).cuda()
+        block.train()
+
+        hidden_states = torch.randn(
+            8, 2, block.config.hidden_size, device="cuda", requires_grad=True
+        )
+        output = block(hidden_states, attention_mask=None)
+
+        layer = block.layers[0]
+        assert isinstance(layer, HyperConnectionHybridLayer)
+        inner_layer = layer.inner_layer
+        assert inner_layer.recompute_pre_mlp_layernorm
+        checkpoint = inner_layer.pre_mlp_norm_checkpoint
+        assert checkpoint.ckpt_manager is None
+        assert checkpoint.outputs[0].untyped_storage().nbytes() == 0
+
+        output.sum().backward()
+        assert checkpoint.ctx is None
+        assert checkpoint.outputs is None
 
     def test_hyper_connection_gpu_forward(self):
         """mHC-enabled HybridStack expands internally and contracts back at the output."""
@@ -485,3 +832,20 @@ class TestHybridBlock:
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.DS_ATTENTION + Symbols.MAMBA
         with pytest.raises(ValueError):
             block = self.get_dsa_mamba_block(layer_pattern)
+
+    def test_mla_layer_types(self):
+        """+ builds standard MLA rather than DSA."""
+        layer_pattern = Symbols.MAMBA + Symbols.MLA + Symbols.MAMBA
+        block = self.get_mla_hybrid_block(layer_pattern)
+        layers = block.layers
+        assert isinstance(layers[0], MambaLayer)
+        assert isinstance(layers[1], TransformerLayer)
+        assert isinstance(layers[1].self_attention, MLASelfAttention)
+        assert isinstance(layers[1].self_attention.core_attention, TEDotProductAttention)
+        assert isinstance(layers[2], MambaLayer)
+
+    def test_mixed_attention_and_mla_layer_types(self):
+        """* and + in the same block fail."""
+        layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLA + Symbols.MAMBA
+        with pytest.raises(ValueError):
+            self.get_mla_hybrid_block(layer_pattern)
