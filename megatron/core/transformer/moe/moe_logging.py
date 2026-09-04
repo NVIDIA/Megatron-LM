@@ -38,6 +38,7 @@ class MetricEntry:
     reduce_group: Optional[torch.distributed.ProcessGroup] = None
     avg_group: Optional[torch.distributed.ProcessGroup] = None
     needs_dp_avg: bool = True
+    normalize_by_global_tokens: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +467,7 @@ class MoEMetricsTracker:
         reduce_group: Optional[torch.distributed.ProcessGroup] = None,
         avg_group: Optional[torch.distributed.ProcessGroup] = None,
         needs_dp_avg: bool = True,
+        normalize_by_global_tokens: bool = False,
     ) -> None:
         """Accumulate a metric value for a specific layer.
 
@@ -492,6 +494,7 @@ class MoEMetricsTracker:
         entry.reduce_group = reduce_group
         entry.avg_group = avg_group
         entry.needs_dp_avg = needs_dp_avg
+        entry.normalize_by_global_tokens = normalize_by_global_tokens
 
     def report(
         self,
@@ -508,6 +511,7 @@ class MoEMetricsTracker:
         total_loss_dict: Optional[dict[str, torch.Tensor]] = None,
         percentiles: Optional[Dict[str, List[float]]] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        total_real_tokens: Optional[float] = None,
     ) -> str:
         """Sync metrics across ranks, aggregate, log, and clear.
 
@@ -554,7 +558,9 @@ class MoEMetricsTracker:
         self._sync_metrics(metric_names, pg_collection)
 
         num_moe_layers = self._count_moe_layers(num_layers, moe_layer_freq, mtp_num_layers)
-        scalars = self._aggregate(loss_scale, num_moe_layers, metric_names, percentiles)
+        scalars = self._aggregate(
+            loss_scale, num_moe_layers, metric_names, percentiles, total_real_tokens
+        )
 
         # Megatron integration: accumulate loss metrics into total_loss_dict
         console_scalars = dict(scalars)
@@ -570,7 +576,13 @@ class MoEMetricsTracker:
         self._log_scalars(scalars, iteration, writer, wandb_writer)
         if per_layer_logging:
             self._log_per_layer(
-                loss_scale, metric_names, iteration, writer, wandb_writer, percentiles
+                loss_scale,
+                metric_names,
+                iteration,
+                writer,
+                wandb_writer,
+                percentiles,
+                total_real_tokens,
             )
 
         log_string = self._format(console_scalars)
@@ -676,6 +688,7 @@ class MoEMetricsTracker:
         num_moe_layers: int,
         metric_names: List[str],
         percentiles: Optional[Dict[str, List[float]]] = None,
+        total_real_tokens: Optional[float] = None,
     ) -> Dict[str, Union[float, torch.Tensor]]:
         """Aggregate per-layer values into scalar summaries.
 
@@ -689,7 +702,13 @@ class MoEMetricsTracker:
             if name not in self._metrics:
                 continue
 
-            values = self._metrics[name].values.float() * loss_scale
+            entry = self._metrics[name]
+            if entry.normalize_by_global_tokens:
+                if total_real_tokens is None or total_real_tokens <= 0:
+                    raise ValueError(f"{name} requires a positive total_real_tokens value")
+                values = entry.values.float() / total_real_tokens
+            else:
+                values = entry.values.float() * loss_scale
 
             if percentiles and name in percentiles:
                 nonzero = values[values > 0]
@@ -723,13 +742,20 @@ class MoEMetricsTracker:
         writer,
         wandb_writer,
         percentiles: Optional[Dict[str, List[float]]] = None,
+        total_real_tokens: Optional[float] = None,
     ) -> None:
         """Write per-layer metric values to TensorBoard and/or W&B."""
         for name in metric_names:
             if name not in self._metrics:
                 continue
 
-            values = self._metrics[name].values.float() * loss_scale
+            entry = self._metrics[name]
+            if entry.normalize_by_global_tokens:
+                if total_real_tokens is None or total_real_tokens <= 0:
+                    raise ValueError(f"{name} requires a positive total_real_tokens value")
+                values = entry.values.float() / total_real_tokens
+            else:
+                values = entry.values.float() * loss_scale
             is_sparse = percentiles is not None and name in percentiles
             for i, val in enumerate(values.tolist()):
                 if is_sparse and val == 0:

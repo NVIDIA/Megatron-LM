@@ -2359,8 +2359,8 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
         dict[str, torch.Tensor]: The batch with sequence-dimension tensors
         partitioned to this CP rank.
     """
-    cp_size = torch.distributed.get_world_size(cp_group)
-    cp_rank = torch.distributed.get_rank(cp_group)
+    cp_size = cp_group.size()
+    cp_rank = cp_group.rank()
 
     if cp_size > 1:
         # cu_seqlens / cu_seqlens_padded carry a leading batch dim (1, n).
@@ -2413,8 +2413,8 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
         partitioned to this CP rank.
     """
 
-    cp_size = torch.distributed.get_world_size(cp_group)
-    cp_rank = torch.distributed.get_rank(cp_group)
+    cp_size = cp_group.size()
+    cp_rank = cp_group.rank()
 
     # HybridCP metadata is not partitioned along the sequence dim — skip by key.
     # Intermediate PP stages set non-metadata keys to None, so still skip those.

@@ -458,6 +458,62 @@ class TestRouterAuxLoss:
         torch.testing.assert_close(grad_mbs1, grad_mbsN)
 
     @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_varlen_packed_seq_aux_loss_is_pack_invariant(self):
+        """Flattening variable-length sequences must not change seq-aux gradients."""
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        router = self.new_router(
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp32",
+            calculate_per_token_loss=True,
+            params_dtype=torch.float32,
+            bf16=False,
+        ).cuda()
+        lengths = (7, 11, 5)
+        hidden_states = torch.randn(
+            (sum(lengths), 1, router.config.hidden_size), device="cuda", dtype=torch.float32
+        )
+
+        def params_for(seq_lengths):
+            cu = torch.tensor(
+                [0, *torch.tensor(seq_lengths).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+            )
+            seq_idx = torch.repeat_interleave(
+                torch.arange(len(seq_lengths), device="cuda", dtype=torch.int32),
+                torch.tensor(seq_lengths, device="cuda"),
+            ).unsqueeze(0)
+            return PackedSeqParams(
+                qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_q_padded=cu, seq_idx=seq_idx
+            )
+
+        clear_aux_losses_tracker()
+        router.weight.grad = None
+        scores, _ = router(hidden_states, packed_seq_params=params_for(lengths))
+        scores.backward(torch.zeros_like(scores))
+        packed_grad = router.weight.grad.clone()
+        packed_metric = get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"][
+            "values"
+        ].clone()
+
+        clear_aux_losses_tracker()
+        router.weight.grad = None
+        offset = 0
+        for length in lengths:
+            sequence = hidden_states[offset : offset + length].contiguous()
+            scores, _ = router(sequence, packed_seq_params=params_for((length,)))
+            scores.backward(torch.zeros_like(scores))
+            offset += length
+        separate_grad = router.weight.grad.clone()
+        separate_metric = get_moe_layer_wise_logging_tracker()["seq_load_balancing_loss"][
+            "values"
+        ].clone()
+
+        torch.testing.assert_close(packed_grad, separate_grad)
+        torch.testing.assert_close(packed_metric, separate_metric)
+
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not torch.cuda.is_available() or not HAVE_ROUTER_FUSION,
         reason="CUDA or TE fused router ops not available",

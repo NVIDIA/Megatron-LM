@@ -92,6 +92,9 @@ class ModelParallelConfig:
     """Minimum CP group size for dynamic context parallel. Default 1 (no CP).
     The maximum is dp_size * context_parallel_size (the full DPxCP group)."""
 
+    use_native_cp_transport: bool = False
+    """Use TE's NCCL Device API kernel instead of ProcessGroupNCCL for dynamic-CP rings."""
+
     hybrid_context_parallel: bool = False
     """Deprecated. Use ``dynamic_context_parallel`` instead."""
 

@@ -4,14 +4,15 @@
 
 import logging
 import os
+import sys
 import warnings
 from datetime import timedelta
-from math import log2
 from typing import Callable, List, Optional
 
 import numpy as np
 import torch
 
+from megatron.core.dynamic_cp_group import LogicalCPGroup
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
 from .utils import GlobalMemoryBuffer, is_torch_min_version
@@ -418,22 +419,42 @@ def create_hierarchical_groups(
     return hierarchical_groups, hierarchical_groups_gloo
 
 
-def create_dynamic_dp_cp_groups(rank, ranks, pg_options, min_cp_size=1):
+def create_dynamic_dp_cp_groups(rank, ranks, pg_options, min_cp_size=1, use_logical_groups=False):
     """
     Creates groups required for dynamic DPxCP.
-    Creates a new group for every power of 2 from min_cp_size up to len(ranks).
+    Creates a group for every supported size from min_cp_size up to len(ranks).
     Returns a dictionary indexed by group size.
+
+    Native transport uses topology-only logical groups in bounded-peer ring
+    order. The legacy path keeps its original ProcessGroups and rank order.
     """
     dynamic_dp_cp_groups = {}
-    group_sizes = [2**i for i in range(int(log2(len(ranks)))) if 2**i >= min_cp_size]
+    # The existing DPxCP parent is the largest legacy group. Native mode also
+    # needs a logical descriptor for that size so attention can select its ring.
+    if use_logical_groups:
+        group_sizes = range(min_cp_size, len(ranks) + 1)
+    else:
+        group_sizes = [
+            size
+            for size in (1 << i for i in range(len(ranks).bit_length()))
+            if min_cp_size <= size < len(ranks)
+        ]
     for group_size in group_sizes:
         for i in range(0, len(ranks), group_size):
-            group = create_group(
-                ranks[i : i + group_size],
-                pg_options=pg_options,
-                group_desc=f"DYNAMIC_DP_CP_GROUP_{group_size}",
-            )
-            if rank in ranks[i : i + group_size]:
+            group_ranks = ranks[i : i + group_size]
+            if len(group_ranks) != group_size:
+                continue
+            if use_logical_groups:
+                if rank not in group_ranks:
+                    continue
+                group = LogicalCPGroup.from_parent_interval(ranks, i, group_size, rank)
+            else:
+                group = create_group(
+                    group_ranks,
+                    pg_options=pg_options,
+                    group_desc=f"DYNAMIC_DP_CP_GROUP_{group_size}",
+                )
+            if rank in group_ranks:
                 assert (
                     group_size not in dynamic_dp_cp_groups
                 ), f"Rank {rank} appears in multiple Dynamic DP CP groups of size {group_size}"
@@ -447,9 +468,7 @@ class RankGenerator(object):
     def __init__(
         self, tp: int, ep: int, dp: int, pp: int, cp: int, order: str, rank_offset: int = 0
     ) -> None:
-        assert (
-            ep == 1 or cp == 1
-        ), "Both EP and CP > 1 in not allow in one rank generator. \
+        assert ep == 1 or cp == 1, "Both EP and CP > 1 in not allow in one rank generator. \
             CP is only included in default RankGenerator, and EP only in expert RankGenerator."
 
         self.tp = tp
@@ -565,6 +584,7 @@ def initialize_model_parallel(
     sharp_enabled_group: Optional[str] = None,
     rank_offset: int = 0,
     local_world_size: Optional[int] = None,
+    use_native_cp_transport: bool = False,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -921,31 +941,37 @@ def initialize_model_parallel(
     if dynamic_context_parallel:
         # TODO: Are gloo groups needed for Dynamic CP?
         global _DYNAMIC_DP_CP_GROUPS
+        if use_native_cp_transport:
+            # Materialize the parent before model construction can load optional native MoE DSOs.
+            torch.distributed.barrier(
+                group=_DATA_PARALLEL_GROUP_WITH_CP, device_ids=[torch.cuda.current_device()]
+            )
+            torch.cuda.synchronize()
         for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
-            assert (
-                len(ranks_with_cp) % 2 == 0
-            ), "Dynamic context parallel requires an even number of ranks"
             _DYNAMIC_DP_CP_GROUPS.update(
                 create_dynamic_dp_cp_groups(
                     rank,
                     ranks_with_cp,
                     get_nccl_options("dp_cp", nccl_comm_cfgs),
                     min_cp_size=min_dynamic_context_parallel_size,
+                    use_logical_groups=use_native_cp_transport,
                 )
             )
 
         data_parallel_size_with_cp = data_parallel_size * context_parallel_size
-        group_sizes = [
-            2**i
-            for i in range(int(log2(data_parallel_size_with_cp)))
-            if 2**i >= min_dynamic_context_parallel_size
-        ]
-        if data_parallel_size_with_cp not in group_sizes:
-            group_sizes.append(data_parallel_size_with_cp)
-        for group_size in group_sizes:
-            group = get_dynamic_data_context_parallel_groups(group_size=group_size)
-            torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
-            torch.cuda.synchronize()
+        # Native transport borrows the parent communicator and creates no subgroup NCCL state.
+        if not use_native_cp_transport:
+            group_sizes = [
+                size
+                for size in (1 << i for i in range(data_parallel_size_with_cp.bit_length()))
+                if min_dynamic_context_parallel_size <= size < data_parallel_size_with_cp
+            ]
+            if data_parallel_size_with_cp not in group_sizes:
+                group_sizes.append(data_parallel_size_with_cp)
+            for group_size in group_sizes:
+                group = get_dynamic_data_context_parallel_groups(group_size=group_size)
+                torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+                torch.cuda.synchronize()
 
     for ranks in decoder_rank_generator.get_ranks('dp'):
         group = create_group(
@@ -1538,8 +1564,22 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
     return _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
 
 
-def get_dynamic_data_context_parallel_groups(check_initialized=True, group_size=None):
+def get_dynamic_data_context_parallel_groups(
+    check_initialized=True, group_size=None, group_start=None
+):
     """Get the dynamic context parallel groups the caller rank belongs to."""
+    if group_start is not None:
+        key = (int(group_size), int(group_start))
+        if key not in _DYNAMIC_DP_CP_GROUPS:
+            parent_ranks = torch.distributed.get_process_group_ranks(
+                get_data_parallel_group(with_context_parallel=True)
+            )
+            _DYNAMIC_DP_CP_GROUPS[key] = LogicalCPGroup.from_parent_interval(
+                parent_ranks, int(group_start), int(group_size), torch.distributed.get_rank()
+            )
+        return _DYNAMIC_DP_CP_GROUPS[key]
+    if group_size in _DYNAMIC_DP_CP_GROUPS:
+        return _DYNAMIC_DP_CP_GROUPS[group_size]
     if get_data_parallel_world_size(with_context_parallel=True) == group_size:
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None
@@ -2110,12 +2150,12 @@ def destroy_model_parallel():
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would
     # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
     # Idempotent and a no-op when NCCL EP was never bootstrapped.
-    try:
-        from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
-
-        nccl_ep_finalize()
-    except Exception:  # finalize must never block teardown
-        pass
+    fused_a2a = sys.modules.get('megatron.core.transformer.moe.fused_a2a')
+    if fused_a2a is not None:
+        try:
+            fused_a2a.nccl_ep_finalize()
+        except Exception:  # finalize must never block teardown
+            pass
 
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None
@@ -2130,6 +2170,15 @@ def destroy_model_parallel():
     _DATA_PARALLEL_GROUP = None
 
     global _DATA_PARALLEL_GROUP_WITH_CP
+    if _DATA_PARALLEL_GROUP_WITH_CP is not None:
+        try:
+            from transformer_engine.pytorch.attention.native_cp_transport import (
+                destroy_native_cp_transport,
+            )
+
+            destroy_native_cp_transport(_DATA_PARALLEL_GROUP_WITH_CP)
+        except ImportError:
+            pass
     _DATA_PARALLEL_GROUP_WITH_CP = None
 
     global _CONTEXT_PARALLEL_GROUP

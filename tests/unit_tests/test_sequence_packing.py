@@ -12,12 +12,15 @@ from megatron.core.datasets import data_schedule
 from megatron.core.datasets.data_schedule import (
     DefaultDynamicCPScheduler,
     _build_thd_padding_mask,
+    _build_thd_sequence_indices,
     _get_scheduler_max_real_num_seqs,
     _sanitize_thd_padding_values,
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
 from megatron.core.datasets.data_schedule_utils import (
+    _pack_sequences,
+    dcp_gpus_needed,
     next_hdp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
 )
@@ -63,6 +66,10 @@ def test_scheduler_thd_padding_mask_from_cu_seqlens():
     assert torch.equal(
         padding_mask, torch.tensor([False, False, False, True, False, False, True, True])
     )
+    assert torch.equal(
+        _build_thd_sequence_indices(cu_seqlens_padded),
+        torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int32),
+    )
 
 
 def test_scheduler_sanitizes_thd_padding_values():
@@ -80,6 +87,24 @@ def test_scheduler_sanitizes_thd_padding_values():
     assert torch.equal(batch['labels'], torch.tensor([12, 13, 0, 22, 0]))
     assert torch.equal(batch['loss_mask'], torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0]))
     assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
+
+
+def test_pack_sequences_aligns_each_sequence_to_local_cp_size():
+    samples = [{'tokens': torch.arange(1, 6)}, {'tokens': torch.arange(6, 10)}]
+
+    packed = _pack_sequences(
+        samples,
+        padded_lengths=torch.tensor([5, 4]),
+        original_lengths=torch.tensor([5, 4]),
+        local_cp_size=torch.tensor(3),
+        local_cp_group_start=torch.tensor(2),
+        dev=torch.device('cpu'),
+    )
+
+    assert torch.equal(packed['tokens'], torch.tensor([1, 2, 3, 4, 5, 0, 6, 7, 8, 9, 0, 0]))
+    assert torch.equal(packed['cu_seqlens'], torch.tensor([0, 5, 9], dtype=torch.int32))
+    assert torch.equal(packed['cu_seqlens_padded'], torch.tensor([0, 6, 12], dtype=torch.int32))
+    assert packed['local_cp_group_start'].item() == 2
 
 
 def test_scheduler_reroute_uses_dp_all_gather(monkeypatch):
@@ -699,6 +724,66 @@ def test_next_hdp_group_packing_aware_can_use_larger_cp_group_for_short_sequence
     assert micro_batches == [[6144, 2048], [6144, 2048]]
     assert sample_ids == [[0, 1], [0, 1]]
     assert exec_times[0] == exec_times[1]
+
+
+def test_next_hdp_group_packing_aware_keeps_legacy_tie_break():
+    _, leftovers, _, sample_ids = next_hdp_group_packing_aware(
+        [(0, 128), (1, 5504), (2, 3840)], total_gpus=8, max_seq_len_per_rank=2048, min_cp_size=2
+    )
+
+    assert leftovers == []
+    assert sample_ids == [[1]] * 4 + [[2, 0]] * 4
+
+
+def test_next_hdp_group_packing_aware_uses_topology_compatible_nonpower_cp_size():
+    assert dcp_gpus_needed(257, 128) == 4
+    assert dcp_gpus_needed(257, 128, round_to_power_of_two=False) == 3
+
+    _, leftovers, _, sample_ids = next_hdp_group_packing_aware(
+        [(0, 1280), (1, 512), (2, 256)],
+        total_gpus=16,
+        max_seq_len_per_rank=128,
+        allow_arbitrary_group_starts=True,
+    )
+
+    assert leftovers == []
+    assert sample_ids == [[0]] * 10 + [[1]] * 4 + [[2]] * 2
+
+
+def test_next_hdp_group_packing_aware_uses_exact_cp3():
+    _, leftovers, _, sample_ids = next_hdp_group_packing_aware(
+        [(0, 384), (1, 128)],
+        total_gpus=4,
+        max_seq_len_per_rank=128,
+        allow_arbitrary_group_starts=True,
+    )
+
+    assert leftovers == []
+    assert sample_ids == [[0], [0], [0], [1]]
+
+
+def test_next_hdp_group_packing_aware_allows_cp5_plus_tail_cp3():
+    _, leftovers, _, sample_ids = next_hdp_group_packing_aware(
+        [(0, 2304), (1, 1408)],
+        total_gpus=8,
+        max_seq_len_per_rank=512,
+        allow_arbitrary_group_starts=True,
+    )
+
+    assert leftovers == []
+    assert sample_ids == [[0]] * 5 + [[1]] * 3
+
+
+def test_next_hdp_group_packing_aware_supports_every_cp_size_through_16():
+    for cp_size in range(1, 17):
+        _, leftovers, _, sample_ids = next_hdp_group_packing_aware(
+            [(0, cp_size * 128)],
+            total_gpus=cp_size,
+            max_seq_len_per_rank=128,
+            allow_arbitrary_group_starts=True,
+        )
+        assert leftovers == []
+        assert sample_ids == [[0]] * cp_size
 
 
 def test_next_hdp_group_packing_aware_fills_non_power_of_two_dpxcp_group():

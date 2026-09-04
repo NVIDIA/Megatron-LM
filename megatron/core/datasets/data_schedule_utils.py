@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import lru_cache
-from math import ceil, log2
+from math import ceil
 from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
@@ -234,19 +234,33 @@ def _pack_sequences(
     padded_lengths: torch.Tensor,
     original_lengths: torch.Tensor,
     local_cp_size: Optional[torch.Tensor],
+    local_cp_group_start: Optional[torch.Tensor],
     dev: torch.device,
 ) -> Dict[str, torch.Tensor]:
     """Pack multiple samples into a single packed sample."""
 
+    padded_lengths = padded_lengths.to(device=dev, dtype=torch.int32, non_blocking=True).reshape(-1)
+    if local_cp_size is not None and int(local_cp_size.item()) > 1:
+        alignment = 2 * int(local_cp_size.item())
+        padded_lengths = ((padded_lengths + alignment - 1) // alignment) * alignment
+    padded_lengths_cpu = padded_lengths.cpu().tolist()
+
     def _pack_tensors(tensors):
-        return torch.cat([t.reshape(-1) for t in tensors], dim=0)
+        chunks = []
+        for tensor, length in zip(tensors, padded_lengths_cpu):
+            tensor = tensor.reshape(-1)
+            pad = length - tensor.numel()
+            assert (
+                pad >= 0
+            ), f"Packed length {length} is shorter than tensor length {tensor.numel()}"
+            chunks.append(torch.nn.functional.pad(tensor, (0, pad)))
+        return torch.cat(chunks, dim=0)
 
     new_sample = {}
     for key in ['tokens', 'labels', 'loss_mask', 'position_ids']:
         if key in samples[0]:
             new_sample[key] = _pack_tensors([sample[key] for sample in samples])
 
-    padded_lengths = padded_lengths.to(device=dev, dtype=torch.int32, non_blocking=True).reshape(-1)
     cu_seqlens_padded = torch.empty(padded_lengths.numel() + 1, device=dev, dtype=torch.int32)
     cu_seqlens_padded[0] = 0
     cu_seqlens_padded[1:] = torch.cumsum(padded_lengths, dim=0)
@@ -265,6 +279,8 @@ def _pack_sequences(
 
     if local_cp_size is not None:
         new_sample["local_cp_size"] = local_cp_size
+    if local_cp_group_start is not None:
+        new_sample["local_cp_group_start"] = local_cp_group_start
 
     return new_sample
 
@@ -333,6 +349,8 @@ def create_data_iterator(
             metadata_keys = ["max_seqlen", "cu_seqlens", "cu_seqlens_padded"]
             if is_dynamic_cp:
                 metadata_keys.append("local_cp_size")
+                if getattr(config, "use_native_cp_transport", False):
+                    metadata_keys.append("local_cp_group_start")
             new_data_iterator = []
             for i in range(vpp_size):
                 if vpp_needs_data is not None and vpp_needs_data[i]:
@@ -503,20 +521,26 @@ def build_packed_microbatches(
     ]
 
     local_cp_sizes_gpu = None
+    local_cp_group_starts_gpu = None
     if is_dynamic_cp:
         local_cp_sizes_cpu: List[int] = []
+        local_cp_group_starts_cpu: List[int] = []
         for i in range(num_micro_batches):
             sample_ids_this_group = sample_id_groups[i][dcp_rank]
-            local_cp_sizes_cpu.append(
-                len(
-                    [
-                        1
-                        for sample_ids in sample_id_groups[i]
-                        if sample_ids_this_group[0] in sample_ids
-                    ]
-                )
-            )
+            member_ranks = [
+                rank
+                for rank, sample_ids in enumerate(sample_id_groups[i])
+                if sample_ids_this_group[0] in sample_ids
+            ]
+            assert member_ranks == list(
+                range(member_ranks[0], member_ranks[-1] + 1)
+            ), f"Dynamic CP group must be contiguous, got ranks {member_ranks}"
+            local_cp_sizes_cpu.append(len(member_ranks))
+            local_cp_group_starts_cpu.append(member_ranks[0])
         local_cp_sizes_gpu = torch.tensor(local_cp_sizes_cpu, dtype=torch.int32, device=dev)
+        local_cp_group_starts_gpu = torch.tensor(
+            local_cp_group_starts_cpu, dtype=torch.int32, device=dev
+        )
 
     for i in range(num_micro_batches):
         samples = grouped_samples[i]
@@ -533,7 +557,10 @@ def build_packed_microbatches(
         lens_padded = padded_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
         lens_original = original_lens_all_gpu[seg_starts[i] : seg_starts[i + 1]]
         local_cp_size = local_cp_sizes_gpu[i] if is_dynamic_cp else None
-        new_sample = _pack_sequences(samples, lens_padded, lens_original, local_cp_size, dev)
+        local_cp_group_start = local_cp_group_starts_gpu[i] if is_dynamic_cp else None
+        new_sample = _pack_sequences(
+            samples, lens_padded, lens_original, local_cp_size, local_cp_group_start, dev
+        )
         new_samples.append(new_sample)
 
     return new_samples
@@ -594,6 +621,7 @@ def next_hdp_group_packing_aware(
     total_gpus: int,
     max_seq_len_per_rank: int,
     min_cp_size: int = 1,
+    allow_arbitrary_group_starts: bool = False,
 ) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
     """Form one DCP microbatch with packing-aware CP group selection.
 
@@ -605,9 +633,11 @@ def next_hdp_group_packing_aware(
        the local tallest sequence in the microbatch.
 
     The scheduler keeps the legacy invariant that each returned microbatch has
-    no empty DPxCP rank after the fill step. For non-power-of-two DPxCP layouts,
-    it falls back to the full DPxCP group if power-of-two expansion cannot fill
-    every rank.
+    no empty DPxCP rank after the fill step.
+
+    ``allow_arbitrary_group_starts`` lets lightweight logical groups occupy any
+    free contiguous interval. Legacy ProcessGroups keep their pre-created,
+    size-aligned partitions.
     """
     if not sample_seqlens:
         return (
@@ -618,10 +648,18 @@ def next_hdp_group_packing_aware(
         )
 
     def cp_min_fn(seq_len: int) -> int:
-        return dcp_gpus_needed(seq_len, max_seq_len_per_rank, min_cp_size)
+        return dcp_gpus_needed(
+            seq_len,
+            max_seq_len_per_rank,
+            min_cp_size,
+            round_to_power_of_two=not allow_arbitrary_group_starts,
+        )
+
+    def per_rank_length(seq_len: int, cp_size: int) -> int:
+        return 2 * ceil(seq_len / (2 * cp_size))
 
     def workload(seq_len: int, cp_size: int) -> float:
-        return (seq_len * seq_len) / cp_size
+        return per_rank_length(seq_len, cp_size) ** 2 * cp_size
 
     sample_seqlens = sorted(sample_seqlens, key=lambda x: x[1], reverse=True)
     local_tall = sample_seqlens[0][1]
@@ -648,7 +686,7 @@ def next_hdp_group_packing_aware(
     members = list(range(cp_size))
     group_members[group_id] = members
     group_size[group_id] = cp_size
-    packing_sequence_len[group_id] = seq_len / cp_size
+    packing_sequence_len[group_id] = per_rank_length(seq_len, cp_size)
     per_gpu_cost = workload(seq_len, cp_size)
     for rank in members:
         gpu_group_id[rank] = group_id
@@ -668,7 +706,10 @@ def next_hdp_group_packing_aware(
             for group_id, size in list(group_size.items()):
                 if size != cp_size:
                     continue
-                if packing_sequence_len.get(group_id, 0) + seq_len / cp_size > max_seq_len_per_rank:
+                if (
+                    packing_sequence_len.get(group_id, 0) + per_rank_length(seq_len, cp_size)
+                    > max_seq_len_per_rank
+                ):
                     continue
                 members = group_members[group_id]
                 member_set = set(members)
@@ -679,22 +720,28 @@ def next_hdp_group_packing_aware(
                 if projected_max <= cap and (best is None or projected_max < best[0]):
                     best = (projected_max, cp_size, "add", group_id, None)
 
-            free_ranks = [
-                rank
-                for rank, assigned_group_id in enumerate(gpu_group_id)
-                if assigned_group_id is None
-            ]
-            if len(free_ranks) >= cp_size:
-                chosen_members = sorted(free_ranks, key=lambda rank: exec_times[rank])[:cp_size]
+            group_start_step = 1 if allow_arbitrary_group_starts else cp_size
+            for group_start in range(0, total_gpus - cp_size + 1, group_start_step):
+                chosen_members = list(range(group_start, group_start + cp_size))
+                if any(gpu_group_id[rank] is not None for rank in chosen_members):
+                    continue
                 chosen_set = set(chosen_members)
                 projected_max = max(
                     time + per_gpu_cost if rank in chosen_set else time
                     for rank, time in enumerate(exec_times)
                 )
-                if projected_max <= cap and (best is None or projected_max < best[0]):
+                if projected_max <= cap and (
+                    best is None
+                    or projected_max < best[0]
+                    or (
+                        allow_arbitrary_group_starts
+                        and projected_max == best[0]
+                        and best[2] == "add"
+                    )
+                ):
                     best = (projected_max, cp_size, "new", None, chosen_members)
 
-            cp_size *= 2
+            cp_size = cp_size + 1 if allow_arbitrary_group_starts else cp_size * 2
 
         if best is None:
             leftovers.append((sample_id, seq_len))
@@ -704,7 +751,7 @@ def next_hdp_group_packing_aware(
         per_gpu_cost = workload(seq_len, selected_cp_size)
         if action == "add":
             members = group_members[group_id]
-            packing_sequence_len[group_id] += seq_len / selected_cp_size
+            packing_sequence_len[group_id] += per_rank_length(seq_len, selected_cp_size)
             for rank in members:
                 micro_batches[rank].append(seq_len)
                 exec_times[rank] += per_gpu_cost
@@ -714,7 +761,7 @@ def next_hdp_group_packing_aware(
             next_gid += 1
             group_members[group_id] = chosen_members
             group_size[group_id] = selected_cp_size
-            packing_sequence_len[group_id] = seq_len / selected_cp_size
+            packing_sequence_len[group_id] = per_rank_length(seq_len, selected_cp_size)
             for rank in chosen_members:
                 gpu_group_id[rank] = group_id
                 micro_batches[rank].append(seq_len)
@@ -746,7 +793,17 @@ def next_hdp_group_packing_aware(
             group_start_rank = members[0]
             group_end_rank = members[-1]
             empty_rank = empty_ranks[0]
-            if group_end_rank + 1 > empty_rank or group_end_rank + needed_count >= total_gpus:
+            if (
+                group_start_rank % next_power
+                or group_end_rank + 1 > empty_rank
+                or empty_rank + needed_count > total_gpus
+                or any(
+                    min(other_members) > group_end_rank
+                    and (min(other_members) + needed_count) % group_size[other_group_id]
+                    for other_group_id, other_members in group_members.items()
+                    if other_group_id != group_id
+                )
+            ):
                 continue
 
             work_to_push = micro_batches[group_end_rank + 1 : empty_rank]
@@ -802,7 +859,7 @@ def next_hdp_group_packing_aware(
         packed_sequence_len = 0.0
 
         for sample_id, seq_len in sample_seqlens:
-            per_rank_len = seq_len / total_gpus
+            per_rank_len = per_rank_length(seq_len, total_gpus)
             if packed_sequence_len + per_rank_len <= max_seq_len_per_rank:
                 selected.append((sample_id, seq_len))
                 packed_sequence_len += per_rank_len
@@ -824,6 +881,10 @@ def next_hdp_group_packing_aware(
         leftovers = next_leftovers
 
     while any(not micro_batch for micro_batch in micro_batches):
+        empty_ranks = [rank for rank, micro_batch in enumerate(micro_batches) if not micro_batch]
+        if not all(not micro_batches[rank] for rank in range(empty_ranks[0], total_gpus)):
+            fill_with_full_dpxcp_group()
+            break
         if not fill_empty_gpus_once():
             fill_with_full_dpxcp_group()
             break
@@ -930,7 +991,14 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
 
 
 @lru_cache(maxsize=128)
-def dcp_gpus_needed(seq_len: int, max_seq_len_per_rank: int, min_cp_size: int = 1) -> int:
-    """Number of GPUs needed, rounded up to the next power of 2, lower-bounded by min_cp_size."""
-    raw = max(1, 2 ** ceil(log2(seq_len / max_seq_len_per_rank)))
+def dcp_gpus_needed(
+    seq_len: int,
+    max_seq_len_per_rank: int,
+    min_cp_size: int = 1,
+    round_to_power_of_two: bool = True,
+) -> int:
+    """Minimum GPUs needed, optionally rounded to the next power of two."""
+    raw = max(1, ceil(seq_len / max_seq_len_per_rank))
+    if round_to_power_of_two:
+        raw = 1 << (raw - 1).bit_length()
     return max(min_cp_size, raw)

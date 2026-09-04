@@ -51,11 +51,23 @@ def _build_thd_padding_mask(
     positions = torch.arange(
         total_tokens, dtype=cu_seqlens_padded.dtype, device=cu_seqlens_padded.device
     )
-    seq_indices = torch.searchsorted(cu_seqlens_padded[1:].contiguous(), positions, right=True)
+    seq_indices = _build_thd_sequence_indices(cu_seqlens_padded)
 
     valid_lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).clamp(min=0)
     valid_ends = cu_seqlens_padded[:-1] + valid_lengths
     return positions >= valid_ends[seq_indices]
+
+
+def _build_thd_sequence_indices(cu_seqlens_padded: torch.Tensor) -> torch.Tensor:
+    """Map every physical THD row to its original packed sequence."""
+    assert cu_seqlens_padded.dim() == 1
+    total_tokens = int(cu_seqlens_padded[-1].item())
+    positions = torch.arange(
+        total_tokens, dtype=cu_seqlens_padded.dtype, device=cu_seqlens_padded.device
+    )
+    return torch.searchsorted(cu_seqlens_padded[1:].contiguous(), positions, right=True).to(
+        torch.int32
+    )
 
 
 def _sanitize_thd_padding_values(batch: Dict[str, Any], padding_mask: torch.Tensor) -> None:
@@ -409,12 +421,13 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
     Dynamic CP scheduler that balances workload across variable CP sizes.
     """
 
-    def __init__(self, *args, min_cp_size=1, **kwargs):
+    def __init__(self, *args, min_cp_size=1, allow_arbitrary_group_starts=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.is_dynamic_cp = True
         self.max_seq_len_per_rank = self.max_seqlen_per_dp_cp_rank
         self.total_hdp_gpus = self.dp_size * self.cp_size
         self.min_cp_size = min_cp_size
+        self.allow_arbitrary_group_starts = allow_arbitrary_group_starts
 
     def get_groups_and_subsamples(self, sample_id_seqlens):
         """
@@ -433,6 +446,7 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
                 self.total_hdp_gpus,
                 max_seq_len_per_rank=mslpr,
                 min_cp_size=min_cp,
+                allow_arbitrary_group_starts=self.allow_arbitrary_group_starts,
             )
             sample_id_groups.append(sample_ids)
 
@@ -524,6 +538,9 @@ def wrap_data_iterator(
     scheduler_kwargs = {}
     if scheduler_type == 'default_dynamic_cp':
         scheduler_kwargs['min_cp_size'] = config.min_dynamic_context_parallel_size
+        scheduler_kwargs['allow_arbitrary_group_starts'] = getattr(
+            config, 'use_native_cp_transport', False
+        )
 
     scheduler_max_num_seqs = (
         _get_scheduler_max_real_num_seqs(config)
@@ -602,11 +619,18 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     is_first_or_last_stage = is_first_stage or is_last_stage
     dev = torch.cuda.current_device()
+    use_native_cp_transport = dynamic_cp and getattr(config, 'use_native_cp_transport', False)
+    router_loss_type = getattr(config, 'moe_router_load_balancing_type', None)
+    use_packed_seq_aux_loss = router_loss_type == 'seq_aux_loss' or (
+        isinstance(router_loss_type, (list, tuple)) and 'seq_aux_loss' in router_loss_type
+    )
 
     # data_iterator should return a batch including the following keys.
     batch_keys = ['cu_seqlens', 'cu_seqlens_padded', 'max_seqlen']
     if dynamic_cp:
         batch_keys.append('local_cp_size')
+        if use_native_cp_transport:
+            batch_keys.append('local_cp_group_start')
     if is_first_stage or mtp_on_this_rank:
         batch_keys.append('tokens')
         batch_keys.append('position_ids')
@@ -629,9 +653,13 @@ def get_batch_on_this_rank_for_sequence_packing(
         local_cp_size_val = batch['local_cp_size']
         if isinstance(local_cp_size_val, torch.Tensor):
             local_cp_size_val = local_cp_size_val.item()
-        cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
-            group_size=local_cp_size_val
-        )
+        group_kwargs = {'group_size': local_cp_size_val}
+        if use_native_cp_transport:
+            local_cp_group_start_val = batch['local_cp_group_start']
+            if isinstance(local_cp_group_start_val, torch.Tensor):
+                local_cp_group_start_val = local_cp_group_start_val.item()
+            group_kwargs['group_start'] = local_cp_group_start_val
+        cp_group = parallel_state.get_dynamic_data_context_parallel_groups(**group_kwargs)
 
     cp_partition_mode = getattr(config, "cp_partition_mode", "zigzag")
     tail_padding_policy = resolve_thd_tail_padding_policy(config)
@@ -669,6 +697,8 @@ def get_batch_on_this_rank_for_sequence_packing(
         batch['padding_mask'] = _build_thd_padding_mask(
             batch['cu_seqlens'], batch['cu_seqlens_padded']
         )
+        if use_packed_seq_aux_loss:
+            batch['seq_idx'] = _build_thd_sequence_indices(batch['cu_seqlens_padded'])
         _sanitize_thd_padding_values(batch, batch['padding_mask'])
 
         # In extend_last mode, the padding tail belongs to the final real
@@ -692,6 +722,8 @@ def get_batch_on_this_rank_for_sequence_packing(
     # on every PP stage, while data tensors are only needed on first/last/MTP stages.
     if is_tp_rank_0:
         cp_slice_keys = ['padding_mask']
+        if use_packed_seq_aux_loss:
+            cp_slice_keys.append('seq_idx')
         if is_first_or_last_stage or mtp_on_this_rank:
             cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
         if non_dummy_global_target_len is not None:
@@ -770,8 +802,16 @@ def get_batch_on_this_rank_for_sequence_packing(
     if is_tp_rank_0:
         assert batch['padding_mask'].dtype == torch.bool
         batch['padding_mask'] = batch['padding_mask'].view(1, total_tokens)
+        if use_packed_seq_aux_loss:
+            assert batch['seq_idx'].dtype == torch.int32
+            batch['seq_idx'] = batch['seq_idx'].view(1, total_tokens)
     else:
         batch['padding_mask'] = torch.empty([1, total_tokens], dtype=torch.bool, device=dev)
+        if use_packed_seq_aux_loss:
+            batch['seq_idx'] = torch.empty([1, total_tokens], dtype=torch.int32, device=dev)
+
+    if not use_packed_seq_aux_loss:
+        batch['seq_idx'] = None
 
     # Step4: Prepare "cu_seqlens", "cu_seqlens_padded", "max_seqlen" on all ranks.
     if is_tp_rank_0:
@@ -804,16 +844,32 @@ def get_batch_on_this_rank_for_sequence_packing(
     else:
         batch['local_cp_size'] = None
 
+    if use_native_cp_transport:
+        if is_tp_rank_0:
+            if type(batch['local_cp_group_start']) == int:
+                batch['local_cp_group_start'] = torch.tensor(
+                    batch['local_cp_group_start'], dtype=torch.int32, device=dev
+                )
+            else:
+                assert batch['local_cp_group_start'].dtype == torch.int32
+                assert batch['local_cp_group_start'].numel() == 1
+        else:
+            batch['local_cp_group_start'] = torch.empty(1, dtype=torch.int32, device=dev)
+    else:
+        batch['local_cp_group_start'] = None
+
     # Broadcast batch inside TP group.
     broadcast_tensor(batch['tokens'], tp_src_rank, tp_group)
     broadcast_tensor(batch['position_ids'], tp_src_rank, tp_group)
     broadcast_tensor(batch['labels'], tp_src_rank, tp_group)
     broadcast_tensor(batch['loss_mask'], tp_src_rank, tp_group)
     broadcast_tensor(batch['padding_mask'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['seq_idx'], tp_src_rank, tp_group)
     broadcast_tensor(batch['cu_seqlens'], tp_src_rank, tp_group)
     broadcast_tensor(batch['cu_seqlens_padded'], tp_src_rank, tp_group)
     broadcast_tensor(batch['max_seqlen'], tp_src_rank, tp_group)
     broadcast_tensor(batch['local_cp_size'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['local_cp_group_start'], tp_src_rank, tp_group)
 
     # Extract the data from batch after broadcasting.
     tokens = batch['tokens']
@@ -821,15 +877,19 @@ def get_batch_on_this_rank_for_sequence_packing(
     labels = batch['labels']
     loss_mask = batch['loss_mask']
     padding_mask = batch['padding_mask']
+    seq_idx = batch['seq_idx']
     cu_seqlens = batch['cu_seqlens']
     cu_seqlens_padded = batch['cu_seqlens_padded']
     max_seqlen = batch['max_seqlen'].item()
     local_cp_size = batch['local_cp_size'].item() if dynamic_cp else None
-    cp_group = (
-        parallel_state.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
-        if dynamic_cp
-        else None
-    )
+    local_cp_group_start = batch['local_cp_group_start'].item() if use_native_cp_transport else None
+    if dynamic_cp:
+        group_kwargs = {'group_size': local_cp_size}
+        if use_native_cp_transport:
+            group_kwargs['group_start'] = local_cp_group_start
+        cp_group = parallel_state.get_dynamic_data_context_parallel_groups(**group_kwargs)
+    else:
+        cp_group = None
 
     # cu_seqlens_q/kv hold the original (unpadded) boundaries so downstream
     # loss paths (e.g. CSA indexer KL) can identify padding rows.
@@ -845,6 +905,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
         cp_group=cp_group,
+        seq_idx=seq_idx,
         cp_partition_mode=cp_partition_mode,
         pad_between_seqs=True,
     )
