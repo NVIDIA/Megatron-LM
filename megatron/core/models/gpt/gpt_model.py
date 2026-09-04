@@ -2,6 +2,7 @@
 
 import logging
 from collections import OrderedDict
+from contextlib import nullcontext
 from typing import Any, Callable, Dict, Literal, Optional
 
 import torch
@@ -168,6 +169,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             mtp_num_layers=self.config.mtp_num_layers,
             ignore_virtual=False,
             vp_stage=vp_stage,
+            pp_group=self.pg_collection.pp,
+            vp_size=self.config.virtual_pipeline_model_parallel_size,
         )
 
         if self.pre_process or self.mtp_process:
@@ -575,6 +578,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
+        mtp_input_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
@@ -625,19 +629,25 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
         # Run decoder.
-        hidden_states = self.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            padding_mask=padding_mask,
-            **(extra_block_kwargs or {}),
+        backbone_context = (
+            torch.no_grad()
+            if self.config.freeze_base_model_for_mtp and self.training
+            else nullcontext()
         )
+        with backbone_context:
+            hidden_states = self.decoder(
+                hidden_states=decoder_input,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
+                **(extra_block_kwargs or {}),
+            )
 
         return self._postprocess(
             hidden_states=hidden_states,
@@ -649,6 +659,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_sin=rotary_pos_sin,
             mtp_in_postprocess=self.mtp_process,
             loss_mask=loss_mask,
+            mtp_input_mask=mtp_input_mask,
             decoder_input=decoder_input,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
@@ -673,6 +684,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         rotary_pos_sin,
         mtp_in_postprocess=None,
         loss_mask=None,
+        mtp_input_mask=None,
         decoder_input=None,
         attention_mask=None,
         padding_mask=None,
@@ -722,6 +734,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 padding_mask=padding_mask,
                 embedding=self.embedding,
+                mtp_input_mask=mtp_input_mask,
                 **(extra_block_kwargs or {}),
             )
 
@@ -758,6 +771,11 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
                     input_ids=input_ids,
+                    mtp_input_mask=mtp_input_mask,
+                    metric_avg_group=(
+                        getattr(self.pg_collection, 'dp_cp_gtp_remat', None)
+                        or self.pg_collection.dp_cp
+                    ),
                 )
         sequence_parallel_override = False
 
@@ -855,6 +873,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         *,
+        mtp_input_mask: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
     ):
@@ -883,6 +902,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 Parameters for inference. Defaults to None.
             loss_mask (Optional[Tensor], optional): Loss mask. Defaults to None.
             padding_mask (Optional[Tensor], optional): Padding mask. Defaults to None.
+            mtp_input_mask (Optional[Tensor], optional): Mask of valid MTP conditioning tokens.
             output_processor (Callable, optional): Custom postprocess hook to run in the
                 schedule-plan postprocess node instead of the default logits/loss path.
             output_processor_context (Any, optional): User-defined context object forwarded to
@@ -911,6 +931,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             runtime_gather_output,
             loss_mask,
             padding_mask,
+            mtp_input_mask=mtp_input_mask,
             output_processor=output_processor,
             output_processor_context=output_processor_context,
         )

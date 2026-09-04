@@ -47,12 +47,17 @@ async def test_inference_client_lifecycle():
     assert client.completion_futures == {}
 
     # start(): handshake sends CONNECT, expects CONNECT_ACK, spawns listener task.
-    # We stage two recv() replies: the CONNECT_ACK during handshake, and an
-    # ENGINE_REPLY for the request we'll add below. Subsequent recvs raise
-    # zmq.Again so the listener loop yields back to the event loop.
+    # We stage two recv_multipart() replies: the CONNECT_ACK during handshake,
+    # and an ENGINE_REPLY for the request we'll add below. Messages arrive as
+    # [metadata, body] frames; the body is only present on replies that carry
+    # one. Subsequent recvs raise zmq.Again so the listener yields back to the
+    # event loop.
     recv_queue = [
-        msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True),
-        msgpack.packb([Headers.ENGINE_REPLY.value, 0, {"foo": "bar"}], use_bin_type=True),
+        [msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)],
+        [
+            msgpack.packb([Headers.ENGINE_REPLY.value, 0], use_bin_type=True),
+            msgpack.packb({"foo": "bar"}, use_bin_type=True),
+        ],
     ]
 
     def fake_recv(*args, **kwargs):
@@ -60,23 +65,33 @@ async def test_inference_client_lifecycle():
             return recv_queue.pop(0)
         raise zmq.Again()
 
-    fake_socket.recv.side_effect = fake_recv
+    fake_socket.recv_multipart.side_effect = fake_recv
 
     client.start()
     assert isinstance(client.listener_task, asyncio.Task)
     sent_connect = fake_socket.send.call_args.args[0]
     assert msgpack.unpackb(sent_connect, raw=False)[0] == Headers.CONNECT.value
 
-    # add_request: SUBMIT_REQUEST payload (header, id, prompt, sampling-dict), counter increments.
+    # add_request frames the submission as [metadata, prompt, block_hashes, media]
+    # so the coordinator can route it without decoding the prompt or the media.
     fut = client.add_request("hello", SamplingParams(temperature=0.5))
     assert isinstance(fut, asyncio.Future)
     assert client.next_request_id == 1
     assert 0 in client.request_submission_times
-    submit_payload = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
+    submit_meta, submit_prompt, submit_hashes, submit_media = (
+        fake_socket.send_multipart.call_args.args[0]
+    )
+    submit_payload = msgpack.unpackb(submit_meta, raw=False)
     assert submit_payload[0] == Headers.SUBMIT_REQUEST.value
     assert submit_payload[1] == 0
-    assert submit_payload[2] == "hello"
-    assert submit_payload[3]["temperature"] == 0.5
+    assert submit_payload[2]["temperature"] == 0.5
+    assert msgpack.unpackb(submit_prompt, raw=False) == "hello"
+    # This client was told no block size, so it reports None -- "I did not hash" --
+    # and the coordinator hashes on its behalf.
+    assert msgpack.unpackb(submit_hashes, raw=False) is None
+    # Text-only, so the media frame is present but empty: the frame count is fixed
+    # so the coordinator can reject a malformed submission on arity alone.
+    assert msgpack.unpackb(submit_media, raw=False) is None
 
     # Listener delivers the reply: future resolves with payload + injected latency.
     # Submission-time entry is popped on completion.
@@ -115,7 +130,9 @@ async def test_inference_client_connect_handshake_rejects_unexpected_reply():
     fatal protocol mismatch, not a recoverable error. Separated from the
     lifecycle test because it short-circuits before any state is established."""
     client, _, fake_socket = _make_client()
-    fake_socket.recv.return_value = msgpack.packb([Headers.STOP.value], use_bin_type=True)
+    fake_socket.recv_multipart.return_value = [
+        msgpack.packb([Headers.STOP.value], use_bin_type=True)
+    ]
     with pytest.raises(AssertionError):
         client._connect_with_inference_coordinator()
 
@@ -131,11 +148,240 @@ async def test_add_request_with_kv_handoff_returns_future():
     assert params.streaming is False
     assert client.completion_futures == {0: future}
     assert client.streams == {}
-    payload = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
-    assert payload[0] == Headers.SUBMIT_REQUEST_WITH_KV.value
-    assert payload[1] == 0
-    assert payload[2] == [1, 2, 3]
-    assert payload[3]["streaming"] is False
-    assert payload[4] == {"agent": "prefill"}
-    assert payload[5] == [10, 11]
+    # Framed as [metadata, prompt, src_block_ids]: src_block_ids names one block
+    # per block_size_tokens of prompt, so it grows with the prompt and travels as
+    # its own body rather than in the metadata frame the coordinator decodes.
+    meta_frame, prompt_frame, blocks_frame = fake_socket.send_multipart.call_args.args[0]
+    metadata = msgpack.unpackb(meta_frame, raw=False)
+    assert metadata[0] == Headers.SUBMIT_REQUEST_WITH_KV.value
+    assert metadata[1] == 0
+    assert metadata[2]["streaming"] is False
+    assert metadata[3] == {"agent": "prefill"}
+    assert msgpack.unpackb(prompt_frame, raw=False) == [1, 2, 3]
+    assert msgpack.unpackb(blocks_frame, raw=False) == [10, 11]
     future.cancel()
+
+
+def _configured_client(policy=None, block_size=4):
+    from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+
+    fake_socket = MagicMock(name="zmq_socket")
+    fake_context = MagicMock(name="zmq_context")
+    fake_context.socket.return_value = fake_socket
+    with patch("megatron.core.inference.inference_client.zmq.Context", return_value=fake_context):
+        client = InferenceClient(
+            "tcp://127.0.0.1:5555",
+            block_size_tokens=block_size,
+            prefix_caching_coordinator_policy=policy
+            or PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        )
+    return client, fake_socket
+
+
+def _hash_frame(fake_socket):
+    return msgpack.unpackb(fake_socket.send_multipart.call_args.args[0][2], raw=False)
+
+
+async def test_unconfigured_client_says_it_did_not_hash():
+    """The regression that matters: None, never [].
+
+    Callers that build an InferenceClient directly -- MegatronAsyncLLM,
+    megatron.rl, the coordinator example -- configure neither the block size nor
+    the policy. Reporting an empty list for them reads as "hashed, nothing
+    matched", so the coordinator skips its own hashing and prefix-affinity
+    routing silently degrades to load balancing with nothing raising.
+    """
+    fake_socket = MagicMock(name="zmq_socket")
+    fake_context = MagicMock(name="zmq_context")
+    fake_context.socket.return_value = fake_socket
+    with patch("megatron.core.inference.inference_client.zmq.Context", return_value=fake_context):
+        client = InferenceClient("tcp://127.0.0.1:5555")
+    client.add_request(list(range(8)), SamplingParams()).cancel()
+    assert _hash_frame(fake_socket) is None
+
+
+async def test_configured_client_hashes_a_text_prompt():
+    import torch
+
+    from megatron.core.inference.inference_request import compute_block_hashes_batched
+
+    client, fake_socket = _configured_client()
+    tokens = list(range(8))
+    client.add_request(tokens, SamplingParams()).cancel()
+    assert _hash_frame(fake_socket) == compute_block_hashes_batched(
+        torch.tensor(tokens, dtype=torch.int64), block_size=4
+    )
+
+
+async def test_multimodal_hashes_are_salted_with_the_media_key():
+    """Same tokens, different media, disjoint hashes.
+
+    The client is the only place holding both the tokens and the media key, so
+    it is the only place that can salt them without deriving the key twice --
+    deriving it digests the media, hundreds of MB for video.
+    """
+    import torch
+
+    from megatron.core.inference.inference_request import (
+        compute_block_hashes_batched,
+        compute_media_cache_key,
+    )
+
+    client, fake_socket = _configured_client()
+    tokens = list(range(8))
+
+    client.add_request(tokens, SamplingParams()).cancel()
+    text_hashes = _hash_frame(fake_socket)
+
+    client.add_request(tokens, SamplingParams(), multi_modal_data={"image": b"jpeg"}).cancel()
+    media_hashes = _hash_frame(fake_socket)
+
+    assert set(text_hashes).isdisjoint(media_hashes)
+    assert media_hashes == compute_block_hashes_batched(
+        torch.tensor(tokens, dtype=torch.int64),
+        block_size=4,
+        cache_salt=compute_media_cache_key("image", [b"jpeg"]),
+    )
+
+
+async def test_media_bytes_travel_in_their_own_frame():
+    """Media rides in a body frame; only its bounded descriptor is metadata.
+
+    The coordinator decodes and repacks the metadata frame for every request, so
+    anything unbounded in it is paid for on a loop shared by every rank. Raw
+    video reaches hundreds of megabytes, which is three orders of magnitude more
+    than the prompt decode the earlier split removed.
+    """
+    from megatron.core.inference.inference_request import compute_media_cache_key
+
+    client, fake_socket = _configured_client()
+    image = b"jpeg-payload"
+
+    client.add_request(list(range(8)), SamplingParams(), multi_modal_data={"image": image}).cancel()
+    meta_frame, _prompt, _hashes, media_frame = fake_socket.send_multipart.call_args.args[0]
+
+    media_meta = msgpack.unpackb(meta_frame, raw=False)[3]
+    assert media_meta == {
+        "media_cache_key": compute_media_cache_key("image", [image]),
+        "modality": "image",
+    }
+    # The bytes are in the body frame, and nowhere in the metadata frame.
+    assert msgpack.unpackb(media_frame, raw=False) == [image]
+    assert image not in meta_frame
+
+
+async def test_media_frames_round_trip_back_to_serialized_form():
+    """What the engine reassembles from the two frames is what was serialized."""
+    from megatron.core.inference.inference_request import (
+        merge_multimodal_data,
+        serialize_multimodal_data,
+    )
+
+    client, fake_socket = _configured_client()
+    multi_modal_data = {"image": [b"a", b"bb"], "media_tokens_preexpanded": True}
+
+    client.add_request(list(range(8)), SamplingParams(), multi_modal_data=multi_modal_data).cancel()
+    meta_frame, _prompt, _hashes, media_frame = fake_socket.send_multipart.call_args.args[0]
+
+    reassembled = merge_multimodal_data(
+        msgpack.unpackb(meta_frame, raw=False)[3], msgpack.unpackb(media_frame, raw=False)
+    )
+    assert reassembled == serialize_multimodal_data(multi_modal_data)
+
+
+async def test_load_balanced_policy_skips_hashing():
+    """Nobody reads them under LOAD_BALANCED, so computing them is pure overhead."""
+    from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+
+    client, fake_socket = _configured_client(PrefixCachingCoordinatorPolicy.LOAD_BALANCED)
+    client.add_request(list(range(8)), SamplingParams()).cancel()
+    assert _hash_frame(fake_socket) == []
+
+
+async def test_string_prompt_is_left_to_the_coordinator():
+    """Hashing needs token ids, and the client has no tokenizer."""
+    client, fake_socket = _configured_client()
+    client.add_request("some prompt text", SamplingParams()).cancel()
+    assert _hash_frame(fake_socket) is None
+
+
+async def test_add_request_with_id_returns_the_id_abort_needs():
+    """The id handed back is the one that reaches the coordinator as ABORT_REQUEST.
+
+    A non-streaming HTTP response writes nothing to the socket while it
+    generates, so a client that disconnects mid-generation is never discovered
+    as a broken pipe. The handler has to abort explicitly, and abort_request
+    takes an id -- with only the future in hand there is nothing to name, and
+    cancelling the future alone leaves the engine generating. add_request keeps
+    returning the future alone, delegating here for the id sequence.
+    """
+    client, _, fake_socket = _make_client()
+
+    delegated = client.add_request("a", SamplingParams())
+    request_id, future = client.add_request_with_id("hello", SamplingParams())
+
+    assert isinstance(future, asyncio.Future)
+    assert request_id == 1, "add_request must consume an id from the same counter"
+    assert client.completion_futures == {0: delegated, request_id: future}
+    # The submission travels as multipart frames; header and id are in frame 0.
+    submitted = msgpack.unpackb(fake_socket.send_multipart.call_args.args[0][0], raw=False)
+    assert submitted[0] == Headers.SUBMIT_REQUEST.value
+    assert submitted[1] == request_id
+
+    client.abort_request(request_id)
+
+    aborted = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
+    assert aborted == [Headers.ABORT_REQUEST.value, request_id]
+    # The abort has to drop local state too, or the handler leaks a future that
+    # nothing will ever resolve.
+    assert request_id not in client.completion_futures
+    assert request_id in client.aborted_request_ids
+
+    delegated.cancel()
+
+
+def _consume_reply_for_a_completed_request(client):
+    """Submit, then stand in for _recv_task delivering the final reply."""
+    request_id, future = client.add_request_with_id("hello", SamplingParams())
+    # _recv_task pops the future from completion_futures immediately before
+    # resolving it.
+    client.completion_futures.pop(request_id)
+    future.set_result({"tokens": [1]})
+    return request_id
+
+
+def _consume_reply_for_a_finished_stream(client):
+    """Same, for the streaming path, whose AsyncStream aborts on close."""
+    stream = client.add_request_streaming("hello", SamplingParams())
+    # _recv_task pops the stream before delivering the final frame.
+    client.streams.pop(stream.request_id)
+    return stream.request_id
+
+
+@pytest.mark.parametrize(
+    "finish_request",
+    [_consume_reply_for_a_completed_request, _consume_reply_for_a_finished_stream],
+    ids=["completed_future", "finished_stream"],
+)
+async def test_abort_request_ignores_a_request_with_no_local_state(finish_request):
+    """A completed request must not be recorded in aborted_request_ids.
+
+    That set is pruned in exactly one place -- _recv_task, when an ENGINE_REPLY
+    arrives for the id. Once the reply has been consumed no further reply will
+    ever arrive, so recording the id there leaks an entry for the lifetime of
+    the process: the same unbounded growth this abort path exists to prevent,
+    moved from the engine's batch into the client. The new callers hit this
+    routinely -- gather propagates on the first failure while siblings that
+    already succeeded are aborted after completion.
+    """
+    client, _, fake_socket = _make_client()
+
+    request_id = finish_request(client)
+    fake_socket.send.reset_mock()
+
+    client.abort_request(request_id)
+
+    assert request_id not in client.aborted_request_ids
+    # The coordinator has already dropped its mapping for a finished request,
+    # so the ABORT_REQUEST send would be wasted too.
+    fake_socket.send.assert_not_called()

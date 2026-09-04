@@ -23,8 +23,15 @@ from megatron.core.inference.config import (
     PrefixCachingEvictionPolicy,
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling.base import Sampling
-from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.sampling_params import (
+    MIN_SAMPLING_TEMPERATURE,
+    SamplingParams,
+    is_no_op_top_k,
+    is_no_op_top_p,
+)
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
@@ -337,6 +344,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Hyperparameter for choosing to prioritize prefix hit matches vs minimizing idle load
         self.prefix_caching_routing_alpha = inference_config.prefix_caching_routing_alpha
+        self.prefix_cache_ttl_seconds = inference_config.prefix_cache_ttl_seconds
+        self.media_cache_coordinator_policy = inference_config.media_cache_coordinator_policy
+        self.media_cache_routing_weight = inference_config.media_cache_routing_weight
 
         # Monotonic clock for prefix caching LRU eviction ordering.
         # Incremented each engine step but kept independent so the engine step
@@ -435,11 +445,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.gdp_num_householder = mamba_inference_state_config.gdp_num_householder
 
             if self.batch_invariant_mode:
-                # Gated Delta Product does not implement batch-invariant mode yet.
-                assert self.gdp_num_householder == 0, (
-                    "batch_invariant_mode does not support Gated Delta Product layers; "
-                    "set batch_invariant_mode=False."
-                )
                 assert not self.enable_prefix_caching, (
                     "batch_invariant_mode does not support Mamba prefix caching; "
                     "set enable_prefix_caching=False."
@@ -819,6 +824,30 @@ class DynamicInferenceContext(BaseInferenceContext):
                 topk=model_config.moe_router_topk,
                 hidden_size=moe_hidden_size,
                 ep_group=self.expert_model_parallel_group,
+            )
+
+        # Pre-allocate the vLLM fused-MoE intermediates so no allocation happens
+        # inside CUDA graph capture; one buffer set is shared by all MoE layers
+        # and graphs. Like the dispatcher buffers above, these persist across
+        # engine suspend/resume.
+        if (
+            model_config.num_moe_experts
+            and model_config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
+        ):
+            ep_size = get_pg_size(self.expert_model_parallel_group)
+            moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
+            # Worst-case rows entering the MoE: the fixed NVLS AGV buffer height
+            # (per-rank worst case * ep_size); max_tokens covers the EP=1 / NCCL paths.
+            moe_max_rows = max(
+                self.max_tokens, self.round_up_tokens(self.max_tokens) // tp_size * ep_size
+            )
+            VllmFusedMoeBuffers.allocate_buffers(
+                max_tokens=moe_max_rows,
+                topk=model_config.moe_router_topk,
+                fc1_output_size=model_config.moe_ffn_hidden_size
+                * (2 if model_config.gated_linear_unit else 1),
+                hidden_size=moe_hidden_size,
+                num_local_experts=model_config.num_moe_experts // ep_size,
             )
 
         # Deal with chunked prefill
@@ -1791,6 +1820,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 padded_active_token_count=self.padded_active_token_count,
                 token_to_block_idx=self.gpu_view.token_to_block_idx,
                 token_to_local_position_within_kv_block=self.gpu_view.token_to_local_position_within_kv_block,
+                dummy_block_idx=self.kv_block_allocator.dummy_block_idx,
             )
 
         block_idx = self.gpu_view.token_to_block_idx[: self.padded_active_token_count]
@@ -3064,10 +3094,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         mamba_map = self.mamba_slot_allocator.hash_to_block_id
         hashes = req.precomputed_block_hashes[start_block:end_block]
-        for i in range(len(hashes) - 1, -1, -1):
-            if hashes[i] in mamba_map:
-                return i + 1
-        return 0
+
+        # Mark the blocks in range whose hash the allocator still holds state
+        # for; the farthest such block is the match count. Intersecting against
+        # the range's hashes first keeps this bounded by the range rather than
+        # the size of the whole cache.
+        block_hashes = torch.tensor(hashes, dtype=torch.int64)
+        cached = mamba_map.keys() & set(hashes)
+        cached_hashes = torch.tensor(list(cached), dtype=torch.int64)
+        is_cached = torch.isin(block_hashes, cached_hashes)
+        return int(is_cached.nonzero()[-1].item()) + 1 if is_cached.any() else 0
 
     def _compute_prefix_match(
         self,
@@ -3124,7 +3160,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # already had Mamba state restored during the first chunk.
         if self.is_hybrid_model and self.mamba_slot_allocator is not None and finished == 0:
             num_mamba_matched = self._find_mamba_match_count(
-                req, already_allocated_blocks, already_allocated_blocks + num_matched
+                req=req,
+                start_block=already_allocated_blocks,
+                end_block=already_allocated_blocks + num_matched,
             )
             if record_mamba_match:
                 req._mamba_num_matched_blocks = num_mamba_matched
@@ -3135,12 +3173,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 raw_skip = num_mamba_matched * self.block_size_tokens
                 if raw_skip >= prefill_chunk_length:
                     # Back off to previous block with cached Mamba state
-                    mamba_map = self.mamba_slot_allocator.hash_to_block_id
-                    backed_off_blocks = 0
-                    for j in range(num_mamba_matched - 2, -1, -1):
-                        if req.precomputed_block_hashes[j] in mamba_map:
-                            backed_off_blocks = j + 1
-                            break
+                    backed_off_blocks = self._find_mamba_match_count(
+                        req=req, start_block=0, end_block=num_mamba_matched - 1
+                    )
                     prefix_skip_tokens = backed_off_blocks * self.block_size_tokens
                 else:
                     prefix_skip_tokens = raw_skip
@@ -3158,6 +3193,32 @@ class DynamicInferenceContext(BaseInferenceContext):
         if prefill_chunk_length - prefix_skip_tokens < 2 and prefill_chunk_length >= 2:
             max_skip = prefill_chunk_length - 2
             prefix_skip_tokens = (max_skip // self.block_size_tokens) * self.block_size_tokens
+
+            # Rounding down can land on a block that has no cached Mamba state.
+            # add_request() restores from `prefix_skip_tokens // block_size - 1`
+            # unconditionally and, when `restore_to_live` misses, ZEROES the SSM
+            # state while still skipping the tokens -- the request then resumes
+            # mid-prompt from a zero state and produces a wrong (but internally
+            # coherent) distribution for its first generated token.
+            #
+            # Mamba boundaries are sparse: only the few positions selected in
+            # `compute_and_store_offsets` are cached, so the clamped boundary is
+            # frequently not one of them. A 5889-token prompt caches state only at
+            # block 22 (offset 5888), the clamp moves the skip to 5632, and the
+            # restore then targets block 21, which has none.
+            #
+            # Walk back to the nearest block that actually has cached state, the
+            # same way the `raw_skip >= prefill_chunk_length` branch above does.
+            if (
+                self.is_hybrid_model
+                and self.mamba_slot_allocator is not None
+                and finished == 0
+                and prefix_skip_tokens > 0
+            ):
+                usable = self._find_mamba_match_count(
+                    req=req, start_block=0, end_block=prefix_skip_tokens // self.block_size_tokens
+                )
+                prefix_skip_tokens = usable * self.block_size_tokens
 
         effective_prefill_chunk_length = prefill_chunk_length - prefix_skip_tokens
         num_blocks_from_pool = max(
@@ -3296,15 +3357,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_matched_blocks = len(matched_block_ids)
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 
-        # Track prefix cache hits. num_cached_tokens accumulates across prefill
-        # chunks: each chunk matches a disjoint block range (start advances with
-        # finished_chunk_token_count), so a long cached prefix is discovered
-        # incrementally and must be summed, not overwritten.
-        if num_matched_blocks > 0:
-            self.prefix_cache_hits += 1
-            self.prefix_cache_blocks_matched += num_matched_blocks
-            req.num_cached_tokens += num_matched_blocks * self.block_size_tokens
-
         # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:prefill_chunk_length]
 
@@ -3332,6 +3384,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 if matched_tensor is not None:
                     self.kv_block_allocator.block_ref_counts[matched_tensor] -= 1
                 raise BlockOverflowError(req.request_id)
+
+        # Track prefix cache hits only after allocation succeeds. Matched blocks
+        # measure KV reuse, while num_cached_tokens accumulates the prefill tokens
+        # actually skipped after Mamba and minimum-prefill backoff.
+        if num_matched_blocks > 0:
+            self.prefix_cache_hits += 1
+            self.prefix_cache_blocks_matched += num_matched_blocks
+            req.num_cached_tokens += prefix_skip_tokens
 
         # Note that we decremented the total_request_count for the chunked prefill request
         # in update_requests, so setting current_id to the total_request_count will again
@@ -3414,6 +3474,63 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_block_idx[
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = self.request_to_kv_block_ids[current_id][token_offset_range // self.block_size_tokens]
+        if num_matched_blocks > 0:
+            # Some tokens we are about to compute may land inside a block we matched
+            # by hash. That block already holds the correct KV for exactly these
+            # tokens and is shared with whoever cached it, so send those writes to the
+            # dummy block rather than perturb a concurrent reader's values.
+            #
+            # Only the write mapping moves. `request_to_kv_block_ids` still points at
+            # the real block, so attention reads the cached KV through the block table,
+            # and `token_to_block_idx` is rebuilt every step so nothing needs restoring.
+            #
+            # All positions below are absolute token positions within the request.
+            # A chunk resuming mid-block, with one fresh block past the match:
+            #
+            #   token      0     B     2B    3B    4B
+            #   blocks     |--0--|--1--|--2--|--3--|
+            #   matched    [=================]        blocks 0-2 were hash-matched
+            #   chunk               [==============]  tokens computed this step
+            #   redirect            [========]        the overlap -> dummy block
+            #   write                        [=====]  the rest -> real block 3
+
+            # 1. The blocks matched here sit right after the blocks this request
+            #    already owns. The partial block carried over from the previous
+            #    chunk joins them when it was itself matched earlier -- the tokens
+            #    completing it are cached too, and it is still shared with whoever
+            #    cached it. Everything before that is a prefix of matched blocks, so
+            #    starting the span at 0 is safe; the intersection below clips it.
+            matched_prefix_start_token = (
+                0
+                if req.num_matched_prefix_blocks >= already_allocated_blocks
+                else already_allocated_blocks * self.block_size_tokens
+            )
+            matched_prefix_end_token = (
+                already_allocated_blocks + num_matched_blocks
+            ) * self.block_size_tokens
+
+            # 2. This chunk computes the tokens starting at `effective_kv_offset`
+            #    (the prompt offset left over after skipping the cached prefix).
+            chunk_start_token = effective_kv_offset
+            chunk_end_token = effective_kv_offset + effective_prefill_chunk_length
+
+            # 3. The redundant tokens are where those two spans overlap. Non-empty
+            #    whenever we matched more blocks than we skipped tokens for: the
+            #    ">= 2 computed tokens" clamp, the Mamba back-off, or memory-only
+            #    hybrid mode where nothing is skipped but blocks are still shared.
+            overlap_start_token = max(matched_prefix_start_token, chunk_start_token)
+            overlap_end_token = min(matched_prefix_end_token, chunk_end_token)
+
+            # 4. Rebase the overlap onto this chunk's slots and redirect it. The
+            #    overlap starts past the chunk start only when this chunk's own
+            #    matched blocks begin later than the tokens it computes, i.e. the
+            #    chunk opens inside a freshly allocated block that it must write.
+            if overlap_end_token > overlap_start_token:
+                redirect_start = self.active_token_count + overlap_start_token - chunk_start_token
+                redirect_end = self.active_token_count + overlap_end_token - chunk_start_token
+                self.token_to_block_idx[redirect_start:redirect_end] = (
+                    self.kv_block_allocator.dummy_block_idx
+                )
         self.token_to_local_position_within_kv_block[
             self.active_token_count : self.active_token_count + effective_prefill_chunk_length
         ] = (token_offset_range % self.block_size_tokens)
@@ -3496,6 +3613,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 matched_block_ids,
                 overall_required_blocks,
             )
+
+        # Extend the request's run of matched blocks, so a later chunk knows not to
+        # rewrite the partial block it inherits from this one. Only extend when this
+        # chunk's matches continue the run: a gap means the blocks in between were
+        # computed by this request and the tokens completing them must be written.
+        if num_matched_blocks > 0 and req.num_matched_prefix_blocks >= already_allocated_blocks:
+            req.num_matched_prefix_blocks = already_allocated_blocks + num_matched_blocks
 
         self.active_token_count += effective_prefill_chunk_length
         self.lifetime_prefill_token_count += effective_prefill_chunk_length
@@ -4599,6 +4723,25 @@ class DynamicInferenceContext(BaseInferenceContext):
             "evict_request_ids": evict_request_ids,
         }
 
+    def active_sampling_filter_flags(
+        self, active_request_count: Optional[int] = None
+    ) -> Tuple[bool, bool]:
+        """Return `(no_top_k, no_top_p)` batch-level flags for the active batch.
+
+        These are read from the pinned CPU sampling metadata, so they incur no GPU sync.
+        They are used in several places to decide whether to skip sampling-filtering work.
+        """
+        if active_request_count is None:
+            active_request_count = self.total_request_count - self.paused_request_count
+        if active_request_count <= 0:
+            return True, True
+
+        top_k = self.active_request_metadata["top_k"][:active_request_count]
+        top_p = self.active_request_metadata["top_p"][:active_request_count]
+        no_top_k = bool(is_no_op_top_k(top_k).all())
+        no_top_p = bool(is_no_op_top_p(top_p).all())
+        return no_top_k, no_top_p
+
     def _processed_log_probs(
         self,
         logits: Tensor,
@@ -4665,7 +4808,25 @@ class DynamicInferenceContext(BaseInferenceContext):
             log_probs = self._processed_log_probs(
                 active_logits, n_active, None, sampling, row_to_request
             )
-            return log_probs[seq_idx, new_tokens], log_probs
+            selected_log_probs = log_probs[seq_idx, new_tokens]
+            if self.config.logprobs_mode != "raw_logprobs" and not all(
+                self.active_sampling_filter_flags(n_active)
+            ):
+                if row_to_request is None:
+                    temperature = self.gpu_view.temperature[: len(new_tokens)]
+                else:
+                    temperature = self.gpu_view.temperature[
+                        row_to_request.to(logits.device, non_blocking=True)
+                    ]
+                scaled = active_logits / temperature.clamp(min=MIN_SAMPLING_TEMPERATURE).unsqueeze(
+                    1
+                )
+                gathered = scaled.gather(1, new_tokens.view(-1, 1).long()).squeeze(1)
+                tempered = gathered - scaled.logsumexp(dim=1)
+                selected_log_probs = torch.where(
+                    torch.isfinite(selected_log_probs), selected_log_probs, tempered
+                )
+            return selected_log_probs, log_probs
 
         logits_squeezed = logits_squeezed.float()
         active_slice = slice(self.paused_request_count, self.total_request_count)
@@ -4681,7 +4842,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             logits_squeezed, n_active, active_query_lengths_cpu, sampling
         )
         seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
-        return log_probs[seq_idx, active_token_ids], log_probs
+        selected_log_probs = log_probs[seq_idx, active_token_ids]
+        if self.config.logprobs_mode != "raw_logprobs" and not all(
+            self.active_sampling_filter_flags(n_active)
+        ):
+            # Only each request's final row is engine-sampled; prompt rows may keep -inf.
+            temperature = self.gpu_view.temperature[:n_active]
+            scaled = logits_squeezed[new_token_idx] / temperature.clamp(
+                min=MIN_SAMPLING_TEMPERATURE
+            ).unsqueeze(1)
+            gathered = scaled.gather(1, new_tokens.view(-1, 1).long()).squeeze(1)
+            tempered = gathered - scaled.logsumexp(dim=1)
+            sampled = selected_log_probs[new_token_idx]
+            selected_log_probs[new_token_idx] = torch.where(
+                torch.isfinite(sampled), sampled, tempered
+            )
+        return selected_log_probs, log_probs
 
     def calculate_log_probs(
         self,
