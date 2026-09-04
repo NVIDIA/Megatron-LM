@@ -1011,24 +1011,26 @@ def _num_dsa_indexer_layers(
     *,
     mtp_num_layers=0,
     mtp_use_repeated_layer=False,
+    mtp_shares_sparse_attention_index=False,
 ):
     """Count DSA indexer executions on the standard-model path.
 
     Cross-layer top-k sharing is tied to the physical layer number, so repeated
-    MTP either executes its one indexer ``D`` times or reuses top-k ``D`` times.
+    MTP normally executes its one indexer ``D`` times. When repeated MTP shares
+    its sparse-attention index, only depth 0 executes the indexer.
     """
 
     def computes_index(layer_number):
         return not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
 
-    return sum(
-        computes_index(layer_number)
-        for layer_number in _standard_layer_numbers_for_execution(
-            num_decoder_layers,
-            mtp_num_layers=mtp_num_layers,
-            mtp_use_repeated_layer=mtp_use_repeated_layer,
-        )
+    layer_numbers = _standard_layer_numbers_for_execution(
+        num_decoder_layers,
+        mtp_num_layers=mtp_num_layers,
+        mtp_use_repeated_layer=mtp_use_repeated_layer,
     )
+    if mtp_use_repeated_layer and mtp_num_layers > 0 and mtp_shares_sparse_attention_index:
+        layer_numbers = layer_numbers[: num_decoder_layers + 1]
+    return sum(computes_index(layer_number) for layer_number in layer_numbers)
 
 
 def _vision_flops_stats_tensor(reference: torch.Tensor | None = None) -> torch.Tensor:
@@ -2047,6 +2049,11 @@ def num_floating_point_operations(
             mtp_num_layers = 0
             num_layers = args.num_layers
 
+        mtp_use_repeated_layer = getattr(args, "mtp_use_repeated_layer", False)
+        mtp_shared_components = frozenset(
+            getattr(args, "mtp_repeated_layer_shared_components", None) or ()
+        )
+
         moe_ffn_hidden_size = (
             args.moe_ffn_hidden_size
             if args.moe_ffn_hidden_size is not None
@@ -2359,7 +2366,10 @@ def num_floating_point_operations(
                     args.dsa_indexer_skip_topk_offset,
                     args.dsa_indexer_topk_freq,
                     mtp_num_layers=mtp_num_layers,
-                    mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+                    mtp_use_repeated_layer=mtp_use_repeated_layer,
+                    mtp_shares_sparse_attention_index=(
+                        "sparse_attention_index" in mtp_shared_components
+                    ),
                 ),
                 dsa_indexer_loss_enabled=(args.dsa_indexer_loss_coeff or 0.0) > 0,
                 dsa_indexer_use_sparse_loss=getattr(args, "dsa_indexer_use_sparse_loss", False),
@@ -5038,6 +5048,10 @@ def training_log(
                 args.dsa_indexer_topk_freq,
                 mtp_num_layers=args.mtp_num_layers,
                 mtp_use_repeated_layer=getattr(args, "mtp_use_repeated_layer", False),
+                mtp_shares_sparse_attention_index=(
+                    "sparse_attention_index"
+                    in (getattr(args, "mtp_repeated_layer_shared_components", None) or ())
+                ),
             )
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
