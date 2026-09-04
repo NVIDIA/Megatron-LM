@@ -61,11 +61,14 @@ kernels remain eligible. KV-only sharing does not itself disable the combined ke
 
 Compatibility:
 
+- Full uniform recompute supports sharing with `recompute_num_layers: 1`.
+  With block recompute, MTP retains its existing non-checkpointed fallback.
 - Selective recompute supports `mlp`, `moe`, `moe_act`, `shared_experts`,
-  `layernorm`, and `mhc`, subject to their existing requirements.
-  `mla_up_proj` supports index-only sharing, but not KV sharing.
-- Full recompute and selective `core_attn` recompute are unsupported.
-  Set `recompute_modules` explicitly: selective recompute defaults to `core_attn`.
+  `layernorm`, `mhc`, and `mla_up_proj`, subject to their existing requirements.
+  With KV sharing, `mla_up_proj` checkpoints Q only and retains the shared KV graph.
+- Selective `core_attn` supports index-only sharing, but not KV sharing.
+  Set `recompute_modules` explicitly for KV sharing: selective recompute defaults
+  to `core_attn`.
 - Attention CUDA graph capture is unsupported; MoE-only scopes remain compatible.
 
 ## Pipeline Parallel Layout for MTP
