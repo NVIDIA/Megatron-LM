@@ -839,7 +839,8 @@ def _get_megatron_emerging_optimizer(
                 override['optimizer'] = config.muon_scalar_optimizer
     config_overrides.update(default_param_overrides)
 
-    # Build param groups and bucket by (optimizer_name, is_expert_parallel).
+    # Build param groups. MFSDP v2 combines all Muon DP groups into one optimizer so
+    # expert-local NS can overlap dense owner communication.
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.
     all_param_groups = _get_param_groups(
         model_chunks, config, config_overrides, param_group_process_group
@@ -857,10 +858,10 @@ def _get_megatron_emerging_optimizer(
                 )
                 params_by_mesh[mesh_ranks].append(parameter)
 
-            for mesh_ranks, parameters in params_by_mesh.items():
+            for parameters in params_by_mesh.values():
                 mesh_group = group.copy()
                 mesh_group['params'] = parameters
-                grouped_param_groups[(opt_name, is_expert, mesh_ranks)].append(mesh_group)
+                grouped_param_groups[(opt_name, False, None)].append(mesh_group)
         else:
             grouped_param_groups[(opt_name, is_expert, None)].append(group)
 
@@ -944,33 +945,17 @@ def _get_megatron_emerging_optimizer(
                 if not parameters:
                     raise RuntimeError("MFSDP v2 Muon received no parameters on this rank.")
 
-                dp_mesh = parameters[0].device_mesh
-                if dp_mesh.ndim != 1:
-                    raise ValueError(
-                        "MFSDP v2 Muon currently supports a one-dimensional data-parallel "
-                        f"mesh, got mesh shape {tuple(dp_mesh.mesh.shape)}."
-                    )
-                expected_ranks = tuple(
-                    torch.distributed.get_process_group_ranks(dp_mesh.get_group())
-                )
-                for parameter in parameters[1:]:
+                for parameter in parameters:
                     parameter_mesh = parameter.device_mesh
-                    if (
-                        parameter_mesh.ndim != 1
-                        or tuple(
-                            torch.distributed.get_process_group_ranks(parameter_mesh.get_group())
-                        )
-                        != expected_ranks
-                    ):
+                    if parameter_mesh.ndim != 1:
                         raise ValueError(
-                            "Each MFSDP v2 Muon optimizer instance requires all parameters "
-                            "to use the same one-dimensional data-parallel mesh."
+                            "MFSDP v2 Muon currently supports one-dimensional data-parallel "
+                            f"meshes, got mesh shape {tuple(parameter_mesh.mesh.shape)}."
                         )
 
                 optimizer = FsdpMuon(
                     groups,
                     inner_optimizer=optimizer,
-                    dp_mesh=dp_mesh,
                     max_params_per_owner_chunk=config.muon_max_params_per_owner_chunk,
                 )
                 optimizer = FullyShardedOptimizer(
