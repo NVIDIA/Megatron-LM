@@ -16,6 +16,7 @@ from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.shared_experts import FusedSharedExpertMLP, SharedExpertMLP
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -353,13 +354,13 @@ class TestSharedExperts:
             tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
         )
         # Create MoE layer with shared expert overlap enabled.
-        model_parallel_cuda_manual_seed(123)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
         moe_layer_overlap = self.get_moe_layer(
             moe_shared_expert_overlap=True, moe_token_dispatcher_type=dispatcher_type
         ).to(dtype=torch.bfloat16)
 
         # Create MoE layer with shared expert overlap disabled.
-        model_parallel_cuda_manual_seed(123)
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
         moe_layer_no_overlap = self.get_moe_layer(
             moe_shared_expert_overlap=False, moe_token_dispatcher_type=dispatcher_type
         ).to(dtype=torch.bfloat16)

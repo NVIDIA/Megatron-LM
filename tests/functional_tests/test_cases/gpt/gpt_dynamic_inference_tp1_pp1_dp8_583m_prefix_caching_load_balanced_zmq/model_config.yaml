@@ -44,7 +44,7 @@ MODEL_ARGS:
   --num-tokens-to-generate: 30
   --inference-dynamic-batching-buffer-size-gb: 20
   --inference-dynamic-batching-prefix-caching: true
-  --inference-dynamic-batching-prefix-caching-coordinator-policy: round_robin
+  --inference-dynamic-batching-prefix-caching-coordinator-policy: load_balanced
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true # To handle the extra_state errors
   --output-path: ${INFERENCE_OUTPUT_PATH}
