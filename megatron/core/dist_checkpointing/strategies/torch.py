@@ -649,10 +649,36 @@ class TorchDistSaveShardedStrategy:
         self.validated_loaded_metadata_reuse = False
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
-        """Sync save always uses the built-in implementation."""
-        async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy="mcore")
-        async_request.execute_sync()
-        del async_request
+        """Sync save always uses PyTorch's built-in synchronous saving mechanism.
+
+        Unlike `async_save`, this doesn't touch any nvrx (or mcore) async modules,
+        so it works without nvidia-resiliency-ext installed.
+        """
+        if self.separation_hint is not None:
+            raise NotImplementedError(
+                "separation_hint is only supported by async_save (requires "
+                "nvidia-resiliency-ext); it is not supported for sync save."
+            )
+
+        # Translate the state dict
+        sharded_state_dict, _flat_mapping, _rename_mapping = (
+            _replace_state_dict_keys_with_sharded_keys(
+                sharded_state_dict, self.keep_only_main_replica
+            )
+        )
+        pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
+
+        writer = _get_filesystem_writer(checkpoint_dir, thread_count=self.thread_count)
+
+        checkpoint.save(
+            pyt_state_dict,
+            storage_writer=writer,
+            planner=MCoreSavePlanner(
+                dedup_replicated_tensors=not self.keep_only_main_replica,
+                flatten_state_dict=False,
+                flatten_sharded_tensors=False,
+            ),
+        )
 
     def async_save(
         self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
@@ -760,6 +786,16 @@ class TorchDistSaveShardedStrategy:
         return make_nvrx_async_request(
             AsyncRequest, save_fn, save_args, [finalize_fn], preload_fn=preload_fn
         )
+
+
+def _get_filesystem_writer(
+    checkpoint_dir: Union[str, Path], thread_count: int = 1
+) -> FileSystemWriter:
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        return msc.torch.MultiStorageFileSystemWriter(checkpoint_dir, thread_count=thread_count)
+
+    return FileSystemWriter(checkpoint_dir, thread_count=thread_count)
 
 
 def _get_filesystem_reader(

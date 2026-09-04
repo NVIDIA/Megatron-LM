@@ -562,7 +562,12 @@ class TestSerialization:
             save_strategy = TorchDistSaveShardedStrategy(
                 "torch_dist", 1, separation_hint=prefix_name
             )
-            save(state_dict, ckpt_dir, save_strategy)
+            # separation_hint is only supported by the nvrx async writer, so this must
+            # go through the async save path (executed synchronously here).
+            async_request = save(
+                state_dict, ckpt_dir, save_strategy, async_sharded_save=True
+            )
+            async_request.execute_sync()
 
             files = os.listdir(ckpt_dir)
             prefix_files = [f for f in files if f.startswith(prefix_name)]
