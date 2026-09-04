@@ -74,9 +74,6 @@ from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end,
 
 logger = getLogger(__name__)
 
-_DTYPE_KEY_FORMAT_METADATA_KEY = 'distrib_optim_dtype_key_format'
-_FQN_SAFE_DTYPE_KEY_FORMAT = 'fqn_safe'
-
 
 def _get_dtype_param_grad_key(param_dtype, grad_dtype):
     """Return the checkpoint-safe key for a parameter/gradient dtype pair."""
@@ -138,11 +135,32 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         'fsdp_dtensor',
     }
 
-    @staticmethod
-    def _back_compat_normalize_loaded_dtype_keys(state_dict: Optional[dict]) -> None:
-        """Normalize dtype tuple keys from old checkpoints to current runtime strings."""
+    def _back_compat_normalize_loaded_dtype_keys(
+        self, state_dict: Optional[dict], checkpoint_version: Optional[float] = None
+    ) -> None:
+        """Adapt legacy dtype FQNs and normalize loaded tuple keys.
+
+        Before loading a checkpoint older than version 3.1, rewrite the loading template's
+        ShardedTensor keys to the legacy dtype FQNs stored in that checkpoint. After loading,
+        normalize any tuple dtype keys in the loaded state to the current string format.
+        """
         if state_dict is None:
             return
+
+        if checkpoint_version is not None and checkpoint_version < 3.1:
+            dtype_fqn_replacements = {
+                f'.dtype_{_get_dtype_param_grad_key(buffer.param_dtype, buffer.grad_dtype)}.': (
+                    f'.dtype_{(buffer.param_dtype, buffer.grad_dtype)}.'
+                )
+                for buffer in self.buffers
+            }
+            for value in nested_values(state_dict):
+                if not isinstance(value, ShardedTensor):
+                    continue
+                for current_dtype_fqn, legacy_dtype_fqn in dtype_fqn_replacements.items():
+                    if current_dtype_fqn in value.key:
+                        value.key = value.key.replace(current_dtype_fqn, legacy_dtype_fqn, 1)
+                        break
 
         def normalize_dtype_keys(dtype_state):
             if not isinstance(dtype_state, dict):
@@ -1574,12 +1592,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 'distrib_optim_sharding_type', 'fully_sharded_model_space'
             )
 
-        # Content metadata is loaded before the sharded state dict is constructed. Mark new
-        # checkpoints so loading can select their FQN-safe dtype names, while the absence of the
-        # marker identifies checkpoints that used tuple dtype keys in their tensor FQNs.
-        if not is_loading and metadata is not None:
-            metadata[_DTYPE_KEY_FORMAT_METADATA_KEY] = _FQN_SAFE_DTYPE_KEY_FORMAT
-
         # Handle FSDP DistributedOptimizer States
         if self.ddp_config.use_megatron_fsdp and sharding_type != "fsdp_dtensor":
             raise NotImplementedError(
@@ -1939,9 +1951,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         data_parallel_rank = self.data_parallel_group.rank()
         data_parallel_world_size = self.data_parallel_group.size()
-        use_legacy_dtype_fqn = is_loading and (
-            (metadata or {}).get(_DTYPE_KEY_FORMAT_METADATA_KEY) != _FQN_SAFE_DTYPE_KEY_FORMAT
-        )
 
         state = self.get_parameter_state_dp_reshardable()
         # per_bucket_numel metadata is saved separately for each TPxPP domain.
@@ -1960,10 +1969,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         for gbuf_idx, gbuf_range_maps in enumerate(self.gbuf_ranges):
             for dtype, gbuf_range_map_for_all_buckets in state[gbuf_idx].items():
-                dtype_fqn = dtype
-                if use_legacy_dtype_fqn:
-                    buffer = self.buffers[gbuf_idx]
-                    dtype_fqn = (buffer.param_dtype, buffer.grad_dtype)
                 for bucket_idx, bucket_state in enumerate(gbuf_range_map_for_all_buckets):
                     # Compute local DP contiguous shard's size.
                     gbuf_world_numel_unpadded = (
@@ -1976,7 +1981,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     sharded_bucket_key = (
                         f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}'
-                        f'.gbuf_idx_{gbuf_idx}.dtype_{dtype_fqn}.bucket_idx_{bucket_idx}'
+                        f'.gbuf_idx_{gbuf_idx}.dtype_{dtype}.bucket_idx_{bucket_idx}'
                     )
 
                     # The global ckpt tensors must be fully covered.
@@ -2058,6 +2063,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 allow_shape_mismatch=False,
                                 replica_id=(self.distributed_optimizer_instance_id, 0, 0),
                             )
+        if is_loading:
+            self._back_compat_normalize_loaded_dtype_keys(
+                state, checkpoint_version=(metadata or {}).get('checkpoint_version')
+            )
         return state
 
     def sharded_param_state_fs_model_space(
