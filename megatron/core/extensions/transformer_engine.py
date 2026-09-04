@@ -2296,6 +2296,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
             if packed_seq_params.cp_group is not None:
+                # Converse of the assert below: a CP-off (local_cp_size == 1)
+                # sub-sample must not carry a CP group, otherwise it would be
+                # routed through the CP attention path. Producers must only
+                # bind cp_group when local_cp_size > 1.
+                assert (
+                    packed_seq_params.local_cp_size is None
+                    or packed_seq_params.local_cp_size > 1
+                ), "cp_group must not be set when local_cp_size == 1 (CP-off convention)"
                 self.cp_group = packed_seq_params.cp_group
                 super().set_context_parallel_group(
                     self.cp_group,
