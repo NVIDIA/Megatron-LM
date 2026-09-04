@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 # pylint: disable=missing-function-docstring, missing-class-docstring
@@ -10,6 +10,16 @@ from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
 
 ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
+
+
+def _propagate_paged_stash_marker(source, target):
+    """Preserve TE's dynamic-activation marker across view/cast operations."""
+    if hasattr(source, "grouped_tensor_scale_inv"):
+        # Lazy import avoids the transformer_engine extension -> MLP -> fusion import cycle.
+        from megatron.core.extensions.transformer_engine import mark_grouped_tensor
+
+        mark_grouped_tensor(target)
+    return target
 
 
 @jit_fuser
@@ -275,6 +285,7 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, weights, fp8_input_store, clamp_value):
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        _propagate_paged_stash_marker(input, input_for_backward)
         ctx.save_for_backward(input_for_backward, weights)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
@@ -339,7 +350,7 @@ def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False, clamp
     """
     ori_shape = input.shape
     assert len(ori_shape) in [2, 3]
-    input = input.view(-1, ori_shape[-1])
+    input = _propagate_paged_stash_marker(input, input.view(-1, ori_shape[-1]))
     if bias is not None:
         raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
     else:

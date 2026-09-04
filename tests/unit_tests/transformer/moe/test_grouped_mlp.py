@@ -10,6 +10,8 @@ import torch.nn.functional as F
 
 import megatron.core.transformer.moe.experts as experts_module
 from megatron.core.activations import squared_relu
+from megatron.core.extensions import transformer_engine as te_ext
+from megatron.core.fusions import fused_bias_geglu, fused_bias_swiglu
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
@@ -66,6 +68,98 @@ def test_grouped_tensor_requires_grouped_gemm():
             num_moe_experts=2,
             moe_use_grouped_tensor=True,
         )
+
+
+def test_paged_stash_allows_non_fused_grouped_tensor_hybridep():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_grouped_gemm=True,
+        moe_use_grouped_tensor=True,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_expert_rank_capacity_factor=1.5,
+        moe_paged_stash=True,
+        use_transformer_engine_op_fuser=False,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        bias_activation_fusion=True,
+    )
+
+    assert config.moe_paged_stash is True
+    assert config.moe_use_grouped_tensor is True
+    assert config.use_transformer_engine_op_fuser is False
+
+
+@pytest.mark.parametrize(
+    "invalid_fused_activation_config",
+    [
+        pytest.param({"bias_activation_fusion": False}, id="fusion-disabled"),
+        pytest.param({"gated_linear_unit": False}, id="not-gated"),
+        pytest.param({"activation_func": F.gelu}, id="unsupported-activation"),
+        pytest.param({"moe_mlp_glu_interleave_size": 16}, id="glu-interleaved"),
+    ],
+)
+def test_non_fused_grouped_tensor_paged_stash_requires_fused_bias_activation(
+    invalid_fused_activation_config,
+):
+    kwargs = {
+        "num_layers": 1,
+        "hidden_size": 128,
+        "num_attention_heads": 4,
+        "num_moe_experts": 2,
+        "moe_grouped_gemm": True,
+        "moe_use_grouped_tensor": True,
+        "moe_token_dispatcher_type": "flex",
+        "moe_flex_dispatcher_backend": "hybridep",
+        "moe_expert_rank_capacity_factor": 1.5,
+        "moe_paged_stash": True,
+        "use_transformer_engine_op_fuser": False,
+        "gated_linear_unit": True,
+        "activation_func": F.silu,
+        "bias_activation_fusion": True,
+    }
+    kwargs.update(invalid_fused_activation_config)
+
+    with pytest.raises(
+        ValueError, match="non-op-fuser GroupedTensor path requires fused SwiGLU or QuickGeGLU"
+    ):
+        TransformerConfig(**kwargs)
+
+
+def test_paged_stash_marking_delegates_to_transformer_engine(monkeypatch):
+    marked = []
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(moe_paged_stash=True)
+    tensors = (torch.zeros(2, 4), torch.ones(2, 1))
+
+    monkeypatch.setattr(te_ext, "_te_mark_grouped_tensor", lambda *args: marked.append(args))
+    module._mark_paged_stash_tensors(*tensors)
+
+    assert len(marked) == 1
+    assert marked[0][0] is tensors[0]
+    assert marked[0][1] is tensors[1]
+
+
+@pytest.mark.parametrize(
+    "propagate_marker",
+    (
+        fused_bias_geglu._propagate_paged_stash_marker,
+        fused_bias_swiglu._propagate_paged_stash_marker,
+    ),
+)
+def test_fused_activation_marker_propagation_uses_te_adapter(monkeypatch, propagate_marker):
+    marked = []
+    source = torch.zeros(2, 4)
+    target = torch.ones(2, 4)
+    source.grouped_tensor_scale_inv = False
+
+    monkeypatch.setattr(te_ext, "_te_mark_grouped_tensor", lambda *args: marked.append(args))
+
+    assert propagate_marker(source, target) is target
+    assert marked == [(target,)]
 
 
 def test_remove_glu_interleaving_restores_contiguous_gate_and_linear_halves():
@@ -222,6 +316,63 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
     torch.testing.assert_close(fused_ops.args[1], tokens_per_expert)
     torch.testing.assert_close(fused_ops.args[2], probs)
     torch.testing.assert_close(fused_ops.args[3], tokens_per_expert)
+
+
+def test_non_fused_forward_wraps_compute_in_paged_stash_scope(monkeypatch):
+    events = []
+
+    class FakeStashContext:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            events.append("exit")
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(
+        fp8=False, fp4=False, moe_paged_stash=True, moe_expert_rank_capacity_factor=1.5
+    )
+    module._with_fused_impl = False
+    module._use_grouped_tensor = True
+
+    monkeypatch.setattr(experts_module, "skip_routed_expert_padding", lambda _config: True)
+
+    def group_start(hidden_states):
+        events.append("start")
+        return hidden_states
+
+    def get_context(**kwargs):
+        events.append("context")
+        assert kwargs["name"] == "grouped_mlp"
+        assert kwargs["max_num_tokens"] == 2
+        torch.testing.assert_close(kwargs["num_tokens_tensor"], torch.tensor(2))
+        assert kwargs["avg_num_tokens"] == 1
+        return FakeStashContext()
+
+    def group_commit(output, *, name):
+        events.append("commit")
+        assert name == "grouped_mlp"
+        return output
+
+    monkeypatch.setattr(experts_module, "paged_stash_group_start", group_start)
+    monkeypatch.setattr(experts_module, "get_paged_stash_context", get_context)
+    monkeypatch.setattr(experts_module, "paged_stash_group_commit", group_commit)
+
+    def unfused_forward(hidden_states, tokens_per_expert, permuted_probs):
+        events.append("compute")
+        assert isinstance(tokens_per_expert, torch.Tensor)
+        return hidden_states + permuted_probs
+
+    module._unfused_forward = unfused_forward
+
+    hidden_states = torch.zeros(2, 4)
+    tokens_per_expert = torch.tensor([1, 1])
+    probs = torch.ones(2)
+    output, output_bias = module.forward(hidden_states, tokens_per_expert, probs)
+
+    torch.testing.assert_close(output, torch.ones_like(hidden_states))
+    assert output_bias is None
+    assert events == ["start", "context", "enter", "compute", "exit", "commit"]
 
 
 def test_apply_bias_returns_input_unchanged_when_bias_is_none():
