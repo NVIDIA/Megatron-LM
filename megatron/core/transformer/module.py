@@ -3,7 +3,7 @@
 """Megatron Module."""
 
 from functools import partial
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import torch
 from torch.autograd import Variable
@@ -21,6 +21,27 @@ from megatron.core.transformer.utils import (
 _FLOAT_TYPES = (torch.FloatTensor, torch.cuda.FloatTensor)
 _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
+
+
+class TwoStageAttentionLayer:
+    """Interface for attention-like modules that expose core and post-core stages."""
+
+    def supports_two_stage_attention(self) -> bool:
+        """Return whether this module instance supports two-stage execution."""
+        return True
+
+    def forward_pre_attn_and_core_attn(
+        self,
+        *args: Any,
+        packed_sequence_cp_metadata: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Run the pre-attention and core-attention stage."""
+        raise NotImplementedError
+
+    def forward_post_core_attn(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the post-core-attention stage."""
+        raise NotImplementedError
 
 
 def param_is_not_shared(param):  # pylint: disable=missing-function-docstring

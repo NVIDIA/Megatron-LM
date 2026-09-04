@@ -2058,6 +2058,9 @@ def validate_args(args, defaults={}):
     assert not (
         args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
     ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'
+    assert not (args.moe_shortcut_connection and args.cuda_graph_impl != "none"), (
+        "CUDA graphs are not supported with --moe-shortcut-connection."
+    )
 
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."

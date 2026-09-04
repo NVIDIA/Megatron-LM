@@ -30,7 +30,7 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -315,7 +315,7 @@ class BaseTransformerLayer(ABC):
         pass
 
 
-class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
+class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAttentionLayer):
     """A single transformer layer.
 
     Transformer layer takes input with size [s, b, h] and returns an
@@ -672,6 +672,37 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return attention_output_with_bias, self.attn_norm_manager, residual
 
+    def supports_two_stage_attention(self) -> bool:
+        """Return whether this is an attention-only layer that supports two-stage execution."""
+        return (
+            isinstance(self.self_attention, TwoStageAttentionLayer)
+            and self.self_attention.supports_two_stage_attention()
+            and isinstance(self.cross_attention, IdentityOp)
+            and isinstance(self.mlp, IdentityOp)
+        )
+
+    def attention_bda_and_cross_attention(
+        self,
+        attention_output_with_bias,
+        residual: Tensor,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        attn_state=(),
+    ):
+        """Apply checkpoint bookkeeping, self-attention BDA, and cross-attention."""
+        if self._input_layernorm_checkpoint_active:
+            # discard the output of the input layernorm and register the recompute
+            # as a gradient hook of attention_output_with_bias[0]
+            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
+                attention_output_with_bias[0]
+            )
+
+        hidden_states = self._apply_self_attn_bda_step(
+            attention_output_with_bias, residual, attn_state
+        )
+        return self._run_cross_attention(hidden_states, context, context_mask, inference_context)
+
     def _forward_attention(
         self,
         hidden_states: Tensor,
@@ -744,17 +775,67 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         nvtx_range_pop(suffix="self_attention")
 
-        if self._input_layernorm_checkpoint_active:
-            # discard the output of the input layernorm and register the recompute
-            # as a gradient hook of attention_output_with_bias[0]
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
-            )
-
-        hidden_states = self._apply_self_attn_bda_step(
-            attention_output_with_bias, residual, attn_state
+        return self.attention_bda_and_cross_attention(
+            attention_output_with_bias,
+            residual,
+            context=context,
+            context_mask=context_mask,
+            inference_context=inference_context,
+            attn_state=attn_state,
         )
-        return self._run_cross_attention(hidden_states, context, context_mask, inference_context)
+
+    def forward_pre_attn_and_core_attn(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        *,
+        packed_sequence_cp_metadata=None,
+    ):
+        """Run the training path through pre-attention and core attention."""
+        assert self.supports_two_stage_attention()
+
+        input_layernorm_output, residual, attn_state = self._run_input_layernorm(hidden_states)
+
+        nvtx_range_push(suffix="self_attention")
+        with _otel_managed_span('layer', 'megatron.layer.self_attention'):
+            attention_intermediate = self.self_attention.forward_pre_attn_and_core_attn(
+                input_layernorm_output,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+            )
+        nvtx_range_pop(suffix="self_attention")
+
+        return attention_intermediate, residual, context, attn_state
+
+    def forward_post_core_attn(
+        self,
+        attention_intermediate: Tensor,
+        residual: Tensor,
+        context: Optional[Tensor] = None,
+        attn_state=(),
+        context_mask: Optional[Tensor] = None,
+    ):
+        """Run the training path after core attention."""
+        assert self.supports_two_stage_attention()
+
+        attention_output_with_bias = self.self_attention.forward_post_core_attn(
+            attention_intermediate
+        )
+        return self.attention_bda_and_cross_attention(
+            attention_output_with_bias,
+            residual,
+            context=context,
+            context_mask=context_mask,
+            attn_state=attn_state,
+        )
 
     def _run_input_layernorm(self, hidden_states):
         """Run input layernorm with optional output-discarding checkpoint and
@@ -857,6 +938,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
         return hidden_states, context
+
 
     @copy_signature(_forward_attention)
     def forward(self, *args, **kwargs):

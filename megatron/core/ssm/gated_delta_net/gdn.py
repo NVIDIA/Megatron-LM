@@ -88,7 +88,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         beta = beta.sigmoid()
         return g, {"beta": beta.contiguous()}
 
-    def forward(
+    def forward_pre_attn_and_core_attn(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -97,14 +97,18 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
+        packed_sequence_cp_metadata=None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> torch.Tensor:
         """
-        Perform a forward pass through the GDN module.
+        Run GDN through its normalized recurrence output, before output projection.
 
         Return:
-            (tuple[torch.Tensor, torch.Tensor]) GDN output and bias.
+            torch.Tensor: Normalized recurrence output.
         """
+        assert packed_sequence_cp_metadata is None, (
+            "GDN does not support packed-sequence chunkwise CP metadata."
+        )
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -278,15 +282,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 core_attn_out, gate, thd_cp_a2a_inv, batch, seq_len, packed_seq_params
             )
 
-        # Output projection
-        nvtx_range_push(suffix="out_proj")
-        out, out_bias = self.out_proj(norm_out)
-        nvtx_range_pop(suffix="out_proj")
-
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
-
-        return out, out_bias
+        return norm_out
 
     def _split_projection(
         self, projected: torch.Tensor, batch: int, seq_len: int
