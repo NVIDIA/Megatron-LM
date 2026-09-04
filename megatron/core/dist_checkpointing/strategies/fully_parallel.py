@@ -101,11 +101,7 @@ class FullyParallelSaveStrategyWrapper:
 
         self.cached_distribution: Optional[ShardDistribution] = None
 
-    def async_save(
-        self,
-        sharded_state_dict: ShardedStateDict,
-        checkpoint_dir: Path,
-    ):
+    def async_save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
         """ """
         self.apply_saving_parallelization(sharded_state_dict)
         return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir)
@@ -223,11 +219,7 @@ class FullyParallelLoadStrategyWrapper:
         self.cached_global_metadata: Optional[Metadata] = None
 
     @debug_time("FullyParallelLoadStrategyWrapper.load", logger)
-    def load(
-        self,
-        sharded_state_dict: ShardedStateDict,
-        checkpoint_dir: Path,
-    ) -> StateDict:
+    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Distributes the load and calls underlying strategy only for parts of the state dict.
 
         Steps:
@@ -320,13 +312,9 @@ class FullyParallelLoadStrategyWrapper:
             # Default (legacy): load only this rank's main-replica objects and
             # exchange them across ranks below.
             with debug_time("base_load_ShardedObjects", logger):
-                loaded_objects = self.base_strategy.load(
-                    to_load_objects, checkpoint_dir
-                )
+                loaded_objects = self.base_strategy.load(to_load_objects, checkpoint_dir)
             with debug_time("base_load_ShardedTensors", logger):
-                loaded_tensors = self.base_strategy.load(
-                    to_load_shards, checkpoint_dir
-                )
+                loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir)
 
         with debug_time("self.exchange_loaded_tensors", logger):
 

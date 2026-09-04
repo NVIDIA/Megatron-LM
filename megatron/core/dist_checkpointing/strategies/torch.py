@@ -681,9 +681,7 @@ class TorchDistSaveShardedStrategy:
         )
 
     def async_save(
-        self,
-        sharded_state_dict: ShardedStateDict,
-        checkpoint_dir: Path,
+        self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
     ) -> AsyncRequest:
         """Translates MCore ShardedTensors to PyT ShardedTensors & saves in PyT Distributed format.
 
@@ -695,7 +693,9 @@ class TorchDistSaveShardedStrategy:
         """
         if HAVE_NVRX:
             # Import needed nvrx modules
-            from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import FileSystemWriterAsync  # pylint: disable=line-too-long
+            from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (  # pylint: disable=line-too-long
+                FileSystemWriterAsync,
+            )
             from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
                 CheckpointMetadataCache,
                 save_state_dict_async_plan,
@@ -773,7 +773,9 @@ class TorchDistSaveShardedStrategy:
 
     def _get_save_and_finalize_callbacks(self, writer, save_state_dict_ret) -> AsyncRequest:
         from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
-        from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import save_state_dict_async_finalize
+        from nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver import (
+            save_state_dict_async_finalize,
+        )
 
         save_fn_args = writer.get_save_function_and_args()
         save_fn, preload_fn, save_args = save_fn_args
@@ -812,7 +814,9 @@ def _get_filesystem_reader(
         return msc.torch.MultiStorageFileSystemReader(checkpoint_dir, thread_count=2)
 
     if cache_metadata:
-        from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import CachedMetadataFileSystemReader  # pylint: disable=line-too-long
+        from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
+            CachedMetadataFileSystemReader,
+        )
 
         return CachedMetadataFileSystemReader(checkpoint_dir, cache_metadata=cache_metadata)
 
@@ -827,11 +831,7 @@ class TorchDistLoadShardedStrategy:
         self.cache_metadata = cache_metadata
         self.checkpoint_name = checkpoint_name
 
-    def load(
-        self,
-        sharded_state_dict: ShardedStateDict,
-        checkpoint_dir: Path,
-    ) -> StateDict:
+    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
 
         Args:
