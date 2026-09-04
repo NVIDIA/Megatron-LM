@@ -374,9 +374,9 @@ class MegatronOptimizer(ABC):
     def _uses_decoupled_grad(self, param_list) -> bool:
         """Whether clip_grad_norm/count_zeros should read `.decoupled_grad` instead of `.grad`.
 
-        A wrong True here doesn't error: `clip_grad_by_total_norm_fp32`/`count_zeros_fp32`
-        silently skip any param whose `decoupled_grad` is unset, so it silently drops that
-        param from clipping/zero-counting instead.
+        Getting this wrong doesn't raise: `clip_grad_by_total_norm_fp32`/`count_zeros_fp32`
+        just skip params with no `decoupled_grad`, so a wrong True here quietly excludes
+        the param from clipping/zero-counting.
         """
         if hasattr(param_list[0], "_mfsdp_parameter_group"):
             # MFSDP v2 always reduces directly into `.grad`.
