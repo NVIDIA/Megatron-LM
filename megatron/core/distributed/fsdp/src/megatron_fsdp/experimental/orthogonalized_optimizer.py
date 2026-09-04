@@ -458,11 +458,15 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
     # =============================
 
     def _group_updates(
-        self, params: Sequence[torch.Tensor], local_shards: Sequence[torch.Tensor]
+        self,
+        params: Sequence[torch.Tensor],
+        local_shards: Sequence[torch.Tensor],
+        plans: Sequence[ShardPlan],
     ) -> list[list[int]]:
         """Using the shard plans, group the updates into chunks.
 
         The updates are grouped into chunks by:
+        - same communication requirement
         - same collective group
         - same dtype and device of orthogonalization input shards
         - same dtype of parameter
@@ -470,10 +474,10 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
           so later owner gathers can overlap orthogonalization of earlier chunks
         """
         chunks: dict[tuple, list[list[int]]] = {}
-        for index, (param, shard) in enumerate(zip(params, local_shards)):
+        for index, (param, shard, plan) in enumerate(zip(params, local_shards, plans)):
             group = get_containing_parameter_group(param)
             collective_group = group.mesh.get_group() if group is not None else None
-            key = (id(collective_group), shard.device, shard.dtype, param.dtype)
+            key = (plan.is_boundary(), id(collective_group), shard.device, shard.dtype, param.dtype)
             compatible_chunks = chunks.setdefault(key, [])
             if (
                 not compatible_chunks
@@ -773,7 +777,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                     self._compute_orthogonalization_inputs(param, param.grad, group, lr)
                 )
 
-            chunks = self._group_updates(matrix_params, local_shards)
+            chunks = self._group_updates(matrix_params, local_shards, matrix_plans)
             owners = self._assign_owner_work(matrix_plans, chunks)
             self._owners.update({matrix_indices[k]: v for k, v in owners.items()})
 
