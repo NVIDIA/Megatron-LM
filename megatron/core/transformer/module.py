@@ -262,10 +262,14 @@ class GraphableMegatronModule(MegatronModule):
             slen_per_cp // tensor_model_parallel_size if sequence_parallel else slen_per_cp
         )
 
+        hidden_states_dtype = (
+            torch.float32 if self.config.fp32_residual_connection else self.config.params_dtype
+        )
+
         static_inputs = {}
         static_inputs["hidden_states"] = torch.ones(
             (slen_per_cptp, micro_batch_size, self.config.hidden_size),
-            dtype=torch.bfloat16,
+            dtype=hidden_states_dtype,
             requires_grad=True,
             device=torch.cuda.current_device(),
         )
