@@ -562,6 +562,9 @@ class MTPLossLoggingHelper:
         num_layers: int,
         reduce_group: torch.distributed.ProcessGroup = None,
         avg_group: torch.distributed.ProcessGroup = None,
+        loss_sum: Optional[torch.Tensor] = None,
+        loss_total: Optional[torch.Tensor] = None,
+        main_total: Optional[torch.Tensor] = None,
     ):
         """Save the mtp metrics (loss, correct, total) for logging.
 
@@ -573,6 +576,13 @@ class MTPLossLoggingHelper:
             num_layers (int): The number of total layers.
             reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
             avg_group (torch.distributed.ProcessGroup): The group for averaging the loss.
+            loss_sum (torch.Tensor, optional): Unnormalized sum of valid MTP losses. When
+                provided with ``loss_total`` and ``main_total``, enables token-weighted MTP
+                logging.
+            loss_total (torch.Tensor, optional): Sum of the MTP loss-mask weights corresponding
+                to ``loss_sum``.
+            main_total (torch.Tensor, optional): Number of valid main-loss tokens corresponding
+                to ``loss_sum``.
         """
         # Skip mtp loss logging if layer_number is None.
         if layer_number is None:
@@ -586,9 +596,33 @@ class MTPLossLoggingHelper:
         if "total_values" not in tracker:
             tracker["total_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
 
+        optional_metrics = (loss_sum, loss_total, main_total)
+        if any(value is None for value in optional_metrics) and any(
+            value is not None for value in optional_metrics
+        ):
+            raise ValueError(
+                "loss_sum, loss_total, and main_total must either all be provided or all omitted"
+            )
+        token_weighted_logging = loss_sum is not None
+        if token_weighted_logging and "loss_sum_values" not in tracker:
+            tracker["loss_sum_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+            tracker["loss_total_values"] = torch.zeros(
+                num_layers, device=torch.cuda.current_device()
+            )
+            tracker["main_total_values"] = torch.zeros(
+                num_layers, device=torch.cuda.current_device()
+            )
+
         tracker["loss_values"][layer_number] += loss.detach()
         tracker["correct_values"][layer_number] += correct.detach()
         tracker["total_values"][layer_number] += total.detach()
+        if token_weighted_logging:
+            tracker["loss_sum_values"][layer_number] += loss_sum.detach()
+            tracker["loss_total_values"][layer_number] += loss_total.detach()
+            tracker["main_total_values"][layer_number] += main_total.detach()
+        tracker["token_weighted_logging"] = (
+            tracker.get("token_weighted_logging", False) or token_weighted_logging
+        )
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
@@ -602,9 +636,15 @@ class MTPLossLoggingHelper:
             tracker["correct_values"].zero_()
         if "total_values" in tracker:
             tracker["total_values"].zero_()
-        # Keep the reduce_group and avg_group across logging intervals: CUDA graph replay
-        # updates the tensors but does not repeat save_metrics_to_tracker's Python
-        # assignments. A new eager forward will overwrite the groups.
+        if "loss_sum_values" in tracker:
+            tracker["loss_sum_values"].zero_()
+        if "loss_total_values" in tracker:
+            tracker["loss_total_values"].zero_()
+        if "main_total_values" in tracker:
+            tracker["main_total_values"].zero_()
+        # Keep token_weighted_logging, reduce_group and avg_group across logging intervals:
+        # CUDA graph replay updates the tensors but does not repeat save_metrics_to_tracker's
+        # Python assignments. A new eager forward will overwrite them.
 
     @staticmethod
     def reduce_metrics_in_tracker():
@@ -621,16 +661,42 @@ class MTPLossLoggingHelper:
                 loss_values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
 
-        for key in ["correct_values", "total_values"]:
-            if key not in tracker:
-                continue
-            values = tracker[key]
+        if tracker.get("token_weighted_logging", False):
+            # Pack all sum-reduced metrics into one collective. Together with the legacy-loss
+            # AVG above, this uses fewer collectives than the legacy correct/total reductions.
+            summed_metrics = torch.stack(
+                [
+                    tracker["loss_sum_values"],
+                    tracker["loss_total_values"],
+                    tracker["correct_values"],
+                    tracker["total_values"],
+                    tracker["main_total_values"],
+                ]
+            )
             if tracker.get('reduce_group') is not None:
-                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+                torch.distributed.all_reduce(summed_metrics, group=tracker.get('reduce_group'))
             if tracker.get('avg_group') is not None:
                 torch.distributed.all_reduce(
-                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.SUM
+                    summed_metrics, group=tracker['avg_group'], op=torch.distributed.ReduceOp.SUM
                 )
+            (
+                tracker["loss_sum_values"],
+                tracker["loss_total_values"],
+                tracker["correct_values"],
+                tracker["total_values"],
+                tracker["main_total_values"],
+            ) = summed_metrics.unbind(0)
+        else:
+            for key in ["correct_values", "total_values"]:
+                if key not in tracker:
+                    continue
+                values = tracker[key]
+                if tracker.get('reduce_group') is not None:
+                    torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+                if tracker.get('avg_group') is not None:
+                    torch.distributed.all_reduce(
+                        values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.SUM
+                    )
 
     @staticmethod
     def track_mtp_metrics(loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None):
@@ -643,6 +709,14 @@ class MTPLossLoggingHelper:
         mtp_losses = tracker["loss_values"] * loss_scale
         mtp_corrects = tracker.get("correct_values", torch.zeros_like(mtp_losses))
         mtp_totals = tracker.get("total_values", torch.ones_like(mtp_losses))
+        token_weighted_logging = tracker.get("token_weighted_logging", False)
+        if token_weighted_logging:
+            mtp_token_weighted_losses = tracker["loss_sum_values"] / torch.clamp(
+                tracker["loss_total_values"], min=1
+            )
+            mtp_valid_fractions = tracker["loss_total_values"] / torch.clamp(
+                tracker["main_total_values"], min=1
+            )
 
         # Process-local logging state; cumulative rates intentionally reset after restart/resume.
         if (
@@ -666,6 +740,8 @@ class MTPLossLoggingHelper:
             loss_name = f"mtp_{i+1} loss"
             step_acc_name = f"mtp_{i+1}_acceptance_rate"
             cum_acc_name = f"mtp_{i+1}_cumulative_acceptance_rate"
+            token_weighted_loss_name = f"mtp_{i+1} token-weighted loss"
+            valid_fraction_name = f"mtp_{i+1} valid fraction"
 
             loss = mtp_losses[i]
             # Empty masks can leave no valid MTP positions, so clamp denominators to avoid NaNs.
@@ -678,15 +754,38 @@ class MTPLossLoggingHelper:
                 total_loss_dict[loss_name] = (
                     total_loss_dict.get(loss_name, torch.zeros_like(loss)) + loss
                 )
+                if token_weighted_logging:
+                    token_weighted_loss = mtp_token_weighted_losses[i]
+                    valid_fraction = mtp_valid_fractions[i]
+                    total_loss_dict[token_weighted_loss_name] = (
+                        total_loss_dict.get(
+                            token_weighted_loss_name, torch.zeros_like(token_weighted_loss)
+                        )
+                        + token_weighted_loss
+                    )
+                    total_loss_dict[valid_fraction_name] = (
+                        total_loss_dict.get(valid_fraction_name, torch.zeros_like(valid_fraction))
+                        + valid_fraction
+                    )
 
             if writer is not None:
                 writer.add_scalar(loss_name, loss, iteration)
                 writer.add_scalar(step_acc_name, step_rate, iteration)
                 writer.add_scalar(cum_acc_name, cum_rate, iteration)
+                if token_weighted_logging:
+                    writer.add_scalar(
+                        token_weighted_loss_name, mtp_token_weighted_losses[i], iteration
+                    )
+                    writer.add_scalar(valid_fraction_name, mtp_valid_fractions[i], iteration)
             if wandb_writer is not None:
                 wandb_writer.log({f"{loss_name}": loss}, iteration)
                 wandb_writer.log({f"{step_acc_name}": step_rate}, iteration)
                 wandb_writer.log({f"{cum_acc_name}": cum_rate}, iteration)
+                if token_weighted_logging:
+                    wandb_writer.log(
+                        {f"{token_weighted_loss_name}": mtp_token_weighted_losses[i]}, iteration
+                    )
+                    wandb_writer.log({f"{valid_fraction_name}": mtp_valid_fractions[i]}, iteration)
 
         MTPLossLoggingHelper.clean_metrics_in_tracker()
 
@@ -1130,9 +1229,9 @@ def process_mtp_loss(
             cp_layout=config.attention_cp_layout,
         )
 
-    # Store the original number of tokens before rolling for proper normalization
-    # when calculate_per_token_loss is enabled. This ensures MTP gradients are
-    # correctly scaled relative to the main loss gradients in finalize_model_grads.
+    # Store the main-loss token count before MTP rolling. Legacy training uses it to
+    # reweight each local MTP mean; main-token normalization uses it for valid-fraction
+    # logging while global gradient finalization supplies the actual denominator.
     original_num_tokens = loss_mask.sum()
 
     cumulative_mtp_input_mask = None
@@ -1260,8 +1359,9 @@ def process_mtp_loss(
 
         if is_training:
             # Logging only: detach so nothing here keeps this head's graph alive.
+            mtp_loss_sum = torch.sum(mtp_loss.detach())
             mtp_loss_for_log = (
-                torch.sum(mtp_loss.detach()) * (num_tokens > 0).to(mtp_loss.dtype)
+                mtp_loss_sum * (num_tokens > 0).to(mtp_loss.dtype)
             ) / num_tokens.clamp(min=1)
 
             if metric_avg_group is None:
@@ -1276,21 +1376,29 @@ def process_mtp_loss(
                 mtp_layer_number,
                 config.mtp_num_layers,
                 avg_group=metric_avg_group,
+                loss_sum=(mtp_loss_sum if config.mtp_normalize_loss_by_main_tokens else None),
+                loss_total=(num_tokens if config.mtp_normalize_loss_by_main_tokens else None),
+                main_total=(
+                    original_num_tokens if config.mtp_normalize_loss_by_main_tokens else None
+                ),
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
         if config.calculate_per_token_loss:
-            # This uses local counts; exact parity for packed or uneven valid-token
-            # distributions across DP/CP ranks would require all-reduced counts.
             # When calculate_per_token_loss is enabled, finalize_model_grads will
             # divide all gradients by total_num_tokens (from main loss).
-            # However, MTP has fewer valid tokens due to rolling. To ensure correct
-            # per-token gradient weighting, we normalize by the rolled token count
-            # and re-scale by the original token count.
-            # Avoid division by zero
-            num_tokens_safe = torch.clamp(num_tokens, min=1)
-            mtp_loss_normalized = (
-                mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
-            )
+            if config.mtp_normalize_loss_by_main_tokens:
+                # Preserve the loss as a sum. Gradient finalization divides the accumulated
+                # main and MTP gradients once by the global main-loss token count, making the
+                # result invariant to rank and microbatch partitioning.
+                mtp_loss_normalized = mtp_loss_scale * mtp_loss
+            else:
+                # Legacy behavior: MTP has fewer valid tokens due to rolling, so normalize
+                # each local rank/microbatch by its valid MTP count, then weight it by its
+                # local main-loss token count before global main-token normalization.
+                num_tokens_safe = torch.clamp(num_tokens, min=1)
+                mtp_loss_normalized = (
+                    mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
+                )
         else:
             safe_num_tokens = num_tokens.clamp(min=1)
             mtp_loss_normalized = mtp_loss_scale * mtp_loss / safe_num_tokens

@@ -1334,6 +1334,61 @@ class TestMultiTokenPredictionLayer:
         assert output_weight.grad is not None
         assert torch.count_nonzero(output_weight.grad) == 0
 
+    @pytest.mark.parametrize(
+        ("normalize_by_main_tokens", "expected_valid_gradient"), [(False, 4.0 / 3.0), (True, 1.0)]
+    )
+    def test_process_mtp_loss_main_token_normalization_is_opt_in(
+        self, normalize_by_main_tokens, expected_valid_gradient
+    ):
+        """The opt-in path leaves MTP as a sum for global main-token finalization."""
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.0,
+            mtp_normalize_loss_by_main_tokens=normalize_by_main_tokens,
+            calculate_per_token_loss=True,
+            num_layers=2,
+            hidden_size=1,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        seq_len = 4
+        hidden_states = torch.ones(2 * seq_len, 1, 1, requires_grad=True)
+        mtp_module.MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+
+        result = process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=torch.arange(seq_len).unsqueeze(0),
+            loss_mask=torch.ones(1, seq_len),
+            output_layer=lambda hidden, **kwargs: (hidden, None),
+            output_weight=None,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=lambda labels, logits: logits.squeeze(-1).transpose(0, 1),
+            config=config,
+        )
+        result.sum().backward()
+
+        mtp_grad = hidden_states.grad[seq_len:, 0, 0]
+        expected = torch.tensor(
+            [expected_valid_gradient] * (seq_len - 1) + [0.0], dtype=mtp_grad.dtype
+        )
+        assert torch.allclose(mtp_grad, expected)
+
+    def test_main_token_mtp_normalization_requires_per_token_loss(self):
+        with pytest.raises(
+            ValueError,
+            match="mtp_normalize_loss_by_main_tokens=True requires calculate_per_token_loss=True",
+        ):
+            TransformerConfig(
+                mtp_num_layers=1,
+                mtp_normalize_loss_by_main_tokens=True,
+                calculate_per_token_loss=False,
+                num_layers=2,
+                hidden_size=1,
+                num_attention_heads=1,
+                use_cpu_initialization=True,
+            )
+
     def test_process_mtp_loss_masks_later_steps_after_invalid_input(self):
         """Mask an MTP prediction after its conditioning path reaches an invalid token."""
         config = TransformerConfig(
@@ -3956,6 +4011,92 @@ class TestMTPLossLoggingHelper:
         token_weighted_loss = torch.tensor(40.0 / 12.0)
         assert torch.isclose(logged_loss, expected_legacy_loss)
         assert not torch.isclose(logged_loss, token_weighted_loss)
+        assert "mtp_1 token-weighted loss" not in writer.scalars
+        assert "mtp_1 valid fraction" not in writer.scalars
+
+    def test_track_mtp_loss_adds_opt_in_token_weighted_metrics(self):
+        """Raw sums produce exact global-style metrics while retaining the legacy loss."""
+        layer_number = 0
+        loss_scale = torch.tensor(0.5)
+        MTPLossLoggingHelper.save_metrics_to_tracker(
+            loss=torch.tensor(10.0),
+            correct=torch.tensor(1.0),
+            total=torch.tensor(2.0),
+            loss_sum=torch.tensor(20.0),
+            loss_total=torch.tensor(2.0),
+            main_total=torch.tensor(4.0),
+            layer_number=layer_number,
+            num_layers=1,
+        )
+        MTPLossLoggingHelper.save_metrics_to_tracker(
+            loss=torch.tensor(2.0),
+            correct=torch.tensor(3.0),
+            total=torch.tensor(10.0),
+            loss_sum=torch.tensor(20.0),
+            loss_total=torch.tensor(10.0),
+            main_total=torch.tensor(12.0),
+            layer_number=layer_number,
+            num_layers=1,
+        )
+
+        class DummyWriter:
+            def __init__(self):
+                self.scalars = {}
+
+            def add_scalar(self, name, value, iteration):
+                self.scalars[name] = value
+
+        writer = DummyWriter()
+        total_loss_dict = {}
+        MTPLossLoggingHelper.track_mtp_metrics(
+            loss_scale=loss_scale, iteration=1, writer=writer, total_loss_dict=total_loss_dict
+        )
+
+        assert torch.isclose(torch.as_tensor(writer.scalars["mtp_1 loss"]), torch.tensor(6.0))
+        assert torch.isclose(
+            torch.as_tensor(writer.scalars["mtp_1 token-weighted loss"]), torch.tensor(40.0 / 12.0)
+        )
+        assert torch.isclose(
+            torch.as_tensor(writer.scalars["mtp_1 valid fraction"]), torch.tensor(12.0 / 16.0)
+        )
+        assert "mtp_1 token-weighted loss" in total_loss_dict
+        assert "mtp_1 valid fraction" in total_loss_dict
+
+    def test_token_weighted_metrics_share_one_sum_collective(self, monkeypatch):
+        """The opt-in metrics add payload but not an additional collective."""
+        avg_group = object()
+        MTPLossLoggingHelper.save_metrics_to_tracker(
+            loss=torch.tensor(3.0),
+            correct=torch.tensor(1.0),
+            total=torch.tensor(2.0),
+            loss_sum=torch.tensor(4.0),
+            loss_total=torch.tensor(2.0),
+            main_total=torch.tensor(5.0),
+            layer_number=0,
+            num_layers=1,
+            avg_group=avg_group,
+        )
+        calls = []
+
+        def fake_all_reduce(tensor, *, group, op=None):
+            calls.append((tensor.shape, group, op))
+            if op == torch.distributed.ReduceOp.SUM:
+                tensor.mul_(2)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+        MTPLossLoggingHelper.reduce_metrics_in_tracker()
+
+        assert calls == [
+            (torch.Size([1]), avg_group, torch.distributed.ReduceOp.AVG),
+            (torch.Size([5, 1]), avg_group, torch.distributed.ReduceOp.SUM),
+        ]
+        tracker = MTPLossLoggingHelper.tracker
+        assert torch.equal(tracker["loss_values"], torch.tensor([3.0], device="cuda"))
+        assert torch.equal(tracker["loss_sum_values"], torch.tensor([8.0], device="cuda"))
+        assert torch.equal(tracker["loss_total_values"], torch.tensor([4.0], device="cuda"))
+        assert torch.equal(tracker["correct_values"], torch.tensor([2.0], device="cuda"))
+        assert torch.equal(tracker["total_values"], torch.tensor([4.0], device="cuda"))
+        assert torch.equal(tracker["main_total_values"], torch.tensor([10.0], device="cuda"))
 
 
 class TestMultiTokenPredictionHybrid:
