@@ -1105,6 +1105,146 @@ class TestTENativeGroupedMxfp8:
         assert torch.isfinite(actual).all()
         torch.testing.assert_close(actual, reference, atol=5e-4, rtol=0.25)
 
+    @pytest.mark.parametrize("weight_format", ["discrete", "single_grouped"])
+    def test_batch_invariant_log_probs_across_256_token_boundary(self, monkeypatch, weight_format):
+        """A request's log probabilities stay bitwise fixed across an FC2 M-bucket change."""
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        from megatron.core.inference.moe.fused_moe import ActivationType, mcore_fused_moe
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        torch.manual_seed(2029)
+        hidden_size, ffn_size = 2688, 1856
+        num_experts, max_tokens, target_tokens = 2, 320, 16
+
+        single_grouped_weight = weight_format == "single_grouped"
+        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", str(int(single_grouped_weight)))
+        with te.fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+            fc1 = te.GroupedLinear(
+                num_experts,
+                hidden_size,
+                ffn_size,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                device="cuda",
+                single_grouped_weight=single_grouped_weight,
+            )
+            fc2 = te.GroupedLinear(
+                num_experts,
+                ffn_size,
+                hidden_size,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                device="cuda",
+                single_grouped_weight=single_grouped_weight,
+            )
+        if single_grouped_weight:
+            fc1_weight = fc1.weight
+            fc2_weight = fc2.weight
+        else:
+            fc1_weight = [fc1.weight0, fc1.weight1]
+            fc2_weight = [fc2.weight0, fc2.weight1]
+
+        hidden = torch.randn(max_tokens, hidden_size, device="cuda", dtype=torch.bfloat16) * 0.1
+        probs = torch.rand(max_tokens, 2, device="cuda", dtype=torch.float32)
+        probs /= probs.sum(dim=-1, keepdim=True)
+        routing_map = torch.tensor([0, 1], device="cuda", dtype=torch.int64).repeat(max_tokens, 1)
+        valid_tokens = _vt(240)
+        small_valid_tokens = _vt(240)
+        large_valid_tokens = _vt(max_tokens)
+        # TE model-init quantization is asynchronous. Checkpoint loading establishes
+        # this boundary before inference starts.
+        torch.cuda.synchronize()
+
+        def run_moe(
+            hidden_input=hidden,
+            probs_input=probs,
+            routing_input=routing_map,
+            valid_input=valid_tokens,
+        ):
+            return mcore_fused_moe(
+                hidden_input,
+                probs_input,
+                fc1_weight,
+                fc2_weight,
+                ActivationType.SQUARED_RELU,
+                num_experts,
+                0,
+                valid_input,
+                routing_input,
+            )
+
+        with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
+            # Prime TE's lazy grouped-GEMM state, as the inference engine does before
+            # CUDA graph capture.
+            warmup_output = run_moe(
+                hidden[:240], probs[:240], routing_map[:240], small_valid_tokens
+            )
+            torch.cuda.synchronize()
+            del warmup_output
+
+            # Different input shapes exercise one versus two static 256-row graph chunks.
+            eager_small_bucket_output = run_moe(
+                hidden[:240], probs[:240], routing_map[:240], small_valid_tokens
+            )
+            torch.cuda.synchronize()
+            eager_small_bucket_output = eager_small_bucket_output[:target_tokens].clone()
+            eager_large_bucket_output = run_moe(valid_input=large_valid_tokens)
+            torch.cuda.synchronize()
+            eager_large_bucket_output = eager_large_bucket_output[:target_tokens].clone()
+
+            def capture_moe(hidden_input, probs_input, routing_input, valid_input):
+                def graph_run():
+                    return run_moe(hidden_input, probs_input, routing_input, valid_input)
+
+                warmup_stream = torch.cuda.Stream()
+                warmup_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(warmup_stream):
+                    for _ in range(3):
+                        graph_run()
+                torch.cuda.current_stream().wait_stream(warmup_stream)
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    graph_output = graph_run()
+                graph.replay()
+                return graph, graph_output
+
+            small_graph, small_graph_output = capture_moe(
+                hidden[:240], probs[:240], routing_map[:240], small_valid_tokens
+            )
+            small_graph.replay()
+            graph_small_bucket_output = small_graph_output[:target_tokens].clone()
+
+            large_graph, large_graph_output = capture_moe(hidden, probs, routing_map, valid_tokens)
+            graph_large_bucket_output = large_graph_output[:target_tokens].clone()
+            valid_tokens.fill_(max_tokens)
+            large_graph.replay()
+            graph_large_batch_output = large_graph_output[:target_tokens].clone()
+
+            # Carry the exact MoE result through a deterministic vocabulary projection
+            # and log-softmax so the assertion matches the user-visible acceptance metric.
+            vocab_weight = torch.randn(256, hidden_size, device="cuda", dtype=torch.bfloat16) * 0.02
+            rows = torch.arange(target_tokens, device="cuda")
+            token_ids = rows
+            small_log_probs = torch.log_softmax(
+                graph_small_bucket_output.to(torch.bfloat16) @ vocab_weight.T, dim=-1
+            )[rows, token_ids]
+            large_log_probs = torch.log_softmax(
+                graph_large_batch_output.to(torch.bfloat16) @ vocab_weight.T, dim=-1
+            )[rows, token_ids]
+            torch.cuda.synchronize()
+
+        assert torch.count_nonzero(graph_large_batch_output).item() > 0
+        assert torch.equal(eager_small_bucket_output, eager_large_bucket_output)
+        assert torch.equal(graph_small_bucket_output, graph_large_bucket_output)
+        assert torch.equal(graph_large_bucket_output, graph_large_batch_output)
+        assert torch.equal(small_log_probs, large_log_probs)
+        assert (small_log_probs - large_log_probs).abs().max().item() == 0.0
+
     def test_swiglu_moe(self):
         from megatron.core.inference.moe.fused_moe import ActivationType, mcore_fused_moe
 
