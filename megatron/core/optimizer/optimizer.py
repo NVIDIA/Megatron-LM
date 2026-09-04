@@ -374,16 +374,9 @@ class MegatronOptimizer(ABC):
     def _uses_decoupled_grad(self, param_list) -> bool:
         """Whether clip_grad_norm/count_zeros should read `.decoupled_grad` instead of `.grad`.
 
-        MFSDP v2 always reduces into `.grad`; `_mfsdp_parameter_group` (set in
-        `experimental/parameter_group.py`) marks v2-owned params, checked directly here the
-        same way `__fsdp_param__` below is duck-typed, without importing the experimental
-        module. Otherwise, `use_precision_aware_optimizer_no_fp8_or_ds_fp8` is
-        `distrib_optimizer.py`'s precision-aware/non-FP8 flag, and `__fsdp_param__` marks a
-        v1 `MegatronFSDP` param.
-
-        `clip_grad_by_total_norm_fp32`/`count_zeros_fp32` silently skip any param with no
-        `decoupled_grad` rather than erroring, so a wrong True here silently drops that
-        param from clipping/zero-counting.
+        A wrong True here doesn't error: `clip_grad_by_total_norm_fp32`/`count_zeros_fp32`
+        silently skip any param whose `decoupled_grad` is unset, so it silently drops that
+        param from clipping/zero-counting instead.
         """
         if hasattr(param_list[0], "_mfsdp_parameter_group"):
             # MFSDP v2 always reduces directly into `.grad`.
