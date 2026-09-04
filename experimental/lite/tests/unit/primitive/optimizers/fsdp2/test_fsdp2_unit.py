@@ -86,6 +86,16 @@ class ToyMoEBlock(nn.Module):
         return self.experts(self.dense(x))
 
 
+class ToyMixedDtypeBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(4, 4, dtype=torch.bfloat16))
+        self.control = nn.Parameter(torch.ones(4, dtype=torch.float32))
+
+    def forward(self, x):
+        return x
+
+
 def test_fsdp2_config_validates_empty_wrap_surface():
     with pytest.raises(ValueError, match="wrap_root=True"):
         FSDP2Config(wrap_root=False)
@@ -108,6 +118,7 @@ def test_fsdp2_pipeline_wraps_dense_and_experts_with_reshard(monkeypatch):
     expert_calls = []
     expert_mesh = SimpleNamespace(name="expert_dp")
     optimizer = object()
+    optimizer_kwargs = {}
     ps = ParallelState(
         pp_size=2,
         ep_size=2,
@@ -131,11 +142,11 @@ def test_fsdp2_pipeline_wraps_dense_and_experts_with_reshard(monkeypatch):
     )
     monkeypatch.setattr(fsdp2_optimizer, "wrap_fsdp2_module", fake_wrap_expert)
     monkeypatch.setattr(fsdp2_optimizer, "wrap_fsdp2", fake_wrap_dense)
-    monkeypatch.setattr(
-        fsdp2_optimizer,
-        "build_fsdp2_adamw",
-        lambda *args, **kwargs: optimizer,
-    )
+    def fake_build_optimizer(*_args, **kwargs):
+        optimizer_kwargs.update(kwargs)
+        return optimizer
+
+    monkeypatch.setattr(fsdp2_optimizer, "build_fsdp2_adamw", fake_build_optimizer)
 
     result = fsdp2_optimizer.build_fsdp2_training_optimizer(
         [model],
@@ -144,8 +155,8 @@ def test_fsdp2_pipeline_wraps_dense_and_experts_with_reshard(monkeypatch):
         unit_modules=(ToyMoEBlock,),
         expert_classifier=lambda name: ".experts." in f".{name}",
         reshard_after_forward=True,
-        use_fp32_shards=False,
-        use_fp32_master=False,
+        use_fp32_shards=True,
+        use_fp32_master=True,
     )
 
     assert result is optimizer
@@ -162,6 +173,59 @@ def test_fsdp2_pipeline_wraps_dense_and_experts_with_reshard(monkeypatch):
     assert dense_config.reshard_after_forward is True
     assert dense_config.last_unit_reshard_after_forward is True
     assert dense_kwargs["ignored_params"] == set(model.experts.parameters())
+    assert optimizer_kwargs["use_fp32_master"] is False
+
+
+def test_fsdp2_replicates_parameters_that_must_keep_their_compute_dtype(monkeypatch):
+    model = ToyMixedDtypeBlock()
+    wrap_calls = []
+    optimizer_calls = []
+    optimizer = object()
+    sync_group = object()
+    ps = ParallelState(dp_cp_group=sync_group, dp_group=object(), dp_cp_size=2)
+
+    monkeypatch.setattr(
+        fsdp2_optimizer,
+        "wrap_fsdp2",
+        lambda module, _ps, config, **kwargs: wrap_calls.append(
+            (module, config, kwargs)
+        ),
+    )
+
+    def fake_build(*args, **kwargs):
+        optimizer_calls.append((args, kwargs))
+        return optimizer
+
+    monkeypatch.setattr(fsdp2_optimizer, "build_fsdp2_adamw", fake_build)
+
+    result = fsdp2_optimizer.build_fsdp2_training_optimizer(
+        [model],
+        None,
+        ps,
+        unit_modules=(),
+        replicated_param_classifier=(
+            lambda _name, parameter: parameter.dtype == torch.float32
+        ),
+        use_fp32_shards=False,
+        use_fp32_master=False,
+    )
+
+    assert result is optimizer
+    assert wrap_calls[0][2]["ignored_params"] == {model.control}
+    assert optimizer_calls[0][1]["replicated_grad_params"] == [model.control]
+    assert optimizer_calls[0][1]["replicated_grad_sync_group"] is sync_group
+
+
+def test_fsdp2_replicated_gradient_collectives_preserve_named_parameter_order():
+    model = nn.Module()
+    model.second = nn.Parameter(torch.ones(2, dtype=torch.float32))
+    model.first = nn.Parameter(torch.zeros(2, dtype=torch.float32))
+
+    params = fsdp2_optimizer._collect_replicated_params(
+        [model], lambda _name, parameter: parameter.dtype == torch.float32
+    )
+
+    assert params == [model.second, model.first]
 
 
 @pytest.mark.parametrize("depth", [0, 1, 2])
@@ -237,6 +301,11 @@ def test_wrap_fsdp2_requires_distributed_when_mesh_is_not_provided(monkeypatch):
 def test_wrap_fsdp2_wraps_units_then_root_and_preserves_param_attrs(monkeypatch):
     model = ToyModel()
     model.block.proj.weight.tensor_model_parallel = True
+    source_scale = torch.tensor([[0.25]], dtype=torch.float32)
+    model.block.proj.weight._fp8_source_scales = source_scale
+    model.block.proj.weight._fp8_source_scale_version = (
+        model.block.proj.weight._version
+    )
     calls: list[nn.Module] = []
 
     def fake_fully_shard(module, **kwargs):
@@ -258,6 +327,11 @@ def test_wrap_fsdp2_wraps_units_then_root_and_preserves_param_attrs(monkeypatch)
     assert result is model
     assert calls == [model.block, model]
     assert model.block.proj.weight.tensor_model_parallel is True
+    assert torch.equal(model.block.proj.weight._fp8_source_scales, source_scale)
+    assert (
+        model.block.proj.weight._fp8_source_scale_version
+        == model.block.proj.weight._version
+    )
     assert model._fake_fsdp2_kwargs["reshard_after_forward"] is False
     assert model._fake_fsdp2_kwargs["mesh"].name == "mesh"
 
@@ -454,7 +528,7 @@ def test_fsdp2_optimizer_uses_scalar_all_reduce_for_all_norm_groups(monkeypatch)
             tp_group=groups.tp,
             pp_group=groups.pp,
         ),
-        clip_grad=100.0,
+        clip_grad=1.0,
         replicated_grad_params=[replicated],
         replicated_grad_norm_group=groups.replicated,
         expert_sharded_grad_params=[expert],
@@ -462,8 +536,15 @@ def test_fsdp2_optimizer_uses_scalar_all_reduce_for_all_norm_groups(monkeypatch)
         tp_replicated_grad_params=[tp_replicated],
     )
 
+    expected_norm = (2.0**2 + 3.0**2 + 4.0**2 + 5.0**2) ** 0.5
+    original_grads = [param.grad.clone() for param in optimizer.params]
+    assert optimizer.compute_grad_norm().item() == pytest.approx(expected_norm)
+    for param, original in zip(optimizer.params, original_grads, strict=True):
+        torch.testing.assert_close(param.grad, original)
+    reduced_groups.clear()
+
     assert optimizer.clip_grad_norm() == pytest.approx(
-        (2.0**2 + 3.0**2 + 4.0**2 + 5.0**2) ** 0.5
+        expected_norm
     )
     assert reduced_groups == [
         groups.dp_cp,

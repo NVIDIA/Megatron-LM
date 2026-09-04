@@ -154,9 +154,11 @@ class DeepseekV4Layer(nn.Module):
         self.input_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # DS4 ONLY: CSA attention behind the SBHD shim (Kimi builds MLA here).
-        self.self_attn = DeepseekV4CSAAttention(config, layer_idx=layer_idx, ps=ps)
+        self.self_attn = self._build_attention(config, layer_idx=layer_idx, ps=ps)
         # DS4 ONLY: hash-routed MoE family (shared Experts/Router/dispatcher).
-        self.mlp = DeepseekV4MoE(config, ps, layer_idx=layer_idx, use_deepep=use_deepep)
+        self.mlp = self._build_moe(
+            config, ps, layer_idx=layer_idx, use_deepep=use_deepep
+        )
         # DS4 ONLY: per-layer multi-head hyper-connections wrapping attn + ffn.
         self.attn_hc = HyperConnection(
             config.hidden_size, config.hc_mult, config.hc_sinkhorn_iters, config.hc_eps
@@ -165,17 +167,32 @@ class DeepseekV4Layer(nn.Module):
             config.hidden_size, config.hc_mult, config.hc_sinkhorn_iters, config.hc_eps
         )
 
-    def forward(
+    def _build_attention(
+        self, config: DeepseekV4Config, *, layer_idx: int, ps: ParallelState
+    ) -> nn.Module:
+        return DeepseekV4CSAAttention(config, layer_idx=layer_idx, ps=ps)
+
+    def _build_moe(
+        self,
+        config: DeepseekV4Config,
+        ps: ParallelState,
+        *,
+        layer_idx: int,
+        use_deepep: bool,
+    ) -> nn.Module:
+        return DeepseekV4MoE(
+            config, ps, layer_idx=layer_idx, use_deepep=use_deepep
+        )
+
+    def _attention_block(
         self,
         x: torch.Tensor,
         *,
         position_ids: torch.Tensor,
-        input_ids: torch.Tensor | None = None,
-        packed_seq_params: Any = None,
+        packed_seq_params: Any,
+        metadata: Any = None,
     ) -> torch.Tensor:
-        # x is SBHD mHC [S, B, hc_mult, H].  HyperConnection collapses the
-        # streams to a 3-D [S, B, H] pre-mix, the sub-block runs SBHD, and
-        # HyperConnection.post recombines into the 4-D residual streams.
+        del metadata
         residual = x
         attn_in, post, comb = self.attn_hc(x)
         attn_out = self.self_attn(
@@ -183,17 +200,43 @@ class DeepseekV4Layer(nn.Module):
             position_ids=position_ids,
             packed_seq_params=packed_seq_params,
         )
-        x = HyperConnection.post(attn_out, residual, post, comb)
+        return HyperConnection.post(attn_out, residual, post, comb)
 
+    def _mlp_block(
+        self,
+        x: torch.Tensor,
+        *,
+        input_ids: torch.Tensor | None,
+    ) -> torch.Tensor:
         residual = x
         ffn_in, post, comb = self.ffn_hc(x)
-        # DS4 hash-routed MoE indexes tid2eid[input_ids.reshape(-1)] and must
-        # align with the flattened hidden.  The skeleton is SBHD, so the FFN
-        # input flattens in (S, B) order; transpose input_ids [B, S] -> [S, B]
-        # so its flatten matches.  (No-op semantics for non-hash layers.)
-        mlp_input_ids = None if input_ids is None else input_ids.transpose(0, 1).contiguous()
-        ffn_out = self.mlp(self.post_attention_layernorm(ffn_in), input_ids=mlp_input_ids)
+        mlp_input_ids = (
+            None if input_ids is None else input_ids.transpose(0, 1).contiguous()
+        )
+        ffn_out = self.mlp(
+            self.post_attention_layernorm(ffn_in), input_ids=mlp_input_ids
+        )
         return HyperConnection.post(ffn_out, residual, post, comb)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        position_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        packed_seq_params: Any = None,
+        attention_metadata: Any = None,
+    ) -> torch.Tensor:
+        # x is SBHD mHC [S, B, hc_mult, H].  HyperConnection collapses the
+        # streams to a 3-D [S, B, H] pre-mix, the sub-block runs SBHD, and
+        # HyperConnection.post recombines into the 4-D residual streams.
+        x = self._attention_block(
+            x,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            metadata=attention_metadata,
+        )
+        return self._mlp_block(x, input_ids=input_ids)
 
 
 class DeepseekV4MTPLayer(DeepseekV4Layer):
@@ -352,7 +395,9 @@ class DeepseekV4Model(nn.Module):
         # for its dense-vs-MoE / per-layer logic.
         self.layers = nn.ModuleDict(
             {
-                str(local): DeepseekV4Layer(config, ps, global_idx, use_deepep=use_deepep)
+                str(local): self._build_layer(
+                    config, ps, global_idx, use_deepep=use_deepep
+                )
                 for local, global_idx in enumerate(self.layer_indices)
             }
         )
@@ -387,6 +432,18 @@ class DeepseekV4Model(nn.Module):
                     for idx in range(config.num_nextn_predict_layers)
                 ]
             )
+
+    def _build_layer(
+        self,
+        config: DeepseekV4Config,
+        ps: ParallelState,
+        layer_idx: int,
+        *,
+        use_deepep: bool,
+    ) -> nn.Module:
+        return DeepseekV4Layer(
+            config, ps, layer_idx, use_deepep=use_deepep
+        )
 
     def set_input_tensor(self, input_tensor):
         if isinstance(input_tensor, list):

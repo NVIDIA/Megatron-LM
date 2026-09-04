@@ -33,7 +33,6 @@ from megatron.lite.model.protocol_utils import (
     add_loss_context_kwargs,
     pack_magi_forward_kwargs,
     pack_thd_forward_kwargs,
-    router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
     unpack_magi_forward_output,
     unpack_thd_forward_output,
@@ -64,6 +63,7 @@ __all__ = [
     "EXPERT_CLASSIFIER",
     "ImplConfig",
     "PLACEMENT_FN",
+    "SUPPORTS_LOCAL_EXPERT_SHARD",
     "build_model",
     "build_model_config",
     "export_hf_weights",
@@ -71,6 +71,8 @@ __all__ = [
     "save_hf_weights",
     "vocab_size",
 ]
+
+SUPPORTS_LOCAL_EXPERT_SHARD = True
 
 # ---------------------------------------------------------------------------
 # ImplConfig

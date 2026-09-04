@@ -7,6 +7,7 @@ import json
 import sys
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -139,7 +140,15 @@ class _FakeRuntime:
     def zero_grad(self, handle) -> None:
         pass
 
-    def forward_backward(self, handle, data, loss_fn, *, num_microbatches: int = 1):
+    def forward_backward(
+        self,
+        handle,
+        data,
+        loss_fn,
+        *,
+        num_microbatches: int = 1,
+        forward_only: bool = False,
+    ):
         self.loss += 1
         return ForwardResult(model_output=ModelOutputs(loss=torch.tensor(float(self.loss))))
 
@@ -176,6 +185,36 @@ def test_pretrain_session_runs_with_fake_runtime_on_cpu():
     assert len(result.step_traces) == 2
     assert [trace.loss for trace in result.step_traces] == [2.0, 3.0]
     assert result.step_traces[0].grad_norm == 3.5
+    assert result.step_traces[0].peak_allocated_bytes == 0
+    assert result.step_traces[0].post_reserved_bytes == 0
+    assert result.metadata["memory_gate"] == {
+        "all_rank_max": True,
+        "max_steady_peak_growth": 0.0,
+        "limit": 0.02,
+        "passed": True,
+        "empty_cache_between_steps": False,
+    }
+
+
+def test_no_optimizer_grad_norm_reports_real_gradients_without_mutation():
+    from examples.bench.session import _global_grad_norm_without_step
+
+    model = torch.nn.Linear(3, 2, bias=False)
+    model.weight.grad = torch.full_like(model.weight, 2.0)
+    original = model.weight.grad.clone()
+    handle = ModelHandle(model=model, _extras={"model_chunks": [model]})
+
+    assert _global_grad_norm_without_step(handle) == pytest.approx(24.0**0.5)
+    torch.testing.assert_close(model.weight.grad, original, rtol=0, atol=0)
+
+
+def test_no_optimizer_grad_norm_uses_sharded_optimizer_path():
+    from examples.bench.session import _global_grad_norm_without_step
+
+    optimizer = SimpleNamespace(compute_grad_norm=lambda: torch.tensor(7.0))
+    handle = ModelHandle(model=torch.nn.Linear(1, 1), optimizer=optimizer)
+
+    assert _global_grad_norm_without_step(handle) == 7.0
 
 
 def test_bench_main_writes_dry_run_output_json(tmp_path):
@@ -226,6 +265,84 @@ def test_bench_main_writes_output_json_only_on_rank_zero(tmp_path, monkeypatch):
 
     assert artifact["dry_run"] is True
     assert not output_path.exists()
+
+
+def test_benchmark_snapshot_records_semantic_and_profiling_configuration(monkeypatch):
+    from examples.bench.bench import BenchCliConfig, _benchmark_config_snapshot
+
+    monkeypatch.setenv("MLITE_PROFILE_SYNC_PHASES", "1")
+    monkeypatch.setenv("MEGATRON_LITE_DETERMINISTIC", "1")
+    monkeypatch.setenv("NCCL_MAX_NCHANNELS", "1")
+    monkeypatch.setenv("MLITE_SOURCE_SHA", "abc123")
+    snapshot = _benchmark_config_snapshot(
+        BenchCliConfig(
+            model_name="deepseek_v4",
+            impl="vllm",
+            ep=8,
+            steps=10,
+            warmup=5,
+            seq_len=16384,
+            no_optimizer=True,
+            skip_load_hf_weights=True,
+            trace_fingerprints=True,
+            impl_cfg_json=(
+                '{"optimizer":"fsdp2","recompute":["full"],'
+                '"cache_deployment_weights":false}'
+            ),
+        )
+    )
+
+    assert snapshot["load_hf_weights"] is False
+    assert snapshot["optimizer_backend"] == "fsdp2"
+    assert snapshot["schedule"]["no_optimizer"] is True
+    assert snapshot["parallel"]["ep"] == 8
+    assert snapshot["schedule"]["warmup"] == 5
+    assert snapshot["recompute"] == ["full"]
+    assert snapshot["cache_deployment_weights"] is False
+    assert snapshot["correctness"]["trace_fingerprints"] is True
+    assert snapshot["profiling"]["sync_phases"] is True
+    assert snapshot["determinism"]["MEGATRON_LITE_DETERMINISTIC"] == "1"
+    assert snapshot["determinism"]["NCCL_MAX_NCHANNELS"] == "1"
+    assert snapshot["provenance"]["source_sha"] == "abc123"
+
+
+def test_result_summary_records_allocated_reserved_and_active_memory():
+    from examples.bench.results import RunResult, StepTrace
+
+    result = RunResult(
+        backend="mlite",
+        model_name="deepseek_v4",
+        impl="vllm",
+        optimizer_backend="fsdp2",
+        tp=1,
+        etp=None,
+        ep=4,
+        pp=1,
+        vpp=1,
+        cp=1,
+        seq_len=16,
+        num_microbatches=1,
+        step_traces=[
+            StepTrace(
+                step=0,
+                loss=1.0,
+                grad_norm=2.0,
+                step_ms=3.0,
+                peak_reserved_bytes=12_000_000_000,
+                post_allocated_bytes=10_000_000_000,
+                post_reserved_bytes=11_000_000_000,
+                active_bytes=9_000_000_000,
+            )
+        ],
+        peak_mem_gb=8.0,
+    )
+
+    summary = result.summary_dict()
+    assert summary["peak_mem_gb"] == 8.0
+    assert summary["peak_reserved_gb"] == 12.0
+    assert summary["post_allocated_gb"] == 10.0
+    assert summary["post_reserved_gb"] == 11.0
+    assert summary["active_gb"] == 9.0
 
 
 def test_result_artifact_summary_and_trace_compare(tmp_path):
@@ -285,6 +402,43 @@ def test_result_trace_compare_reports_metric_level_failures():
     assert comparison["grad_norm_passed"] is False
 
 
+def test_result_trend_compare_allows_offsets_but_rejects_opposite_direction():
+    from examples.bench.results import compare_step_trends
+
+    def artifact(losses, grad_norms):
+        return {
+            "result": {
+                "step_traces": [
+                    {
+                        "step": step,
+                        "loss": loss,
+                        "grad_norm": grad_norm,
+                        "step_ms": 1.0,
+                    }
+                    for step, (loss, grad_norm) in enumerate(
+                        zip(losses, grad_norms, strict=True)
+                    )
+                ]
+            }
+        }
+
+    baseline = artifact(
+        [20.0, 19.8, 19.7, 19.4, 19.2],
+        [10.0, 10.2, 10.1, 10.5, 10.8],
+    )
+    aligned = artifact(
+        [21.0, 20.7, 20.55, 20.1, 19.8],
+        [8.0, 8.3, 8.15, 8.75, 9.2],
+    )
+    opposite = artifact(
+        [21.0, 21.2, 21.3, 21.6, 21.8],
+        [8.0, 7.8, 7.9, 7.5, 7.2],
+    )
+
+    assert compare_step_trends(baseline, aligned)["passed"] is True
+    assert compare_step_trends(baseline, opposite)["passed"] is False
+
+
 def test_correctness_compare_requires_bitwise_fields():
     from examples.bench.results import compare_correctness_artifacts
 
@@ -311,6 +465,16 @@ def test_correctness_compare_requires_bitwise_fields():
 
     assert comparison["passed"] is False
     assert comparison["max_grad_norm_abs"] == 0.5
+
+    candidate = json.loads(json.dumps(baseline))
+    candidate["steps"][0]["grad_fingerprint"]["sha256"] = "different"
+    comparison = compare_correctness_artifacts(baseline, candidate)
+
+    assert comparison["passed"] is False
+    assert any(
+        mismatch["step"] == 0 and mismatch["field"] == "grad_fingerprint"
+        for mismatch in comparison["mismatches"]
+    )
 
 
 def test_correctness_compare_supports_explicit_numeric_tolerances():
@@ -355,3 +519,33 @@ def test_correctness_compare_supports_explicit_numeric_tolerances():
 
     assert comparison["passed"] is True
     assert abs(comparison["max_tensor_abs"] - 2e-3) < 1e-12
+
+
+def test_correctness_fixed_routes_are_deterministic_and_unique():
+    from types import SimpleNamespace
+
+    from examples.bench.correctness import _fixed_route_batches
+    from megatron.lite.runtime.contracts.data import PackedBatch
+
+    batch = PackedBatch(
+        input_ids=torch.arange(8),
+        labels=torch.arange(8),
+        seq_lens=torch.tensor([3, 5]),
+    )
+    handle = SimpleNamespace(
+        _extras={
+            "model_cfg": SimpleNamespace(
+                num_hidden_layers=4,
+                num_experts_per_tok=6,
+                n_routed_experts=256,
+            )
+        }
+    )
+
+    routed_batch = next(_fixed_route_batches(iter([batch]), handle))
+    rows = list(routed_batch.routed_experts.unbind())
+
+    assert [tuple(row.shape) for row in rows] == [(3, 4, 6), (5, 4, 6)]
+    assert all(torch.equal(row, row.remainder(256)) for row in rows)
+    assert all(torch.all(row[..., 1:] != row[..., :-1]) for row in rows)
+    assert routed_batch.r3_replay_mask.tolist() == [True] * 8

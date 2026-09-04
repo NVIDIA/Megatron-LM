@@ -20,7 +20,6 @@ from megatron.lite.model.protocol_utils import (
     nested_from_packed,
     pack_r3_replay_mask as _pack_r3_replay_mask,
     pack_routed_experts as _pack_routed_experts,
-    router_replay_roots as router_replay_roots,
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
@@ -43,6 +42,9 @@ from megatron.lite.primitive.quantization import (
     normalize_qat_spec,
 )
 from megatron.lite.runtime.contracts import OptimizerConfig, PackedBatch, ParallelConfig
+
+
+SUPPORTS_LOCAL_EXPERT_SHARD = True
 
 
 def is_expert_param(name: str) -> bool:
@@ -147,10 +149,14 @@ def _infer_cp_local_seq_len(
 _nested_from_packed_tensor = nested_from_packed
 
 
-def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
+def pack_packed_batch(model, batch: PackedBatch, seq_lens=None):
     ps = parallel_state_from_model(model) or ParallelState()
-    seq_lens = batch.sizes().to(device=batch.input_ids.device)
-    packed = pack_nested_thd(
+    seq_lens = (
+        batch.sizes().to(device=batch.input_ids.device)
+        if seq_lens is None
+        else seq_lens
+    )
+    return pack_nested_thd(
         _nested_from_packed_tensor(batch.input_ids, seq_lens),
         cp_size=ps.cp_size,
         cp_rank=ps.cp_rank,
@@ -161,6 +167,10 @@ def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
         roll_labels=batch.labels is not None,
         roll_loss_mask=batch.loss_mask is not None,
     )
+
+
+def _prepare_packed_batch_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
+    packed = pack_packed_batch(model, batch)
     kwargs: dict[str, Any] = {
         "input_ids": packed.input_ids,
         "labels": packed.labels,
@@ -367,67 +377,43 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
         )
 
 
-def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
-    from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Model
+def _is_native_fp32_control(name: str) -> bool:
+    """Classify FP32 controls by the native Lite module names."""
 
-    p = impl_cfg.parallel
-    _validate_parallel_scope(p)
-    _apply_mtp_config(model_cfg, impl_cfg)
-    mtp_enable = bool(impl_cfg.mtp_enable) and model_cfg.num_nextn_predict_layers > 0
-    mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
-    ps = init_parallel(impl_cfg.parallel)
-    vpp = None if p.vpp == 1 else p.vpp
-    train_cfg = SimpleNamespace(
-        tp=ps.tp_size,
-        ep=ps.ep_size,
-        etp=ps.etp_size,
-        pp=ps.pp_size,
-        cp=ps.cp_size,
-        vpp=vpp,
-        fp8=False,
-        use_deepep=impl_cfg.use_deepep,
+    leaf = name.rsplit(".", 1)[-1]
+    return (
+        (
+            (name.startswith("hc_head.") or ".hc_head." in name)
+            and leaf in {"hc_fn", "hc_base", "hc_scale"}
+        )
+        or (".attn_hc." in name and leaf in {"fn", "base", "scale"})
+        or (".ffn_hc." in name and leaf in {"fn", "base", "scale"})
+        or name.endswith(".sinks")
+        or name.endswith(".ape")
+        or name.endswith(".mlp.gate.expert_bias")
     )
 
-    def _chunk(i: int | None = None):
-        return (
-            DeepseekV4Model(
-                model_cfg,
-                train_cfg,
-                ps,
-                vpp_chunk_id=i,
-                use_deepep=impl_cfg.use_deepep,
-                use_thd=impl_cfg.use_thd,
-                hf_path=impl_cfg.hf_path,
-                attention_backend_override=impl_cfg.attention_backend_override,
-                mtp_enable=mtp_enable,
-                mtp_enable_train=mtp_enable_train,
-                mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
-            )
-            .to(torch.bfloat16)
-            .cuda()
-        )
 
-    chunks = [_chunk(i) for i in range(vpp)] if vpp is not None else [_chunk()]
-    _configure_attention_backend(chunks, backend=impl_cfg.attention_backend_override)
+def _cast_training_parameters(model: nn.Module) -> None:
+    """Cast matrix parameters to BF16 without truncating FP32 controls."""
+    for name, parameter in model.named_parameters():
+        if parameter.is_floating_point() and not _is_native_fp32_control(name):
+            parameter.data = parameter.data.to(torch.bfloat16)
 
-    recompute_spec = parse_recompute_spec(impl_cfg.recompute)
-    if recompute_spec:
-        for chunk in chunks:
-            apply_recompute(_iter_transformer_units(chunk), recompute_spec, MODULE_MAP)
 
-    if impl_cfg.offload:
-        from megatron.lite.primitive.recompute import apply_offload
+def build_training_backend(
+    chunks: list[nn.Module],
+    model_cfg: DeepseekV4Config,
+    impl_cfg,
+    ps: ParallelState,
+    *,
+    unit_modules: tuple[type[nn.Module], ...],
+    use_fp32_shards: bool,
+    cast_forward_inputs: bool = True,
+    fsdp2_replicated_param_classifier=None,
+):
+    """Build the shared DS4 runtime-owned optimizer backend."""
 
-        for chunk in chunks:
-            apply_offload(_iter_transformer_units(chunk), impl_cfg.offload, MODULE_MAP)
-
-    # Parametrize before optimizer construction so it captures the BF16 master.
-    apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
-
-    optimizer = None
-    finalize_grads = None
-    post_model_load_hook = None
-    optimizer_backend = "none"
     optimizer_name = _optimizer_backend_name(impl_cfg.optimizer)
     if optimizer_name == "dist_opt":
         from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
@@ -449,33 +435,111 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
         )
         register_training_hooks(chunks, optimizer)
-        optimizer_backend = "dist_opt"
-    elif optimizer_name == "fsdp2":
-        optimizer_backend = "fsdp2"
+        return optimizer, finalize_grads, None, "dist_opt"
+    if optimizer_name == "fsdp2":
+        config = impl_cfg.optimizer_config or OptimizerConfig()
 
-        def _post_model_load_hook():
-            from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Layer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
+        def post_model_load_hook():
+            from megatron.lite.primitive.optimizers.fsdp2 import (
+                build_fsdp2_training_optimizer,
+            )
 
             return {
                 "optimizer": build_fsdp2_training_optimizer(
                     chunks,
-                    impl_cfg.optimizer_config,
+                    config,
                     ps,
-                    unit_modules=(DeepseekV4Layer,),
+                    unit_modules=unit_modules,
                     expert_classifier=is_expert_param,
+                    replicated_param_classifier=fsdp2_replicated_param_classifier,
                     deterministic=impl_cfg.deterministic,
                     vpp=impl_cfg.parallel.vpp,
                     leaf_module_names=(),
-                    use_fp32_shards=False,
+                    use_fp32_shards=use_fp32_shards,
+                    cast_forward_inputs=cast_forward_inputs,
                 )
             }
 
-        post_model_load_hook = _post_model_load_hook
-    elif optimizer_name is None:
-        optimizer_backend = "none"
-    else:
-        raise ValueError(f"Unknown DeepSeek V4 lite optimizer: {impl_cfg.optimizer!r}.")
+        return None, None, post_model_load_hook, "fsdp2"
+    if optimizer_name is None:
+        return None, None, None, "none"
+    raise ValueError(
+        "DeepSeek V4 optimizer must be runtime-owned dist_opt or fsdp2; "
+        f"got {optimizer_name!r}"
+    )
+
+
+def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
+    from megatron.lite.model.deepseek_v4.lite.model import (
+        DeepseekV4Layer,
+        DeepseekV4Model,
+    )
+
+    p = impl_cfg.parallel
+    _validate_parallel_scope(p)
+    _apply_mtp_config(model_cfg, impl_cfg)
+    mtp_enable = bool(impl_cfg.mtp_enable) and model_cfg.num_nextn_predict_layers > 0
+    mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
+    ps = init_parallel(impl_cfg.parallel)
+    vpp = None if p.vpp == 1 else p.vpp
+    train_cfg = SimpleNamespace(
+        tp=ps.tp_size,
+        ep=ps.ep_size,
+        etp=ps.etp_size,
+        pp=ps.pp_size,
+        cp=ps.cp_size,
+        vpp=vpp,
+        fp8=False,
+        use_deepep=impl_cfg.use_deepep,
+    )
+
+    def _chunk(i: int | None = None):
+        model = DeepseekV4Model(
+            model_cfg,
+            train_cfg,
+            ps,
+            vpp_chunk_id=i,
+            use_deepep=impl_cfg.use_deepep,
+            use_thd=impl_cfg.use_thd,
+            hf_path=impl_cfg.hf_path,
+            attention_backend_override=impl_cfg.attention_backend_override,
+            mtp_enable=mtp_enable,
+            mtp_enable_train=mtp_enable_train,
+            mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
+        )
+        _cast_training_parameters(model)
+        return model.cuda()
+
+    chunks = [_chunk(i) for i in range(vpp)] if vpp is not None else [_chunk()]
+    _configure_attention_backend(chunks, backend=impl_cfg.attention_backend_override)
+
+    recompute_spec = parse_recompute_spec(impl_cfg.recompute)
+    if recompute_spec:
+        for chunk in chunks:
+            apply_recompute(_iter_transformer_units(chunk), recompute_spec, MODULE_MAP)
+
+    if impl_cfg.offload:
+        from megatron.lite.primitive.recompute import apply_offload
+
+        for chunk in chunks:
+            apply_offload(_iter_transformer_units(chunk), impl_cfg.offload, MODULE_MAP)
+
+    # Parametrize before optimizer construction so it captures the BF16 master.
+    apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
+
+    optimizer, finalize_grads, post_model_load_hook, optimizer_backend = (
+        build_training_backend(
+            chunks,
+            model_cfg,
+            impl_cfg,
+            ps,
+            unit_modules=(DeepseekV4Layer,),
+            use_fp32_shards=False,
+            fsdp2_replicated_param_classifier=(
+                lambda name, _parameter: _is_native_fp32_control(name)
+            ),
+        )
+    )
 
     return ModelBundle(
         chunks=chunks,

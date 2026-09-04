@@ -26,11 +26,18 @@ class MegatronLiteEngineConfig(EngineConfig):
     pp: int = 1
     vpp: int = 1
     cp: int = 1
+    # Colocated rollout topology.  When it matches the actor's EP layout,
+    # verl_mlite can route only the expert shard owned by the paired vLLM rank.
+    rollout_ep: int = 1
+    rollout_tp: int = 1
 
     attention_backend_override: str | None = "flash"
     router_aux_loss_coef: float | None = None
     cross_entropy_fusion: bool | None = None
-    export_dtype: str | None = "bfloat16"
+    # Preserve each model parameter's declared dtype by default.  A blanket
+    # BF16 cast corrupts FP32 coefficients when the receiver restores them
+    # into FP32 parameter containers.
+    export_dtype: str | None = None
     qat: dict[str, Any] = field(default_factory=dict)
     resync_format: str | None = None
     resync_config: dict[str, Any] = field(default_factory=dict)
@@ -44,6 +51,8 @@ class MegatronLiteEngineConfig(EngineConfig):
             raise ValueError(
                 f"MegatronLiteEngineConfig expects strategy='mlite', got {self.strategy!r}"
             )
+        if self.rollout_ep < 1 or self.rollout_tp < 1:
+            raise ValueError("rollout_ep and rollout_tp must be positive")
         if self.custom_backend_module:
             importlib.import_module(self.custom_backend_module)
         if self.resync_format is not None:

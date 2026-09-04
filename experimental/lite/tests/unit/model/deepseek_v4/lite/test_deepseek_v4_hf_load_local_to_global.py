@@ -18,6 +18,7 @@ nothing, and leaves the params untouched.
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,6 +50,34 @@ class _LayerNorm(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(dim))
+
+
+def test_ds4_default_export_preserves_fp32_coefficient_bits() -> None:
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+
+    ckpt = _checkpoint_module()
+    model = nn.Module()
+    model.norm = _LayerNorm(2)
+    model.norm.weight.data.copy_(torch.tensor([1.0001, -0.9999]))
+    config = DeepseekV4Config(vocab_size=2, num_hidden_layers=0)
+    parallel_state = SimpleNamespace(
+        tp_size=1,
+        tp_group=None,
+        ep_size=1,
+        ep_group=None,
+        pp_size=1,
+        pp_rank=0,
+        pp_group=None,
+        pp_global_ranks=[0],
+    )
+
+    exported = dict(
+        ckpt._export_unquantized_weights(model, config, parallel_state)
+    )["norm.weight"]
+
+    assert exported.dtype == torch.float32
+    assert torch.equal(exported, model.norm.weight)
+    assert not torch.equal(exported, exported.bfloat16().float())
 
 
 class _Block(nn.Module):
@@ -156,6 +185,336 @@ def test_ds4_load_hf_canonicalizes_qat_state_before_dynamic_mapping(tmp_path):
     ckpt.load_hf_weights(model, str(tmp_path), cfg, ps)
 
     torch.testing.assert_close(master, expected)
+
+
+def test_ds4_shared_checkpoint_preserves_reversible_fp8_source_scale(tmp_path):
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+    from safetensors.torch import save_file
+
+    ckpt = _checkpoint_module()
+    model = _QATStage([0], 128)
+    qweight = torch.randn(128, 128).clamp(-4, 4).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.25]], dtype=torch.float32)
+    shard = "model-00001-of-00001.safetensors"
+    weight_name = "layers.0.attn.wq_a.weight"
+    scale_name = "layers.0.attn.wq_a.scale"
+    save_file({weight_name: qweight, scale_name: scale}, str(tmp_path / shard))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {weight_name: shard, scale_name: shard}})
+    )
+
+    cfg = DeepseekV4Config(
+        num_hidden_layers=1,
+        n_routed_experts=8,
+        quantization_config={"scale_fmt": "ue8m0"},
+    )
+    ps = SimpleNamespace(
+        tp_size=1,
+        etp_size=1,
+        ep_size=1,
+        ep_rank=0,
+        dp_cp_group=None,
+    )
+    ckpt.load_hf_weights(model, str(tmp_path), cfg, ps)
+
+    master = model.layers["0"].self_attn.self_attn.wq_a.weight
+    restored = ckpt.requantize_block_fp8_weight(
+        master.detach().to(torch.bfloat16), master._fp8_source_scales
+    )
+    assert torch.equal(restored.qweight, qweight)
+    assert master._fp8_source_scale_version == master._version
+    assert torch.equal(
+        model.layers["0"].self_attn.self_attn.wq_a._fp8_source_scales_by_parameter[
+            "weight"
+        ],
+        scale,
+    )
+    assert torch.equal(
+        model._fp8_source_scales_by_name[
+            "layers.0.self_attn.self_attn.wq_a.weight"
+        ],
+        scale,
+    )
+
+
+def test_ds4_optimizer_invalidation_removes_parameter_source_scale_state():
+    ckpt = _checkpoint_module()
+    model = nn.Linear(128, 128, bias=False, dtype=torch.bfloat16)
+    scale = torch.ones(1, 1, dtype=torch.float32)
+    model.weight._fp8_source_scales = scale
+    model.weight._fp8_source_scale_version = model.weight._version
+    model._fp8_source_scales_by_parameter = {"weight": scale}
+    model._fp8_source_scales_by_name = {"weight": scale}
+    model._fp8_source_scales_valid = True
+
+    ckpt.invalidate_bound_source_scales(model)
+
+    assert not hasattr(model.weight, "_fp8_source_scales")
+    assert not hasattr(model.weight, "_fp8_source_scale_version")
+    assert model._fp8_source_scales_by_parameter == {}
+    assert model._fp8_source_scales_by_name == {}
+    assert model._fp8_source_scales_valid is False
+
+
+def test_ds4_resume_invalidation_requantizes_first_export_from_current_weight():
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+    from megatron.lite.primitive.parallel.state import ParallelState
+    from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
+
+    ckpt = _checkpoint_module()
+    model = _QATStage([0], 128)
+    parameter = model.layers["0"].self_attn.self_attn.wq_a.weight
+    native_name = "layers.0.self_attn.self_attn.wq_a.weight"
+    hf_name = "layers.0.attn.wq_a.weight"
+    stale_scale = torch.tensor([[0.25]], dtype=torch.float32)
+    model._fp8_source_scales_valid = True
+    model._fp8_source_scales_by_name = {native_name: stale_scale}
+    parameter._fp8_source_scales = stale_scale
+    parameter._fp8_source_scale_version = parameter._version
+
+    with torch.no_grad():
+        parameter.fill_(1.0)
+
+    config = DeepseekV4Config(
+        num_hidden_layers=1,
+        n_routed_experts=8,
+        expert_dtype="fp8",
+        quantization_config={"weight_block_size": [128, 128]},
+    )
+    export_kwargs = {
+        "target": "block_fp8",
+        "resync_config": {"expert_dtype": "fp8"},
+    }
+    stale_export = dict(
+        ckpt.export_hf_weights(model, config, ParallelState(), **export_kwargs)
+    )
+    assert torch.equal(stale_export["layers.0.attn.wq_a.scale"], stale_scale)
+
+    ckpt.invalidate_bound_source_scales(model)
+    current_export = dict(
+        ckpt.export_hf_weights(model, config, ParallelState(), **export_kwargs)
+    )
+    expected_weight, expected_scale = quantize_block_fp8(
+        parameter, (128, 128), scale_format="float32"
+    )
+
+    assert torch.equal(current_export[hf_name], expected_weight)
+    assert torch.equal(current_export["layers.0.attn.wq_a.scale"], expected_scale)
+    assert not torch.equal(stale_export[hf_name], current_export[hf_name])
+    assert not torch.equal(expected_scale, stale_scale)
+
+
+def test_ds4_fused_expert_preserves_w1_w3_bytes_and_scale_order():
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+
+    ckpt = _checkpoint_module()
+    cfg = DeepseekV4Config(num_hidden_layers=1, n_routed_experts=8)
+    spec = ckpt.DeepseekV4WeightSpec(cfg, source_block_fp8=True)
+    native_name = "layers.0.mlp.experts.fc1.weight0"
+    qweights = [
+        torch.randn(128, 128).clamp(-4, 4).to(torch.float8_e4m3fn)
+        for _ in range(2)
+    ]
+    scales = [
+        torch.tensor([[0.125]], dtype=torch.float32),
+        torch.tensor([[0.5]], dtype=torch.float32),
+    ]
+
+    master = spec.hf_to_native(
+        native_name,
+        [qweights[0], scales[0], qweights[1], scales[1]],
+    )
+    fused_scale = spec.source_block_scales[native_name]
+    restored = ckpt.requantize_block_fp8_weight(master, fused_scale)
+
+    assert torch.equal(restored.qweight, torch.cat(qweights, dim=0))
+    assert torch.equal(fused_scale, torch.cat(scales, dim=0))
+
+
+def _mock_dense_replica_receiver(monkeypatch, master, source_scale):
+    from megatron.lite.primitive.ckpt import hf_weights
+
+    broadcasts = 0
+
+    def fake_broadcast(tensor, *, src, group):
+        nonlocal broadcasts
+        assert src == 0
+        assert group is not None
+        broadcasts += 1
+        if broadcasts == 1:
+            tensor.copy_(master)
+        elif broadcasts == 2:
+            tensor.fill_(source_scale is not None)
+        elif broadcasts == 3 and source_scale is not None:
+            tensor.copy_(source_scale)
+        else:
+            raise AssertionError(f"unexpected replica broadcast #{broadcasts}")
+
+    monkeypatch.setattr(hf_weights.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(hf_weights.dist, "get_world_size", lambda _group: 4)
+    monkeypatch.setattr(
+        hf_weights.dist, "get_process_group_ranks", lambda _group: [0, 1, 2, 3]
+    )
+    monkeypatch.setattr(hf_weights.dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(hf_weights.dist, "broadcast", fake_broadcast)
+    return lambda: broadcasts
+
+
+def _dense_ep4_parallel_state():
+    return SimpleNamespace(
+        tp_size=1,
+        etp_size=1,
+        ep_size=4,
+        ep_rank=1,
+        dp_cp_group=object(),
+        ep_dp_group=None,
+    )
+
+
+def test_ds4_native_fp8_dense_replica_receives_source_scale(tmp_path, monkeypatch):
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+    from safetensors.torch import save_file
+
+    ckpt = _checkpoint_module()
+    qweight = torch.randn(128, 128).clamp(-4, 4).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.25]], dtype=torch.float32)
+    expanded = scale.repeat_interleave(128, 0).repeat_interleave(128, 1)
+    master = (qweight.float() * expanded).to(torch.bfloat16)
+    weight_name = "layers.0.attn.wq_a.weight"
+    scale_name = "layers.0.attn.wq_a.scale"
+    shard = "model-00001-of-00001.safetensors"
+    save_file({weight_name: qweight, scale_name: scale}, str(tmp_path / shard))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {weight_name: shard, scale_name: shard}})
+    )
+    broadcast_count = _mock_dense_replica_receiver(monkeypatch, master, scale)
+    model = _QATStage([0], 128)
+    cfg = DeepseekV4Config(
+        num_hidden_layers=1,
+        n_routed_experts=8,
+        quantization_config={"scale_fmt": "ue8m0"},
+    )
+
+    ckpt.load_hf_weights(model, str(tmp_path), cfg, _dense_ep4_parallel_state())
+
+    parameter = model.layers["0"].self_attn.self_attn.wq_a.weight
+    assert torch.equal(parameter, master)
+    assert torch.equal(parameter._fp8_source_scales, scale)
+    assert parameter._fp8_source_scale_version == parameter._version
+    restored = ckpt.requantize_block_fp8_weight(
+        parameter.detach().to(torch.bfloat16), scale
+    )
+    assert torch.equal(restored.qweight, qweight)
+    assert broadcast_count() == 3
+
+
+def test_ds4_mxfp4_dense_replica_receives_identical_bf16_master(tmp_path, monkeypatch):
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+    from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
+    from safetensors.torch import save_file
+
+    ckpt = _checkpoint_module()
+    source = torch.linspace(-3, 3, 128 * 128).reshape(128, 128)
+    packed, scale = quantize_mxfp4(source)
+    native_name = "layers.0.self_attn.self_attn.wq_a.weight"
+    cfg = DeepseekV4Config(num_hidden_layers=1, n_routed_experts=8)
+    source_spec = ckpt.DeepseekV4WeightSpec(cfg, source_block_fp8=True)
+    master = source_spec.hf_to_native(native_name, [packed, scale])
+    weight_name = "layers.0.attn.wq_a.weight"
+    scale_name = "layers.0.attn.wq_a.scale"
+    shard = "model-00001-of-00001.safetensors"
+    save_file({weight_name: packed, scale_name: scale}, str(tmp_path / shard))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {weight_name: shard, scale_name: shard}})
+    )
+    broadcast_count = _mock_dense_replica_receiver(monkeypatch, master, None)
+    model = _QATStage([0], 128)
+
+    ckpt.load_hf_weights(model, str(tmp_path), cfg, _dense_ep4_parallel_state())
+
+    parameter = model.layers["0"].self_attn.self_attn.wq_a.weight
+    assert torch.equal(parameter, master)
+    assert not hasattr(parameter, "_fp8_source_scales")
+    assert broadcast_count() == 2
+
+
+def test_ds4_source_scales_bind_global_expert_to_ep_local_parameter():
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+
+    ckpt = _checkpoint_module()
+    model = nn.Module()
+    model.layer_indices = [2]
+    model.layers = nn.ModuleDict({"0": nn.Module()})
+    layer = model.layers["0"]
+    layer.mlp = nn.Module()
+    layer.mlp.experts = nn.Module()
+    layer.mlp.experts.fc1 = nn.Module()
+    layer.mlp.experts.fc1.register_parameter(
+        "weight0", nn.Parameter(torch.zeros(128, 128, dtype=torch.bfloat16))
+    )
+    cfg = DeepseekV4Config(num_hidden_layers=1, n_routed_experts=256)
+    spec = ckpt.DeepseekV4WeightSpec(cfg, source_block_fp8=True)
+    scale = torch.ones(1, 1, dtype=torch.float32)
+    # The shared loader has already remapped the PP-stage layer to its local
+    # index, while the expert suffix remains global until EP binding.
+    spec.source_block_scales["layers.0.mlp.experts.fc1.weight128"] = scale
+    ps = SimpleNamespace(ep_size=2, ep_rank=1)
+
+    spec.bind_source_scales(model, ps)
+
+    parameter = layer.mlp.experts.fc1.weight0
+    assert torch.equal(parameter._fp8_source_scales, scale)
+    assert torch.equal(
+        layer.mlp.experts.fc1._fp8_source_scales_by_parameter["weight0"], scale
+    )
+    assert "layers.2.mlp.experts.fc1.weight128" in model._fp8_source_scales_by_name
+
+
+def test_ds4_source_scale_export_keeps_bound_global_layer_names():
+    from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
+
+    ckpt = _checkpoint_module()
+    model = nn.Module()
+    model.layer_indices = [2]
+    model._fp8_source_scales_valid = True
+    model._fp8_source_scales_by_name = {
+        "layers.0.self_attn.self_attn.wq_a.weight": torch.ones(1, 1),
+        "layers.2.self_attn.self_attn.wq_a.weight": torch.full((1, 1), 2.0),
+    }
+    ps = SimpleNamespace(
+        ep_size=1,
+        ep_group=None,
+        pp_size=1,
+        pp_group=None,
+    )
+
+    scales = ckpt._export_source_scales(
+        model, DeepseekV4Config(num_hidden_layers=4), ps
+    )
+
+    assert torch.equal(scales["layers.0.attn.wq_a.weight"], torch.ones(1, 1))
+    assert torch.equal(scales["layers.2.attn.wq_a.weight"], torch.full((1, 1), 2.0))
+
+
+def test_ds4_source_scale_export_gathers_remote_ep_experts(monkeypatch):
+    ckpt = _checkpoint_module()
+    local = {"layers.0.ffn.experts.0.w1.weight": torch.tensor([[1.0]])}
+    remote = {"layers.0.ffn.experts.128.w1.weight": torch.tensor([[2.0]])}
+    group = object()
+
+    monkeypatch.setattr(ckpt.dist, "is_initialized", lambda: True)
+
+    def fake_all_gather_object(output, value, *, group):
+        output[:] = [value, remote]
+
+    monkeypatch.setattr(ckpt.dist, "all_gather_object", fake_all_gather_object)
+
+    combined = ckpt._gather_source_scale_registry(
+        local, size=2, group=group, parallelism="EP"
+    )
+
+    assert set(combined) == set(local) | set(remote)
+    assert torch.equal(combined[next(iter(remote))], next(iter(remote.values())))
 
 
 def test_ds4_export_streams_router_buffers_from_every_pp_stage(monkeypatch):

@@ -120,6 +120,19 @@ def _reshard_fsdp2_modules(model_chunk: Any) -> None:
             module.reshard()
 
 
+def _pinned_cpu_copy(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy CUDA data directly into its final pinned CPU allocation."""
+    cpu_tensor = torch.empty(
+        tensor.size(),
+        dtype=tensor.dtype,
+        layout=tensor.layout,
+        device="cpu",
+        pin_memory=True,
+    )
+    cpu_tensor.copy_(tensor, non_blocking=False)
+    return cpu_tensor
+
+
 def offload_model_to_cpu(model_list: list) -> None:
     """Offload DDP model to CPU via buffer-resize (zero-copy on GPU side)."""
     for model_chunk in model_list:
@@ -128,8 +141,17 @@ def offload_model_to_cpu(model_list: list) -> None:
             for buffers in all_buffers:
                 for buffer in buffers:
                     if buffer.param_data.storage().size() > 0:
-                        buffer.param_data.cpu_data = buffer.param_data.data.cpu().pin_memory()
-                        buffer.param_data_size = buffer.param_data.storage().size()
+                        param_data_size = buffer.param_data.storage().size()
+                        cpu_data = getattr(buffer.param_data, "cpu_data", None)
+                        if (
+                            cpu_data is not None
+                            and cpu_data.storage().size() == param_data_size
+                        ):
+                            cpu_data.copy_(buffer.param_data.data, non_blocking=False)
+                        else:
+                            cpu_data = _pinned_cpu_copy(buffer.param_data.data)
+                            buffer.param_data.cpu_data = cpu_data
+                        buffer.param_data_size = param_data_size
                         buffer.param_data.storage().resize_(0)
 
                     if buffer.grad_data.storage().size() > 0:
@@ -182,18 +204,25 @@ def offload_optimizer(optimizer) -> None:
     for _opt in _iter_opts(optimizer, ChainedOptimizer):
         if _opt.optimizer is not None:
             hdo = _opt.optimizer
+            state_offloader = getattr(_opt, "_optimizer_state_offloader", None)
             if all(
                 hasattr(hdo, a) for a in ("sub_optimizers", "inner_param_to_orig_param", "state")
             ):
                 for sub_opt in hdo.sub_optimizers:
                     for param, state in sub_opt.state.items():
+                        orig_param = hdo.inner_param_to_orig_param.get(param, param)
+                        if state_offloader is not None and state_offloader.is_param_offloaded(
+                            orig_param
+                        ):
+                            continue
                         for k, v in state.items():
                             if not isinstance(v, torch.Tensor):
                                 continue
-                            orig_param = hdo.inner_param_to_orig_param.get(param, param)
                             hdo.state[orig_param][k] = state[k] = v.to("cpu")
             else:
-                for v in _opt.optimizer.state.values():
+                for param, v in _opt.optimizer.state.items():
+                    if state_offloader is not None and state_offloader.is_param_offloaded(param):
+                        continue
                     if "exp_avg" in v:
                         v["exp_avg"] = v["exp_avg"].to("cpu", non_blocking=True)
                     if "exp_avg_sq" in v:
@@ -212,7 +241,13 @@ def load_optimizer(optimizer) -> None:
             if hasattr(_opt.optimizer, "_move_new_state_to_right_device"):
                 _opt.optimizer._move_new_state_to_right_device()
             else:
-                for v in _opt.optimizer.state.values():
+                state_offloader = getattr(_opt, "_optimizer_state_offloader", None)
+                for param, v in _opt.optimizer.state.items():
+                    # Chunk-managed state is CPU-canonical and is staged by MCore's
+                    # optimizer lifecycle.  Moving it wholesale here defeats the
+                    # configured memory bound and can OOM a colocated train/rollout job.
+                    if state_offloader is not None and state_offloader.is_param_offloaded(param):
+                        continue
                     if "exp_avg" in v:
                         v["exp_avg"] = v["exp_avg"].to("cuda", non_blocking=True)
                     if "exp_avg_sq" in v:

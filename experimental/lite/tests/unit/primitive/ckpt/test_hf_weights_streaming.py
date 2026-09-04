@@ -769,6 +769,39 @@ def test_qat_parametrized_parameter_exports_with_logical_name() -> None:
     assert torch.equal(exported["hf.proj.weight"], expected)
 
 
+def test_export_spec_can_restore_parameter_logical_dtype() -> None:
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor([1.0001], dtype=torch.float32))
+            self._fsdp2_model_param_dtypes_by_name = {"weight": torch.bfloat16}
+
+    class Spec:
+        num_experts = 0
+        is_expert = staticmethod(lambda name: False)
+        tp_spec = staticmethod(lambda name: None)
+        weight_map = staticmethod(lambda: {"weight": ["weight"]})
+        native_to_hf = staticmethod(lambda name, tensor: [(name, tensor)])
+
+    ps = type(
+        "ParallelState",
+        (),
+        {
+            "pp_size": 1,
+            "tp_size": 1,
+            "tp_group": None,
+            "ep_size": 1,
+            "ep_group": None,
+            "etp_size": 1,
+            "etp_group": None,
+        },
+    )()
+
+    exported = dict(export_hf_weights(Model(), Spec(), ps))
+
+    assert exported["weight"].dtype == torch.bfloat16
+
+
 def test_pp_export_never_materializes_the_whole_stage(monkeypatch) -> None:
     """Residency guard: with one-param buckets, pulling the first streamed param
     must visit exactly one of three stage params — the legacy path would have

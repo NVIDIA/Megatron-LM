@@ -110,7 +110,10 @@ register_model(
     "deepseek_v4",
     package="megatron.lite.model.deepseek_v4",
     hf_model_types=["deepseek_v4"],
-    impls={"lite": "megatron.lite.model.deepseek_v4.lite.protocol"},
+    impls={
+        "lite": "megatron.lite.model.deepseek_v4.lite.protocol",
+        "vllm": "megatron.lite.model.deepseek_v4.vllm.protocol",
+    },
 )
 
 

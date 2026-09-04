@@ -11,8 +11,6 @@ import argparse
 import importlib.metadata as metadata
 import inspect
 import json
-import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -20,16 +18,17 @@ from packaging.version import Version
 
 
 EXACT_DEPENDENCIES = {
-    "vllm": "0.25.1",
-    "flashinfer-python": "0.6.13",
-    "nvidia-cutlass-dsl": "4.5.2",
-    "tilelang": "0.1.9",
+    "vllm": "0.26.1rc1.dev682+g7aa248fcf",
+    "flashinfer-python": "0.6.16.post3",
+    "nvidia-cutlass-dsl": "4.6.2",
+    "nvidia-nvshmem-cu13": "3.4.5",
+    "nvidia-resiliency-ext": "0.6.0",
+    "tilelang": "0.1.12",
 }
 MINIMUM_DEPENDENCIES = {
     "transformer-engine": "2.15.0",
     "nvidia-cudnn-frontend": "1.27.0",
 }
-EXPECTED_VERL_COMMIT = "b9c513c4"
 
 
 def installed(name: str) -> str:
@@ -50,27 +49,6 @@ def validate_geometry(model_config: Path, rollout_tp: int) -> None:
         f"DS4_ROLLOUT_TP_PREFLIGHT_PASSED o_groups={o_groups} rollout_tp={rollout_tp}",
         flush=True,
     )
-
-
-def verl_commit() -> str:
-    declared = os.environ.get("VERL_COMMIT")
-    root = os.environ.get("VERL_ROOT")
-    if declared is None and root:
-        try:
-            declared = subprocess.check_output(
-                ["git", "-C", root, "rev-parse", "HEAD"],
-                text=True,
-                stderr=subprocess.DEVNULL,
-            ).strip()
-        except (OSError, subprocess.CalledProcessError):
-            pass
-    if declared is None:
-        raise SystemExit(
-            f"VERL provenance is not verifiable; set VERL_COMMIT={EXPECTED_VERL_COMMIT}"
-        )
-    if not declared.startswith(EXPECTED_VERL_COMMIT):
-        raise SystemExit(f"DS4 requires VERL {EXPECTED_VERL_COMMIT}, got {declared}")
-    return declared
 
 
 def validate_environment() -> None:
@@ -99,9 +77,9 @@ def validate_environment() -> None:
     import transformer_engine.pytorch as te
     from cudnn import DSA
 
-    if not torch.__version__.startswith("2.12.0a0") or torch.version.cuda != "13.2":
+    if not torch.__version__.startswith("2.13.0") or torch.version.cuda != "13.0":
         raise SystemExit(
-            "DS4 requires PyTorch 2.12 nv26.05 / CUDA 13.2, "
+            "DS4 requires PyTorch 2.13 nv26.07 / CUDA 13.0, "
             f"got torch={torch.__version__} cuda={torch.version.cuda}"
         )
     if "q_causal_offsets" not in inspect.signature(
@@ -110,16 +88,23 @@ def validate_environment() -> None:
         raise SystemExit(
             "nvidia-cudnn-frontend lacks q_causal_offsets required by fused DSA CP"
         )
+    sparse_backward = getattr(DSA, "sparse_attention_backward_wrapper", None)
+    if not callable(sparse_backward):
+        raise SystemExit(
+            "nvidia-cudnn-frontend lacks sparse_attention_backward_wrapper "
+            "required by DS4 actor backward"
+        )
 
-    declared_verl = verl_commit()
     print(
         "DS4_DEPENDENCY_CONTRACT_PASSED "
-        f"verl={declared_verl} python={sys.version.split()[0]} "
+        f"python={sys.version.split()[0]} "
         f"torch={torch.__version__} torch_cuda={torch.version.cuda} "
         f"vllm={actual['vllm']} te={actual['transformer-engine']} "
         f"cudnn_frontend={actual['nvidia-cudnn-frontend']} "
         f"flashinfer={actual['flashinfer-python']} "
-        f"cutlass={actual['nvidia-cutlass-dsl']} tilelang={actual['tilelang']} "
+        f"cutlass={actual['nvidia-cutlass-dsl']} "
+        f"nvshmem={actual['nvidia-nvshmem-cu13']} "
+        f"nvrx={actual['nvidia-resiliency-ext']} tilelang={actual['tilelang']} "
         f"te_origin={te.__file__} cudnn_origin={cudnn.__file__}",
         flush=True,
     )

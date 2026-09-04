@@ -30,9 +30,8 @@ WORKER_PATH = HARNESS_ROOT / "pytest_worker.py"
 if str(HARNESS_ROOT) not in sys.path:
     sys.path.insert(0, str(HARNESS_ROOT))
 
+from markers import ARCHITECTURE_CAPABILITIES  # noqa: E402
 from markers import (  # noqa: E402
-    ARCHITECTURE_CAPABILITIES,
-    ARCHITECTURE_ORDER,
     DEFAULT_TIMEOUT_SECONDS,
     ENVIRONMENT_VARIABLES,
     architecture_supports,
@@ -172,7 +171,9 @@ def resolve_targets(arguments: list[str], caller_cwd: Path) -> list[str]:
         selected.append(resolved)
 
     deduplicated: list[Path] = []
-    for path in sorted(set(selected), key=lambda value: (len(value.parts), value.as_posix())):
+    for path in sorted(
+        set(selected), key=lambda value: (len(value.parts), value.as_posix())
+    ):
         if any(path == parent or parent in path.parents for parent in deduplicated):
             continue
         deduplicated.append(path)
@@ -196,8 +197,13 @@ def _probe_hardware(torch_module, profile: str) -> HardwareSelection:
     architecture = next(
         (
             name
-            for name, expected_capability in ARCHITECTURE_CAPABILITIES.items()
-            if expected_capability == capability
+            for name, minimum_capability in sorted(
+                ARCHITECTURE_CAPABILITIES.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+            if capability[0] == minimum_capability[0]
+            and capability >= minimum_capability
         ),
         None,
     )
@@ -211,7 +217,10 @@ def detect_default_hardware(torch_module) -> HardwareSelection:
     for profile, (gpu_count, architecture) in HARDWARE_PROFILES.items():
         if detected.gpu_count == gpu_count and detected.architecture == architecture:
             return HardwareSelection(
-                profile, detected.architecture, detected.gpu_count, detected.compute_capability
+                profile,
+                detected.architecture,
+                detected.gpu_count,
+                detected.compute_capability,
             )
     raise UnsupportedHardware("visible GPU topology is not a supported default profile")
 
@@ -224,7 +233,9 @@ def _load_torch():
     try:
         with warnings.catch_warnings():
             warnings.filterwarnings(
-                "ignore", message=r"The pynvml package is deprecated\..*", category=FutureWarning
+                "ignore",
+                message=r"The pynvml package is deprecated\..*",
+                category=FutureWarning,
             )
             import torch
     except Exception as exc:
@@ -234,6 +245,7 @@ def _load_torch():
 
 def _sanitized_environment(environ: dict[str, str] | None = None) -> dict[str, str]:
     base = dict(os.environ if environ is None else environ)
+    dependency_paths = base.get("MLITE_TEST_DEPENDENCY_PATHS", "")
     for key in tuple(base):
         if (
             key in _DISTRIBUTED_ENV
@@ -244,10 +256,10 @@ def _sanitized_environment(environ: dict[str, str] | None = None) -> dict[str, s
             base.pop(key)
     base.pop("PYTEST_ADDOPTS", None)
     base.pop("PYTEST_PLUGINS", None)
-    # LITE_ROOT first: the worker is launched as a script, so sys.path[0] is the
-    # harness directory and cwd never participates. Megatron-LM's repository root
-    # also ships an `examples/` package, and it would otherwise shadow lite's.
-    base["PYTHONPATH"] = os.pathsep.join((str(LITE_ROOT), str(REPO_ROOT)))
+    source_roots = [
+        path for path in dependency_paths.split(os.pathsep) if path
+    ] + [str(REPO_ROOT), str(LITE_ROOT)]
+    base["PYTHONPATH"] = os.pathsep.join(source_roots)
     base["PYTHONDONTWRITEBYTECODE"] = "1"
     base["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     base["PYTHONHASHSEED"] = "0"
@@ -361,7 +373,9 @@ def select_cases(
             if not architecture_supports(selection.architecture, case.min_architecture):
                 raise SelectionError("selected test requires a newer GPU architecture")
             if case.gpus > selection.gpu_count:
-                raise SelectionError("selected test requires more GPUs than are visible")
+                raise SelectionError(
+                    "selected test requires more GPUs than are visible"
+                )
         selected.append(case)
     return selected
 
@@ -436,7 +450,9 @@ def build_suite_environment(
     base["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     base["NCCL_NVLS_ENABLE"] = "0"
     base["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
-    _configure_writable_caches(base, report_dir / "cache" if cache_root is None else cache_root)
+    _configure_writable_caches(
+        base, report_dir / "cache" if cache_root is None else cache_root
+    )
 
     for name, value in suite.environment:
         if value is None:
@@ -475,9 +491,13 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
-def _run_command(command: list[str], env: dict[str, str], timeout: int) -> tuple[int, bool]:
+def _run_command(
+    command: list[str], env: dict[str, str], timeout: int
+) -> tuple[int, bool]:
     try:
-        process = subprocess.Popen(command, cwd=REPO_ROOT, env=env, start_new_session=True)
+        process = subprocess.Popen(
+            command, cwd=REPO_ROOT, env=env, start_new_session=True
+        )
     except OSError:
         return EXIT_FAILURE, False
     try:
@@ -565,11 +585,15 @@ def run_suite(suite: Suite, temporary_root: Path) -> SuiteResult:
     report_dir = temporary_root / suite.name
     report_dir.mkdir(parents=True, exist_ok=False)
     command = build_suite_command(suite)
-    environment = build_suite_environment(suite, report_dir, cache_root=temporary_root / "cache")
+    environment = build_suite_environment(
+        suite, report_dir, cache_root=temporary_root / "cache"
+    )
 
     print(f"suite={suite.name} gpus={suite.gpus} status=RUNNING", flush=True)
     started = time.monotonic()
-    process_exit_code, timed_out = _run_command(command, environment, suite.timeout_seconds)
+    process_exit_code, timed_out = _run_command(
+        command, environment, suite.timeout_seconds
+    )
     duration = time.monotonic() - started
     return evaluate_suite_reports(
         suite, _load_rank_reports(report_dir), process_exit_code, timed_out, duration
@@ -613,7 +637,9 @@ def _print_header(selection: HardwareSelection, torch_module) -> None:
             "hardware_architecture=not_required"
         )
     else:
-        capability = f"sm_{selection.compute_capability[0]}{selection.compute_capability[1]}"
+        capability = (
+            f"sm_{selection.compute_capability[0]}{selection.compute_capability[1]}"
+        )
         print(
             f"hardware_gpu_count={selection.gpu_count} "
             f"hardware_compute_capability={capability} "
@@ -675,7 +701,10 @@ def _hardware_failure(exc: Exception, profile: str) -> int:
         )
     if isinstance(exc, UnsupportedHardware):
         return _stop(
-            profile, "UNSUPPORTED", EXIT_UNSUPPORTED_HARDWARE, message=f"hardware_error={exc}"
+            profile,
+            "UNSUPPORTED",
+            EXIT_UNSUPPORTED_HARDWARE,
+            message=f"hardware_error={exc}",
         )
     return _stop(
         profile,
@@ -760,7 +789,10 @@ def main(argv: list[str] | None = None) -> int:
                 or not distributed.is_nccl_available()
             ):
                 return _stop(
-                    selection.profile, "FAIL", EXIT_FAILURE, "distributed_nccl_unavailable"
+                    selection.profile,
+                    "FAIL",
+                    EXIT_FAILURE,
+                    "distributed_nccl_unavailable",
                 )
 
         for suite in suites:

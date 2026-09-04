@@ -3,13 +3,31 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
+from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert_classifier
 from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
+
+
+@contextmanager
+def _step_nvtx_range(name: str):
+    if os.environ.get("MLITE_STEP_NVTX") != "1" or not torch.cuda.is_available():
+        yield
+        return
+    synchronize = os.environ.get("MLITE_PROFILE_SYNC_PHASES") == "1" and (
+        name.endswith("/forward") or name.endswith("/backward")
+    )
+    if synchronize:
+        torch.cuda.synchronize()
+    with torch.cuda.nvtx.range(name):
+        yield
+    if synchronize:
+        torch.cuda.synchronize()
 
 
 def run_microbatch_loop(
@@ -49,26 +67,30 @@ def run_microbatch_loop(
     last_out = None
     all_metrics: list[dict] = []
     for mb in range(num_microbatches):
-        batch, loss_context = split_loss_context(next(data_iter))
-        if pre_forward_hook is not None:
-            scale = torch.tensor(1.0 / num_microbatches, device="cuda")
-            pre_forward_hook(scale)
-        with use_loss_context(loss_context):
-            out = forward_fn(model, batch)
-        if dist_opt and optimizer is not None and mb == num_microbatches - 1:
-            optimizer.grad_sync_enabled = True
-        if loss_fn is not None:
-            if loss_context is None:
-                loss, metrics = loss_fn(out, batch)
-            else:
-                loss, metrics = loss_fn(out, batch, loss_context)
-            if not forward_only:
-                (loss / num_microbatches).backward()
-            out["loss"] = loss.detach()
-            all_metrics.append(metrics)
-        elif not forward_only:
-            (out["loss"] / num_microbatches).backward()
-        last_out = out
+        with _step_nvtx_range(f"microbatch/{mb}"):
+            batch, loss_context = split_loss_context(next(data_iter))
+            if pre_forward_hook is not None:
+                scale = torch.tensor(1.0 / num_microbatches, device="cuda")
+                pre_forward_hook(scale)
+            with _step_nvtx_range(f"microbatch/{mb}/forward"):
+                with use_loss_context(loss_context):
+                    out = forward_fn(model, batch)
+            if dist_opt and optimizer is not None and mb == num_microbatches - 1:
+                optimizer.grad_sync_enabled = True
+            if loss_fn is not None:
+                if loss_context is None:
+                    loss, metrics = loss_fn(out, batch)
+                else:
+                    loss, metrics = loss_fn(out, batch, loss_context)
+                if not forward_only:
+                    with _step_nvtx_range(f"microbatch/{mb}/backward"):
+                        (loss / num_microbatches).backward()
+                out["loss"] = loss.detach()
+                all_metrics.append(metrics)
+            elif not forward_only:
+                with _step_nvtx_range(f"microbatch/{mb}/backward"):
+                    (out["loss"] / num_microbatches).backward()
+            last_out = out
     if last_out is not None and all_metrics:
         last_out["_loss_fn_metrics"] = all_metrics
     return last_out
@@ -166,9 +188,12 @@ def _bucketed_grad_sq_sum(
         bucket_bytes = 0
 
     for name, param in model.named_parameters():
-        if param.grad is None or not include_param(name):
+        grad = param.grad
+        if grad is None:
+            grad = getattr(param, "main_grad", None)
+        if grad is None or not include_param(name):
             continue
-        grad = param.grad.view(-1)
+        grad = grad.view(-1)
         grad_bytes = grad.numel() * grad.element_size()
         if bucket and bucket_bytes + grad_bytes > max_bucket_bytes:
             flush_bucket()

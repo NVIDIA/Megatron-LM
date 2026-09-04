@@ -98,12 +98,38 @@ def test_ds4_hash_router_records_and_replays_its_layer_column():
     _, recorded = module._hash_route(x, token_ids)
     assert torch.equal(gate.router_replay.recorded_topk_idx, recorded)
 
+    # Slot order is part of the exact R3 replay contract.
     target = torch.tensor([[1, 0], [3, 2]])
     RouterReplay.set_replay_data([target], replay_mask=torch.tensor([True, True]))
     RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
     weights, replayed = module._hash_route(x, token_ids)
     assert torch.equal(replayed, target)
     torch.testing.assert_close(weights.sum(dim=-1), torch.ones(2))
+
+
+def test_replay_preserves_exact_target_order_and_reports_set_changes():
+    from megatron.lite.primitive.modules.router_replay import (
+        RouterReplay,
+        RouterReplayAction,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+    replay = RouterReplay()
+    native = torch.tensor([[4, 2, 7], [1, 5, 3]])
+    target = torch.tensor([[7, 4, 2], [1, 6, 3]])
+    RouterReplay.set_replay_data([target])
+    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    RouterReplay.reset_replay_stats()
+
+    selected = replay.select_indices(native)
+
+    assert torch.equal(selected, target)
+    assert RouterReplay.replay_stats() == {
+        "calls": 1,
+        "rows": 6,
+        "changed": 4,
+        "sets_changed": 1,
+    }
 
 
 def test_r3_mask_replays_every_causal_row_except_last():
@@ -182,7 +208,7 @@ def test_replay_roots_exclude_mtp_layers():
     "protocol_name",
     ["qwen3_moe", "qwen3_5", "deepseek_v4", "glm5", "kimi_k2"],
 )
-def test_supported_moe_protocols_expose_mtp_safe_replay_roots(protocol_name):
+def test_supported_moe_protocols_do_not_reexport_shared_replay_roots(protocol_name):
     from pathlib import Path
 
     protocol_path = (
@@ -195,7 +221,7 @@ def test_supported_moe_protocols_expose_mtp_safe_replay_roots(protocol_name):
         / "protocol.py"
     )
     source = protocol_path.read_text()
-    assert "router_replay_roots" in source
+    assert "router_replay_roots" not in source
     if protocol_name in {"deepseek_v4", "glm5"}:
         assert "def pack_r3_replay_mask" in source
 

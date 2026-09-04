@@ -17,6 +17,8 @@ class DeepseekV4MoE(nn.Module):
     Allowlist reason: this owns DS4 hash routing wiring, while expert compute stays shared.
     """
 
+    dispatcher_cls = TokenDispatcher
+
     def __init__(
         self,
         config: DeepseekV4Config,
@@ -39,7 +41,7 @@ class DeepseekV4MoE(nn.Module):
             )
         else:
             self.gate._non_persistent_buffers_set.discard("expert_bias")
-        self.experts = Experts(config, ps)
+        self.experts = self._build_experts(config, ps)
         shared_intermediate = config.n_shared_experts * config.moe_intermediate_size
         self.shared_experts = (
             SwiGLUMLP(
@@ -50,12 +52,28 @@ class DeepseekV4MoE(nn.Module):
             if config.n_shared_experts > 0
             else None
         )
-        self.dispatcher = TokenDispatcher(
+        self.dispatcher = self._build_dispatcher(
+            config,
+            ps,
+            use_deepep=use_deepep,
+        )
+
+    def _build_dispatcher(
+        self,
+        config: DeepseekV4Config,
+        ps: ParallelState,
+        *,
+        use_deepep: bool,
+    ) -> TokenDispatcher:
+        return self.dispatcher_cls(
             config.n_routed_experts,
             config.hidden_size,
             ps,
             use_deepep=use_deepep,
         )
+
+    def _build_experts(self, config: DeepseekV4Config, ps: ParallelState) -> nn.Module:
+        return Experts(config, ps)
 
     def _hash_route(
         self,
@@ -80,13 +98,22 @@ class DeepseekV4MoE(nn.Module):
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         return (weights * self.route_scale).to(dtype=x.dtype), indices
 
+    def _route(
+        self,
+        x: torch.Tensor,
+        input_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.is_hash_layer and input_ids is not None:
+            return self._hash_route(x, input_ids)
+        return self.gate(x)
+
+    def _shared_expert_forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.shared_experts(x)
+
     def forward(self, x: torch.Tensor, *, input_ids: torch.Tensor | None = None) -> torch.Tensor:
         shape = x.shape
         x_flat = x.reshape(-1, self.hidden_size)
-        if self.is_hash_layer and input_ids is not None:
-            weights, indices = self._hash_route(x_flat, input_ids)
-        else:
-            weights, indices = self.gate(x_flat)
+        weights, indices = self._route(x_flat, input_ids)
         dispatched, tpe, permuted_probs = self.dispatcher.dispatch(x_flat, weights, indices)
         del weights, indices
         self.dispatcher.wait_dispatch_event()
@@ -98,5 +125,5 @@ class DeepseekV4MoE(nn.Module):
         )
         out = self.dispatcher.combine(out)
         if self.shared_experts is not None:
-            out = out + self.shared_experts(x_flat)
+            out = out + self._shared_expert_forward(x_flat)
         return out.view(shape)
