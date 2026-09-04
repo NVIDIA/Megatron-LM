@@ -17,6 +17,7 @@ from megatron.core.dist_checkpointing import (
     ShardedObject,
     ShardedTensor,
     load,
+    load_content_metadata,
     load_plain_tensors,
     save,
 )
@@ -518,7 +519,8 @@ class TestDistributedOptimizer:
             for per_buffer_numel in distributed_optimizer.per_bucket_numel
             for dtype in per_buffer_numel
         ]
-        assert runtime_dtype_keys and all(isinstance(key, str) for key in runtime_dtype_keys)
+        assert runtime_dtype_keys
+        assert set(runtime_dtype_keys) == {'dtype_param_torch:bfloat16_grad_torch:bfloat16'}
         metadata = {
             'distrib_optim_sharding_type': sharding_type,
             'distrib_optim_fully_reshardable_mem_efficient': False,
@@ -576,6 +578,11 @@ class TestDistributedOptimizer:
                     model_A[0].sharded_state_dict(), metadata=metadata
                 )
 
+            # A legacy checkpoint predates the dtype-key format marker. New checkpoints add the
+            # marker automatically when their sharded optimizer state is constructed.
+            if legacy_keys:
+                metadata.pop('distrib_optim_dtype_key_format')
+
             has_tuple_key = torch.tensor(
                 any(isinstance(key, tuple) for _, key in iter_state_dict_keys(optim_sd)),
                 device='cuda',
@@ -584,7 +591,7 @@ class TestDistributedOptimizer:
             torch.distributed.all_reduce(has_tuple_key, op=torch.distributed.ReduceOp.MAX)
             assert bool(has_tuple_key.item()) == legacy_keys
 
-            save(optim_sd, ckpt_dir)
+            save(optim_sd, ckpt_dir, content_metadata=metadata)
             optim_param_state_A = get_param_state_dp_zero(optimizer_A)
 
             model_B, optimizer_B = setup_model_and_optimizer(
@@ -595,8 +602,10 @@ class TestDistributedOptimizer:
                 dist_opt=True,
                 initialize_fn=initialize_pp_agnostic_model,
             )
+            loaded_metadata = load_content_metadata(ckpt_dir)
+            assert ('distrib_optim_dtype_key_format' in loaded_metadata) != legacy_keys
             load_sharded_state_dict = optimizer_B.sharded_state_dict(
-                model_B[0].sharded_state_dict(), metadata=metadata, is_loading=True
+                model_B[0].sharded_state_dict(), metadata=loaded_metadata, is_loading=True
             )
             loaded_state_dict = load(load_sharded_state_dict, ckpt_dir)
             loaded_has_tuple_key = torch.tensor(
@@ -952,8 +961,11 @@ class TestDistributedOptimizer:
             plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
             torch.distributed.barrier()
 
-            # Stringifying the state-dict key must not rename legacy checkpoint tensors.
-            assert any('.dtype_(torch.' in key for key in plain_state_dict_B)
+            assert any(
+                '.dtype_dtype_param_torch:bfloat16_grad_torch:bfloat16.' in key
+                for key in plain_state_dict_B
+            )
+            assert not any('.dtype_(torch.' in key for key in plain_state_dict_B)
 
             # We test only the `plain_state_dict_B` keys because of decreasing PP
             for key in list(plain_state_dict_B.keys()):
