@@ -528,6 +528,12 @@ class _GDNBase(MegatronModule):
                     tp_group=tp_group,
                     dp_cp_group=metadata['dp_cp_group'],
                 )
+            elif name == "core_attention":
+                # The TE backend adds a parameter-free TEGatedDeltaNetAttention wrapper around
+                # GatedDeltaNetAttention solely as a kernel adapter. Its TE runtime/extra state is
+                # not part of the learned GDN state and has no FLA counterpart, so omit it to
+                # keep checkpoints portable between the TransformerEngine and FLA backends.
+                continue
             else:
                 module_sharded_sd = sharded_state_dict_default(
                     module, f"{prefix}{name}.", sharded_offsets, metadata, tp_group=tp_group
