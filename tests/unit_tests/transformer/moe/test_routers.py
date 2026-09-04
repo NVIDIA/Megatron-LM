@@ -2,19 +2,22 @@
 
 
 import dataclasses
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import (
+    get_tokens_per_expert_and_token_count,
     get_updated_expert_bias,
     router_gating_linear,
     topk_routing_with_score_function,
 )
-from megatron.core.transformer.moe.router import Router
+from megatron.core.transformer.moe.router import Router, TopKRouter
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
@@ -29,6 +32,133 @@ try:
     HAVE_ROUTER_FUSION = _fused_topk_with_score_function is not None
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
+
+
+def test_dynamic_cp_aux_loss_uses_runtime_cp_then_tp_groups():
+    router = TopKRouter.__new__(TopKRouter)
+    static_tp = object()
+    static_tp_cp = object()
+    static_tp_dp_cp = object()
+    runtime_cp = object()
+    object.__setattr__(router, "tp_group", static_tp)
+    object.__setattr__(router, "tp_cp_group", static_tp_cp)
+    object.__setattr__(router, "tp_dp_cp_group", static_tp_dp_cp)
+
+    packed = PackedSeqParams(qkv_format="thd", local_cp_size=2, cp_group=runtime_cp)
+    groups = router._get_aux_loss_groups(packed)
+
+    assert groups.loss_reduce_groups == (runtime_cp, static_tp)
+    assert groups.metric_reduce_group is None
+    assert groups.metric_avg_group is static_tp_dp_cp
+    assert groups.metric_needs_dp_avg is False
+
+
+def test_dynamic_cp_size_one_aux_loss_uses_tp_group_only():
+    router = TopKRouter.__new__(TopKRouter)
+    static_tp = object()
+    static_tp_cp = object()
+    static_tp_dp_cp = object()
+    object.__setattr__(router, "tp_group", static_tp)
+    object.__setattr__(router, "tp_cp_group", static_tp_cp)
+    object.__setattr__(router, "tp_dp_cp_group", static_tp_dp_cp)
+
+    packed = PackedSeqParams(qkv_format="thd", local_cp_size=1, cp_group=None)
+    groups = router._get_aux_loss_groups(packed)
+
+    assert groups.loss_reduce_groups == (static_tp,)
+    assert groups.metric_reduce_group is None
+    assert groups.metric_avg_group is static_tp_dp_cp
+    assert groups.metric_needs_dp_avg is False
+
+
+def test_static_aux_loss_keeps_tp_cp_group():
+    router = TopKRouter.__new__(TopKRouter)
+    static_tp_cp = object()
+    object.__setattr__(router, "tp_cp_group", static_tp_cp)
+
+    groups = router._get_aux_loss_groups()
+
+    assert groups.loss_reduce_groups == (static_tp_cp,)
+    assert groups.metric_reduce_group is static_tp_cp
+    assert groups.metric_avg_group is None
+    assert groups.metric_needs_dp_avg is True
+
+
+def test_token_count_reduction_composes_runtime_cp_and_tp(monkeypatch):
+    class _Group:
+        def __init__(self, size):
+            self._size = size
+
+        def size(self):
+            return self._size
+
+    cp_group = _Group(2)
+    tp_group = _Group(3)
+    calls = []
+
+    def _reduce(value, group):
+        calls.append(group)
+        return value * group.size()
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.moe_utils.reduce_from_tensor_model_parallel_region", _reduce
+    )
+    routing_map = torch.tensor([[True, False], [False, True]])
+
+    tokens_per_expert, local_tokens, total_tokens = get_tokens_per_expert_and_token_count(
+        routing_map, reduce_group=cp_group, reduce_groups=(cp_group, tp_group), topk=1
+    )
+
+    assert calls == [cp_group, tp_group]
+    assert torch.equal(tokens_per_expert, torch.tensor([6, 6]))
+    assert local_tokens == 2
+    assert total_tokens == 12
+
+
+def test_seq_aux_loss_restores_batch_size_for_per_token_scaling(monkeypatch):
+    router = TopKRouter.__new__(TopKRouter)
+    object.__setattr__(router, "topk", 2)
+    object.__setattr__(
+        router, "config", SimpleNamespace(num_moe_experts=2, moe_router_fusion=False)
+    )
+    object.__setattr__(router, "get_aux_loss_coeff", lambda _name: 1.0)
+    object.__setattr__(
+        router,
+        "_get_aux_loss_groups",
+        lambda _packed=None: SimpleNamespace(
+            loss_reduce_groups=(object(),),
+            metric_reduce_group=None,
+            metric_avg_group=None,
+            metric_needs_dp_avg=False,
+            metric_pre_reduce_groups=(),
+        ),
+    )
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.router.get_tokens_per_expert_and_token_count",
+        lambda **_kwargs: (torch.tensor([4, 6]), 5, 10),
+    )
+    monkeypatch.setattr(
+        "megatron.core.transformer.moe.router.switch_load_balancing_loss_func",
+        lambda **_kwargs: torch.tensor(4.0),
+    )
+
+    captured = {}
+
+    def _capture_attach(probs, *_args, **kwargs):
+        captured.update(kwargs)
+        return probs
+
+    object.__setattr__(router, "attach_and_log_load_balancing_loss", _capture_attach)
+
+    seq_length = 5
+    batch_size = 2
+    probs = torch.zeros(seq_length * batch_size, 2)
+    routing_map = torch.zeros(seq_length * batch_size, 2, dtype=torch.bool)
+    router._apply_seq_aux_loss(probs, probs, routing_map, seq_length=seq_length, bsz=batch_size)
+
+    assert captured["valid_token_count"] == 10
+    assert captured["aux_loss_scale_num_tokens"] == 20
 
 
 class TestTop2Router:

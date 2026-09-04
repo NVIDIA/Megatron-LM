@@ -19,7 +19,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
@@ -342,6 +342,8 @@ class Attention(MegatronModule, ABC):
                 pg_collection, 'cp'
             ), "Attention pg_collection must have cp process group"
         self.pg_collection = pg_collection
+        # Build-time CP group, kept so runtime (hybrid/dynamic) CP can restore
+        # it on microbatches that carry no per-microbatch CP group.
         self.tp_group = pg_collection.tp
 
         # Per attention head and per partition values
@@ -1342,6 +1344,10 @@ class Attention(MegatronModule, ABC):
             (Tuple[Tensor, Tensor]) Attention output and bias.
 
         """
+        original_cp_group = self.pg_collection.cp
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            self.pg_collection.cp = resolve_cp_group(original_cp_group, packed_seq_params)
+
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
         no_rope = (
@@ -1468,6 +1474,7 @@ class Attention(MegatronModule, ABC):
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
             output, bias = apply_module(self.linear_proj)(context_layer)
+            self.pg_collection.cp = original_cp_group
             return output, bias
 
         if (
@@ -1655,6 +1662,7 @@ class Attention(MegatronModule, ABC):
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
 
+        self.pg_collection.cp = original_cp_group
         return output, bias
 
     @jit_fuser
