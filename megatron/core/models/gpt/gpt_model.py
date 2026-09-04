@@ -50,6 +50,15 @@ from megatron.core.utils import (
 logger = logging.getLogger(__name__)
 
 
+
+def _has_extra_state_data(sharded_entry) -> bool:
+    """True when a sharded ``_extra_state`` entry carries a payload."""
+    data = getattr(sharded_entry, 'data', sharded_entry)
+    if isinstance(data, torch.Tensor):
+        return data.numel() > 0
+    return data is not None and bool(data)
+
+
 class GPTModel(LanguageModule, GraphableMegatronModule):
     """GPT Transformer language model.
 
@@ -955,11 +964,12 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         output_layer_extra_state_key = f'{prefix}output_layer._extra_state'
 
-        # Old GPT checkpoints only stored the output layer weight key. So we remove the
-        # _extra_state key but check that it doesn't contain any data anyway
-        output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
-        assert not (
-            output_extra_state and output_extra_state.data
-        ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
+        # Old GPT checkpoints only stored the output layer weight key, so drop the
+        # _extra_state key when it is an empty placeholder. Keep it when it carries data:
+        # quantization frameworks store per-module state there and dropping it loses the
+        # quantized output layer on both save and load.
+        output_extra_state = sharded_state_dict.get(output_layer_extra_state_key)
+        if output_extra_state is None or not _has_extra_state_data(output_extra_state):
+            sharded_state_dict.pop(output_layer_extra_state_key, None)
 
         return sharded_state_dict

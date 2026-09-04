@@ -24,7 +24,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_mlp_module_spec,
 )
-from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.gpt.gpt_model import GPTModel, _has_extra_state_data
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import Float16Module
@@ -59,6 +59,20 @@ class TestGPTModel:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def test_output_layer_extra_state_dropped_when_empty(self):
+        """An empty placeholder is dropped, as old GPT checkpoints never stored it."""
+        sharded_state_dict = self.gpt_model.sharded_state_dict()
+        assert 'output_layer._extra_state' not in sharded_state_dict
+
+    @pytest.mark.internal
+    def test_output_layer_extra_state_kept_when_populated(self):
+        """Quantization frameworks store per-module state here; dropping it loses the layer."""
+        state = torch.frombuffer(bytearray(b'quantizer-state'), dtype=torch.uint8)
+        with patch.object(self.gpt_model.output_layer, 'get_extra_state', return_value=state):
+            sharded_state_dict = self.gpt_model.sharded_state_dict()
+        assert 'output_layer._extra_state' in sharded_state_dict
 
     @pytest.mark.internal
     def test_constructor(self):
@@ -627,3 +641,20 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
         assert (
             call_kwargs.get('use_te_activation_func') is True
         ), "use_te_activation_func must be forwarded from config"
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    ("data", "expected"),
+    [
+        (None, False),
+        (torch.empty(0), False),
+        (torch.frombuffer(bytearray(b'quantizer-state'), dtype=torch.uint8), True),
+    ],
+)
+def test_has_extra_state_data(data, expected):
+    class _Entry:
+        def __init__(self, value):
+            self.data = value
+
+    assert _has_extra_state_data(_Entry(data)) is expected
+
