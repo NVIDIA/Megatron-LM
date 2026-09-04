@@ -55,6 +55,8 @@ def _make_gpt_args(
     args.num_query_groups = num_attention_heads
     args.attention_output_gate = False
     args.gated_attention_proj_granularity = "elementwise"
+    args.enable_attention_residuals = False
+    args.attn_res_block_layers = None
     args.multi_latent_attention = False
     # MoE / MTP disabled.
     args.num_experts = None
@@ -522,6 +524,52 @@ class TestHybridAttentionOutputGateFlops:
 
         expected_delta = 3 * 2 * total_tokens * args.hidden_size * gate_projection_size
         assert gated_flops - ungated_flops == expected_delta
+
+
+class TestAttentionResidualFlops:
+    """AttnRes FLOPs must follow the runtime depth-source schedule."""
+
+    @staticmethod
+    def _enabled_delta(args, batch_size=2):
+        disabled_flops = num_floating_point_operations(args, batch_size)
+        args.enable_attention_residuals = True
+        args.attn_res_block_layers = 2
+        enabled_flops = num_floating_point_operations(args, batch_size)
+        return enabled_flops - disabled_flops
+
+    def test_standard_transformer_counts_both_sublayers_and_final_head(self):
+        args = _make_gpt_args(num_layers=4)
+        total_tokens = 2 * args.seq_length
+
+        # Source arities for block size 2:
+        # attention = [1, 2, 2, 3], MLP = [2, 2, 3, 3], final = [3].
+        total_source_arity = 21
+        expected_delta = 3 * 4 * total_tokens * args.hidden_size * total_source_arity
+
+        assert self._enabled_delta(args) == expected_delta
+
+    def test_hybrid_counts_pattern_entries_and_final_head(self):
+        args = _make_hybrid_args(num_layers=4)
+        total_tokens = 2 * args.seq_length
+
+        # A hybrid pattern entry is one sublayer. For block size 2, "*M*M"
+        # therefore has per-entry arities [1, 2, 2, 3] and final arity 3.
+        total_source_arity = 11
+        expected_delta = 3 * 4 * total_tokens * args.hidden_size * total_source_arity
+
+        assert self._enabled_delta(args) == expected_delta
+
+    def test_standard_mtp_counts_three_aggregations_per_depth(self):
+        args = _make_gpt_args(num_layers=4)
+        args.mtp_num_layers = 2
+        total_tokens = 2 * args.seq_length
+
+        # The trunk contributes 21 source-visits. Its final history has arity
+        # three; each MTP depth adds a fresh partial to three aggregations.
+        total_source_arity = 21 + 2 * 3 * 4
+        expected_delta = 3 * 4 * total_tokens * args.hidden_size * total_source_arity
+
+        assert self._enabled_delta(args) == expected_delta
 
 
 class TestPaddingRemoval:
