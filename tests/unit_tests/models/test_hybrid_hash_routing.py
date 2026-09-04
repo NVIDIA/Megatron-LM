@@ -664,6 +664,7 @@ def test_hash_top1_preserves_gate_weight_and_gradient(score_function):
     router.score_function = score_function
     router.topk = 1
     router.num_experts = 2
+    router.router_replay = None
     router.config = SimpleNamespace(
         moe_router_force_load_balancing=False,
         moe_router_force_biased=None,
