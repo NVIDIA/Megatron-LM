@@ -1,15 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Cross-rank correctness for the replica weight-transfer kernels.
+"""Cross-rank correctness for the virtual-expert weight-transfer kernels.
 
 Run on one four-GPU NVLink node::
 
     uv run python -m torch.distributed.run --nproc-per-node 4 -m pytest -q \
-      tests/unit_tests/transformer/moe/test_replica_weight_triton.py
+      tests/unit_tests/transformer/moe/test_virtual_expert_triton.py
 
-These tests cover what the kernels put on the wire. Wire *bandwidth* is not
-measured here; ``bench_replica_weight_sol.py`` is the benchmark of record and
-sweeps plan occupancy, which is what actually moves the number.
+These tests cover what the kernels put on the wire. Wire *bandwidth* is not measured here;
+``bench_virtual_expert_weight_sol.py`` is the benchmark of record and sweeps plan occupancy,
+which is what actually moves the number.
 """
 
 import gc
@@ -20,27 +20,27 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.transformer.moe.virtual_expert_triton import (
-    MAX_REPLICA_WEIGHT_SMS,
+    MAX_VIRTUAL_EXPERT_WEIGHT_SMS,
     _transport_tile,
     _validate_transport_shape,
-    compile_replica_weight_kernels,
-    launch_replica_grad_reduce,
-    launch_replica_weight_prefetch,
+    compile_virtual_expert_weight_kernels,
+    launch_virtual_expert_grad_reduce,
+    launch_virtual_expert_weight_prefetch,
 )
 from tests.unit_tests.test_utilities import Utils
 
 NUM_SMS = 4
 requires_four_ranks = pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) != 4 or not torch.cuda.is_available(),
-    reason="Replica transport coverage requires a 4-rank torchrun launch on CUDA",
+    reason="Virtual-expert transport coverage requires a 4-rank torchrun launch on CUDA",
 )
 
 
-def test_replica_transport_shape_guards():
+def test_virtual_expert_transport_shape_guards():
     """Reject launches the transport kernels cannot serve."""
     with pytest.raises(ValueError, match="limited to 32 SMs"):
         _validate_transport_shape(
-            world_size=4, num_local_experts=32, num_sms=MAX_REPLICA_WEIGHT_SMS + 1
+            world_size=4, num_local_experts=32, num_sms=MAX_VIRTUAL_EXPERT_WEIGHT_SMS + 1
         )
     # Both projections share one row-aligned tile, so an odd member breaks it.
     with pytest.raises(ValueError, match="256-aligned"):
@@ -106,7 +106,7 @@ def _report(errors, group):
 
 
 def _make_plan(placement, slots, world_size, num_local_experts, device):
-    """Build one ``[world_size, num_local_experts]`` replica assignment."""
+    """Build one ``[world_size, num_local_experts]`` virtual-expert assignment."""
     plan = torch.full((world_size, num_local_experts), -1, dtype=torch.int32, device=device)
     if placement == "asymmetric":
         # Only two ranks receive anything, and only into slot 0.
@@ -130,8 +130,8 @@ def _make_plan(placement, slots, world_size, num_local_experts, device):
 @pytest.mark.parametrize(
     "grad_dtype", [torch.float32, torch.bfloat16], ids=["fp32-grad", "bf16-grad"]
 )
-def test_replica_weight_transport(grad_dtype):
-    """Push BF16 weights and reduce replica gradients over full, sparse and empty plans."""
+def test_virtual_expert_weight_transport(grad_dtype):
+    """Push BF16 weights and reduce virtual-expert gradients over full, sparse and empty plans."""
     Utils.initialize_distributed()
     group = dist.group.WORLD
     rank = dist.get_rank(group)
@@ -162,7 +162,7 @@ def test_replica_weight_transport(grad_dtype):
     )
     weight_barrier = torch.zeros(1, dtype=torch.int32, device=device)
     grad_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-    compile_replica_weight_kernels(
+    compile_virtual_expert_weight_kernels(
         world_size=world_size,
         num_local_experts=num_local_experts,
         member_numels=member_numels,
@@ -194,7 +194,7 @@ def test_replica_weight_transport(grad_dtype):
             weight_arena.fill_(-123)
             torch.cuda.synchronize(device)
             dist.barrier(group=group, device_ids=[device.index])
-            launch_replica_weight_prefetch(
+            launch_virtual_expert_weight_prefetch(
                 sources=tuple(_pointer_table(source) for source in sources),
                 arena=weight_arena,
                 peer_bases=weight_handle.buffer_ptrs_dev,
@@ -236,7 +236,7 @@ def test_replica_weight_transport(grad_dtype):
                 main_grads[projection].fill_(projection + 5)
             torch.cuda.synchronize(device)
             dist.barrier(group=group, device_ids=[device.index])
-            launch_replica_grad_reduce(
+            launch_virtual_expert_grad_reduce(
                 arena=grad_arena,
                 native_grads=tuple(_pointer_table(grad) for grad in main_grads),
                 peer_bases=grad_handle.buffer_ptrs_dev,
@@ -299,7 +299,7 @@ def test_replica_weight_transport(grad_dtype):
 
 @pytest.mark.internal
 @requires_four_ranks
-def test_replica_mxfp8_transport_moves_one_orientation_at_a_time():
+def test_virtual_expert_mxfp8_transport_moves_one_orientation_at_a_time():
     """Copy MXFP8 bytes and scales exactly without touching the other GEMM orientation."""
     Utils.initialize_distributed()
     group = dist.group.WORLD
@@ -335,7 +335,7 @@ def test_replica_mxfp8_transport_moves_one_orientation_at_a_time():
                 tensor[expert].fill_(base + rank * num_local_experts + expert + 20 * projection)
         sources[(orientation, kind)] = tensors
 
-    # Every rank replicates its right-hand neighbour's whole expert set.
+    # Every rank materializes its right-hand neighbour's whole expert set.
     plan = torch.empty((world_size, num_local_experts), dtype=torch.int32, device=device)
     for destination in range(world_size):
         owner = (destination + 1) % world_size
@@ -348,7 +348,7 @@ def test_replica_mxfp8_transport_moves_one_orientation_at_a_time():
     barriers = {
         orientation: torch.zeros(1, dtype=torch.int32, device=device) for orientation in arenas
     }
-    compile_replica_weight_kernels(
+    compile_virtual_expert_weight_kernels(
         world_size=world_size,
         num_local_experts=num_local_experts,
         member_numels=member_numels,
@@ -359,7 +359,7 @@ def test_replica_mxfp8_transport_moves_one_orientation_at_a_time():
 
     def launch(orientation):
         dist.barrier(group=group, device_ids=[device.index])
-        launch_replica_weight_prefetch(
+        launch_virtual_expert_weight_prefetch(
             sources=tuple(_pointer_table(s) for s in sources[(orientation, "data")]),
             scale_sources=tuple(_pointer_table(s) for s in sources[(orientation, "scale")]),
             arena=arenas[orientation],

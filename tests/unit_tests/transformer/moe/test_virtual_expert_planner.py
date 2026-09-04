@@ -1,15 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Process-local coverage for replica route planning and the weight bridge.
+"""Process-local coverage for virtual-expert route planning and the weight bridge.
 
-Every test here runs in one process on one GPU, so a plain
-``pytest tests/unit_tests/transformer/moe/test_replica_planner.py`` runs the
-whole file. The planner kernels take a gathered histogram as an argument rather
+Every test here runs in one process on one GPU, so a plain ``pytest
+tests/unit_tests/transformer/moe/test_virtual_expert_planner.py`` runs the whole file.
+The planner kernels take a gathered histogram as an argument rather
 than performing the collective themselves, so a complete expert-parallel
 group's placement is reproducible here without a distributed launch.
 
-Cross-rank transport lives in ``test_replica_weight_triton.py`` and end-to-end
-gradient parity in ``test_replica_hybridep.py``.
+Cross-rank transport lives in ``test_virtual_expert_triton.py`` and end-to-end
+gradient parity in ``test_virtual_expert_hybridep.py``.
 """
 
 import functools
@@ -18,22 +18,22 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.transformer.moe.experts import _ReplicaFC2WgradStore
+from megatron.core.transformer.moe.experts import _VirtualExpertFC2WgradStore
+from megatron.core.transformer.moe.token_dispatcher import _VirtualExpertHybridEPManager
 from megatron.core.transformer.moe.virtual_expert_load_balancer import (
     BACKWARD,
     FORWARD,
-    ReplicaPlan,
-    ReplicaPlannerWorkspace,
-    ReplicaWeightBridge,
     VirtualExpertLoadBalancer,
-    _ReplicaBackwardHook,
-    _ReplicaProjection,
-    _ReplicaWaitGradReduce,
+    VirtualExpertPlan,
+    VirtualExpertPlannerWorkspace,
+    VirtualExpertWeightBridge,
+    _VirtualExpertBackwardHook,
+    _VirtualExpertProjection,
+    _VirtualExpertWaitGradReduce,
     extract_semantic_routes,
-    map_replica_plan_to_hybridep,
     map_routes_to_runtime_experts,
 )
-from megatron.core.transformer.moe.virtual_expert_triton import launch_replica_placement
+from megatron.core.transformer.moe.virtual_expert_triton import launch_virtual_expert_placement
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
@@ -86,19 +86,19 @@ def _histogram(routes: torch.Tensor) -> torch.Tensor:
 
 def _plan_locally(
     gathered_counts: torch.Tensor, routes: torch.Tensor | None, source_rank: int, device
-) -> tuple[ReplicaPlannerWorkspace, torch.Tensor | None]:
+) -> tuple[VirtualExpertPlannerWorkspace, torch.Tensor | None]:
     """Run placement (and optionally route mapping) for one source rank."""
-    workspace = ReplicaPlannerWorkspace.allocate(
+    workspace = VirtualExpertPlannerWorkspace.allocate(
         num_experts=NUM_EXPERTS, ep_size=EP_SIZE, device=device
     )
     workspace.gathered_counts.copy_(gathered_counts)
-    launch_replica_placement(
+    launch_virtual_expert_placement(
         workspace.gathered_counts,
         workspace.balance,
         workspace.allocation,
         workspace.destination_boundaries,
         workspace.experts_to_copy,
-        workspace.expert_replica_slots,
+        workspace.virtual_expert_slots,
         workspace.placement_grid_sync,
         rank_route_capacity=NUM_ROUTES,
         source_rank=source_rank,
@@ -118,8 +118,8 @@ def _plan_locally(
 
 @requires_cuda
 @pytest.mark.parametrize("skew", ["balanced", "hot_expert", "hot_rank", "two_ranks_own_everything"])
-def test_replica_placement_balances_every_destination(skew):
-    """Equalize route load across ranks without over-subscribing replica slots."""
+def test_virtual_expert_placement_balances_every_destination(skew):
+    """Equalize route load across ranks without over-subscribing virtual-expert slots."""
     device = torch.device("cuda", torch.cuda.current_device())
     counts = _histogram(_routes_for_skew(skew))
     workspace, _ = _plan_locally(counts.to(device), None, source_rank=0, device=device)
@@ -155,7 +155,7 @@ def test_replica_placement_balances_every_destination(skew):
             if expert // NUM_LOCAL_EXPERTS != destination and allocation[expert, destination] > 0
         }
         filled = [expert for expert in slots if expert >= 0]
-        # A remote expert that receives routes but owns no replica slot would
+        # A remote expert that receives routes but owns no virtual-expert slot would
         # execute against a stale slot's weights. The single-sender rule bounds
         # this set by num_local_experts; the device-side trap covers the rest.
         assert set(filled) == migrated, f"rank {destination} slots {slots} vs migrated {migrated}"
@@ -164,7 +164,7 @@ def test_replica_placement_balances_every_destination(skew):
 
     # Placement is replayed independently on every rank and must agree exactly.
     repeated, _ = _plan_locally(counts.to(device), None, source_rank=EP_SIZE - 1, device=device)
-    for field in ("balance", "allocation", "experts_to_copy", "expert_replica_slots"):
+    for field in ("balance", "allocation", "experts_to_copy", "virtual_expert_slots"):
         torch.testing.assert_close(
             getattr(repeated, field).cpu(), getattr(workspace, field).cpu(), rtol=0, atol=0
         )
@@ -172,7 +172,7 @@ def test_replica_placement_balances_every_destination(skew):
 
 @requires_cuda
 @pytest.mark.parametrize("skew", ["hot_expert", "two_ranks_own_everything"])
-def test_replica_planner_maps_every_route_to_the_expert_it_selected(skew):
+def test_virtual_expert_planner_maps_every_route_to_the_expert_it_selected(skew):
     """Decode each virtual route back to the semantic expert and destination it was given."""
     device = torch.device("cuda", torch.cuda.current_device())
     routes = _routes_for_skew(skew)
@@ -196,7 +196,7 @@ def test_replica_planner_maps_every_route_to_the_expert_it_selected(skew):
             else:
                 slot = runtime_local - NUM_LOCAL_EXPERTS
                 assert int(experts_to_copy[destination][slot]) == route, (
-                    f"route to expert {route} became replica slot {slot} on rank "
+                    f"route to expert {route} became virtual-expert slot {slot} on rank "
                     f"{destination}, which holds expert "
                     f"{int(experts_to_copy[destination][slot])}"
                 )
@@ -208,7 +208,7 @@ def test_replica_planner_maps_every_route_to_the_expert_it_selected(skew):
 
 
 @requires_cuda
-def test_replica_semantic_routes_follow_the_routing_map():
+def test_virtual_expert_semantic_routes_follow_the_routing_map():
     """The routing map is authoritative: a selected zero-probability route survives."""
     routing_map = torch.tensor(
         [[False, True, False, True], [True, False, True, False]], device="cuda"
@@ -232,15 +232,17 @@ def test_replica_semantic_routes_follow_the_routing_map():
     torch.testing.assert_close(probs.grad, routing_map.to(probs.dtype))
 
 
-def test_replica_plan_expands_to_dense_hybridep_inputs():
+def test_virtual_expert_plan_expands_to_dense_hybridep_inputs():
     """Scatter compact virtual routes into HybridEP's dense map without losing gradients."""
-    plan = ReplicaPlan(
+    plan = VirtualExpertPlan(
         virtual_experts=torch.tensor([[1, 6], [3, 4]], dtype=torch.int64),
         experts_to_copy=torch.empty((0,), dtype=torch.int32),
     )
     probs = torch.tensor([[0.75, 0.25], [0.6, 0.4]], requires_grad=True)
 
-    routing_map, dense_probs = map_replica_plan_to_hybridep(plan, probs, num_experts=8)
+    routing_map, dense_probs = _VirtualExpertHybridEPManager.map_virtual_expert_plan_to_hybridep(
+        plan, probs, num_experts=8
+    )
 
     assert routing_map.shape == (2, 8) and dense_probs.shape == (2, 8)
     assert routing_map[0, 1] and routing_map[0, 6]
@@ -267,7 +269,7 @@ def test_virtual_expert_rank_capacity_includes_per_expert_padding():
     )
 
 
-def test_replica_backward_hooks_span_the_transport_window():
+def test_virtual_expert_backward_hooks_span_the_transport_window():
     """Order the four transport hooks across one layer's backward, as the dispatcher places them."""
     events = []
     plan = object()
@@ -311,21 +313,21 @@ def test_replica_backward_hooks_span_the_transport_window():
 
     bridge = FakeBridge()
     hidden = torch.ones((), requires_grad=True)
-    hidden = _ReplicaWaitGradReduce.apply(
+    hidden = _VirtualExpertWaitGradReduce.apply(
         hidden, *bridge.source_parameters, bridge, SimpleNamespace(plan=plan)
     )
     hidden = BackwardMarker.apply(hidden, "router_and_shared_expert_backward")
-    hidden = _ReplicaBackwardHook.apply(
+    hidden = _VirtualExpertBackwardHook.apply(
         hidden, functools.partial(bridge.start_pending_grad_reduces, plan)
     )
     hidden = BackwardMarker.apply(hidden, "dispatch_backward")
     hidden = BackwardMarker.apply(hidden, "expert_backward")
-    hidden = _ReplicaBackwardHook.apply(
+    hidden = _VirtualExpertBackwardHook.apply(
         hidden, functools.partial(bridge.wait_prefetch_for_backward, plan)
     )
     hidden = BackwardMarker.apply(hidden, "combine_backward")
     hidden = BackwardMarker.apply(hidden, "latent_up_projection_backward")
-    hidden = _ReplicaBackwardHook.apply(
+    hidden = _VirtualExpertBackwardHook.apply(
         hidden, functools.partial(bridge.start_prefetch, plan, BACKWARD)
     )
     hidden.backward()
@@ -349,11 +351,11 @@ def test_replica_backward_hooks_span_the_transport_window():
         assert parameter.grad.data_ptr() != bridge.source_grads[index].data_ptr()
 
 
-def test_replica_fc2_reduction_starts_from_the_wgrad_store_and_fc1_after_dispatch():
+def test_virtual_expert_fc2_reduction_starts_from_the_wgrad_store_and_fc1_after_dispatch():
     """FC2 reduces behind its own wgrad GEMM; only FC1 waits for dispatch backward."""
     plan = object()
     started = []
-    bridge = ReplicaWeightBridge.__new__(ReplicaWeightBridge)
+    bridge = VirtualExpertWeightBridge.__new__(VirtualExpertWeightBridge)
     bridge._backward_plan = plan
     bridge._reduced = set()
 
@@ -366,7 +368,7 @@ def test_replica_fc2_reduction_starts_from_the_wgrad_store_and_fc1_after_dispatc
     # TE's delayed-wgrad protocol hands the GEMM to the store instead of
     # launching it; the store runs it and starts FC2's reduction right behind.
     gemm_calls = []
-    store = _ReplicaFC2WgradStore(bridge)
+    store = _VirtualExpertFC2WgradStore(bridge)
     assert store.delay_wgrad_compute() and store.context is None
     store.put(["x", "dy", "out"], lambda *tensors: gemm_calls.append(tensors))
     assert gemm_calls == [("x", "dy", "out")]
@@ -379,8 +381,8 @@ def test_replica_fc2_reduction_starts_from_the_wgrad_store_and_fc1_after_dispatc
 
 
 @requires_cuda
-def test_replica_fused_wgrad_handoff_preserves_fp32():
-    """Accumulate the FP32 replica wgrad into main_grad and return a BF16 dummy."""
+def test_virtual_expert_fused_wgrad_handoff_preserves_fp32():
+    """Accumulate the FP32 virtual-expert wgrad into main_grad and return a BF16 dummy."""
     device = torch.device("cuda", torch.cuda.current_device())
     parameter = torch.nn.Parameter(torch.ones(4, dtype=torch.bfloat16, device=device))
     parameter.main_grad = torch.zeros(4, dtype=torch.float32, device=device)
@@ -397,7 +399,7 @@ def test_replica_fused_wgrad_handoff_preserves_fp32():
             return (external_wgrad,)
 
     hidden = torch.ones((), device=device, requires_grad=True)
-    _ReplicaWaitGradReduce.apply(
+    _VirtualExpertWaitGradReduce.apply(
         hidden, parameter, FakeBridge(), SimpleNamespace(plan=plan)
     ).backward()
 
@@ -454,7 +456,7 @@ def _gtp_projection(weight_format, device, num_local_experts=2):
             torch.zeros((num_local_experts, *MEMBER_SHAPE), dtype=torch.float32, device=device),
         ),
     )
-    return _ReplicaProjection("test projection", parameters, workspace, 0), gathers
+    return _VirtualExpertProjection("test projection", parameters, workspace, 0), gathers
 
 
 def _data_ptrs(weights, weight_format, direction):
@@ -467,7 +469,7 @@ def _data_ptrs(weights, weight_format, direction):
 
 @requires_cuda
 @pytest.mark.parametrize("weight_format", ["bf16", "mxfp8"])
-def test_replica_projection_binds_gtp_gathers_into_its_pointer_tables(weight_format):
+def test_virtual_expert_projection_binds_gtp_gathers_into_its_pointer_tables(weight_format):
     """Point the push tables and the runtime parameters at each direction's GTP gather."""
     device = torch.device("cuda", torch.cuda.current_device())
     projection, gathers = _gtp_projection(weight_format, device)
