@@ -24,7 +24,19 @@ from datetime import datetime
 from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type, TypeVar, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
 
 import numpy
 import torch
@@ -546,6 +558,65 @@ def _validate_dsa_kernel_backend_dependencies(dsa_kernel_backend: str) -> None:
             f"but the following packages are not available: {', '.join(missing)}. "
             "Install them or set dsa_kernel_backend=none to use the PyTorch fallback."
         )
+
+
+_CALLABLE_KWARG_SIGNATURE_CACHE: Dict[int, Tuple[Callable, Optional[frozenset[str]], bool]] = {}
+
+
+def filter_kwargs_for_callable(
+    func: Callable,
+    candidate_kwargs: Mapping[str, Any],
+    *,
+    signature_unavailable_fallback: Iterable[str] = (),
+) -> Dict[str, Any]:
+    """Return the candidate keyword arguments accepted by a callable.
+
+    Args:
+        func: Callable whose keyword-capable parameters should be inspected.
+        candidate_kwargs: Candidate keyword arguments to filter.
+        signature_unavailable_fallback: Names to forward when ``func`` has no
+            inspectable signature.
+
+    Returns:
+        A dictionary containing only keyword arguments accepted by ``func``.
+    """
+    cache_key = id(func)
+    cached = _CALLABLE_KWARG_SIGNATURE_CACHE.get(cache_key)
+    if cached is not None and cached[0] is func:
+        accepted_names = cached[1]
+        signature_is_unavailable = cached[2]
+    else:
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):
+            accepted_names = frozenset()
+            signature_is_unavailable = True
+        else:
+            signature_is_unavailable = False
+            if any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in signature.parameters.values()
+            ):
+                accepted_names = None
+            else:
+                accepted_names = frozenset(
+                    name
+                    for name, parameter in signature.parameters.items()
+                    if parameter.kind
+                    in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+                )
+        # Retain the callable so Python object-id reuse cannot apply a stale signature.
+        _CALLABLE_KWARG_SIGNATURE_CACHE[cache_key] = (
+            func,
+            accepted_names,
+            signature_is_unavailable,
+        )
+
+    if accepted_names is None:
+        return dict(candidate_kwargs)
+    if signature_is_unavailable:
+        accepted_names = frozenset(signature_unavailable_fallback)
+    return {name: value for name, value in candidate_kwargs.items() if name in accepted_names}
 
 
 def accepts_parameter(func: Callable, name: str) -> bool:

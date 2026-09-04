@@ -4,14 +4,8 @@
 
 import pytest
 
+from megatron.core import utils as core_utils
 from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels, dsa_kernels
-
-
-@pytest.fixture(autouse=True)
-def _clear_hook_signature_cache():
-    dsa_kernels._HOOK_KWARG_SIGNATURE_CACHE.clear()
-    yield
-    dsa_kernels._HOOK_KWARG_SIGNATURE_CACHE.clear()
 
 
 def _run_split_hook(
@@ -107,31 +101,6 @@ def _run_split_loss_hook(
     return result, marker
 
 
-def test_hook_kwarg_signature_is_inspected_once(monkeypatch):
-    inspected = []
-    original_signature = dsa_kernels.inspect.signature
-
-    def hook(*, varlen_is_plain_causal=False):
-        return varlen_is_plain_causal
-
-    def track_signature(fn):
-        inspected.append(fn)
-        return original_signature(fn)
-
-    monkeypatch.setattr(dsa_kernels.inspect, "signature", track_signature)
-
-    expected = {"varlen_is_plain_causal": True}
-    assert (
-        dsa_kernels._hook_kwargs_accepting(hook, varlen_is_plain_causal=True, unsupported=True)
-        == expected
-    )
-    assert (
-        dsa_kernels._hook_kwargs_accepting(hook, varlen_is_plain_causal=True, unsupported=True)
-        == expected
-    )
-    assert inspected == [hook]
-
-
 def test_legacy_exact_split_hook_excludes_new_optional_kwarg(monkeypatch):
     calls = []
     expected = object()
@@ -215,7 +184,7 @@ def test_opaque_split_hook_receives_no_new_optional_kwarg(monkeypatch):
         raise ValueError("opaque callable")
 
     monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", lambda _config, _name: opaque_hook)
-    monkeypatch.setattr(dsa_kernels.inspect, "signature", fail_signature)
+    monkeypatch.setattr(core_utils.inspect, "signature", fail_signature)
 
     result, _ = _run_split_hook(varlen_is_plain_causal=True)
 
@@ -356,7 +325,7 @@ def test_opaque_full_hook_preserves_existing_varlen_kwarg(monkeypatch):
         raise ValueError("opaque callable")
 
     monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", lambda _config, _name: opaque_full_hook)
-    monkeypatch.setattr(dsa_kernels.inspect, "signature", fail_signature)
+    monkeypatch.setattr(core_utils.inspect, "signature", fail_signature)
 
     result, _ = _run_full_hook(varlen_is_plain_causal=True)
 

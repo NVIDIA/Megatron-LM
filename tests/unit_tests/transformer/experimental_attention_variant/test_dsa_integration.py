@@ -287,7 +287,9 @@ def test_checkpointed_absorbed_attention_keeps_metadata_out_of_tensor_args(monke
             return kwargs["x"]
 
     dummy_attention = SimpleNamespace(
-        attn_mask_type=AttnMaskType.causal, core_attention=CoreAttention()
+        attn_mask_type=AttnMaskType.causal,
+        core_attention=CoreAttention(),
+        pg_collection=SimpleNamespace(cp=None),
     )
     monkeypatch.setattr(absorbed_mla_module.tensor_parallel, "checkpoint", fake_checkpoint)
 
@@ -310,11 +312,12 @@ def test_checkpointed_absorbed_attention_keeps_metadata_out_of_tensor_args(monke
     assert output is hidden_states
 
 
-def test_absorbed_mla_forward_uses_and_restores_dynamic_cp_group():
-    original_cp_group = object()
-    dynamic_cp_group = SimpleNamespace(size=lambda: 2)
+def test_absorbed_mla_forward_uses_and_restores_dynamic_cp_group(monkeypatch):
+    original_cp_group = SimpleNamespace(size=lambda: 1)
+    dynamic_cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
     pg_collection = SimpleNamespace(cp=original_cp_group)
     observed_groups = []
+    checkpoint_call = {}
 
     hidden_states = torch.randn(4, 1, 6)
     q_absorbed = torch.randn(4, 1, 2, 2)
@@ -341,19 +344,36 @@ def test_absorbed_mla_forward_uses_and_restores_dynamic_cp_group():
         observed_groups.append(pg_collection.cp)
         return core_attn_out, None
 
+    def fake_checkpoint(run_function, distribute_saved_activations, *args):
+        del distribute_saved_activations
+        checkpoint_call["run_function"] = run_function
+        checkpoint_call["args"] = args
+        return run_function(*args)
+
+    monkeypatch.setattr(absorbed_mla_module.tensor_parallel, "checkpoint", fake_checkpoint)
+
     dummy_attention = SimpleNamespace(
-        training=False,
+        training=True,
         cache_mla_latents=False,
         pg_collection=pg_collection,
         get_query_key_value_tensors=get_query_key_value_tensors,
         _get_v_up_weight=lambda: v_up_weight,
-        checkpoint_core_attention=False,
+        checkpoint_core_attention=True,
         core_attention=CoreAttention(),
         attn_mask_type=AttnMaskType.causal,
         num_attention_heads_per_partition=2,
-        config=SimpleNamespace(kv_lora_rank=2, v_head_dim=3, tensor_model_parallel_size=1),
+        config=SimpleNamespace(
+            kv_lora_rank=2,
+            v_head_dim=3,
+            tensor_model_parallel_size=1,
+            context_parallel_size=1,
+            dynamic_context_parallel=True,
+        ),
         recompute_up_proj=False,
         linear_proj=linear_proj,
+    )
+    dummy_attention._checkpointed_attention_forward = lambda *args, **kwargs: (
+        AbsorbedMLASelfAttention._checkpointed_attention_forward(dummy_attention, *args, **kwargs)
     )
     packed_seq_params = PackedSeqParams(
         qkv_format="thd", local_cp_size=2, cp_group=dynamic_cp_group
@@ -366,6 +386,11 @@ def test_absorbed_mla_forward_uses_and_restores_dynamic_cp_group():
     assert bias is None
     assert output is hidden_states
     assert observed_groups == [dynamic_cp_group, dynamic_cp_group, dynamic_cp_group]
+    assert pg_collection.cp is original_cp_group
+
+    replayed = checkpoint_call["run_function"](*checkpoint_call["args"])
+    assert replayed is hidden_states
+    assert observed_groups[-1] is dynamic_cp_group
     assert pg_collection.cp is original_cp_group
 
 

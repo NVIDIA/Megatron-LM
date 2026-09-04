@@ -3,6 +3,7 @@
 import copy
 import logging
 import math
+import warnings
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -18,9 +19,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.cuda_graph_config import (
-    is_packed_dsa_cp_cuda_graph_capture_unsupported,
-)
+from megatron.core.transformer.cuda_graph_config import is_packed_dsa_cp_cuda_graph_experimental
 from megatron.core.transformer.enums import AttnMaskType, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.experimental_attention_variant import dsa_indexer_loss, dsa_kernels
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
@@ -2931,6 +2930,118 @@ class TestDSAttention:
         assert seen["single_packed_thd_sequence"] is True
         assert seen["local_packed_cp_rank"] == cp_rank
 
+    def test_packed_layout_reuses_non_sp_reorder_for_sequence_parallel(self, monkeypatch):
+        """The sequence-parallel KV gather reuses the packed layout built without SP."""
+        local_seq_len = 4
+        tp_size = 2
+        cp_size = 2
+        tp_rank = 1
+        cp_rank = 1
+        cp_local_seq_len = local_seq_len * tp_size
+        global_seq_len = cp_local_seq_len * cp_size
+        batch_size = 1
+        num_heads = self.config.num_attention_heads
+        head_dim = self.config.hidden_size // num_heads
+        tp_group = _FakeCPGroup(tp_size, tp_rank)
+        cp_group = _FakeCPGroup(cp_size, cp_rank)
+        reorder_builds = []
+
+        def _counted_host_reorder(*args, **kwargs):
+            reorder_builds.append(
+                (
+                    kwargs["local_output_size"],
+                    kwargs["key_local_output_size"],
+                    kwargs["global_output_size"],
+                    kwargs["query_cu_seqlens_cover_output"],
+                    kwargs["key_cu_seqlens_cover_output"],
+                )
+            )
+            return build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
+                *args, **kwargs
+            )
+
+        def _fake_forward_before_topk(_x, _qr, _packed_seq_params):
+            return (
+                torch.randn(cp_local_seq_len, batch_size, 2, 4),
+                torch.randn(cp_local_seq_len, batch_size, 4),
+                torch.ones(cp_local_seq_len, batch_size, 2),
+            )
+
+        def _fake_gather_from_sequence_parallel_region(tensor, group):
+            assert group is tp_group or group is cp_group
+            return torch.cat([tensor, tensor], dim=0)
+
+        def _fake_run_fused_attention(**kwargs):
+            return (
+                torch.zeros(
+                    kwargs["query"].size(0),
+                    batch_size,
+                    self.config.hidden_size,
+                    dtype=kwargs["query"].dtype,
+                    device=kwargs["query"].device,
+                ),
+                None,
+            )
+
+        monkeypatch.setattr(self.config, "attention_backend", "auto")
+        monkeypatch.setattr(self.config, "dsa_kernel_backend", "cudnn")
+        monkeypatch.setattr(self.config, "dsa_indexer_loss_coeff", 0.0)
+        monkeypatch.setattr(self.config, "sequence_parallel", False)
+        monkeypatch.setattr(self.sparse_attention, "cp_comm_type", "allgather")
+        monkeypatch.setattr(self.sparse_attention.pg_collection, "tp", tp_group)
+        monkeypatch.setattr(self.sparse_attention.pg_collection, "cp", cp_group)
+        monkeypatch.setattr(
+            self.sparse_attention.indexer, "forward_before_topk", _fake_forward_before_topk
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa." "_cp_reorder_from_host",
+            _counted_host_reorder,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa."
+            "gather_from_sequence_parallel_region",
+            _fake_gather_from_sequence_parallel_region,
+        )
+        monkeypatch.setattr(
+            "megatron.core.transformer.experimental_attention_variant.dsa."
+            "dsa_kernels.run_fused_dsa_attention",
+            _fake_run_fused_attention,
+        )
+
+        cu_seqlens = torch.tensor([0, global_seq_len], dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens.clone(),
+            cu_seqlens_kv_padded=cu_seqlens.clone(),
+            max_seqlen_q=global_seq_len,
+            max_seqlen_kv=global_seq_len,
+        )
+        packed_seq_params.thd_cp_host_cu_seqlens_q = [0, global_seq_len]
+        packed_seq_params.thd_cp_host_cu_seqlens_kv = [0, global_seq_len]
+
+        def _forward(seq_len):
+            return self.sparse_attention(
+                query=torch.randn(seq_len, batch_size, num_heads, head_dim),
+                key=torch.randn(seq_len, batch_size, num_heads, head_dim),
+                value=torch.randn(seq_len, batch_size, num_heads, head_dim),
+                x=torch.randn(seq_len, batch_size, self.config.hidden_size),
+                qr=torch.randn(seq_len, batch_size, self.config.q_lora_rank),
+                attention_mask=None,
+                attn_mask_type=AttnMaskType.causal,
+                packed_seq_params=packed_seq_params,
+            )
+
+        expected_build = (cp_local_seq_len, cp_local_seq_len, global_seq_len, True, True)
+
+        _forward(cp_local_seq_len)
+        assert reorder_builds == [expected_build]
+        self.config.sequence_parallel = True
+        _forward(local_seq_len)
+
+        assert reorder_builds == [expected_build]
+
     def test_packed_cp_gathers_local_indexer_key_with_global_attention_kv(self, monkeypatch):
         """A pre-gathered attention KV still requires gathering the local indexer key."""
         seq_len = 4
@@ -4069,17 +4180,17 @@ class TestDSAModuleSpecDispatch:
             "cp4_te_whole_layer",
         ],
     )
-    def test_packed_cudnn_dsa_cp_rejects_measured_cuda_graph_scopes(
+    def test_previously_rejected_packed_cudnn_dsa_cp_graph_configs_now_warn(
         self, monkeypatch, context_parallel_size, cuda_graph_impl, cuda_graph_modules
     ):
-        """Reject only packed CP graph scopes whose failure was reproduced on GPU."""
-        with pytest.raises(ValueError, match="packed DSA context-parallel configuration"):
-            self._make_packed_dsa_graph_config(
+        with pytest.warns(UserWarning, match="experimental and not fully supported"):
+            config = self._make_packed_dsa_graph_config(
                 monkeypatch,
                 context_parallel_size=context_parallel_size,
                 cuda_graph_impl=cuda_graph_impl,
                 cuda_graph_modules=cuda_graph_modules,
             )
+        assert isinstance(config, MLATransformerConfig)
 
     @pytest.mark.parametrize(
         "overrides",
@@ -4104,57 +4215,87 @@ class TestDSAModuleSpecDispatch:
             "repeated_string_scope",
         ],
     )
-    def test_packed_cudnn_dsa_cp_graph_guard_follows_normalized_legacy_inputs(
+    def test_packed_cudnn_dsa_cp_graph_warning_follows_normalized_legacy_inputs(
         self, monkeypatch, overrides
     ):
-        """Legacy graph flags and string scopes must not bypass the measured guard."""
-        with pytest.raises(ValueError, match="packed DSA context-parallel configuration"):
-            self._make_packed_dsa_graph_config(monkeypatch, **overrides)
+        with pytest.warns(UserWarning, match="experimental and not fully supported"):
+            config = self._make_packed_dsa_graph_config(monkeypatch, **overrides)
+        assert isinstance(config, MLATransformerConfig)
 
     @pytest.mark.parametrize(
-        "overrides",
+        ("overrides", "expected_warning"),
         [
-            {"context_parallel_size": 1, "cp_comm_type": None},
-            {"experimental_attention_variant": None},
-            {
-                "sequence_packing_scheduler": None,
-                "max_seqlen_per_dp_cp_rank": None,
-                "pad_packed_seq_alignment": None,
-                "thd_max_packed_sequences": None,
-            },
-            {"cuda_graph_impl": "none"},
-            {"cuda_graph_impl": "transformer_engine", "cuda_graph_modules": [CudaGraphModule.mlp]},
-            {
-                "sequence_packing_scheduler": "default_dynamic_cp",
-                "dynamic_context_parallel": True,
-                "cuda_graph_impl": "transformer_engine",
-                "cuda_graph_modules": [CudaGraphModule.mlp],
-            },
-            {
-                "context_parallel_size": 1,
-                "cp_comm_type": None,
-                "sequence_packing_scheduler": "default_dynamic_cp",
-                "dynamic_context_parallel": True,
-            },
-            {"context_parallel_size": 3},
-            {
-                "context_parallel_size": 4,
-                "cuda_graph_impl": "transformer_engine",
-                "cuda_graph_modules": [CudaGraphModule.mlp],
-            },
-            {
-                "context_parallel_size": 4,
-                "cuda_graph_modules": [CudaGraphModule.attn, CudaGraphModule.mlp],
-            },
-            {
-                "context_parallel_size": 4,
-                "dsa_kernel_backend": "none",
-                "cuda_graph_modules": [CudaGraphModule.attn],
-            },
-            {"sequence_packing_scheduler": "default_dynamic_cp"},
-            {"cuda_graph_modules": [], "inference_cuda_graph_scope": InferenceCudaGraphScope.block},
-            {"cuda_graph_impl": "local", "cuda_graph_modules": [CudaGraphModule.mamba]},
-            {"cuda_graph_impl": "full_iteration", "cuda_graph_modules": []},
+            ({"context_parallel_size": 1, "cp_comm_type": None}, False),
+            ({"experimental_attention_variant": None}, False),
+            (
+                {
+                    "sequence_packing_scheduler": None,
+                    "max_seqlen_per_dp_cp_rank": None,
+                    "pad_packed_seq_alignment": None,
+                    "thd_max_packed_sequences": None,
+                },
+                False,
+            ),
+            ({"cuda_graph_impl": "none"}, False),
+            (
+                {
+                    "cuda_graph_impl": "transformer_engine",
+                    "cuda_graph_modules": [CudaGraphModule.mlp],
+                },
+                True,
+            ),
+            (
+                {
+                    "sequence_packing_scheduler": "default_dynamic_cp",
+                    "dynamic_context_parallel": True,
+                    "cuda_graph_impl": "transformer_engine",
+                    "cuda_graph_modules": [CudaGraphModule.mlp],
+                },
+                True,
+            ),
+            (
+                {
+                    "context_parallel_size": 1,
+                    "cp_comm_type": None,
+                    "sequence_packing_scheduler": "default_dynamic_cp",
+                    "dynamic_context_parallel": True,
+                },
+                True,
+            ),
+            ({"context_parallel_size": 3}, True),
+            (
+                {
+                    "context_parallel_size": 4,
+                    "cuda_graph_impl": "transformer_engine",
+                    "cuda_graph_modules": [CudaGraphModule.mlp],
+                },
+                True,
+            ),
+            (
+                {
+                    "context_parallel_size": 4,
+                    "cuda_graph_modules": [CudaGraphModule.attn, CudaGraphModule.mlp],
+                },
+                True,
+            ),
+            (
+                {
+                    "context_parallel_size": 4,
+                    "dsa_kernel_backend": "none",
+                    "cuda_graph_modules": [CudaGraphModule.attn],
+                },
+                True,
+            ),
+            ({"sequence_packing_scheduler": "default_dynamic_cp"}, False),
+            (
+                {
+                    "cuda_graph_modules": [],
+                    "inference_cuda_graph_scope": InferenceCudaGraphScope.block,
+                },
+                True,
+            ),
+            ({"cuda_graph_impl": "local", "cuda_graph_modules": [CudaGraphModule.mamba]}, True),
+            ({"cuda_graph_impl": "full_iteration", "cuda_graph_modules": []}, True),
         ],
         ids=[
             "cp1",
@@ -4164,23 +4305,32 @@ class TestDSAModuleSpecDispatch:
             "te_mlp",
             "dynamic_te_mlp",
             "dynamic_configured_cp1",
-            "configured_cp3_unmeasured",
-            "configured_cp4_te_mlp_passed",
-            "configured_cp4_combined_unmeasured",
-            "configured_cp4_unfused_unmeasured",
-            "dynamic_scheduler_without_dynamic_cp_unmeasured",
-            "block_inference_whole_scope_unmeasured",
-            "local_mamba_unmeasured",
-            "full_iteration_unmeasured",
+            "configured_cp3",
+            "configured_cp4_te_mlp",
+            "configured_cp4_combined",
+            "configured_cp4_unfused",
+            "dynamic_scheduler_without_dynamic_cp",
+            "block_inference_whole_scope",
+            "local_mamba",
+            "full_iteration",
         ],
     )
-    def test_packed_cudnn_dsa_cp_cuda_graph_guard_is_narrow(self, monkeypatch, overrides):
-        """Changing any measured guard dimension leaves the neighboring config available."""
-        config = self._make_packed_dsa_graph_config(monkeypatch, **overrides)
+    def test_packed_dsa_cp_cuda_graph_warning_boundary(
+        self, monkeypatch, overrides, expected_warning
+    ):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            config = self._make_packed_dsa_graph_config(monkeypatch, **overrides)
+        graph_warnings = [
+            warning
+            for warning in caught
+            if "packed DSA with context parallelism" in str(warning.message)
+        ]
+        assert bool(graph_warnings) is expected_warning
         assert isinstance(config, MLATransformerConfig)
 
     def test_packed_cudnn_dsa_preserves_legacy_block_inference_scope(self, monkeypatch):
-        """The deprecated spelling maps to an unmeasured block-inference graph."""
+        """The deprecated spelling is normalized before the graph warning is evaluated."""
         with pytest.warns(DeprecationWarning, match="full_iteration_inference"):
             config = self._make_packed_dsa_graph_config(
                 monkeypatch, cuda_graph_impl="local", cuda_graph_modules="full_iteration_inference"
@@ -4229,9 +4379,12 @@ class TestDSAModuleSpecDispatch:
             "dynamic_cudnn_te_whole_layer",
         ],
     )
-    def test_packed_dsa_cp_rejects_additional_measured_graph_configs(self, monkeypatch, overrides):
-        with pytest.raises(ValueError, match="packed DSA context-parallel configuration"):
-            self._make_packed_dsa_graph_config(monkeypatch, **overrides)
+    def test_additional_previously_rejected_packed_dsa_cp_graph_configs_now_warn(
+        self, monkeypatch, overrides
+    ):
+        with pytest.warns(UserWarning, match="experimental and not fully supported"):
+            config = self._make_packed_dsa_graph_config(monkeypatch, **overrides)
+        assert isinstance(config, MLATransformerConfig)
 
     @pytest.mark.parametrize(
         (
@@ -4265,19 +4418,8 @@ class TestDSAModuleSpecDispatch:
                 "local",
                 [CudaGraphModule.attn, CudaGraphModule.mlp],
             ),
-            (2, "cudnn", "dp_balanced", False, "local", [CudaGraphModule.moe]),
-            (2, "cudnn", "dp_balanced", False, "local", [CudaGraphModule.moe_router]),
-            (
-                2,
-                "cudnn",
-                "dp_balanced",
-                False,
-                "local",
-                [CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
-            ),
             (2, "cudnn", "dp_balanced", False, "local", [CudaGraphModule.mamba]),
             (2, "cudnn", "dp_balanced", False, "transformer_engine", [CudaGraphModule.mlp]),
-            (2, "cudnn", "dp_balanced", False, "transformer_engine", [CudaGraphModule.moe]),
             (2, "cudnn", "dp_balanced", False, "full_iteration", []),
         ],
         ids=[
@@ -4289,17 +4431,14 @@ class TestDSAModuleSpecDispatch:
             "cp2_backend_tilelang",
             "cp2_local_mlp_mamba_combined",
             "cp4_local_attention_mlp_combined",
-            "cp2_local_moe",
-            "cp2_local_moe_router",
-            "cp2_local_moe_preprocess",
             "cp2_local_mamba",
             "cp2_te_mlp",
-            "cp2_te_moe",
             "cp2_full_iteration",
         ],
     )
-    def test_packed_dsa_cp_cuda_graph_predicate_preserves_unmeasured_neighbors(
+    def test_packed_dsa_cp_cuda_graph_warning_is_independent_of_backend_and_scope(
         self,
+        monkeypatch,
         context_parallel_size,
         dsa_kernel_backend,
         sequence_packing_scheduler,
@@ -4307,26 +4446,31 @@ class TestDSAModuleSpecDispatch:
         cuda_graph_impl,
         cuda_graph_modules,
     ):
-        """Do not turn static reasoning about unmeasured neighbors into prohibitions."""
-        assert not is_packed_dsa_cp_cuda_graph_capture_unsupported(
-            experimental_attention_variant="dsa",
-            dsa_kernel_backend=dsa_kernel_backend,
-            sequence_packing_scheduler=sequence_packing_scheduler,
-            dynamic_context_parallel=dynamic_context_parallel,
-            context_parallel_size=context_parallel_size,
-            cuda_graph_impl=cuda_graph_impl,
-            cuda_graph_modules=cuda_graph_modules,
-            inference_cuda_graph_scope=InferenceCudaGraphScope.layer,
-        )
+        with pytest.warns(UserWarning, match="experimental and not fully supported"):
+            config = self._make_packed_dsa_graph_config(
+                monkeypatch,
+                context_parallel_size=context_parallel_size,
+                dsa_kernel_backend=dsa_kernel_backend,
+                sequence_packing_scheduler=sequence_packing_scheduler,
+                dynamic_context_parallel=dynamic_context_parallel,
+                cuda_graph_impl=cuda_graph_impl,
+                cuda_graph_modules=cuda_graph_modules,
+            )
+        assert isinstance(config, MLATransformerConfig)
 
     @pytest.mark.parametrize(
-        ("context_parallel_size", "sequence_packing_scheduler", "dynamic_context_parallel"),
+        (
+            "context_parallel_size",
+            "sequence_packing_scheduler",
+            "dynamic_context_parallel",
+            "expected",
+        ),
         [
-            (3, "dp_balanced", False),
-            (3, "default_dynamic_cp", True),
-            (4, "default_dynamic_cp", True),
-            (2, "dp_balanced", True),
-            (2, "default_dynamic_cp", False),
+            (3, "dp_balanced", False, True),
+            (3, "default_dynamic_cp", True, True),
+            (4, "default_dynamic_cp", True, True),
+            (2, "dp_balanced", True, False),
+            (2, "default_dynamic_cp", False, False),
         ],
         ids=[
             "static_cp3",
@@ -4336,19 +4480,52 @@ class TestDSAModuleSpecDispatch:
             "dynamic_scheduler_without_flag",
         ],
     )
-    def test_packed_dsa_cuda_graph_predicate_preserves_unmeasured_topologies(
-        self, context_parallel_size, sequence_packing_scheduler, dynamic_context_parallel
+    def test_packed_dsa_cuda_graph_predicate_scheduler_boundary(
+        self, context_parallel_size, sequence_packing_scheduler, dynamic_context_parallel, expected
     ):
-        assert not is_packed_dsa_cp_cuda_graph_capture_unsupported(
-            experimental_attention_variant="dsa",
-            dsa_kernel_backend="cudnn",
-            sequence_packing_scheduler=sequence_packing_scheduler,
-            dynamic_context_parallel=dynamic_context_parallel,
-            context_parallel_size=context_parallel_size,
-            cuda_graph_impl="local",
-            cuda_graph_modules=[CudaGraphModule.attn],
-            inference_cuda_graph_scope=InferenceCudaGraphScope.layer,
+        assert (
+            is_packed_dsa_cp_cuda_graph_experimental(
+                experimental_attention_variant="dsa",
+                sequence_packing_scheduler=sequence_packing_scheduler,
+                dynamic_context_parallel=dynamic_context_parallel,
+                context_parallel_size=context_parallel_size,
+                cuda_graph_impl="local",
+            )
+            is expected
         )
+
+    @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine", "full_iteration"])
+    def test_packed_dsa_cuda_graph_predicate_accepts_all_graph_implementations(
+        self, cuda_graph_impl
+    ):
+        assert is_packed_dsa_cp_cuda_graph_experimental(
+            experimental_attention_variant="dsa",
+            sequence_packing_scheduler="dp_balanced",
+            dynamic_context_parallel=False,
+            context_parallel_size=2,
+            cuda_graph_impl=cuda_graph_impl,
+        )
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"experimental_attention_variant": None},
+            {"cuda_graph_impl": "none"},
+            {"context_parallel_size": 1},
+            {"sequence_packing_scheduler": None},
+        ],
+        ids=["not_dsa", "graphs_disabled", "static_cp1", "not_packed"],
+    )
+    def test_packed_dsa_cuda_graph_predicate_negative_boundaries(self, overrides):
+        kwargs = {
+            "experimental_attention_variant": "dsa",
+            "sequence_packing_scheduler": "dp_balanced",
+            "dynamic_context_parallel": False,
+            "context_parallel_size": 2,
+            "cuda_graph_impl": "local",
+        }
+        kwargs.update(overrides)
+        assert not is_packed_dsa_cp_cuda_graph_experimental(**kwargs)
 
     def test_get_dsa_module_spec_for_backend(self):
         """get_dsa_module_spec_for_backend returns the correct full spec structure."""

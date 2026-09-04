@@ -52,6 +52,80 @@ def test_divide_improperly():
         util.divide(4, 5)
 
 
+@pytest.fixture
+def clear_callable_kwarg_signature_cache():
+    util._CALLABLE_KWARG_SIGNATURE_CACHE.clear()
+    yield
+    util._CALLABLE_KWARG_SIGNATURE_CACHE.clear()
+
+
+def test_filter_kwargs_for_callable_inspects_signature_once(
+    monkeypatch, clear_callable_kwarg_signature_cache
+):
+    inspected = []
+    original_signature = util.inspect.signature
+
+    def target(*, supported=False):
+        return supported
+
+    def track_signature(func):
+        inspected.append(func)
+        return original_signature(func)
+
+    monkeypatch.setattr(util.inspect, "signature", track_signature)
+    candidates = {"supported": True, "unsupported": True}
+
+    assert util.filter_kwargs_for_callable(target, candidates) == {"supported": True}
+    assert util.filter_kwargs_for_callable(target, candidates) == {"supported": True}
+    assert inspected == [target]
+
+
+def test_filter_kwargs_for_callable_keeps_only_keyword_capable_parameters(
+    clear_callable_kwarg_signature_cache,
+):
+    def target(positional_only, /, positional_or_keyword=None, *, keyword_only=None):
+        return positional_only, positional_or_keyword, keyword_only
+
+    candidates = {
+        "positional_only": 1,
+        "positional_or_keyword": 2,
+        "keyword_only": 3,
+        "unsupported": 4,
+    }
+
+    assert util.filter_kwargs_for_callable(target, candidates) == {
+        "positional_or_keyword": 2,
+        "keyword_only": 3,
+    }
+
+
+def test_filter_kwargs_for_callable_keeps_all_for_var_keyword(clear_callable_kwarg_signature_cache):
+    def target(**kwargs):
+        return kwargs
+
+    candidates = {"first": 1, "second": 2}
+
+    assert util.filter_kwargs_for_callable(target, candidates) == candidates
+
+
+@pytest.mark.parametrize("exception_type", [TypeError, ValueError])
+def test_filter_kwargs_for_callable_uses_signature_unavailable_fallback(
+    monkeypatch, clear_callable_kwarg_signature_cache, exception_type
+):
+    def target(**kwargs):
+        return kwargs
+
+    def fail_signature(_func):
+        raise exception_type("signature unavailable")
+
+    monkeypatch.setattr(util.inspect, "signature", fail_signature)
+    candidates = {"legacy": 1, "new": 2}
+
+    assert util.filter_kwargs_for_callable(
+        target, candidates, signature_unavailable_fallback=(name for name in ("legacy",))
+    ) == {"legacy": 1}
+
+
 @pytest.mark.skipif(not util.HAVE_PACKAGING, reason="packaging is not installed")
 @pytest.mark.parametrize("check_equality", [True, False])
 def test_is_flashinfer_min_version(check_equality):

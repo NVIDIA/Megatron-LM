@@ -2187,6 +2187,16 @@ class DSAttention(MegatronModule):
                 sequence_parallel_tp_full_rows if sequence_parallel_tp else sq
             )
             packed_global_output_size = packed_query_output_size * cp_size
+            query_cu_seqlens_cover_output = (
+                single_packed_thd_sequence
+                and isinstance(packed_seq_params.max_seqlen_q, int)
+                and packed_seq_params.max_seqlen_q == packed_global_output_size
+            )
+            key_cu_seqlens_cover_output = (
+                single_packed_thd_sequence
+                and isinstance(packed_seq_params.max_seqlen_kv, int)
+                and packed_seq_params.max_seqlen_kv == packed_global_output_size
+            )
             if sequence_parallel_query_is_local and cp_size == 1:
                 row_start = sequence_parallel_tp_row_start
                 packed_query_positions = torch.arange(
@@ -2220,18 +2230,6 @@ class DSAttention(MegatronModule):
                 else:
                     packed_query_positions = packed_query_positions_full
             elif cp_size > 1:
-                # For one sequence, host max-seqlen metadata proves whether cu_seqlens already
-                # covers every packed row without synchronizing on the CUDA cu_seqlens tensor.
-                query_cu_seqlens_cover_output = (
-                    single_packed_thd_sequence
-                    and isinstance(packed_seq_params.max_seqlen_q, int)
-                    and packed_seq_params.max_seqlen_q == packed_global_output_size
-                )
-                key_cu_seqlens_cover_output = (
-                    single_packed_thd_sequence
-                    and isinstance(packed_seq_params.max_seqlen_kv, int)
-                    and packed_seq_params.max_seqlen_kv == packed_global_output_size
-                )
                 packed_query_positions, kv_reorder_idx = self._memoized(
                     layout_cache,
                     (
@@ -2321,8 +2319,8 @@ class DSAttention(MegatronModule):
                             local_len,
                             local_len,
                             local_len * cp_size,
-                            False,
-                            False,
+                            query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output,
                         ),
                         lambda: (
                             _cp_reorder_from_host(
@@ -2334,6 +2332,8 @@ class DSAttention(MegatronModule):
                                 local_output_size=local_len,
                                 key_local_output_size=local_len,
                                 global_output_size=local_len * cp_size,
+                                query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                                key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
                             )
                             if host_cu_q is not None and host_cu_kv is not None
                             else (
@@ -2347,6 +2347,8 @@ class DSAttention(MegatronModule):
                                 local_output_size=local_len,
                                 key_local_output_size=local_len,
                                 global_output_size=local_len * cp_size,
+                                query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                                key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
                             )
                         ),
                     )

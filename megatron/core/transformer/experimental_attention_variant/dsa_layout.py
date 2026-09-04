@@ -484,10 +484,8 @@ def _host_packed_cp_spans(
 
 
 def _host_to_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Move a freshly built host tensor to ``device`` without blocking the CPU."""
-    if device.type == "cuda":
-        return values.pin_memory().to(device, non_blocking=True)
-    return values.to(device)
+    """Move a freshly built host tensor to ``device``."""
+    return values.to(device, non_blocking=device.type == "cuda")
 
 
 def build_packed_allgather_cp_local_positions_from_host(
