@@ -19,12 +19,13 @@ import pytest
 import torch
 
 from megatron.core.transformer.moe.experts import _ReplicaFC2WgradStore
-from megatron.core.transformer.moe.replica_planner import (
+from megatron.core.transformer.moe.virtual_expert_load_balancer import (
     BACKWARD,
     FORWARD,
     ReplicaPlan,
     ReplicaPlannerWorkspace,
     ReplicaWeightBridge,
+    VirtualExpertLoadBalancer,
     _ReplicaBackwardHook,
     _ReplicaProjection,
     _ReplicaWaitGradReduce,
@@ -32,7 +33,7 @@ from megatron.core.transformer.moe.replica_planner import (
     map_replica_plan_to_hybridep,
     map_routes_to_runtime_experts,
 )
-from megatron.core.transformer.moe.replica_weight_triton import launch_replica_placement
+from megatron.core.transformer.moe.virtual_expert_triton import launch_replica_placement
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
@@ -249,18 +250,21 @@ def test_replica_plan_expands_to_dense_hybridep_inputs():
     torch.testing.assert_close(probs.grad, torch.ones_like(probs))
 
 
-def test_replica_rank_capacity_includes_per_expert_padding():
+def test_virtual_expert_rank_capacity_includes_per_expert_padding():
     """Size the static dropless capacity for HybridEP's per-segment alignment."""
-    from megatron.core.transformer.moe.token_dispatcher import _get_replica_hybridep_rank_capacity
-
     common = {"num_tokens": 8192, "router_topk": 22, "num_runtime_experts": 64}
     assert (
-        _get_replica_hybridep_rank_capacity(**common, capacity_factor=1.0, alignment=256) == 196608
+        VirtualExpertLoadBalancer._get_rank_capacity(**common, capacity_factor=1.0, alignment=256)
+        == 196608
     )
     assert (
-        _get_replica_hybridep_rank_capacity(**common, capacity_factor=2.0, alignment=256) == 360448
+        VirtualExpertLoadBalancer._get_rank_capacity(**common, capacity_factor=2.0, alignment=256)
+        == 360448
     )
-    assert _get_replica_hybridep_rank_capacity(**common, capacity_factor=1.0, alignment=0) == 180224
+    assert (
+        VirtualExpertLoadBalancer._get_rank_capacity(**common, capacity_factor=1.0, alignment=0)
+        == 180224
+    )
 
 
 def test_replica_backward_hooks_span_the_transport_window():
