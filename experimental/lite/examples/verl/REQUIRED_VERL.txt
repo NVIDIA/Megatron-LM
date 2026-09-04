@@ -1,4 +1,4 @@
 # Reference VERL source for the Megatron Lite VERL example.
 # Requires verl latest main (engine-worker / V1 trainer architecture).
-# Pinned reference commit: b9c513c4 (engine-worker / V1 trainer).
-verl @ git+https://github.com/verl-project/verl.git@b9c513c4
+# Pinned reference commit: b9c513c44c0680822016b63e39249165f1fc6b94 (engine-worker / V1 trainer).
+verl @ git+https://github.com/verl-project/verl.git@b9c513c44c0680822016b63e39249165f1fc6b94
