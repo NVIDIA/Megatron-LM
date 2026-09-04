@@ -94,7 +94,6 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "disable_parameter_transpose_cache": False,
     "distribute_saved_activations": False,
     "dsa_cp_balance_indexer": False,
-    "dsa_cp_balance_indexer_graph_dynamic_packs": False,
     "dsa_indexer_head_dim": None,
     "dsa_indexer_k_norm_epsilon": None,
     "dsa_indexer_k_norm_fp32": False,
