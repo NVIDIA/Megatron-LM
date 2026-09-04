@@ -3295,10 +3295,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
-    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
+    # Logging-only: leave them on device, training_log reads the whole bundle once.
+    grad_norm = reduce_max_stat_across_model_parallel_group(
+        grad_norm, group=mp_group, return_tensor=True
+    )
     if args.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
-            num_zeros_in_grad, group=mp_group
+            num_zeros_in_grad, group=mp_group, return_tensor=True
         )
 
     # Vision momentum.
@@ -3494,22 +3497,25 @@ def training_log(
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     _lr_mp_group = pg_collection.mp if pg_collection is not None else None
-    learning_rate: float | None = reduce_max_stat_across_model_parallel_group(
-        learning_rate, group=_lr_mp_group
+    learning_rate = reduce_max_stat_across_model_parallel_group(
+        learning_rate, group=_lr_mp_group, return_tensor=True
     )
-    if learning_rate is None and args.freeze_all_layers:
-        learning_rate = 0.0
     # Tensorboard values.
     if writer and (iteration % args.tensorboard_log_interval == 0):
         # Runs before the log block below, so it pays for the read; still one copy.
         # Only reached when a writer is configured.
-        loss_scale, params_norm, grad_norm, num_zeros_in_grad = _read_logging_stats(
-            [loss_scale, params_norm, grad_norm, num_zeros_in_grad]
+        loss_scale, params_norm, grad_norm, num_zeros_in_grad, learning_rate = (
+            _read_logging_stats(
+                [loss_scale, params_norm, grad_norm, num_zeros_in_grad, learning_rate]
+            )
         )
         # calc_params_l2_norm returned the SQUARED norm; root it here.
         params_norm = None if params_norm is None else params_norm**0.5
         grad_norm = _none_if_absent(grad_norm)
         num_zeros_in_grad = _none_if_absent(num_zeros_in_grad)
+        learning_rate = _none_if_absent(learning_rate)
+        if learning_rate is None and args.freeze_all_layers:
+            learning_rate = 0.0
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples}, iteration)
         if learning_rate is not None:
@@ -3692,9 +3698,9 @@ def training_log(
             for key in total_loss_dict
             if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]
         ]
-        loss_scale, params_norm, grad_norm, num_zeros_in_grad, *loss_totals = (
+        loss_scale, params_norm, grad_norm, num_zeros_in_grad, learning_rate, *loss_totals = (
             _read_logging_stats(
-                [loss_scale, params_norm, grad_norm, num_zeros_in_grad]
+                [loss_scale, params_norm, grad_norm, num_zeros_in_grad, learning_rate]
                 + [total_loss_dict[key] for key in loss_keys]
             )
         )
@@ -3703,6 +3709,9 @@ def training_log(
         params_norm = None if params_norm is None else params_norm**0.5
         grad_norm = _none_if_absent(grad_norm)
         num_zeros_in_grad = _none_if_absent(num_zeros_in_grad)
+        learning_rate = _none_if_absent(learning_rate)
+        if learning_rate is None and args.freeze_all_layers:
+            learning_rate = 0.0
 
         throughput = num_floating_point_operations(
             args,
