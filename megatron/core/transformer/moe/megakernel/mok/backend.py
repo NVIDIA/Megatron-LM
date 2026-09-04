@@ -97,7 +97,12 @@ class MoKMegakernel(MegakernelBackend):
                     "but MOK bypasses that forward path."
                 )
         self.native_single_grouped_weights = bool(config.moe_single_grouped_weight)
-        self.mok_config = MoKConfig(**(config.moe_megakernel_backend_config or {}))
+        try:
+            self.mok_config = MoKConfig(**(config.moe_megakernel_backend_config or {}))
+        except TypeError as exc:
+            raise ValueError(
+                f"Invalid MOK option in moe_megakernel_backend_config: {exc}"
+            ) from exc
 
         if not hasattr(routed_experts, "linear_fc1") or not hasattr(
             routed_experts, "linear_fc2"

@@ -3333,17 +3333,6 @@ class TransformerConfig(ModelParallelConfig):
         assert all(
             isinstance(scope, CudaGraphModule) for scope in self.cuda_graph_modules
         ), f"cuda_graph_modules must be a list of CudaGraphModule, got {self.cuda_graph_modules}."
-        if self.moe_megakernel_backend == "mok" and any(
-            scope in self.cuda_graph_modules
-            for scope in (CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess)
-        ):
-            # TODO: Support router-only partial MoE graph replay for megakernel backends by
-            # passing graph-produced probabilities and routing maps directly to the backend,
-            # bypassing native token-dispatcher preprocess and state replay.
-            raise ValueError(
-                "MOK does not currently support MCore's partial MoE graph replay protocol "
-                "(moe_router/moe_preprocess)"
-            )
 
         assert self.cuda_graph_impl in [
             "none",
@@ -3364,6 +3353,29 @@ class TransformerConfig(ModelParallelConfig):
         assert not (
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
+
+        if self.moe_megakernel_backend == "mok":
+            if self.cuda_graph_impl in ("local", "transformer_engine"):
+                if not self.cuda_graph_modules:
+                    raise ValueError(
+                        "MOK does not support per-layer whole-layer CUDA Graph capture"
+                    )
+                if any(
+                    scope in self.cuda_graph_modules
+                    for scope in (
+                        CudaGraphModule.moe,
+                        CudaGraphModule.moe_router,
+                        CudaGraphModule.moe_preprocess,
+                    )
+                ):
+                    raise ValueError(
+                        "MOK does not support per-layer CUDA Graph scopes containing "
+                        "moe/moe_router/moe_preprocess"
+                    )
+            elif self.cuda_graph_impl not in ("none", "full_iteration"):
+                raise ValueError(
+                    f"MOK does not support cuda_graph_impl={self.cuda_graph_impl!r}"
+                )
 
         # mHC selective recompute composes with CUDA graphs on two paths: the
         # opt-in attention-only split, and whole-range capture for everything

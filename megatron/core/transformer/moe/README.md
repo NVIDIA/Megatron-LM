@@ -510,6 +510,7 @@ Select MOK with the following YAML configuration:
 ```yaml
 bf16: true
 moe_grouped_gemm: true
+moe_ffn_hidden_size: 3072
 gradient_accumulation_fusion: true
 moe_shared_expert_intermediate_size: 3072
 moe_megakernel_backend: mok
