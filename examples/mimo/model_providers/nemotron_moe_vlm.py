@@ -153,6 +153,7 @@ def nemotron_projection_config(
     config.hidden_size = int(args.hidden_size)
     config.num_attention_heads = 1
     config.ffn_hidden_size = 4 * projection_input_size
+    config.gated_linear_unit = False
     config.bias_activation_fusion = False
     config.bias_dropout_fusion = False
     config.add_bias_linear = False
