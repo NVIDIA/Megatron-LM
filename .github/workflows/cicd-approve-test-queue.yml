@@ -88,6 +88,7 @@ jobs:
           REPO = os.environ["GITHUB_REPOSITORY"]
           CONTRIBUTOR_TYPE = os.environ["CONTRIBUTOR_TYPE"]
           INTERNAL_SERVICE_ACCOUNTS = {"svcnemo-autobot"}
+          CICD_WORKFLOW_NAME = "CICD Megatron-LM"
           FUNCTIONAL_TEST_LABEL = "Run functional tests"
           if CONTRIBUTOR_TYPE == "external":
               # Global limit across all branches — no division needed since we count globally.
@@ -230,7 +231,7 @@ jobs:
 
           # The functional-test slot is global across all branch/contributor queues.
           functional_test_workflow_running = any(
-              has_functional_test_label(run)
+              run.get("name") == CICD_WORKFLOW_NAME and has_functional_test_label(run)
               for run in queued_workflow_runs + in_progress_workflow_runs
           )
 
@@ -238,15 +239,15 @@ jobs:
           # For internal contributors, enforce per-branch limits as before.
           if CONTRIBUTOR_TYPE == "external":
               queued_workflow_runs = [run for run in queued_workflow_runs
-                                      if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+                                      if run["name"] == CICD_WORKFLOW_NAME and matches_contributor(run, CONTRIBUTOR_TYPE)]
               in_progress_workflow_runs = [run for run in in_progress_workflow_runs
-                                          if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+                                          if run["name"] == CICD_WORKFLOW_NAME and matches_contributor(run, CONTRIBUTOR_TYPE)]
           else:
               # Filter for workflows belonging to PRs targeting ${{ matrix.branch }} with matching contributor type
               queued_workflow_runs = [run for run in queued_workflow_runs
-                                      if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+                                      if run["name"] == CICD_WORKFLOW_NAME and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
               in_progress_workflow_runs = [run for run in in_progress_workflow_runs
-                                          if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+                                          if run["name"] == CICD_WORKFLOW_NAME and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
 
           # Count running and queued workflows
           queued_workflows = len(queued_workflow_runs)
@@ -272,10 +273,10 @@ jobs:
           print("Pending workflows:", len(pending_workflows))
           if CONTRIBUTOR_TYPE == "external":
               pending_workflows = [run for run in pending_workflows
-                                  if run["name"] == "CICD Megatron-LM" and matches_contributor(run, CONTRIBUTOR_TYPE)]
+                                  if run["name"] == CICD_WORKFLOW_NAME and matches_contributor(run, CONTRIBUTOR_TYPE)]
           else:
               pending_workflows = [run for run in pending_workflows
-                                  if run["name"] == "CICD Megatron-LM" and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
+                                  if run["name"] == CICD_WORKFLOW_NAME and matches_queue(run, "${{ matrix.branch }}", CONTRIBUTOR_TYPE)]
 
           # Sort deployments by creation date (oldest first)
           print("Sorting workflows...")
