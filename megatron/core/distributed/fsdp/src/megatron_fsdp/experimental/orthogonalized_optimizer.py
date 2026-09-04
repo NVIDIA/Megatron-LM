@@ -109,7 +109,7 @@ class _BoundaryChunkState:
 
     `FsdpOrthogonalizedOptimizer.step` issues every chunk's owner-gather first,
     then `_issue_boundary_update` fills the scatter fields for
-    `_finish_boundary_update` to consume.
+    `_enqueue_boundary_update` to consume.
     """
 
     b_params: Sequence[DTensor]
@@ -827,16 +827,14 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                     continue
                 self._orthogonalize_and_update(matrix_params[i], local_shards[i], lr, group)
 
-            # Pipeline each chunk's owner-scatter with the next chunk's Newton-Schulz.
-            # Keeping one pending scatter bounds additional storage to one chunk.
-            pending_update: _BoundaryChunkState | None = None
+            # Submit all owner-scatter work before applying any received updates so
+            # host-side Work.wait() does not stall later chunk launches.
             for state in chunk_states:
                 self._issue_boundary_update(state)
-                if pending_update is not None:
-                    self._finish_boundary_update(pending_update)
-                pending_update = state
-            if pending_update is not None:
-                self._finish_boundary_update(pending_update)
+            for state in chunk_states:
+                self._enqueue_boundary_update(state)
+            for state in chunk_states:
+                self._wait_for_dist_buffer(state.scatter_works)
 
             for param in matrix_params:
                 pg = get_containing_parameter_group(param)
@@ -971,13 +969,12 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         state.scatter_works = scatter_works
         state.scatter_event = scatter_event
 
-    def _finish_boundary_update(self, state: _BoundaryChunkState) -> None:
-        """Wait for one owner-scatter and apply its local update shards."""
+    def _enqueue_boundary_update(self, state: _BoundaryChunkState) -> None:
+        """Apply local update shards after the asynchronous owner-scatter."""
         # Depend only on this chunk's scatter, not later communication queued
         # on the shared owner-comm stream.
         if state.scatter_event is not None:
             torch.cuda.current_stream(state.device).wait_event(state.scatter_event)
-        self._wait_for_dist_buffer(state.scatter_works)
         scatter_plan = cast(OwnerScatterPlan, state.scatter_plan)
         received = self._unpack_update_shards(scatter_plan, state.scatter_recv)
 
