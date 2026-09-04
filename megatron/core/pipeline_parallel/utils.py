@@ -112,9 +112,22 @@ def set_ideal_affinity_for_current_gpu():
     err, device_uuid = cuda_driver.cuDeviceGetUuid(device_id)
     assert err == cuda_driver.CUresult.CUDA_SUCCESS
     # Set CPU affinity based on GPU's NUMA node
-    pynvml.nvmlInit()
-    handle = pynvml.nvmlDeviceGetHandleByUUID("GPU-" + str(uuid.UUID(bytes=device_uuid.bytes)))
-    pynvml.nvmlDeviceSetCpuAffinity(handle)
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByUUID(
+            "GPU-" + str(uuid.UUID(bytes=device_uuid.bytes))
+        )
+        pynvml.nvmlDeviceSetCpuAffinity(handle)
+    except pynvml.NVMLError as error:
+        # CPU affinity improves host-device transfer performance but is not
+        # required for correctness. Containerized environments may expose the
+        # GPU while denying the NVML affinity operation.
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"Could not set CPU affinity through NVML; continuing without it: {error}",
+        )
+        return
 
     log_single_rank(
         logger,
