@@ -19,6 +19,10 @@ from typing import MutableMapping
 
 import torch
 
+# Explicit: `import torch` does not reliably bind the `torch.utils.deterministic`
+# submodule, and this module writes to one of its attributes.
+import torch.utils.deterministic
+
 # Maps each arg name to the value it must hold for bit-exact execution;
 # verified by :func:`apply_determinism_to_args`.
 ARG_VALUES_REQUIRED_FOR_DETERMINISM = {"cross_entropy_loss_fusion": False, "tp_comm_overlap": False}
@@ -129,7 +133,9 @@ def apply_determinism_to_args(args) -> None:
        ``NVTE_ALLOW_NONDETERMINISTIC_ALGO``, ``CUBLAS_WORKSPACE_CONFIG``,
        ``MAMBA_DETERMINISTIC``, ``CAUSAL_CONV1D_DETERMINISTIC``) and
        setdefaults the canonical values.
-    3. Calls ``torch.use_deterministic_algorithms(True)``.
+    3. Calls ``torch.use_deterministic_algorithms(True)``, then clears
+       ``torch.utils.deterministic.fill_uninitialized_memory``, which that call
+       turns on and which reproducibility does not need.
 
     Incompatible options are rejected with an explicit error rather than
     silently overridden: the user must turn them off themselves so the
@@ -156,3 +162,17 @@ def apply_determinism_to_args(args) -> None:
 
     # Torch global state last — all assertions have already passed.
     torch.use_deterministic_algorithms(True)
+
+    # Reproducibility comes from the independent output buffer that replaces an
+    # unordered atomic accumulation and fixes the summation order. That stays.
+    #
+    # The line above also fills every uninitialized allocation (torch.empty,
+    # empty_like, empty_strided, Tensor.resize_) with NaN/MAX_INT, pinning what a
+    # kernel would read from memory it never wrote. Reproducibility does not need
+    # that: with no padding feeding the computation, results are bit-identical
+    # either way.
+    #
+    # It costs a kernel launch per empty allocation, serialized between real work
+    # — roughly 15% TFLOP/s on large configs. Set back to True only to debug a
+    # suspected uninitialized-memory read.
+    torch.utils.deterministic.fill_uninitialized_memory = False
