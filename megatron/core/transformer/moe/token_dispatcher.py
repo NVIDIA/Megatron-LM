@@ -46,10 +46,7 @@ from megatron.core.transformer.moe.moe_utils import (
     unpermute,
 )
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
-from megatron.core.transformer.moe.virtual_expert_load_balancer import (
-    VirtualExpertLoadBalancer,
-    VirtualExpertPlan,
-)
+from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 """ We use the following notation throughout this file:
@@ -1270,18 +1267,6 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         self.setup_virtual_expert_metadata(routing_map, probs)
 
-    @staticmethod
-    def map_virtual_expert_plan_to_hybridep(
-        plan: VirtualExpertPlan, topk_probs: torch.Tensor, num_experts: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Scatter compact virtual routes into HybridEP's dense routing metadata."""
-        dense_shape = (int(plan.virtual_experts.shape[0]), num_experts)
-        routing_map = torch.zeros(dense_shape, dtype=torch.bool, device=plan.virtual_experts.device)
-        dense_probs = torch.zeros(dense_shape, dtype=torch.float32, device=topk_probs.device)
-        routing_map.scatter_(1, plan.virtual_experts, True)
-        dense_probs.scatter_(1, plan.virtual_experts, topk_probs.to(torch.float32))
-        return routing_map, dense_probs
-
     def dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -1293,10 +1278,8 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
             num_runtime_experts=self.num_local_experts,
             alignment=self._quantization_alignment(),
         )
-        routing_map, token_probs = self.map_virtual_expert_plan_to_hybridep(
-            plan, self.semantic_token_probs, num_experts=self.num_experts
-        )
-        super().setup_metadata(routing_map, token_probs)
+        # The planner already wrote the dense runtime routing map and probabilities.
+        super().setup_metadata(plan.routing_map, plan.probs)
         # The planner gives every rank exactly its own route count, and HybridEP pads each of
         # the 2L runtime expert segments on top; the base budget (routes x capacity factor)
         # would make HybridEP drop the padded routes.
