@@ -223,6 +223,11 @@ class _GDNBase(MegatronModule):
             name=(name + ".in_proj") if name is not None else None,
         )
 
+        if self.config.gated_delta_net_separate_grad_norm:
+            # Keep the literal in sync with optimizer.optimizer.GDN_GRAD_NORM_GROUP.
+            for param in self.in_proj.parameters():
+                param.grad_norm_group = 'gated_delta_net'
+
         # Conv1d for QKV
         self.conv_dim = self.qk_dim * 2 + self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size

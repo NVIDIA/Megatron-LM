@@ -731,6 +731,51 @@ def test_mtp_grad_clipping_uses_separate_norms():
         Utils.destroy_model_parallel()
 
 
+def test_gdn_grad_clipping_does_not_shrink_main_grads():
+    """A large GDN input-projection grad is clipped without shrinking main grads."""
+    from megatron.core.optimizer.optimizer import GDN_GRAD_NORM_GROUP, MegatronOptimizer
+
+    class MockOptimizer:
+        _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
+        get_grad_norm = MegatronOptimizer.get_grad_norm
+        get_grad_stats_parallel_group = MegatronOptimizer.get_grad_stats_parallel_group
+        has_grad_norm_group = MegatronOptimizer.has_grad_norm_group
+        _compute_grad_norms_by_group = MegatronOptimizer._compute_grad_norms_by_group
+        clip_grad_norm = MegatronOptimizer.clip_grad_norm
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    Utils.initialize_model_parallel()
+    try:
+        clip = 1.0
+        main_param = torch.nn.Parameter(torch.randn(4, 4).cuda())
+        main_param.grad = torch.full((4, 4), 0.1, device='cuda')
+        main_grad_before = main_param.grad.clone()
+
+        gdn_param = torch.nn.Parameter(torch.randn(4, 4).cuda())
+        gdn_param.grad_norm_group = GDN_GRAD_NORM_GROUP
+        gdn_param.grad = torch.full((4, 4), 10.0, device='cuda')
+        gdn_norm_before = gdn_param.grad.norm().item()
+
+        opt = MockOptimizer([main_param, gdn_param])
+        returned_norm = opt.clip_grad_norm(clip)
+
+        torch.testing.assert_close(
+            float(returned_norm), main_grad_before.norm().item(), rtol=1e-4, atol=1e-4
+        )
+        torch.testing.assert_close(main_param.grad, main_grad_before)
+        assert gdn_param.grad.norm().item() < gdn_norm_before
+        assert GDN_GRAD_NORM_GROUP in opt.grad_norms_by_group
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_precision_aware_fused_adam():
     try:
         from transformer_engine.pytorch.optimizers import FusedAdam
