@@ -49,7 +49,13 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
+from megatron.core.utils import (
+    get_pg_size,
+    make_tp_sharded_tensor_for_checkpoint,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
@@ -1094,6 +1100,10 @@ class Compressor(MegatronModule):
         )
         config.init_method(_ape)
         self.ape = mark_keep_in_fp32(nn.Parameter(_ape))
+        if get_pg_size(pg_collection.tp) > 1 and config.sequence_parallel:
+            # APE is replicated, but its gradient is computed from sequence-
+            # parallel slices and must be reduced across the TP group.
+            setattr(self.ape, 'sequence_parallel', True)
 
         norm_config = copy.copy(config)
         norm_config.normalization = "RMSNorm"
@@ -1747,7 +1757,13 @@ class CompressedSparseAttention(MegatronModule):
         self.window_size = config.csa_window_size
         self.v_head_dim = config.v_head_dim
 
-        self.n_local_heads = config.num_attention_heads
+        tp_size = get_pg_size(pg_collection.tp)
+        if config.num_attention_heads % tp_size != 0:
+            raise ValueError(
+                "CSA query heads must be divisible by tensor model parallel size: "
+                f"{config.num_attention_heads} % {tp_size} != 0"
+            )
+        self.n_local_heads = config.num_attention_heads // tp_size
 
         if softmax_scale is None:
             softmax_scale = config.v_head_dim**-0.5
@@ -1760,6 +1776,8 @@ class CompressedSparseAttention(MegatronModule):
         self.attn_sink = mark_keep_in_fp32(
             nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
         )
+        if tp_size > 1:
+            set_tensor_model_parallel_attributes(self.attn_sink, True, 0, 1)
 
         # Conditionally build Compressor (ratio > 1). ratio == 0 is window-only ('W'): not built.
         if self.compress_ratio > 1 and submodules.compressor is not None:
@@ -1803,6 +1821,18 @@ class CompressedSparseAttention(MegatronModule):
             self.compressor.backward_dw()
         if self.indexer is not None:
             self.indexer.backward_dw()
+
+    def sharded_state_dict(self, prefix: str = "", sharded_offsets: tuple = (), metadata=None):
+        """Shard the per-query-head attention sink along the TP head axis."""
+        state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        key = f"{prefix}attn_sink"
+        state_dict[key] = make_tp_sharded_tensor_for_checkpoint(
+            tensor=self.attn_sink,
+            key=key,
+            tp_axis=0,
+            prepend_offsets=sharded_offsets,
+        )
+        return state_dict
 
     # ------------------------------------------------------------------
     # Private helpers – each owns one logical slice of the forward pass.
@@ -1872,7 +1902,7 @@ class CompressedSparseAttention(MegatronModule):
                     q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
                         x_det, qr_det, packed_seq_params
                     )
-                    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+                    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0
                     key_for_loss = compressed_kv.unsqueeze(2).expand(-1, -1, np, -1)
                     weights_for_unfused = weights_indexer.float() * self.indexer.softmax_scale
                     non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
@@ -2077,6 +2107,16 @@ class CompressedSparseAttention(MegatronModule):
         packed_seq_params: PackedSeqParams = None,
         boundary_hidden: Optional[torch.Tensor] = None,
         boundary_kv: Optional[torch.Tensor] = None,
+        indexer_x_local: Optional[torch.Tensor] = None,
+        indexer_qr_local: Optional[torch.Tensor] = None,
+        tp_local_indexer_q: bool = False,
+        tp_local_indexer_topk: bool = False,
+        indexer_compressor_x_local: Optional[torch.Tensor] = None,
+        indexer_compressor_boundary_hidden: Optional[torch.Tensor] = None,
+        tp_local_indexer_compressor: bool = False,
+        attention_compressor_x_local: Optional[torch.Tensor] = None,
+        attention_compressor_boundary_hidden: Optional[torch.Tensor] = None,
+        tp_local_attention_compressor: bool = False,
     ) -> torch.Tensor:
         """Forward pass for CompressedSparseAttention.
 
@@ -2114,7 +2154,23 @@ class CompressedSparseAttention(MegatronModule):
                     query, key, x, qr, boundary_hidden, boundary_kv, packed_seq_params
                 )
             else:
-                output = self._forward_thd(query, key, x, qr, packed_seq_params)
+                output = self._forward_thd(
+                    query,
+                    key,
+                    x,
+                    qr,
+                    packed_seq_params,
+                    indexer_x_local=indexer_x_local,
+                    indexer_qr_local=indexer_qr_local,
+                    tp_local_indexer_q=tp_local_indexer_q,
+                    tp_local_indexer_topk=tp_local_indexer_topk,
+                    attention_compressor_x_local=attention_compressor_x_local,
+                    attention_compressor_boundary_hidden=attention_compressor_boundary_hidden,
+                    tp_local_attention_compressor=tp_local_attention_compressor,
+                    indexer_compressor_x_local=indexer_compressor_x_local,
+                    indexer_compressor_boundary_hidden=indexer_compressor_boundary_hidden,
+                    tp_local_indexer_compressor=tp_local_indexer_compressor,
+                )
             self.pg_collection.cp = _orig_cp_group
             nvtx_range_pop("compressed_sparse_attn")
             return output
@@ -2129,6 +2185,7 @@ class CompressedSparseAttention(MegatronModule):
         has_indexer_compressed = (
             self.compress_ratio > 1 and n_compressed > 0 and self.indexer is not None
         )
+        has_indexer_loss = (getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0) > 0
 
         indexer_loss = None
 
@@ -2144,7 +2201,12 @@ class CompressedSparseAttention(MegatronModule):
                 window_idxs,
                 packed_seq_params,
             )
-        elif has_indexer_compressed and self.training and torch.is_grad_enabled():
+        elif (
+            has_indexer_compressed
+            and self.training
+            and torch.is_grad_enabled()
+            and has_indexer_loss
+        ):
             output, indexer_loss = self._forward_fused_indexer_training(
                 query, x, qr, kv_full, n_compressed, offset, window_idxs, packed_seq_params
             )
@@ -2216,7 +2278,7 @@ class CompressedSparseAttention(MegatronModule):
 
                     key_for_loss_thd = compressed_kv.unsqueeze(1).expand(-1, np_, -1)
                     weights_for_unfused = w_thd * self.indexer.softmax_scale
-                    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+                    indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0
 
                     # Physical padded offsets define the packed address space;
                     # unpadded lengths identify the real rows within each segment.
@@ -2383,6 +2445,14 @@ class CompressedSparseAttention(MegatronModule):
         max_seqlen_q: int,
         max_seqlen_compressed_idx: int,
         max_seqlen_kv: int,
+        *,
+        indexer_x_local: Optional[torch.Tensor] = None,
+        indexer_qr_local: Optional[torch.Tensor] = None,
+        tp_local_indexer_q: bool = False,
+        tp_local_indexer_topk: bool = False,
+        indexer_compressor_x_local: Optional[torch.Tensor] = None,
+        indexer_compressor_boundary_hidden: Optional[torch.Tensor] = None,
+        tp_local_indexer_compressor: bool = False,
     ) -> torch.Tensor:
         """Path C (THD): separate indexer forward (no loss) + fused sparse attn (compact).
 
@@ -2391,27 +2461,110 @@ class CompressedSparseAttention(MegatronModule):
         x_det = x.detach()
         qr_det = qr.detach()
 
-        q_indexer, k_indexer, weights_indexer, cu_seqlens_compressed_idx = (
-            self.indexer.forward_before_topk(x_det, qr_det, packed_seq_params)
-        )
-        q_thd = q_indexer.squeeze(1)
-        w_thd = weights_indexer.squeeze(1)
-        if k_indexer is None:
-            topk_indices_cmp = torch.full((total_q, 0), -1, dtype=torch.int32, device=query.device)
-        else:
-            k_thd = k_indexer.squeeze(1)
-            topk_indices_cmp, _ = indexer_topk(
-                q_thd,
-                k_thd,
-                w_thd,
-                topk=self.indexer.index_topk,
-                ratio=self.compress_ratio,
-                indexer_softmax_scale=self.indexer.softmax_scale,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_kv=cu_seqlens_compressed_idx,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_kv=max_seqlen_compressed_idx,
+        # With a zero teacher-loss coefficient the Indexer route is a discrete
+        # routing decision only.  No Indexer activation can contribute a
+        # gradient, so do not build a parameter autograd graph for Q/K/weights.
+        with torch.no_grad():
+            if tp_local_indexer_topk:
+                if indexer_x_local is None or indexer_qr_local is None:
+                    raise RuntimeError(
+                        "TP-local Indexer top-k path requires local hidden and compressed-query inputs."
+                    )
+                q_indexer, weights_indexer = self._forward_indexer_q_weights_tp_local(
+                    indexer_x_local.detach(),
+                    indexer_qr_local.detach(),
+                    packed_seq_params,
+                    gather=False,
+                )
+            elif tp_local_indexer_q:
+                if indexer_x_local is None or indexer_qr_local is None:
+                    raise RuntimeError(
+                        "TP-local Indexer Q path requires local hidden and compressed-query inputs."
+                    )
+                q_indexer, weights_indexer = self._forward_indexer_q_weights_tp_local(
+                    indexer_x_local.detach(),
+                    indexer_qr_local.detach(),
+                    packed_seq_params,
+                )
+            elif tp_local_indexer_compressor:
+                q_indexer, weights_indexer = self._forward_indexer_q_weights_global(
+                    x_det, qr_det, packed_seq_params
+                )
+            else:
+                q_indexer, k_indexer, weights_indexer, cu_seqlens_compressed_idx = (
+                    self.indexer.forward_before_topk(x_det, qr_det, packed_seq_params)
+                )
+            if tp_local_indexer_topk or tp_local_indexer_q or tp_local_indexer_compressor:
+                if tp_local_indexer_compressor:
+                    if (
+                        indexer_compressor_x_local is None
+                        or indexer_compressor_boundary_hidden is None
+                    ):
+                        raise RuntimeError(
+                            "TP-local Indexer compressor requires local hidden and boundary inputs."
+                        )
+                    k_indexer, cu_seqlens_compressed_idx = (
+                        self._forward_indexer_compressor_tp_local(
+                            indexer_compressor_x_local.detach(),
+                            indexer_compressor_boundary_hidden,
+                            packed_seq_params,
+                        )
+                    )
+                else:
+                    k_indexer, cu_seqlens_compressed_idx = self.indexer.compressor(
+                        x_det, packed_seq_params=packed_seq_params
+                    )
+        if tp_local_indexer_topk:
+            if k_indexer is None:
+                local_rows = indexer_x_local.shape[0]
+                topk_indices_cmp = torch.full(
+                    (local_rows, 0), -1, dtype=torch.int32, device=query.device
+                )
+            else:
+                topk_indices_cmp, _ = cp_utils.compute_cp_indexer_topk(
+                    q_indexer,
+                    weights_indexer,
+                    k_indexer.squeeze(1),
+                    cu_seqlens_q,
+                    cu_seqlens_compressed_idx,
+                    self.pg_collection.tp.rank() * indexer_x_local.shape[0],
+                    self.compress_ratio,
+                    self.indexer.index_topk,
+                    self.indexer.softmax_scale,
+                    max_seqlen_q,
+                    use_fused=self.use_fused_kernels,
+                )
+                if topk_indices_cmp is None:
+                    topk_indices_cmp = torch.full(
+                        (indexer_x_local.shape[0], 0),
+                        -1,
+                        dtype=torch.int32,
+                        device=query.device,
+                    )
+            topk_indices_cmp = gather_from_sequence_parallel_region(
+                topk_indices_cmp, group=self.pg_collection.tp
             )
+        else:
+            q_thd = q_indexer.squeeze(1)
+            w_thd = weights_indexer.squeeze(1)
+            if k_indexer is None:
+                topk_indices_cmp = torch.full(
+                    (total_q, 0), -1, dtype=torch.int32, device=query.device
+                )
+            else:
+                k_thd = k_indexer.squeeze(1)
+                topk_indices_cmp, _ = indexer_topk(
+                    q_thd,
+                    k_thd,
+                    w_thd,
+                    topk=self.indexer.index_topk,
+                    ratio=self.compress_ratio,
+                    indexer_softmax_scale=self.indexer.softmax_scale,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_kv=cu_seqlens_compressed_idx,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_kv=max_seqlen_compressed_idx,
+                )
 
         # Shift into per-segment full-KV index space.
         if topk_indices_cmp.shape[-1] > 0:
@@ -2445,6 +2598,151 @@ class CompressedSparseAttention(MegatronModule):
         )
         return output.unsqueeze(1)
 
+    def _forward_indexer_q_weights_global(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute the global Indexer Q/weights without invoking its K compressor."""
+        indexer = self.indexer
+        cu_seqlens_q = (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else packed_seq_params.cu_seqlens_q
+        )
+        max_seqlen_q = int(packed_seq_params.max_seqlen_q)
+        q_indexer, _ = indexer.linear_wq_b(qr)
+        local_rows, bsz, _ = x.shape
+        q_indexer = q_indexer.reshape(
+            local_rows, bsz, indexer.index_n_heads, indexer.index_head_dim
+        )
+        q_indexer = _apply_rope(
+            q_indexer,
+            indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
+            indexer.qk_pos_emb_head_dim,
+            indexer.rotary_pos_emb,
+            self.config,
+            rotary_seq_len=local_rows,
+            ratio=1,
+            cp_group=self.pg_collection.cp,
+            cu_seqlens=cu_seqlens_q,
+            max_seqlen_rope=max_seqlen_q,
+        )
+        q_indexer = rotate_activation(q_indexer)
+        weights_indexer, _ = indexer.linear_weights_proj(x)
+        weights_indexer = weights_indexer * (indexer.index_n_heads**-0.5)
+        return q_indexer, weights_indexer
+
+    def _forward_indexer_q_weights_tp_local(
+        self,
+        x_local: torch.Tensor,
+        qr_local: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+        *,
+        gather: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute duplicated Indexer Q/weights on TP-local sequence rows.
+
+        The Indexer compressor K remains on the legacy global-row path because
+        every TP rank needs the complete compressed-K buffer.  Q and weights are
+        token-wise and are only used to form a non-differentiable top-k when the
+        Indexer teacher-loss coefficient is zero, so computing them once on the
+        rank owning each sequence row and then gathering the results is exact.
+        ``gather=False`` keeps the results local for the local-top-k variant.
+        """
+        tp_group = self.pg_collection.tp
+        if tp_group is None or tp_group.size() <= 1:
+            raise RuntimeError("TP-local Indexer Q path requires a TP group larger than one.")
+        if (getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0) > 0:
+            raise RuntimeError(
+                "TP-local Indexer Q is only enabled when dsa_indexer_loss_coeff == 0; "
+                "the teacher-loss gradient path still requires a dedicated implementation."
+            )
+
+        indexer = self.indexer
+        local_rows = x_local.shape[0]
+        if x_local.ndim != 3 or x_local.shape[1] != 1:
+            raise RuntimeError(
+                f"TP-local Indexer Q expects x_local [rows,1,hidden], got {tuple(x_local.shape)}"
+            )
+        cu_seqlens_q = (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else packed_seq_params.cu_seqlens_q
+        )
+        max_seqlen_q = int(packed_seq_params.max_seqlen_q)
+        global_start = tp_group.rank() * local_rows
+        with torch.no_grad():
+            q_indexer, _ = indexer.linear_wq_b(qr_local)
+            q_indexer = q_indexer.reshape(
+                local_rows, 1, indexer.index_n_heads, indexer.index_head_dim
+            )
+            if gather:
+                # Gather the raw token-wise projection before RoPE. Applying
+                # RoPE to local slices changes a few BF16 ulps in the fused
+                # kernel; the Indexer top-k is discrete and those ulps can
+                # flip many routes. Keeping the existing global RoPE call
+                # makes the top-k numerically equivalent while still removing
+                # the duplicated GEMM work.
+                q_indexer = gather_from_sequence_parallel_region(
+                    q_indexer, group=tp_group
+                )
+                q_indexer = _apply_rope(
+                    q_indexer,
+                    indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
+                    indexer.qk_pos_emb_head_dim,
+                    indexer.rotary_pos_emb,
+                    self.config,
+                    rotary_seq_len=q_indexer.shape[0],
+                    ratio=1,
+                    cp_group=self.pg_collection.cp,
+                    cu_seqlens=cu_seqlens_q,
+                    max_seqlen_rope=max_seqlen_q,
+                )
+            else:
+                # Local top-k uses the same CP metadata as the existing CP
+                # implementation so causal visibility is based on the true
+                # global position rather than the local row number.
+                if self.config.apply_dsa_kernel_fusion:
+                    rotary_pos_cos, rotary_pos_sin = indexer.rotary_pos_emb.get_cached_cos_sin(
+                        max_seqlen_q, dtype=q_indexer.dtype, packed_seq=True, mscale=1.0
+                    )
+                    q_indexer = cp_utils.apply_thd_cp_local_rope_fused(
+                        q_indexer,
+                        rotary_pos_cos,
+                        rotary_pos_sin,
+                        indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
+                        indexer.qk_pos_emb_head_dim,
+                        cu_seqlens_q,
+                        global_start,
+                    )
+                else:
+                    rope_result = indexer.rotary_pos_emb(max_seqlen_q, packed_seq=True)
+                    rotary_pos_emb = (
+                        rope_result[0] if isinstance(rope_result, tuple) else rope_result
+                    )
+                    q_indexer = cp_utils.apply_thd_cp_local_rope_unfused(
+                        q_indexer,
+                        rotary_pos_emb,
+                        indexer.index_head_dim - indexer.qk_pos_emb_head_dim,
+                        indexer.qk_pos_emb_head_dim,
+                        cu_seqlens_q,
+                        global_start,
+                        self.config,
+                    )
+            q_indexer = rotate_activation(q_indexer)
+            weights_indexer, _ = indexer.linear_weights_proj(x_local)
+            weights_indexer = weights_indexer * (indexer.index_n_heads**-0.5)
+
+            if gather:
+                weights_indexer = gather_from_sequence_parallel_region(
+                    weights_indexer, group=tp_group
+                )
+        if not gather:
+            return q_indexer.squeeze(1), weights_indexer.squeeze(1)
+        return q_indexer, weights_indexer
+
     def _forward_fused_indexer_training_thd(
         self,
         query: torch.Tensor,
@@ -2468,7 +2766,7 @@ class CompressedSparseAttention(MegatronModule):
         ``(total_q, 1, np * hn)``.
         """
         sparse_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", True)
-        indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
+        indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0
 
         x_det = x.detach()
         qr_det = qr.detach()
@@ -2754,7 +3052,13 @@ class CompressedSparseAttention(MegatronModule):
                     compressed_kv_local.squeeze(1), group=cp_group
                 )
 
-        use_indexer_loss = training_with_grad and compressed_topk is not None
+        # A zero coefficient still needs Indexer top-k for sparse attention,
+        # but it must not enter the dense/sparse teacher-loss autograd path.
+        # That path allocates large score/recompute workspaces even when its
+        # contribution is mathematically zero (especially at 256K).
+        use_indexer_loss = (
+            training_with_grad and compressed_topk is not None and indexer_loss_coeff > 0
+        )
         # ``use_indexer_loss`` implies the RS consumer edges above were built,
         # so the fused indexer-loss path always runs with backward overlap.
         overlap_cp_backward = use_indexer_loss and self.use_fused_kernels
@@ -2895,6 +3199,100 @@ class CompressedSparseAttention(MegatronModule):
             )
         return output.unsqueeze(1)
 
+    def _forward_compressor_tp_local(
+        self,
+        compressor,
+        x_local: torch.Tensor,
+        boundary_hidden: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        """Compute the attention compressed-KV producer on TP-local rows.
+
+        Every TP rank still receives the complete compressed-KV tensor for its
+        global query rows, but the duplicated token-wise compressor GEMMs run
+        only on the rank owning each sequence interval.  ``prepare_cp...`` and
+        its autograd boundary exchange preserve compression groups that cross a
+        rank boundary; the final gather is rank-major and is reordered into the
+        original sequence-major compressed layout.
+        """
+        tp_group = self.pg_collection.tp
+        if tp_group is None or tp_group.size() <= 1:
+            raise RuntimeError("TP-local compressor requires a TP group larger than one.")
+        if x_local.ndim != 3 or x_local.shape[1] != 1:
+            raise RuntimeError(
+                f"TP-local compressor expects [rows,1,hidden], got {tuple(x_local.shape)}"
+            )
+        cu_seqlens = (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else packed_seq_params.cu_seqlens_q
+        )
+        if packed_seq_params.max_seqlen_q is None:
+            raise ValueError("TP-local attention compressor requires max_seqlen_q for THD metadata.")
+        ratio = int(compressor.compress_ratio)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        compressed_lens = torch.div(seq_lens, ratio, rounding_mode="floor")
+        cu_seqlens_compressed = torch.cat(
+            (
+                torch.zeros_like(cu_seqlens[:1]),
+                torch.cumsum(compressed_lens, dim=0, dtype=torch.int32),
+            )
+        )
+        if int(cu_seqlens_compressed[-1].item()) == 0:
+            return None, cu_seqlens_compressed
+
+        global_start = tp_group.rank() * x_local.shape[0]
+        hidden_compact, compressed_group_ids, seq_to_rank_row = (
+            cp_utils.prepare_cp_compressor_input(
+                x_local,
+                boundary_hidden,
+                cu_seqlens,
+                cu_seqlens_compressed,
+                global_start,
+                tp_group.size(),
+                ratio,
+            )
+        )
+        compressed_local, _ = compressor._forward_thd(
+            hidden_compact,
+            cu_seqlens,
+            max_seqlen_q=int(packed_seq_params.max_seqlen_q),
+            compressed_group_ids=compressed_group_ids,
+        )
+        if compressed_local is None:
+            raise RuntimeError("TP-local compressor unexpectedly returned no compressed rows.")
+        compressed_rank_major = gather_from_sequence_parallel_region(
+            compressed_local.squeeze(1), group=tp_group
+        )
+        compressed_global = torch.index_select(
+            compressed_rank_major,
+            0,
+            seq_to_rank_row.clamp_min(0).long(),
+        )
+        return compressed_global.unsqueeze(1), cu_seqlens_compressed
+
+    def _forward_attention_compressor_tp_local(
+        self,
+        x_local: torch.Tensor,
+        boundary_hidden: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        """Compute the attention compressor through the generic local producer."""
+        return self._forward_compressor_tp_local(
+            self.compressor, x_local, boundary_hidden, packed_seq_params
+        )
+
+    def _forward_indexer_compressor_tp_local(
+        self,
+        x_local: torch.Tensor,
+        boundary_hidden: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
+        """Compute the no-loss Indexer compressed-K producer on TP-local rows."""
+        return self._forward_compressor_tp_local(
+            self.indexer.compressor, x_local, boundary_hidden, packed_seq_params
+        )
+
     def _forward_thd(
         self,
         query: torch.Tensor,  # (total_q, np, hn)        TE THD convention
@@ -2902,6 +3300,17 @@ class CompressedSparseAttention(MegatronModule):
         x: torch.Tensor,  # (total_q, 1, hidden_size)
         qr: torch.Tensor,  # (total_q, 1, q_lora_rank)
         packed_seq_params: PackedSeqParams,
+        *,
+        indexer_x_local: Optional[torch.Tensor] = None,
+        indexer_qr_local: Optional[torch.Tensor] = None,
+        tp_local_indexer_q: bool = False,
+        tp_local_indexer_topk: bool = False,
+        attention_compressor_x_local: Optional[torch.Tensor] = None,
+        attention_compressor_boundary_hidden: Optional[torch.Tensor] = None,
+        tp_local_attention_compressor: bool = False,
+        indexer_compressor_x_local: Optional[torch.Tensor] = None,
+        indexer_compressor_boundary_hidden: Optional[torch.Tensor] = None,
+        tp_local_indexer_compressor: bool = False,
     ) -> torch.Tensor:
         """THD-packed branch of :meth:`forward`. See class docstring for layout.
 
@@ -2944,9 +3353,25 @@ class CompressedSparseAttention(MegatronModule):
 
         # ---- Step 2: per-segment compression --------------------------------
         if self.compressor is not None and self.compress_ratio > 1:
-            compressed_kv, cu_seqlens_compressed = self.compressor(
-                x, packed_seq_params=packed_seq_params
-            )
+            if tp_local_attention_compressor:
+                if (
+                    attention_compressor_x_local is None
+                    or attention_compressor_boundary_hidden is None
+                ):
+                    raise RuntimeError(
+                        "TP-local attention compressor requires local hidden and boundary inputs."
+                    )
+                compressed_kv, cu_seqlens_compressed = (
+                    self._forward_attention_compressor_tp_local(
+                        attention_compressor_x_local,
+                        attention_compressor_boundary_hidden,
+                        packed_seq_params,
+                    )
+                )
+            else:
+                compressed_kv, cu_seqlens_compressed = self.compressor(
+                    x, packed_seq_params=packed_seq_params
+                )
             # compressed_kv is (total_comp, 1, hn) or None
             if compressed_kv is not None:
                 compressed_kv = compressed_kv.squeeze(1)  # (total_comp, hn)
@@ -2981,6 +3406,7 @@ class CompressedSparseAttention(MegatronModule):
         has_indexer = (
             self.compress_ratio > 1 and n_compressed_total > 0 and self.indexer is not None
         )
+        has_indexer_loss = (getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0) > 0
 
         indexer_loss = None
 
@@ -3003,7 +3429,7 @@ class CompressedSparseAttention(MegatronModule):
                 max_seqlen_compressed_idx,
                 packed_seq_params,
             )
-        elif has_indexer and is_training:
+        elif has_indexer and is_training and has_indexer_loss:
             output, indexer_loss = self._forward_fused_indexer_training_thd(
                 query,
                 x,
@@ -3035,6 +3461,13 @@ class CompressedSparseAttention(MegatronModule):
                 max_seqlen_q,
                 max_seqlen_compressed_idx,
                 max_seqlen_kv,
+                indexer_x_local=indexer_x_local,
+                indexer_qr_local=indexer_qr_local,
+                tp_local_indexer_q=tp_local_indexer_q,
+                tp_local_indexer_topk=tp_local_indexer_topk,
+                indexer_compressor_x_local=indexer_compressor_x_local,
+                indexer_compressor_boundary_hidden=indexer_compressor_boundary_hidden,
+                tp_local_indexer_compressor=tp_local_indexer_compressor,
             )
         else:
             output = self._forward_fused_no_indexer_thd(

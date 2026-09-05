@@ -22,6 +22,7 @@ Public API (same shape as the old ``dsa_kernels`` package):
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Optional, Tuple
 
@@ -122,7 +123,48 @@ def _get_topk_alignment() -> int:
     return 128
 
 
-def _csa_fwd_flash_mla(
+@lru_cache(maxsize=8)
+def _get_head_padding(num_heads: int) -> int:
+    """Return a FlashMLA-supported query-head count for local TP heads."""
+    sm = torch.cuda.get_device_capability()
+    if sm[0] >= 10:
+        supported = (64, 128)
+    elif sm[0] >= 9:
+        supported = (64, )
+    else:
+        raise RuntimeError(f"fused DSA requires SM90+, got SM{sm[0]}{sm[1]}")
+    for padded_heads in supported:
+        if padded_heads % num_heads == 0:
+            return padded_heads
+    raise RuntimeError(
+        "FlashMLA sparse prefill requires local query heads to divide a supported "
+        f"head count, got h_q={num_heads}"
+    )
+
+
+def _get_flash_mla_query_chunk_size() -> int:
+    """Return the optional row chunk size for TP head-padding mitigation.
+
+    The default keeps the historical one-shot path. A positive value makes the
+    wrapper split query rows before applying FlashMLA's supported-head padding.
+    This is an environment gate until the underlying FlashMLA/cuDNN interfaces
+    accept native TP-local head counts.
+    """
+    raw_value = os.environ.get('DSV4_FLASH_MLA_QUERY_CHUNK_SIZE', '0').strip()
+    if not raw_value:
+        return 0
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            'DSV4_FLASH_MLA_QUERY_CHUNK_SIZE must be a non-negative integer'
+        ) from exc
+    if value < 0:
+        raise ValueError('DSV4_FLASH_MLA_QUERY_CHUNK_SIZE must be non-negative')
+    return value
+
+
+def _csa_fwd_flash_mla_single(
     q: Tensor,
     kv: Tensor,
     topk_idxs: Tensor,
@@ -131,24 +173,31 @@ def _csa_fwd_flash_mla(
     attn_sink: Optional[Tensor] = None,
     topk_length: Optional[Tensor] = None,
     indexer_topk: int = 0,
+    compact_output: bool = False,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
-    """DSA-shaped adapter around :func:`flash_mla.flash_mla_sparse_fwd`.
-
-    Accepts flat (unbatched) tensors with global indices; pads ``TopK`` to
-    the GPU-specific alignment; returns ``(out, lse, lse_indexer)``.
-    """
+    """Run one FlashMLA call for a flat query row range."""
     assert not (
         indexer_topk > 0 and topk_length is not None
     ), "indexer_topk > 0 requires non-compact mode (topk_length must be None)"
     _ensure_flash_mla()
 
-    _total_S_q, _H, _D = q.shape
     TopK = topk_idxs.shape[-1]
     topk_align = _get_topk_alignment()
     TopK_padded = (TopK + topk_align - 1) // topk_align * topk_align
     if TopK_padded != TopK:
         pad_width = TopK_padded - TopK
         topk_idxs = torch.nn.functional.pad(topk_idxs, (0, pad_width), value=-1)
+
+    actual_num_heads = q.size(1)
+    padded_num_heads = _get_head_padding(actual_num_heads)
+    if padded_num_heads != actual_num_heads:
+        q_padded = q.new_zeros((q.size(0), padded_num_heads, q.size(2)))
+        q_padded[:, :actual_num_heads, :] = q
+        q = q_padded
+        if attn_sink is not None:
+            attn_sink_padded = attn_sink.new_full((padded_num_heads,), float('-inf'))
+            attn_sink_padded[:actual_num_heads] = attn_sink
+            attn_sink = attn_sink_padded
 
     kv_3d = kv.unsqueeze(1)  # (total_S_kv, 1, D)  h_kv=1
     indices = topk_idxs.unsqueeze(1)  # (total_S_q, 1, TopK_padded) h_kv=1
@@ -170,6 +219,19 @@ def _csa_fwd_flash_mla(
             out, _max_logits, lse = res
             lse_indexer = None
 
+    if padded_num_heads != actual_num_heads:
+        out = out[:, :actual_num_heads, :]
+        lse = lse[:, :actual_num_heads]
+        if lse_indexer is not None:
+            lse_indexer = lse_indexer[:, :actual_num_heads]
+        if compact_output:
+            # A slice is a view into FlashMLA's padded storage. Make the result
+            # independent so autograd does not retain the padded buffer.
+            out = out.contiguous()
+            lse = lse.contiguous()
+            if lse_indexer is not None:
+                lse_indexer = lse_indexer.contiguous()
+
     if indexer_topk > 0:
         # When indexer_topk == total TopK, lse_indexer should equal lse but
         # the kernel may not snapshot correctly; fall back to lse.
@@ -177,6 +239,174 @@ def _csa_fwd_flash_mla(
             return out, lse, lse.clone()
         return out, lse, lse_indexer
     return out, lse, None
+
+
+def _csa_fwd_flash_mla(
+    q: Tensor,
+    kv: Tensor,
+    topk_idxs: Tensor,
+    softmax_scale: float,
+    d_v: int = 512,
+    attn_sink: Optional[Tensor] = None,
+    topk_length: Optional[Tensor] = None,
+    indexer_topk: int = 0,
+) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    """Run FlashMLA, optionally chunking rows before TP head padding.
+
+    TP8 currently presents FlashMLA with a global query row count and only
+    eight local heads. On H200 the adapter pads those heads to 64, so a one-shot
+    64K call materializes a 64K x 64 buffer. Row chunking preserves global KV
+    and top-k indices while bounding that padded buffer by the configured size.
+    """
+    assert not (
+        indexer_topk > 0 and topk_length is not None
+    ), "indexer_topk > 0 requires non-compact mode (topk_length must be None)"
+
+    chunk_size = _get_flash_mla_query_chunk_size()
+    actual_num_heads = q.size(1)
+    padded_num_heads = _get_head_padding(actual_num_heads)
+    should_chunk = (
+        chunk_size > 0 and padded_num_heads > actual_num_heads and q.size(0) > chunk_size
+    )
+    if not should_chunk:
+        return _csa_fwd_flash_mla_single(
+            q,
+            kv,
+            topk_idxs,
+            softmax_scale,
+            d_v=d_v,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+            indexer_topk=indexer_topk,
+            compact_output=chunk_size > 0 and padded_num_heads > actual_num_heads,
+        )
+
+    outputs = []
+    lses = []
+    lse_indexers = []
+    for start in range(0, q.size(0), chunk_size):
+        end = min(start + chunk_size, q.size(0))
+        chunk_output, chunk_lse, chunk_lse_indexer = _csa_fwd_flash_mla_single(
+            q[start:end],
+            kv,
+            topk_idxs[start:end],
+            softmax_scale,
+            d_v=d_v,
+            attn_sink=attn_sink,
+            topk_length=topk_length[start:end] if topk_length is not None else None,
+            indexer_topk=indexer_topk,
+            compact_output=True,
+        )
+        outputs.append(chunk_output)
+        lses.append(chunk_lse)
+        if indexer_topk > 0:
+            assert chunk_lse_indexer is not None
+            lse_indexers.append(chunk_lse_indexer)
+
+    output = torch.cat(outputs, dim=0)
+    lse = torch.cat(lses, dim=0)
+    if indexer_topk > 0:
+        lse_indexer = torch.cat(lse_indexers, dim=0)
+        if indexer_topk >= topk_idxs.shape[-1]:
+            return output, lse, lse.clone()
+        return output, lse, lse_indexer
+    return output, lse, None
+
+
+def _pad_sparse_backward_inputs(q, out, d_out, lse, attn_sink):
+    """Pad local TP query heads for the cuDNN sparse backward contract."""
+    actual_num_heads = q.shape[1]
+    padded_num_heads = _get_head_padding(actual_num_heads)
+    if padded_num_heads == actual_num_heads:
+        return q, out, d_out, lse, attn_sink, actual_num_heads
+
+    q_padded = q.new_zeros((q.size(0), padded_num_heads, q.size(2)))
+    q_padded[:, :actual_num_heads, :] = q
+    out_padded = out.new_zeros((out.size(0), padded_num_heads, out.size(2)))
+    out_padded[:, :actual_num_heads, :] = out
+    d_out_padded = d_out.new_zeros((d_out.size(0), padded_num_heads, d_out.size(2)))
+    d_out_padded[:, :actual_num_heads, :] = d_out
+    lse_padded = lse.new_zeros((lse.size(0), padded_num_heads))
+    lse_padded[:, :actual_num_heads] = lse
+    sink_padded = attn_sink.new_full((padded_num_heads,), float('-inf'))
+    sink_padded[:actual_num_heads] = attn_sink
+    return q_padded, out_padded, d_out_padded, lse_padded, sink_padded, actual_num_heads
+
+
+def _unpad_head_gradient(gradient, actual_num_heads):
+    """Remove FlashMLA-only query-head padding from a gradient tensor."""
+    return gradient[:, :actual_num_heads, :].contiguous()
+
+
+def _sparse_attention_backward(
+    q: Tensor,
+    kv: Tensor,
+    out: Tensor,
+    d_out: Tensor,
+    lse: Tensor,
+    attn_sink: Tensor,
+    topk_idxs: Tensor,
+    softmax_scale: float,
+    topk_length: Optional[Tensor],
+):
+    """Run cuDNN DSA backward, optionally in the same row chunks as forward."""
+    _ensure_dsa_namespace()
+    chunk_size = _get_flash_mla_query_chunk_size()
+    actual_num_heads = q.size(1)
+    padded_num_heads = _get_head_padding(actual_num_heads)
+    should_chunk = (
+        chunk_size > 0 and padded_num_heads > actual_num_heads and q.size(0) > chunk_size
+    )
+    if not should_chunk:
+        bwd_q, bwd_out, bwd_dO, bwd_lse, bwd_sink, actual_num_heads = (
+            _pad_sparse_backward_inputs(q, out, d_out, lse, attn_sink)
+        )
+        result = _DSA.sparse_attention_backward_wrapper(
+            bwd_q,
+            kv,
+            bwd_out,
+            bwd_dO,
+            bwd_lse,
+            bwd_sink,
+            topk_idxs,
+            softmax_scale=softmax_scale,
+            topk_length=topk_length,
+        )
+        return (
+            _unpad_head_gradient(result['dq'], actual_num_heads),
+            result['dkv'],
+            result['d_sink'][:actual_num_heads],
+        )
+
+    grad_q = torch.empty_like(q)
+    grad_kv = torch.zeros_like(kv)
+    grad_sink = torch.zeros_like(attn_sink)
+    for start in range(0, q.size(0), chunk_size):
+        end = min(start + chunk_size, q.size(0))
+        bwd_q, bwd_out, bwd_dO, bwd_lse, bwd_sink, actual_num_heads = (
+            _pad_sparse_backward_inputs(
+                q[start:end],
+                out[start:end],
+                d_out[start:end],
+                lse[start:end],
+                attn_sink,
+            )
+        )
+        result = _DSA.sparse_attention_backward_wrapper(
+            bwd_q,
+            kv,
+            bwd_out,
+            bwd_dO,
+            bwd_lse,
+            bwd_sink,
+            topk_idxs[start:end],
+            softmax_scale=softmax_scale,
+            topk_length=topk_length[start:end] if topk_length is not None else None,
+        )
+        grad_q[start:end].copy_(_unpad_head_gradient(result['dq'], actual_num_heads))
+        grad_kv.add_(result['dkv'])
+        grad_sink.add_(result['d_sink'][:actual_num_heads])
+    return grad_q, grad_kv, grad_sink
 
 
 def _ensure_dsa_namespace():
@@ -736,11 +966,8 @@ class CSASparseAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dO, d_lse, d_lse_indexer):
         """Compute sparse-attention backward via cuDNN DSA wrapper."""
-        _ensure_dsa_namespace()
-
         q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
-
-        result = _DSA.sparse_attention_backward_wrapper(
+        dq, dkv, d_sink = _sparse_attention_backward(
             q,
             kv,
             out,
@@ -751,7 +978,6 @@ class CSASparseAttnFunc(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             topk_length=ctx.topk_length,
         )
-        dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
         return dq, dkv, d_sink, None, None, None, None
 
 
@@ -1851,7 +2077,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             dO_flat = dO_flat.masked_fill(ctx.padding_row_mask[:, None, None], 0)
             lse = lse.masked_fill(ctx.padding_row_mask[:, None], 0)
 
-        attn_bwd = _DSA.sparse_attention_backward_wrapper(
+        grad_query, grad_kv_full, d_sink = _sparse_attention_backward(
             q_flat,
             kv_flat,
             out_flat,
@@ -1862,13 +2088,9 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             topk_length=topk_length,
         )
-        if is_thd:
-            grad_query = attn_bwd["dq"]
-            grad_kv_full = attn_bwd["dkv"]
-        else:
-            grad_query = attn_bwd["dq"].reshape(sq, b, np_, d)
-            grad_kv_full = attn_bwd["dkv"].reshape(skv, b, d)
-        d_sink = attn_bwd["d_sink"]
+        if not is_thd:
+            grad_query = grad_query.reshape(sq, b, np_, d)
+            grad_kv_full = grad_kv_full.reshape(skv, b, d)
 
         # ---- 2. Scale pre-computed indexer grads by grad_loss. ---------------
         grad_q_indexer = precomputed_grad_q_indexer * grad_loss
@@ -2193,7 +2415,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             dO_flat = dO_flat.masked_fill(ctx.q_padding_mask[:, None, None], 0)
             lse = lse.masked_fill(ctx.q_padding_mask[:, None], 0)
         nvtx_range_push("dsv4_cp_sparse_attention_backward")
-        attn_bwd = _DSA.sparse_attention_backward_wrapper(
+        grad_query, grad_kv_full, d_sink = _sparse_attention_backward(
             query,
             kv_full,
             out_flat,
@@ -2216,7 +2438,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
                     f"got {grad_k_indexer_rank_major.shape[0]} rows, "
                     f"expected {expected_indexer_rows}."
                 )
-            grad_compressed_kv = attn_bwd["dkv"][ctx.compressed_kv_start :]
+            grad_compressed_kv = grad_kv_full[ctx.compressed_kv_start :]
             expected_rows = ctx.local_compressed_kv_rows * cp_group.size()
             if grad_compressed_kv.shape[0] != expected_rows:
                 raise RuntimeError(
@@ -2261,9 +2483,9 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             grad_k_indexer = None
 
         gradients = (
-            attn_bwd["dq"],
-            attn_bwd["dkv"],
-            attn_bwd["d_sink"],
+            grad_query,
+            grad_kv_full,
+            d_sink,
             None,
             grad_q_indexer,
             grad_k_indexer,
