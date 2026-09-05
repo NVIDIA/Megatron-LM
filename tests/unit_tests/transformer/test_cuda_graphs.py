@@ -3,6 +3,7 @@
 import gc
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,7 +11,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 import megatron.core.transformer.cuda_graphs as cuda_graphs_module
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.enums import ModelType
+from megatron.core.enums import Fp8Recipe, ModelType
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -37,9 +38,13 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
+    _apply_cudagraph_buffer_metadata,
     _CudagraphGlobalRecord,
+    _CudagraphRecordNode,
     _CudagraphReplayNode,
     _CudaGraphRunner,
+    _GraphStatus,
+    _gtp_backward_requires_wgrad_rings,
     create_cudagraphs,
     delete_cuda_graphs,
 )
@@ -50,7 +55,7 @@ from megatron.core.transformer.enums import (
     InferenceCudaGraphScope,
 )
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -71,6 +76,88 @@ from tests.unit_tests.test_utilities import Utils
 fp8_available, _ = check_fp8_support()
 
 
+class TestCudaGraphBoundaryInvariants:
+    @staticmethod
+    def _gtp_runner(*, span, grad_enabled=True):
+        return SimpleNamespace(
+            gtp_remat=True, grad_enabled=grad_enabled, is_hybrid_cuda_graph_span=span
+        )
+
+    def test_coalesced_gtp_backward_does_not_require_wgrad_rings(self):
+        runners = [self._gtp_runner(span=True), self._gtp_runner(span=False, grad_enabled=False)]
+
+        assert not _gtp_backward_requires_wgrad_rings(runners)
+
+    def test_per_module_gtp_backward_requires_wgrad_rings(self):
+        assert _gtp_backward_requires_wgrad_rings([self._gtp_runner(span=False)])
+
+    def test_mixed_gtp_backward_capture_is_rejected(self):
+        runners = [self._gtp_runner(span=True), self._gtp_runner(span=False)]
+
+        with pytest.raises(RuntimeError, match="cannot mix coalesced and per-module"):
+            _gtp_backward_requires_wgrad_rings(runners)
+
+    def test_coalesced_span_uses_per_operation_mxfp8_contexts(self):
+        runner = SimpleNamespace(
+            is_hybrid_cuda_graph_span=True,
+            fp8_runtime_enabled=True,
+            fp4_runtime_enabled=False,
+            base_module=SimpleNamespace(config=SimpleNamespace(fp8_recipe=Fp8Recipe.mxfp8)),
+        )
+
+        with _CudaGraphRunner.get_quantization_context(runner):
+            pass
+
+    def test_output_alias_preserves_input_metadata(self):
+        base = torch.empty(8)
+        view = base[2:]
+        metadata = _apply_cudagraph_buffer_metadata(base)
+        metadata.is_cudagraph_input = True
+        metadata.is_saved_for_backward = True
+        metadata.input_use_count = 3
+        metadata.cudagraph_reuse_ref_count = 2
+        metadata.capture_reuse_count = 1
+
+        output_metadata = _apply_cudagraph_buffer_metadata(view, is_output=True)
+
+        assert output_metadata is metadata
+        assert view.cg_buffer_metadata is metadata
+        assert base.cg_buffer_metadata is metadata
+        assert metadata.is_cudagraph_input
+        assert metadata.is_cudagraph_output
+        assert metadata.is_saved_for_backward
+        assert metadata.input_use_count == 3
+        assert metadata.cudagraph_reuse_ref_count == 2
+        assert metadata.capture_reuse_count == 1
+
+    def test_record_node_waits_for_all_differentiable_outputs(self, monkeypatch):
+        class FakeRunner:
+            status = _GraphStatus.FWD_READY
+            bwd_graph_recorded = False
+
+        runner = FakeRunner()
+        x = torch.ones(4, requires_grad=True)
+        y = torch.ones(4, requires_grad=True)
+        x_out, y_out = _CudagraphRecordNode.apply(runner, x, y)
+
+        ready_outputs = set()
+        x_out.register_hook(lambda grad: ready_outputs.add("x"))
+        y_out.register_hook(lambda grad: ready_outputs.add("y"))
+        record_snapshots = []
+        monkeypatch.setattr(
+            _CudagraphGlobalRecord,
+            "record_bwd_graph",
+            classmethod(lambda cls, recorded_runner: record_snapshots.append(set(ready_outputs))),
+        )
+
+        runner.status = _GraphStatus.BWD_READY
+        (x_out.sum() + 2 * y_out.sum()).backward()
+
+        assert record_snapshots == [{"x", "y"}]
+        assert torch.equal(x.grad, torch.ones_like(x))
+        assert torch.equal(y.grad, torch.full_like(y, 2))
+
+
 def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
     created_streams = []
 
@@ -81,6 +168,7 @@ def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
 
     monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
     monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "32")
+    monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_POOL_SIZE", 3)
     monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_POOLS", None)
     monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_NEXT_SLOT", 0)
 
@@ -90,6 +178,52 @@ def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
     assert len(created_streams) == pool_size
     assert len({stream.cuda_stream for stream in created_streams}) == pool_size
     assert assigned[:pool_size] == assigned[pool_size:]
+
+
+def test_hybrid_cuda_graph_spans_use_one_stream_pool(monkeypatch):
+    created_streams = []
+
+    class FakeStream:
+        def __init__(self):
+            self.cuda_stream = len(created_streams) + 1
+            created_streams.append(self)
+
+    monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
+    monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "32")
+    monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_POOL_SIZE", 3)
+    monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_POOLS", None)
+    monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_NEXT_SLOT", 0)
+
+    cuda_graphs_module.set_cuda_graph_stream_pool_size(1)
+    span_streams = [cuda_graphs_module._get_cuda_graph_stream() for _ in range(3)]
+
+    assert span_streams[0] is span_streams[1] is span_streams[2]
+    assert cuda_graphs_module._CUDA_GRAPH_STREAM_POOL_SIZE == 1
+    assert len(created_streams) == 1
+
+
+def test_hybrid_cuda_graph_stream_pool_warns_and_narrows_late_resize(monkeypatch, caplog):
+    class FakeStream:
+        _next_id = 0
+
+        def __init__(self):
+            type(self)._next_id += 1
+            self.cuda_stream = type(self)._next_id
+
+    monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
+    monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "32")
+    monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_POOL_SIZE", 3)
+    monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_POOLS", None)
+    monkeypatch.setattr(cuda_graphs_module, "_CUDA_GRAPH_STREAM_NEXT_SLOT", 0)
+
+    first_stream = cuda_graphs_module._get_cuda_graph_stream()
+
+    with caplog.at_level("WARNING"):
+        cuda_graphs_module.set_cuda_graph_stream_pool_size(1)
+
+    assigned = [cuda_graphs_module._get_cuda_graph_stream() for _ in range(3)]
+    assert "using the first 1 for future assignments" in caplog.text
+    assert assigned == [first_stream] * 3
 
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
@@ -128,6 +262,36 @@ def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
 
 
 class TestCudaGraphConfigAndArguments:
+    def test_partial_cuda_graph_capture_coalescing_default_off(self, monkeypatch):
+        args, _, _ = _validated_cuda_graph_cli_args(monkeypatch)
+
+        assert not args.cuda_graph_coalesce_partial_captures
+
+    def test_partial_cuda_graph_capture_coalescing_can_be_enabled_with_local_impl(
+        self, monkeypatch
+    ):
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, ["--cuda-graph-impl", "local", "--cuda-graph-coalesce-partial-captures"]
+        )
+
+        assert args.cuda_graph_coalesce_partial_captures
+
+    def test_partial_cuda_graph_capture_coalescing_rejects_nonlocal_impl(self, monkeypatch):
+        with pytest.raises(
+            AssertionError,
+            match="--cuda-graph-coalesce-partial-captures requires --cuda-graph-impl=local",
+        ):
+            _validated_cuda_graph_cli_args(monkeypatch, ["--cuda-graph-coalesce-partial-captures"])
+
+    def test_partial_cuda_graph_capture_coalescing_rejects_nonlocal_config(self):
+        with pytest.raises(
+            AssertionError,
+            match="cuda_graph_coalesce_partial_captures requires cuda_graph_impl='local'",
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl="transformer_engine", cuda_graph_coalesce_partial_captures=True
+            )
+
     def test_local_impl_defaults_to_layer_scope(self):
         cfg = _base_cuda_graph_config(cuda_graph_impl='local')
         assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.layer
@@ -416,6 +580,58 @@ class TestCudaGraphConfigAndArguments:
 
 
 class TestCudaGraphReplay:
+    def test_backward_ready_event_records_on_runner_stream(self, monkeypatch):
+        calls = []
+
+        class FakeStream:
+            def __init__(self, name):
+                self.name = name
+
+            def wait_stream(self, stream):
+                calls.append((self.name, "wait_stream", stream.name))
+
+            def wait_event(self, event):
+                calls.append((self.name, "wait_event", event))
+
+        class FakeStreamContext:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
+
+        class FakeEvent:
+            def record(self, stream):
+                calls.append(("ready_event", "record", stream.name))
+
+        outer_stream = FakeStream("outer")
+        runner_stream = FakeStream("runner")
+        early_completion_event = object()
+        runner = SimpleNamespace(
+            bwd_graph=SimpleNamespace(replay=lambda: calls.append(("graph", "replay"))),
+            status=_GraphStatus.BWD_READY,
+            static_grad_outputs=(),
+            use_stream=True,
+            stream=runner_stream,
+            gtp_remat=True,
+            _gtp_wgrad_ring_slots=(),
+            _gtp_finalize_hook_plan=(),
+            bwd_completion_event=early_completion_event,
+            bwd_graph_replay_complete_event=FakeEvent(),
+            params_to_backprop=(),
+            fp8_enabled=False,
+            static_grad_inputs=(),
+        )
+        ctx = SimpleNamespace(runner=runner)
+        monkeypatch.setattr(torch.cuda, "current_stream", lambda: outer_stream)
+        monkeypatch.setattr(torch.cuda, "stream", lambda stream: FakeStreamContext())
+
+        _CudagraphReplayNode.backward(ctx)
+
+        assert ("outer", "wait_event", early_completion_event) in calls
+        assert ("ready_event", "record", "runner") in calls
+        assert ("ready_event", "record", "outer") not in calls
+
     def test_gtp_forward_ensures_captured_params_ready_before_replay(self, monkeypatch):
         calls = []
         first = object()
@@ -1771,17 +1987,50 @@ class _CheckpointDependencyModule(MegatronModule):
 
 
 class _RepeatedParameterModule(MegatronModule):
-    """Invoke one graphed operation twice so two runners share its parameter."""
+    """Invoke one graphed projection twice so two runners share its parameters."""
 
     def __init__(self, config):
         super().__init__(config)
-        self.weight = torch.nn.Parameter(torch.randn(config.hidden_size))
+        self.projection = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
 
     def forward(self, x):
         return self.project(x) + self.project(0.5 * x)
 
     def project(self, x):
-        return x + self.weight
+        return self.projection(x)
+
+
+class _TemporaryBufferModule(MegatronModule):
+    """Mimic the expert-bias token accumulator updated by a captured training graph."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.projection = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.register_buffer("expert_bias", torch.zeros(1))
+        self.register_buffer("local_tokens_per_expert", torch.zeros(1))
+
+    def forward(self, x):
+        return self.project(x)
+
+    def project(self, x):
+        if torch.is_grad_enabled():
+            self.local_tokens_per_expert.add_(1)
+        return self.projection(x)
+
+
+class _WholeGraphTemporaryBufferModule(GraphableMegatronModule):
+    """Whole-module variant of the temporary-buffer test module."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.projection = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.register_buffer("expert_bias", torch.zeros(1))
+        self.register_buffer("local_tokens_per_expert", torch.zeros(1))
+
+    def forward(self, x):
+        if torch.is_grad_enabled():
+            self.local_tokens_per_expert.add_(1)
+        return self.projection(x)
 
 
 class _SimpleNonModule:
@@ -1800,6 +2049,97 @@ def _make_simple_module(config):
 
 def _make_simple_non_module(config):
     return _SimpleNonModule(config)
+
+
+class TestLocalCudaGraphEvaluation:
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        if _CudagraphGlobalRecord.cudagraph_created:
+            delete_cuda_graphs()
+        else:
+            _CudagraphGlobalRecord.cudagraph_record = []
+            _CudagraphGlobalRecord.cudagraph_inference_record = []
+            CudaGraphManager.global_mempool = None
+        torch.cuda.set_stream(torch.cuda.default_stream())
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    @pytest.mark.parametrize("whole_module", [False, True], ids=["wrapped_method", "whole_module"])
+    def test_training_graph_temporary_state_is_reset_when_training_resumes(self, whole_module):
+        def first_output(output):
+            return output[0] if isinstance(output, tuple) else output
+
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            cuda_graph_warmup_steps=0,
+            moe_router_enable_expert_bias=True,
+            moe_router_score_function="sigmoid",
+        )
+        if whole_module:
+            module = _WholeGraphTemporaryBufferModule(config).cuda()
+            manager = module.cudagraph_manager
+        else:
+            module = _TemporaryBufferModule(config).cuda()
+            manager = CudaGraphManager(
+                config, base_module=module, function_name="project", need_backward=True
+            )
+            module.cudagraph_manager = manager
+        ddp_model = DistributedDataParallel(
+            config,
+            DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=1_000_000),
+            module,
+        )
+        test_input = torch.randn(4, config.hidden_size, device="cuda", requires_grad=True)
+
+        ddp_model.zero_grad_buffer()
+        first_output(ddp_model(test_input)).sum().backward()
+        ddp_model.finish_grad_sync()
+        assert module.local_tokens_per_expert.item() == 1
+
+        create_cudagraphs()
+        assert module.local_tokens_per_expert.item() == 1
+        runner = manager.cudagraph_runners[0]
+        runner_status = runner.status
+
+        # Match the end-of-training-step reset before validation begins.
+        module.local_tokens_per_expert.zero_()
+        module.expert_bias.fill_(2)
+
+        ddp_model.eval()
+        with torch.no_grad():
+            eval_output = ddp_model(test_input.detach())
+            if whole_module:
+                reference_output = module.forward(test_input.detach())
+            else:
+                reference_output = module.project(test_input.detach(), eager=True)
+
+        torch.testing.assert_close(first_output(eval_output), first_output(reference_output))
+        # no_grad does not change the operations already captured in the training graph.
+        assert module.local_tokens_per_expert.item() == 1
+        assert manager.cudagraph_runners == [runner]
+        assert runner.status is runner_status
+
+        ddp_model.train()
+        assert module.local_tokens_per_expert.item() == 0
+        assert module.expert_bias.item() == 2
+
+        ddp_model.zero_grad_buffer()
+        replay_input = test_input.detach().clone().requires_grad_()
+        first_output(ddp_model(replay_input)).sum().backward()
+        ddp_model.finish_grad_sync()
+
+        assert module.local_tokens_per_expert.item() == 1
 
 
 class TestCheckpointParameterDiscovery:
@@ -1943,7 +2283,7 @@ class TestRepeatedParameterCapture:
         reference_output = reference(test_input.detach().clone().requires_grad_(True))
         reference_output_value = reference_output.detach().clone()
         reference_output.sum().backward()
-        reference_local_wgrad = reference.weight.grad.detach().clone()
+        reference_local_wgrad = reference.projection.weight.grad.detach().clone()
         reference_wgrad = reference_local_wgrad.clone()
         torch.distributed.all_reduce(reference_wgrad, group=ddp_model.dp_group)
         reference_wgrad.div_(ddp_model.dp_group.size())
@@ -1952,13 +2292,13 @@ class TestRepeatedParameterCapture:
         record_output = ddp_model(test_input.detach().clone().requires_grad_(True))
         record_output.sum().backward()
         ddp_model.finish_grad_sync()
-        record_wgrad = module.weight.main_grad.detach().clone()
+        record_wgrad = module.projection.weight.main_grad.detach().clone()
         torch.testing.assert_close(record_wgrad, reference_wgrad)
 
         create_cudagraphs()
 
         assert len(manager.cudagraph_runners) == 2
-        torch.testing.assert_close(module.weight.main_grad, record_wgrad)
+        torch.testing.assert_close(module.projection.weight.main_grad, record_wgrad)
 
         ddp_model.zero_grad_buffer()
         with ddp_model.no_sync():
@@ -1967,7 +2307,7 @@ class TestRepeatedParameterCapture:
         torch.cuda.synchronize()
 
         torch.testing.assert_close(replay_output, reference_output_value)
-        torch.testing.assert_close(module.weight.main_grad, reference_local_wgrad)
+        torch.testing.assert_close(module.projection.weight.main_grad, reference_local_wgrad)
 
         for _ in range(2):
             ddp_model.zero_grad_buffer()
@@ -1977,7 +2317,7 @@ class TestRepeatedParameterCapture:
             torch.cuda.synchronize()
 
             torch.testing.assert_close(replay_output, reference_output_value)
-            torch.testing.assert_close(module.weight.main_grad, reference_wgrad)
+            torch.testing.assert_close(module.projection.weight.main_grad, reference_wgrad)
 
 
 class TestInlineCaptureManager:

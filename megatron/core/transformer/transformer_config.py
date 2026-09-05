@@ -1136,6 +1136,10 @@ class TransformerConfig(ModelParallelConfig):
     cuda_graph_modules has no effect when cuda_graph_impl="none" and must be empty when
     cuda_graph_impl="full_iteration"."""
 
+    cuda_graph_coalesce_partial_captures: bool = False
+    """Coalesce eligible HybridStack operations into maximal local partial CUDA graphs. Enable
+    with ``--cuda-graph-coalesce-partial-captures``; otherwise use the per-module graph."""
+
     cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
     """Selects training capture coverage within per-layer CUDA graphs (local and
     transformer_engine implementations).
@@ -3004,6 +3008,9 @@ class TransformerConfig(ModelParallelConfig):
             "local",
             "full_iteration",
         ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
+        assert (
+            not self.cuda_graph_coalesce_partial_captures or self.cuda_graph_impl == "local"
+        ), "cuda_graph_coalesce_partial_captures requires cuda_graph_impl='local'."
 
         self.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
             self.inference_cuda_graph_scope, self.cuda_graph_impl

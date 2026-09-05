@@ -173,13 +173,18 @@ class GraphableMegatronModule(MegatronModule):
         config (TransformerConfig): Transformer config
     """
 
-    def __init__(self, config: TransformerConfig, vp_stage: Optional[int] = None):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        vp_stage: Optional[int] = None,
+        create_cudagraph_manager: bool = True,
+    ):
         super().__init__(config)
 
         assert isinstance(config, TransformerConfig), "config must be a TransformerConfig"
 
         # Enable cuda graphs.
-        if config.cuda_graph_impl == "local":
+        if config.cuda_graph_impl == "local" and create_cudagraph_manager:
             if hasattr(self, "create_mcore_cudagraph_manager"):
                 self.create_mcore_cudagraph_manager(config)
             else:
