@@ -44,8 +44,24 @@ Checked against the parsed `args` Namespace in `apply_determinism_to_args`. Inco
 | `--cross-entropy-loss-fusion` | Must be off — asserted (fused CE is non-deterministic); drop the flag yourself |
 | `--tp-comm-overlap` | Must be off — asserted (the overlap path is not bit-exact); drop the flag yourself |
 | `torch.use_deterministic_algorithms` | Set to `True` |
+| `torch.utils.deterministic.fill_uninitialized_memory` | Set to `False` — see below |
 
 Flash attention is permitted: Transformer Engine's flash-attention backend is deterministic when `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` (see the [Transformer Engine docs](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html)).
+
+## Uninitialized-memory fill
+
+Determinism costs an *independent* output buffer: a reduction that would otherwise accumulate into shared memory with unordered atomics writes into its own buffer instead, fixing the summation order run to run. That is what makes training reproducible, and `--deterministic-mode` keeps it.
+
+`torch.use_deterministic_algorithms(True)` also switches on a separate knob, `torch.utils.deterministic.fill_uninitialized_memory`, which fills every uninitialized allocation — `torch.empty`, `empty_like`, `empty_strided`, `Tensor.resize_` — with NaN or MAX_INT, so a kernel *reading* memory it never wrote reads the same bytes every run. Reproducibility does not need that, and it is not free: one extra fill kernel per empty allocation, serialized between real work, which suppresses the overlap between compute and communication and so costs far more wall time than GPU time. Clearing it is worth roughly **15% TFLOP/s** on large configs, and more the more `torch.empty` calls a step makes. `apply_determinism_to_args` clears it immediately after enabling deterministic algorithms.
+
+Padding matters only if a computation reads it. **Benign — nothing reads it:** computed values are bit-identical and only saved bytes differ. Checkpoints are the example — some saved tensors carry trailing pad slots that no kernel writes, so two runs of the same configuration write files differing in those bytes while every trained value matches. **Harmful — a computation consumes it:** a reduction over a padded tail, a GEMM with a rounded-up K, an unmasked attention region. Results then differ run to run, and the fill does not make them correct, only repeatably wrong — every run reads the same NaN instead of different garbage. Fix the read; re-enabling the fill hides it.
+
+Set the fill back to `True` while hunting such a read — turning garbage into a loud NaN is the one thing it is good for:
+
+```python
+import torch.utils.deterministic
+torch.utils.deterministic.fill_uninitialized_memory = True
+```
 
 ## Verifying determinism
 
