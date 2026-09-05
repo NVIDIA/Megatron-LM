@@ -4,6 +4,7 @@
 
 import logging
 import os
+import sys
 import warnings
 from datetime import timedelta
 from math import log2
@@ -229,6 +230,12 @@ def update_pg_timeout(
             raise e
 
 
+# Every ProcessGroup create_group handed out to this rank, in creation order. Only groups
+# this rank is a member of are tracked (non-member ranks get the NON_GROUP_MEMBER sentinel
+# back from new_group, which there is nothing to destroy for).
+_CREATED_PROCESS_GROUPS: List[torch.distributed.ProcessGroup] = []
+
+
 def create_group(
     ranks=None,
     timeout=None,
@@ -263,6 +270,10 @@ def create_group(
         _global_process_group_list = [None]
     if torch.distributed.get_rank() in ranks:
         _global_process_group_list.append(group)
+        # Tracked so destroy_model_parallel can release them. Clearing the module globals only
+        # drops Megatron's reference; c10d keeps its own, so the communicator would survive
+        # and, with NVLS enabled, hold a multicast reservation for the life of the process.
+        _CREATED_PROCESS_GROUPS.append(group)
     return group
 
 
@@ -2502,18 +2513,129 @@ def get_all_ranks():
     return "_".join(map(lambda x: str(x or 0), ranks))
 
 
-def destroy_model_parallel():
-    """Set the groups to none."""
+def _destroy_created_process_groups():
+    """Destroy every ProcessGroup create_group made on this rank, newest first.
+
+    Aliases are assignments rather than creations, so each group appears here once.
+
+    Each NCCL backend is aborted before the group is destroyed (the pattern
+    nvidia-resiliency-ext uses in inprocess/abort.py). destroy_process_group()
+    alone runs ProcessGroupNCCL::shutdown(), whose ncclCommFinalize blocks until
+    every rank of that communicator arrives and until nothing references the
+    communicator anymore — it deadlocks on rank skew and on communicators still
+    referenced by captured CUDA graphs (pytorch#115388). ncclCommAbort is
+    unilateral, also drops the communicator's allocator-hook registrations
+    (which shutdown() leaves dangling in torch's ncclCommMemPoolMap), and makes
+    the subsequent destroy_process_group() a fast local cleanup.
+    """
+    if not _CREATED_PROCESS_GROUPS:
+        return
+    if torch.distributed.is_initialized():
+        # Quiesce first so no rank aborts a communicator a peer still has kernels
+        # in flight on; an abort would surface as an error in the peer's op.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        try:
+            # A bounded wait, not a bare barrier: under the default
+            # TORCH_NCCL_ASYNC_ERROR_HANDLING a hung barrier is unrecoverable (the
+            # watchdog rethrows on its own thread and SIGABRTs the process), while
+            # an explicit work timeout raises here in the main thread, letting a
+            # rank whose peer died fall through to the unilateral aborts below.
+            work = torch.distributed.barrier(async_op=True)
+            work.wait(timeout=timedelta(seconds=60))
+        except Exception:
+            pass
+    cuda_device = torch.device("cuda") if torch.cuda.is_available() else None
+    while _CREATED_PROCESS_GROUPS:
+        group = _CREATED_PROCESS_GROUPS.pop()
+        if torch.distributed.distributed_c10d._world.pg_map.get(group, None) is None:
+            # Already destroyed elsewhere (e.g. the explicit Gloo-group teardown).
+            continue
+        backend = None
+        if cuda_device is not None:
+            try:
+                backend = group._get_backend(cuda_device)
+            except Exception:
+                backend = None  # No CUDA backend (e.g. a Gloo-only group).
+        if backend is not None and isinstance(
+            backend, getattr(torch.distributed, "ProcessGroupNCCL", ())
+        ):
+            if hasattr(backend, "abort"):
+                backend.abort()
+            else:  # torch < 2.6
+                backend._shutdown()
+        torch.distributed.destroy_process_group(group)
+
+
+def destroy_model_parallel() -> None:
+    """Destroy model-parallel process groups and clear their global state."""
+    # Everything below up to _destroy_created_process_groups() releases process-lifetime
+    # caches that hold communicator-backed resources, in each case while the communicators
+    # are still alive. Any cache that survives past the group destruction at the end of
+    # this function resurfaces later as "NCCL communicator was aborted on rank N".
+
     # Release the NCCL EP context (if the 'ncclep' flex dispatcher bootstrapped one) before the
     # process group's communicator is torn down. TE registers an atexit ep_finalize that would
-    # otherwise run after dist.destroy_process_group() and hit a "corrupted comm object" at exit.
-    # Idempotent and a no-op when NCCL EP was never bootstrapped.
+    # otherwise run after dist.destroy_process_group() and hit a corrupted comm object at exit.
+    # Idempotent and a no-op when NCCL EP was never bootstrapped. Also drop the module-global
+    # DeepEP/HybridEP buffers: they embed the expert-parallel group of the lifetime that built
+    # them and are reused without liveness checks.
     try:
-        from megatron.core.transformer.moe.fused_a2a import nccl_ep_finalize
+        from megatron.core.transformer.moe.fused_a2a import (
+            nccl_ep_finalize,
+            reset_fused_a2a_buffers,
+        )
 
         nccl_ep_finalize()
+        reset_fused_a2a_buffers()
     except Exception:  # finalize must never block teardown
         pass
+
+    # The 'ncclep' zero-copy path keeps class-level symmetric-memory buffers allocated from
+    # TE's pool on the expert-parallel group; drop them so the next lifetime reallocates.
+    token_dispatcher_module = sys.modules.get("megatron.core.transformer.moe.token_dispatcher")
+    if token_dispatcher_module is not None:
+        try:
+            manager = token_dispatcher_module._NCCLEPManager
+            manager._zc_fwd_token_buf = None
+            manager._zc_bwd_token_buf = None
+            manager._zc_recv_topk_weights_buf = None
+        except Exception:
+            pass
+
+    # Captured CUDA graphs keep references to the communicators whose collectives they
+    # captured; ncclCommFinalize/Destroy cannot complete while such a graph is alive
+    # (pytorch#115388). Only touch the module if something already imported it.
+    cuda_graphs_module = sys.modules.get("megatron.core.transformer.cuda_graphs")
+    if cuda_graphs_module is not None:
+        try:
+            # Skip when no graph state exists: delete_cuda_graphs runs a full
+            # gc.collect + empty_cache, which is pure overhead on graph-free
+            # teardowns (twice per unit-test cycle). cudagraph_record alone is not
+            # enough — creation clears it while the graphs live on in the runners.
+            record = cuda_graphs_module._CudagraphGlobalRecord
+            if (
+                record.cudagraph_created
+                or record.cudagraph_record
+                or record.cudagraph_inference_record
+                or cuda_graphs_module.CudaGraphManager.global_mempool is not None
+            ):
+                cuda_graphs_module.delete_cuda_graphs()
+        except Exception:
+            pass
+
+    # Transformer Engine caches its FP8 reduction group globally. Clear the cache while the
+    # communicator still exists so later model-parallel initializations cannot reuse it.
+    if "transformer_engine.pytorch" in sys.modules:
+        try:
+            try:
+                from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+            except ImportError:  # TE < 2.9 keeps it in transformer_engine.pytorch.fp8
+                from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+            FP8GlobalStateManager.reset()
+        except Exception:
+            pass
 
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None
@@ -2689,3 +2811,7 @@ def destroy_model_parallel():
     _global_process_group_list = None
 
     SymmetricMemoryManager.destroy()
+
+    # Destroy the tracked process groups last, after every cache above has released the
+    # resources it held on their communicators.
+    _destroy_created_process_groups()
