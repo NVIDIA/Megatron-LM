@@ -245,6 +245,93 @@ def qb_dual_update(
     return indices, beta_local
 
 
+def compute_quantile_balancing_histogram(
+    scores: torch.Tensor,
+    expert_bias: torch.Tensor,
+    topk: int,
+    num_bins: int,
+    score_span: float = 1.0,
+) -> torch.Tensor:
+    """Histogram the per-expert bias required to reach each token's top-k cutoff."""
+    with torch.no_grad():
+        scores = scores.float()
+        expert_bias = expert_bias.float()
+        num_tokens, num_experts = scores.shape
+        if topk >= num_experts:
+            raise ValueError("Quantile Balancing requires topk < num_experts.")
+        if num_bins <= 0 or score_span <= 0.0:
+            raise ValueError("Quantile Balancing requires positive histogram bins and score span.")
+
+        histogram = torch.zeros((num_experts, num_bins), dtype=torch.int32, device=scores.device)
+        if num_tokens == 0:
+            return histogram
+
+        cutoff = (scores + expert_bias).kthvalue(num_experts - topk, dim=1).values.unsqueeze(1)
+        required_bias = cutoff - scores
+        lower_bound = expert_bias.min() - score_span
+        bin_width = (expert_bias.max() - expert_bias.min() + 2.0 * score_span) / num_bins
+        bin_indices = torch.floor((required_bias - lower_bound) / bin_width).to(torch.int64)
+        bin_indices.clamp_(min=0, max=num_bins - 1)
+        expert_offsets = torch.arange(num_experts, dtype=torch.int64, device=scores.device).unsqueeze(0)
+        histogram.view(-1).scatter_add_(
+            0,
+            (bin_indices + expert_offsets * num_bins).flatten(),
+            torch.ones_like(bin_indices, dtype=histogram.dtype).flatten(),
+        )
+        return histogram
+
+
+def get_updated_expert_bias_quantile_balancing(
+    histogram: torch.Tensor,
+    expert_bias: torch.Tensor,
+    topk: int,
+    score_span: float = 1.0,
+    ema_beta: float = 0.0,
+    ema_step: Optional[torch.Tensor] = None,
+    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """All-reduce whole-step QB histograms and recover mean-centered expert biases."""
+    with torch.no_grad():
+        if not 0.0 <= ema_beta < 1.0:
+            raise ValueError("Quantile Balancing EMA must be in [0, 1).")
+        if tp_dp_cp_group is None:
+            tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+                with_context_parallel=True
+            )
+        torch.distributed.all_reduce(histogram, group=tp_dp_cp_group)
+
+        histogram = histogram.to(torch.int64)
+        expert_bias = expert_bias.float()
+        num_experts, num_bins = histogram.shape[-2:]
+        flat_histogram = histogram.reshape(-1, num_experts, num_bins)
+        flat_bias = expert_bias.reshape(-1, num_experts)
+        tokens = flat_histogram[:, 0, :].sum(dim=-1)
+        cumulative = flat_histogram.cumsum(dim=-1)
+        target = tokens.float() * topk / num_experts
+        target_count = target.ceil().to(torch.int64)
+        selected_bins = torch.searchsorted(
+            cumulative,
+            target_count[:, None, None].expand(-1, num_experts, 1).contiguous(),
+        ).squeeze(-1).clamp(max=num_bins - 1)
+        counts_in_bin = flat_histogram.gather(-1, selected_bins.unsqueeze(-1)).squeeze(-1)
+        counts_before = cumulative.gather(-1, selected_bins.unsqueeze(-1)).squeeze(-1) - counts_in_bin
+        fraction = ((target[:, None] - counts_before.float()) / counts_in_bin.clamp_min(1).float()).clamp_(0, 1)
+        lower_bound = flat_bias.min(dim=-1).values - score_span
+        bin_width = (flat_bias.max(dim=-1).values - flat_bias.min(dim=-1).values + 2.0 * score_span) / num_bins
+        updated = lower_bound[:, None] + (selected_bins.float() + fraction) * bin_width[:, None]
+        if ema_beta > 0.0:
+            if ema_step is None:
+                beta = ema_beta
+            else:
+                step = ema_step.reshape(-1, 1).to(flat_bias.dtype).clamp_min(1.0)
+                beta_pow_step = torch.pow(torch.full_like(step, ema_beta), step)
+                beta = (ema_beta - beta_pow_step) / (1.0 - beta_pow_step)
+            updated = beta * flat_bias + (1.0 - beta) * updated
+        updated -= updated.mean(dim=-1, keepdim=True)
+        updated = torch.where((tokens > 0)[:, None], updated, flat_bias)
+        return updated.reshape_as(expert_bias)
+
+
 def get_capacity(
     num_tokens: int, num_experts: int, capacity_factor: float, min_capacity: Optional[int] = None
 ) -> int:

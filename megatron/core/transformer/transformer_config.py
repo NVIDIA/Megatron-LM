@@ -782,9 +782,9 @@ class TransformerConfig(ModelParallelConfig):
     for each individual sample.
     - "global_aux_loss": Load balancing loss calculated at global batch level.
     - "sinkhorn": Balancing algorithm used in S-BASE.
-    - "quantile_balancing": Dual coordinate-descent quantile balancing (QB). Load balance is
-    handled entirely by an internal per-expert bias update; auxiliary losses must be disabled
-    (`moe_aux_loss_coeff` = 0) when QB is selected.
+    - "quantile_balancing": Loss-free Quantile Balancing (QB). The original PR implementation
+    is used by default; set `moe_router_quantile_balancing_histogram` for the Kimi K3-style
+    histogram-based whole-step update. Auxiliary losses must be disabled (`moe_aux_loss_coeff` = 0).
     - "none": No load balancing.
     A list of strings can be provided to combine multiple aux-loss load balancing types.
     The default is "aux_loss".
@@ -861,10 +861,15 @@ class TransformerConfig(ModelParallelConfig):
     The default value 1e-3 is same as that used in DeepSeekV3."""
 
     moe_router_quantile_balancing_ema: float = 0.0
-    """EMA coefficient for the quantile-balancing per-expert bias (`qb_beta`), used only when
-    `moe_router_load_balancing_type` is "quantile_balancing". At each global batch the bias is
-    updated as `qb_beta = ema * qb_beta + (1 - ema) * local_quantile`. The default 0.0 means
-    no memory: the bias is replaced by the latest global-batch quantile estimate each step."""
+    """EMA coefficient for the quantile-balancing per-expert bias (`qb_beta`). The recovered
+    whole-step global quantile is blended with the previous bias; the persistent update counter
+    applies bias correction so a newly resumed EMA is not artificially pulled toward zero."""
+
+    moe_router_quantile_balancing_num_bins: int = 1000
+    """Number of uniform per-expert bins used to pool whole-step QB histograms."""
+
+    moe_router_quantile_balancing_histogram: bool = False
+    """Opt in to Kimi K3-style whole-step histogram QB. False retains the original QB update."""
 
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
@@ -2846,6 +2851,20 @@ class TransformerConfig(ModelParallelConfig):
                 "score functions. Please set --moe-router-score-function to 'sigmoid' or "
                 "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
             )
+
+        if self.moe_router_load_balancing_type == "quantile_balancing":
+            if not 0.0 <= self.moe_router_quantile_balancing_ema < 1.0:
+                raise ValueError("Quantile Balancing EMA must be in [0, 1).")
+        if (
+            self.moe_router_load_balancing_type == "quantile_balancing"
+            and self.moe_router_quantile_balancing_histogram
+        ):
+            if self.moe_router_score_function != "sigmoid":
+                raise ValueError("Histogram Quantile Balancing requires sigmoid router scores.")
+            if self.moe_router_quantile_balancing_num_bins <= 0:
+                raise ValueError("Quantile Balancing histogram bins must be positive.")
+            if self.moe_router_topk >= self.num_moe_experts:
+                raise ValueError("Quantile Balancing requires moe_router_topk < num_moe_experts.")
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
