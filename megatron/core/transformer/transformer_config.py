@@ -454,6 +454,15 @@ class TransformerConfig(ModelParallelConfig):
     This is only valid without chunkwise CP: padding a chunk-local causal-conv input changes
     the sequence seen by later chunks and therefore changes the GDN recurrence numerics."""
 
+    gdn_gdr_backend: Literal["torch", "fla", "internal"] = "internal"
+    """Backend used for the Gated DeltaNet recurrence."""
+
+    gdn_gdr_recompute_h: bool = False
+    """Whether the internal GDR backward recomputes recurrent states instead of saving them.
+
+    This has no effect unless ``gdn_gdr_backend`` is ``"internal"``.
+    """
+
     ####################
     # initialization
     ####################

@@ -846,7 +846,10 @@ def get_batch_on_this_rank_for_sequence_packing(
         local_cp_size=local_cp_size,
         cp_group=cp_group,
         cp_partition_mode=cp_partition_mode,
-        pad_between_seqs=True,
+        # [REMOVE BEFORE MERGE] Temporary internal GDR experiment workaround: keep
+        # inter-sequence padding out of the packed layout while the kernel only supports
+        # the validated 64-token-aligned dataset shapes used in ptyche runs.
+        pad_between_seqs=False,
     )
 
     # Dummy metadata is appended after CP slicing as an ordinary sequence.
