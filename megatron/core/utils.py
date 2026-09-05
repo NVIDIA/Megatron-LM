@@ -935,7 +935,10 @@ def check_param_hashes_across_dp_replicas(
     for params, local_param_hashes, all_gather_group in zip(
         [non_expert_params, expert_params],
         [local_non_expert_param_hashes, local_expert_param_hashes],
-        [parallel_state.get_data_parallel_group(), parallel_state.get_expert_data_parallel_group()],
+        [
+            parallel_state.get_data_parallel_group(with_gtp_remat=False),
+            parallel_state.get_expert_data_parallel_group(with_gtp_remat=False),
+        ],
     ):
         # Collect per-parameter hashes across all ranks in group.
         assert len(params) == len(local_param_hashes)
@@ -1015,8 +1018,11 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     new_offsets.append((tp_axis + prepend_axis_num, tp_rank, tp_size))
 
-    if HAVE_DTENSOR and isinstance(tensor, DTensor):
-        # TP + FSDP2 sharding
+    is_torch_fsdp2_param = (
+        hasattr(tensor, "is_torch_fsdp2_param") and HAVE_DTENSOR and isinstance(tensor, DTensor)
+    )
+    if is_torch_fsdp2_param:
+        # When using FSDP2, every DP shard is a main replica.
         dp_replica_id = 0
         tensor = tensor._local_tensor
 
@@ -1029,10 +1035,54 @@ def make_tp_sharded_tensor_for_checkpoint(
             # FSDP2 shards axis 0 and TP shards some other axis
             new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
+    # GTP: a GTP param additionally shards out_features (axis 0) by 1/gtp_remat. Layer that
+    # split onto TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp_remat so direct
+    # callers (e.g. VocabParallelEmbedding, which can't use that wrapper because it needs
+    # allow_shape_mismatch) still save GTP weights with correct global offsets/shape.
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.fp8_utils import is_float8tensor
+        from megatron.core.tensor_parallel.gtp_api import dequantize_gtp_native_fp8, is_gtp_param
+
+        if is_gtp_param(tensor):
+            gtp_rank = get_pg_rank(tensor.group)
+            gtp_remat_size = get_pg_size(tensor.group)
+            if tp_axis == 0:
+                # same axis as TP → one composite axis-0 offset
+                new_offsets[0] = (
+                    prepend_axis_num,
+                    tp_rank * gtp_remat_size + gtp_rank,
+                    tp_size * gtp_remat_size,
+                )
+            else:
+                # GTP shards axis 0, TP shards a different axis → add a separate axis-0 offset
+                new_offsets.append((prepend_axis_num, gtp_rank, gtp_remat_size))
+            # Elect the writer over the gtp_remat-EXCLUDED DP group (its true replicas).
+            dp_replica_id = parallel_state.get_data_parallel_rank(
+                with_context_parallel=True, with_gtp_remat=False
+            )
+            # Saved global is the padded shape when GTP padded out_features for alignment.
+            if getattr(tensor, "pad_length", 0):
+                kwargs.setdefault("allow_shape_mismatch", True)
+            # Native-FP8 GTP shard: the param IS a QuantizedTensor (reports a fake BF16 dtype
+            # over FP8 bytes). Dequantize to real BF16 so the checkpoint stores portable
+            # high-precision values, not raw FP8 bytes mislabeled as BF16. Offsets above were
+            # already read from the FP8 param's GTP attrs; shape is preserved by dequantize.
+            # (dequantize_gtp_native_fp8 restores the base FP8 class for the dequantize call —
+            # TE's tex.dequantize does not recognize the dynamic GTP_<Fp8Tensor> subclass.)
+            if is_float8tensor(tensor):
+                fp8_param = tensor
+                tensor = dequantize_gtp_native_fp8(tensor)
+                # Backlink to the live FP8 param: optimizer sharded_state_dict matches params
+                # to model entries by id(entry.data), which this dequantized copy would break
+                # (see _backfill_gtp_sharded_param_map in optimizer.py).
+                tensor._gtp_dequant_src = fp8_param
+
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
 
-    return ShardedTensor.from_rank_offsets(
+    sharded_tensor = ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
@@ -1041,6 +1091,11 @@ def make_tp_sharded_tensor_for_checkpoint(
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+    if is_torch_fsdp2_param:
+        # Marker used downstream for FSDP2-related logic, such as TP-DP
+        # sharding / loading for non-trivial parameters like SwiGLU.
+        sharded_tensor.is_torch_fsdp2_param = is_torch_fsdp2_param
+    return sharded_tensor
 
 
 def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_id=None, **kwargs):
@@ -1058,6 +1113,18 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
             - dp_cp_group: Data parallel + context parallel group
               (default: None, falls back to parallel_state)
     """
+    # Sanity guard.
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+
+        assert not is_gtp_param(tensor), (
+            f"GTP weight-remat param '{key}' reached make_sharded_tensor_for_checkpoint (the "
+            "replicated path); route GTP-sharded weights through "
+            "make_tp_sharded_tensor_for_checkpoint or make_sharded_tensors_for_checkpoint instead."
+        )
+
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
@@ -1082,16 +1149,20 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     dp_size = get_pg_size(dp_cp_group)
     dp_replica_id = get_pg_rank(dp_cp_group)
 
-    if HAVE_DTENSOR and isinstance(tensor, DTensor):
-        # FSDP2 sharding
+    is_torch_fsdp2_param = (
+        hasattr(tensor, "is_torch_fsdp2_param") and HAVE_DTENSOR and isinstance(tensor, DTensor)
+    )
+    if is_torch_fsdp2_param:
+        # When using FSDP2, every DP shard is a main replica.
         dp_replica_id = 0
         tensor = get_full_tensor_if_necessary(tensor)
+        # Add FSDP sharding rank offsets.
         new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
     if replica_id is None:
         replica_id = (0, get_pg_rank(tp_group), dp_replica_id)
 
-    return ShardedTensor.from_rank_offsets(
+    sharded_tensor = ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
@@ -1100,10 +1171,19 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+    if is_torch_fsdp2_param:
+        # Marker used downstream for FSDP2-related logic, such as TP-DP
+        # sharding / loading for non-trivial parameters like SwiGLU.
+        sharded_tensor.is_torch_fsdp2_param = is_torch_fsdp2_param
+    return sharded_tensor
 
 
 def get_full_tensor_if_necessary(tensor):
-    """For DTensor gets full tensor if some ranks will not have a local copy"""
+    """
+    Captures an edge case where devices out-number elements in a DTensor,
+    for instance when generating a ShardedTensor. Replicate the DTensor
+    on all ranks to avoid empty DTensors on any rank.
+    """
     need_full_tensor = False
     for i in range(tensor.device_mesh.ndim):
         if (

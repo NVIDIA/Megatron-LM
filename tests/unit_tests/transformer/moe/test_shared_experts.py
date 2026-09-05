@@ -140,6 +140,8 @@ def _fake_shared_expert(**config_kwargs):
     shared_expert.tp_group = object()
     shared_expert._fused_grouped_swiglu_ops = None
     shared_expert._fused_grouped_swiglu_recipe = None
+    shared_expert._fused_grouped_swiglu_unit_scale = None
+    shared_expert._fused_grouped_swiglu_tokens_per_expert = {}
     return shared_expert
 
 
@@ -228,6 +230,7 @@ def test_make_fused_grouped_swiglu_ops_builds_grouped_pipeline(monkeypatch):
 
     assert isinstance(activation_op, _FakeTEScaledSwiGLU)
     assert activation_op.glu_interleave_size == 32
+    assert activation_op._grouped_mlp_unit_activation_scale is True
 
     assert isinstance(fc2_op, _FakeTEGroupedLinear)
     assert fc2_op.kwargs["num_groups"] == 1
@@ -280,12 +283,16 @@ def test_fused_grouped_swiglu_no_comm_flattens_and_caches_fused_ops(monkeypatch)
 
     (ops,) = shared_expert._fused_grouped_swiglu_ops
     hidden_states_2d, tokens_per_expert, scales, tokens_per_expert_again = ops.args
+    shared_expert._fused_grouped_swiglu_no_comm(torch.randn_like(hidden_states))
+    _, cached_tokens_per_expert, cached_scales, _ = ops.args
     assert output.shape == hidden_states.shape
     assert shared_expert._fused_grouped_swiglu_recipe.__class__ is _FakeMXFP8Recipe
     assert hidden_states_2d.shape == (6, 4)
     assert tokens_per_expert.tolist() == [6]
     assert tokens_per_expert_again is tokens_per_expert
-    torch.testing.assert_close(scales, torch.ones(6))
+    torch.testing.assert_close(scales, torch.ones(1))
+    assert cached_tokens_per_expert is tokens_per_expert
+    assert cached_scales is scales
 
 
 def test_backward_dw_dispatches_fused_children_and_original_reduce_hooks(monkeypatch):

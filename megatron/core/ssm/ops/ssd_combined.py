@@ -32,11 +32,10 @@ def _mamba_chunk_scan_combined_fwd(
     z=None,
     dt_bias=None,
     initial_states=None,
-    return_intermediate_states=False,
     seq_idx=None,
     cu_chunk_seqlens=None,
     last_chunk_indices=None,
-    intermediate_chunk_indices=None,
+    return_raw_states=False,
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
     state_dtype=None,
@@ -149,15 +148,11 @@ def _mamba_chunk_scan_combined_fwd(
         initial_states=initial_states,
     )
 
-    if return_intermediate_states:
-        return states
-
     final_states = states[last_chunk_indices]
-    if intermediate_chunk_indices is not None:
-        intermediate_states = states[intermediate_chunk_indices]
-        return final_states, intermediate_states
-    else:
-        return final_states
+    if return_raw_states:
+        # Caller extracts any chunk-boundary states itself from the raw states.
+        return final_states, states
+    return final_states
 
 
 def mamba_chunk_scan_combined_varlen(
@@ -177,8 +172,7 @@ def mamba_chunk_scan_combined_varlen(
     initial_states=None,
     dt_softplus=False,
     dt_limit=(0.0, float("inf")),
-    return_intermediate_states=False,
-    intermediate_chunk_indices=None,
+    return_raw_states=False,
     state_dtype=None,
 ):
     """
@@ -198,13 +192,13 @@ def mamba_chunk_scan_combined_varlen(
         dt_bias: (nheads,)
         initial_states: (batch, nheads, headdim, dstate)
         dt_softplus: Whether to apply softplus to dt
-        intermediate_chunk_indices: (N,) optional int64 tensor of chunk indices at which to
-            extract intermediate SSM states. When provided, returns (final_states,
-            intermediate_states) instead of just final_states.
+        return_raw_states: If True, returns ``(varlen_states, raw_states)`` where
+            ``raw_states`` is the full ``(nchunks, nheads, headdim, dstate)``
+            chunk-boundary state tensor for the caller to extract from directly.
         state_dtype: The data type of the ssm state
     Return:
         varlen_states: (batch, nheads, headdim, dstate), or
-        (varlen_states, intermediate_states) if intermediate_chunk_indices is provided
+        (varlen_states, raw_states) if return_raw_states is True
     """
 
     assert seq_idx is not None
@@ -221,11 +215,10 @@ def mamba_chunk_scan_combined_varlen(
         z=z,
         dt_bias=dt_bias,
         initial_states=initial_states,
-        return_intermediate_states=return_intermediate_states,
         seq_idx=seq_idx,
         cu_chunk_seqlens=cu_chunk_seqlens,
         last_chunk_indices=last_chunk_indices,
-        intermediate_chunk_indices=intermediate_chunk_indices,
+        return_raw_states=return_raw_states,
         dt_softplus=dt_softplus,
         dt_limit=dt_limit,
         state_dtype=state_dtype,
