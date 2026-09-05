@@ -24,24 +24,18 @@ from megatron.core.fp8_utils import is_mxfp8tensor
 try:
     from megatron.core.transformer.moe.virtual_expert_triton import (
         MAX_VIRTUAL_EXPERT_WEIGHT_SMS,
-        compaction_grid,
-        launch_compact_routing_map,
-        launch_map_routes,
-        launch_map_routes_backward,
+        PLANNER_PROGRAMS,
         launch_virtual_expert_grad_reduce,
-        launch_virtual_expert_placement,
+        launch_virtual_expert_planner,
         launch_virtual_expert_weight_prefetch,
     )
 
     _TRITON_AVAILABLE = True
 except ImportError:
     MAX_VIRTUAL_EXPERT_WEIGHT_SMS = 32
-    compaction_grid = None
-    launch_compact_routing_map = None
-    launch_map_routes = None
-    launch_map_routes_backward = None
+    PLANNER_PROGRAMS = 128
     launch_virtual_expert_grad_reduce = None
-    launch_virtual_expert_placement = None
+    launch_virtual_expert_planner = None
     launch_virtual_expert_weight_prefetch = None
     _TRITON_AVAILABLE = False
 from megatron.core.utils import nvtx_decorator
@@ -65,38 +59,22 @@ _MXFP8_COMPONENTS = (
 
 
 @dataclass(slots=True)
-class SemanticRoutes:
-    """This rank's semantic routing for one layer: the dense ``[num_tokens, num_experts]``
-    ``routing_map`` (bool) and ``probs``, their int32 ``[num_tokens, router_topk]`` compaction
-    ``token_indices`` (ascending expert order per token), the compaction's per-program
-    histogram rows and the local histogram ``tokens_per_expert`` the placement kernel fills."""
-
-    routing_map: torch.Tensor
-    probs: torch.Tensor
-    token_indices: torch.Tensor
-    program_histogram: torch.Tensor
-    tokens_per_expert: torch.Tensor
-    router_topk: int
-
-
-@dataclass(slots=True)
 class VirtualExpertPlan:
-    """``virtual_experts``: int64 ``[num_tokens, router_topk]`` runtime ids;
-    ``experts_to_copy``: int32 ``[ep_size, num_local_experts]`` semantic ids, ``-1`` if unused;
-    ``routing_map`` / ``probs``: the dense ``[num_tokens, 2 * num_experts]`` runtime routing
-    inputs of the transport (``probs`` carries the gradient back to the router)."""
+    """``virtual_experts``: int16 ``[num_tokens, router_topk]`` runtime ids (HybridEP's dense
+    top-k routing); ``probs``: float32 ``[num_tokens, 2 * num_experts]`` dense runtime
+    probabilities, carrying the gradient back to the router; ``experts_to_copy``: int32
+    ``[ep_size, num_local_experts]`` semantic ids per virtual-expert slot, ``-1`` if unused."""
 
-    virtual_experts: torch.Tensor | None
+    virtual_experts: torch.Tensor
+    probs: torch.Tensor
     experts_to_copy: torch.Tensor
-    routing_map: torch.Tensor | None = None
-    probs: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
 class VirtualExpertPlannerWorkspace:
-    """Placement scratch for one expert layout and EP group; every plan overwrites it.
+    """Planner scratch for one expert layout and EP group; every plan overwrites it.
 
-    ``gathered_counts`` is this rank's NCCL symmetric-memory window: the placement kernel
+    ``gathered_counts`` is this rank's NCCL symmetric-memory window: the planner kernel
     publishes the local histogram into every peer's window and reads the peers' rows from its
     own, so planning needs no collective.
     """
@@ -107,9 +85,13 @@ class VirtualExpertPlannerWorkspace:
     gathered_counts: torch.Tensor  # [ep_size, num_experts] local routes per (source, expert)
     histogram_handle: object  # symmetric-memory handle of gathered_counts
     sequence: torch.Tensor  # int32 [1] exchange launch counter the flags carry
+    program_histogram: torch.Tensor  # [PLANNER_PROGRAMS, num_experts] per-program histograms
+    running_counts: torch.Tensor  # [PLANNER_PROGRAMS, num_experts] mapping-phase prefix counts
+    tokens_per_expert: torch.Tensor  # [num_experts] this rank's histogram
     balance: torch.Tensor  # [ep_size] native load minus rank capacity
     allocation: torch.Tensor  # [num_experts, ep_size] routes of each expert per destination
-    placement_grid_sync: torch.Tensor
+    placement_grid_sync: torch.Tensor  # barrier of the EP_SIZE placing programs
+    grid_sync: torch.Tensor  # barrier of all planner programs
     # Per-expert destination segment ends in this rank's local ordinal space, padded to a
     # power of two columns.
     destination_boundaries: torch.Tensor
@@ -128,32 +110,53 @@ class VirtualExpertPlannerWorkspace:
 
     @classmethod
     def allocate(cls, *, num_experts: int, device: torch.device, group: dist.ProcessGroup):
-        """Allocate the scratch for one expert layout on ``group``."""
+        """Allocate the scratch for one expert layout on ``group``, with the symmetric window."""
         import torch.distributed._symmetric_memory as symm_mem
 
         ep_size = dist.get_world_size(group=group)
-        int32 = dict(dtype=torch.int32, device=device)
         # The window needs the group's communicator (created by a first collective).
         dist.all_reduce(torch.zeros(1, device=device), group=group)
         if symm_mem.get_backend(device) != "NCCL":
             symm_mem.set_backend("NCCL")
-        window = symm_mem.empty(ep_size * num_experts, **int32)
+        window = symm_mem.empty(ep_size * num_experts, dtype=torch.int32, device=device)
         handle = symm_mem.rendezvous(window, group)
         if handle.signal_pad_size < ep_size * 4 * 4:
             raise RuntimeError(
                 "Virtual-expert planner needs one signal word per EP rank; the symmetric "
                 f"memory signal pad holds {handle.signal_pad_size} bytes for {ep_size} ranks."
             )
-        return cls(
-            num_experts=num_experts,
-            ep_size=ep_size,
+        return cls.scratch(
+            num_experts,
+            ep_size,
+            device,
             rank=dist.get_rank(group=group),
             gathered_counts=window.view(ep_size, num_experts),
             histogram_handle=handle,
+        )
+
+    @classmethod
+    def scratch(
+        cls, num_experts, ep_size, device, *, rank=0, gathered_counts=None, histogram_handle=None
+    ):
+        """The scratch tensors; without a window (process-local tests), ``gathered_counts`` is
+        plain memory the caller fills with every rank's histogram."""
+        int32 = dict(dtype=torch.int32, device=device)
+        if gathered_counts is None:
+            gathered_counts = torch.empty((ep_size, num_experts), **int32)
+        return cls(
+            num_experts=num_experts,
+            ep_size=ep_size,
+            rank=rank,
+            gathered_counts=gathered_counts,
+            histogram_handle=histogram_handle,
             sequence=torch.zeros(1, **int32),
+            program_histogram=torch.empty((PLANNER_PROGRAMS, num_experts), **int32),
+            running_counts=torch.empty((PLANNER_PROGRAMS, num_experts), **int32),
+            tokens_per_expert=torch.empty(num_experts, **int32),
             balance=torch.empty(ep_size, **int32),
             allocation=torch.empty((num_experts, ep_size), **int32),
             placement_grid_sync=torch.zeros(1, **int32),
+            grid_sync=torch.zeros(1, **int32),
             destination_boundaries=torch.empty(
                 (num_experts, 1 << (ep_size - 1).bit_length()), **int32
             ),
@@ -166,7 +169,7 @@ _planner_workspaces: dict = {}
 
 
 def get_planner_workspace(*, num_experts: int, device: torch.device, group: dist.ProcessGroup):
-    """Return the process-wide placement scratch for one expert layout and process group;
+    """Return the process-wide planner scratch for one expert layout and process group;
     planning is stream-ordered, so every layer of a device shares it."""
     key = (num_experts, device.index, group.group_name)
     workspace = _planner_workspaces.get(key)
@@ -177,152 +180,62 @@ def get_planner_workspace(*, num_experts: int, device: torch.device, group: dist
     return workspace
 
 
-class _MapRoutes(torch.autograd.Function):
-    """Fused route mapping: one kernel writes the runtime top-k ids and HybridEP's dense
-    runtime routing map and probabilities; the backward gathers the dense probability gradient
-    back onto the semantic probabilities in one kernel."""
+class _PlanRoutes(torch.autograd.Function):
+    """One planner launch. The dense runtime probabilities it writes carry the gradient back to
+    the router's ``[num_tokens, topk]`` probabilities through a gather at the runtime ids."""
 
     @staticmethod
-    def forward(ctx, probs, routes: SemanticRoutes, workspace: VirtualExpertPlannerWorkspace):
-        num_tokens, num_experts = routes.routing_map.shape
+    def forward(ctx, probs, top_indices, workspace, exchange):
+        num_tokens, router_topk = top_indices.shape
         empty = functools.partial(torch.empty, device=probs.device)
-        virtual_experts = empty((num_tokens, routes.router_topk), dtype=torch.int64)
-        runtime_routing_map = empty((num_tokens, 2 * num_experts), dtype=torch.bool)
-        runtime_probs = empty((num_tokens, 2 * num_experts), dtype=torch.float32)
-        launch_map_routes(
-            routes.routing_map,
+        virtual_experts = empty((num_tokens, router_topk), dtype=torch.int16)
+        runtime_probs = empty((num_tokens, 2 * workspace.num_experts), dtype=torch.float32)
+        # A plan owns its slot table: the backward push and reduction read it, possibly past
+        # another forward of the same layer, so the planner writes it straight into the plan.
+        experts_to_copy = torch.empty_like(workspace.experts_to_copy)
+        launch_virtual_expert_planner(
+            top_indices,
             probs,
-            routes.tokens_per_expert,
-            routes.program_histogram,
-            workspace.destination_boundaries,
-            workspace.virtual_expert_slots,
+            workspace,
             virtual_experts,
-            runtime_routing_map,
             runtime_probs,
-            num_tokens=num_tokens,
-            router_topk=routes.router_topk,
-            num_experts=num_experts,
-            num_local_experts=workspace.num_local_experts,
-            ep_size=workspace.ep_size,
+            experts_to_copy,
+            exchange=exchange,
         )
-        ctx.save_for_backward(virtual_experts, routes.token_indices)
+        ctx.save_for_backward(virtual_experts)
         ctx.probs_dtype = probs.dtype
-        ctx.mark_non_differentiable(virtual_experts, runtime_routing_map)
+        ctx.mark_non_differentiable(virtual_experts, experts_to_copy)
         # Autograd would otherwise zero-fill gradients for the two non-differentiable outputs.
         ctx.set_materialize_grads(False)
-        return virtual_experts, runtime_routing_map, runtime_probs
+        return virtual_experts, runtime_probs, experts_to_copy
 
     @staticmethod
-    def backward(ctx, grad_virtual_experts, grad_runtime_routing_map, grad_runtime_probs):
+    def backward(ctx, grad_virtual_experts, grad_runtime_probs, grad_experts_to_copy):
         if grad_runtime_probs is None:
-            return None, None, None
-        virtual_experts, token_indices = ctx.saved_tensors
-        num_tokens, router_topk = virtual_experts.shape
-        num_experts = grad_runtime_probs.shape[1] // 2
-        grad_probs = torch.empty(
-            (num_tokens, num_experts), dtype=torch.float32, device=virtual_experts.device
-        )
-        launch_map_routes_backward(
-            grad_runtime_probs.contiguous(),
-            virtual_experts,
-            token_indices,
-            grad_probs,
-            num_tokens=num_tokens,
-            router_topk=router_topk,
-            num_experts=num_experts,
-        )
-        return grad_probs.to(ctx.probs_dtype), None, None
-
-
-def map_routes_to_runtime_experts(
-    routes: SemanticRoutes, workspace: VirtualExpertPlannerWorkspace
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Turn this rank's semantic routes into rank-major runtime expert ids under the placement
-    held by ``workspace`` and write the transport's dense runtime inputs.
-
-    A route's stable ordinal among this rank's routes to its expert, offset by the routes
-    earlier ranks send that expert (already folded into ``destination_boundaries``), selects
-    the destination segment; a remote destination runs it in the virtual-expert slot the
-    placement assigned that expert there. Returns ``(virtual_experts, routing_map, probs)``.
-    """
-    return _MapRoutes.apply(routes.probs, routes, workspace)
-
-
-def extract_semantic_routes(
-    routing_map: torch.Tensor, probs: torch.Tensor, router_topk: int
-) -> SemanticRoutes:
-    """Compact a dense ``[num_tokens, num_experts]`` routing map into top-k routes.
-
-    The map, not the probabilities, is authoritative, so a selected zero-probability route
-    survives. Nothing is zeroed: the compaction fills exactly ``router_topk`` slots per token
-    (the placement kernel's route-total check traps on anything else) and the placement
-    kernel derives ``tokens_per_expert`` from the per-program histogram rows.
-    """
-    num_tokens, num_experts = routing_map.shape
-    num_programs, _ = compaction_grid(num_tokens, num_experts)
-    empty = functools.partial(torch.empty, dtype=torch.int32, device=routing_map.device)
-    routes = SemanticRoutes(
-        routing_map.contiguous(),
-        probs.contiguous(),
-        empty((num_tokens, router_topk)),
-        empty((num_programs, num_experts)),
-        empty(num_experts),
-        router_topk,
-    )
-    launch_compact_routing_map(
-        routes.routing_map,
-        routes.token_indices,
-        routes.program_histogram,
-        num_tokens=num_tokens,
-        router_topk=router_topk,
-        num_experts=num_experts,
-    )
-    return routes
+            return None, None, None, None
+        (virtual_experts,) = ctx.saved_tensors
+        grad_probs = grad_runtime_probs.gather(1, virtual_experts.long()).to(ctx.probs_dtype)
+        return grad_probs, None, None, None
 
 
 def plan_virtual_expert_routes(
-    routes: SemanticRoutes,
+    top_indices: torch.Tensor,
+    probs: torch.Tensor,
     workspace: VirtualExpertPlannerWorkspace,
     *,
-    on_placement_ready: Callable[[VirtualExpertPlan], None] | None = None,
+    exchange: bool = True,
 ) -> VirtualExpertPlan:
-    """Plan deterministic virtual-expert placement for one EP group.
+    """Plan deterministic virtual-expert placement for one EP group and map this rank's routes.
 
-    Every rank must route the same number of tokens. The histograms are the only cross-rank
-    input and the placement kernel exchanges them itself; from there every rank computes the
-    same placement. ``on_placement_ready`` runs as soon as ``experts_to_copy`` is final so the
-    weight push can start ahead of the route mapping.
+    ``top_indices`` / ``probs`` are the router's ``[num_tokens, topk]`` expert ids and
+    probabilities; every rank must route the same number of tokens. The histograms are the only
+    cross-rank input and the planner kernel exchanges them itself, so every rank computes the
+    same placement. ``exchange=False`` (process-local tests) plans from a pre-filled window.
     """
-    if routes.tokens_per_expert.numel() != workspace.num_experts:
-        raise ValueError("Virtual-expert planner routes do not match the workspace's experts.")
-    # A plan owns its slot table: the backward push and reduction read it, possibly past
-    # another forward of the same layer, so the placement writes it straight into the plan.
-    plan = VirtualExpertPlan(None, torch.empty_like(workspace.experts_to_copy))
-    launch_virtual_expert_placement(
-        workspace.gathered_counts,
-        workspace.balance,
-        workspace.allocation,
-        workspace.destination_boundaries,
-        plan.experts_to_copy,
-        workspace.virtual_expert_slots,
-        workspace.placement_grid_sync,
-        rank_route_capacity=routes.token_indices.numel(),
-        source_rank=workspace.rank,
-        ep_size=workspace.ep_size,
-        num_experts=workspace.num_experts,
-        num_local_experts=workspace.num_local_experts,
-        program_histogram=routes.program_histogram,
-        tokens_per_expert=routes.tokens_per_expert,
-        peer_bases=workspace.histogram_handle.buffer_ptrs_dev,
-        signal_bases=workspace.histogram_handle.signal_pad_ptrs_dev,
-        sequence=workspace.sequence,
-    )
-    if on_placement_ready is not None:
-        on_placement_ready(plan)
-    plan.virtual_experts, plan.routing_map, plan.probs = map_routes_to_runtime_experts(
-        routes, workspace
-    )
-    return plan
+    if top_indices.shape != probs.shape or top_indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Virtual-expert planner takes matching [num_tokens, topk] ids and probs.")
+    top_indices, probs = top_indices.contiguous(), probs.contiguous()
+    return VirtualExpertPlan(*_PlanRoutes.apply(probs, top_indices, workspace, exchange))
 
 
 # --------------------------------------------------------------------------------------
@@ -1007,7 +920,7 @@ class VirtualExpertLoadBalancer:
         self.router_topk = router_topk
         self.semantic_num_experts = num_experts
         self.num_owned_experts = num_local_experts
-        self.semantic_routes: SemanticRoutes | None = None
+        self.routes: tuple[torch.Tensor, torch.Tensor] | None = None
         # Placement scratch shared by every layer of this device and group (planning is
         # stream-ordered); resolved at the first plan, when the group's communicator exists.
         self._planner_workspace: VirtualExpertPlannerWorkspace | None = None
@@ -1067,16 +980,11 @@ class VirtualExpertLoadBalancer:
             hidden_states, *bridge.source_parameters, bridge, self._context
         )
 
-    def setup_virtual_expert_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> None:
-        """Extract compact semantic routes for the placement planner."""
-        num_tokens = int(routing_map.shape[0])
-        self.semantic_routes = extract_semantic_routes(
-            routing_map.reshape(num_tokens, self.semantic_num_experts),
-            probs.reshape(num_tokens, self.semantic_num_experts),
-            self.router_topk,
-        )
-        self.num_local_tokens = num_tokens
-        self.token_probs = self.semantic_routes.probs
+    def setup_virtual_expert_metadata(self, top_indices: torch.Tensor, probs: torch.Tensor) -> None:
+        """Keep the router's ``[num_tokens, topk]`` expert ids and probabilities for the planner."""
+        self.routes = (top_indices, probs)
+        self.num_local_tokens = int(top_indices.shape[0])
+        self.token_probs = probs
 
     def plan_dispatch(self) -> None:
         """Plan routes and begin the weight push before shared-expert compute."""
@@ -1085,19 +993,14 @@ class VirtualExpertLoadBalancer:
                 "Virtual-expert planning needs bound experts, a wrapped layer input and a "
                 "combined previous dispatch."
             )
+        top_indices, probs = self.routes
+        self.routes = None
         if self._planner_workspace is None:
             self._planner_workspace = get_planner_workspace(
-                num_experts=self.semantic_num_experts,
-                device=self.semantic_routes.routing_map.device,
-                group=self.group,
+                num_experts=self.semantic_num_experts, device=probs.device, group=self.group
             )
-        self._plan = self._context.plan = plan_virtual_expert_routes(
-            self.semantic_routes, self._planner_workspace, on_placement_ready=self._start_prefetch
-        )
-        self.semantic_routes = None
-
-    def _start_prefetch(self, plan) -> None:
-        self._bridge.last_plan = plan
+        plan = plan_virtual_expert_routes(top_indices, probs, self._planner_workspace)
+        self._plan = self._context.plan = self._bridge.last_plan = plan
         self._bridge.start_prefetch(plan)
 
     def prepare_virtual_expert_dispatch(
