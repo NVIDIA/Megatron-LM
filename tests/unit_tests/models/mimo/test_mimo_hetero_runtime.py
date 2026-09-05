@@ -194,7 +194,7 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
         ddp_config=ddp_config,
         data_parallel_random_init=True,
         use_layer_wise_distributed_optimizer=True,
-        use_layer_wise_param_layout=False,
+        layer_wise_param_layout='legacy',
     ) == [model]
 
     torch_device.assert_called_once_with("meta")
@@ -206,7 +206,7 @@ def test_builder_seeds_per_role_meta_builds_and_sets_contract(mocker):
         ddp_config=ddp_config,
         data_parallel_random_init=True,
         use_layer_wise_distributed_optimizer=True,
-        use_layer_wise_param_layout=False,
+        layer_wise_param_layout='legacy',
     )
     grad_sync.assert_called_once_with(args, model, topology)
     # Load-bearing contract for Increments 2/4: own module PGC and role prefix on the model.

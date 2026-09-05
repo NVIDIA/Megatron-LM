@@ -469,7 +469,7 @@ def get_mimo_model(
             ),
             ddp_config,
             use_layer_wise_distributed_optimizer=True,
-            use_layer_wise_param_layout=True,
+            layer_wise_param_layout='padded',
         )
     else:
         if mimo_model.language_model is not None:

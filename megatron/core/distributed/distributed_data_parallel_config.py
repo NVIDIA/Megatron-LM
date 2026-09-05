@@ -1,7 +1,7 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import torch
 
@@ -38,6 +38,20 @@ class DistributedDataParallelConfig:
     num_distributed_optimizer_instances: int = 1
     """Sets the factor by which the DP domain is sharded to have the partial DistOpt
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.
+    """
+
+    layer_wise_param_layout: Literal['padded', 'decoupled', 'legacy'] = 'decoupled'
+    """Layer-wise (Muon) optimizer only; ignored otherwise.
+
+       - ``'decoupled'`` (default): LayerWise-managed (Muon 2D matrix) buffers use a compact
+         no-padding DDP layout and locally disable ``use_distributed_optimizer`` (all-reduce
+         gradients, whole-param ping-pong ownership), while sibling buffers (embeddings, biases,
+         layernorm) keep the byte-level ``DistributedOptimizer``.
+       - ``'padded'``: LayerWise-managed buffers use the shard-aligned padded LayerWise param
+         layout, which costs a persistent ``dp_size * max(shard_load)`` padding.
+       - ``'legacy'``: DDP is not told about LayerWise at all — every parameter lands in one
+         non-DistOpt buffer and the optimizer owns the sync. Set by the training layer; DDP
+         itself only distinguishes ``'decoupled'`` from the other two.
     """
 
     check_for_nan_in_grad: bool = False
@@ -287,7 +301,7 @@ class DistributedDataParallelConfig:
 
         - No gather is needed because every DP rank runs the same optimizer update.
         - Another component performs the gather. With ``LayerWiseDistributedOptimizer``, this
-          happens when ``use_layer_wise_param_layout=False``, parameter-gather overlap is disabled,
+          happens when ``layer_wise_param_layout='legacy'``, parameter-gather overlap is disabled,
           and MXFP8 grad-buffer reuse is disabled. Each rank updates only its assigned parameters,
           then the optimizer calls ``allgather_params()`` synchronously after the step.
         """
