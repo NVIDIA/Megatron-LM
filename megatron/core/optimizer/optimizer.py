@@ -419,8 +419,8 @@ class MegatronOptimizer(ABC):
                 )
         return grad_norm
 
-    def count_zeros(self) -> float:
-        """Count number of zeros in model's gradients."""
+    def count_zeros(self) -> torch.Tensor:
+        """Count number of zeros in model's gradients, left on device for logging."""
         params = self.get_parameters()
         return count_zeros_fp32(
             params,
@@ -1533,7 +1533,7 @@ class ChainedOptimizer(MegatronOptimizer):
         if self.chained_optimizers:
             return self.chained_optimizers[0].get_loss_scale()
         else:
-            return torch.tensor([1.0], dtype=torch.float32, device=torch.cuda.current_device())
+            return torch.ones(1, dtype=torch.float32, device=torch.cuda.current_device())
 
     def _split_state_dict(self, state_dict):
         """Split the state dict into sub-state dicts according to the chunks of each sub-optimizer

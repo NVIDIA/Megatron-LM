@@ -8,7 +8,7 @@ import warnings
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
@@ -56,7 +56,7 @@ from megatron.training import get_adlr_autoresume, get_args, get_timers
 def _compute_norm_2(params_list):
     """Compute squared L2 norm of a list of tensors. Returns a CUDA scalar."""
     if len(params_list) > 0:
-        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
         norm, _ = multi_tensor_applier(
             multi_tensor_l2norm, dummy_overflow_buf, [params_list], False,
         )
@@ -345,8 +345,10 @@ def average_losses_across_data_parallel_group(
 
 
 def reduce_max_stat_across_model_parallel_group(
-    stat: float, group: Optional[torch.distributed.ProcessGroup] = None
-) -> float | None:
+    stat: Union[float, torch.Tensor, None],
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    return_tensor: bool = False,
+) -> Union[float, torch.Tensor, None]:
     """
     Ranks without an optimizer will have no grad_norm or num_zeros_in_grad stats.
     We need to ensure the logging and writer rank has those values.
@@ -354,19 +356,35 @@ def reduce_max_stat_across_model_parallel_group(
 
     We use an all_reduce max since the values have already been summed across optimizer ranks where possible
 
-    group: model-parallel process group; defaults to mpu.get_model_parallel_group().
+    Args:
+        stat: The value to reduce, as a device tensor, a host float, or None.
+        group: Model-parallel process group; defaults to mpu.get_model_parallel_group().
+        return_tensor (bool): Leave the result on device, with the -1.0 "no rank
+            had this stat" sentinel still encoded, so a logging-only caller can
+            defer the host read. Decode it at the log point with `_none_if_absent`.
+
+    Returns:
+        float or None, or a device tensor when ``return_tensor`` is set.
     """
     if group is None:
         group = mpu.get_model_parallel_group()
     if stat is None:
         stat = -1.0
-    stat = torch.tensor([stat], dtype=torch.float32, device=torch.cuda.current_device())
-    torch.distributed.all_reduce(stat, op=torch.distributed.ReduceOp.MAX, group=group)
-    if stat.item() == -1.0:
-        # No rank has a valid stat, so return None to indicate that it is None across all ranks.
-        return None
+    if torch.is_tensor(stat):
+        # copy=True so the in-place all-reduce never lands in the caller's buffer.
+        stat = stat.reshape(1).to(torch.float32, copy=True)
     else:
-        return stat.item()
+        # full(), not tensor([stat]): the latter is a pageable host-to-device copy
+        # and blocks. full() passes the value in the kernel argument buffer.
+        stat = torch.full((1,), stat, dtype=torch.float32, device=torch.cuda.current_device())
+    # Every rank reduces the same (1,) float32 buffer regardless of which branch it
+    # took above; ranks with and without trainable params meet in this collective.
+    torch.distributed.all_reduce(stat, op=torch.distributed.ReduceOp.MAX, group=group)
+    if return_tensor:
+        return stat
+    stat = stat.item()
+    # No rank has a valid stat, so return None to indicate that it is None across all ranks.
+    return None if stat == -1.0 else stat
 
 
 def logical_and_across_model_parallel_group(
@@ -383,7 +401,8 @@ def logical_and_across_model_parallel_group(
         input = 1
     else:
         input = 0
-    input = torch.tensor([input], dtype=torch.int, device=torch.cuda.current_device())
+    # full(), not tensor([input]) -- see reduce_max_stat above.
+    input = torch.full((1,), input, dtype=torch.int, device=torch.cuda.current_device())
     torch.distributed.all_reduce(input, op=torch.distributed.ReduceOp.MIN, group=group)
     return bool(input.item())
 

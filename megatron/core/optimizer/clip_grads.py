@@ -226,7 +226,7 @@ def count_zeros_fp32(
     use_decoupled_grad: bool = False,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     expert_tp_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> float:
+) -> torch.Tensor:
     """Counts the number of zero values in the gradients of the given parameters.
 
     The count is performed in FP32. This method filters parameters to ensure
@@ -245,7 +245,9 @@ def count_zeros_fp32(
             Defaults to False.
 
     Returns:
-        float: The total number of zeros in the gradients across the process group.
+        torch.Tensor: Device-resident count of zeros in the gradients across the
+            process group. Left on device so the host read can be deferred to the
+            log point; only logging consumes it.
     """
 
     if isinstance(parameters, torch.Tensor):
@@ -300,7 +302,5 @@ def count_zeros_fp32(
     torch.distributed.all_reduce(
         total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
     )
-
-    total_num_zeros = total_num_zeros.item()
 
     return total_num_zeros
