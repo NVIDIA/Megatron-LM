@@ -498,3 +498,26 @@ def test_real_cuda_handoff_and_projection_gradients():
     assert projection.weight.grad is not None
     assert torch.isfinite(projection.weight.grad).all()
     assert all(parameter.grad is None for parameter in backbone.parameters())
+
+
+def test_cleanup_resources_attempts_every_cleanup_after_errors(monkeypatch):
+    from examples.mimo import pretrain_mimo
+
+    calls = []
+
+    class _PrefetchLoader:
+        def close(self):
+            calls.append("prefetch")
+            raise RuntimeError("prefetch failed")
+
+    class _Topology:
+        def destroy(self):
+            calls.append("topology")
+            raise RuntimeError("topology failed")
+
+    monkeypatch.setattr(pretrain_mimo, "shutdown_distributed", lambda: calls.append("distributed"))
+
+    with pytest.raises(RuntimeError, match="prefetch failed"):
+        pretrain_mimo._cleanup_resources(_PrefetchLoader(), _Topology())
+
+    assert calls == ["prefetch", "topology", "distributed"]

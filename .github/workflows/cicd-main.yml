@@ -204,23 +204,21 @@ jobs:
 
       # Resolve a single SHA used by the build, every test job, and every
       # downstream checkout so that the container image, golden values, and
-      # test recipes always come from the same commit. For PR pushes this is
-      # the synthetic PR `merge_commit_sha`; for merge_group it is the merge
-      # queue head_sha; otherwise it falls back to github.sha.
+      # test recipes always come from the same commit. The pull-request mirror
+      # already points at the candidate head; using GitHub's merge_commit_sha
+      # can yield an empty value while the PR is temporarily unmergeable.
       - name: Resolve SHA
         id: resolve-sha
         shell: bash -x -e -u -o pipefail {0}
         env:
-          IS_PR: ${{ startsWith(github.ref, 'refs/heads/pull-request/') && github.event_name == 'push' }}
           IS_MERGE_GROUP: ${{ github.event_name == 'merge_group' }}
         run: |
-          if [[ "$IS_PR" == "true" ]]; then
-            SHA='${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}'
-          elif [[ "$IS_MERGE_GROUP" == "true" ]]; then
+          if [[ "$IS_MERGE_GROUP" == "true" ]]; then
             SHA='${{ github.event.merge_group.head_sha }}'
           else
             SHA='${{ github.sha }}'
           fi
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
           echo "sha=${SHA}" | tee -a "$GITHUB_OUTPUT"
 
       - name: Generate GitHub App token
