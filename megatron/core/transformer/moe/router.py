@@ -812,6 +812,12 @@ class TopKRouter(Router):
                 router_replay=self.router_replay,
                 dense_output=compact_routes,
             )
+            if compact_routes and routing_map.dtype == torch.bool:
+                # The fused (Transformer Engine) router only produces the dense map and
+                # probabilities; recover the selected ids from the map (it is authoritative) and
+                # their probabilities with a gather, which also carries the gradient.
+                routing_map = torch.topk(routing_map.to(torch.int8), self.topk, dim=1).indices
+                probs = probs.gather(1, routing_map)
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
