@@ -3074,6 +3074,30 @@ class TransformerConfig(ModelParallelConfig):
                                 'DtoH copies and synchronizations in the preprocess step.'
                             )
 
+            # Full-iteration capture puts the token dispatch inside the graph. The 'hybridep'
+            # and 'ncclep' backends size their permute/receive buffers from a DtoH copy of the
+            # dispatched token count unless a static budget makes the shapes known on the host.
+            # That synchronization cannot run during capture, so the backend would size the
+            # buffer from uninitialized pinned memory.
+            if (
+                self.cuda_graph_impl == "full_iteration"
+                and self.moe_token_dispatcher_type == "flex"
+                and self.moe_flex_dispatcher_backend in ("hybridep", "ncclep")
+                and self.moe_expert_rank_capacity_factor is None
+                and not (
+                    self.moe_pad_expert_input_to_capacity
+                    and self.moe_expert_capacity_factor is not None
+                )
+            ):
+                raise ValueError(
+                    f"moe_flex_dispatcher_backend={self.moe_flex_dispatcher_backend!r} needs "
+                    "static dispatch shapes with cuda_graph_impl='full_iteration', which "
+                    "captures the token dispatch. Set moe_expert_rank_capacity_factor (with "
+                    "use_transformer_engine_op_fuser=True or moe_use_grouped_tensor=True), or "
+                    "keep the dispatch out of the graph with cuda_graph_impl='local' and "
+                    "cuda_graph_modules that exclude 'moe'."
+                )
+
             if self.recompute_granularity:
                 if self.recompute_granularity != "selective":
                     assert (

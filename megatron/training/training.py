@@ -2039,6 +2039,10 @@ def pretrain(
         else:
             print_rank_0('training ...')
 
+        if args.log_params_norm:
+            params_norm = calc_params_l2_norm(model)
+            print_rank_0(f'params norm before training: {params_norm!r}')
+
         iteration = 0
         args.curr_iteration = iteration
         if args.do_train and (args.train_iters or 0) > 0:

@@ -205,6 +205,10 @@ class FullCudaGraphWrapper:
 
         training_str = 'training' if training else 'validation'
         curr_iteration = self.curr_iter(training_str)
+        # #region agent log
+        # import json as _j, time as _t
+        # open('/home/gkollu/lustre/.cursor/debug-788eac.log', 'a').write(_j.dumps({"sessionId": "788eac", "runId": "pre-fix", "hypothesisId": "H1", "location": "full_cuda_graph.py:208", "message": "FullCudaGraphWrapper called (full-iteration graph path is active)", "data": {"stage": training_str, "curr_iteration": curr_iteration, "warmup_steps": self.cuda_graph_warmup_steps, "will_capture_now": curr_iteration == self.cuda_graph_warmup_steps, "num_microbatches": num_microbatches}, "timestamp": int(_t.time() * 1000)}) + "\n")
+        # #endregion
         if curr_iteration == self.cuda_graph_warmup_steps:
             logger.info(f'Capture CUDA graph for {training_str}!!!')
             if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
