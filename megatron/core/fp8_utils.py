@@ -4,7 +4,7 @@
 
 import importlib
 import weakref
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from functools import wraps
 from typing import List, Optional, Union
 
@@ -933,6 +933,14 @@ else:
     def get_fp8_disabled_context(config: TransformerConfig, is_init: bool = False):
         """Return a no-op context manager since TE is not available."""
         return nullcontext()
+
+
+def get_fp8_backward_quantization_update_context() -> AbstractContextManager:
+    """Run the TE delayed-scaling update once for a backward made of several autograd calls."""
+    if not HAVE_TE:
+        return nullcontext()
+    scope = getattr(transformer_engine.pytorch, "quantization_backward_scope", None)
+    return scope() if scope is not None else nullcontext()
 
 
 if HAVE_TE:
