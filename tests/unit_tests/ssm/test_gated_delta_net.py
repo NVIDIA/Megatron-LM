@@ -4,6 +4,8 @@ import copy
 
 import pytest
 import torch
+import torch._dynamo
+import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -19,9 +21,183 @@ from megatron.core.ssm.gated_delta_net import (
     torch_chunk_gated_delta_rule,
     torch_chunk_gdn2,
 )
+from megatron.core.ssm.gated_delta_net.common import l2norm
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.ssm.gated_delta_net_test_utils import GatedDeltaNetTestBase
+from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_multi_latent_attention import make_test_packed_seq_params
+
+
+@pytest.mark.parametrize("use_gdn2", [False, True], ids=["gdn", "gdn2"])
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.internal
+def test_torch_gdn_l2norm_flag_matches_explicit_normalization(use_gdn2):
+    """The torch fallback flag must match explicit q/k normalization."""
+    torch.manual_seed(123)
+    torch.cuda.set_device(Utils.local_rank % torch.cuda.device_count())
+    device = torch.cuda.current_device()
+    batch_size, sequence_length, num_heads, head_dim = 1, 8, 2, 16
+    shape = (batch_size, sequence_length, num_heads, head_dim)
+    q = torch.randn(shape, device=device)
+    k = torch.randn(shape, device=device)
+    v = torch.randn(shape, device=device)
+
+    if use_gdn2:
+        kernel = torch_chunk_gdn2
+        kernel_kwargs = {
+            "g": torch.full(shape, -0.01, device=device),
+            "b": torch.full(shape, 0.1, device=device),
+            "w": torch.full(shape, 0.1, device=device),
+        }
+    else:
+        kernel = torch_chunk_gated_delta_rule
+        gate_shape = (batch_size, sequence_length, num_heads)
+        kernel_kwargs = {
+            "g": torch.full(gate_shape, -0.01, device=device),
+            "beta": torch.full(gate_shape, 0.1, device=device),
+        }
+
+    actual_output, actual_state = kernel(
+        q=q,
+        k=k,
+        v=v,
+        chunk_size=8,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        **kernel_kwargs,
+    )
+    expected_output, expected_state = kernel(
+        q=l2norm(q),
+        k=l2norm(k),
+        v=v,
+        chunk_size=8,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=False,
+        **kernel_kwargs,
+    )
+
+    torch.testing.assert_close(actual_output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+
+
+@pytest.fixture
+def gdn_process_group_collection():
+    """Initialize the model-parallel groups used by standalone GDN tests."""
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
+    )
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    cp_group = parallel_state.get_context_parallel_group()
+    yield ProcessGroupCollection(tp=tp_group, cp=cp_group)
+    Utils.destroy_model_parallel()
+    # These standalone tests compile GDNs before the parametrized TP/CP matrix.
+    # Do not let their process-global Dynamo cache change later tests' execution mode.
+    torch._dynamo.reset()
+
+
+def _build_gdn_for_l2norm_test(pg_collection, gdn_use_qk_l2norm_in_kernel, use_qk_l2norm=True):
+    config = TransformerConfig(
+        hidden_size=128,
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        num_layers=1,
+        normalization="RMSNorm",
+        use_cpu_initialization=True,
+        layernorm_zero_centered_gamma=True,
+        num_attention_heads=4,
+        num_query_groups=2,
+        activation_func=F.silu,
+        bf16=True,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
+        context_parallel_size=1,
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=[1],
+        transformer_impl="transformer_engine",
+        gdn_use_qk_l2norm_in_kernel=gdn_use_qk_l2norm_in_kernel,
+    )
+    gdn_spec = get_experimental_attention_variant_module_spec(config=config)
+    gdn = gdn_spec.module(
+        config,
+        submodules=gdn_spec.submodules,
+        layer_number=1,
+        bias=False,
+        conv_bias=False,
+        conv_init=1.0,
+        use_qk_l2norm=use_qk_l2norm,
+        A_init_range=(1, 16),
+        pg_collection=pg_collection,
+    )
+    assert gdn.use_qk_l2norm_in_kernel is gdn_use_qk_l2norm_in_kernel
+    return gdn.cuda().bfloat16()
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.internal
+def test_gdn_in_kernel_l2norm_requires_qk_l2norm(gdn_process_group_collection):
+    """In-kernel normalization is invalid when q/k normalization is disabled."""
+    with pytest.raises(
+        AssertionError, match="gdn_use_qk_l2norm_in_kernel requires use_qk_l2norm=True"
+    ):
+        _build_gdn_for_l2norm_test(
+            gdn_process_group_collection, gdn_use_qk_l2norm_in_kernel=True, use_qk_l2norm=False
+        )
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.internal
+def test_gdn_in_kernel_l2norm_matches_caller_end_to_end(gdn_process_group_collection):
+    """GDN's BF16 in-kernel route must match the former caller-normalized route."""
+    model_parallel_cuda_manual_seed(42)
+    torch.manual_seed(42)
+    kernel_norm_gdn = _build_gdn_for_l2norm_test(
+        gdn_process_group_collection, gdn_use_qk_l2norm_in_kernel=True
+    )
+    caller_norm_gdn = _build_gdn_for_l2norm_test(
+        gdn_process_group_collection, gdn_use_qk_l2norm_in_kernel=False
+    )
+    caller_norm_gdn.load_state_dict(kernel_norm_gdn.state_dict())
+
+    torch.manual_seed(123)
+    hidden_states = torch.randn(
+        (16, 2, kernel_norm_gdn.config.hidden_size),
+        device=torch.cuda.current_device(),
+        dtype=torch.bfloat16,
+    )
+
+    def run(module):
+        module.zero_grad(set_to_none=True)
+        module_input = hidden_states.detach().clone().requires_grad_(True)
+        output, _ = module(module_input, None)
+        output.float().square().mean().backward()
+        parameter_grads = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in module.named_parameters()
+            if parameter.grad is not None
+        }
+        return output.detach(), module_input.grad.detach().clone(), parameter_grads
+
+    kernel_output, kernel_input_grad, kernel_parameter_grads = run(kernel_norm_gdn)
+    caller_output, caller_input_grad, caller_parameter_grads = run(caller_norm_gdn)
+
+    atol = rtol = 2e-2
+    torch.testing.assert_close(kernel_output.float(), caller_output.float(), atol=atol, rtol=rtol)
+    torch.testing.assert_close(
+        kernel_input_grad.float(), caller_input_grad.float(), atol=atol, rtol=rtol
+    )
+    assert set(kernel_parameter_grads) == set(caller_parameter_grads)
+    for name in kernel_parameter_grads:
+        torch.testing.assert_close(
+            kernel_parameter_grads[name].float(),
+            caller_parameter_grads[name].float(),
+            atol=atol,
+            rtol=rtol,
+            msg=lambda msg, name=name: f"Parameter grad mismatch for {name}: {msg}",
+        )
 
 
 @pytest.mark.parametrize("use_gdn2", [False, True], ids=["gdn", "gdn2"])
@@ -203,8 +379,6 @@ class TestGatedDeltaNet(GatedDeltaNetTestBase):
         )
 
     def test_jit_compiled_helpers(self):
-        import torch._dynamo
-
         gdn = self.gdn
         batch = 2
         seq_len = 16

@@ -134,7 +134,7 @@ class _GDNBase(MegatronModule):
             bias: Whether to use bias in the linear layers.
             conv_bias: Whether to use bias in the causal convolution.
             conv_init: The initialization range for the causal convolution weights.
-            use_qk_l2norm: Whether to use L2 normalization in the kernel of the gated delta rule.
+            use_qk_l2norm: Whether to L2-normalize q and k.
             A_init_range: The initialization range for the attention weights.
             pg_collection: The required process groups to use for tensor model parallel and context
                 parallel.
@@ -161,6 +161,10 @@ class _GDNBase(MegatronModule):
         assert A_init_range[0] >= 0 and A_init_range[1] >= A_init_range[0]
         self.A_init_range = A_init_range
         self.use_qk_l2norm = use_qk_l2norm
+        self.use_qk_l2norm_in_kernel = config.gdn_use_qk_l2norm_in_kernel
+        assert (
+            self.use_qk_l2norm or not self.use_qk_l2norm_in_kernel
+        ), "gdn_use_qk_l2norm_in_kernel requires use_qk_l2norm=True"
         assert pg_collection is not None, "pg_collection must be provided for GatedDeltaNet"
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
@@ -389,6 +393,7 @@ class _GDNBase(MegatronModule):
         batch: int,
         seq_len: int,
         *gate_feats: tuple[torch.Tensor],
+        use_qk_l2norm_in_kernel: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Prepare all gated delta rule kernel inputs.
@@ -396,6 +401,8 @@ class _GDNBase(MegatronModule):
         Fuses split, reshape, L2 norm, decay/gate activations, repeat_interleave, and
         contiguous operations. ``gate_feats`` holds the variant-specific in_proj
         sections, which ``_compute_gates`` turns into the decay and gating tensors.
+        When ``use_qk_l2norm_in_kernel`` is true, q/k normalization is deferred to
+        the gated delta rule kernel to avoid materializing normalized q/k here.
 
         Returns:
             (dict[str, Tensor]): Kernel inputs keyed by kernel argument name (``q``,
@@ -413,8 +420,9 @@ class _GDNBase(MegatronModule):
         query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
         value = value.reshape(batch, seq_len, -1, self.value_head_dim)
 
-        # Apply L2 norm to query and key
-        if self.use_qk_l2norm:
+        # Let a supporting kernel own normalization so caller autograd does not retain an
+        # additional pre-split, normalized query_key activation alongside the kernel q/k.
+        if self.use_qk_l2norm and not use_qk_l2norm_in_kernel:
             query_key = l2norm(query_key.contiguous())
 
         # Split query and key

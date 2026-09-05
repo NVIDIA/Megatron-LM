@@ -415,6 +415,9 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    gdn_use_qk_l2norm_in_kernel: bool = False
+    """Whether GatedDeltaNet defers q/k L2 normalization to the gated delta rule kernel."""
+
     ####################
     # initialization
     ####################
