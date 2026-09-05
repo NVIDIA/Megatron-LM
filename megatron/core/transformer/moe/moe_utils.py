@@ -2,6 +2,7 @@
 
 import functools
 import math
+import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -750,6 +751,19 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     # Calculate how many tokens need to be padded for each expert
     num_ones = routing_map.sum(dim=1)
     num_to_pad = (-num_ones) % pad_multiple
+
+    # If an expert has fewer zero entries than the padding it needs, the mask
+    # below can only flip the zeros that exist and the returned map stays
+    # unaligned. Report that instead of silently handing back a routing map
+    # that does not satisfy the requested alignment.
+    num_zeros = routing_map.size(1) - num_ones
+    if (num_to_pad > num_zeros).any():
+        warnings.warn(
+            "pad_routing_map: not enough zero entries to pad every expert's "
+            f"token count to a multiple of {pad_multiple}; the returned routing "
+            "map may still have unaligned expert token counts.",
+            stacklevel=2,
+        )
 
     # Find the positions of zeros in each row and their ranks
     is_zero = routing_map == 0
