@@ -19,6 +19,11 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core.transformer.moe.virtual_expert_load_balancer import (
+    VirtualExpertPlannerWorkspace,
+    extract_semantic_routes,
+    plan_virtual_expert_routes,
+)
 from megatron.core.transformer.moe.virtual_expert_triton import (
     MAX_VIRTUAL_EXPERT_WEIGHT_SMS,
     _transport_tile,
@@ -405,3 +410,50 @@ def test_virtual_expert_mxfp8_transport_moves_one_orientation_at_a_time():
         handles.clear()
         gc.collect()
         Utils.destroy_model_parallel()
+
+
+@requires_four_ranks
+def test_virtual_expert_histogram_exchange_matches_all_gather():
+    """The placement kernel's symmetric-memory histogram exchange gathers what an all-gather
+    gathers and fills the local histogram, launch after launch (the flags carry a sequence)."""
+    Utils.initialize_distributed()
+    group = dist.group.WORLD
+    rank, world_size = dist.get_rank(group), dist.get_world_size(group)
+    device = torch.device("cuda", torch.cuda.current_device())
+    num_tokens, topk, num_experts = 512, 3, 4 * world_size
+    workspace = VirtualExpertPlannerWorkspace.allocate(
+        num_experts=num_experts, device=device, group=group
+    )
+    generator = torch.Generator(device=device).manual_seed(77 + rank)
+    try:
+        for launch in range(3):
+            weights = torch.rand(num_experts, device=device, generator=generator) + 0.05
+            weights[(rank + launch) % num_experts] = 10.0  # a hot expert per rank migrates
+            indices = torch.multinomial(
+                weights.expand(num_tokens, num_experts), topk, generator=generator
+            )
+            routing_map = torch.zeros(
+                (num_tokens, num_experts), dtype=torch.bool, device=device
+            ).scatter_(1, indices, True)
+            probs = torch.rand((num_tokens, num_experts), device=device, generator=generator)
+            routes = extract_semantic_routes(routing_map, probs * routing_map, topk)
+            plan = plan_virtual_expert_routes(routes, workspace)
+            # Snapshot the window in stream order: a peer may publish its next histogram into
+            # it as soon as this rank's placement has read it (the all-gather below is what
+            # keeps the peers from getting further ahead than that).
+            gathered = workspace.gathered_counts.clone()
+            histogram = routing_map.sum(0, dtype=torch.int32)
+            expected = torch.empty_like(gathered)
+            dist.all_gather_into_tensor(expected.view(-1), histogram, group=group)
+            torch.cuda.synchronize(device)
+            assert torch.equal(gathered, expected)
+            assert torch.equal(routes.tokens_per_expert, histogram)
+            assert int(workspace.sequence.item()) == launch + 1
+            # Every route lands on a runtime expert of some rank; the mapping's exactness
+            # against a torch reference is tier 1's job.
+            assert plan.virtual_experts.shape == (num_tokens, topk)
+            assert 0 <= int(plan.virtual_experts.min()) <= int(plan.virtual_experts.max())
+            assert int(plan.virtual_experts.max()) < 2 * num_experts
+    finally:
+        workspace.destroy()
+        dist.barrier(group=group, device_ids=[device.index])

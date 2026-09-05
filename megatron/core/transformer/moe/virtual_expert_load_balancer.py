@@ -20,12 +20,14 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.fp8_utils import is_mxfp8tensor
-from megatron.core.jit import jit_fuser
 
 try:
     from megatron.core.transformer.moe.virtual_expert_triton import (
         MAX_VIRTUAL_EXPERT_WEIGHT_SMS,
+        compaction_grid,
         launch_compact_routing_map,
+        launch_map_routes,
+        launch_map_routes_backward,
         launch_virtual_expert_grad_reduce,
         launch_virtual_expert_placement,
         launch_virtual_expert_weight_prefetch,
@@ -34,7 +36,10 @@ try:
     _TRITON_AVAILABLE = True
 except ImportError:
     MAX_VIRTUAL_EXPERT_WEIGHT_SMS = 32
+    compaction_grid = None
     launch_compact_routing_map = None
+    launch_map_routes = None
+    launch_map_routes_backward = None
     launch_virtual_expert_grad_reduce = None
     launch_virtual_expert_placement = None
     launch_virtual_expert_weight_prefetch = None
@@ -60,22 +65,48 @@ _MXFP8_COMPONENTS = (
 
 
 @dataclass(slots=True)
+class SemanticRoutes:
+    """This rank's semantic routing for one layer: the dense ``[num_tokens, num_experts]``
+    ``routing_map`` (bool) and ``probs``, their int32 ``[num_tokens, router_topk]`` compaction
+    ``token_indices`` (ascending expert order per token), the compaction's per-program
+    histogram rows and the local histogram ``tokens_per_expert`` the placement kernel fills."""
+
+    routing_map: torch.Tensor
+    probs: torch.Tensor
+    token_indices: torch.Tensor
+    program_histogram: torch.Tensor
+    tokens_per_expert: torch.Tensor
+    router_topk: int
+
+
+@dataclass(slots=True)
 class VirtualExpertPlan:
     """``virtual_experts``: int64 ``[num_tokens, router_topk]`` runtime ids;
-    ``experts_to_copy``: int32 ``[ep_size, num_local_experts]`` semantic ids, ``-1`` if unused."""
+    ``experts_to_copy``: int32 ``[ep_size, num_local_experts]`` semantic ids, ``-1`` if unused;
+    ``routing_map`` / ``probs``: the dense ``[num_tokens, 2 * num_experts]`` runtime routing
+    inputs of the transport (``probs`` carries the gradient back to the router)."""
 
     virtual_experts: torch.Tensor | None
     experts_to_copy: torch.Tensor
+    routing_map: torch.Tensor | None = None
+    probs: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
 class VirtualExpertPlannerWorkspace:
-    """Placement scratch for one ``(num_experts, ep_size)`` shape; every plan overwrites it."""
+    """Placement scratch for one expert layout and EP group; every plan overwrites it.
+
+    ``gathered_counts`` is this rank's NCCL symmetric-memory window: the placement kernel
+    publishes the local histogram into every peer's window and reads the peers' rows from its
+    own, so planning needs no collective.
+    """
 
     num_experts: int
     ep_size: int
-    num_local_experts: int
+    rank: int
     gathered_counts: torch.Tensor  # [ep_size, num_experts] local routes per (source, expert)
+    histogram_handle: object  # symmetric-memory handle of gathered_counts
+    sequence: torch.Tensor  # int32 [1] exchange launch counter the flags carry
     balance: torch.Tensor  # [ep_size] native load minus rank capacity
     allocation: torch.Tensor  # [num_experts, ep_size] routes of each expert per destination
     placement_grid_sync: torch.Tensor
@@ -85,15 +116,41 @@ class VirtualExpertPlannerWorkspace:
     virtual_expert_slots: torch.Tensor  # [num_experts, ep_size] slot holding an expert on a rank
     experts_to_copy: torch.Tensor  # [ep_size, num_local_experts]
 
+    @property
+    def num_local_experts(self) -> int:
+        return self.num_experts // self.ep_size
+
+    def destroy(self) -> None:
+        """Drop the symmetric window while its process group is still alive."""
+        if self.histogram_handle is not None:
+            torch.cuda.synchronize(self.gathered_counts.device)
+        self.histogram_handle = self.gathered_counts = None
+
     @classmethod
-    def allocate(cls, *, num_experts, ep_size, device):
-        """Allocate the scratch for one expert layout on ``device``."""
+    def allocate(cls, *, num_experts: int, device: torch.device, group: dist.ProcessGroup):
+        """Allocate the scratch for one expert layout on ``group``."""
+        import torch.distributed._symmetric_memory as symm_mem
+
+        ep_size = dist.get_world_size(group=group)
         int32 = dict(dtype=torch.int32, device=device)
+        # The window needs the group's communicator (created by a first collective).
+        dist.all_reduce(torch.zeros(1, device=device), group=group)
+        if symm_mem.get_backend(device) != "NCCL":
+            symm_mem.set_backend("NCCL")
+        window = symm_mem.empty(ep_size * num_experts, **int32)
+        handle = symm_mem.rendezvous(window, group)
+        if handle.signal_pad_size < ep_size * 4 * 4:
+            raise RuntimeError(
+                "Virtual-expert planner needs one signal word per EP rank; the symmetric "
+                f"memory signal pad holds {handle.signal_pad_size} bytes for {ep_size} ranks."
+            )
         return cls(
             num_experts=num_experts,
             ep_size=ep_size,
-            num_local_experts=num_experts // ep_size,
-            gathered_counts=torch.empty((ep_size, num_experts), **int32),
+            rank=dist.get_rank(group=group),
+            gathered_counts=window.view(ep_size, num_experts),
+            histogram_handle=handle,
+            sequence=torch.zeros(1, **int32),
             balance=torch.empty(ep_size, **int32),
             allocation=torch.empty((num_experts, ep_size), **int32),
             placement_grid_sync=torch.zeros(1, **int32),
@@ -105,140 +162,166 @@ class VirtualExpertPlannerWorkspace:
         )
 
 
-@jit_fuser
-def _map_routes(
-    topk_indices: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
-    destination_boundaries: torch.Tensor,
-    virtual_expert_slots: torch.Tensor,
-    num_local_experts: int,
-    ep_size: int,
-) -> torch.Tensor:
-    """Sort the routes by expert (stably, so each expert's routes keep token order) and read
-    every route's destination off one global array of segment ends."""
-    flat = topk_indices.reshape(-1)
-    sorted_experts, order = torch.sort(flat, stable=True)
-    experts = sorted_experts.long()
-    # Segment d of expert e ends, in sorted-position space, at the expert's bucket start plus
-    # its destination boundary clipped to the routes this rank actually holds.
-    bucket_start = torch.cumsum(tokens_per_expert, 0) - tokens_per_expert
-    boundaries = (
-        destination_boundaries[:, :ep_size].clamp(min=0).minimum(tokens_per_expert[:, None])
-    )
-    ends = (bucket_start[:, None] + boundaries).reshape(-1)
-    positions = torch.arange(flat.numel(), device=flat.device, dtype=torch.int64)
-    destination = torch.searchsorted(ends, positions, right=True) - experts * ep_size
-    slot = virtual_expert_slots.view(-1)[experts * ep_size + destination]
-    runtime_local = torch.where(
-        destination == experts // num_local_experts,
-        experts % num_local_experts,
-        num_local_experts + slot,
-    )
-    virtual = torch.empty_like(positions)
-    virtual[order] = destination * (2 * num_local_experts) + runtime_local
-    return virtual.view(topk_indices.shape)
+_planner_workspaces: dict = {}
+
+
+def get_planner_workspace(*, num_experts: int, device: torch.device, group: dist.ProcessGroup):
+    """Return the process-wide placement scratch for one expert layout and process group;
+    planning is stream-ordered, so every layer of a device shares it."""
+    key = (num_experts, device.index, group.group_name)
+    workspace = _planner_workspaces.get(key)
+    if workspace is None:
+        workspace = _planner_workspaces[key] = VirtualExpertPlannerWorkspace.allocate(
+            num_experts=num_experts, device=device, group=group
+        )
+    return workspace
+
+
+class _MapRoutes(torch.autograd.Function):
+    """Fused route mapping: one kernel writes the runtime top-k ids and HybridEP's dense
+    runtime routing map and probabilities; the backward gathers the dense probability gradient
+    back onto the semantic probabilities in one kernel."""
+
+    @staticmethod
+    def forward(ctx, probs, routes: SemanticRoutes, workspace: VirtualExpertPlannerWorkspace):
+        num_tokens, num_experts = routes.routing_map.shape
+        empty = functools.partial(torch.empty, device=probs.device)
+        virtual_experts = empty((num_tokens, routes.router_topk), dtype=torch.int64)
+        runtime_routing_map = empty((num_tokens, 2 * num_experts), dtype=torch.bool)
+        runtime_probs = empty((num_tokens, 2 * num_experts), dtype=torch.float32)
+        launch_map_routes(
+            routes.routing_map,
+            probs,
+            routes.tokens_per_expert,
+            routes.program_histogram,
+            workspace.destination_boundaries,
+            workspace.virtual_expert_slots,
+            virtual_experts,
+            runtime_routing_map,
+            runtime_probs,
+            num_tokens=num_tokens,
+            router_topk=routes.router_topk,
+            num_experts=num_experts,
+            num_local_experts=workspace.num_local_experts,
+            ep_size=workspace.ep_size,
+        )
+        ctx.save_for_backward(virtual_experts, routes.token_indices)
+        ctx.probs_dtype = probs.dtype
+        ctx.mark_non_differentiable(virtual_experts, runtime_routing_map)
+        # Autograd would otherwise zero-fill gradients for the two non-differentiable outputs.
+        ctx.set_materialize_grads(False)
+        return virtual_experts, runtime_routing_map, runtime_probs
+
+    @staticmethod
+    def backward(ctx, grad_virtual_experts, grad_runtime_routing_map, grad_runtime_probs):
+        if grad_runtime_probs is None:
+            return None, None, None
+        virtual_experts, token_indices = ctx.saved_tensors
+        num_tokens, router_topk = virtual_experts.shape
+        num_experts = grad_runtime_probs.shape[1] // 2
+        grad_probs = torch.empty(
+            (num_tokens, num_experts), dtype=torch.float32, device=virtual_experts.device
+        )
+        launch_map_routes_backward(
+            grad_runtime_probs.contiguous(),
+            virtual_experts,
+            token_indices,
+            grad_probs,
+            num_tokens=num_tokens,
+            router_topk=router_topk,
+            num_experts=num_experts,
+        )
+        return grad_probs.to(ctx.probs_dtype), None, None
 
 
 def map_routes_to_runtime_experts(
-    topk_indices: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
-    workspace: VirtualExpertPlannerWorkspace,
-) -> torch.Tensor:
-    """Turn this rank's semantic routes into rank-major runtime expert ids under the
-    placement held by ``workspace``.
+    routes: SemanticRoutes, workspace: VirtualExpertPlannerWorkspace
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Turn this rank's semantic routes into rank-major runtime expert ids under the placement
+    held by ``workspace`` and write the transport's dense runtime inputs.
 
     A route's stable ordinal among this rank's routes to its expert, offset by the routes
     earlier ranks send that expert (already folded into ``destination_boundaries``), selects
-    the destination segment; a remote destination runs it in the virtual-expert slot the placement
-    assigned that expert there.
+    the destination segment; a remote destination runs it in the virtual-expert slot the
+    placement assigned that expert there. Returns ``(virtual_experts, routing_map, probs)``.
     """
-    return _map_routes(
-        topk_indices,
-        tokens_per_expert,
-        workspace.destination_boundaries,
-        workspace.virtual_expert_slots,
-        workspace.num_local_experts,
-        workspace.ep_size,
-    )
+    return _MapRoutes.apply(routes.probs, routes, workspace)
 
 
 def extract_semantic_routes(
     routing_map: torch.Tensor, probs: torch.Tensor, router_topk: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> SemanticRoutes:
     """Compact a dense ``[num_tokens, num_experts]`` routing map into top-k routes.
 
-    Returns ``(token_probs, token_indices, tokens_per_expert)``: the first two are
-    ``[num_tokens, router_topk]`` in ascending expert order (gradients flow back to the
-    selected entries of ``probs``), the last is the int32 local histogram. The map, not
-    the probabilities, is authoritative, so a selected zero-probability route survives.
+    The map, not the probabilities, is authoritative, so a selected zero-probability route
+    survives. Nothing is zeroed: the compaction fills exactly ``router_topk`` slots per token
+    (the placement kernel's route-total check traps on anything else) and the placement
+    kernel derives ``tokens_per_expert`` from the per-program histogram rows.
     """
-    num_tokens, num_experts = (int(size) for size in routing_map.shape)
-    tokens_per_expert = torch.zeros(num_experts, dtype=torch.int32, device=routing_map.device)
-    # Zero-filled so a token with fewer than router_topk selections leaves a route to
-    # expert 0 rather than a stale id; the placement kernel's route-total check reports it.
-    token_indices = torch.zeros(
-        (num_tokens, router_topk), dtype=torch.int32, device=routing_map.device
+    num_tokens, num_experts = routing_map.shape
+    num_programs, _ = compaction_grid(num_tokens, num_experts)
+    empty = functools.partial(torch.empty, dtype=torch.int32, device=routing_map.device)
+    routes = SemanticRoutes(
+        routing_map.contiguous(),
+        probs.contiguous(),
+        empty((num_tokens, router_topk)),
+        empty((num_programs, num_experts)),
+        empty(num_experts),
+        router_topk,
     )
     launch_compact_routing_map(
-        routing_map,
-        token_indices,
-        tokens_per_expert,
+        routes.routing_map,
+        routes.token_indices,
+        routes.program_histogram,
         num_tokens=num_tokens,
         router_topk=router_topk,
         num_experts=num_experts,
     )
-    return torch.gather(probs, 1, token_indices.long()), token_indices, tokens_per_expert
+    return routes
 
 
 def plan_virtual_expert_routes(
-    topk_indices: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
-    ep_group: dist.ProcessGroup,
+    routes: SemanticRoutes,
     workspace: VirtualExpertPlannerWorkspace,
     *,
     on_placement_ready: Callable[[VirtualExpertPlan], None] | None = None,
 ) -> VirtualExpertPlan:
     """Plan deterministic virtual-expert placement for one EP group.
 
-    ``topk_indices`` (int32/int64 ``[num_tokens, router_topk]``) and ``tokens_per_expert``
-    (int32 ``[num_experts]``) are this rank's semantic routes and histogram; every rank must
-    route the same number of tokens. ``on_placement_ready`` runs as soon as
-    ``experts_to_copy`` is final so the weight push can start ahead of the route mapping.
+    Every rank must route the same number of tokens. The histograms are the only cross-rank
+    input and the placement kernel exchanges them itself; from there every rank computes the
+    same placement. ``on_placement_ready`` runs as soon as ``experts_to_copy`` is final so the
+    weight push can start ahead of the route mapping.
     """
-    ep_size = dist.get_world_size(group=ep_group)
-    if (
-        (tokens_per_expert.numel(), ep_size) != (workspace.num_experts, workspace.ep_size)
-        or topk_indices.dtype not in (torch.int32, torch.int64)
-        or tokens_per_expert.dtype != torch.int32
-        or not (topk_indices.is_contiguous() and tokens_per_expert.is_contiguous())
-    ):
-        raise ValueError(
-            "Virtual-expert planner inputs do not match the workspace shape or dtypes."
-        )
-    # The only cross-rank input; from here every rank computes the same placement.
-    dist.all_gather_into_tensor(
-        workspace.gathered_counts.view(-1), tokens_per_expert, group=ep_group
-    )
+    if routes.tokens_per_expert.numel() != workspace.num_experts:
+        raise ValueError("Virtual-expert planner routes do not match the workspace's experts.")
+    # A plan owns its slot table: the backward push and reduction read it, possibly past
+    # another forward of the same layer, so the placement writes it straight into the plan.
+    plan = VirtualExpertPlan(None, torch.empty_like(workspace.experts_to_copy))
     launch_virtual_expert_placement(
         workspace.gathered_counts,
         workspace.balance,
         workspace.allocation,
         workspace.destination_boundaries,
-        workspace.experts_to_copy,
+        plan.experts_to_copy,
         workspace.virtual_expert_slots,
         workspace.placement_grid_sync,
-        rank_route_capacity=topk_indices.numel(),
-        source_rank=dist.get_rank(group=ep_group),
-        ep_size=ep_size,
+        rank_route_capacity=routes.token_indices.numel(),
+        source_rank=workspace.rank,
+        ep_size=workspace.ep_size,
         num_experts=workspace.num_experts,
         num_local_experts=workspace.num_local_experts,
+        program_histogram=routes.program_histogram,
+        tokens_per_expert=routes.tokens_per_expert,
+        peer_bases=workspace.histogram_handle.buffer_ptrs_dev,
+        signal_bases=workspace.histogram_handle.signal_pad_ptrs_dev,
+        sequence=workspace.sequence,
     )
-    # A plan owns its outputs: the backward push and reduction read experts_to_copy and
-    # autograd saves virtual_experts, possibly past another forward of the same layer.
-    plan = VirtualExpertPlan(None, workspace.experts_to_copy.clone())
     if on_placement_ready is not None:
         on_placement_ready(plan)
-    plan.virtual_experts = map_routes_to_runtime_experts(topk_indices, tokens_per_expert, workspace)
+    plan.virtual_experts, plan.routing_map, plan.probs = map_routes_to_runtime_experts(
+        routes, workspace
+    )
     return plan
 
 
@@ -334,12 +417,10 @@ class _VirtualExpertWeightWorkspace:
         # pool and may alias one of them.
         self.weight_streams = (torch.cuda.Stream(device=device), torch.cuda.Stream(device=device))
         self.grad_stream = torch.cuda.Stream(device=device)
-        # Full native wgrad staging per projection: TE's GEMM overwrites it, the
-        # reduction adds the virtual-expert partials, autograd hands it to the optimizer.
-        self.native_grads = tuple(
-            torch.empty((num_local_experts, *shape), dtype=grad_dtype, device=device)
-            for shape in member_shapes
-        )
+        # Full native wgrad staging per projection, allocated on first use: TE's GEMM overwrites
+        # it, the reduction adds the virtual-expert partials, autograd hands it to the optimizer.
+        # GTP projections write per-layer GTP scratch instead and never allocate it.
+        self._native_grads: dict[int, torch.Tensor] = {}
 
     def weight_stream(self, current_stream: torch.cuda.Stream) -> torch.cuda.Stream:
         """Return a weight stream distinct from ``current_stream``."""
@@ -358,6 +439,17 @@ class _VirtualExpertWeightWorkspace:
             return data, None
         scales = self.weight_arena.narrow(0, offset + count * numel, count * scale_numel)
         return data, scales.view(count, scale_numel)
+
+    def native_staging(self, projection: int) -> torch.Tensor:
+        """Return the ``[L, *shape]`` native wgrad staging of one projection."""
+        staging = self._native_grads.get(projection)
+        if staging is None:
+            staging = self._native_grads[projection] = torch.empty(
+                (self.num_local_experts, *self.member_shapes[projection]),
+                dtype=self.grad_dtype,
+                device=self.grad_arena.device,
+            )
+        return staging
 
     def grad_slots(self, projection: int) -> torch.Tensor:
         """Return the ``[L, *shape]`` virtual-expert gradient slots of one projection."""
@@ -404,9 +496,12 @@ def finalize_virtual_expert_weight_bridges() -> None:
             bridge.release()
         for workspace in _workspaces.values():
             workspace.destroy()
+        for workspace in _planner_workspaces.values():
+            workspace.destroy()
     except Exception:  # a teardown release must never raise
         pass
     _workspaces.clear()
+    _planner_workspaces.clear()
     # The runtime parameters and their TE ops sit in reference cycles; free the arenas now.
     gc.collect()
 
@@ -420,7 +515,8 @@ class _VirtualExpertProjection:
     """One projection's optimizer parameters, runtime parameters and pointer tables.
 
     The ``2L`` runtime parameters are the natives followed by the virtual-expert slots. Their
-    ``main_grad`` is the native staging or the slot's gradient arena member and carries
+    ``main_grad`` is the native staging (GTP: the layer's GTP wgrad scratch, bound per backward
+    by :meth:`bind_wgrad_scratch`) or the slot's gradient arena member and carries
     ``overwrite_main_grad``, so TE's wgrad GEMM rewrites every member on each backward
     and the slots never need clearing (a planned slot always receives tokens).
     """
@@ -435,11 +531,25 @@ class _VirtualExpertProjection:
         self.gtp_leader = (
             parameters[0] if getattr(parameters[0], "is_gtp_weight_remat", False) else None
         )
+        self.grad_dtype = workspace.grad_dtype
         self.virtual_grad = workspace.grad_slots(index)
-        self.native_grad = workspace.native_grads[index]
-        self.native_grad_bases = torch.tensor(
-            [grad.data_ptr() for grad in self.native_grad], dtype=torch.int64, device=self.device
-        )
+        if self.gtp_leader is None:
+            self.native_grad = workspace.native_staging(index)
+            native_grads = tuple(self.native_grad)
+            grad_bases = [grad.data_ptr() for grad in self.native_grad]
+        else:
+            # GTP: every backward binds the layer's GTP wgrad scratch (bind_wgrad_scratch), so
+            # nothing is staged and nothing is copied on the way to the reduce-scatter. TE's
+            # forward only checks that a fused-accumulation weight has *a* main_grad; an empty
+            # placeholder satisfies it and fails loudly if a backward ever ran unbound.
+            self.native_grad = None
+            placeholder = torch.empty(0, dtype=self.grad_dtype, device=self.device)
+            native_grads = (placeholder,) * len(parameters)
+            grad_bases = [0] * len(parameters)
+        self.native_grad_bases = torch.tensor(grad_bases, dtype=torch.int64, device=self.device)
+        self.host_grad_bases = torch.empty(len(parameters), dtype=torch.int64, pin_memory=True)
+        self.grad_bases_copied = torch.cuda.Event()
+        self.wgrad_scratch: list[torch.Tensor] | None = None
         data, scales = workspace.slot_views(index)
         if self.mxfp8:
             template = parameters[0]
@@ -468,9 +578,7 @@ class _VirtualExpertProjection:
         self.runtime_parameters = tuple(
             torch.nn.Parameter(weight) for weight in (*sources, *self.virtual_weights)
         )
-        for parameter, grad in zip(
-            self.runtime_parameters, (*self.native_grad, *self.virtual_grad)
-        ):
+        for parameter, grad in zip(self.runtime_parameters, (*native_grads, *self.virtual_grad)):
             parameter.main_grad = grad
             parameter.grad_added_to_main_grad = True
             parameter.overwrite_main_grad = True
@@ -541,6 +649,56 @@ class _VirtualExpertProjection:
         self.tables[direction].copy_(self.host_tables[direction], non_blocking=True)
         self.copied[direction].record(torch.cuda.current_stream(self.device))
         self.bound[direction] = pointers
+
+    def bind_wgrad_scratch(self) -> None:
+        """Point the natives' ``main_grad`` and the reduction's pointer table at this layer's GTP
+        wgrad scratch, before the backward that fills them.
+
+        TE's wgrad GEMM then writes the native experts' gradients straight into the buffers the
+        reduce-scatter sends and the reduction adds the virtual-expert partials there, so
+        :meth:`take_wgrads` hands them over without a copy. The scratch comes through the same
+        protocol TE uses (``get_wgrad_tensor``); GTP recycles it once its reduce-scatter is done.
+        """
+        if self.gtp_leader is None:
+            return
+        if self.wgrad_scratch is not None:
+            raise RuntimeError(f"{self.name} virtual-expert wgrad scratch is already bound.")
+        scratch = [weight.get_wgrad_tensor() for weight in self.gtp_leader._weights]
+        numel = math.prod(self.member_shape)
+        if len(scratch) != len(self.parameters) or any(
+            grad.dtype != self.grad_dtype
+            or grad.numel() != numel
+            or not grad.is_contiguous()
+            or grad.data_ptr() % 16
+            for grad in scratch
+        ):
+            raise ValueError(
+                f"{self.name} GTP wgrad scratch must be {len(self.parameters)} contiguous "
+                f"16-byte aligned {self.grad_dtype} buffers of {numel} elements."
+            )
+        for parameter, grad in zip(self.runtime_parameters, scratch):
+            parameter.main_grad = grad
+        # The pinned mirror may only be rewritten once its previous copy has landed.
+        self.grad_bases_copied.synchronize()
+        self.host_grad_bases.copy_(
+            torch.tensor([grad.data_ptr() for grad in scratch], dtype=torch.int64)
+        )
+        self.native_grad_bases.copy_(self.host_grad_bases, non_blocking=True)
+        self.grad_bases_copied.record(torch.cuda.current_stream(self.device))
+        self.wgrad_scratch = scratch
+
+    def take_wgrads(self) -> tuple[torch.Tensor, ...]:
+        """Return the buffers holding this backward's full native wgrads: the staging, or the
+        bound GTP scratch, which passes to the caller."""
+        if self.gtp_leader is None:
+            return tuple(self.native_grad)
+        if self.wgrad_scratch is None:
+            raise RuntimeError(
+                f"{self.name} has no GTP wgrad scratch bound; the backward weight push must run "
+                "before the expert backward."
+            )
+        scratch, self.wgrad_scratch = self.wgrad_scratch, None
+        return tuple(scratch)
 
 
 class VirtualExpertWeightBridge:
@@ -624,6 +782,8 @@ class VirtualExpertWeightBridge:
         # Expert backward computes FC2 before FC1; keep GTP's linked gathers in that order.
         for projection in self.projections[:: -1 if direction == BACKWARD else 1]:
             projection.prepare(direction)
+            if direction == BACKWARD:
+                projection.bind_wgrad_scratch()
         workspace = self.workspace
         current_stream = torch.cuda.current_stream(self.device)
         weight_stream = workspace.weight_stream(current_stream)
@@ -675,6 +835,9 @@ class VirtualExpertWeightBridge:
             raise RuntimeError(
                 f"Virtual-expert gradient reduction of FC{projection + 1} started twice."
             )
+        for p in self.projections:
+            if p.gtp_leader is not None and p.wgrad_scratch is None:
+                raise RuntimeError(f"{p.name} has no GTP wgrad scratch bound for this backward.")
         workspace = self.workspace
         workspace.grad_stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(workspace.grad_stream):
@@ -716,8 +879,8 @@ class VirtualExpertWeightBridge:
     def wait_grad_reduce(self, plan: VirtualExpertPlan) -> tuple[torch.Tensor | None, ...]:
         """Finish both reductions and return one full wgrad per source parameter.
 
-        GTP parameters reduce-scatter a copy of the staging (FC2 first, as their linked
-        reduce-scatter chain expects) and return what their protocol returns.
+        GTP parameters reduce-scatter the scratch the GEMM and the reduction wrote (FC2 first,
+        as their linked reduce-scatter chain expects) and return what their protocol returns.
         """
         if plan is not self._backward_plan or self._reduced != {0, 1}:
             raise RuntimeError(
@@ -728,16 +891,13 @@ class VirtualExpertWeightBridge:
             current_stream.wait_event(event)
         self._backward_plan = None
         self._reduced.clear()
-        grads = [tuple(projection.native_grad) for projection in self.projections]
+        grads = [projection.take_wgrads() for projection in self.projections]
         for index in (1, 0):
             leader = self.projections[index].gtp_leader
             if leader is not None:
-                # GTP reduce-scatters asynchronously and frees its inputs when done, while
-                # the next layer's wgrad GEMM rewrites the shared staging; hand it scratch
-                # it owns, exactly as TE does through the same protocol.
-                scratch = [weight.get_wgrad_tensor() for weight in leader._weights]
-                torch._foreach_copy_(scratch, list(grads[index]))
-                reduced = leader.wgrad_reduce_scatter(scratch)
+                # GTP owns and recycles this scratch once its asynchronous reduce-scatter has
+                # read it, so the next layer's GEMM never races it.
+                reduced = leader.wgrad_reduce_scatter(list(grads[index]))
                 grads[index] = tuple(reduced) if isinstance(reduced, (list, tuple)) else (reduced,)
         return tuple(grad for projection in grads for grad in projection)
 
@@ -747,6 +907,7 @@ class VirtualExpertWeightBridge:
         if experts is not None:
             experts._fused_ops = experts._virtual_expert_weight_bridge = None
         for projection in self.projections:
+            projection.wgrad_scratch = None
             for parameter in projection.runtime_parameters:
                 parameter.main_grad = None
         self.projections.clear()
@@ -818,7 +979,7 @@ class VirtualExpertLoadBalancer:
     and whose gradients are reduced back to the owning rank in backward. A rank duplicates experts
     from a single overloaded home rank, so ``num_local_experts`` slots always suffice. The token
     transport is handled by the underlying token dispatcher while the virtual expert materialization
-    and grad reduction are handled by trition kernels in virtul_expert_triton.py.
+    and grad reduction are handled by Triton kernels in virtual_expert_triton.py.
 
     """
 
@@ -846,15 +1007,10 @@ class VirtualExpertLoadBalancer:
         self.router_topk = router_topk
         self.semantic_num_experts = num_experts
         self.num_owned_experts = num_local_experts
-        self.semantic_token_probs = None
-        self.semantic_token_indices = None
-        self.semantic_tokens_per_expert = None
-        # Placement scratch; every plan overwrites it and copies out what it keeps.
-        self._planner_workspace = VirtualExpertPlannerWorkspace.allocate(
-            num_experts=num_experts,
-            ep_size=world_size,
-            device=torch.device("cuda", torch.cuda.current_device()),
-        )
+        self.semantic_routes: SemanticRoutes | None = None
+        # Placement scratch shared by every layer of this device and group (planning is
+        # stream-ordered); resolved at the first plan, when the group's communicator exists.
+        self._planner_workspace: VirtualExpertPlannerWorkspace | None = None
         self._experts_ref = None
         self._bridge = None
         self._plan = None
@@ -914,15 +1070,13 @@ class VirtualExpertLoadBalancer:
     def setup_virtual_expert_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> None:
         """Extract compact semantic routes for the placement planner."""
         num_tokens = int(routing_map.shape[0])
-        self.semantic_token_probs, self.semantic_token_indices, self.semantic_tokens_per_expert = (
-            extract_semantic_routes(
-                routing_map.reshape(num_tokens, self.semantic_num_experts),
-                probs.reshape(num_tokens, self.semantic_num_experts),
-                self.router_topk,
-            )
+        self.semantic_routes = extract_semantic_routes(
+            routing_map.reshape(num_tokens, self.semantic_num_experts),
+            probs.reshape(num_tokens, self.semantic_num_experts),
+            self.router_topk,
         )
         self.num_local_tokens = num_tokens
-        self.token_probs = self.semantic_token_probs
+        self.token_probs = self.semantic_routes.probs
 
     def plan_dispatch(self) -> None:
         """Plan routes and begin the weight push before shared-expert compute."""
@@ -931,13 +1085,16 @@ class VirtualExpertLoadBalancer:
                 "Virtual-expert planning needs bound experts, a wrapped layer input and a "
                 "combined previous dispatch."
             )
+        if self._planner_workspace is None:
+            self._planner_workspace = get_planner_workspace(
+                num_experts=self.semantic_num_experts,
+                device=self.semantic_routes.routing_map.device,
+                group=self.group,
+            )
         self._plan = self._context.plan = plan_virtual_expert_routes(
-            self.semantic_token_indices,
-            self.semantic_tokens_per_expert,
-            self.group,
-            self._planner_workspace,
-            on_placement_ready=self._start_prefetch,
+            self.semantic_routes, self._planner_workspace, on_placement_ready=self._start_prefetch
         )
+        self.semantic_routes = None
 
     def _start_prefetch(self, plan) -> None:
         self._bridge.last_plan = plan
