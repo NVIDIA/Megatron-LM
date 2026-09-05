@@ -2,8 +2,10 @@
 
 import copy
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import Iterator, Optional, Tuple, Union
 
 import torch
 
@@ -32,6 +34,25 @@ try:
     from fast_hadamard_transform import hadamard_transform
 except ImportError:
     hadamard_transform = None
+
+
+class _DSAIndexShareCarrier:
+    """Per-forward DSA index-share carrier for non-packed activation recompute."""
+
+
+_CURRENT_DSA_INDEX_SHARE_CARRIER: ContextVar[Optional[object]] = ContextVar(
+    "current_dsa_index_share_carrier", default=None
+)
+
+
+@contextmanager
+def _dsa_index_share_carrier_scope(carrier: object) -> Iterator[None]:
+    """Expose one non-packed forward's index-share carrier to its checkpoint closures."""
+    token = _CURRENT_DSA_INDEX_SHARE_CARRIER.set(carrier)
+    try:
+        yield
+    finally:
+        _CURRENT_DSA_INDEX_SHARE_CARRIER.reset(token)
 
 
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
@@ -1695,6 +1716,9 @@ class DSAttention(MegatronModule):
         """Return the object that carries DSA top-k sharing state for this forward."""
         if packed_seq_params is not None:
             return packed_seq_params
+        carrier = _CURRENT_DSA_INDEX_SHARE_CARRIER.get()
+        if carrier is not None:
+            return carrier
         return attention_mask if attention_mask is not None else self.config
 
     def _get_index_share_topk_holder(
