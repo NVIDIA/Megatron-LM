@@ -41,6 +41,32 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.utils import start_memory_history_recording
 
 
+def configure_vision_recompute(vision_config, *, whole_tower: bool = False) -> None:
+    """--recompute-vision: full activation recompute for the vision tower.
+
+    The block size is the whole trade-off, and it is payload-dependent, so it
+    stays opt-in rather than becoming a silent change of what --recompute-vision
+    has always meant:
+
+    - per-layer blocks (default): every layer's input is saved, and backward
+      re-materializes one layer at a time — a bounded spike.
+    - one whole-tower block (--recompute-vision-whole-tower): only the block
+      input (the patch-embed output) is saved, but backward re-materializes ALL
+      layers' internal activations simultaneously.
+
+    Recompute FLOPs are identical either way (any full recompute re-runs the
+    tower in backward). Whole-tower is the measured winner for this stack's
+    long-window envelope, where the per-layer saves
+    (raw_patches x vision_hidden x num_layers) dominate vision memory; it was
+    validated by the 128K qualification with allocation-point margin forensics.
+    A different model or a lighter payload can just as easily be dominated by
+    the backward spike instead, which is why the default is unchanged.
+    """
+    vision_config.recompute_granularity = "full"
+    vision_config.recompute_method = "uniform"
+    vision_config.recompute_num_layers = vision_config.num_layers if whole_tower else 1
+
+
 def model_provider(
     pre_process: bool = True,
     post_process: bool = True,
@@ -82,9 +108,9 @@ def model_provider(
     vision_config.apply_rope_fusion = language_config.apply_rope_fusion
 
     if getattr(args, "recompute_vision", False):
-        vision_config.recompute_granularity = "full"
-        vision_config.recompute_method = "uniform"
-        vision_config.recompute_num_layers = 1
+        configure_vision_recompute(
+            vision_config, whole_tower=getattr(args, "recompute_vision_whole_tower", False)
+        )
 
     # --- vision FLOPs metadata ---
     vision_flops_fn = registry.get("vision_flops_fn")
@@ -143,13 +169,9 @@ def datasets_provider(train_val_test_num_samples):
     return provider_fn(train_val_test_num_samples)
 
 
-if __name__ == "__main__":
-    datasets_provider.is_distributed = True
-
-    args = parse_and_validate_args(
-        extra_args_provider=add_multimodal_args,
-        args_defaults={},
-    )
+def validate_entry_args(args) -> None:
+    """Reject statically-decidable misconfigurations before any model
+    construction (fail in seconds, not after multi-node setup)."""
     # multimodal_dev's model_provider builds the full model on every rank and
     # does not honor pre_process / post_process pipeline-stage flags. PP>1
     # would silently violate Megatron's pipeline-parallel contract.
@@ -160,6 +182,70 @@ if __name__ == "__main__":
             "builds the full model on every rank; pipeline-stage splitting is "
             "not wired through. Run with --pipeline-model-parallel-size 1."
         )
+    # MTP itself IS wired through (models/base.py passes mtp_block_spec to the
+    # language model). The conflict is narrower: this entry sets
+    # scatter_embedding_sequence_parallel=False and scatters later, so under an
+    # EFFECTIVE sequence-parallel layout the decoder embedding keeps its full
+    # [S, B, D] shape while MTP expects the scattered hidden states. Without SP
+    # (or at TP=1, where SP does nothing) the two agree and MTP is supported.
+    if (
+        getattr(args, "mtp_num_layers", 0)
+        and getattr(args, "sequence_parallel", False)
+        and args.tensor_model_parallel_size > 1
+    ):
+        raise ValueError(
+            "MTP is not supported together with sequence parallelism on this entry: "
+            "the deferred embedding scatter (scatter_embedding_sequence_parallel=False) "
+            "leaves the decoder embedding unscattered while MTP consumes scattered "
+            "hidden states. Run with --mtp-num-layers 0, or drop --sequence-parallel."
+        )
+    # Block-size without the feature is a no-op the operator cannot see: the
+    # run starts with NO vision recompute at all and, for a long-window recipe,
+    # only says so as an OOM at the GPU allocation point.
+    if getattr(args, "recompute_vision_whole_tower", False) and not getattr(
+        args, "recompute_vision", False
+    ):
+        raise ValueError(
+            "--recompute-vision-whole-tower selects the recompute BLOCK SIZE and "
+            "does nothing on its own; pass --recompute-vision as well, or drop it."
+        )
+    # The fixed-shape providers size their samples from --total-seq-length
+    # while pack_or_pad_batch caps at --seq-length, so this combination always
+    # aborts at step 1. It is decidable here, before the run costs anything.
+    total_seq_length = getattr(args, "total_seq_length", None)
+    if (
+        getattr(args, "dataset_provider", "mock") != "mock_varlen"
+        and total_seq_length is not None
+        and total_seq_length > args.seq_length
+    ):
+        raise ValueError(
+            f"--total-seq-length {total_seq_length} exceeds --seq-length "
+            f"{args.seq_length}: the fixed-shape providers would emit samples the "
+            "packer refuses to truncate. Lower --total-seq-length or raise "
+            "--seq-length."
+        )
+    # Statically decidable misconfig: the multimodal packed THD path does not
+    # support CUDA graphs (forward_step keeps a runtime guard as defense in
+    # depth); reject the combination at startup instead of at the first step.
+    if getattr(args, "use_packed_sequence", False) and getattr(
+        args, "cuda_graph_impl", "none"
+    ) not in (None, "none"):
+        raise ValueError(
+            "--use-packed-sequence is incompatible with "
+            f"--cuda-graph-impl {args.cuda_graph_impl}: the multimodal packed "
+            "THD path does not support CUDA Graph. Run with "
+            "--cuda-graph-impl none."
+        )
+
+
+if __name__ == "__main__":
+    datasets_provider.is_distributed = True
+
+    args = parse_and_validate_args(
+        extra_args_provider=add_multimodal_args,
+        args_defaults={},
+    )
+    validate_entry_args(args)
     full_config = pretrain_cfg_container_from_args(args)
     # training.py enables allocator history only on the config-container MODEL
     # flow; this entry uses model_provider, so it enables recording itself, and
