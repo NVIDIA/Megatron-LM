@@ -12,8 +12,10 @@ from torch.optim import SGD, Adam
 # FP8 recipe will be used to test precision-aware-optimizer.
 from transformer_engine.pytorch.fp8 import fp8_autocast
 
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.optimizer import (
@@ -37,6 +39,7 @@ from megatron.core.transformer.multi_latent_attention import (
     FusedMLASelfAttention,
     MLASelfAttentionSubmodules,
 )
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -1182,6 +1185,74 @@ def test_distributed_optimizer_synthesizes_fused_qkv_down_weight_for_state_dict_
         assert q_key not in state_dict
         assert kv_key not in state_dict
         torch.testing.assert_close(state_dict[fused_key], torch.cat([q_weight, kv_weight], dim=0))
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_distributed_optimizer_reload_main_params_from_fused_mla_canonical_state_dict():
+    """Fused-LN MLA keeps the input LayerNorm params on linear_qkv_down_proj at runtime while the
+    checkpoint canonicalizes them to input_layernorm.*; reloading main params through a
+    DDP-wrapped model must still match every parameter."""
+    if not is_te_min_version("1.10.0"):
+        pytest.skip("Requires TE >= 1.10.0")
+
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        transformer_config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            bf16=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="rope",
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+            mla_down_proj_fusion=True,
+        )
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            multi_latent_attention=True, mla_down_proj_fusion=True
+        )
+        layer = build_module(layer_spec, config=transformer_config, layer_number=1)
+        if not layer.submodules_config.sharded_state_dict_keys_map:
+            pytest.skip("Backend does not fuse the input LayerNorm into the MLA down-projection")
+        runtime_names = [name for name, _ in layer.named_parameters()]
+        assert any("linear_qkv_down_proj.layer_norm_" in name for name in runtime_names)
+
+        model = nn.Module()
+        model.decoder = nn.Module()
+        model.decoder.layers = nn.ModuleList([layer])
+        model = model.bfloat16().cuda()
+        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+        model = DistributedDataParallel(transformer_config, ddp_config, model)
+        optimizer_config = OptimizerConfig(
+            optimizer='adam', bf16=True, use_distributed_optimizer=True
+        )
+        optim = get_megatron_optimizer(optimizer_config, [model])
+
+        # Checkpoint-style state dict: canonical keys from sharded_state_dict, all values 3.
+        sharded_state_dict = layer.sharded_state_dict(prefix="decoder.layers.0.")
+        state_dict = {
+            key: torch.full_like(sh_ten.data, 3.0)
+            for key, sh_ten in sharded_state_dict.items()
+            if isinstance(sh_ten, ShardedTensor)
+        }
+        assert any(key.startswith("decoder.layers.0.input_layernorm.") for key in state_dict)
+        assert not any("linear_qkv_down_proj.layer_norm_" in key for key in state_dict)
+
+        optim.reload_model_params(state_dict)
+
+        for group in optim.param_groups:
+            for main_param in group['params']:
+                assert main_param.dtype == torch.float32
+                torch.testing.assert_close(
+                    main_param, torch.full_like(main_param, 3.0), atol=0, rtol=0
+                )
     finally:
         Utils.destroy_model_parallel()
 
