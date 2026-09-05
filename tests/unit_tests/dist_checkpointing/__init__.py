@@ -41,9 +41,11 @@ class TempNamedDir(TemporaryDirectory):
             os.makedirs(name, exist_ok=True)
 
         self._ignore_cleanup_errors = ignore_cleanup_errors
-        self._finalizer = weakref.finalize(
-            self, self._cleanup, self.name, warn_message="Implicitly cleaning up {!r}".format(self)
-        )
+        # Finalization must obey the same ownership rule as explicit cleanup.
+        if Utils.rank == 0:
+            self._finalizer = weakref.finalize(
+                self, self._cleanup, self.name, warn_message="Implicitly cleaning up {!r}".format(self)
+            )
         self.sync = sync
 
     def cleanup(self, override_sync: Optional[bool] = None) -> None:
