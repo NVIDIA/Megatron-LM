@@ -158,6 +158,7 @@ class ScheduleNode:
         name: str = "schedule_node",
         forward_nvtx_name: Optional[str] = None,
         backward_nvtx_name: Optional[str] = None,
+        free_input_handback_stream: Optional[torch.cuda.Stream | Callable] = None,
     ):
         """Initialize a schedule node.
 
@@ -174,6 +175,11 @@ class ScheduleNode:
             backward_func (callable, optional): Function for the backward pass.
             free_input (bool): Flag to indicate if the input should be freed after the
                 forward pass.
+            free_input_handback_stream (torch.cuda.Stream or callable, optional): The stream that
+                created a cross-stream input. Before releasing the input, enqueue a wait for this
+                node's last consumer on that stream instead of calling ``record_stream``. This is
+                only safe when the scheduler knows both the creation stream and the last consumer;
+                every released input must have been created on this same stream.
             name (str): Name of the node for debugging purposes.
             forward_nvtx_name (str, optional): Stable NVTX label for forward execution.
             backward_nvtx_name (str, optional): Stable NVTX label for backward execution.
@@ -186,6 +192,7 @@ class ScheduleNode:
         self.stream = stream
         self.event = event
         self.free_input = free_input
+        self.free_input_handback_stream = free_input_handback_stream
         self.inputs = None
         self.outputs = None
         # When True, the forward runs under torch.no_grad() so no autograd graph is
@@ -236,15 +243,36 @@ class ScheduleNode:
 
             self.output = data
 
-        # Immediately frees input tensors after they are used for nodes
-        # where inputs are no longer needed after computation.
-        if self.free_input:
-            for input in inputs:
-                if input is not None:
-                    input.record_stream(self.stream)
-                    input.untyped_storage().resize_(0)
+        self._free_forward_inputs(inputs)
 
         return self.output
+
+    def _free_forward_inputs(self, inputs):
+        """Release forward inputs after their final scheduled consumer.
+
+        ``record_stream`` is the general fallback for inputs created on another stream. When the
+        schedule provides the creation stream explicitly, the node's completion event can instead
+        be handed back to that stream before release. Subsequent allocations on the creation stream
+        are then ordered after the consumer without leaving the block pending on a side stream.
+        """
+        if not self.free_input:
+            return
+
+        handback_stream = self.free_input_handback_stream
+        if isinstance(handback_stream, Callable):
+            handback_stream = handback_stream()
+            self.free_input_handback_stream = handback_stream
+
+        if handback_stream is not None:
+            # stream_acquire_context records this event after the forward callable, so this wait
+            # is the precise last-consumer frontier for every input released below.
+            self.event.wait(handback_stream)
+
+        for input in inputs:
+            if input is not None:
+                if handback_stream is None:
+                    input.record_stream(self.stream)
+                input.untyped_storage().resize_(0)
 
     def get_output(self):
         """Get the forward output"""

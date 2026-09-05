@@ -1011,6 +1011,15 @@ class TransformerConfig(ModelParallelConfig):
     upstream and leave this option disabled.
     """
 
+    moe_hybridep_use_manual_forward_stream_handback: bool = False
+    """Hand forward HybridEP dispatch-output storage back to its communication stream after the
+    expert MLP consumes it on the compute stream. This avoids ``record_stream`` pending-free growth
+    when combined-1F1B enqueues several dispatches ahead of their GPU consumers. Backward dispatch
+    outputs keep the default lifetime path because an immediate hand-back would serialize the next
+    forward dispatch. This optimization is limited to the statically scheduled low-precision
+    HybridEP overlap path, where the creation stream and final consumer are both known.
+    """
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
@@ -2209,6 +2218,33 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_use_grouped_tensor=True without use_transformer_engine_op_fuser is "
                     "not yet supported with the NCCL-EP dispatcher. Use the TE op-fuser path "
                     "or select the alltoall, DeepEP, or HybridEP dispatcher."
+                )
+
+        if self.moe_hybridep_use_manual_forward_stream_handback:
+            if not (
+                self.moe_token_dispatcher_type == "flex"
+                and self.moe_flex_dispatcher_backend == "hybridep"
+            ):
+                raise ValueError(
+                    "moe_hybridep_use_manual_forward_stream_handback requires the flex HybridEP "
+                    "backend."
+                )
+            if not self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "moe_hybridep_use_manual_forward_stream_handback requires "
+                    "overlap_moe_expert_parallel_comm."
+                )
+            if self.fp8 is None and self.fp4 is None:
+                raise ValueError(
+                    "moe_hybridep_use_manual_forward_stream_handback requires fp8 or fp4 so the "
+                    "expert MLP can release its original dispatch input after the forward cast."
+                )
+            if self.fine_grained_activation_offloading and 'expert_fc1' in (
+                self.offload_modules or []
+            ):
+                raise ValueError(
+                    "moe_hybridep_use_manual_forward_stream_handback does not support offloading "
+                    "'expert_fc1', which retains the original dispatch input beyond MLP forward."
                 )
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into

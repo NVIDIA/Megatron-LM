@@ -333,6 +333,7 @@ class TransformerLayerNode(ScheduleNode):
         name="default",
         bwd_dw_callables=None,
         extra_args={},
+        free_input_handback_stream=None,
     ):
         """Initialize a transformer layer node.
 
@@ -346,6 +347,8 @@ class TransformerLayerNode(ScheduleNode):
             name (str): Node name, also used to determine memory strategy
             bwd_dw_callables (list): List of weight gradient functions for the layer.
             extra_args (dict): Extra arguments for the node: is_moe, config.
+            free_input_handback_stream (torch.cuda.Stream or callable, optional): Stream that
+                created a cross-stream input and should regain ownership after its last consumer.
         """
         # Determine whether to free input memory
         config = extra_args.get("config", None)
@@ -364,6 +367,7 @@ class TransformerLayerNode(ScheduleNode):
             event,
             weak_method(self.backward_impl),
             free_input=free_input,
+            free_input_handback_stream=free_input_handback_stream,
             name=name,
         )
         self.layer_state = layer_state
