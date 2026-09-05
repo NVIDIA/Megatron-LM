@@ -72,6 +72,11 @@ class TestMcoreAdapterDense:
         model_parallel_cuda_manual_seed(1234)
 
     def teardown_method(self):
+        # The wrapper stores capture state globally. Reset it so the next parametrized
+        # case captures its own optimizer step instead of replaying this case's graph.
+        OptimizerCudaGraphWrapper.curr_iteration = 0
+        OptimizerCudaGraphWrapper.cuda_graph = None
+        OptimizerCudaGraphWrapper.result = None
         _destroy_model_parallel()
 
     def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(self):
@@ -214,9 +219,13 @@ class TestMcoreAdapterDense:
 
         assert fully_shard_context_calls == [True]
 
-    @pytest.mark.parametrize("optimizer_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
-    @pytest.mark.parametrize("cuda_graph_impl", ["none", "full_iteration"])
-    def test_build_train_and_step(self, optimizer_cuda_graph, cuda_graph_impl):
+    @pytest.mark.parametrize(
+        "optimizer_cuda_graph", [False, True], ids=["optimizer_eager", "optimizer_cuda_graph"]
+    )
+    @pytest.mark.parametrize(
+        "model_cuda_graph", [False, True], ids=["model_eager", "model_cuda_graph"]
+    )
+    def test_build_train_and_step(self, optimizer_cuda_graph, model_cuda_graph):
         config = TransformerConfig(
             num_layers=2,
             hidden_size=16,
@@ -226,7 +235,7 @@ class TestMcoreAdapterDense:
             params_dtype=torch.bfloat16,
             attention_dropout=0.0,
             hidden_dropout=0.0,
-            cuda_graph_impl=cuda_graph_impl,
+            cuda_graph_impl="full_iteration" if model_cuda_graph else "none",
         )
         reference_model = _build_block(config)
         model = _build_block(config)
@@ -265,20 +274,17 @@ class TestMcoreAdapterDense:
             reference_optimizer_config,
             optimizer_cuda_graph=optimizer_cuda_graph,
             use_precision_aware_optimizer=True,
+            # Exercise MFSDP v2's precision-aware optimizer with BF16 moment state.
             exp_avg_dtype=torch.bfloat16,
             exp_avg_sq_dtype=torch.bfloat16,
         )
-        with pytest.raises(
-            ValueError, match="MFSDP v2 currently requires use_distributed_optimizer=False"
-        ):
-            get_megatron_optimizer(
-                replace(reference_optimizer_config, use_distributed_optimizer=True),
-                [model],
-            )
         optimizer = get_megatron_optimizer(optimizer_config, [model])
         assert isinstance(optimizer, FullyShardedOptimizer)
         optimizer.reload_model_params()
         if optimizer_cuda_graph:
+            # The factory makes FusedAdam capturable from optimizer_cuda_graph, but the
+            # training loop installs the graph-capture wrapper separately. Mirror that
+            # production wiring here so this case actually replays optimizer.step().
             optimizer.step = OptimizerCudaGraphWrapper(optimizer.step, cuda_graph_warmup_steps=1)
 
         steps = [
@@ -317,10 +323,9 @@ class TestMcoreAdapterDense:
                 assert success
                 losses.append(torch.stack(microbatch_losses).mean())
 
-        if optimizer_cuda_graph:
-            # The first step is eager; capture replays once and every subsequent step replays.
-            graph_launches = sum(event.name == "cudaGraphLaunch" for event in prof.events())
-            assert graph_launches == len(steps) - 1
+        expected_graph_launches = optimizer_cuda_graph * (len(steps) - 1)
+        graph_launches = sum(event.name == "cudaGraphLaunch" for event in prof.events())
+        assert graph_launches == expected_graph_launches
 
         for state in optimizer.optimizer.state.values():
             assert state["exp_avg"].dtype == torch.bfloat16
@@ -366,12 +371,7 @@ class TestMcoreAdapterDense:
             use_distributed_optimizer=False,
             clip_grad=0.0,
         )
-        optimizer = get_megatron_optimizer(
-            optimizer_config,
-            [model],
-            use_gloo_process_groups=False,
-            pg_collection=self.pg_collection,
-        )
+        optimizer = get_megatron_optimizer(optimizer_config, [model])
 
         optimizer.zero_grad(set_to_none=True)
         output = model(
@@ -584,12 +584,8 @@ class TestMcoreAdapterExpertParallel:
         optimizer_config = OptimizerConfig(
             lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=1.0e-4
         )
-        reference_optimizer = get_megatron_optimizer(
-            optimizer_config, [reference_model], use_gloo_process_groups=False
-        )
-        optimizer = get_megatron_optimizer(
-            replace(optimizer_config), [model], use_gloo_process_groups=False
-        )
+        reference_optimizer = get_megatron_optimizer(optimizer_config, [reference_model])
+        optimizer = get_megatron_optimizer(optimizer_config, [model])
         assert isinstance(optimizer, FullyShardedOptimizer)
         optimizer.reload_model_params()
 
@@ -700,8 +696,6 @@ class TestMcoreAdapterHybrid:
                 clip_grad=0.0,
             ),
             [model],
-            pg_collection=pg_collection,
-            use_gloo_process_groups=False,
         )
         losses = []
         for step in range(steps):
@@ -832,8 +826,6 @@ class TestMcoreAdapterHybrid:
                 clip_grad=0.0,
             ),
             [model],
-            pg_collection=pg_collection,
-            use_gloo_process_groups=False,
         )
 
         optimizer.zero_grad(set_to_none=True)
