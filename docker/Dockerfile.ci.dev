@@ -8,8 +8,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG UV_VERSION=0.7.2
 ARG TARGETARCH
 ARG YQ_VERSION=4.44.1
-# TE 2.18's NCCL EP build requires NCCL 2.30.7+; the 26.06 base uses CUDA 13.3.
-ARG NCCL_VERSION=2.30.7-1+cuda13.3
+ARG REINSTALL_NCCL=False
+ARG NCCL_VERSION
 ARG NCCL_EXTENSIONS_VERSION=0.1.0
 ENV PATH="/usr/local/bin:$PATH"
 ARG UV_PROJECT_ENVIRONMENT=/opt/venv
@@ -48,7 +48,22 @@ RUN bash -ex <<"EOF"
 EOF
 
 RUN --mount=type=bind,source=docker/common/install_nccl.sh,target=/opt/install_nccl.sh \
-    bash /opt/install_nccl.sh --NCCL_VER=${NCCL_VERSION}
+    bash -ex <<"EOF"
+    case "${REINSTALL_NCCL}" in
+        True)
+            if [ -z "${NCCL_VERSION}" ]; then
+                echo "NCCL_VERSION must be set when REINSTALL_NCCL=True" >&2
+                exit 1
+            fi
+            bash /opt/install_nccl.sh --NCCL_VER="${NCCL_VERSION}"
+            ;;
+        False) ;;
+        *)
+            echo "REINSTALL_NCCL must be True or False" >&2
+            exit 1
+            ;;
+    esac
+EOF
 
 COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
@@ -129,6 +144,7 @@ ENV HYBRID_EP_MULTINODE=1
 ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
 COPY docker/patches/deepep.patch /workspace/deepep.patch
+COPY docker/patches/deepep-nvshmem.patch /workspace/deepep-nvshmem.patch
 RUN bash -ex <<"EOF"
     if [ "$IMAGE_TYPE" = "lts" ]; then
         echo "[DeepEP] skipping install for IMAGE_TYPE=lts"
@@ -144,16 +160,21 @@ RUN bash -ex <<"EOF"
     ln -sfn /usr/lib/${ARCH_LIB} ${RDMA_CORE_HOME}/lib
 
     cd /workspace
-    uv pip install nvidia-nvshmem-cu13==3.4.5
+    # DeepEP discovers NVSHMEM through the wheel, including the headers and
+    # static archive it needs. Keep its runtime ABI aligned with NGC PyTorch.
+    uv pip install nvidia-nvshmem-cu13==3.7.1
     pushd /opt/venv/lib/python3.12/site-packages/nvidia/nvshmem/lib/
         ln -sf libnvshmem_host.so.3 libnvshmem_host.so
     popd
+    python -c "import torch"
 
     git clone https://github.com/deepseek-ai/DeepEP.git
     pushd DeepEP
         git fetch origin $DEEPEP_COMMIT
         git checkout FETCH_HEAD
         patch -p1 < /workspace/deepep.patch
+        # Backport deepseek-ai/DeepEP#564 for NVSHMEM 3.5 and newer.
+        patch -p1 < /workspace/deepep-nvshmem.patch
         apt-get update
         apt-get install -y --no-install-recommends libnvidia-ml-dev
         TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v .
