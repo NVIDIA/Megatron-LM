@@ -64,9 +64,6 @@ def open_file(*args, **kwargs):
         return open(*args, **kwargs)
 
 
-__all__ = ['MultiStorageClientFeature', 'open_file']
-
-
 class MaybeMultiStorageClient:
     """Resolve filesystem helpers through MSC only when it is enabled."""
 

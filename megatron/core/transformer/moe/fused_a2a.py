@@ -499,9 +499,6 @@ except ImportError:
 
 _hybrid_ep_buffer = None
 
-# HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
-HYBRIDEP_TOKEN_ALIGNMENT = 64
-
 
 # HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
 HYBRIDEP_TOKEN_ALIGNMENT = 64
