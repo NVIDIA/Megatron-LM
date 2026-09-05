@@ -1,11 +1,21 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
+import megatron.core.models.common.language_module.language_module as language_module
+import megatron.core.pipeline_parallel.utils as pipeline_utils
+import megatron.training.models.dist_utils as dist_utils
+import megatron.training.training as training
+from megatron.core.models.common.language_module.language_module import (
+    LanguageModule,
+    defer_initial_embedding_sync,
+)
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
@@ -56,6 +66,164 @@ def create_test_args():
     args.phase_transition_iterations = None
 
     return args
+
+
+def _make_mtp_language_module():
+    module = LanguageModule.__new__(LanguageModule)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        init_model_with_meta_device=False,
+        mtp_num_layers=1,
+        pipeline_model_parallel_size=2,
+        use_mup=False,
+    )
+    module.share_embeddings_and_output_weights = False
+    module.mtp_process = True
+    module.pre_process = False
+    module.post_process = False
+    module.vp_stage = 1
+    module.vp_size = 2
+    module.pp_group = None
+    module.embd_group = object()
+    module.embedding = torch.nn.Module()
+    module.embedding.word_embeddings = torch.nn.Embedding(4, 2)
+    return module
+
+
+def _model_construction_config():
+    return SimpleNamespace(
+        bf16=False,
+        fp16=False,
+        freeze_all_layers=False,
+        init_model_with_meta_device=False,
+        use_cpu_initialization=True,
+        use_megatron_fsdp=False,
+        use_torch_fsdp2=True,
+        virtual_pipeline_model_parallel_size=3,
+    )
+
+
+def _model_construction_pg_collection():
+    pp_group = mock.Mock()
+    pp_group.size.return_value = 2
+    return SimpleNamespace(cp=object(), dp=object(), gtp_remat=object(), pp=pp_group, tp=object())
+
+
+def _record_deferred_scope(event_log):
+    @contextmanager
+    def context():
+        event_log.append("enter-defer")
+        try:
+            yield
+        finally:
+            event_log.append("exit-defer")
+
+    return context
+
+
+def _make_sync_recording_model(event_log, vp_stage):
+    model = torch.nn.Module()
+
+    def record_sync():
+        event_log.append(f"sync-{vp_stage}")
+
+    setattr(model, "sync_initial_embeddings_and_output_layer", record_sync)
+    return model
+
+
+def test_mtp_embedding_sync_is_deferred_until_explicit_sync(monkeypatch):
+    module = _make_mtp_language_module()
+    shared_weight = mock.Mock()
+    shared_weight.data.cuda.return_value = shared_weight.data
+    module.shared_embedding_or_output_weight = mock.Mock(return_value=shared_weight)
+    module._is_in_embd_group = mock.Mock(return_value=True)
+    all_reduce = mock.Mock()
+    monkeypatch.setattr(
+        language_module, "is_vp_first_stage", lambda vp_stage, _vp_size: vp_stage == 0
+    )
+    monkeypatch.setattr(language_module, "is_pp_first_stage", lambda _group: False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+
+    with defer_initial_embedding_sync():
+        module.setup_embeddings_and_output_layer()
+
+    all_reduce.assert_not_called()
+    module.sync_initial_embeddings_and_output_layer()
+    all_reduce.assert_called_once_with(shared_weight.data, group=module.embd_group)
+
+    all_reduce.reset_mock()
+    module.setup_embeddings_and_output_layer()
+    all_reduce.assert_called_once_with(shared_weight.data, group=module.embd_group)
+
+
+def test_vpp_builders_sync_embeddings_after_all_chunks_are_built(monkeypatch):
+    expected_events = [
+        "enter-defer",
+        "build-0",
+        "build-1",
+        "build-2",
+        "exit-defer",
+        "sync-0",
+        "sync-1",
+        "sync-2",
+    ]
+
+    legacy_events = []
+    legacy_args = _model_construction_config()
+    legacy_pg = _model_construction_pg_collection()
+    monkeypatch.setattr(training, "get_args", lambda: legacy_args)
+    monkeypatch.setattr(training, "get_pg_size", lambda group: 2 if group is legacy_pg.pp else 1)
+    monkeypatch.setattr(training, "get_pg_rank", lambda _group: 1)
+    monkeypatch.setattr(training, "is_pp_first_stage", lambda _group: True)
+    monkeypatch.setattr(training, "is_pp_last_stage", lambda _group: False)
+    monkeypatch.setattr(training, "correct_amax_history_if_needed", lambda _model: None)
+    monkeypatch.setattr(training, "has_nvidia_modelopt", False)
+    monkeypatch.setattr(
+        training, "defer_initial_embedding_sync", _record_deferred_scope(legacy_events)
+    )
+
+    def legacy_model_provider(**kwargs):
+        legacy_events.append(f"build-{kwargs['vp_stage']}")
+        return _make_sync_recording_model(legacy_events, kwargs["vp_stage"])
+
+    legacy_model = training.get_model(
+        legacy_model_provider, wrap_with_ddp=False, pg_collection=legacy_pg
+    )
+
+    assert len(legacy_model) == 3
+    assert legacy_events == expected_events
+
+    builder_events = []
+    builder_config = _model_construction_config()
+    builder_pg = _model_construction_pg_collection()
+    monkeypatch.setattr(pipeline_utils, "is_pp_first_stage", lambda _group: True)
+    monkeypatch.setattr(pipeline_utils, "is_pp_last_stage", lambda _group: False)
+    monkeypatch.setattr(
+        pipeline_utils, "is_vp_first_stage", lambda vp_stage, vp_size: vp_stage == 0
+    )
+    monkeypatch.setattr(
+        pipeline_utils, "is_vp_last_stage", lambda vp_stage, vp_size: vp_stage == vp_size - 1
+    )
+    monkeypatch.setattr(
+        dist_utils, "defer_initial_embedding_sync", _record_deferred_scope(builder_events)
+    )
+    monkeypatch.setattr(
+        dist_utils,
+        "prepare_existing_model_chunks_for_distributed_training",
+        lambda model, *_args, **_kwargs: model,
+    )
+
+    def build_model(_pg_collection, *, vp_stage, **_kwargs):
+        builder_events.append(f"build-{vp_stage}")
+        return _make_sync_recording_model(builder_events, vp_stage)
+
+    builder_model = dist_utils.unimodal_build_distributed_models(
+        build_model, builder_config, builder_pg, wrap_with_ddp=False
+    )
+
+    assert len(builder_model) == 3
+    assert builder_events == expected_events
 
 
 class TestTraining:

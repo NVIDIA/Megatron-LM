@@ -60,6 +60,10 @@ from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
+from megatron.core.models.common.language_module.language_module import (
+    defer_initial_embedding_sync,
+    sync_initial_embeddings_and_output_layers,
+)
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_gated_delta_net_variant,
     is_linear_attention_variant,
@@ -2444,12 +2448,14 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
 
+    should_defer_embedding_sync = (
+        get_pg_size(pg_collection.pp) > 1
+        and args.virtual_pipeline_model_parallel_size is not None
+    )
+
     # Build model.
     def build_model():
-        if (
-            get_pg_size(pg_collection.pp) > 1
-            and args.virtual_pipeline_model_parallel_size is not None
-        ):
+        if should_defer_embedding_sync:
             model = []
             vp_size = args.virtual_pipeline_model_parallel_size
             for i in range(vp_size):
@@ -2483,14 +2489,23 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         return model
 
 
-    if args.init_model_with_meta_device:
-        with torch.device('meta'):
+    embedding_sync_context = (
+        defer_initial_embedding_sync()
+        if should_defer_embedding_sync
+        else nullcontext()
+    )
+    with embedding_sync_context:
+        if args.init_model_with_meta_device:
+            with torch.device('meta'):
+                model = build_model()
+        else:
             model = build_model()
-    else:
-        model = build_model()
 
     if not isinstance(model, list):
         model = [model]
+
+    if should_defer_embedding_sync:
+        sync_initial_embeddings_and_output_layers(model)
 
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
