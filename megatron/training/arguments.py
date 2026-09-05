@@ -2470,6 +2470,8 @@ def _add_network_size_args(parser):
         "heterogeneous_block_specs",
         "hetereogenous_dist_checkpoint",
         "quant_recipe",
+        "fp8_recipe_attrs",
+        "fp4_recipe_attrs",
         # deprecated and no CLI arg exists
         "tp_comm_atomic_ag",
         "tp_comm_atomic_rs",

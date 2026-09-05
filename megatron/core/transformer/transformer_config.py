@@ -5,7 +5,7 @@ import math
 import warnings
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Callable, List, Literal, Optional, Self, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Self, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -670,6 +670,9 @@ class TransformerConfig(ModelParallelConfig):
     under the MXFP8 autocast context. Only active when fp8=True and
     fp8_recipe='mxfp8'."""
 
+    fp8_recipe_attrs: Optional[Dict[str, Any]] = None
+    """Attributes to set in the FP8 recipe."""
+
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
 
@@ -710,8 +713,9 @@ class TransformerConfig(ModelParallelConfig):
     supports 'nvfp4' which uses NVFP4BlockScaling recipe (requires TE >= 2.7.0.dev0)."""
 
     fp4_recipe: Optional[Literal['nvfp4', 'custom']] = "nvfp4"
-    """If set, enables the use of FP4 precision through Transformer Engine. Currently only
-    'nvfp4' is supported which uses NVFP4BlockScaling recipe for Blackwell+ architecture."""
+    """If set, enables the use of FP4 precision through Transformer Engine."""
+    fp4_recipe_attrs: Optional[Dict[str, Any]] = None
+    """Attributes to set in the FP4 recipe."""
 
     fp4_param: bool = field(
         default=False, metadata={"argparse_meta": {"arg_names": ["--fp4-param-gather"]}}

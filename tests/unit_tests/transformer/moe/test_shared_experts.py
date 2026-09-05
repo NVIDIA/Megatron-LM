@@ -116,6 +116,16 @@ def _patch_fake_shared_expert_te(monkeypatch, linear_cls=_FakeTELinear):
     fake_te = _fake_te_module(linear_cls)
     monkeypatch.setattr(shared_experts_module, "HAVE_TE", True)
     monkeypatch.setattr(shared_experts_module, "te", fake_te)
+    monkeypatch.setattr(
+        shared_experts_module,
+        "get_fp8_recipe",
+        lambda _config: fake_te.common.recipe.MXFP8BlockScaling(),
+    )
+    monkeypatch.setattr(
+        shared_experts_module,
+        "get_fp4_recipe",
+        lambda _config: fake_te.common.recipe.NVFP4BlockScaling(),
+    )
     monkeypatch.setattr(shared_experts_module, "is_te_min_version", lambda *args, **kwargs: True)
     monkeypatch.setattr(shared_experts_module, "get_pg_size", lambda group: 1)
     monkeypatch.setattr(
@@ -137,9 +147,9 @@ def _fake_shared_expert(**config_kwargs):
         moe_shared_expert_glu_interleave_size=32,
         delay_wgrad_compute=False,
         sequence_parallel=False,
-        fp4=False,
+        fp4=None,
         fp4_recipe="nvfp4",
-        fp8=True,
+        fp8="e4m3",
         fp8_recipe="mxfp8",
     )
     for key, value in config_kwargs.items():
