@@ -1262,14 +1262,30 @@ def validate_args(args, defaults={}):
                 "--megatron-fsdp-prefetch-recompute-forward-weights is only supported "
                 'with --data-parallel-sharding-strategy optim_grads_params.'
             )
-            assert args.recompute_granularity == "full", (
-                "--megatron-fsdp-prefetch-recompute-forward-weights is only supported "
-                "with full activation recomputation."
-            )
-            assert not args.overlap_moe_expert_parallel_comm, (
-                "--megatron-fsdp-prefetch-recompute-forward-weights is not supported "
-                "with --overlap-moe-expert-parallel-comm."
-            )
+            if args.recompute_granularity == "full":
+                assert not args.overlap_moe_expert_parallel_comm, (
+                    "--megatron-fsdp-prefetch-recompute-forward-weights with full "
+                    "activation recomputation is not supported with "
+                    "--overlap-moe-expert-parallel-comm."
+                )
+            else:
+                assert args.recompute_granularity == "selective", (
+                    "--megatron-fsdp-prefetch-recompute-forward-weights requires "
+                    "full activation recomputation, or selective recomputation of "
+                    "mla_up_proj."
+                )
+                assert "mla_up_proj" in (args.recompute_modules or []), (
+                    "Selective --megatron-fsdp-prefetch-recompute-forward-weights "
+                    "requires mla_up_proj in --recompute-modules."
+                )
+                assert (
+                    args.cuda_graph_impl != "full_iteration"
+                    or args.overlap_moe_expert_parallel_comm
+                ), (
+                    "Selective --megatron-fsdp-prefetch-recompute-forward-weights with "
+                    "full-iteration CUDA graphs requires "
+                    "--overlap-moe-expert-parallel-comm."
+                )
 
         if args.nccl_ub:
             # In Megatron-LM, required implementation for manual registration is already provided.
