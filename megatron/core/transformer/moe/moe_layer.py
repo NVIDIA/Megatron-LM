@@ -15,6 +15,7 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_rout
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -205,6 +206,13 @@ class BaseMoELayer(MegatronModule, ABC):
 
         self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
         self.shared_expert_overlap = self.config.moe_shared_expert_overlap
+        self.run_shared_experts_before_router = (
+            self.config.cuda_graph_impl == "transformer_engine"
+            and bool(
+                {CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess}
+                & set(self.config.cuda_graph_modules)
+            )
+        )
 
         self.local_expert_indices = [
             local_expert_indices_offset + i for i in range(self.num_local_experts)
@@ -720,14 +728,21 @@ class MoELayer(BaseMoELayer):
             shared_expert_output = None
             try:
                 if "route" in self.fwd_execution_map:
+                    # preprocess rebinds hidden_states to the dispatch input (latent, flattened);
+                    # the shared experts always consume the layer input.
+                    layer_input = hidden_states
+                    if self.run_shared_experts_before_router:
+                        shared_expert_output = self.shared_experts_compute(layer_input)
+
                     probs, routing_map = self.route(
-                        hidden_states, padding_mask, input_ids, packed_seq_params=packed_seq_params
+                        layer_input, padding_mask, input_ids, packed_seq_params=packed_seq_params
                     )
                     hidden_states, probs = self.preprocess(
-                        hidden_states, probs, routing_map, padding_mask
+                        layer_input, probs, routing_map, padding_mask
                     )
-                    shared_expert_output = self.shared_experts_compute(hidden_states)
 
+                    if not self.run_shared_experts_before_router:
+                        shared_expert_output = self.shared_experts_compute(layer_input)
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output
 

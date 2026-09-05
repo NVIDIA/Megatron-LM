@@ -26,6 +26,9 @@ import torch.nn.functional as F
 
 from megatron.core.activations import squared_relu
 from megatron.core.transformer.moe import fused_a2a
+from megatron.core.transformer.moe.virtual_expert_load_balancer import (
+    finalize_virtual_expert_weight_bridges,
+)
 
 MXFP8_COMPONENTS = (
     "_rowwise_data",
@@ -33,6 +36,9 @@ MXFP8_COMPONENTS = (
     "_columnwise_data",
     "_columnwise_scale_inv",
 )
+
+# The GB200 CI bucket launches marked files with four ranks, which these tests need.
+pytestmark = pytest.mark.launch_on_gb200
 
 requires_four_ranks = pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) != 4
@@ -68,13 +74,22 @@ def _set_main_grad(parameter, dtype=torch.float32):
     parameter.overwrite_main_grad = True
 
 
+def _dense_linears(layer):
+    """The layer's ordinary TE linears: latent projections and shared experts, if present."""
+    linears = []
+    if layer.config.moe_latent_size is not None:
+        linears += [layer.fc1_latent_proj, layer.fc2_latent_proj]
+    if layer.use_shared_expert:
+        linears += [layer.shared_experts.linear_fc1, layer.shared_experts.linear_fc2]
+    return linears
+
+
 def _set_main_grads(layer, dtype):
     for linear in (layer.experts.linear_fc1, layer.experts.linear_fc2):
         for index in range(linear.num_gemms):
             _set_main_grad(linear.get_parameter(f"weight{index}"), dtype)
-    if layer.config.moe_latent_size is not None:
-        _set_main_grad(layer.fc1_latent_proj.weight, dtype)
-        _set_main_grad(layer.fc2_latent_proj.weight, dtype)
+    for linear in _dense_linears(layer):
+        _set_main_grad(linear.weight, dtype)
 
 
 def _stack_linear_main_grad(linear):
@@ -152,6 +167,7 @@ def _run_full_layer_parity(
     *,
     activation="swiglu",
     moe_latent_size=None,
+    shared_expert_size=None,
     mxfp8=False,
     gtp=False,
     grad_dtype=torch.float32,
@@ -198,6 +214,7 @@ def _run_full_layer_parity(
         "gated_linear_unit": activation == "swiglu",
         "use_fused_weighted_squared_relu": activation != "swiglu",
         "moe_latent_size": moe_latent_size,
+        "moe_shared_expert_intermediate_size": shared_expert_size,
     }
     if mxfp8:
         common.update(
@@ -241,15 +258,15 @@ def _run_full_layer_parity(
         for layer in (ref_layer, virtual_expert_layer):
             assert not layer.experts.linear_fc1.single_grouped_weight
             assert not layer.experts.linear_fc2.single_grouped_weight
-        if mxfp8 and moe_latent_size is not None:
+        if mxfp8:
             # In production DDP exposes an MXFP8 parameter's main-grad buffer
             # through its distributed-weight wrapper. This focused MoELayer test
-            # has no DDP wrapper, so let the two ordinary latent linears return
-            # wgrads through autograd; expert wgrads stay fused and exercise the
-            # virtual-expert reduction.
+            # has no DDP wrapper, so let the ordinary latent and shared-expert
+            # linears return wgrads through autograd; expert wgrads stay fused and
+            # exercise the virtual-expert reduction.
             for layer in (ref_layer, virtual_expert_layer):
-                layer.fc1_latent_proj.fuse_wgrad_accumulation = False
-                layer.fc2_latent_proj.fuse_wgrad_accumulation = False
+                for linear in _dense_linears(layer):
+                    linear.fuse_wgrad_accumulation = False
         virtual_expert_layer.load_state_dict(ref_layer.state_dict())
         assert virtual_expert_layer.state_dict().keys() == ref_layer.state_dict().keys()
         _set_main_grads(ref_layer, grad_dtype)
@@ -300,14 +317,13 @@ def _run_full_layer_parity(
                 _stack_linear_main_grad(layer.experts.linear_fc1),
                 _stack_linear_main_grad(layer.experts.linear_fc2),
             ]
-            if moe_latent_size is not None:
-                for projection in (layer.fc1_latent_proj, layer.fc2_latent_proj):
-                    gradient = (
-                        projection.weight.main_grad
-                        if projection.fuse_wgrad_accumulation
-                        else projection.weight.grad
-                    )
-                    values.append(gradient.detach().clone())
+            for linear in _dense_linears(layer):
+                gradient = (
+                    linear.weight.main_grad
+                    if linear.fuse_wgrad_accumulation
+                    else linear.weight.grad
+                )
+                values.append(gradient.detach().clone())
             return values
 
         ref_values = run(ref_layer)
@@ -342,6 +358,8 @@ def _run_full_layer_parity(
         names = ["output", "input grad", "router grad", "FC1 main_grad", "FC2 main_grad"]
         if moe_latent_size is not None:
             names += ["latent FC1 main_grad", "latent FC2 main_grad"]
+        if shared_expert_size is not None:
+            names += ["shared FC1 main_grad", "shared FC2 main_grad"]
         for name, actual, expected in zip(names, virtual_expert_values, ref_values):
             if bitwise and "main_grad" not in name:
                 tolerance = dict(rtol=0, atol=0)
@@ -366,9 +384,9 @@ def _run_full_layer_parity(
                 actual, expected, **tolerance, msg=lambda msg: f"{name}: {msg}"
             )
     finally:
-        # Virtual-expert bridges own CUDA work that can reference the HybridEP
-        # execution context. Finalize them first, then destroy the
-        # process-global buffer in lockstep across ranks.
+        # Release the arenas while their communicator is alive, then destroy the
+        # process-global HybridEP buffer in lockstep across ranks.
+        finalize_virtual_expert_weight_bridges()
         Utils.destroy_model_parallel()
         torch.cuda.synchronize()
         torch.distributed.barrier()
@@ -510,17 +528,21 @@ def _run_repeated_mtp_parity(monkeypatch):
         plans = []
         plan_dispatch = manager.plan_dispatch
 
-        def record_plan(hidden_states):
-            plan_dispatch(hidden_states)
+        def record_plan():
+            plan_dispatch()
             plans.append(manager._plan)
 
         manager.plan_dispatch = record_plan
         virtual_expert_loss = forward(virtual_expert_model)
         assert len(plans) == 2
         assert plans[0].experts_to_copy.data_ptr() != plans[1].experts_to_copy.data_ptr()
-        active_virtual_expert = torch.stack([torch.any(plan.experts_to_copy >= 0) for plan in plans]).any()
+        active_virtual_expert = torch.stack(
+            [torch.any(plan.experts_to_copy >= 0) for plan in plans]
+        ).any()
         torch.distributed.all_reduce(active_virtual_expert, op=torch.distributed.ReduceOp.MAX)
-        assert active_virtual_expert.item(), "repeated MTP parity must exercise an active virtual-expert"
+        assert (
+            active_virtual_expert.item()
+        ), "repeated MTP parity must exercise an active virtual-expert"
 
         virtual_expert_loss.sum().backward()
         virtual_expert_gradients = snapshot(virtual_expert_model)
@@ -535,7 +557,9 @@ def _run_repeated_mtp_parity(monkeypatch):
         )
         assert virtual_expert_gradients.keys() == reference_gradients.keys()
         for name in virtual_expert_gradients:
-            virtual_expert_grad, virtual_expert_main_grad, virtual_expert_fused = virtual_expert_gradients[name]
+            virtual_expert_grad, virtual_expert_main_grad, virtual_expert_fused = (
+                virtual_expert_gradients[name]
+            )
             reference_grad, reference_main_grad, reference_fused = reference_gradients[name]
             assert virtual_expert_fused == reference_fused, name
             assert (virtual_expert_grad is None) == (reference_grad is None), name
@@ -559,7 +583,11 @@ def _run_repeated_mtp_parity(monkeypatch):
                 msg=lambda msg, name=name: f"{name} main_grad: {msg}",
             )
     finally:
+        # The losses keep the autograd graphs, whose TE contexts hold the runtime parameters
+        # aliasing the symmetric arenas; drop them so the arenas are released with the group.
+        reference_loss = virtual_expert_loss = None
         del reference_model, virtual_expert_model
+        finalize_virtual_expert_weight_bridges()
         Utils.destroy_model_parallel()
         torch.cuda.synchronize()
         torch.distributed.barrier()
@@ -571,7 +599,8 @@ def _run_repeated_mtp_parity(monkeypatch):
 @pytest.mark.internal
 @requires_four_ranks
 def test_virtual_expert_hybridep_production_recipe_matches_alltoall(monkeypatch):
-    """Cover the production combination: MXFP8 weights, GTP experts, BF16 grads, latent MoE."""
+    """Cover the production combination: MXFP8 weights, GTP experts, BF16 grads, latent MoE
+    with shared experts (which must see the full-width layer input, not the latent one)."""
     try:
         from transformer_engine.pytorch.ops import ScaledSReLU  # noqa: F401
     except ImportError:
@@ -580,6 +609,7 @@ def test_virtual_expert_hybridep_production_recipe_matches_alltoall(monkeypatch)
         monkeypatch,
         activation="squared_relu",
         moe_latent_size=640,
+        shared_expert_size=1024,
         mxfp8=True,
         gtp=True,
         grad_dtype=torch.bfloat16,

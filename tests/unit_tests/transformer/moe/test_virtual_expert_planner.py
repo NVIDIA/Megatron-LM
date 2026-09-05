@@ -35,6 +35,9 @@ from megatron.core.transformer.moe.virtual_expert_load_balancer import (
 )
 from megatron.core.transformer.moe.virtual_expert_triton import launch_virtual_expert_placement
 
+# The GB200 CI bucket launches marked files with four ranks, which these tests need.
+pytestmark = pytest.mark.launch_on_gb200
+
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 # One fixed planner shape drives every placement test: four ranks owning two
