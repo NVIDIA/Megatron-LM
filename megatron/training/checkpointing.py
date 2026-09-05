@@ -1026,8 +1026,7 @@ def save_checkpoint(
 
     # And update the latest iteration
     if not skip_weight_ckpt and (
-        not torch.distributed.is_initialized()
-        or torch.distributed.get_rank() == 0
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     ):
         tracker_filename = get_checkpoint_tracker_filename(save_dir)
 
@@ -1158,9 +1157,7 @@ def save_checkpoint(
             iter_finalize_fn()
 
     # Additional callback for one_logger (last rank)
-    if not skip_weight_ckpt and (
-        not torch.distributed.is_initialized() or is_last_rank()
-    ):
+    if not skip_weight_ckpt and (not torch.distributed.is_initialized() or is_last_rank()):
 
         def onelogger_finalize_fn():
             on_save_checkpoint_success(productive_metrics, args.async_save)
@@ -1172,9 +1169,7 @@ def save_checkpoint(
             onelogger_finalize_fn()
 
     # Additional callback for wandb (last rank)
-    if not skip_weight_ckpt and (
-        not torch.distributed.is_initialized() or is_last_rank()
-    ):
+    if not skip_weight_ckpt and (not torch.distributed.is_initialized() or is_last_rank()):
 
         def wandb_finalize_fn():
             wandb_utils.on_save_checkpoint_success(
@@ -1208,16 +1203,16 @@ def save_checkpoint(
             # never skips or replays a window. Written by a single rank -- the last rank, which
             # lives on the last pipeline stage where the logits saver is attached (get_logits_saver
             # is None on earlier stages, including global rank 0 when PP > 1).
-            if skip_weight_ckpt and (
-                not torch.distributed.is_initialized() or is_last_rank()
-            ):
+            if skip_weight_ckpt and (not torch.distributed.is_initialized() or is_last_rank()):
 
                 def progress_finalize_fn():
                     tracker_filename = get_checkpoint_tracker_filename(args.save)
                     with maybe_msc.open(tracker_filename, 'w') as f:
                         f.write(str(iteration))
-                    print_rank_last(f"  recorded logits-dump progress: iteration "
-                                    f"{iteration} to {tracker_filename}")
+                    print_rank_last(
+                        f"  recorded logits-dump progress: iteration "
+                        f"{iteration} to {tracker_filename}"
+                    )
 
                 logits_finalize_fns.append(progress_finalize_fn)
             async_request_cls = get_async_strategy(args.async_strategy)[1]['AsyncRequest']
@@ -2224,7 +2219,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
         print_rank_0('Checkpoint not found to provide arguments, using provided arguments.')
         return args
 
-    if 'args' not in state_dict:
+    if state_dict.get('args') is None:
         print_rank_0('Checkpoint provided does not have arguments saved, using provided arguments.')
         return args
 
@@ -2366,7 +2361,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     return args, checkpoint_args
 
 
-def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
+def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model, checkpoint_name=None, ckpt_format=None):
     """Detect a GPT (pure transformer) checkpoint being loaded into a HybridModel run.
 
     Returns ``(layer_maps, load_optim)`` where ``layer_maps`` is used to retarget
@@ -2402,7 +2397,20 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     ckpt_pattern = getattr(ckpt_args, 'hybrid_layer_pattern', None) or getattr(
         ckpt_args, 'hybrid_override_pattern', None
     )
-    if runtime_is_hybrid == bool(ckpt_pattern):
+    checkpoint_is_hybrid = bool(ckpt_pattern)
+    if ckpt_args is None:
+        if ckpt_format == 'torch_dist':
+            checkpoint_keys = dist_checkpointing.load_tensors_metadata(checkpoint_name)
+        else:
+            checkpoint_keys = FileSystemReader(checkpoint_name).read_metadata().state_dict_metadata
+        has_gpt_layout = any('decoder.final_layernorm.' in key for key in checkpoint_keys)
+        checkpoint_is_hybrid = any('decoder.final_norm.' in key for key in checkpoint_keys)
+        if has_gpt_layout == checkpoint_is_hybrid and (has_gpt_layout or runtime_is_hybrid):
+            raise RuntimeError(
+                'Checkpoint tensor metadata does not uniquely identify a GPTModel or '
+                'HybridModel layout.'
+            )
+    if runtime_is_hybrid == checkpoint_is_hybrid:
         return None, False
     if not runtime_is_hybrid:
         raise RuntimeError(
@@ -2540,17 +2548,15 @@ def load_checkpoint(
     ignore_rng_state = False
     ignore_rerun_state = True
     ckpt_args = types.SimpleNamespace()
-    if (
-        ckpt_format in ('torch_dist', 'fsdp_dtensor')
-        and state_dict is not None
-        and 'args' in state_dict
-    ):
-        ckpt_args = state_dict.get('args') or types.SimpleNamespace()
+    if ckpt_format in ('torch_dist', 'fsdp_dtensor') and state_dict is not None:
+        ckpt_args = state_dict.get('args')
 
     # Both model-space torch_dist and fsdp_dtensor checkpoints carry model-keyed
     # optimizer state that can be retargeted from GPTModel to HybridModel.
     gpt_compat_layer_maps, gpt_compat_load_optim = (
-        _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model)
+        _maybe_setup_gpt_to_hybrid_load(
+            args, ckpt_args, model, checkpoint_name=checkpoint_name, ckpt_format=ckpt_format
+        )
         if ckpt_format in ('torch_dist', 'fsdp_dtensor') and state_dict is not None
         else (None, False)
     )
@@ -2873,7 +2879,7 @@ def load_checkpoint(
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
     # Check arguments.
-    if 'args' in state_dict and not args.finetune:
+    if state_dict.get('args') is not None and not args.finetune:
         checkpoint_args = state_dict['args']
         # A GPT block is split into separate attention and MLP positions in
         # HybridModel, so num_layers intentionally differs even for an
@@ -2909,8 +2915,10 @@ def load_checkpoint(
         args.consumed_train_samples = iteration * args.global_batch_size
         args.skipped_train_samples = 0
         update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
-        print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} '
-                     f'(consumed_train_samples {args.consumed_train_samples})')
+        print_rank_0(
+            f'--override-ckpt-iteration: start at iteration {iteration} '
+            f'(consumed_train_samples {args.consumed_train_samples})'
+        )
 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""

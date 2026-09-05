@@ -19,6 +19,7 @@ from unittest import mock
 import pytest
 import torch
 
+import megatron.training.checkpointing as checkpointing
 from megatron.core import parallel_state as ps
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
@@ -632,6 +633,21 @@ def _configure_checkpoint_args(args, ckpt_dir, parallel, moe, use_megatron_fsdp)
     args.num_attention_heads = _OPT_HEADS
 
 
+def _save_checkpoint_without_args(iteration, model, optimizer):
+    """Save a checkpoint whose cached args entry is explicitly None."""
+    generate_state_dict = checkpointing.generate_state_dict
+
+    def _generate_state_dict_without_args(*args, **kwargs):
+        state_dict = generate_state_dict(*args, **kwargs)
+        state_dict['args'] = None
+        return state_dict
+
+    with mock.patch.object(
+        checkpointing, 'generate_state_dict', new=_generate_state_dict_without_args
+    ):
+        save_checkpoint(iteration, model, optimizer, None, 0)
+
+
 def _run_gpt_to_hybrid_optimizer_load(
     tmp_path_dist_ckpt,
     src_parallel,
@@ -641,6 +657,7 @@ def _run_gpt_to_hybrid_optimizer_load(
     *,
     finetune=True,
     use_megatron_fsdp=False,
+    checkpoint_args_available=True,
 ):
     layer_maps = gpt_compatible_layer_maps(pattern)
     num_gpt_layers = layer_maps.num_gpt_layers
@@ -674,7 +691,10 @@ def _run_gpt_to_hybrid_optimizer_load(
             _seed_optimizer_moments(gpt_optimizer, seed=3)
             _configure_checkpoint_args(mock_args, ckpt_dir, src_parallel, moe, use_megatron_fsdp)
             mock_args.num_layers = num_gpt_layers
-            save_checkpoint(10, gpt_model, gpt_optimizer, None, 0)
+            if checkpoint_args_available:
+                save_checkpoint(10, gpt_model, gpt_optimizer, None, 0)
+            else:
+                _save_checkpoint_without_args(10, gpt_model, gpt_optimizer)
             Utils.destroy_model_parallel()
 
             # Build a hybrid model + optimizer (independently seeded moments) and
@@ -779,6 +799,88 @@ class TestGPTToHybridOptimizerLoad:
         _run_gpt_to_hybrid_optimizer_load(
             tmp_path_dist_ckpt, src_parallel, dest_parallel, pattern, moe, finetune=finetune
         )
+
+    @pytest.mark.internal
+    def test_no_args_gpt_checkpoint_loads_through_load_checkpoint(self, tmp_path_dist_ckpt):
+        _run_gpt_to_hybrid_optimizer_load(
+            tmp_path_dist_ckpt,
+            (1, 1, 1, 1, 1),
+            (1, 1, 1, 1, 1),
+            'M*-M*-',
+            False,
+            checkpoint_args_available=False,
+        )
+
+
+class TestNoArgsHybridCheckpointLoad:
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize('runtime_is_hybrid', [True, False], ids=['hybrid', 'gpt'])
+    def test_layout_is_checked_through_load_checkpoint(self, tmp_path_dist_ckpt, runtime_is_hybrid):
+        parallel = (1, 1, 1, 1, 1)
+        pattern = '*-*-'
+        Utils.initialize_model_parallel(1, 1)
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'no_args_hybrid_checkpoint') as ckpt_dir:
+            mock_args = parse_args(ignore_unknown_args=True)
+            with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
+                source_model, source_optimizer = setup_model_and_optimizer(
+                    seed=11,
+                    tp=1,
+                    pp=1,
+                    cp=1,
+                    ep=1,
+                    etp=1,
+                    use_megatron_fsdp=False,
+                    initialize_fn=partial(hybrid_provider_for_opt, pattern=pattern, moe=False),
+                )
+                source_module = _unwrap_interop_model(source_model[0])
+                expected_parameters = _model_parameter_snapshot(source_module)
+                _configure_checkpoint_args(mock_args, ckpt_dir, parallel, False, False)
+                mock_args.hybrid_layer_pattern = pattern
+                mock_args.num_layers = len(pattern)
+                _save_checkpoint_without_args(10, source_model, source_optimizer)
+                Utils.destroy_model_parallel()
+
+                Utils.initialize_model_parallel(1, 1)
+                initialize_fn = (
+                    partial(hybrid_provider_for_opt, pattern=pattern, moe=False)
+                    if runtime_is_hybrid
+                    else partial(gpt_provider_for_opt, num_gpt_layers=2, moe=False)
+                )
+                loaded_model, loaded_optimizer = setup_model_and_optimizer(
+                    seed=12,
+                    tp=1,
+                    pp=1,
+                    cp=1,
+                    ep=1,
+                    etp=1,
+                    use_megatron_fsdp=False,
+                    initialize_fn=initialize_fn,
+                )
+
+                _configure_checkpoint_args(mock_args, ckpt_dir, parallel, False, False)
+                mock_args.finetune = True
+                mock_args.hybrid_layer_pattern = pattern if runtime_is_hybrid else None
+                mock_args.num_layers = len(pattern) if runtime_is_hybrid else 2
+                if not runtime_is_hybrid:
+                    with pytest.raises(RuntimeError, match='hybrid model run'):
+                        load_checkpoint(loaded_model, loaded_optimizer, None)
+                    return
+
+                loaded_module = _unwrap_interop_model(loaded_model[0])
+                before_load = _model_parameter_snapshot(loaded_module)
+                iteration, _ = load_checkpoint(loaded_model, loaded_optimizer, None)
+
+                assert iteration == 0
+                assert any(
+                    not torch.equal(param, before_load[name])
+                    for name, param in loaded_module.named_parameters()
+                ), 'native HybridModel parameters do not appear to have been loaded'
+                for name, param in loaded_module.named_parameters():
+                    assert torch.equal(param, expected_parameters[name]), name
 
 
 class TestGPTToHybridFSDPLoad:
