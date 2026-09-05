@@ -12,6 +12,11 @@ import click
 import gitlab
 import requests
 
+if __package__:
+    from .archive_utils import safe_extract_zip
+else:
+    from archive_utils import safe_extract_zip
+
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 PROJECT_ID = int(os.getenv("CI_PROJECT_ID", 19378))
 GITHUB_REPO = os.getenv("GITHUB_REPOSITORY", "NVIDIA/Megatron-LM")
@@ -60,8 +65,8 @@ def download_from_gitlab(pipeline_id: int, only_failing: bool):
                 file_name = "__artifacts.zip"
                 with open(file_name, "wb") as f:
                     job.artifacts(streamed=True, action=f.write)
-                zip = zipfile.ZipFile(file_name)
-                zip.extractall("tmp")
+                with zipfile.ZipFile(file_name) as archive:
+                    safe_extract_zip(archive, "tmp")
                 logger.info("Downloaded artifacts of job %s", job.name)
             except Exception as e:
                 logger.error("Failed to download artifacts of job %s due to %s", job.name, e)
@@ -334,8 +339,8 @@ def _download_and_extract_artifact(
             f.write(chunk)
 
     # Extract the artifact
-    zip_file = zipfile.ZipFile(file_name)
-    zip_file.extractall("tmp")
+    with zipfile.ZipFile(file_name) as archive:
+        safe_extract_zip(archive, "tmp")
     logger.info("Downloaded and extracted artifact %s", artifact["name"])
 
     os.unlink(file_name)
