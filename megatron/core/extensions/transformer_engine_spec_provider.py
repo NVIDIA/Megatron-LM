@@ -17,7 +17,11 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-from megatron.core.models.backends import BackendSpecProvider
+from megatron.core.models.backends import (
+    BackendSpecProvider,
+    CrossEntropyTarget,
+    select_cross_entropy,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
 from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, SequentialMLP, TEGroupedMLP
@@ -35,6 +39,25 @@ class _TENormWithResidual:
 
 class TESpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
+
+    #: The optional package this backend needs. Declared here so there is one place to read
+    #: it from, and checked by ``require`` at the point a caller wants an early, clear
+    #: refusal. It is deliberately *not* checked when the provider is built: a spec may be
+    #: assembled without Transformer Engine installed -- several module-level specs are, at
+    #: import time -- and it is instantiating a TE module that fails.
+    REQUIRES = "transformer_engine"
+
+    def __init__(
+        self,
+        use_te_op_fuser: bool = False,
+        cross_entropy_loss_fusion: bool = False,
+        cross_entropy_fusion_impl: str = "native",
+        cuda_graph_impl: Optional[str] = None,
+    ) -> None:
+        self._use_te_op_fuser = use_te_op_fuser
+        self._cross_entropy_loss_fusion = cross_entropy_loss_fusion
+        self._cross_entropy_fusion_impl = cross_entropy_fusion_impl
+        self._cuda_graph_impl = cuda_graph_impl
 
     def linear(self) -> type:
         """Which linear module TE backend uses"""
@@ -112,3 +135,37 @@ class TESpecProvider(BackendSpecProvider):
         # transformer_engine.BasicOperation.forward has an overly permissive return type, but by
         # design these classes always meet the interface.
         return cast(TEActivationFunctionBuilder, TEActivationOp)
+
+    def mlp_module(self, grouped: bool = False) -> type:
+        """The dense MLP block, fused into TE operations when the fuser is on."""
+        if not self._use_te_op_fuser:
+            from megatron.core.transformer.mlp import MLP
+
+            return MLP
+        from megatron.core.extensions.transformer_engine import (
+            TEFusedMLP,
+            TEFusedMLPWithGroupedLinear,
+        )
+
+        target = TEFusedMLPWithGroupedLinear if grouped else TEFusedMLP
+        if target is None:
+            raise ImportError(
+                "Transformer Engine is installed but does not expose the operation-fused MLP."
+            )
+        return target
+
+    def moe_router(self) -> Optional[type]:
+        """Keep the MoESubmodules default."""
+        return None
+
+    def vocab_parallel_cross_entropy(self) -> CrossEntropyTarget:
+        """Which vocab-parallel cross entropy to use.
+
+        Which one depends on the config rather than on this being the TE provider, so the
+        same settings give the same kernel whichever backend supplies the rest of the model.
+        ``megatron/training/arguments.py`` rejects ``cross_entropy_fusion_impl='te'``, but a
+        config built directly can still ask for it.
+        """
+        return select_cross_entropy(
+            self._cross_entropy_loss_fusion, self._cross_entropy_fusion_impl, self._cuda_graph_impl
+        )
