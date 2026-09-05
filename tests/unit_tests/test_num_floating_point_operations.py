@@ -126,6 +126,16 @@ def _make_mla_hybrid_args():
     return args
 
 
+def test_situ_glu_counts_the_same_ffn_gemms_as_swiglu():
+    swiglu_args = _make_gpt_args(swiglu=True)
+    situ_glu_args = _make_gpt_args(swiglu=False)
+    situ_glu_args.situ_glu = True
+
+    assert num_floating_point_operations(
+        situ_glu_args, batch_size=8
+    ) == num_floating_point_operations(swiglu_args, batch_size=8)
+
+
 class TestBSHDBackwardCompat:
     """For unpacked BSHD, the new optional arg must not change the result."""
 

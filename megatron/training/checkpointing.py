@@ -979,8 +979,7 @@ def save_checkpoint(
 
     # And update the latest iteration
     if not skip_weight_ckpt and (
-        not torch.distributed.is_initialized()
-        or torch.distributed.get_rank() == 0
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     ):
         tracker_filename = get_checkpoint_tracker_filename(save_dir)
 
@@ -1100,9 +1099,7 @@ def save_checkpoint(
             iter_finalize_fn()
 
     # Additional callback for one_logger (last rank)
-    if not skip_weight_ckpt and (
-        not torch.distributed.is_initialized() or is_last_rank()
-    ):
+    if not skip_weight_ckpt and (not torch.distributed.is_initialized() or is_last_rank()):
 
         def onelogger_finalize_fn():
             on_save_checkpoint_success(productive_metrics, args.async_save)
@@ -1114,9 +1111,7 @@ def save_checkpoint(
             onelogger_finalize_fn()
 
     # Additional callback for wandb (last rank)
-    if not skip_weight_ckpt and (
-        not torch.distributed.is_initialized() or is_last_rank()
-    ):
+    if not skip_weight_ckpt and (not torch.distributed.is_initialized() or is_last_rank()):
 
         def wandb_finalize_fn():
             wandb_utils.on_save_checkpoint_success(
@@ -1150,16 +1145,16 @@ def save_checkpoint(
             # never skips or replays a window. Written by a single rank -- the last rank, which
             # lives on the last pipeline stage where the logits saver is attached (get_logits_saver
             # is None on earlier stages, including global rank 0 when PP > 1).
-            if skip_weight_ckpt and (
-                not torch.distributed.is_initialized() or is_last_rank()
-            ):
+            if skip_weight_ckpt and (not torch.distributed.is_initialized() or is_last_rank()):
 
                 def progress_finalize_fn():
                     tracker_filename = get_checkpoint_tracker_filename(args.save)
                     with maybe_msc.open(tracker_filename, 'w') as f:
                         f.write(str(iteration))
-                    print_rank_last(f"  recorded logits-dump progress: iteration "
-                                    f"{iteration} to {tracker_filename}")
+                    print_rank_last(
+                        f"  recorded logits-dump progress: iteration "
+                        f"{iteration} to {tracker_filename}"
+                    )
 
                 logits_finalize_fns.append(progress_finalize_fn)
             async_request_cls = get_async_strategy(args.async_strategy)[1]['AsyncRequest']
@@ -1432,7 +1427,7 @@ def generate_state_dict(
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict['model'])
-    if args.swiglu:
+    if args.swiglu or getattr(args, 'situ_glu', False):
         if 'optimizer' in state_dict:
             model_state_dict, optimizer_state_dict = handle_swiglu_in_state_dict(
                 model, state_dict['model'], state_dict['optimizer']
@@ -1962,6 +1957,9 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('add_qkv_bias', force=True)
     _set_arg('squared_relu', force=True)
     _set_arg('swiglu', force=True)
+    _set_arg('situ_glu', force=True)
+    _set_arg('situ_glu_beta1', force=True)
+    _set_arg('situ_glu_beta2', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
     _set_arg('normalization', force=True)
@@ -2568,8 +2566,10 @@ def load_checkpoint(
         args.consumed_train_samples = iteration * args.global_batch_size
         args.skipped_train_samples = 0
         update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
-        print_rank_0(f'--override-ckpt-iteration: start at iteration {iteration} '
-                     f'(consumed_train_samples {args.consumed_train_samples})')
+        print_rank_0(
+            f'--override-ckpt-iteration: start at iteration {iteration} '
+            f'(consumed_train_samples {args.consumed_train_samples})'
+        )
 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""
