@@ -65,6 +65,7 @@ def fully_shard_context(
     *,
     use_symmetric_memory: bool = False,
     unify_communication_stream: bool = False,
+    overlap_dp_outer_communication: bool = False,
 ) -> Iterator[FsdpContext]:
     """Construct FSDP modules that share runtime streams and prefetch orders.
 
@@ -79,9 +80,18 @@ def fully_shard_context(
         unify_communication_stream: Whether all-gathers and reduce-scatters share one
             communication stream to reduce peak transient memory. See
             https://github.com/NVIDIA/Megatron-LM/issues/6471.
+        overlap_dp_outer_communication: Run the last-microbatch DP-outer reduction on its
+            own stream so it overlaps the DP-inner reductions. Mutually exclusive with
+            unify_communication_stream, which forces a single communication stream. See
+            https://github.com/NVIDIA/Megatron-LM/issues/6714.
     """
     if _FSDP_CONTEXT.get() is not None:
         raise RuntimeError("fully_shard_context does not support nesting.")
+    if unify_communication_stream and overlap_dp_outer_communication:
+        raise ValueError(
+            "overlap_dp_outer_communication needs a separate DP-outer stream and is "
+            "incompatible with unify_communication_stream."
+        )
 
     device = device or torch.device("cuda", torch.cuda.current_device())
     if device.type != "cuda":
@@ -91,6 +101,7 @@ def fully_shard_context(
         device=device,
         use_symmetric_memory=use_symmetric_memory,
         unify_communication_stream=unify_communication_stream,
+        overlap_dp_outer_communication=overlap_dp_outer_communication,
     )
     token = _FSDP_CONTEXT.set(context)
     try:
