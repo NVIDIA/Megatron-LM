@@ -12,7 +12,7 @@ import io
 import logging
 import os
 from pathlib import Path
-from typing import Callable, Dict, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Set, Tuple, Union
 
 import torch
 
@@ -29,7 +29,6 @@ from .mapping import (
     apply_factory_merges,
 )
 from .state_dict_utils import load_preprocess, save_preprocess
-from .strategies.async_utils import AsyncRequest
 from .strategies.common import COMMON_STATE_FNAME, load_common
 from .strategies.torch import (
     TorchDistLoadShardedStrategy,
@@ -46,6 +45,12 @@ from .validation import (
     verify_checkpoint,
     verify_integrity_manifest,
 )
+
+if TYPE_CHECKING:
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest
+else:
+    AsyncRequest = Any
+
 
 logger = logging.getLogger(__name__)
 
@@ -138,8 +143,7 @@ def load(
         sharded_state_dict
     )
     # Common (non-tensor) data is stored either as a single ShardedObject inside the
-    # torch_dist checkpoint (current format) or in a legacy common.pt. Loading it up front
-    # is also required to determine `async_strategy` for the sharded load below.
+    # torch_dist checkpoint (current format) or in a legacy common.pt.
     common_state_dict = load_common_state_dict(checkpoint_dir)
     merge(common_state_dict, nonpersistent_state_dict)
 
@@ -171,13 +175,7 @@ def load(
         ckpt_sharded_metadata,
     )
 
-    ckpt_args = common_state_dict.get("args")
-    async_strategy = (
-        getattr(ckpt_args, "async_strategy", "mcore")
-        if getattr(ckpt_args, "async_save", False)
-        else "mcore"
-    )
-    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
+    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
 
     merge(common_state_dict, loaded_state_dict)
 
@@ -348,7 +346,6 @@ def save(
         Callable[[CommonStateDict], StateDict]
     ] = None,
     content_metadata: Optional[dict] = None,
-    async_strategy: Optional[str] = "nvrx",
     verify_integrity: bool = False,
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
@@ -456,7 +453,7 @@ def save(
             integrity_finalize_fn()
         return None
 
-    async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir, async_strategy)
+    async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir)
     async_request.finalize_fns.append(metadata_finalize_fn)
     if verify_integrity:
         async_request.finalize_fns.append(integrity_finalize_fn)

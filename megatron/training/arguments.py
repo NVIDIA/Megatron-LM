@@ -1907,9 +1907,6 @@ def validate_args(args, defaults={}):
             )
             args.async_save = False
 
-    if not args.async_save:
-        args.async_strategy = "mcore"
-
     if args.logits_save_dir is not None:
         assert args.logits_save_top_k is not None, '--logits-save-top-k is required when --logits-save-dir is set.'
         assert args.async_save, (
