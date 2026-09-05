@@ -3,7 +3,7 @@
 """Layout helpers for DeepSeek sparse attention."""
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -22,6 +22,8 @@ __all__ = [
     "get_cp_positions_from_layout",
     "get_packed_qk_cu_seqlens",
     "normalize_cp_comm_type",
+    "build_packed_allgather_cp_local_positions_from_host",
+    "build_packed_allgather_cp_query_positions_and_key_reorder_from_host",
 ]
 
 
@@ -305,6 +307,102 @@ def build_packed_allgather_cp_local_positions(
     return segment_starts.index_select(0, segment_ids) + segment_offsets
 
 
+def build_packed_allgather_cp_all_rank_positions(
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+    device: torch.device,
+    output_size: Optional[int] = None,
+    *,
+    cu_seqlens_cover_output: bool = False,
+) -> torch.Tensor:
+    """Build every CP rank's local packed positions at once: ``[cp_size, output_size]``.
+
+    Row ``r`` is identical to
+    ``build_packed_allgather_cp_local_positions(..., cp_rank=r, ...)``.
+
+    Doing all ranks together is worth a separate function because every expensive
+    step is rank-invariant. ``cp_rank`` enters only through ``front_starts`` and
+    ``back_starts`` -- cheap elementwise expressions. In particular
+    ``segment_lens`` is ``stack(half, half)`` and so does not depend on the rank,
+    which means the ``nonzero``/``nonempty_segments`` boolean masks, and therefore
+    all of the data-dependent output shapes that force a device-to-host size
+    readback, are shared across ranks. The per-rank loop this replaces paid those
+    readbacks ``cp_size`` times over; here they are paid once.
+    """
+    cu_seqlens_i64 = cu_seqlens.to(device=device, dtype=torch.int64)
+    if cp_size <= 1:
+        return build_packed_allgather_cp_local_positions(
+            cu_seqlens,
+            cp_size,
+            0,
+            device,
+            output_size=output_size,
+            cu_seqlens_cover_output=cu_seqlens_cover_output,
+        ).unsqueeze(0)
+
+    seq_starts = cu_seqlens_i64[:-1]
+    seq_ends = cu_seqlens_i64[1:]
+    seq_lens = seq_ends - seq_starts
+    nonzero = seq_lens > 0
+    seq_starts = seq_starts[nonzero]
+    seq_ends = seq_ends[nonzero]
+    seq_lens = seq_lens[nonzero]
+    if seq_lens.numel() == 0:
+        return torch.empty((cp_size, 0), dtype=torch.int64, device=device)
+
+    # Host-side guard for CPU/test callers; mirrors the single-rank builder.
+    if cu_seqlens_i64.device.type == "cpu":
+        bad_divisible = seq_lens[seq_lens % cp_size != 0]
+        if bad_divisible.numel() > 0:
+            raise ValueError(
+                "Packed DSA CP expects per-sequence padded lengths divisible by cp_size, got "
+                f"seq_len={int(bad_divisible[0].item())}, cp_size={cp_size}"
+            )
+        bad_local = seq_lens[(seq_lens // cp_size) % 2 != 0]
+        if bad_local.numel() > 0:
+            seq_len = int(bad_local[0].item())
+            raise ValueError(
+                "Packed DSA CP expects per-rank packed sequence lengths divisible by 2, got "
+                f"local_seq_len={seq_len // cp_size}, seq_len={seq_len}, cp_size={cp_size}"
+            )
+
+    half_seq_lens = (seq_lens // cp_size) // 2
+    ranks = torch.arange(cp_size, dtype=torch.int64, device=device).unsqueeze(1)
+    # [cp_size, n_seq]
+    front_starts = seq_starts.unsqueeze(0) + ranks * half_seq_lens.unsqueeze(0)
+    back_starts = seq_ends.unsqueeze(0) - (ranks + 1) * half_seq_lens.unsqueeze(0)
+    # Interleave to [f0, b0, f1, b1, ...] per row, matching the single-rank builder.
+    segment_starts = torch.stack((front_starts, back_starts), dim=2).reshape(cp_size, -1)
+    segment_lens = torch.stack((half_seq_lens, half_seq_lens), dim=1).reshape(-1)
+    nonempty_segments = segment_lens > 0
+    segment_starts = segment_starts[:, nonempty_segments]
+    segment_lens = segment_lens[nonempty_segments]
+
+    if output_size is None:
+        output_size = int(segment_lens.sum().item())
+    if output_size == 0:
+        return torch.empty((cp_size, 0), dtype=torch.int64, device=device)
+    if not cu_seqlens_cover_output:
+        pad_len = (
+            torch.tensor(output_size, dtype=torch.int64, device=device) - segment_lens.sum()
+        ).clamp_min(0)
+        # Per-rank padding origin, matching cu_seqlens[-1] + cp_rank * output_size.
+        pad_start = cu_seqlens_i64[-1] + ranks.reshape(-1) * output_size
+        segment_starts = torch.cat((segment_starts, pad_start.unsqueeze(1)), dim=1)
+        segment_lens = torch.cat((segment_lens, pad_len.view(1)), dim=0)
+
+    segment_ids = torch.repeat_interleave(
+        torch.arange(segment_lens.numel(), dtype=torch.int64, device=device),
+        segment_lens,
+        output_size=output_size,
+    )
+    segment_offsets = torch.arange(output_size, dtype=torch.int64, device=device)
+    segment_offsets -= torch.repeat_interleave(
+        torch.cumsum(segment_lens, dim=0) - segment_lens, segment_lens, output_size=output_size
+    )
+    return segment_starts.index_select(1, segment_ids) + segment_offsets.unsqueeze(0)
+
+
 def build_packed_allgather_cp_query_positions_and_key_reorder(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_kv: torch.Tensor,
@@ -336,18 +434,15 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
     )
     if key_local_output_size is None:
         key_local_output_size = local_output_size
-    gathered_key_positions = [
-        build_packed_allgather_cp_local_positions(
-            cu_seqlens_kv,
-            cp_size,
-            rank,
-            device,
-            output_size=key_local_output_size,
-            cu_seqlens_cover_output=key_cu_seqlens_cover_output,
-        )
-        for rank in range(cp_size)
-    ]
-    gathered_key_positions = torch.cat(gathered_key_positions, dim=0)
+    # All ranks in one batched build. Row-major flattening reproduces exactly the
+    # rank0-local, rank1-local, ... concatenation the gathered KV tensor is in.
+    gathered_key_positions = build_packed_allgather_cp_all_rank_positions(
+        cu_seqlens_kv,
+        cp_size,
+        device,
+        output_size=key_local_output_size,
+        cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+    ).reshape(-1)
     key_reorder_idx = torch.argsort(gathered_key_positions)
     if global_output_size is not None and key_reorder_idx.numel() != global_output_size:
         raise RuntimeError(
@@ -355,6 +450,159 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
             f"expected {global_output_size}"
         )
     return query_positions, key_reorder_idx
+
+
+def _host_packed_cp_spans(
+    host_cu_seqlens: List[int], cp_size: int, cp_rank: int
+) -> List[Tuple[int, int]]:
+    """One rank's zigzag layout as ``(global_start, length)`` spans, from host ints.
+
+    The span decomposition is the same maths as the device builders above, but on a
+    Python list there is nothing to synchronize on: every length is already known.
+    Zero-length sequences contribute no spans, matching the device builders' filter.
+    """
+    spans: List[Tuple[int, int]] = []
+    for seq_start, seq_end in zip(host_cu_seqlens[:-1], host_cu_seqlens[1:]):
+        seq_len = seq_end - seq_start
+        if seq_len == 0:
+            continue
+        # The zigzag layout requires it, and on host integers the check is free --
+        # unlike the device builders, which can only validate without a sync on CPU
+        # inputs. Without it, non-divisible lengths would silently drop tokens here
+        # and leave uninitialized slots in the reorder buffer downstream.
+        if seq_len % (2 * cp_size) != 0:
+            raise ValueError(
+                "Packed DSA CP expects per-sequence padded lengths divisible by "
+                f"2 * cp_size ({2 * cp_size}), got seq_len={seq_len}"
+            )
+        half = seq_len // cp_size // 2
+        if half <= 0:
+            continue
+        spans.append((seq_start + cp_rank * half, half))
+        spans.append((seq_end - (cp_rank + 1) * half, half))
+    return spans
+
+
+def _host_to_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Move a freshly built host tensor to ``device``."""
+    return values.to(device, non_blocking=device.type == "cuda")
+
+
+def build_packed_allgather_cp_local_positions_from_host(
+    host_cu_seqlens: List[int],
+    cp_size: int,
+    cp_rank: int,
+    device: torch.device,
+    output_size: Optional[int] = None,
+    *,
+    cu_seqlens_cover_output: bool = False,
+) -> torch.Tensor:
+    """Host-side equivalent of :func:`build_packed_allgather_cp_local_positions`.
+
+    The device builder runs ~20 kernels over a few dozen integers and pays two
+    device-to-host size readbacks for its boolean-mask filters. When the compacted
+    ``cu_seqlens`` are already on the host -- ``prebuild_thd_cp_partition_routes``
+    stores them on ``PackedSeqParams`` at batch-construction time, where the one
+    blocking copy is cheap because the CUDA queue is still shallow -- the whole
+    table is a closed form over Python ints: zero kernels, zero synchronization,
+    one asynchronous host-to-device copy of the finished table.
+    """
+    if cp_size <= 1:
+        # Mirror the device builder: at cp_size <= 1 the local layout is the identity,
+        # with no zigzag halving (and therefore no even-length requirement).
+        if output_size is None:
+            output_size = host_cu_seqlens[-1]
+        return _host_to_device(torch.arange(output_size, dtype=torch.int64), device)
+    spans = _host_packed_cp_spans(host_cu_seqlens, cp_size, cp_rank)
+    real = (
+        torch.cat([torch.arange(start, start + length) for start, length in spans])
+        if spans
+        else torch.empty(0, dtype=torch.int64)
+    )
+    total = real.numel()
+    if output_size is None:
+        output_size = total
+    positions = torch.empty(output_size, dtype=torch.int64)
+    n = min(total, output_size)
+    positions[:n] = real[:n]
+    if output_size > n:
+        # The cover flag only ever accompanies output_size == total (dsa.py derives it
+        # from host max-seqlen metadata), so this branch is the not-covered case; fill
+        # it unconditionally rather than leave torch.empty garbage if a caller lies.
+        pad_start = host_cu_seqlens[-1] + cp_rank * output_size
+        positions[n:] = torch.arange(pad_start, pad_start + (output_size - n))
+    return _host_to_device(positions, device)
+
+
+def build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
+    host_cu_seqlens_q: List[int],
+    host_cu_seqlens_kv: List[int],
+    cp_size: int,
+    cp_rank: int,
+    device: torch.device,
+    local_output_size: Optional[int] = None,
+    key_local_output_size: Optional[int] = None,
+    global_output_size: Optional[int] = None,
+    *,
+    query_cu_seqlens_cover_output: bool = False,
+    key_cu_seqlens_cover_output: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Host-side equivalent of the query-positions + key-reorder wrapper.
+
+    Besides removing the device builders' synchronizations, this replaces the
+    ``argsort`` over the gathered key positions with a direct inverse permutation.
+    The sort is unnecessary because the real positions of all ranks tile
+    ``[0, total_tokens)`` exactly once (every padded sequence length is divisible
+    by ``2 * cp_size``), so the rank of a value in sorted order *is* the value;
+    and the padding pseudo-positions ``total + r * output_size + j`` are unique
+    and already ascending in ``(rank, j)`` order. Both facts are pinned by the
+    bit-equality tests against the device path.
+    """
+    query_positions = build_packed_allgather_cp_local_positions_from_host(
+        host_cu_seqlens_q,
+        cp_size,
+        cp_rank,
+        device,
+        output_size=local_output_size,
+        cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+    )
+    if key_local_output_size is None:
+        key_local_output_size = local_output_size
+
+    kv_total = host_cu_seqlens_kv[-1]
+    if cp_size <= 1:
+        # Identity layout: the gathered order is already the global order.
+        out = key_local_output_size if key_local_output_size is not None else kv_total
+        return query_positions, _host_to_device(torch.arange(out, dtype=torch.int64), device)
+    spans_by_rank = [
+        _host_packed_cp_spans(host_cu_seqlens_kv, cp_size, rank) for rank in range(cp_size)
+    ]
+    real_len = sum(length for _, length in spans_by_rank[0]) if spans_by_rank else 0
+    if real_len * cp_size != kv_total:
+        raise ValueError(
+            "Packed DSA CP spans do not tile the key stream: "
+            f"{cp_size} ranks x {real_len} real tokens != total {kv_total}"
+        )
+    out = key_local_output_size if key_local_output_size is not None else real_len
+    pad = max(0, out - real_len)
+    n = cp_size * out
+    if global_output_size is not None and n != global_output_size:
+        raise RuntimeError(
+            f"Packed DSA CP key reorder length mismatch: got {n}, " f"expected {global_output_size}"
+        )
+    key_reorder_idx = torch.empty(n, dtype=torch.int64)
+    for rank, spans in enumerate(spans_by_rank):
+        local = 0
+        for global_start, length in spans:
+            key_reorder_idx[global_start : global_start + length] = torch.arange(
+                rank * out + local, rank * out + local + length
+            )
+            local += length
+        if pad > 0:
+            key_reorder_idx[kv_total + rank * pad : kv_total + (rank + 1) * pad] = torch.arange(
+                rank * out + local, rank * out + out
+            )
+    return query_positions, _host_to_device(key_reorder_idx, device)
 
 
 def extract_query_positions_from_position_ids(

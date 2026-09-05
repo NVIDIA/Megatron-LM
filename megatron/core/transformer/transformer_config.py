@@ -15,7 +15,9 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
+    PACKED_DSA_CP_CUDA_GRAPH_WARNING,
     get_deprecated_cuda_graph_modules_migration,
+    is_packed_dsa_cp_cuda_graph_experimental,
     is_whole_moe_cuda_graph_scope,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
@@ -3455,6 +3457,15 @@ class TransformerConfig(ModelParallelConfig):
             self.cuda_graph_impl in ("local", "transformer_engine")
             and (not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules)
         )
+
+        if is_packed_dsa_cp_cuda_graph_experimental(
+            experimental_attention_variant=self.experimental_attention_variant,
+            sequence_packing_scheduler=self.sequence_packing_scheduler,
+            dynamic_context_parallel=self.dynamic_context_parallel,
+            context_parallel_size=self.context_parallel_size,
+            cuda_graph_impl=self.cuda_graph_impl,
+        ):
+            warnings.warn(PACKED_DSA_CP_CUDA_GRAPH_WARNING, stacklevel=2)
 
         cp_layout_conversion_required = is_gated_delta_net_variant(
             self.experimental_attention_variant
