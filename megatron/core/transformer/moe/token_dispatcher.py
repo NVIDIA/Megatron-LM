@@ -27,6 +27,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     fused_combine,
     fused_dispatch,
     hybrid_ep_combine,
+    hybrid_ep_dense_topk_routing,
     hybrid_ep_dispatch,
     is_nccl_ep_bootstrapped,
     nccl_ep_combine,
@@ -1067,6 +1068,8 @@ class _HybridEPManager(_DispatchManager):
 
         # Metadata
         self.token_probs: Optional[torch.Tensor] = None
+        # Dense top-k expert ids replacing the routing map when HybridEP supports them.
+        self.topk_idx: Optional[torch.Tensor] = None
         # Handle used for combine operation
         self.handle = None
         # Used for padding the output for each expert
@@ -1085,8 +1088,16 @@ class _HybridEPManager(_DispatchManager):
         self._original_num_tokens: Optional[int] = None
         self._padded_num_tokens: Optional[int] = None
 
-    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
-        num_tokens = routing_map.shape[0]
+    def setup_metadata(
+        self,
+        routing_map: Optional[torch.Tensor],
+        probs: torch.Tensor,
+        topk_idx: Optional[torch.Tensor] = None,
+    ):
+        """Cache the routing inputs of the next dispatch: the bool ``[num_tokens, num_experts]``
+        routing map, or with HybridEP's dense top-k routing the ``[num_tokens, topk]`` expert
+        ids (``topk_idx``) in its place, and the dense probabilities."""
+        num_tokens = probs.shape[0]
         self._original_num_tokens = num_tokens
 
         padded_num_tokens = num_tokens
@@ -1103,16 +1114,23 @@ class _HybridEPManager(_DispatchManager):
             padded_num_tokens += -padded_num_tokens % HYBRIDEP_TOKEN_ALIGNMENT
         self._padded_num_tokens = padded_num_tokens
 
-        routing_map = routing_map.reshape(num_tokens, self.num_experts)
+        if topk_idx is None:
+            routing_map = routing_map.reshape(num_tokens, self.num_experts)
         probs = probs.reshape(num_tokens, self.num_experts)
         if padded_num_tokens > num_tokens:
             pad_rows = padded_num_tokens - num_tokens
-            routing_map = torch.cat(
-                [routing_map, routing_map.new_zeros((pad_rows, self.num_experts))], dim=0
-            )
+            if topk_idx is None:
+                routing_map = torch.cat(
+                    [routing_map, routing_map.new_zeros((pad_rows, self.num_experts))], dim=0
+                )
+            else:  # -1 is HybridEP's dropped-route sentinel
+                topk_idx = torch.cat(
+                    [topk_idx, topk_idx.new_full((pad_rows, topk_idx.shape[1]), -1)]
+                )
             probs = torch.cat([probs, probs.new_zeros((pad_rows, self.num_experts))], dim=0)
 
         self.routing_map = routing_map
+        self.topk_idx = topk_idx
         self.token_probs = probs
 
         if self.moe_expert_rank_capacity_factor is not None:
@@ -1178,6 +1196,8 @@ class _HybridEPManager(_DispatchManager):
                 probs=self.token_probs,
                 group=self.group,
                 num_local_experts=self.num_local_experts,
+                topk_idx=self.topk_idx,
+                num_experts=self.num_experts,
                 num_sms_dispatch_api=self.config.moe_flex_dispatcher_num_sms,
                 num_sms_combine_api=self.config.moe_flex_dispatcher_num_sms,
                 num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
@@ -1227,6 +1247,7 @@ class _HybridEPManager(_DispatchManager):
         # For drop_and_pad mode, we don't need to reset the num_permuted_tokens and
         # num_dispatched_tokens, because their values never change.
         self.handle = None
+        self.topk_idx = None
         if not self.drop_and_pad:
             self.num_permuted_tokens = None
         self._original_num_tokens = None
@@ -1263,9 +1284,15 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
             num_experts=2 * num_experts,
             config=config,
         )
+        # The planner's runtime ids feed HybridEP directly when it routes by dense top-k ids;
+        # the routing metadata then scales with router_topk instead of 2L runtime experts.
+        self._dense_topk_routing = hybrid_ep_dense_topk_routing(
+            self.num_experts, self.num_local_experts
+        )
 
-    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
-        self.setup_virtual_expert_metadata(routing_map, probs)
+    def setup_metadata(self, top_indices: torch.Tensor, probs: torch.Tensor):
+        """The router hands this path its ``[num_tokens, topk]`` expert ids and probabilities."""
+        self.setup_virtual_expert_metadata(top_indices, probs)
 
     def dispatch(
         self,
@@ -1278,8 +1305,13 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
             num_runtime_experts=self.num_local_experts,
             alignment=self._quantization_alignment(),
         )
-        # The planner already wrote the dense runtime routing map and probabilities.
-        super().setup_metadata(plan.routing_map, plan.probs)
+        if self._dense_topk_routing:
+            super().setup_metadata(None, plan.probs, topk_idx=plan.virtual_experts)
+        else:
+            # This HybridEP lacks dense top-k routing: expand the runtime ids into its map.
+            routing_map = torch.zeros_like(plan.probs, dtype=torch.bool)
+            routing_map.scatter_(1, plan.virtual_experts.long(), True)
+            super().setup_metadata(routing_map, plan.probs)
         # The planner gives every rank exactly its own route count, and HybridEP pads each of
         # the 2L runtime expert segments on top; the base budget (routes x capacity factor)
         # would make HybridEP drop the padded routes.
@@ -1302,7 +1334,7 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
-        self.token_probs = self.routing_map = None
+        self.token_probs = self.routing_map = self.topk_idx = None
         return hidden_states
 
 
@@ -2047,8 +2079,10 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         self.hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
-        # Initialize metadata
-        routing_map, probs = self._initialize_metadata(routing_map, probs)
+        # Virtual-expert planning takes the router's [num_tokens, topk] ids and probabilities
+        # as they are; every other backend takes the dense map and probabilities.
+        if not self.config.moe_virtual_expert_load_balance:
+            routing_map, probs = self._initialize_metadata(routing_map, probs)
 
         self._comm_manager.setup_metadata(routing_map, probs)
         return hidden_states, self._comm_manager.token_probs
