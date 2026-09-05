@@ -69,6 +69,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 from megatron.core.transformer.utils import (
     set_model_config_attribute,
     toggle_cuda_graphs,
@@ -136,6 +137,46 @@ _GLOBAL_PACKING_CONTEXT = None
 # Track whether the inference model is currently paused (offloaded to CPU).
 # Model starts on GPU after creation and is used immediately, so starts as False.
 _INFERENCE_MODEL_IS_PAUSED = False
+
+
+@torch.no_grad()
+def _refresh_inference_grouped_mlp_weights(
+    model_chunks: list[LanguageModule],
+    model_core: torch.nn.Module,
+    optimizer: MegatronOptimizer,
+    *,
+    synchronize_parameters: bool,
+) -> bool:
+    """Refresh materialized grouped-MLP serving weights before RL inference.
+
+    Args:
+        model_chunks: Possibly wrapped model chunks that own parameter synchronization.
+        model_core: Unwrapped model whose inference modules should be refreshed.
+        optimizer: Optimizer that stages model parameters before explicit synchronization.
+        synchronize_parameters: Whether this is a colocated model whose DDP parameter gathers
+            must finish before serving weights are refreshed.
+
+    Returns:
+        Whether any serving weights were refreshed.
+    """
+    grouped_mlps = [
+        module for module in model_core.modules() if isinstance(module, InferenceGroupedMLP)
+    ]
+    if not grouped_mlps:
+        return False
+
+    if synchronize_parameters:
+        optimizer.prepare_model_params_for_param_sync()
+        for model_chunk in model_chunks:
+            model_chunk.start_param_sync(force_sync=True)
+
+    refreshed = False
+    for grouped_mlp in grouped_mlps:
+        refreshed = grouped_mlp.refresh_inference_weights() or refreshed
+    if refreshed:
+        # Serving engines may replay graphs on a different stream.
+        torch.cuda.synchronize()
+    return refreshed
 
 
 def _torch_saver_swap_inference_model(*, to_cpu: bool) -> None:
@@ -2927,6 +2968,13 @@ def megatron_rl_inference_mode(
     model_core = unwrap_model(model[0])
     with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
         _maybe_prefetch_separate_inference_model_weights(model_core, to_cpu=False)
+    with nvtx_range("rl/refresh-inference-weights", time=True):
+        _refresh_inference_grouped_mlp_weights(
+            model_chunks=model,
+            model_core=model_core,
+            optimizer=optimizer,
+            synchronize_parameters=training_model is None,
+        )
 
     rotary_module = getattr(lang_module, "rotary_pos_emb", None)
     # Vanilla RotaryEmbedding module has lru_cache decorator which breaks RL training

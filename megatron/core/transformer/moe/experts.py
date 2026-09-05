@@ -1324,18 +1324,18 @@ class InferenceGroupedMLP(TEGroupedMLP):
         return True
 
     @torch.inference_mode(False)  # needed for non-colocated inference.
+    @torch.no_grad()
     def _build_concatenated_weights(self):
-        """Create big contiguous weight tensors that share storage with TE's per-expert parameters.
+        """Create stable contiguous serving buffers from TE's expert parameters.
 
         Creates _fc1_weight and _fc2_weight as contiguous tensors of shape
-        [num_experts, out_features, in_features]. Instead of replacing TE's parameters
-        (which breaks TE's internal bookkeeping), we redirect each parameter's .data
-        to be a view into the contiguous buffer. The nn.Parameter objects themselves
-        remain untouched in TE's module, preserving FP8 scaling state, etc.
+        [num_experts, out_features, in_features]. TE's parameters remain attached to their
+        canonical storage, including any DDP parameter buffer. The serving tensors have stable
+        addresses for CUDA graph capture and are refreshed explicitly before each RL inference
+        phase.
 
         This allows:
-        - TE's forward to work correctly (same Parameter objects, same internal state)
-        - Training updates to flow through (param.data is a view into the big tensor)
+        - TE and the distributed optimizer to retain their canonical parameter storage
         - torch.nn.functional.grouped_mm / FlashInfer to use the big tensor directly
         """
         # Get device/dtype from existing TE weights
@@ -1349,23 +1349,43 @@ class InferenceGroupedMLP(TEGroupedMLP):
         _fc1_weight = torch.empty(self.num_local_experts, *fc1_shape, device=device, dtype=dtype)
         _fc2_weight = torch.empty(self.num_local_experts, *fc2_shape, device=device, dtype=dtype)
 
-        # Copy existing TE weights into big tensors, then point param.data to the views
+        # Copy existing TE weights into the serving buffers without redirecting the parameters.
         for i in range(self.num_local_experts):
             fc1_param = getattr(self.linear_fc1, f'weight{i}')
             fc2_param = getattr(self.linear_fc2, f'weight{i}')
 
             # Copy initialized data into contiguous buffer
-            _fc1_weight[i].copy_(fc1_param.data)
-            _fc2_weight[i].copy_(fc2_param.data)
-
-            # Redirect param.data to view into contiguous buffer.
-            # The nn.Parameter object stays the same — TE's internal state is preserved.
-            fc1_param.data = _fc1_weight[i]
-            fc2_param.data = _fc2_weight[i]
+            _fc1_weight[i].copy_(fc1_param)
+            _fc2_weight[i].copy_(fc2_param)
 
         # Register big tensors as non-persistent buffers (for .to() device movement, not saved)
         self.register_buffer('_fc1_weight', _fc1_weight, persistent=False)
         self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
+
+    @torch.no_grad()
+    def refresh_inference_weights(self) -> bool:
+        """Refresh stable high-precision serving buffers from canonical TE parameters.
+
+        Returns:
+            Whether serving buffers were refreshed.
+        """
+        if not self._concatenated_weights_built:
+            return False
+
+        weight = self.linear_fc1.weight0
+        if isinstance(weight, MXFP8Tensor) or (
+            hasattr(weight, 'data') and isinstance(weight.data, MXFP8Tensor)
+        ):
+            return False
+
+        for linear, serving_weight in (
+            (self.linear_fc1, self._fc1_weight),
+            (self.linear_fc2, self._fc2_weight),
+        ):
+            for expert_idx in range(self.num_local_experts):
+                param = getattr(linear, f'weight{expert_idx}')
+                serving_weight[expert_idx].copy_(param)
+        return True
 
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
         """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""

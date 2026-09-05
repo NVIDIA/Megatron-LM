@@ -159,6 +159,40 @@ class DummyMoELayer:
         self.use_partial_cudagraphs = mode == "partial"
 
 
+@pytest.mark.parametrize("synchronize_parameters", [True, False])
+def test_refresh_inference_grouped_mlp_weights_syncs_before_copy(
+    monkeypatch, synchronize_parameters
+):
+    events = []
+
+    class FakeInferenceGroupedMLP(torch.nn.Module):
+        def refresh_inference_weights(self) -> bool:
+            events.append("refresh")
+            return True
+
+    monkeypatch.setattr(rl_utils, "InferenceGroupedMLP", FakeInferenceGroupedMLP)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("cuda-sync"))
+
+    model_core = torch.nn.Sequential(FakeInferenceGroupedMLP())
+    model_chunk = MagicMock()
+    model_chunk.start_param_sync.side_effect = lambda **_kwargs: events.append("param-sync")
+    optimizer = MagicMock()
+    optimizer.prepare_model_params_for_param_sync.side_effect = lambda: events.append("prepare")
+
+    assert rl_utils._refresh_inference_grouped_mlp_weights(
+        model_chunks=[model_chunk],
+        model_core=model_core,
+        optimizer=optimizer,
+        synchronize_parameters=synchronize_parameters,
+    )
+    expected_events = ["prepare", "param-sync"] if synchronize_parameters else []
+    assert events == [*expected_events, "refresh", "cuda-sync"]
+    if synchronize_parameters:
+        model_chunk.start_param_sync.assert_called_once_with(force_sync=True)
+    else:
+        model_chunk.start_param_sync.assert_not_called()
+
+
 @pytest.fixture
 def initialize_model_parallel(request, monkeypatch):
     """Fixture to initialize and destroy model parallel.

@@ -16,7 +16,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.transformer.module import Float16Module
-from megatron.core.transformer.moe.experts import TEGroupedMLP
+from megatron.core.transformer.moe.experts import InferenceGroupedMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -92,6 +92,38 @@ def test_remove_glu_interleaving_restores_contiguous_gate_and_linear_halves():
     output = TEGroupedMLP._remove_glu_interleaving(interleaved, interleave_size=2)
 
     torch.testing.assert_close(output, expected)
+
+
+def test_inference_grouped_mlp_refreshes_serving_weights_without_redirecting_parameters():
+    module = InferenceGroupedMLP.__new__(InferenceGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.num_local_experts = 2
+    module._concatenated_weights_built = False
+
+    for linear_name, shape in (('linear_fc1', (4, 3)), ('linear_fc2', (3, 2))):
+        linear = torch.nn.Module()
+        for expert_idx in range(module.num_local_experts):
+            linear.register_parameter(
+                f'weight{expert_idx}', torch.nn.Parameter(torch.full(shape, float(expert_idx + 1)))
+            )
+        setattr(module, linear_name, linear)
+
+    parameter_ptrs = {name: param.data_ptr() for name, param in module.named_parameters()}
+    module._build_concatenated_weights()
+    module._concatenated_weights_built = True
+    serving_ptrs = (module._fc1_weight.data_ptr(), module._fc2_weight.data_ptr())
+
+    assert {name: param.data_ptr() for name, param in module.named_parameters()} == parameter_ptrs
+    assert module._fc1_weight.data_ptr() not in parameter_ptrs.values()
+    assert module._fc2_weight.data_ptr() not in parameter_ptrs.values()
+
+    module.linear_fc1.weight0.data.fill_(11)
+    module.linear_fc2.weight1.data.fill_(22)
+
+    assert module.refresh_inference_weights()
+    assert (module._fc1_weight.data_ptr(), module._fc2_weight.data_ptr()) == serving_ptrs
+    torch.testing.assert_close(module._fc1_weight[0], module.linear_fc1.weight0)
+    torch.testing.assert_close(module._fc2_weight[1], module.linear_fc2.weight1)
 
 
 def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch):
