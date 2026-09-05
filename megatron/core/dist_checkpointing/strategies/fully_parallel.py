@@ -245,11 +245,11 @@ class FullyParallelLoadStrategyWrapper:
         # Step 3: load part of the checkpoint.
         # Load only sharded objects first. ShardedTensors will be loaded separately
         # so that we can keep track of sharded tensors loaded by this rank
-        (sharded_tensors, sharded_state_dict, to_load_shards, unloaded_shards) = (
+        sharded_tensors, sharded_state_dict, to_load_shards, unloaded_shards = (
             self._defer_loading_sharded_tensors(sharded_state_dict)
         )
 
-        (sharded_objects, sharded_state_dict, to_load_objects, unloaded_objects) = (
+        sharded_objects, sharded_state_dict, to_load_objects, unloaded_objects = (
             self._defer_loading_sharded_objects(sharded_state_dict)
         )
 

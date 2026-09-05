@@ -193,12 +193,8 @@ class MLP(MegatronModule):
         if ffn_hidden_size is None:
             if is_expert:
                 raise ValueError("MoE MLP requires `ffn_hidden_size`, but it was not provided.")
-            warnings.warn(
-                "MLP requires ffn_hidden_size, but it was not provided. Using \
-                    config.ffn_hidden_size by default.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+            warnings.warn("MLP requires ffn_hidden_size, but it was not provided. Using \
+                    config.ffn_hidden_size by default.", DeprecationWarning, stacklevel=2)
             ffn_hidden_size = not_none(self.config.ffn_hidden_size)
 
         # If this is a gated linear unit we double the output width

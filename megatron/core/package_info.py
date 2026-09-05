@@ -16,7 +16,6 @@ __version__ = '.'.join(map(str, VERSION[:3])) + ''.join(VERSION[3:])
 import os as _os  # noqa: I001
 import subprocess as _subprocess
 
-
 if not int(_os.getenv('NO_VCS_VERSION', '0')):
     try:
         _git = _subprocess.run(

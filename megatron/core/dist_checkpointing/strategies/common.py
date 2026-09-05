@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
-""" Common strategies. """
+"""Common strategies."""
 
 import logging
 import os
