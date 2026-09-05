@@ -23,11 +23,13 @@ from megatron.core.transformer.moe.virtual_expert_triton import (
     MAX_VIRTUAL_EXPERT_WEIGHT_SMS,
     _transport_tile,
     _validate_transport_shape,
-    compile_virtual_expert_weight_kernels,
     launch_virtual_expert_grad_reduce,
     launch_virtual_expert_weight_prefetch,
 )
 from tests.unit_tests.test_utilities import Utils
+
+# The GB200 CI bucket launches marked files with four ranks, which these tests need.
+pytestmark = pytest.mark.launch_on_gb200
 
 NUM_SMS = 4
 requires_four_ranks = pytest.mark.skipif(
@@ -162,14 +164,6 @@ def test_virtual_expert_weight_transport(grad_dtype):
     )
     weight_barrier = torch.zeros(1, dtype=torch.int32, device=device)
     grad_barrier = torch.zeros(1, dtype=torch.int32, device=device)
-    compile_virtual_expert_weight_kernels(
-        world_size=world_size,
-        num_local_experts=num_local_experts,
-        member_numels=member_numels,
-        num_sms=NUM_SMS,
-        device_index=device.index,
-        grad_dtype=grad_dtype,
-    )
 
     cases = (
         ("all-peers", tuple(range(num_local_experts))),
@@ -348,14 +342,6 @@ def test_virtual_expert_mxfp8_transport_moves_one_orientation_at_a_time():
     barriers = {
         orientation: torch.zeros(1, dtype=torch.int32, device=device) for orientation in arenas
     }
-    compile_virtual_expert_weight_kernels(
-        world_size=world_size,
-        num_local_experts=num_local_experts,
-        member_numels=member_numels,
-        mxfp8=True,
-        num_sms=NUM_SMS,
-        device_index=device.index,
-    )
 
     def launch(orientation):
         dist.barrier(group=group, device_ids=[device.index])
