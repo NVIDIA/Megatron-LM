@@ -223,6 +223,10 @@ class _GDNBase(MegatronModule):
             name=(name + ".in_proj") if name is not None else None,
         )
 
+        # This projection packs heterogeneous q/k/v/gate components into one matrix, so
+        # orthogonalizing it as a single Muon weight is not meaningful.
+        setattr(self.in_proj.weight, "use_muon", False)
+
         # Conv1d for QKV
         self.conv_dim = self.qk_dim * 2 + self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
