@@ -1687,20 +1687,8 @@ def validate_args(args, defaults={}):
         if args.expert_model_parallel_size > 1 and 'ep_dp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('ep_dp')
 
-    # Derive the internal gtp_weight_remat_size from the user-facing
-    # --tensor-parallel-num-weight-shards. gtp_weight_remat_size has no CLI flag (it is excluded
-    # from argument generation), so it is set here as a fresh attribute on args before it is
-    # consumed below (and in initialize/training, which read args.gtp_weight_remat_size directly).
-    # Mirrors ModelParallelConfig.__post_init__.
-    from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
-
-    args.tensor_parallel_num_weight_shards, args.gtp_weight_remat_size = (
-        resolve_tensor_parallel_weight_shards(
-            args.tensor_model_parallel_size,
-            args.tensor_parallel_num_weight_shards,
-            getattr(args, "gtp_weight_remat_size", 1),
-        )
-    )
+    # The dense GTP size was resolved near the start of validation because it participates in
+    # total_model_size. Derive only the expert-layer internal rematerialization size here.
     # Same for the expert layers: derive the internal expert_gtp_weight_remat_size from the
     # user-facing --expert-tensor-parallel-num-weight-shards (expert_tensor_parallel_size is
     # defaulted earlier in validate_args). expert_gtp_weight_remat_size has no CLI flag.

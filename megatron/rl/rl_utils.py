@@ -166,15 +166,21 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
     device = -1 if to_cpu else int(torch.cuda.current_device())
     # Note: include_buffers=False because buffers created with explicit device= in register_buffer()
     # are not allocated via the UVM mempool and will fail UVM operations. Only parameters are UVM-allocated.
-    advise_managed_module_parameters_preferred_location(model_core, device=device, include_buffers=False)
+    advise_managed_module_parameters_preferred_location(
+        model_core, device=device, include_buffers=False
+    )
     nbytes = prefetch_managed_module_parameters(model_core, device=device, include_buffers=False)
     # Ensure pages are resident before we enter CUDA-graph capture / inference, or before training continues.
     torch.cuda.synchronize()
 
     if to_cpu:
-        print_rank_0(f"[Rank 0] offloaded {nbytes / 1024**2:.2f} MB of separate RL inference model weights to CPU (other ranks may vary)")
+        print_rank_0(
+            f"[Rank 0] offloaded {nbytes / 1024**2:.2f} MB of separate RL inference model weights to CPU (other ranks may vary)"
+        )
     else:
-        print_rank_0(f"[Rank 0] prefetched {nbytes / 1024**2:.2f} MB of separate RL inference model weights to GPU (other ranks may vary)")
+        print_rank_0(
+            f"[Rank 0] prefetched {nbytes / 1024**2:.2f} MB of separate RL inference model weights to GPU (other ranks may vary)"
+        )
 
 
 def verify_model_weights_swap(
@@ -219,8 +225,11 @@ def verify_model_weights_swap(
     # Generate deterministic test input - same across ALL ranks
     torch.manual_seed(1234)
     test_tokens = torch.randint(
-        low=0, high=actual_vocab_size, size=(batch_size, actual_seq_len),
-        device=device, dtype=torch.long
+        low=0,
+        high=actual_vocab_size,
+        size=(batch_size, actual_seq_len),
+        device=device,
+        dtype=torch.long,
     )
     test_position_ids = (
         torch.arange(actual_seq_len, device=device, dtype=torch.long)
@@ -241,25 +250,23 @@ def verify_model_weights_swap(
     try:
         with torch.no_grad():
             train_output = train_lm(
-                test_tokens, test_position_ids, test_attention_mask,
-                runtime_gather_output=True
+                test_tokens, test_position_ids, test_attention_mask, runtime_gather_output=True
             )
 
             inf_output = inf_lm(
-                test_tokens, test_position_ids, test_attention_mask,
-                runtime_gather_output=True
+                test_tokens, test_position_ids, test_attention_mask, runtime_gather_output=True
             )
 
         # Only check on ranks that have output (last PP stage)
         if train_output is not None and inf_output is not None:
-            assert train_output.shape == inf_output.shape, (
-                f"Output shape mismatch: train={train_output.shape}, infer={inf_output.shape}"
-            )
+            assert (
+                train_output.shape == inf_output.shape
+            ), f"Output shape mismatch: train={train_output.shape}, infer={inf_output.shape}"
 
             max_diff = (train_output - inf_output).abs().max().item()
-            assert torch.allclose(train_output, inf_output, atol=atol, rtol=rtol), (
-                f"Forward pass outputs do not match: max_diff={max_diff:.6e}, atol={atol}, rtol={rtol}"
-            )
+            assert torch.allclose(
+                train_output, inf_output, atol=atol, rtol=rtol
+            ), f"Forward pass outputs do not match: max_diff={max_diff:.6e}, atol={atol}, rtol={rtol}"
 
     finally:
         # Restore training state
@@ -269,14 +276,13 @@ def verify_model_weights_swap(
             inf_core.train()
 
 
-
 @dataclass(slots=True)
 class RolloutStats:
-    rewards: list[list[float]] # inner list is for a group
-    env_ids: list[str] # same length as len(rewards)
-    turn_lens: list[list[int]] # tokens newly added by each turn, grouped.
-    traj_lens: list[list[int]] # the final sequence is the full trajectory.
-    num_turns: None | list[list[int]] # num_turns per traj
+    rewards: list[list[float]]  # inner list is for a group
+    env_ids: list[str]  # same length as len(rewards)
+    turn_lens: list[list[int]]  # tokens newly added by each turn, grouped.
+    traj_lens: list[list[int]]  # the final sequence is the full trajectory.
+    num_turns: None | list[list[int]]  # num_turns per traj
     advantages: None | list[list[float]]
     min_piold_to_inf_prob: None | float
     max_piold_to_inf_prob: None | float
@@ -338,7 +344,9 @@ def get_rl_runtime_state():
     return _rl_runtime_state
 
 
-def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer):
+def log_rl_throughput_metrics(
+    args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer
+):
     """Compute, log, and store RL token throughput metrics.
 
     Returns a string fragment to append to the training log line.
@@ -391,21 +399,30 @@ def log_rl_throughput_metrics(args, batch_size, elapsed_time_per_iteration, iter
     # Log throughput metrics to wandb
     if wandb_writer is not None:
         if tokens_per_sec is not None:
-            wandb_writer.log({
-                'throughput/tokens_per_sec': tokens_per_sec,
-                'throughput/tokens_per_sec_per_gpu': tokens_per_sec_per_gpu,
-            }, iteration)
+            wandb_writer.log(
+                {
+                    'throughput/tokens_per_sec': tokens_per_sec,
+                    'throughput/tokens_per_sec_per_gpu': tokens_per_sec_per_gpu,
+                },
+                iteration,
+            )
         if compute_tokens_per_sec is not None:
-            wandb_writer.log({
-                'throughput/compute_tokens_per_sec': compute_tokens_per_sec,
-                'throughput/compute_tokens_per_sec_per_gpu': compute_tokens_per_sec_per_gpu,
-            }, iteration)
+            wandb_writer.log(
+                {
+                    'throughput/compute_tokens_per_sec': compute_tokens_per_sec,
+                    'throughput/compute_tokens_per_sec_per_gpu': compute_tokens_per_sec_per_gpu,
+                },
+                iteration,
+            )
         if actual_tokens_per_sec is not None:
-            wandb_writer.log({
-                'throughput/actual_tokens_per_sec': actual_tokens_per_sec,
-                'throughput/actual_tokens_per_sec_per_gpu': actual_tokens_per_sec_per_gpu,
-                'throughput/packing_efficiency': packing_efficiency,
-            }, iteration)
+            wandb_writer.log(
+                {
+                    'throughput/actual_tokens_per_sec': actual_tokens_per_sec,
+                    'throughput/actual_tokens_per_sec_per_gpu': actual_tokens_per_sec_per_gpu,
+                    'throughput/packing_efficiency': packing_efficiency,
+                },
+                iteration,
+            )
 
     # Store derived throughput metrics on RLRuntimeState so that
     # downstream consumers (e.g. RLProfiler) can read them.
@@ -519,7 +536,9 @@ def align_unpacked_inference_logprobs(
             truncated_mask = torch.nn.functional.pad(truncated_mask, (0, pad_size), value=False)
 
     # Sanity check: Two probability values cannot be more than 1.0 apart
-    abs_diffs = (old_logprobs_for_data.exp() - padded_inference_logprobs.exp()).abs()[truncated_mask]
+    abs_diffs = (old_logprobs_for_data.exp() - padded_inference_logprobs.exp()).abs()[
+        truncated_mask
+    ]
     assert all(abs_diffs <= 1.0)
 
     # Update group statistics using common helper
@@ -543,8 +562,7 @@ def get_agent(args, parallel_generation_tasks: int | None = None):
         config = yaml.safe_load(f)
 
     return WeightedMultiTask.from_config(
-        config,
-        parallel_generation_tasks=parallel_generation_tasks,
+        config, parallel_generation_tasks=parallel_generation_tasks
     )
 
 
@@ -556,10 +574,8 @@ def get_inference_interface(args, loop, model):
     if _INFERENCE_INTERFACE is None:
         _INFERENCE_INTERFACE = loop.run_until_complete(
             MegatronLocal.launch(
-                model[0],
-                host='0.0.0.0',
-                port=8294,
-                verbose=args.inference_text_gen_server_logging)
+                model[0], host='0.0.0.0', port=8294, verbose=args.inference_text_gen_server_logging
+            )
         )
     return _INFERENCE_INTERFACE
 
@@ -596,7 +612,11 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
 
 
 def get_environment_rollouts(
-    model: LanguageModule, inference_model: LanguageModule, optimizer: MegatronOptimizer, n_prompts: int, samples_per_group: int
+    model: LanguageModule,
+    inference_model: LanguageModule,
+    optimizer: MegatronOptimizer,
+    n_prompts: int,
+    samples_per_group: int,
 ):
     """Sample environment rollouts from an LLM.
 
@@ -619,7 +639,8 @@ def get_environment_rollouts(
                     model[0].offload_grad_buffers()
             else:
                 logger.warning(
-                    "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
+                    "Gradient buffers will not be offloaded when training cudagraphs are enabled!"
+                )
             with nvtx_range("rl/offload/optimizer-state", time=True):
                 optimizer.offload_to_cpu()
 
@@ -634,17 +655,14 @@ def get_environment_rollouts(
         swap_model_weights(model, inference_model, args.refit_method)
         if args.rl_verify_model_weights_swap:
             verify_model_weights_swap(
-                train_model=model,
-                inference_model=inference_model,
-                atol=.1,
-                rtol=5e-4,
+                train_model=model, inference_model=inference_model, atol=0.1, rtol=5e-4
             )
     else:
         inference_model = model
 
     inference_pg_collection = get_attr_wrapped_model(inference_model[0], "pg_collection")
     pg_size = get_pg_size(inference_pg_collection.ep)
-    assert (n_prompts % pg_size == 0), f"{n_prompts=} must be divisible by {pg_size=}"
+    assert n_prompts % pg_size == 0, f"{n_prompts=} must be divisible by {pg_size=}"
 
     with nvtx_range("rl/rollout-collection", time=True):
         loop = get_asyncio_loop()
@@ -652,7 +670,7 @@ def get_environment_rollouts(
             inference_model,
             optimizer,
             args.cuda_graph_impl,
-            False, # offload optimizer during rollout collection is handled above
+            False,  # offload optimizer during rollout collection is handled above
             training_model=model if has_separate_inference_model else None,
         ) as inference_interface:
 
@@ -677,7 +695,11 @@ def get_environment_rollouts(
                     # In deterministic mode, sort rollouts by problem_id for consistent ordering
                     # regardless of completion order due to system timing jitter.
                     if torch.are_deterministic_algorithms_enabled():
-                        rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
+                        rollouts.sort(
+                            key=lambda group: (
+                                group[0].problem_id if group and group[0].problem_id else ""
+                            )
+                        )
                     if not args.rl_partial_rollouts:
                         while True:
                             try:
@@ -748,7 +770,9 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 
 
-def get_logprobs(model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None):
+def get_logprobs(
+    model, tokens, position_ids, no_grad=False, sequence_packing=False, packed_seq_params=None
+):
     """Get sequence logprobs from their token ids.
 
     Args:
@@ -856,7 +880,7 @@ def calculate_grpo_advantages(rewards: list[list[float]], num_turns: list[list[i
 
 
 def compute_group_stats(
-    rollouts: GroupedRollouts, tokenizer: MegatronTokenizer, seq_len: int,
+    rollouts: GroupedRollouts, tokenizer: MegatronTokenizer, seq_len: int
 ) -> RolloutStats:
     """Add group-based rollout stats for logging.
 
@@ -876,7 +900,7 @@ def compute_group_stats(
     rewards = []
     env_ids = []
     group_reward_ids = []
-    num_turns = [] # num_turns per traj
+    num_turns = []  # num_turns per traj
     all_policy_epoch = []
     all_kv_cache_epoch = []
     all_completed_epochs = []
@@ -934,9 +958,7 @@ def compute_group_stats(
             group_kv_epoch.append([epoch for turn in rollout.kv_cache_epoch for _, epoch in turn])
             # completed_epochs is per-turn, so it cannot be masked per-rollout downstream
             if rollout.trajectory:
-                group_completed_epochs.extend(
-                    turn[-1][1] for turn in rollout.policy_epoch
-                )
+                group_completed_epochs.extend(turn[-1][1] for turn in rollout.policy_epoch)
             group_num_evictions.append(sum(rollout.num_evictions))
         all_policy_epoch.append(group_policy_epoch)
         all_kv_cache_epoch.append(group_kv_epoch)
@@ -944,7 +966,7 @@ def compute_group_stats(
         all_num_evictions.append(group_num_evictions)
         traj_lens.append(group_traj_lengths)
         turn_lens.append(group_turn_lengths)
-        env_ids.append(group[0].env_id) # All rollouts in a group share the env_id by design.
+        env_ids.append(group[0].env_id)  # All rollouts in a group share the env_id by design.
         rewards.append(group_rewards)
         # https://arxiv.org/abs/2504.21233 reports that lens variance hurts.
         # Let's track this.
@@ -977,23 +999,21 @@ def compute_group_stats(
     return stats
 
 
-
 def prep_wandb_metrics(
-        wandb_writer: wandb_run.Run,
-        traj_lens: List[List[int]],
-        turn_lens: List[List[int]],
-        rewards: List[List[float]],
-        num_turns: List[List[int]],
-        advantages: List[float],
-        policy_epoch: List[List[List[int]]],
-        kv_cache_epoch: List[List[List[int]]],
-        completed_epochs: List[List[int]],
-        num_evictions: List[List[int]],
-        current_iteration: int,
-        example_group: list[TokenRollout | Rollout] | None = None,
-        tokenizer: MegatronTokenizer | None = None,
-    ):
-
+    wandb_writer: wandb_run.Run,
+    traj_lens: List[List[int]],
+    turn_lens: List[List[int]],
+    rewards: List[List[float]],
+    num_turns: List[List[int]],
+    advantages: List[float],
+    policy_epoch: List[List[List[int]]],
+    kv_cache_epoch: List[List[List[int]]],
+    completed_epochs: List[List[int]],
+    num_evictions: List[List[int]],
+    current_iteration: int,
+    example_group: list[TokenRollout | Rollout] | None = None,
+    tokenizer: MegatronTokenizer | None = None,
+):
     """Make a wandb-parseable dictionary of metrics for logging.
 
     Zero-turn rollouts are a mark of placeholders (empty-trajectory pads for failed episodes).
@@ -1022,16 +1042,12 @@ def prep_wandb_metrics(
     failed_rollouts = sum(not keep for g in real_mask for keep in g)
     failure_metrics = {
         'failed_rollouts/count': failed_rollouts,
-        'failed_rollouts/ratio': (
-            failed_rollouts / total_rollouts if total_rollouts else 0.0
-        ),
+        'failed_rollouts/ratio': (failed_rollouts / total_rollouts if total_rollouts else 0.0),
     }
 
     def _real(grouped):
         """Grouped per-rollout entries with placeholder (zero-turn) rollouts removed."""
-        return [
-            [x for x, keep in zip(g, m) if keep] for g, m in zip(grouped, real_mask)
-        ]
+        return [[x for x, keep in zip(g, m) if keep] for g, m in zip(grouped, real_mask)]
 
     # Reward metrics include failures. All other metrics do not.
     table_rewards = [r for g in _real(rewards) for r in g]
@@ -1041,8 +1057,7 @@ def prep_wandb_metrics(
     kv_cache_epoch_real = _real(kv_cache_epoch)
 
     group_table = wandb_writer.Table(
-        columns=['group_means', 'group_stds'],
-        data=[[np.mean(g), np.std(g)] for g in rewards],
+        columns=['group_means', 'group_stds'], data=[[np.mean(g), np.std(g)] for g in rewards]
     )
 
     # Per-rollout staleness (oldest token)
@@ -1062,105 +1077,133 @@ def prep_wandb_metrics(
     per_token_kv_staleness = [
         current_iteration - e for g in kv_cache_epoch_real for r in g for e in r
     ]
+    # Turn/completion lists already omit failed rollouts; filtering them with the per-rollout
+    # mask would misalign entries. Only per-rollout fields retain placeholder slots.
+    turn_lens_real = turn_lens
+    completed_epochs_real = completed_epochs
+    num_evictions_real = _real(num_evictions)
+
+    def _safe_mean(values):
+        return np.mean(values) if values else 0.0
+
+    def _safe_max(values):
+        return max(values) if values else 0
+
+    def _safe_min(values):
+        return min(values) if values else 0
+
+    mean_reward = _safe_mean([np.mean(g) for g in rewards if g])
+    mean_advantage = _safe_mean(advantages)
+    nonzero_groups_ratio = np.count_nonzero(advantages) / len(advantages) if advantages else 0.0
 
     metrics = {
-            'group_means_hist': wandb_writer.plot.histogram(
-                group_table, 'group_means', 'Group Means'
-            ),
-            'group_stds_hist': wandb_writer.plot.histogram(
-                group_table, 'group_stds', 'Group STDs'
-            ),
-            'rewards_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(
-                    columns=['reward'], data=[[r] for g in rewards for r in g]
-                ),
-                'reward', 'All Rewards'
-            ),
-            'advantages_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(
-                    columns=['advantages'], data=[[x] for x in advantages]
-                ),
-                'advantages', 'Advantages'
-            ),
-            # One row per real rollout.
-            'rollout_table': wandb_writer.Table(
-                columns=[
-                    'reward', 'traj_length', 'num_evictions',
-                    'policy_staleness', 'kv_staleness',
-                    'policy_last_token_staleness', 'kv_last_token_staleness',
-                ],
-                data=list(zip(
+        'group_means_hist': wandb_writer.plot.histogram(group_table, 'group_means', 'Group Means'),
+        'group_stds_hist': wandb_writer.plot.histogram(group_table, 'group_stds', 'Group STDs'),
+        'rewards_hist': wandb_writer.plot.histogram(
+            wandb_writer.Table(columns=['reward'], data=[[r] for g in rewards for r in g]),
+            'reward',
+            'All Rewards',
+        ),
+        'advantages_hist': wandb_writer.plot.histogram(
+            wandb_writer.Table(columns=['advantages'], data=[[x] for x in advantages]),
+            'advantages',
+            'Advantages',
+        ),
+        # One row per real rollout.
+        'rollout_table': wandb_writer.Table(
+            columns=[
+                'reward',
+                'traj_length',
+                'num_evictions',
+                'policy_staleness',
+                'kv_staleness',
+                'policy_last_token_staleness',
+                'kv_last_token_staleness',
+            ],
+            data=list(
+                zip(
                     table_rewards,
                     [l for g in traj_lens_real for l in g],
-                    [e for g in _real(num_evictions) for e in g],
+                    [e for g in num_evictions_real for e in g],
                     rollout_policy_staleness,
                     rollout_kv_staleness,
                     rollout_policy_last_token_staleness,
                     rollout_kv_last_token_staleness,
-                )),
+                )
             ),
-            # NOTE: This table can get very large (one row per token across all rollouts).
-            'per_token_table': wandb_writer.Table(
-                columns=['policy_staleness', 'kv_staleness'],
-                data=list(zip(per_token_policy_staleness, per_token_kv_staleness)),
+        ),
+        # NOTE: This table can get very large (one row per token across all rollouts).
+        'per_token_table': wandb_writer.Table(
+            columns=['policy_staleness', 'kv_staleness'],
+            data=list(zip(per_token_policy_staleness, per_token_kv_staleness)),
+        ),
+        # Group-level length/turn stats skip groups with all failed rollouts.
+        'mean_turn_length': _safe_mean([np.mean(g) for g in turn_lens_real if g]),
+        'mean_turn_length_std': _safe_mean([np.std(g) for g in turn_lens_real if g]),
+        'max_turn_length': _safe_max([max(g) for g in turn_lens_real if g]),
+        'min_turn_length': _safe_min([min(g) for g in turn_lens_real if g]),
+        'mean_traj_length': _safe_mean([np.mean(g) for g in traj_lens_real if g]),
+        'mean_traj_length_std': _safe_mean([np.std(g) for g in traj_lens_real if g]),
+        'max_traj_length': _safe_max([max(g) for g in traj_lens_real if g]),
+        'min_traj_length': _safe_min([min(g) for g in traj_lens_real if g]),
+        'mean_num_turns': _safe_mean([np.mean(g) for g in num_turns_real if g]),
+        'max_num_turns': _safe_max([max(g) for g in num_turns_real if g]),
+        'min_num_turns': _safe_min([min(g) for g in num_turns_real if g]),
+        'mean_reward': mean_reward,
+        'mean_advantage': mean_advantage,
+        'nonzero_groups_ratio': nonzero_groups_ratio,
+        'mean_policy_staleness': _safe_mean(rollout_policy_staleness),
+        'max_policy_staleness': _safe_max(rollout_policy_staleness),
+        'min_policy_staleness': _safe_min(rollout_policy_staleness),
+        'mean_kv_cache_staleness': _safe_mean(rollout_kv_staleness),
+        'max_kv_cache_staleness': _safe_max(rollout_kv_staleness),
+        'min_kv_cache_staleness': _safe_min(rollout_kv_staleness),
+        'mean_policy_last_token_staleness': _safe_mean(rollout_policy_last_token_staleness),
+        'max_policy_last_token_staleness': _safe_max(rollout_policy_last_token_staleness),
+        'min_policy_last_token_staleness': _safe_min(rollout_policy_last_token_staleness),
+        'mean_kv_cache_last_token_staleness': _safe_mean(rollout_kv_last_token_staleness),
+        'max_kv_cache_last_token_staleness': _safe_max(rollout_kv_last_token_staleness),
+        'min_kv_cache_last_token_staleness': _safe_min(rollout_kv_last_token_staleness),
+        'total_eviction_count': sum(sum(g) for g in num_evictions_real),
+        'max_num_evictions': _safe_max([max(g) for g in num_evictions_real if g]),
+        'mean_completion_gap': _safe_mean(
+            [current_iteration - s for g in completed_epochs_real for s in g]
+        ),
+        'per_token_policy_staleness_hist': wandb_writer.plot.histogram(
+            wandb_writer.Table(
+                columns=['staleness'], data=[[s] for s in per_token_policy_staleness]
             ),
-            # Group-level length/turn stats skip groups with all failed rollouts.
-            'mean_turn_length': np.mean([np.mean(g) for g in turn_lens if g]),
-            'mean_turn_length_std': np.mean([np.std(g) for g in turn_lens if g]),
-            'max_turn_length': max(max(g) for g in turn_lens if g),
-            'min_turn_length': min(min(g) for g in turn_lens if g),
-            'mean_traj_length': np.mean([np.mean(g) for g in traj_lens_real if g]),
-            'mean_traj_length_std': np.mean([np.std(g) for g in traj_lens_real if g]),
-            'max_traj_length': max(max(g) for g in traj_lens_real if g),
-            'min_traj_length': min(min(g) for g in traj_lens_real if g),
-            'mean_num_turns': np.mean([np.mean(g) for g in num_turns_real if g]),
-            'max_num_turns': max(max(g) for g in num_turns_real if g),
-            'min_num_turns': min(min(g) for g in num_turns_real if g),
-            'mean_reward': np.mean([np.mean(g) for g in rewards]),
-            'mean_advantage': np.mean(advantages),
-            'nonzero_groups_ratio': np.count_nonzero(advantages)
-            / len(advantages),
-            'mean_policy_staleness': np.mean(rollout_policy_staleness),
-            'max_policy_staleness': max(rollout_policy_staleness),
-            'min_policy_staleness': min(rollout_policy_staleness),
-            'mean_kv_cache_staleness': np.mean(rollout_kv_staleness),
-            'max_kv_cache_staleness': max(rollout_kv_staleness),
-            'min_kv_cache_staleness': min(rollout_kv_staleness),
-            'mean_policy_last_token_staleness': np.mean(rollout_policy_last_token_staleness),
-            'max_policy_last_token_staleness': max(rollout_policy_last_token_staleness),
-            'min_policy_last_token_staleness': min(rollout_policy_last_token_staleness),
-            'mean_kv_cache_last_token_staleness': np.mean(rollout_kv_last_token_staleness),
-            'max_kv_cache_last_token_staleness': max(rollout_kv_last_token_staleness),
-            'min_kv_cache_last_token_staleness': min(rollout_kv_last_token_staleness),
-            'total_eviction_count': sum([sum(g) for g in num_evictions]),
-            'max_num_evictions': max([max(g) for g in num_evictions]),
-            'mean_completion_gap': np.mean([current_iteration - s for g in completed_epochs for s in g]),
-            'per_token_policy_staleness_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_policy_staleness]),
-                'staleness', 'Per-Token Policy Staleness'
-            ),
-            'per_token_kv_staleness_hist': wandb_writer.plot.histogram(
-                wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_kv_staleness]),
-                'staleness', 'Per-Token KV Cache Staleness'
-            ),
-            **failure_metrics,
+            'staleness',
+            'Per-Token Policy Staleness',
+        ),
+        'per_token_kv_staleness_hist': wandb_writer.plot.histogram(
+            wandb_writer.Table(columns=['staleness'], data=[[s] for s in per_token_kv_staleness]),
+            'staleness',
+            'Per-Token KV Cache Staleness',
+        ),
+        **failure_metrics,
     }
     if example_group:
         if tokenizer is None:
-            raise ValueError("If you provide an example group to log, you need to provide a tokenizer too.")
+            raise ValueError(
+                "If you provide an example group to log, you need to provide a tokenizer too."
+            )
         # Each turn in a trajectory is a cumulative sequence (prompt + all turns so far), so
         # one row per rollout: the final turn already contains the whole conversation.
         metrics['rollouts'] = wandb_writer.Table(
             columns=['Trajectories', 'Tokens', 'Rewards'],
             rows=[
                 [
-                    tokenizer.detokenize(r.trajectory[-1])
-                    if isinstance(r, TokenRollout)
-                    else r.trajectory[-1],
+                    (
+                        tokenizer.detokenize(r.trajectory[-1])
+                        if isinstance(r, TokenRollout)
+                        else r.trajectory[-1]
+                    ),
                     r.trajectory,
                     r.reward,
                 ]
-                for r in example_group if r.trajectory
+                for r in example_group
+                if r.trajectory
             ],
         )
     return metrics
@@ -1178,9 +1221,7 @@ def _collect_rollout_pipeline_metrics() -> dict:
     if _ROLLOUT_AGENT is None:
         return {}
     sub_agents = (
-        _ROLLOUT_AGENT.agents
-        if isinstance(_ROLLOUT_AGENT, WeightedMultiTask)
-        else [_ROLLOUT_AGENT]
+        _ROLLOUT_AGENT.agents if isinstance(_ROLLOUT_AGENT, WeightedMultiTask) else [_ROLLOUT_AGENT]
     )
     metrics: dict = {}
     for sub_agent in sub_agents:
@@ -1189,27 +1230,29 @@ def _collect_rollout_pipeline_metrics() -> dict:
             continue
         env_id = getattr(sub_agent, "env_id", "") or "rollout"
         gate = pipeline.gate
-        metrics.update({
-            # Queue sizes and gate held are point-in-time reads.
-            f"{env_id}_pipeline_infer_queue_size": pipeline.infer_queue.qsize(),
-            f"{env_id}_pipeline_assemble_queue_size": pipeline.assemble_queue.qsize(),
-            f"{env_id}_pipeline_output_queue_size": pipeline.output_queue.qsize(),
-            f"{env_id}_pipeline_assemble_pending_groups": len(pipeline._assemble_pending),
-            f"{env_id}_pipeline_consume_pending_groups": len(pipeline._consume_pending),
-            f"{env_id}_pipeline_gate_capacity": gate.capacity,
-            f"{env_id}_pipeline_gate_held": gate.held,
-            f"{env_id}_pipeline_gate_utilization": (
-                gate.held / gate.capacity if gate.capacity else 0.0
-            ),
-            # Counters below accumulate since the previous collection.
-            f"{env_id}_pipeline_gate_prepare_blocked_seconds": gate.prepare_blocked_seconds,
-            f"{env_id}_pipeline_gate_acquire_calls": gate.acquire_calls,
-            f"{env_id}_pipeline_gate_release_calls": gate.release_calls,
-            f"{env_id}_pipeline_prepared_count": pipeline.prepared_count,
-            f"{env_id}_pipeline_inferred_count": pipeline.inferred_count,
-            f"{env_id}_pipeline_assembled_count": pipeline.assembled_count,
-            f"{env_id}_pipeline_yielded_count": pipeline.yielded_count,
-        })
+        metrics.update(
+            {
+                # Queue sizes and gate held are point-in-time reads.
+                f"{env_id}_pipeline_infer_queue_size": pipeline.infer_queue.qsize(),
+                f"{env_id}_pipeline_assemble_queue_size": pipeline.assemble_queue.qsize(),
+                f"{env_id}_pipeline_output_queue_size": pipeline.output_queue.qsize(),
+                f"{env_id}_pipeline_assemble_pending_groups": len(pipeline._assemble_pending),
+                f"{env_id}_pipeline_consume_pending_groups": len(pipeline._consume_pending),
+                f"{env_id}_pipeline_gate_capacity": gate.capacity,
+                f"{env_id}_pipeline_gate_held": gate.held,
+                f"{env_id}_pipeline_gate_utilization": (
+                    gate.held / gate.capacity if gate.capacity else 0.0
+                ),
+                # Counters below accumulate since the previous collection.
+                f"{env_id}_pipeline_gate_prepare_blocked_seconds": gate.prepare_blocked_seconds,
+                f"{env_id}_pipeline_gate_acquire_calls": gate.acquire_calls,
+                f"{env_id}_pipeline_gate_release_calls": gate.release_calls,
+                f"{env_id}_pipeline_prepared_count": pipeline.prepared_count,
+                f"{env_id}_pipeline_inferred_count": pipeline.inferred_count,
+                f"{env_id}_pipeline_assembled_count": pipeline.assembled_count,
+                f"{env_id}_pipeline_yielded_count": pipeline.yielded_count,
+            }
+        )
         for name, samples in (
             ("infer_queue_dwell", pipeline.infer_queue_dwell),
             ("engine_dwell", pipeline.engine_dwell),
@@ -1273,7 +1316,9 @@ def maybe_log_training_metrics(
     wandb_writer = get_wandb_writer()
     tb_writer = get_tensorboard_writer()
     if tb_writer:
-        tb_writer.add_scalar('mean_reward', np.mean([np.mean(g) for g in group_stats.rewards]), current_iteration)
+        tb_writer.add_scalar(
+            'mean_reward', np.mean([np.mean(g) for g in group_stats.rewards]), current_iteration
+        )
 
     # Pipeline instrumentation lives on rank 0 (the only rank that drives
     # rollout generation), while the wandb writer lives on the last rank.
@@ -1311,10 +1356,19 @@ def maybe_log_training_metrics(
     completed_epochs = group_stats.completed_epochs
     num_evictions = group_stats.num_evictions
 
-    metrics = metrics | prep_wandb_metrics(wandb_writer=wandb_writer,
-        traj_lens=traj_lens, turn_lens=turn_lens, rewards=rewards, num_turns=num_turns, advantages=advantages,
-        policy_epoch=policy_epoch, kv_cache_epoch=kv_cache_epoch, completed_epochs=completed_epochs,
-        num_evictions=num_evictions, current_iteration=current_iteration)
+    metrics = metrics | prep_wandb_metrics(
+        wandb_writer=wandb_writer,
+        traj_lens=traj_lens,
+        turn_lens=turn_lens,
+        rewards=rewards,
+        num_turns=num_turns,
+        advantages=advantages,
+        policy_epoch=policy_epoch,
+        kv_cache_epoch=kv_cache_epoch,
+        completed_epochs=completed_epochs,
+        num_evictions=num_evictions,
+        current_iteration=current_iteration,
+    )
     env_stats = lambda cont, idx: [cont[i] for i in idx]
     group_turn_counts = [sum(nt) for nt in num_turns]
 
@@ -1328,7 +1382,9 @@ def maybe_log_training_metrics(
             end = st + group_turn_counts[i]
             env_advantages.extend(advantages[st:end])
 
-        env_metrics = prep_wandb_metrics(wandb_writer=wandb_writer, traj_lens=env_stats(traj_lens, env_idx),
+        env_metrics = prep_wandb_metrics(
+            wandb_writer=wandb_writer,
+            traj_lens=env_stats(traj_lens, env_idx),
             turn_lens=env_stats(turn_lens, env_idx),
             rewards=env_stats(rewards, env_idx),
             num_turns=env_stats(num_turns, env_idx),
@@ -1383,7 +1439,7 @@ def prepare_trajectories(
     DEFAULT_PAD_TOKENS = ['<|finetune_right_pad_id|>', '<SPECIAL_999>']
 
     if tokenizer.library == "huggingface":
-        tokenizer : HuggingFaceTokenizer
+        tokenizer: HuggingFaceTokenizer
         if not tokenizer.pad:
             for pad_token in DEFAULT_PAD_TOKENS:
                 if pad_token in tokenizer._tokenizer.tokenizer.get_vocab():
@@ -1497,9 +1553,9 @@ def logprobs_forward_step(data_iterator, model, is_correction, packing_context=N
     if packing_context is not None:
         # When using sequence packing, the data iterator returns a tuple with a single element, the bin index.
         bin_tensor = next(data_iterator)[0]
-        #TODO(jalbericiola): change for named tuple
-        (b_trajs, _, _, _, b_posids, _, _, _, _, _, b_packed_seq_params) = (
-            load_packed_data_by_index(bin_tensor.item(), packing_context, is_correction)
+        # TODO(jalbericiola): change for named tuple
+        b_trajs, _, _, _, b_posids, _, _, _, _, _, b_packed_seq_params = load_packed_data_by_index(
+            bin_tensor.item(), packing_context, is_correction
         )
     else:
         b_trajs, b_posids = next(data_iterator)
@@ -1525,7 +1581,7 @@ def compute_logprobs_batch(
     data_loader,
     forward_backward_func,
     packing_context,
-    trajs_batch_size, # n_bins for seq packing, and batch_size for non seq packing
+    trajs_batch_size,  # n_bins for seq packing, and batch_size for non seq packing
     seq_length,
     logprobs_batch_size,
     decoder_seq_length,
@@ -1539,7 +1595,9 @@ def compute_logprobs_batch(
     data_iterator = iter(data_loader)
     for i in range(len(data_loader)):
         output_tensor = forward_backward_func(
-            forward_step_func=partial(logprobs_forward_step, is_correction=is_correction, packing_context=packing_context),
+            forward_step_func=partial(
+                logprobs_forward_step, is_correction=is_correction, packing_context=packing_context
+            ),
             data_iterator=data_iterator,
             model=model,
             num_microbatches=1,
@@ -1558,10 +1616,7 @@ def compute_logprobs_batch(
         assert logprobs.dtype == dtype
     else:
         logprobs = torch.empty(
-            trajs_batch_size,
-            seq_length-1,
-            dtype=dtype,
-            device=torch.cuda.current_device(),
+            trajs_batch_size, seq_length - 1, dtype=dtype, device=torch.cuda.current_device()
         )
 
     # Only PP>1 needs a broadcast from the last stage; for PP=1 the output is already local.
@@ -1608,7 +1663,9 @@ def prepare_data_for_update(
         with nvtx_range("rl/compute-group-stats", time=True):
             group_stats = compute_group_stats(rollouts, tokenizer, args.seq_length)
             # TODO(vitalyk): why do we need global_advantages here? go inside packing
-            advantages = global_advantages = torch.tensor(group_stats.advantages, dtype=dtype).cuda()
+            advantages = global_advantages = torch.tensor(
+                group_stats.advantages, dtype=dtype
+            ).cuda()
 
         # Now split the rollouts across the data parallel ranks for training
         # This needs to be done at this point because we are about to calculate logprobs
@@ -1627,7 +1684,9 @@ def prepare_data_for_update(
         rollouts = [r for g in rollouts for r in g]
 
         # We might sample more than we consume in one step.
-        samples_ratio_per_step = args.global_batch_size / (args.grpo_prompts_per_step * args.grpo_group_size)
+        samples_ratio_per_step = args.global_batch_size / (
+            args.grpo_prompts_per_step * args.grpo_group_size
+        )
         assert samples_ratio_per_step <= 1, "You cannot use more data than you sampled."
 
         # Multi-turn rollouts contribute one trainable trajectory per turn, and turn counts vary.
@@ -1655,7 +1714,9 @@ def prepare_data_for_update(
             )
         total_turns_sampled = len(rollout_turns)
 
-        has_inference_logprobs = any(isinstance(rollout, TokenRollout) for rollout, _ in rollout_turns)
+        has_inference_logprobs = any(
+            isinstance(rollout, TokenRollout) for rollout, _ in rollout_turns
+        )
 
         if data_parallel_world_size > 0:
             data_split_size = len(rollout_turns) // data_parallel_world_size
@@ -1670,7 +1731,7 @@ def prepare_data_for_update(
 
         with nvtx_range("rl/prepare-trajectories", time=True):
             trajs, generation_masks, inference_logprobs = prepare_trajectories(
-                rollout_turns, tokenizer, args.seq_length, args.rl_skip_bos_token,
+                rollout_turns, tokenizer, args.seq_length, args.rl_skip_bos_token
             )
         if not has_inference_logprobs:
             inference_logprobs = None
@@ -1690,8 +1751,8 @@ def prepare_data_for_update(
                     global_advantages,
                     args.seq_length,
                     args.rl_sequence_packing_max_sequences_per_bin,
-                    args.rl_sequence_packing_algo
-                    )
+                    args.rl_sequence_packing_algo,
+                )
 
                 compute_trajs = packing_context.packed_trajs
                 compute_position_ids = packing_context.packed_position_ids
@@ -1721,7 +1782,6 @@ def prepare_data_for_update(
                 )
                 logprobs_batch_size = args.micro_batch_size
 
-
         with torch.no_grad(), nvtx_range("rl/compute-logprobs", time=True):
             # Before we can update the model, we need to get the logprobs for the \pi_{old} model.
 
@@ -1733,9 +1793,7 @@ def prepare_data_for_update(
                     use_single_mempool=args.cuda_graph_use_single_mempool,
                 )
 
-            dtype = (
-                torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
-            )
+            dtype = torch.bfloat16 if args.bf16 else (torch.float16 if args.fp16 else torch.float32)
 
             pg_collection = get_attr_wrapped_model(model, "pg_collection")
             pp_group = pg_collection.pp
@@ -1783,7 +1841,6 @@ def prepare_data_for_update(
                     gc.collect()
                     torch.cuda.empty_cache()
 
-
         if sequence_packing:
             with nvtx_range("rl/pack-logprobs", time=True):
                 # Store logprobs on gpu in packing context
@@ -1812,7 +1869,6 @@ def prepare_data_for_update(
                         filled_mask=packed_inference_filled_mask,
                     )
 
-
                     # Store packed inference logprobs in packing context
                     packing_context.packed_inference_logprobs = packed_inference_logprobs.cuda()
             with nvtx_range("rl/create-dataloader", time=True):
@@ -1823,13 +1879,15 @@ def prepare_data_for_update(
 
                 update_microbatch_calculator(
                     samples_ratio_per_step=samples_ratio_per_step,
-                    num_bins_this_rank = len(packing_context.packed_trajs),
-                    bin_seq_indices = packing_context.packing_info.bin_seq_indices,
+                    num_bins_this_rank=len(packing_context.packed_trajs),
+                    bin_seq_indices=packing_context.packing_info.bin_seq_indices,
                     global_batch_size=args.global_batch_size,
                     micro_batch_size=args.micro_batch_size,
                     decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
-               )
-                loader = get_microbatch_dataloader(len(packing_context.packed_trajs), args.micro_batch_size)
+                )
+                loader = get_microbatch_dataloader(
+                    len(packing_context.packed_trajs), args.micro_batch_size
+                )
         else:
             with nvtx_range("rl/align-inference-logprobs", time=True):
                 if inference_logprobs is not None:
@@ -1851,7 +1909,7 @@ def prepare_data_for_update(
 
                 reconfigure_num_microbatches_calculator(
                     rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
-                    global_batch_size=math.ceil(samples_ratio_per_step*total_turns_sampled),
+                    global_batch_size=math.ceil(samples_ratio_per_step * total_turns_sampled),
                     micro_batch_size=args.micro_batch_size,
                     decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
                     data_parallel_size=mpu.get_data_parallel_world_size(),
@@ -1918,10 +1976,8 @@ def get_grpo_data_iterator(
 
     # We collect new rollouts when we've gone over the collected data 'grpo_iterations' times.
     global_batches_per_collection = (grpo_prompts_per_step * grpo_group_size) // global_batch_size
-    if (
-        buffered_rollouts is None or
-        iteration == runtime_state.last_collection_iteration +
-        (grpo_iterations * global_batches_per_collection)
+    if buffered_rollouts is None or iteration == runtime_state.last_collection_iteration + (
+        grpo_iterations * global_batches_per_collection
     ):
 
         rollouts = get_environment_rollouts(
@@ -2225,11 +2281,14 @@ def megatron_rl_inference_mode(
             with nvtx_range("rl/offload-optimizer-before-inference", time=True):
                 if not args.rl_training_cuda_graphs:
                     with nvtx_range("rl/offload/grad-buffers", time=True):
-                        model_for_grad_offload = training_model if training_model is not None else model
+                        model_for_grad_offload = (
+                            training_model if training_model is not None else model
+                        )
                         model_for_grad_offload[0].offload_grad_buffers()
                 else:
                     logger.warning(
-                        "Gradient buffers will not be offloaded when training cudagraphs are enabled!")
+                        "Gradient buffers will not be offloaded when training cudagraphs are enabled!"
+                    )
                 with nvtx_range("rl/offload/optimizer-state", time=True):
                     optimizer.offload_to_cpu()
 
@@ -2284,7 +2343,9 @@ def megatron_rl_inference_mode(
                     optimizer.restore_from_cpu()
 
         # Set training model back to train mode (not inference model if they're separate)
-        training_lang_module = unwrap_model(training_model[0]) if training_model is not None else lang_module
+        training_lang_module = (
+            unwrap_model(training_model[0]) if training_model is not None else lang_module
+        )
         training_lang_module.train()
 
         if has_lru_cache:
@@ -2315,6 +2376,7 @@ def rl_inference_interface_shutdown():
     # It seem the Flask server has non-daemon threads that are preventing the program from exiting.
     # We need to find a way to gracefully complete all in progress requests and shutdown the Flask server.
     import os
+
     os._exit(0)
 
 
@@ -2327,6 +2389,7 @@ def get_iteration_sequence_count(args):
     if torch.distributed.is_initialized():
         torch.distributed.all_reduce(sequences_tensor, group=mpu.get_data_parallel_group())
     return int(sequences_tensor.item())
+
 
 def _pad_nonnull_with_zeros(data: list[Optional[torch.Tensor]], max_len: int) -> torch.Tensor:
     """Pad each element of a list of tensors to the length required.

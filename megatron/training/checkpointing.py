@@ -716,7 +716,12 @@ def save_checkpoint(
             optimizer.save_parameter_state(optim_checkpoint_name)
 
     # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
-    if getattr(args, 'use_layer_wise_distributed_optimizer', False) and args.ckpt_format == 'torch':
+    if (
+        getattr(args, 'use_layer_wise_distributed_optimizer', False)
+        and not args.no_save_optim
+        and optimizer is not None
+        and args.ckpt_format == 'torch'
+    ):
         dp_rank = mpu.get_data_parallel_rank()
         optim_checkpoint_name = os.path.join(
             os.path.dirname(checkpoint_name), f'layer_wise_optimizer_{dp_rank}.pt'

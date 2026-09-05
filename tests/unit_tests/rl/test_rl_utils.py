@@ -1259,6 +1259,36 @@ class TestRLUtils:
         # mean_completion_gap = mean([6-5, 6-3, 6-5, 6-1]) = mean([1, 3, 1, 5]) = 2.5
         assert metrics["mean_completion_gap"] == 2.5
 
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [pytest.param((1, 1), id="tp1-pp1")],
+        indirect=["initialize_model_parallel"],
+    )
+    def test_prep_wandb_metrics_all_failed(self, initialize_model_parallel):
+        writer = MagicMock()
+        metrics = rl_utils.prep_wandb_metrics(
+            writer,
+            traj_lens=[[0, 0]],
+            turn_lens=[[]],
+            rewards=[[0.0, 0.0]],
+            num_turns=[[0, 0]],
+            advantages=[],
+            policy_epoch=[[[0], [0]]],
+            kv_cache_epoch=[[[0], [0]]],
+            completed_epochs=[[]],
+            num_evictions=[[0, 0]],
+            current_iteration=6,
+        )
+
+        assert metrics["failed_rollouts/count"] == 2
+        assert metrics["failed_rollouts/ratio"] == 1.0
+        assert metrics["max_traj_length"] == 0
+        assert metrics["mean_advantage"] == 0.0
+        assert metrics["nonzero_groups_ratio"] == 0.0
+        assert metrics["max_policy_staleness"] == 0
+        assert metrics["max_num_evictions"] == 0
+        assert metrics["mean_completion_gap"] == 0.0
+
     def test_compute_group_stats_excludes_placeholders_from_metric_fields(self):
         def real_rollout(tokens, epoch, problem_id):
             return TokenRollout(
