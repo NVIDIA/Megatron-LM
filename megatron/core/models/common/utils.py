@@ -283,6 +283,22 @@ class TransformerLayerNode(ScheduleNode):
         """Free-input policy hook. Subclasses override to specialize."""
         return should_free_input(name, is_moe, config, num_local_experts)
 
+    def reset_for_recompute(self):
+        """Release this node's forward activations, keeping it reusable for a replay.
+
+        Called as soon as the node's recompute segment has finished forwarding, so a
+        recomputed layer's boundary tensors do not stay pinned for the rest of the chunk
+        forward; the same node is later re-run with grad enabled to rebuild its state.
+
+        Only the references are dropped. The storages are deliberately left intact: the
+        replay rebuilds the autograd graph on top of these tensors, so resizing them the
+        way ``ScheduleNode``'s ``free_input`` path does corrupts that graph.
+        """
+        self.inputs = None
+        self.output = None
+        self.detached = tuple()
+        self.before_detached = tuple()
+
     def detach(self, t):
         """Detach a tensor and remember it for backward through the schedule node."""
         detached = make_viewless(t).detach()
