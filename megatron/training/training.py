@@ -4158,8 +4158,8 @@ def checkpoint_and_decide_exit(
             print_datetime('exiting program after receiving SIGTERM.')
             exit_now = True
 
-    # Exit based on duration.
-    if args.exit_duration_in_mins:
+    # Exit based on duration, only if signal was not received
+    elif args.exit_duration_in_mins:
         train_time = (time.time() - _TRAIN_START_TIME) / 60.0
         done_cuda = torch.tensor(
             [train_time > args.exit_duration_in_mins], dtype=torch.int, device='cuda'
@@ -4173,7 +4173,7 @@ def checkpoint_and_decide_exit(
         if exit_now:
             print_datetime(f'exiting program after {train_time} minutes')
 
-    # Exit based on iterations.
+    # Check for exit based on iterations.
     if (
         args.exit_interval
         and iteration % args.exit_interval == 0
