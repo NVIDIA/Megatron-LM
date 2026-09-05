@@ -16,8 +16,10 @@ import torch
 import torch.distributed as dist
 from packaging import version
 
-from megatron.core.dist_checkpointing import load, save
+from examples.mimo.training.topology import ModuleGridSpec, create_topology
+from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.validation import StrictHandling
+from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
@@ -56,7 +58,16 @@ def _randomize_params(model, seed):
             p.random_()
 
 
-def _create_model_and_optimizer(encoder_grid, llm_grid, hidden_size, num_layers, vocab_size, seed):
+def _create_model_and_optimizer(
+    encoder_grid,
+    llm_grid,
+    hidden_size,
+    num_layers,
+    vocab_size,
+    seed,
+    encoder_hidden_size=None,
+    language_rank_input_projection=False,
+):
     """Create MIMO model with DDP + optimizer, do a fake step to populate optimizer state.
 
     Caller must call create_all_embedding_groups() before this function.
@@ -71,6 +82,8 @@ def _create_model_and_optimizer(encoder_grid, llm_grid, hidden_size, num_layers,
         num_layers=num_layers,
         vocab_size=vocab_size,
         seq_len=64,
+        encoder_hidden_size=encoder_hidden_size,
+        language_rank_input_projection=language_rank_input_projection,
     )
     _randomize_params(mimo_model, seed)
 
@@ -93,6 +106,77 @@ def _create_model_and_optimizer(encoder_grid, llm_grid, hidden_size, num_layers,
     optimizer.step()
 
     return mimo_model, optimizer
+
+
+def run_projection_cross_placement_checkpoint_test(source_on_language_ranks):
+    """Save with one projector placement and load model weights with the other."""
+    for name in ('NVTE_FLASH_ATTN', 'NVTE_FUSED_ATTN', 'NVTE_UNFUSED_ATTN'):
+        os.environ.pop(name, None)
+
+    topology = create_topology(
+        [
+            ModuleGridSpec(name=ENCODER_NAME, num_ranks=4, tp=2, rank_offset=0, expt_tp=2),
+            ModuleGridSpec(
+                name=MIMO_LANGUAGE_MODULE_KEY,
+                num_ranks=4,
+                tp=2,
+                gtp_remat=2,
+                rank_offset=4,
+                expt_tp=2,
+                expt_gtp_remat=2,
+            ),
+        ]
+    )
+    encoder_grid = topology.grids[ENCODER_NAME]
+    llm_grid = topology.grids[MIMO_LANGUAGE_MODULE_KEY]
+
+    common = {
+        "encoder_name": ENCODER_NAME,
+        "encoder_grid": encoder_grid,
+        "llm_grid": llm_grid,
+        "hidden_size": 256,
+        "encoder_hidden_size": 128,
+        "num_layers": 2,
+        "vocab_size": 1000,
+        "seq_len": 64,
+        "projection_type": "affine",
+        "language_pg_collection": topology.module_pgs[MIMO_LANGUAGE_MODULE_KEY],
+        "vision_pg_collection": topology.module_pgs[ENCODER_NAME],
+    }
+    model_a, *_ = get_mimo_model(
+        **common, language_rank_input_projection=source_on_language_ranks, freeze_encoder=True
+    )
+    _randomize_params(model_a, seed=1)
+
+    source_ckpt = _get_shared_tmpdir()
+    destination_ckpt = _get_shared_tmpdir()
+    try:
+        save(model_a.sharded_state_dict(), source_ckpt)
+        dist.barrier()
+
+        model_b, *_ = get_mimo_model(
+            **common,
+            language_rank_input_projection=not source_on_language_ranks,
+            freeze_encoder=True,
+        )
+        _randomize_params(model_b, seed=2)
+        model_sd, missing, unexpected = load(
+            model_b.sharded_state_dict(), source_ckpt, strict=StrictHandling.RETURN_ALL
+        )
+        assert not [key for key in missing if '_extra_state' not in key], missing
+        assert not [key for key in unexpected if '_extra_state' not in key], unexpected
+        model_b.load_state_dict(model_sd)
+
+        save(model_b.sharded_state_dict(), destination_ckpt)
+        source_tensors = load_plain_tensors(source_ckpt)
+        destination_tensors = load_plain_tensors(destination_ckpt)
+        assert source_tensors.keys() == destination_tensors.keys()
+        for name, tensor in source_tensors.items():
+            assert torch.equal(tensor, destination_tensors[name]), name
+    finally:
+        _cleanup_tmpdir(source_ckpt)
+        _cleanup_tmpdir(destination_ckpt)
+        topology.destroy()
 
 
 def run_checkpoint_test(
@@ -274,6 +358,16 @@ class TestMimoCheckpoint:
             hidden_size=256,
             num_layers=2,
         )
+
+    @pytest.mark.parametrize("source_on_language_ranks", [False, True])
+    def test_input_projection_checkpoint_loads_across_placements(self, source_on_language_ranks):
+        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+        if self.world_size != 8:
+            pytest.skip(f"Requires 8 GPUs, got {self.world_size}")
+        if not HAVE_GTP:
+            pytest.skip("GTP requires a supported Transformer Engine version")
+        run_projection_cross_placement_checkpoint_test(source_on_language_ranks)
 
 
 class TestOptimizerCheckpointHelpers:

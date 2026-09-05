@@ -18,6 +18,7 @@ from examples.mimo.model_providers.nemotron_moe_vlm import (
     add_model_provider_args,
 )
 from examples.mimo.model_providers.radio_encoder import RADIO_ENCODER_MODULE_NAME
+from examples.mimo.training.args import add_hetero_grid_args
 
 # (num_layers, hybrid_layer_pattern) is the ONLY architecture delta between the
 # 20L and 54L Nemotron presets; every other field is shared. num_layers follows
@@ -196,7 +197,10 @@ def _parse_validate(argv):
     saved = sys.argv
     sys.argv = ["pytest"] + argv
     try:
-        args = parse_args(add_model_provider_args, ignore_unknown_args=True)
+        args = parse_args(
+            lambda parser: add_hetero_grid_args(add_model_provider_args(parser)),
+            ignore_unknown_args=True,
+        )
     finally:
         sys.argv = saved
     validate_args(args)
@@ -329,6 +333,37 @@ def test_projection_input_size_tracks_pixel_shuffle(pixel_shuffle, expected_proj
     assert encoder.params["apply_pixel_shuffle"] is pixel_shuffle
     assert projection.params["input_size"] == expected_projection_input_size
     assert projection.params["config"].ffn_hidden_size == 4 * expected_projection_input_size
+
+
+def test_language_rank_placement_uses_language_parallelism():
+    from examples.mimo.model_providers import resolve_provider
+    from examples.mimo.model_providers.nemotron_moe_vlm import (
+        language_input_projection_spec,
+        nemotron_language_config,
+        vision_submodules_spec,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    args = _parse_validate(_build_argv(*_PRESET_20L))
+    args.mimo_run_input_projections_on_llm_ranks = True
+    encoder_spec = vision_submodules_spec(args, pg_collection=None, encoder_grid=None)
+
+    assert encoder_spec.submodules["input_projections"] == []
+
+    args.tensor_parallel_num_weight_shards = 4
+    language_config = nemotron_language_config(
+        args, tp_size=2, pp_size=1, ep_size=1, expt_tp_size=1
+    )
+    language_spec = ModuleSpec(module=object, params={"config": language_config})
+    projection = language_input_projection_spec(args, None, None, language_spec)
+
+    assert projection.params["input_size"] == 5120
+    assert projection.params["config"].tensor_model_parallel_size == 2
+    assert projection.params["config"].gtp_weight_remat_size == 2
+    provider = resolve_provider(args)
+    assert provider.language_input_projection_specs[RADIO_ENCODER_MODULE_NAME] is (
+        language_input_projection_spec
+    )
 
 
 # A full model instantiation (constructing MambaModel / RADIOEncoderWrapper) needs
