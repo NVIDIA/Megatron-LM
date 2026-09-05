@@ -11,6 +11,7 @@ Tests cover:
 import pytest
 import torch
 
+from megatron.core.inference.moe import HAVE_TE_GROUPED_MXFP8
 from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize, mxfp8_quantize_into
 from megatron.core.inference.quantization.mxfp8_tensor import HAVE_FLASHINFER, MXFP8Tensor
 
@@ -1025,3 +1026,399 @@ class TestPermuteAndQuantizeMxfp8:
             assert (
                 offs[i].item() % alignment == 0
             ), f"Offset {i}={offs[i].item()} not aligned to {alignment}"
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not HAVE_TE_GROUPED_MXFP8
+    or torch.cuda.get_device_capability()[0] < 10,
+    reason="Native TE MXFP8 grouped GEMM requires its device-metadata APIs and Blackwell",
+)
+class TestTENativeGroupedMxfp8:
+    """Native TE MXFP8 grouped quantization/GEMM for inference-optimized MoE."""
+
+    @staticmethod
+    def _quantized_weights(num_experts, in_features, out_features=None, optimize_for_gemm=True):
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+        quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+        quantizer.optimize_for_gemm = optimize_for_gemm
+        if out_features is None:
+            out_features = in_features
+        bf16_weights = [
+            torch.randn(out_features, in_features, device="cuda", dtype=torch.bfloat16) * 0.02
+            for _ in range(num_experts)
+        ]
+        return bf16_weights, [quantizer(weight) for weight in bf16_weights]
+
+    def test_moe_zero_pads_splits_to_256_and_matches_reference(self, monkeypatch):
+        import megatron.core.inference.moe.fused_moe as fused_moe
+
+        torch.manual_seed(11)
+        num_tokens, hidden_size, num_experts, topk = 19, 128, 4, 2
+        hidden = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16) * 0.2
+        probs = torch.rand(num_tokens, topk, device="cuda", dtype=torch.float32)
+        routing_map = torch.tensor(
+            [[token % 3, (token + 1) % 3] for token in range(num_tokens)],
+            device="cuda",
+            dtype=torch.int64,
+        )
+        fc1_bf16, fc1_mxfp8 = self._quantized_weights(num_experts, hidden_size)
+        fc2_bf16, fc2_mxfp8 = self._quantized_weights(num_experts, hidden_size)
+
+        captured_splits = []
+        original_grouped_mm = fused_moe._te_mxfp8_grouped_mm
+
+        def record_splits(x, weight, first_dims):
+            captured_splits.append(first_dims.clone())
+            return original_grouped_mm(x, weight, first_dims)
+
+        monkeypatch.setattr(fused_moe, "_te_mxfp8_grouped_mm", record_splits)
+        actual = fused_moe.mcore_fused_moe(
+            hidden,
+            probs,
+            fc1_mxfp8,
+            fc2_mxfp8,
+            fused_moe.ActivationType.SQUARED_RELU,
+            num_experts,
+            0,
+            _vt(num_tokens),
+            routing_map,
+        )
+
+        reference = torch.zeros_like(hidden, dtype=torch.float32)
+        for token in range(num_tokens):
+            for route in range(topk):
+                expert = routing_map[token, route].item()
+                intermediate = torch.nn.functional.linear(
+                    hidden[token : token + 1], fc1_bf16[expert]
+                )
+                intermediate = torch.relu(intermediate.float()).square().to(torch.bfloat16)
+                expert_output = torch.nn.functional.linear(intermediate, fc2_bf16[expert])
+                reference[token] += expert_output[0].float() * probs[token, route]
+
+        assert len(captured_splits) == 2
+        for splits in captured_splits:
+            assert splits.tolist() == [256, 256, 256, 0]
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, reference, atol=5e-4, rtol=0.25)
+
+    @pytest.mark.parametrize("weight_format", ["discrete", "single_grouped"])
+    def test_batch_invariant_log_probs_across_256_token_boundary(self, monkeypatch, weight_format):
+        """A request's log probabilities stay bitwise fixed across an FC2 M-bucket change."""
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        from megatron.core.inference.moe.fused_moe import ActivationType, mcore_fused_moe
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+
+        torch.manual_seed(2029)
+        hidden_size, ffn_size = 2688, 1856
+        num_experts, max_tokens, target_tokens = 2, 320, 16
+
+        single_grouped_weight = weight_format == "single_grouped"
+        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", str(int(single_grouped_weight)))
+        with te.fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+            fc1 = te.GroupedLinear(
+                num_experts,
+                hidden_size,
+                ffn_size,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                device="cuda",
+                single_grouped_weight=single_grouped_weight,
+            )
+            fc2 = te.GroupedLinear(
+                num_experts,
+                ffn_size,
+                hidden_size,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                device="cuda",
+                single_grouped_weight=single_grouped_weight,
+            )
+        if single_grouped_weight:
+            fc1_weight = fc1.weight
+            fc2_weight = fc2.weight
+        else:
+            fc1_weight = [fc1.weight0, fc1.weight1]
+            fc2_weight = [fc2.weight0, fc2.weight1]
+
+        hidden = torch.randn(max_tokens, hidden_size, device="cuda", dtype=torch.bfloat16) * 0.1
+        probs = torch.rand(max_tokens, 2, device="cuda", dtype=torch.float32)
+        probs /= probs.sum(dim=-1, keepdim=True)
+        routing_map = torch.tensor([0, 1], device="cuda", dtype=torch.int64).repeat(max_tokens, 1)
+        valid_tokens = _vt(240)
+        small_valid_tokens = _vt(240)
+        large_valid_tokens = _vt(max_tokens)
+        # TE model-init quantization is asynchronous. Checkpoint loading establishes
+        # this boundary before inference starts.
+        torch.cuda.synchronize()
+
+        def run_moe(
+            hidden_input=hidden,
+            probs_input=probs,
+            routing_input=routing_map,
+            valid_input=valid_tokens,
+        ):
+            return mcore_fused_moe(
+                hidden_input,
+                probs_input,
+                fc1_weight,
+                fc2_weight,
+                ActivationType.SQUARED_RELU,
+                num_experts,
+                0,
+                valid_input,
+                routing_input,
+            )
+
+        with torch.no_grad(), set_batch_invariant_mode(True, backend="te_native"):
+            # Prime TE's lazy grouped-GEMM state, as the inference engine does before
+            # CUDA graph capture.
+            warmup_output = run_moe(
+                hidden[:240], probs[:240], routing_map[:240], small_valid_tokens
+            )
+            torch.cuda.synchronize()
+            del warmup_output
+
+            # Different input shapes exercise one versus two static 256-row graph chunks.
+            eager_small_bucket_output = run_moe(
+                hidden[:240], probs[:240], routing_map[:240], small_valid_tokens
+            )
+            torch.cuda.synchronize()
+            eager_small_bucket_output = eager_small_bucket_output[:target_tokens].clone()
+            eager_large_bucket_output = run_moe(valid_input=large_valid_tokens)
+            torch.cuda.synchronize()
+            eager_large_bucket_output = eager_large_bucket_output[:target_tokens].clone()
+
+            def capture_moe(hidden_input, probs_input, routing_input, valid_input):
+                def graph_run():
+                    return run_moe(hidden_input, probs_input, routing_input, valid_input)
+
+                warmup_stream = torch.cuda.Stream()
+                warmup_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(warmup_stream):
+                    for _ in range(3):
+                        graph_run()
+                torch.cuda.current_stream().wait_stream(warmup_stream)
+
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    graph_output = graph_run()
+                graph.replay()
+                return graph, graph_output
+
+            small_graph, small_graph_output = capture_moe(
+                hidden[:240], probs[:240], routing_map[:240], small_valid_tokens
+            )
+            small_graph.replay()
+            graph_small_bucket_output = small_graph_output[:target_tokens].clone()
+
+            large_graph, large_graph_output = capture_moe(hidden, probs, routing_map, valid_tokens)
+            graph_large_bucket_output = large_graph_output[:target_tokens].clone()
+            valid_tokens.fill_(max_tokens)
+            large_graph.replay()
+            graph_large_batch_output = large_graph_output[:target_tokens].clone()
+
+            # Carry the exact MoE result through a deterministic vocabulary projection
+            # and log-softmax so the assertion matches the user-visible acceptance metric.
+            vocab_weight = torch.randn(256, hidden_size, device="cuda", dtype=torch.bfloat16) * 0.02
+            rows = torch.arange(target_tokens, device="cuda")
+            token_ids = rows
+            small_log_probs = torch.log_softmax(
+                graph_small_bucket_output.to(torch.bfloat16) @ vocab_weight.T, dim=-1
+            )[rows, token_ids]
+            large_log_probs = torch.log_softmax(
+                graph_large_batch_output.to(torch.bfloat16) @ vocab_weight.T, dim=-1
+            )[rows, token_ids]
+            torch.cuda.synchronize()
+
+        assert torch.count_nonzero(graph_large_batch_output).item() > 0
+        assert torch.equal(eager_small_bucket_output, eager_large_bucket_output)
+        assert torch.equal(graph_small_bucket_output, graph_large_bucket_output)
+        assert torch.equal(graph_large_bucket_output, graph_large_batch_output)
+        assert torch.equal(small_log_probs, large_log_probs)
+        assert (small_log_probs - large_log_probs).abs().max().item() == 0.0
+
+    def test_swiglu_moe(self):
+        from megatron.core.inference.moe.fused_moe import ActivationType, mcore_fused_moe
+
+        torch.manual_seed(14)
+        num_tokens, hidden_size, num_experts = 19, 128, 4
+        hidden = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        probs = torch.rand(num_tokens, 2, device="cuda", dtype=torch.float32)
+        routing_map = torch.tensor(
+            [[token % 3, (token + 1) % 3] for token in range(num_tokens)],
+            device="cuda",
+            dtype=torch.int64,
+        )
+        _, fc1_mxfp8 = self._quantized_weights(
+            num_experts, hidden_size, out_features=2 * hidden_size
+        )
+        _, fc2_mxfp8 = self._quantized_weights(num_experts, hidden_size)
+
+        output = mcore_fused_moe(
+            hidden,
+            probs,
+            fc1_mxfp8,
+            fc2_mxfp8,
+            ActivationType.SWIGLU,
+            num_experts,
+            0,
+            _vt(num_tokens),
+            routing_map,
+        )
+
+        assert output.shape == hidden.shape
+        assert torch.isfinite(output).all()
+
+    def test_model_conversion_preserves_te_experts(self):
+        from megatron.core.inference.moe import InferenceGroupedGemmBackend
+        from megatron.core.inference.quantization.utils import (
+            get_te_grouped_moe_parameter_ids,
+            quantize_model_to_mxfp8,
+        )
+        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+        hidden_size = 128
+        root = torch.nn.Module()
+        root.dense = torch.nn.Module()
+        _, dense_weights = self._quantized_weights(1, hidden_size, optimize_for_gemm=False)
+        root.dense.weight = torch.nn.Parameter(dense_weights[0], requires_grad=False)
+
+        root.experts = torch.nn.Module()
+        root.experts.num_local_experts = 1
+        root.experts.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.TE
+        root.experts.linear_fc1 = torch.nn.Module()
+        root.experts.linear_fc2 = torch.nn.Module()
+        _, fc1_weights = self._quantized_weights(1, hidden_size)
+        _, fc2_weights = self._quantized_weights(1, hidden_size)
+        root.experts.linear_fc1.weight0 = torch.nn.Parameter(fc1_weights[0], requires_grad=False)
+        root.experts.linear_fc2.weight0 = torch.nn.Parameter(fc2_weights[0], requires_grad=False)
+
+        excluded = get_te_grouped_moe_parameter_ids(root)
+        quantize_model_to_mxfp8(root, backend="triton", excluded_parameter_ids=excluded)
+        InferenceGroupedMLP._build_te_mxfp8_weights(root.experts)
+
+        assert isinstance(root.dense.weight, MXFP8Tensor)
+        assert not isinstance(root.experts.linear_fc1.weight0, MXFP8Tensor)
+        assert not isinstance(root.experts.linear_fc2.weight0, MXFP8Tensor)
+        assert root.experts._fc1_weight[0] is root.experts.linear_fc1.weight0
+        assert root.experts._fc2_weight[0] is root.experts.linear_fc2.weight0
+
+    def test_single_grouped_weight_representation(self, monkeypatch):
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        from megatron.core.inference.moe.fused_moe import ActivationType, mcore_fused_moe
+        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+        # TE gates the experimental single-parameter representation behind this flag.
+        # Without it, GroupedLinear silently falls back to weight0..weightN.
+        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+        torch.manual_seed(12)
+        num_tokens, hidden_size, num_experts = 19, 128, 4
+        with te.fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+            fc1 = te.GroupedLinear(
+                num_experts,
+                hidden_size,
+                hidden_size,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                device="cuda",
+                single_grouped_weight=True,
+            )
+            fc2 = te.GroupedLinear(
+                num_experts,
+                hidden_size,
+                hidden_size,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                device="cuda",
+                single_grouped_weight=True,
+            )
+
+        grouped_mlp = torch.nn.Module()
+        grouped_mlp.num_local_experts = num_experts
+        grouped_mlp.linear_fc1 = fc1
+        grouped_mlp.linear_fc2 = fc2
+        InferenceGroupedMLP._build_te_mxfp8_weights(grouped_mlp)
+
+        hidden = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        probs = torch.rand(num_tokens, 2, device="cuda", dtype=torch.float32)
+        routing_map = torch.tensor(
+            [[token % 3, (token + 1) % 3] for token in range(num_tokens)],
+            device="cuda",
+            dtype=torch.int64,
+        )
+        output = mcore_fused_moe(
+            hidden,
+            probs,
+            grouped_mlp._fc1_weight,
+            grouped_mlp._fc2_weight,
+            ActivationType.SQUARED_RELU,
+            num_experts,
+            0,
+            _vt(num_tokens),
+            routing_map,
+        )
+
+        assert grouped_mlp._fc1_weight is fc1.weight
+        assert grouped_mlp._fc2_weight is fc2.weight
+        assert output.shape == hidden.shape
+        assert torch.isfinite(output).all()
+
+    def test_cuda_graph_replays_with_new_device_splits(self):
+        from megatron.core.inference.moe.fused_moe import ActivationType, mcore_fused_moe
+
+        torch.manual_seed(13)
+        num_tokens, hidden_size, num_experts = 17, 128, 4
+        hidden = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16) * 0.2
+        probs = torch.rand(num_tokens, 1, device="cuda", dtype=torch.float32)
+        routing_map = torch.zeros(num_tokens, 1, device="cuda", dtype=torch.int64)
+        _, fc1_mxfp8 = self._quantized_weights(num_experts, hidden_size)
+        _, fc2_mxfp8 = self._quantized_weights(num_experts, hidden_size)
+        valid_tokens = _vt(num_tokens)
+
+        def run_moe():
+            return mcore_fused_moe(
+                hidden,
+                probs,
+                fc1_mxfp8,
+                fc2_mxfp8,
+                ActivationType.SQUARED_RELU,
+                num_experts,
+                0,
+                valid_tokens,
+                routing_map,
+            )
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(3):
+                warmup_output = run_moe()
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_output = run_moe()
+        graph.replay()
+        first_output = graph_output.clone()
+
+        # The captured operations must consume this new device-resident routing state.
+        routing_map.fill_(2)
+        graph.replay()
+        second_output = graph_output.clone()
+        eager_output = run_moe()
+        torch.cuda.synchronize()
+
+        assert warmup_output is not None
+        assert torch.isfinite(second_output).all()
+        assert not torch.equal(first_output, second_output)
+        torch.testing.assert_close(second_output, eager_output, atol=0, rtol=0)

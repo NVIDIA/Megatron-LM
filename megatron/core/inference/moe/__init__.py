@@ -2,7 +2,14 @@
 
 import enum
 
-from .fused_moe import ActivationType, mcore_fused_moe
+from .fused_moe import (
+    HAVE_TE_GROUPED_MXFP8,
+    ActivationType,
+    is_te_mxfp8_weight,
+    mcore_fused_moe,
+    prepare_te_mxfp8_batch_invariant_weight,
+    refresh_te_mxfp8_batch_invariant_weight,
+)
 from .vllm_fused_moe import vllm_fused_moe
 
 
@@ -14,5 +21,6 @@ class InferenceGroupedGemmBackend(enum.Enum):
     """
 
     FLASHINFER = "flashinfer"
+    TE = "te"
     TORCH = "torch"
     VLLM = "vllm"

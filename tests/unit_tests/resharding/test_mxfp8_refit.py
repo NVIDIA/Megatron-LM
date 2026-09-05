@@ -602,3 +602,150 @@ class TestMXFP8RefitIntegration:
             expected = MXFP8Tensor.from_bf16(source_weight)
             assert torch.equal(actual.data, expected.data)
             assert torch.equal(actual.scale, expected.scale)
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+class TestTENativeMxfp8Refit:
+    """Refit native TE MXFP8 experts across both parameter representations."""
+
+    @pytest.mark.parametrize(
+        "source_single_grouped,destination_single_grouped",
+        [(False, False), (False, True), (True, False), (True, True)],
+    )
+    def test_refit_is_format_independent_and_preserves_storage(
+        self, monkeypatch, source_single_grouped, destination_single_grouped
+    ):
+        import transformer_engine.pytorch as te
+        import transformer_engine_torch as tex
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        from megatron.core.fp8_utils import get_grouped_quantized_members
+        from megatron.core.inference.moe import (
+            prepare_te_mxfp8_batch_invariant_weight,
+            refresh_te_mxfp8_batch_invariant_weight,
+        )
+        from megatron.core.resharding.utils import named_refit_tensors
+
+        class LoopbackCopyService(CopyService):
+            requires_process_group_barrier = False
+            supports_multiple_runs_per_plan = True
+
+            def __init__(self):
+                self.sends = {}
+                self.recvs = []
+
+            def submit_send(self, src_tensor, dest_rank, task_id=None):
+                # Communication backends require real, addressable tensors, not
+                # TE's metadata-only GroupedTensor wrapper (whose data_ptr is zero).
+                assert type(src_tensor) is torch.Tensor
+                assert src_tensor.data_ptr() != 0
+                self.sends[task_id] = src_tensor.clone()
+
+            def submit_recv(self, dest_tensor, src_rank, task_id=None):
+                assert type(dest_tensor) is torch.Tensor
+                assert dest_tensor.data_ptr() != 0
+                self.recvs.append((dest_tensor, task_id))
+
+            def run(self):
+                for dest_tensor, task_id in self.recvs:
+                    dest_tensor.copy_(self.sends[task_id])
+                self.sends.clear()
+                self.recvs.clear()
+
+        def make_grouped_linear(single_grouped_weight, seed):
+            torch.manual_seed(seed)
+            with te.fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+                return te.GroupedLinear(
+                    2,
+                    128,
+                    64,
+                    bias=False,
+                    params_dtype=torch.bfloat16,
+                    device="cuda",
+                    single_grouped_weight=single_grouped_weight,
+                )
+
+        def storage_pointers(tensors):
+            return {
+                name: (tensor._rowwise_data.data_ptr(), tensor._rowwise_scale_inv.data_ptr())
+                for name, tensor in tensors.items()
+            }
+
+        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+        source = make_grouped_linear(source_single_grouped, seed=123)
+        destination = make_grouped_linear(destination_single_grouped, seed=456)
+
+        # The registered grouped parameter carries Megatron's parallel metadata;
+        # refit's per-expert views must inherit it for EP/TP planning.
+        for layer, uses_single_grouped in (
+            (source, source_single_grouped),
+            (destination, destination_single_grouped),
+        ):
+            if uses_single_grouped:
+                layer.weight.allreduce = False
+                layer.weight.tensor_model_parallel = True
+                layer.weight.partition_dim = 1
+
+        source_tensors = dict(named_refit_tensors(source))
+        destination_tensors = dict(named_refit_tensors(destination))
+        assert source_tensors.keys() == destination_tensors.keys() == {"weight0", "weight1"}
+        for layer, tensors, uses_single_grouped in (
+            (source, source_tensors, source_single_grouped),
+            (destination, destination_tensors, destination_single_grouped),
+        ):
+            if uses_single_grouped:
+                assert list(dict(layer.named_parameters())) == ["weight"]
+                members = get_grouped_quantized_members(layer.weight)
+                assert all(
+                    tensors[f"weight{index}"] is member for index, member in enumerate(members)
+                )
+                for tensor in tensors.values():
+                    assert tensor.allreduce is False
+                    assert tensor.tensor_model_parallel is True
+                    assert tensor.partition_dim == 1
+
+        destination_weight = (
+            destination.weight
+            if destination_single_grouped
+            else [destination.weight0, destination.weight1]
+        )
+        prepare_te_mxfp8_batch_invariant_weight(destination_weight)
+        cached_scale = None
+        cached_scale_before = None
+        cached_scale_ptr = None
+        if destination_single_grouped:
+            cached_storage, _ = getattr(destination.weight, "_mcore_batch_invariant_gemm_weight")
+            cached_scale = cached_storage.scale_inv
+            cached_scale_before = cached_scale.clone()
+            cached_scale_ptr = cached_scale.data_ptr()
+
+        expected = {name: tensor.dequantize().clone() for name, tensor in source_tensors.items()}
+        pointers_before = storage_pointers(destination_tensors)
+        full_slice = (slice(None), slice(None))
+        send_ops = []
+        recv_ops = []
+        for task_id, name in enumerate(source_tensors):
+            send_ops.append(TransferOp(name, 0, True, full_slice, full_slice, task_id=task_id))
+            recv_ops.append(TransferOp(name, 0, False, full_slice, full_slice, task_id=task_id))
+
+        execute_reshard_plan(
+            ReshardPlan(send_ops=send_ops, recv_ops=recv_ops),
+            source,
+            destination,
+            LoopbackCopyService(),
+        )
+
+        actual = dict(named_refit_tensors(destination))
+        assert storage_pointers(actual) == pointers_before
+        for name, tensor in actual.items():
+            torch.testing.assert_close(tensor.dequantize(), expected[name], atol=0, rtol=0)
+
+        refreshed = refresh_te_mxfp8_batch_invariant_weight(destination_weight)
+        assert refreshed is destination_single_grouped
+        if destination_single_grouped:
+            expected_storage = destination.weight.copy()
+            tex.grouped_swizzle_for_gemm(expected_storage, rowwise=True, columnwise=False)
+            assert cached_scale.data_ptr() == cached_scale_ptr
+            assert not torch.equal(cached_scale, cached_scale_before)
+            assert torch.equal(cached_scale, expected_storage.scale_inv)

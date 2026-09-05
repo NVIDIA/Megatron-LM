@@ -13,6 +13,7 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
     GPTInferenceWrapper,
 )
 from megatron.core.inference.quantization.utils import (
+    get_te_grouped_moe_parameter_ids,
     quantize_model_to_mxfp8,
     resolve_mxfp8_backend,
 )
@@ -113,7 +114,11 @@ def get_model_for_inference() -> MegatronModule:
 
     if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
         quant_backend = resolve_mxfp8_backend(args.inference_grouped_gemm_backend)
-        quantize_model_to_mxfp8(unwrap_model(model), backend=quant_backend)
+        unwrapped_model = unwrap_model(model)
+        excluded_parameter_ids = get_te_grouped_moe_parameter_ids(unwrapped_model)
+        quantize_model_to_mxfp8(
+            unwrapped_model, backend=quant_backend, excluded_parameter_ids=excluded_parameter_ids
+        )
     return model
 
 

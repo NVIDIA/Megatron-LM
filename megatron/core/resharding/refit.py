@@ -16,6 +16,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.inference.quantization.utils import (
     _should_quantize_param,
+    get_te_grouped_moe_parameter_ids,
     quantize_params_to_mxfp8,
     resolve_mxfp8_backend,
 )
@@ -315,12 +316,13 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     lm = target_model[0] if isinstance(target_model, (list, tuple)) else target_model
     core = unwrap_model(lm)
     decoder = core.decoder if hasattr(core, 'decoder') else core
+    excluded_parameter_ids = get_te_grouped_moe_parameter_ids(decoder)
 
     # 1. Compute which parameters are eligible for MXFP8 conversion.
     #    Must be done while params are still visible as nn.Parameter (BF16).
     convertible: set[str] = set()
     for name, param in decoder.named_parameters():
-        if _should_quantize_param(param):
+        if id(param) not in excluded_parameter_ids and _should_quantize_param(param):
             convertible.add(f"decoder.{name}")
 
     # 2. Quantize decoder weights -> persistent MXFP8Tensor buffers.
@@ -328,7 +330,9 @@ def _setup_mxfp8_transform_on_plan(plan, target_model) -> None:
     # representation. The reshard transform updates those canonical buffers, then
     # refresh_flashinfer_mxfp8_weights refreshes the derived buffers in place.
     backend = resolve_mxfp8_backend(lm.config.inference_grouped_gemm_backend)
-    persistent_buffers = quantize_params_to_mxfp8(decoder, backend=backend)
+    persistent_buffers = quantize_params_to_mxfp8(
+        decoder, backend=backend, excluded_parameter_ids=excluded_parameter_ids
+    )
 
     # 3. Build the transform and attach it to the plan.
     plan.transform = MXFP8ReshardTransform(
@@ -587,10 +591,14 @@ def reshard_model_weights(
     if tgt_core is not None and isinstance(transform, MXFP8ReshardTransform):
         refreshed = False
         for module in tgt_core.modules():
-            refresh = getattr(module, "refresh_flashinfer_mxfp8_weights", None)
-            if refresh is not None:
-                refreshed = bool(refresh()) or refreshed
+            for refresh_name in (
+                "refresh_flashinfer_mxfp8_weights",
+                "refresh_te_mxfp8_batch_invariant_weights",
+            ):
+                refresh = getattr(module, refresh_name, None)
+                if refresh is not None:
+                    refreshed = bool(refresh()) or refreshed
         if refreshed:
-            # Repacking is asynchronous. Synchronize before another stream replays graphs
-            # that read these derived weight buffers.
+            # Derived-weight refreshes are asynchronous. Synchronize before another
+            # stream replays graphs that read these buffers.
             torch.cuda.synchronize()

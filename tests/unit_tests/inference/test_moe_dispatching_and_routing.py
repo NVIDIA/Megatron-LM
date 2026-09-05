@@ -80,6 +80,76 @@ def _make_base_config(**overrides):
     return TransformerConfig(**params)
 
 
+def test_config_accepts_te_mxfp8_grouped_gemm():
+    """The native TE backend is available only for parameter-resident MXFP8."""
+    from megatron.core.inference.moe import InferenceGroupedGemmBackend
+
+    config = _make_base_config(
+        inference_grouped_gemm_backend="te", fp8="hybrid", fp8_recipe="mxfp8", fp8_param=True
+    )
+
+    assert config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TE
+
+
+def test_config_rejects_te_grouped_gemm_without_mxfp8():
+    with pytest.raises(ValueError, match="requires fp8_recipe='mxfp8'"):
+        _make_base_config(inference_grouped_gemm_backend="te")
+
+
+def test_config_accepts_te_mxfp8_batch_invariant():
+    """Native TE MXFP8 is the supported quantized batch-invariant MoE path."""
+    config = _make_base_config(
+        inference_grouped_gemm_backend="te",
+        fp8="hybrid",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+        batch_invariant_mode=True,
+        batch_invariant_backend="te_native",
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=4,
+        attention_dropout=0.0,
+    )
+
+    assert config.batch_invariant_mode
+
+
+def test_config_rejects_te_mxfp8_batch_invariant_with_substitute_backend(monkeypatch):
+    """The MXFP8 exception must not silently enable unsupported dense backends."""
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels
+
+    monkeypatch.setattr(batch_invariant_kernels, "HAVE_DEEPGEMM_BF16", True)
+    with pytest.raises(AssertionError, match="native TE MXFP8"):
+        _make_base_config(
+            inference_grouped_gemm_backend="te",
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            batch_invariant_mode=True,
+            batch_invariant_backend="triton",
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+        )
+
+
+def test_config_rejects_te_mxfp8_batch_invariant_with_gated_activation():
+    """The validated MXFP8 path is limited to Nemotron-style squared-ReLU experts."""
+    with pytest.raises(AssertionError, match="non-gated squared-ReLU"):
+        _make_base_config(
+            inference_grouped_gemm_backend="te",
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            gated_linear_unit=True,
+            activation_func=torch.nn.functional.silu,
+            batch_invariant_mode=True,
+            batch_invariant_backend="te_native",
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+        )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # InferenceTopKRouter
 # ──────────────────────────────────────────────────────────────────────
@@ -230,6 +300,44 @@ class TestNCCLAllGatherDispatcher:
         assert dispatcher.topk == NANOV3_BASE["moe_router_topk"]
         assert dispatcher.ep_size == Utils.world_size
 
+    @requires_te
+    @pytest.mark.launch_on_gb200
+    def test_te_mxfp8_moe_layer_end_to_end(self):
+        """A production-wired inference MoE layer runs with native TE expert weights."""
+        from megatron.core.fp8_utils import get_fp8_context
+        from megatron.core.inference.moe import HAVE_TE_GROUPED_MXFP8
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        if (
+            not torch.cuda.is_available()
+            or not HAVE_TE_GROUPED_MXFP8
+            or torch.cuda.get_device_capability()[0] < 10
+        ):
+            pytest.skip("Native TE MXFP8 grouped GEMM requires its device APIs and Blackwell")
+
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="te",
+            inference_moe_token_dispatcher_type="nccl",
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            use_cpu_initialization=False,
+            moe_shared_expert_intermediate_size=None,
+        )
+        NCCLAllGatherDispatcher.allocate_buffers()
+        with get_fp8_context(config, 0, is_init=True):
+            layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+
+        hidden_states = torch.randn(17, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad(), InferenceMode.active():
+            output, _ = layer(hidden_states)
+
+        assert output.shape == hidden_states.shape
+        assert output.dtype == torch.bfloat16
+        assert torch.isfinite(output).all()
+
     def test_init_rejects_batch_invariant_ep(self):
         """Batch-invariant MoE on the inference EP path is NVLS-only on this branch."""
         if Utils.world_size == 1:
@@ -370,6 +478,91 @@ class TestNVLSAllGatherVDispatcher:
         dispatcher = self._make_dispatcher()
         assert dispatcher.topk == NANOV3_BASE["moe_router_topk"]
         assert dispatcher.ep_size == Utils.world_size
+
+    @requires_te
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("batch_invariant_mode", [False, True])
+    def test_te_mxfp8_moe_layer_end_to_end(self, batch_invariant_mode):
+        """Native TE MXFP8 is bitwise co-batch invariant through the real NVLS layer."""
+        from megatron.core.fp8_utils import get_fp8_context
+        from megatron.core.inference.moe import HAVE_TE_GROUPED_MXFP8
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.parallel_state import get_expert_model_parallel_group
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            set_batch_invariant_mode,
+        )
+        from megatron.core.transformer.moe.token_dispatcher_inference import (
+            NVLSAllGatherVDispatcher,
+        )
+
+        if Utils.world_size & (Utils.world_size - 1):
+            pytest.skip("NVLS Triton symmetric-memory barrier requires power-of-two EP size.")
+        if (
+            not torch.cuda.is_available()
+            or not HAVE_TE_GROUPED_MXFP8
+            or torch.cuda.get_device_capability()[0] < 10
+        ):
+            pytest.skip("Native TE MXFP8 grouped GEMM requires its device APIs and Blackwell")
+
+        config = _make_base_config(
+            expert_model_parallel_size=Utils.world_size,
+            inference_grouped_gemm_backend="te",
+            inference_moe_token_dispatcher_type="nvls",
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            use_cpu_initialization=False,
+            moe_shared_expert_intermediate_size=None,
+            batch_invariant_mode=batch_invariant_mode,
+            batch_invariant_backend="te_native",
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+        )
+        NVLSAllGatherVDispatcher.allocate_buffers(
+            per_rank_worst_case_token_count=_NVLS_ENGINE_MAX_TOKENS,
+            topk=config.moe_router_topk,
+            hidden_size=config.hidden_size,
+            ep_group=get_expert_model_parallel_group(),
+        )
+        with get_fp8_context(config, 0, is_init=True):
+            layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+
+        shared_tokens = 17 + torch.distributed.get_rank()
+        # Across EP ranks the larger case adds enough routed rows to move typical
+        # per-expert loads from below 256 to above it.
+        hidden_states = torch.randn(
+            shared_tokens + 96, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        with (
+            torch.no_grad(),
+            InferenceMode.active(),
+            set_batch_invariant_mode(batch_invariant_mode, backend="te_native"),
+        ):
+            small_output, _ = layer(hidden_states[:shared_tokens])
+            large_output, _ = layer(hidden_states)
+
+        assert small_output.shape == hidden_states[:shared_tokens].shape
+        assert large_output.shape == hidden_states.shape
+        assert small_output.dtype == torch.bfloat16
+        assert torch.isfinite(small_output).all()
+        assert torch.isfinite(large_output).all()
+
+        if batch_invariant_mode:
+            shared_large_output = large_output[:shared_tokens]
+            assert torch.equal(small_output, shared_large_output)
+
+            vocab_weight = torch.randn(256, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+            rows = torch.arange(shared_tokens, device="cuda")
+            token_ids = rows.remainder(vocab_weight.shape[0])
+            small_log_probs = torch.log_softmax(small_output[:, 0] @ vocab_weight.T, dim=-1)[
+                rows, token_ids
+            ]
+            large_log_probs = torch.log_softmax(shared_large_output[:, 0] @ vocab_weight.T, dim=-1)[
+                rows, token_ids
+            ]
+            assert torch.equal(small_log_probs, large_log_probs)
+            assert (small_log_probs - large_log_probs).abs().max().item() == 0.0
 
     @pytest.mark.parametrize("seed", [42, 123, 7])
     @pytest.mark.parametrize(
