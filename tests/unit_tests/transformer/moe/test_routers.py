@@ -653,6 +653,47 @@ def test_router_gating_linear_bias(router_dtype):
 
 
 @pytest.mark.internal
+@pytest.mark.parametrize("use_pre_softmax", [True, False])
+@pytest.mark.parametrize("score_function", ["softmax", "sigmoid"])
+def test_topk_scaling_factor_applies_for_all_pre_softmax_settings(use_pre_softmax, score_function):
+    """`moe_router_topk_scaling_factor` should multiply the post-top-k probabilities for
+    every combination of `score_function` and `use_pre_softmax`.
+
+    Pins the documented behavior of `moe_router_topk_scaling_factor` (issue #1875): the
+    scaling is applied unconditionally inside `topk_routing_with_score_function`, not
+    only when `moe_router_pre_softmax=True`.
+    """
+    torch.manual_seed(0)
+    logits = torch.randn(8, 4)
+    scaling = 2.5
+
+    probs_unscaled, map_unscaled = topk_routing_with_score_function(
+        logits,
+        topk=2,
+        use_pre_softmax=use_pre_softmax,
+        scaling_factor=None,
+        score_function=score_function,
+    )
+    probs_scaled, map_scaled = topk_routing_with_score_function(
+        logits,
+        topk=2,
+        use_pre_softmax=use_pre_softmax,
+        scaling_factor=scaling,
+        score_function=score_function,
+    )
+
+    # The selected experts must be identical: scaling is monotonic and only changes
+    # magnitude of probabilities, not which experts win the top-k selection.
+    assert torch.equal(map_scaled, map_unscaled)
+    selected = map_unscaled
+    assert selected.any(), "Sanity: at least one expert should be selected"
+
+    torch.testing.assert_close(
+        probs_scaled[selected], probs_unscaled[selected] * scaling, rtol=1e-6, atol=1e-6
+    )
+
+
+@pytest.mark.internal
 @pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
 @pytest.mark.parametrize("use_pre_softmax", [True, False])
 @pytest.mark.parametrize("topk", [1, 2])
