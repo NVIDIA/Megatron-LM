@@ -479,9 +479,10 @@ def make_weakref(ten, inplace=True):
         # transformer_engine/pytorch/utils.py.
         if torch.distributed.get_rank() == 0:
             logger.warning(
-                f"Could not create weak ref for tensor with dtype {arg.dtype}; "
+                f"Could not create weak ref for tensor with dtype {ten.dtype}; "
                 f"keeping strong ref with a potential memory overhead."
             )
+        wr = ten
 
     return wr
 
