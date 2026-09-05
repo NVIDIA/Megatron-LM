@@ -3063,9 +3063,22 @@ class TransformerConfig(ModelParallelConfig):
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
                     ):
+                        sync_free_hybridep_moe_graph = (
+                            self.cuda_graph_impl == "transformer_engine"
+                            and self.moe_token_dispatcher_type == "flex"
+                            and self.moe_flex_dispatcher_backend == "hybridep"
+                            and self.moe_expert_rank_capacity_factor is not None
+                            and self.moe_paged_stash
+                            and self.use_transformer_engine_op_fuser
+                        )
                         assert (
                             CudaGraphModule.moe not in self.cuda_graph_modules
-                        ), 'moe cuda graph is only supported with drop-padding MoE.'
+                            or sync_free_hybridep_moe_graph
+                        ), (
+                            "moe cuda graph is only supported with drop-padding MoE or "
+                            "transformer_engine sync-free HybridEP with rank capacity and "
+                            "paged stash."
+                        )
                         if self.moe_token_dispatcher_type == 'alltoall' and (
                             self.moe_expert_capacity_factor is not None
                             or self.moe_router_padding_for_fp8
@@ -3074,6 +3087,17 @@ class TransformerConfig(ModelParallelConfig):
                                 'moe_preprocess cuda graph is not supported when there are '
                                 'DtoH copies and synchronizations in the preprocess step.'
                             )
+
+            te_whole_moe_paged_stash = (
+                self.cuda_graph_impl == "transformer_engine"
+                and CudaGraphModule.moe in self.cuda_graph_modules
+                and self.moe_paged_stash
+            )
+            if te_whole_moe_paged_stash:
+                assert self.cuda_graph_warmup_steps >= 2, (
+                    "Transformer Engine whole-MoE CUDA graphs with paged stash require at least "
+                    "2 cuda_graph_warmup_steps to record the pipeline schedule before capture."
+                )
 
             if self.recompute_granularity:
                 if self.recompute_granularity != "selective":
