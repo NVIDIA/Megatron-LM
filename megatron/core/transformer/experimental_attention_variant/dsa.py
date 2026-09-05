@@ -8,6 +8,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -1255,6 +1256,8 @@ class DSAIndexer(MegatronModule):
                 f'"yarn"'
             )
 
+        # Indexer precision split: linear_wq_b runs FP8 (q-projection), while
+        # linear_wk + linear_weights_proj run BF16 (they feed index scores directly).
         self.linear_wq_b = build_module(
             submodules.linear_wq_b,
             self.q_lora_rank,
@@ -1267,17 +1270,19 @@ class DSAIndexer(MegatronModule):
             parallel_mode="duplicated",
         )
 
-        self.linear_wk = build_module(
-            submodules.linear_wk,
-            self.hidden_size,
-            self.index_head_dim,
-            config=self.config,
-            init_method=self.config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
-        )
+        # wk + weights_proj run in BF16; they feed index scores directly.
+        with get_fp8_disabled_context(self.config, is_init=True):
+            self.linear_wk = build_module(
+                submodules.linear_wk,
+                self.hidden_size,
+                self.index_head_dim,
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                parallel_mode="duplicated",
+            )
 
         k_norm_config = copy.copy(self.config)
         k_norm_config.normalization = "LayerNorm"
@@ -1290,17 +1295,18 @@ class DSAIndexer(MegatronModule):
             submodules.k_norm, config=k_norm_config, hidden_size=self.index_head_dim, eps=k_norm_eps
         )
 
-        self.linear_weights_proj = build_module(
-            submodules.linear_weights_proj,
-            self.hidden_size,
-            self.index_n_heads,
-            config=self.config,
-            init_method=self.config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
-        )
+        with get_fp8_disabled_context(self.config, is_init=True):
+            self.linear_weights_proj = build_module(
+                submodules.linear_weights_proj,
+                self.hidden_size,
+                self.index_n_heads,
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                parallel_mode="duplicated",
+            )
         # Indexer projections are duplicated across tensor-parallel ranks, so their gradients
         # should be averaged during final gradient synchronization.
         for param in self.parameters():
@@ -1382,40 +1388,43 @@ class DSAIndexer(MegatronModule):
         # q linear and apply rope to q
         # =========================================
         # [seqlen, batch, q_lora_rank] -> [seqlen, batch, index_n_heads * index_head_dim]
-        q, _ = self.linear_wq_b(qr)
+        with get_fp8_disabled_context(self.config):
+            q, _ = self.linear_wq_b(qr)
         # [seqlen, batch, index_n_heads * index_head_dim]
         #   -> [seqlen, batch, index_n_heads, index_head_dim]
         q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
         q = self._apply_rope(q, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_q)
-
-        # =========================================
-        # k linear and apply rope to k
-        # =========================================
-        # [seqlen, batch, hidden_size] -> [seqlen, batch, index_head_dim]
-        k, _ = self.linear_wk(x)
-        if self.config.dsa_indexer_k_norm_fp32:
-            k_dtype = k.dtype
-            k = self.k_norm(k.float()).to(dtype=k_dtype)
-        else:
-            k = self.k_norm(k)
-        # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
-        k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
-        k = self._apply_rope(k, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_kv)
-        # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
-        k = k.reshape(seqlen, bsz, self.index_head_dim)
-
-        # =========================================
-        # Rotate activation
-        # =========================================
         if self.config.dsa_indexer_rotate_activation:
             q = rotate_activation(q)
-            k = rotate_activation(k)
 
         # =========================================
-        # Prepare weights for index scores
+        # k linear, k_norm, rotate, and weights_proj run in BF16 (FP8 disabled).
         # =========================================
-        # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
-        weights, _ = self.linear_weights_proj(x)
+        with get_fp8_disabled_context(self.config):
+            # [seqlen, batch, hidden_size] -> [seqlen, batch, index_head_dim]
+            k, _ = self.linear_wk(x)
+            if self.config.dsa_indexer_k_norm_fp32:
+                k_dtype = k.dtype
+                k = self.k_norm(k.float()).to(dtype=k_dtype)
+            else:
+                k = self.k_norm(k)
+            # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
+            k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
+            k = self._apply_rope(k, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_kv)
+            # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
+            k = k.reshape(seqlen, bsz, self.index_head_dim)
+
+            # =========================================
+            # Rotate activation (k only; q already rotated in FP8 path)
+            # =========================================
+            if self.config.dsa_indexer_rotate_activation:
+                k = rotate_activation(k)
+
+            # =========================================
+            # Prepare weights for index scores
+            # =========================================
+            # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
+            weights, _ = self.linear_weights_proj(x)
         weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
 
         return q, k, weights
