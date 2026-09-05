@@ -1575,7 +1575,7 @@ def generate_state_dict(
     # Arguments, iteration, and model.
     state_dict = {}
     state_dict['args'] = args
-    state_dict['checkpoint_version'] = 3.0
+    state_dict['checkpoint_version'] = 3.1
     if iteration is not None:
         state_dict['iteration'] = iteration
 
@@ -2696,6 +2696,8 @@ def load_checkpoint(
         if sharded_sd_metadata is None:
             sharded_sd_metadata = {}
         sharded_sd_metadata['dp_cp_group'] = dp_cp_group
+        # Optimizer load templates use the content version to select checkpoint-era FQNs.
+        sharded_sd_metadata['checkpoint_version'] = state_dict.get('checkpoint_version', 0)
 
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
         model_sd_kwargs = dict(metadata=sharded_sd_metadata)
