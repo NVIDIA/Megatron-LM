@@ -3094,7 +3094,28 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         an intermediary.
         """
         if isinstance(self.optimizer, HybridDeviceOptimizer):
-            self.optimizer.update_fp32_param_by_new_param()
+            # The HybridDeviceOptimizer keeps its own detached copies -- pinned CPU
+            # clones and/or FP32 working copies -- that its sub-optimizers step on and
+            # that nothing else refreshes; reload_model_params() re-seeds them.
+            if not self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                # Without precision-aware the sub-optimizers step on the real FP32 shard
+                # masters (shard_fp32_from_float16_groups / shard_fp32_groups), so refresh
+                # those from the model params -- or from the checkpoint when a state_dict
+                # is given -- before re-seeding the detached copies from them.
+                self._copy_model_params_to_shard_main_params(state_dict)
+            else:
+                # With precision-aware the shard masters are None; the FP32 masters live
+                # inside the optimizer and reload_model_params() re-seeds them from the
+                # model params below. Seeding those from a checkpoint here is a limitation
+                # of the whole precision-aware path (the non-offload branch below also
+                # returns without consuming state_dict), so reject it explicitly rather
+                # than silently discarding the checkpoint's master weights.
+                assert state_dict is None, (
+                    "--load-main-params-from-ckpt is not supported with optimizer_cpu_offload: "
+                    "the FP32 master weights are held inside the HybridDeviceOptimizer, not in "
+                    "a shard that can be seeded from the checkpoint here."
+                )
+            self.optimizer.reload_model_params()
             return
 
         if self.ddp_config.use_megatron_fsdp:
@@ -3107,6 +3128,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             return
 
+        self._copy_model_params_to_shard_main_params(state_dict)
+
+    def _copy_model_params_to_shard_main_params(self, state_dict=None):
+        """Refresh the FP32 shard master params from the model params.
+
+        When ``state_dict`` is provided (``--load-main-params-from-ckpt``) the master
+        params are initialized from the checkpoint tensors instead of the current model
+        params.
+        """
         if state_dict is not None:
             # Build a mapping from the model params to the corresponding tensors in the state dict,
             # so that whenever the model params are used to initialize the main params, they can be
