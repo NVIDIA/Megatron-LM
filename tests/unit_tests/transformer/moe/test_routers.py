@@ -150,9 +150,15 @@ class TestTop2Router:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_router_with_padding_mask(self):
-        """Test that padding mask correctly excludes padding tokens from routing."""
+    @pytest.mark.parametrize("router_fusion", [False, True])
+    def test_router_with_padding_mask(self, router_fusion):
+        """Test that HybridEP excludes padding tokens from routing."""
+        if router_fusion and not HAVE_ROUTER_FUSION:
+            pytest.skip("TE fused router ops not available")
         self.router = self.router.cuda()
+        self.router.config.moe_router_fusion = router_fusion
+        self.router.config.moe_token_dispatcher_type = "flex"
+        self.router.config.moe_flex_dispatcher_backend = "hybridep"
         seq_len = 32
         batch_size = 2
         hidden_size = self.router.config.hidden_size
@@ -192,19 +198,65 @@ class TestTop2Router:
                 self.router.config.num_moe_experts,
             )
 
+            padding_rows = padding_mask.reshape(-1)
+            assert torch.count_nonzero(probs_with_mask[padding_rows]) == 0
+            assert not routing_map_with_mask[padding_rows].any()
+
             # Verify that probs for valid tokens are similar
             assert torch.equal(probs_valid_part, probs_without_mask)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize(
+        "dispatcher,backend,capacity_factor,rank_capacity_factor",
+        [
+            ("allgather", "deepep", None, None),
+            ("alltoall", "deepep", None, None),
+            ("flex", "deepep", None, None),
+            ("flex", "ncclep", None, None),
+            ("flex", "hybridep", 1.0, None),
+            ("flex", "hybridep", None, 1.0),
+        ],
+    )
+    def test_padding_mask_preserves_routes_outside_dropless_hybridep(
+        self, dispatcher, backend, capacity_factor, rank_capacity_factor
+    ):
+        """Only dropless HybridEP may consume a sparse route map."""
+        self.router = self.router.cuda()
+        self.router.config.moe_token_dispatcher_type = dispatcher
+        self.router.config.moe_flex_dispatcher_backend = backend
+        self.router.config.moe_expert_capacity_factor = capacity_factor
+        self.router.config.moe_expert_rank_capacity_factor = rank_capacity_factor
+        hidden_states = torch.randn(
+            (16, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        padding_mask = torch.zeros((16, 2), dtype=torch.bool, device="cuda")
+        padding_mask[8:, :] = True
+
+        with torch.no_grad():
+            probs_with_mask, routing_map_with_mask = self.router(
+                hidden_states, padding_mask=padding_mask
+            )
+            probs_without_mask, routing_map_without_mask = self.router(hidden_states)
+
+        torch.testing.assert_close(probs_with_mask, probs_without_mask)
+        assert torch.equal(routing_map_with_mask, routing_map_without_mask)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("with_padding_mask", [False, True])
-    def test_expert_bias_token_counts_with_padding_mask(self, with_padding_mask):
+    @pytest.mark.parametrize("dispatcher,backend", [("allgather", "deepep"), ("flex", "hybridep")])
+    def test_expert_bias_token_counts_with_padding_mask(
+        self, with_padding_mask, dispatcher, backend
+    ):
         """Test expert-bias counts in grad-enabled masked and unmasked forwards."""
         config = dataclasses.replace(
             self.transformer_config,
             moe_router_enable_expert_bias=True,
             moe_router_load_balancing_type="none",
             moe_router_score_function="sigmoid",
+            moe_token_dispatcher_type=dispatcher,
+            moe_flex_dispatcher_backend=backend,
         )
         submodules = get_submodules(
             get_gpt_layer_local_submodules(
@@ -229,6 +281,9 @@ class TestTop2Router:
             padding_mask[-2:, 0] = True
 
         probs, routing_map = router(hidden_states, padding_mask=padding_mask)
+        if dispatcher == "flex" and padding_mask is not None:
+            assert not routing_map[padding_mask.reshape(-1)].any()
+
         valid_routing_map = routing_map
         if padding_mask is not None:
             valid_routing_map = routing_map[~padding_mask.reshape(-1)]
