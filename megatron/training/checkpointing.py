@@ -2347,6 +2347,12 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('moe_latent_size', force=True)
     _set_arg('moe_use_norm_before_up_proj', force=True)
 
+    # Two-tower diffusion args (with backward compat for old checkpoint attr names).
+    _set_arg('tt_diffusion_time_conditioning', old_arg_name='use_time_conditioning', force=True)
+    _set_arg('tt_diffusion_time_conditioning', force=True)
+    _set_arg('tt_diffusion_bidirectional_mamba', old_arg_name='bidirectional_mamba', force=True)
+    _set_arg('tt_diffusion_bidirectional_mamba', force=True)
+
     # Tokenizer args.
     if args.use_tokenizer_model_from_checkpoint_args:
         # Using checkpoint version might not always be safe (e.g., if running on different cluster).
