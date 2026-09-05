@@ -412,6 +412,13 @@ it** — a different collective over a different process group, so enable either
   symmetric dense-GTP reduce-scatter and the fp32-accum all-to-all on the EGTP axis.
 - **Independent of `--use-nccl-ub`.** That flag registers DP-group (DDP bucket) buffers; these
   flags cover the gtp_remat axes only.
+- **Pool allocator.** The pools are backed by a VMM allocator implementing [NCCL's
+  memory-allocator requirements](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#memory-allocator)
+  minimally: unlike `ncclMemAlloc`, memory is mapped only on the allocation's device.
+  `ncclMemAlloc` additionally maps every allocation on all P2P-visible peer GPUs, and those
+  persistent peer mappings slow CPU-side kernel launching for the whole step (measured −6%
+  end-to-end at 256 GPUs; the VMM allocator recovers it). Window registration accepts this
+  memory and runs the same symmetric kernels.
 
 ---
 

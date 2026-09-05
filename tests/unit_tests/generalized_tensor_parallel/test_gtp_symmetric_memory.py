@@ -13,7 +13,11 @@ Test groups
 - TestSymmBackwardNumerics  - symm-flagged backward produces the same main_grad as plain GTP
 - TestRealPoolRegistration  - register_gtp_symm_pool + gtp_symm_pool_ctx + a
                               collective on pool memory; skips where NCCL window
-                              registration is unsupported
+                              registration is unsupported. Proves ncclCommWindowRegister
+                              accepts the VMM allocator's current-device-only memory
+- TestVmmAllocatorModule / TestSymmPoolBackend
+                            - the VMM allocator extension (build caching, pool
+                              alloc/recycle, granularity) and pool-backend wiring
 
 The buffer-routing tests monkeypatch ``is_gtp_symm_pool_registered`` in BOTH consuming
 namespaces
@@ -122,6 +126,88 @@ class TestRegisterVersionGuard:
         monkeypatch.setattr(gtp_symm, "is_torch_min_version", lambda v: False)
         with pytest.raises(RuntimeError, match="PyTorch >= 2.9"):
             gtp_symm.register_gtp_symm_pool(_StubGroup(size=2))
+
+
+def _vmm_pool_or_skip():
+    import shutil
+
+    import megatron.core.vmm_symm_allocator as vmm_alloc
+
+    # Preflight only: skip where the extension cannot possibly build, but let a real
+    # build failure FAIL the test (a broad skip would turn compiler regressions green).
+    if shutil.which("nvcc") is None:
+        pytest.skip("nvcc unavailable; cannot build the VMM allocator extension")
+    return vmm_alloc.create_vmm_mem_pool()
+
+
+class TestVmmAllocatorModule:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA allocator test")
+    def test_build_is_cached(self):
+        import megatron.core.vmm_symm_allocator as vmm_alloc
+
+        _vmm_pool_or_skip()
+        first = vmm_alloc._allocator
+        _vmm_pool_or_skip()
+        assert first is not None and vmm_alloc._allocator is first
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA allocator test")
+    def test_pool_alloc_write_read_recycle(self):
+        pool = _vmm_pool_or_skip()
+        with torch.cuda.use_mem_pool(pool):
+            t = torch.full((1024,), 3.0, device="cuda")
+        segments_after_alloc = pool.snapshot()
+        assert segments_after_alloc, "pool has no segments after an allocation"
+        # The hook's contract: segment base and size are granularity-multiples
+        # (recommended VMM granularity is at least 2 MiB on supported GPUs).
+        granularity = 2 * 1024 * 1024
+        assert segments_after_alloc[0]["address"] % granularity == 0
+        assert segments_after_alloc[0]["total_size"] % granularity == 0
+        assert torch.equal(t.cpu(), torch.full((1024,), 3.0))
+        segments = len(pool.snapshot())
+        del t
+        # Same-size realloc must recycle the cached segment, not map a new slab.
+        with torch.cuda.use_mem_pool(pool):
+            t2 = torch.empty(1024, device="cuda")
+        assert len(pool.snapshot()) == segments
+        del t2
+        torch.cuda.synchronize()
+
+
+class TestSymmPoolBackend:
+    def test_pools_are_vmm_backed(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(gtp_symm.vmm_symm_allocator, "init", lambda: calls.append("init"))
+        monkeypatch.setattr(
+            gtp_symm.vmm_symm_allocator,
+            "create_vmm_mem_pool",
+            lambda: calls.append("pool") or object(),
+        )
+        try:
+            gtp_symm._get_gtp_symm_pool(_StubGroup(name="backend_default_group"))
+            assert calls == ["init", "pool"]
+        finally:
+            gtp_symm._pools.pop("backend_default_group", None)
+
+    def test_falls_back_to_nccl_when_vmm_unavailable(self, monkeypatch):
+        calls = []
+
+        def _boom():
+            raise RuntimeError("extension failed to build")
+
+        monkeypatch.setattr(gtp_symm.vmm_symm_allocator, "init", _boom)
+        monkeypatch.setattr(
+            gtp_symm.nccl_allocator, "init", lambda: calls.append("nccl_init")
+        )
+        monkeypatch.setattr(
+            gtp_symm.nccl_allocator,
+            "create_nccl_mem_pool",
+            lambda symmetric: calls.append("nccl_pool") or object(),
+        )
+        try:
+            gtp_symm._get_gtp_symm_pool(_StubGroup(name="fallback_group"))
+            assert calls == ["nccl_init", "nccl_pool"]
+        finally:
+            gtp_symm._pools.pop("fallback_group", None)
 
 
 class TestRegisteredLIFOPool:
@@ -426,5 +512,7 @@ def _worker_real_pool_registration(rank, world_size, port):
 
 class TestRealPoolRegistration:
     def test_register_alloc_collective_deregister(self):
+        """The VMM round trip: it proves ncclCommWindowRegister accepts
+        current-device-only mapped VMM memory."""
         _requires_multi_gpu(4)
         _run_distributed(_worker_real_pool_registration, 4)
