@@ -71,6 +71,7 @@ class MaybeMultiStorageClient:
     """Resolve filesystem helpers through MSC only when it is enabled."""
 
     def path_isdir(self, path, strict: bool = True):
+        """Return whether ``path`` is a directory using MSC when enabled."""
         if MultiStorageClientFeature.is_enabled():
             pkg = MultiStorageClientFeature.import_package()
             return pkg.os.path.isdir(path, strict=strict)
