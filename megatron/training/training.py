@@ -5092,6 +5092,16 @@ def train(
             nsys_nvtx_context,
         )
 
+        # Detect a dead/broken cached-logits-saver async worker promptly: its
+        # completion queue only ever reports "done", never "failed", so an
+        # uncaught exception there would otherwise stall silently (both future
+        # logits and regular checkpoint saves for that rank) rather than
+        # surfacing until a much later blocking checkpoint finalize hangs.
+        if args.logits_save_dir is not None:
+            from megatron.training.distillation import check_logits_saver_failure
+
+            check_logits_saver_failure()
+
         # Checkpoint and decide whether to exit.
         should_exit = checkpoint_and_decide_exit(
             model,
