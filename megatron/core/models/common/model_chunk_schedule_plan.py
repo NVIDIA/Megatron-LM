@@ -9,6 +9,7 @@ from torch import Tensor
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.pipeline_parallel.tensor_lifetime import ScheduleTensorLifetimeManager
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -196,7 +197,16 @@ class TransformerLayerSchedulePlan:
     mhc_recompute = None
     mtp_post_process = None
 
-    def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
+    def __init__(
+        self,
+        layer,
+        event,
+        chunk_state,
+        comp_stream,
+        comm_stream,
+        extra_args={},
+        lifetime_manager=None,
+    ):
         """Initializes a transformer layer schedule plan.
 
         Args:
@@ -226,7 +236,9 @@ class TransformerLayerSchedulePlan:
         self.recompute_segment = None
 
         # get callable nodes for transformer/mtp layer
-        self._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
+        self._build_callable_nodes(
+            event, comp_stream, comm_stream, extra_args, lifetime_manager=lifetime_manager
+        )
 
     def release_state(self):
         """Release reference, this helps avoid memory leak."""
@@ -275,7 +287,9 @@ class TransformerLayerSchedulePlan:
                 self.layer._mhc_recompute_manager = None
             del self.layer
 
-    def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
+    def _build_callable_nodes(
+        self, event, comp_stream, comm_stream, extra_args, lifetime_manager=None
+    ):
         """
         Builds the callable nodes for the transformer/mtp layer:
             attn, mlp, moe_dispatch, moe_combine, and mtp_post_process.
@@ -303,7 +317,9 @@ class TransformerLayerSchedulePlan:
         extra_args["is_mtp"] = is_mtp
 
         # wrapper to help create TransformerLayerNode
-        def create_node(stream, module, name):
+        def create_node(
+            stream, module, name, input_owner_stream=None, backward_input_owner_stream=None
+        ):
             bwd_dw_callables = bwd_dw_callable_map.get(name, None)
             return TransformerLayerNode(
                 stream,
@@ -314,6 +330,9 @@ class TransformerLayerSchedulePlan:
                 name=name,
                 bwd_dw_callables=bwd_dw_callables,
                 extra_args=extra_args,
+                lifetime_manager=lifetime_manager,
+                input_owner_stream=input_owner_stream,
+                backward_input_owner_stream=backward_input_owner_stream,
             )
 
         (
@@ -327,11 +346,34 @@ class TransformerLayerSchedulePlan:
 
         # Create nodes for different operations in the layer
         # Each node type has a predefined name that determines its memory strategy
-        self.attn = create_node(comp_stream, attn_module, "attn")
-        self.mlp = create_node(comp_stream, mlp_module, "mlp")
+        self.attn = create_node(
+            comp_stream,
+            attn_module,
+            "attn",
+            backward_input_owner_stream=comm_stream if is_moe else comp_stream,
+        )
+        self.mlp = create_node(
+            comp_stream,
+            mlp_module,
+            "mlp",
+            input_owner_stream=comm_stream if is_moe else comp_stream,
+            backward_input_owner_stream=comm_stream if is_moe else comp_stream,
+        )
         if is_moe:
-            self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
-            self.moe_combine = create_node(comm_stream, moe_combine_module, "moe_combine")
+            self.moe_dispatch = create_node(
+                comm_stream,
+                moe_dispatch_module,
+                "moe_dispatch",
+                input_owner_stream=comp_stream,
+                backward_input_owner_stream=comp_stream,
+            )
+            self.moe_combine = create_node(
+                comm_stream,
+                moe_combine_module,
+                "moe_combine",
+                input_owner_stream=comp_stream,
+                backward_input_owner_stream=comp_stream,
+            )
         else:
             self.moe_dispatch = NoopScheduleNode()
             self.moe_combine = NoopScheduleNode()
@@ -341,7 +383,9 @@ class TransformerLayerSchedulePlan:
         # tensors cross-stream (allocated on compute, read on comm, then freed),
         # which the caching allocator cannot track.
         if mhc_post_module is not None:
-            self.mhc_post = create_node(comp_stream, mhc_post_module, "mhc_post")
+            self.mhc_post = create_node(
+                comp_stream, mhc_post_module, "mhc_post", backward_input_owner_stream=comp_stream
+            )
         else:
             self.mhc_post = NoopScheduleNode()
 
@@ -363,13 +407,17 @@ class TransformerLayerSchedulePlan:
                 event,
                 name="mhc_recompute",
                 forward_nvtx_name=f"mhc/recompute/{module_tag}/group_{group_index}/B",
+                lifetime_manager=lifetime_manager,
             )
         else:
             self.mhc_recompute = None
 
         if is_mtp:
             self.mtp_post_process = create_node(
-                comp_stream, mtp_post_process_module, "mtp_post_process"
+                comp_stream,
+                mtp_post_process_module,
+                "mtp_post_process",
+                backward_input_owner_stream=comp_stream,
             )
         else:
             self.mtp_post_process = NoopScheduleNode()
@@ -663,6 +711,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
         self._event = torch.cuda.Event()
+        self._lifetime_manager = (
+            ScheduleTensorLifetimeManager()
+            if model.config.ep_overlap_use_scheduled_tensor_lifetime
+            else None
+        )
         self.pre_process = None
         self.post_process = None
         self.vp_stage = model.vp_stage
@@ -763,6 +816,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 comp_stream,
                 comm_stream,
                 extra_args,
+                lifetime_manager=self._lifetime_manager,
             )
             self._transformer_layers.append(layer_plan)
 
@@ -823,6 +877,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     def event(self):
         """Gets the CUDA event for synchronization."""
         return self._event
+
+    @property
+    def lifetime_manager(self):
+        """Gets the optional schedule-aware tensor lifetime manager."""
+        return self._lifetime_manager
 
     def record_current_stream(self):
         """Records the current CUDA stream in the event."""
@@ -926,6 +985,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             # graph with a recomputed segment on the last PP stage.
             if b_schedule_plan.post_process is not None:
                 b_grad = b_schedule_plan.post_process.backward(b_grad)
+            elif b_schedule_plan.lifetime_manager is not None:
+                # The pipeline receive path lives outside this plan.  Its allocation
+                # stream is intentionally unknown, so the first real backward consumer
+                # retains the conservative record_stream path.
+                b_schedule_plan.lifetime_manager.mark_external_gradients(b_grad)
 
         f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
         b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
@@ -1007,8 +1071,16 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         if f_schedule_plan:
             f_schedule_plan.wait_current_stream()
+            if f_schedule_plan.lifetime_manager is not None:
+                f_schedule_plan.lifetime_manager.finalize_phase(
+                    f_schedule_plan.event, phase="forward"
+                )
         if b_schedule_plan:
             b_schedule_plan.wait_current_stream()
+            if b_schedule_plan.lifetime_manager is not None:
+                b_schedule_plan.lifetime_manager.finalize_phase(
+                    b_schedule_plan.event, phase="backward"
+                )
             # Release reference as early as possible, this helps avoid memory leak.
             b_schedule_plan.release_state()
 
