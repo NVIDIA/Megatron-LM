@@ -19,6 +19,7 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,
+    dense_routing_from_topk,
     get_tokens_per_expert_and_token_count,
     qb_dual_update,
     router_gating_linear,
@@ -743,6 +744,13 @@ class TopKRouter(Router):
         """
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
+                if routing_map.dtype != torch.bool:
+                    # Compact [num_tokens, topk] expert ids (virtual-expert load balancing).
+                    ids = routing_map if padding_mask is None else routing_map[~padding_mask]
+                    self.local_tokens_per_expert += torch.bincount(
+                        ids.reshape(-1), minlength=self.config.num_moe_experts
+                    )
+                    return
                 if padding_mask is not None:
                     routing_map = routing_map & (~padding_mask).unsqueeze(-1)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
@@ -760,6 +768,10 @@ class TopKRouter(Router):
             probs (torch.Tensor): The probabilities of token to experts assignment.
             routing_map (torch.Tensor): The mapping of token to experts assignment,
                 with shape [num_tokens, num_experts].
+
+            With virtual-expert load balancing the dispatcher plans from the router's compact
+            routes instead: ``probs`` is ``[num_tokens, topk]`` and ``routing_map`` holds the
+            ``[num_tokens, topk]`` expert ids. The dense map is never built.
         """
         seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
@@ -770,6 +782,13 @@ class TopKRouter(Router):
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
+
+        # Virtual-expert planning consumes the [num_tokens, topk] ids and probabilities directly.
+        compact_routes = self.config.moe_virtual_expert_load_balance
+        if compact_routes and self.routing_type in ("sinkhorn", "quantile_balancing"):
+            raise NotImplementedError(
+                f"Virtual-expert load balancing does not support {self.routing_type} routing."
+            )
 
         # Calculate probs and routing_map for token dispatching
         if self.routing_type == "sinkhorn":
@@ -791,6 +810,7 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
+                dense_output=compact_routes,
             )
 
         # Apply token dropping to probs and routing_map.

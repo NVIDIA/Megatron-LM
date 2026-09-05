@@ -2,9 +2,10 @@
 
 """Triton kernels for virtual-expert planning and intra-node virtual-expert transport.
 
-The planner kernels compact semantic routes, compute deterministic virtual-expert
-placement and map every route to its runtime expert while writing HybridEP's dense inputs.
-The transport kernels move only weights and gradients: owners push weights straight into
+The planner kernel histograms the router's routes, exchanges the histograms between ranks,
+computes deterministic virtual-expert placement and maps every route to its runtime expert,
+writing HybridEP's inputs, all in one cooperative launch. The transport kernels move only
+weights and gradients: owners push weights straight into
 their peers' virtual-expert slots in symmetric memory and pull the virtual-expert gradients
 back into native wgrad staging. Both are pure wire movement, and within the reserved SM
 budget only TMA saturates NVLink, so they are built on ``tl.make_tensor_descriptor`` over
@@ -45,8 +46,9 @@ _GRID_SYNC_TAG = tl.constexpr(0x40000000)
 # One int32 word per ordered rank pair inside the symmetric-memory signal pad.
 _SIGNAL_STRIDE = tl.constexpr(4)
 _BARRIER_TIMEOUT_NS = tl.constexpr(100_000_000_000)
-# Grid width of the routing-map compaction.
-_MAX_PLANNER_PROGRAMS = 128
+# Grid width of the planner kernel (a cooperative launch; the first EP_SIZE programs also place).
+# Measured at EP 4, 8192 tokens x top-k 10 x 512 experts: 128 programs x 4 warps beat 64 x 8 by 75 us.
+PLANNER_PROGRAMS = 128
 
 
 @triton.jit
@@ -70,19 +72,18 @@ def _grid_sync(grid_barrier, TAG: tl.constexpr, NUM_SMS: tl.constexpr):
     tl.debug_barrier()
 
 
-@triton.jit(debug=True, do_not_specialize=["source_rank", "num_programs"])
-def _plan_virtual_expert_placement_kernel(
+@triton.jit
+def _place_virtual_experts(
+    program_histogram,
+    tokens_per_expert,
     gathered_tokens_per_expert,
     rank_load_balance,
     expert_rank_allocations,
     destination_boundaries,
     experts_to_copy,
     virtual_expert_slots,
-    grid_sync,
+    placement_sync,
     source_rank,
-    program_histogram,
-    tokens_per_expert,
-    num_programs,
     peer_bases,
     signal_bases,
     sequence,
@@ -93,26 +94,27 @@ def _plan_virtual_expert_placement_kernel(
     BLOCK_EP_SIZE: tl.constexpr,
     BLOCK_NUM_EXPERTS_PER_GPU: tl.constexpr,
     BLOCK_NUM_EXPERTS: tl.constexpr,
-    EXCHANGE: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
     HISTOGRAM_TILE: tl.constexpr,
+    EXCHANGE: tl.constexpr,
     TIMEOUT_NS: tl.constexpr,
 ):
-    """Compute deterministic virtual-expert placement in one cooperative launch.
+    """Deterministic virtual-expert placement, run by the planner's first ``EP_SIZE`` programs.
 
-    One program owns each EP rank. It computes native expert totals, replays
-    the quota greedy, assigns quotas across its experts, and finally fills its
-    virtual-expert slots. Quotas and the local allocation tile remain in registers.
-    Equal rank ties choose the lowest rank, expert allocation ties choose the
-    lowest expert, and virtual-expert-slot ties choose the highest expert.
+    Program ``rank`` sums rank ``rank``'s native-expert columns of the per-program histogram rows
+    into ``tokens_per_expert``, then publishes this rank's histogram into peer ``rank``'s
+    symmetric window (row ``source_rank``) and waits for that peer's row to land in ours, so
+    ``gathered_tokens_per_expert`` (this rank's window) is complete without a collective. Flags
+    carry a per-launch sequence number; every rank plans every layer, so the sequences agree, and
+    HybridEP's dispatch orders one layer's exchange after every peer read the previous one. A
+    peer that never arrives fails the device assert after ``TIMEOUT_NS``. ``EXCHANGE=False`` is
+    the process-local test seam: the window then already holds every row.
 
-    The kernel gathers its own input: each program sums its native experts' columns of the
-    compaction's per-program histograms into ``tokens_per_expert``, publishes this rank's
-    histogram into peer ``rank``'s symmetric window (row ``source_rank``) and waits for that
-    peer's row to land in ours. Flags carry a per-launch sequence number; every rank plans
-    every layer, so the sequences agree, and HybridEP's dispatch orders one layer's exchange
-    after every peer read the previous one. A peer that never arrives fails the device assert
-    after ``TIMEOUT_NS`` (``debug=True`` keeps it live). ``EXCHANGE=False`` is the
-    process-local test seam: ``gathered_tokens_per_expert`` then already holds every row.
+    From the gathered histograms each program computes its rank's native totals, replays the
+    quota greedy, assigns quotas across its experts and fills its virtual-expert slots. Quotas
+    and the local allocation tile remain in registers. Equal rank ties choose the lowest rank,
+    expert allocation ties choose the lowest expert, and virtual-expert-slot ties choose the
+    highest expert.
     """
     rank = tl.program_id(0)
     ranks = tl.arange(0, BLOCK_EP_SIZE)
@@ -121,21 +123,21 @@ def _plan_virtual_expert_placement_kernel(
     valid_local_experts = local_experts < NUM_EXPERTS_PER_GPU
     native_experts = rank * NUM_EXPERTS_PER_GPU + local_experts
 
+    histogram_rows = tl.arange(0, HISTOGRAM_TILE)
+    local_totals = tl.zeros((BLOCK_NUM_EXPERTS_PER_GPU,), dtype=tl.int32)
+    for row_start in tl.range(0, NUM_PROGRAMS, HISTOGRAM_TILE):
+        rows = row_start + histogram_rows
+        local_totals += tl.sum(
+            tl.load(
+                program_histogram + rows[:, None] * NUM_EXPERTS + native_experts[None, :],
+                mask=(rows[:, None] < NUM_PROGRAMS) & valid_local_experts[None, :],
+                other=0,
+            ),
+            axis=0,
+        )
+    tl.store(tokens_per_expert + native_experts, local_totals, mask=valid_local_experts)
+    _grid_sync(placement_sync, _GRID_SYNC_TAG, EP_SIZE)
     if EXCHANGE:
-        histogram_rows = tl.arange(0, HISTOGRAM_TILE)
-        local_totals = tl.zeros((BLOCK_NUM_EXPERTS_PER_GPU,), dtype=tl.int32)
-        for row_start in tl.range(0, num_programs, HISTOGRAM_TILE):
-            rows = row_start + histogram_rows
-            local_totals += tl.sum(
-                tl.load(
-                    program_histogram + rows[:, None] * NUM_EXPERTS + native_experts[None, :],
-                    mask=(rows[:, None] < num_programs) & valid_local_experts[None, :],
-                    other=0,
-                ),
-                axis=0,
-            )
-        tl.store(tokens_per_expert + native_experts, local_totals, mask=valid_local_experts)
-        _grid_sync(grid_sync, _GRID_SYNC_TAG, EP_SIZE)
         sequence_number = tl.load(sequence) + 1
         experts = tl.arange(0, BLOCK_NUM_EXPERTS)
         valid_experts = experts < NUM_EXPERTS
@@ -157,14 +159,14 @@ def _plan_virtual_expert_placement_kernel(
             tl.load(signals + source_rank).to(tl.pointer_type(tl.int32)) + rank * _SIGNAL_STRIDE
         )
         # Spin on the timer only; the assert's call site stays out of the loop, where it would
-        # cost the placement kernel a good part of its runtime (this kernel is debug=True).
+        # cost the placement a good part of its runtime (the kernel is debug=True).
         start = tl.extra.cuda.globaltimer()
         arrived = tl.atomic_add(own_flag, 0, sem="acquire", scope="sys") >= sequence_number
         while not arrived and tl.extra.cuda.globaltimer() - start < TIMEOUT_NS:
             arrived = tl.atomic_add(own_flag, 0, sem="acquire", scope="sys") >= sequence_number
         tl.device_assert(arrived, "virtual-expert planner: histogram exchange stalled")
         # Every program has acquired its peer's row; the barrier hands them all to everyone.
-        _grid_sync(grid_sync, _GRID_SYNC_TAG, EP_SIZE)
+        _grid_sync(placement_sync, _GRID_SYNC_TAG, EP_SIZE)
         if rank == 0:
             tl.store(sequence, sequence_number)
 
@@ -196,7 +198,7 @@ def _plan_virtual_expert_placement_kernel(
         rank_load_balance + rank, tl.sum(native_totals, axis=0).to(tl.int32) - RANK_ROUTE_CAPACITY
     )
 
-    _grid_sync(grid_sync, _GRID_SYNC_TAG, EP_SIZE)
+    _grid_sync(placement_sync, _GRID_SYNC_TAG, EP_SIZE)
 
     # Pair the most overloaded rank with the emptiest one and move the
     # receiver's whole deficit from that single sender. This can send more than
@@ -255,7 +257,7 @@ def _plan_virtual_expert_placement_kernel(
         mask=valid_local_experts[:, None],
     )
 
-    _grid_sync(grid_sync, _GRID_SYNC_TAG, EP_SIZE)
+    _grid_sync(placement_sync, _GRID_SYNC_TAG, EP_SIZE)
 
     experts = tl.arange(0, BLOCK_NUM_EXPERTS)
     owner = experts // NUM_EXPERTS_PER_GPU
@@ -279,100 +281,113 @@ def _plan_virtual_expert_placement_kernel(
     )
 
 
-# ``debug=True`` keeps the device assert below alive for eager launches, and a
-# device assert is the only trap torch.compile can analyze: the flex dispatcher's
-# preprocess launches this kernel under torch.compile, where Inductor re-emits
-# the kernel without the flag. The placement kernel's route-total check covers
-# that path.
-@triton.jit(debug=True)
-def _compact_routing_map_kernel(
-    routing_map,
-    token_indices,
-    program_histogram,
-    num_tokens,
-    ROUTER_TOPK: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr,
-    BLOCK_TOKENS: tl.constexpr,
-    BLOCK_NUM_EXPERTS: tl.constexpr,
-):
-    """Compact a dense routing map and store each program's expert histogram row; the route
-    mapping recovers stable ordinals from the rows without a sort, the placement kernel sums
-    them."""
-    program = tl.program_id(0)
-    experts = tl.arange(0, BLOCK_NUM_EXPERTS)
-    valid_experts = experts < NUM_EXPERTS
-    token_offsets = tl.arange(0, BLOCK_TOKENS)
-    histogram = tl.zeros((BLOCK_NUM_EXPERTS,), dtype=tl.int32)
-    tokens_per_program = tl.cdiv(num_tokens, tl.num_programs(0))
-    program_start = program * tokens_per_program
-    program_end = tl.minimum(program_start + tokens_per_program, num_tokens)
-
-    for token_start in tl.range(program_start, program_end, BLOCK_TOKENS, loop_unroll_factor=1):
-        tokens = token_start + token_offsets
-        valid = (tokens[:, None] < program_end) & valid_experts[None, :]
-        selected = tl.load(
-            routing_map + tokens[:, None] * NUM_EXPERTS + experts[None, :], mask=valid, other=0
-        ).to(tl.int32)
-        slots = tl.cumsum(selected, axis=1) - selected
-        # The planner sizes every rank's capacity from ROUTER_TOPK routes per token
-        # and fills exactly that many slots; a token with a different count would
-        # silently misroute or drop routes downstream, so fail loudly instead.
-        selections = tl.sum(selected, axis=1)
-        tl.device_assert(
-            (selections == ROUTER_TOPK) | (tokens >= program_end),
-            "virtual-expert planner requires exactly router_topk routes per token",
-        )
-        tl.store(
-            token_indices + tokens[:, None] * ROUTER_TOPK + slots,
-            tl.broadcast_to(experts[None, :], (BLOCK_TOKENS, BLOCK_NUM_EXPERTS)),
-            mask=(selected != 0) & (slots < ROUTER_TOPK),
-        )
-        histogram += tl.sum(selected, axis=0)
-
-    tl.store(program_histogram + program * NUM_EXPERTS + experts, histogram, mask=valid_experts)
-
-
-@triton.jit
-def _map_routes_kernel(
-    routing_map,
+# ``debug=True`` keeps the device asserts alive: the planner launches eagerly, so a failed
+# route-count, exchange or slot check traps the run instead of misrouting tokens.
+@triton.jit(debug=True, do_not_specialize=["source_rank", "num_tokens"])
+def _plan_virtual_expert_routes_kernel(
+    top_indices,
     probs,
-    tokens_per_expert,
-    program_histogram,
-    destination_boundaries,
-    virtual_expert_slots,
     virtual_experts,
-    runtime_routing_map,
     runtime_probs,
+    program_histogram,
+    running_counts,
+    tokens_per_expert,
+    gathered_tokens_per_expert,
+    rank_load_balance,
+    expert_rank_allocations,
+    destination_boundaries,
+    experts_to_copy,
+    virtual_expert_slots,
+    placement_sync,
+    grid_sync,
+    source_rank,
     num_tokens,
+    peer_bases,
+    signal_bases,
+    sequence,
     ROUTER_TOPK: tl.constexpr,
+    EP_SIZE: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     NUM_EXPERTS_PER_GPU: tl.constexpr,
-    EP_SIZE: tl.constexpr,
     BLOCK_EP_SIZE: tl.constexpr,
-    BLOCK_TOKENS: tl.constexpr,
+    BLOCK_NUM_EXPERTS_PER_GPU: tl.constexpr,
     BLOCK_NUM_EXPERTS: tl.constexpr,
     BLOCK_RUNTIME_EXPERTS: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
     HISTOGRAM_TILE: tl.constexpr,
+    EXCHANGE: tl.constexpr,
+    TIMEOUT_NS: tl.constexpr,
 ):
-    """Map every semantic route to its runtime expert and write HybridEP's dense inputs.
+    """Plan one layer's virtual-expert routes in one cooperative launch.
 
-    Runs on the compaction's token partition. A route's destination is decided by its
-    stable ordinal among this rank's routes to the same expert (earlier programs' histograms
-    plus the running count inside this program plus an in-tile prefix sum), compared against
-    the placement's per-destination segment ends. The same pass writes the runtime-id top-k
-    table, the dense ``[tokens, 2 * num_experts]`` routing map and the dense runtime
-    probabilities, replacing a sort, a bucketize and two scatters.
+    Phase 1: every program histograms its token range of the router's ``[num_tokens, topk]``
+    expert ids into its ``program_histogram`` row. Phase 2: the first ``EP_SIZE`` programs run
+    :func:`_place_virtual_experts` (histogram exchange and placement) while the rest wait at the
+    grid barrier. Phase 3: every program maps its routes. A route's destination is decided by its
+    stable ordinal among this rank's routes to the same expert (earlier programs' rows, the
+    running count inside this program, its rank inside the tile) compared against the
+    placement's per-destination segment ends; a remote destination runs it in the virtual-expert
+    slot the placement assigned that expert there. The same pass writes the runtime ids (int16,
+    HybridEP's dense top-k routing) and the dense ``[num_tokens, 2 * num_experts]`` runtime
+    probabilities HybridEP consumes.
     """
     NUM_RUNTIME_EXPERTS: tl.constexpr = 2 * NUM_EXPERTS
     program = tl.program_id(0)
     experts = tl.arange(0, BLOCK_NUM_EXPERTS)
     valid_experts = experts < NUM_EXPERTS
-    token_offsets = tl.arange(0, BLOCK_TOKENS)
-    tokens_per_program = tl.cdiv(num_tokens, tl.num_programs(0))
+    tokens_per_program = tl.cdiv(num_tokens, NUM_PROGRAMS)
     program_start = program * tokens_per_program
     program_end = tl.minimum(program_start + tokens_per_program, num_tokens)
+    # One tile holds BLOCK_TOKENS tokens' routes in token-major order, flat index
+    # local_token * BLOCK_TOPK + k, so ordering by flat index is the routes' order.
+    flat = tl.arange(0, BLOCK_TOKENS * BLOCK_TOPK)
+    tile_tokens = flat // BLOCK_TOPK
+    tile_slots = flat % BLOCK_TOPK
 
-    # Routes of the same expert issued by earlier programs come first in the ordinal space.
+    # Phase 1: this program's histogram row.
+    row = tl.zeros((BLOCK_NUM_EXPERTS,), dtype=tl.int32)
+    for token_start in tl.range(program_start, program_end, BLOCK_TOKENS, loop_unroll_factor=1):
+        tokens = token_start + tile_tokens
+        valid = (tokens < program_end) & (tile_slots < ROUTER_TOPK)
+        ids = tl.load(top_indices + tokens * ROUTER_TOPK + tile_slots, mask=valid, other=0)
+        row += tl.histogram(ids.to(tl.int32), BLOCK_NUM_EXPERTS, mask=valid)
+    tl.store(program_histogram + program * NUM_EXPERTS + experts, row, mask=valid_experts)
+    _grid_sync(grid_sync, _GRID_SYNC_TAG, NUM_PROGRAMS)
+
+    # Phase 2: histogram exchange and placement, one program per EP rank.
+    if program < EP_SIZE:
+        _place_virtual_experts(
+            program_histogram,
+            tokens_per_expert,
+            gathered_tokens_per_expert,
+            rank_load_balance,
+            expert_rank_allocations,
+            destination_boundaries,
+            experts_to_copy,
+            virtual_expert_slots,
+            placement_sync,
+            source_rank,
+            peer_bases,
+            signal_bases,
+            sequence,
+            RANK_ROUTE_CAPACITY=num_tokens * ROUTER_TOPK,
+            EP_SIZE=EP_SIZE,
+            NUM_EXPERTS=NUM_EXPERTS,
+            NUM_EXPERTS_PER_GPU=NUM_EXPERTS_PER_GPU,
+            BLOCK_EP_SIZE=BLOCK_EP_SIZE,
+            BLOCK_NUM_EXPERTS_PER_GPU=BLOCK_NUM_EXPERTS_PER_GPU,
+            BLOCK_NUM_EXPERTS=BLOCK_NUM_EXPERTS,
+            NUM_PROGRAMS=NUM_PROGRAMS,
+            HISTOGRAM_TILE=HISTOGRAM_TILE,
+            EXCHANGE=EXCHANGE,
+            TIMEOUT_NS=TIMEOUT_NS,
+        )
+    _grid_sync(grid_sync, _GRID_SYNC_TAG, NUM_PROGRAMS)
+
+    # Phase 3: map this program's routes. Routes of the same expert issued by earlier programs
+    # come first in the ordinal space.
     running = tl.zeros((BLOCK_NUM_EXPERTS,), dtype=tl.int32)
     histogram_rows = tl.arange(0, HISTOGRAM_TILE)
     for row_start in tl.range(0, program, HISTOGRAM_TILE):
@@ -385,271 +400,125 @@ def _map_routes_kernel(
             ),
             axis=0,
         )
-    local_routes = tl.load(tokens_per_expert + experts, mask=valid_experts, other=0)
-    owner = experts // NUM_EXPERTS_PER_GPU
+    ranks = tl.arange(0, BLOCK_EP_SIZE)
+    valid_ranks = ranks < EP_SIZE
+    tile_rows = tl.arange(0, BLOCK_TOKENS)
     runtime_columns = tl.arange(0, BLOCK_RUNTIME_EXPERTS)
-
     for token_start in tl.range(program_start, program_end, BLOCK_TOKENS, loop_unroll_factor=1):
-        tokens = token_start + token_offsets
-        valid_tokens = tokens < program_end
-        valid = valid_tokens[:, None] & valid_experts[None, :]
-        selected = tl.load(
-            routing_map + tokens[:, None] * NUM_EXPERTS + experts[None, :], mask=valid, other=0
-        ).to(tl.int32)
-        chosen = selected != 0
-        ordinal = running[None, :] + tl.cumsum(selected, axis=0) - selected
-        running += tl.sum(selected, axis=0)
+        # The running counts go through memory so every route can gather its expert's count.
+        tl.store(running_counts + program * NUM_EXPERTS + experts, running, mask=valid_experts)
+        tl.debug_barrier()
+        tokens = token_start + tile_tokens
+        valid = (tokens < program_end) & (tile_slots < ROUTER_TOPK)
+        route_offsets = tokens * ROUTER_TOPK + tile_slots
+        ids = tl.load(top_indices + route_offsets, mask=valid, other=0).to(tl.int32)
+        earlier = tl.sum(
+            ((ids[None, :] == ids[:, None]) & (flat[None, :] < flat[:, None]) & valid[None, :]).to(
+                tl.int32
+            ),
+            axis=1,
+        )
+        ordinal = tl.load(running_counts + program * NUM_EXPERTS + ids, mask=valid, other=0)
+        ordinal += earlier
         # Destination = number of segment ends at or below the ordinal. Segment ends are the
         # placement's cumulative allocations in this rank's ordinal space, clipped to the
         # routes this rank actually holds.
-        destination = tl.zeros((BLOCK_TOKENS, BLOCK_NUM_EXPERTS), dtype=tl.int32)
-        for rank in tl.range(0, EP_SIZE):
-            segment_end = tl.load(
-                destination_boundaries + experts * BLOCK_EP_SIZE + rank, mask=valid_experts, other=0
-            )
-            segment_end = tl.minimum(tl.maximum(segment_end, 0), local_routes)
-            destination += (segment_end[None, :] <= ordinal).to(tl.int32)
-        remote = chosen & (destination != owner[None, :])
-        slot = tl.load(
-            virtual_expert_slots + experts[None, :] * EP_SIZE + destination, mask=remote, other=0
+        local_routes = tl.load(tokens_per_expert + ids, mask=valid, other=0)
+        segment_ends = tl.load(
+            destination_boundaries + ids[:, None] * BLOCK_EP_SIZE + ranks[None, :],
+            mask=valid[:, None] & valid_ranks[None, :],
+            other=0,
         )
-        runtime_local = tl.where(
-            remote, NUM_EXPERTS_PER_GPU + slot, experts[None, :] % NUM_EXPERTS_PER_GPU
+        segment_ends = tl.minimum(tl.maximum(segment_ends, 0), local_routes[:, None])
+        destination = tl.sum(
+            ((segment_ends <= ordinal[:, None]) & valid_ranks[None, :]).to(tl.int32), axis=1
         )
-        runtime = destination * (2 * NUM_EXPERTS_PER_GPU) + runtime_local
-        # Ascending expert order within a token, as the compaction stored the semantic ids.
-        position = tl.cumsum(selected, axis=1) - selected
-        tl.store(
-            virtual_experts + tokens[:, None] * ROUTER_TOPK + position,
-            runtime.to(tl.int64),
-            mask=chosen & (position < ROUTER_TOPK),
+        remote = valid & (destination != ids // NUM_EXPERTS_PER_GPU)
+        slot = tl.load(virtual_expert_slots + ids * EP_SIZE + destination, mask=remote, other=0)
+        runtime = destination * (2 * NUM_EXPERTS_PER_GPU) + tl.where(
+            remote, NUM_EXPERTS_PER_GPU + slot, ids % NUM_EXPERTS_PER_GPU
         )
-        # Dense runtime inputs: clear the tile's rows, then scatter the routes into them.
+        tl.store(virtual_experts + route_offsets, runtime.to(tl.int16), mask=valid)
+        # Dense runtime probabilities: clear the tile's rows, then scatter the routes into them.
+        rows = token_start + tile_rows
+        valid_rows = rows < program_end
         for column_start in tl.range(0, NUM_RUNTIME_EXPERTS, BLOCK_RUNTIME_EXPERTS):
             columns = column_start + runtime_columns
-            clear = valid_tokens[:, None] & (columns[None, :] < NUM_RUNTIME_EXPERTS)
-            offsets = tokens[:, None] * NUM_RUNTIME_EXPERTS + columns[None, :]
             tl.store(
-                runtime_routing_map + offsets,
-                tl.zeros((BLOCK_TOKENS, BLOCK_RUNTIME_EXPERTS), dtype=tl.int8),
-                mask=clear,
-            )
-            tl.store(
-                runtime_probs + offsets,
+                runtime_probs + rows[:, None] * NUM_RUNTIME_EXPERTS + columns[None, :],
                 tl.zeros((BLOCK_TOKENS, BLOCK_RUNTIME_EXPERTS), dtype=tl.float32),
-                mask=clear,
+                mask=valid_rows[:, None] & (columns[None, :] < NUM_RUNTIME_EXPERTS),
             )
         tl.debug_barrier()
-        prob = tl.load(
-            probs + tokens[:, None] * NUM_EXPERTS + experts[None, :], mask=chosen, other=0.0
-        )
-        offsets = tokens[:, None] * NUM_RUNTIME_EXPERTS + runtime
-        tl.store(runtime_routing_map + offsets, tl.full((1,), 1, tl.int8), mask=chosen)
-        tl.store(runtime_probs + offsets, prob.to(tl.float32), mask=chosen)
-
-
-@triton.jit
-def _map_routes_backward_kernel(
-    grad_runtime_probs,
-    virtual_experts,
-    token_indices,
-    grad_probs,
-    num_tokens,
-    ROUTER_TOPK: tl.constexpr,
-    NUM_EXPERTS: tl.constexpr,
-    BLOCK_TOKENS: tl.constexpr,
-    BLOCK_TOPK: tl.constexpr,
-    BLOCK_NUM_EXPERTS: tl.constexpr,
-):
-    """Gather the dense runtime probability gradient back onto the semantic probabilities."""
-    NUM_RUNTIME_EXPERTS: tl.constexpr = 2 * NUM_EXPERTS
-    tokens = tl.program_id(0) * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
-    valid_tokens = tokens < num_tokens
-    routes = tl.arange(0, BLOCK_TOPK)
-    valid = valid_tokens[:, None] & (routes[None, :] < ROUTER_TOPK)
-    route_offsets = tokens[:, None] * ROUTER_TOPK + routes[None, :]
-    runtime = tl.load(virtual_experts + route_offsets, mask=valid, other=0)
-    semantic = tl.load(token_indices + route_offsets, mask=valid, other=0)
-    grad = tl.load(
-        grad_runtime_probs + tokens[:, None] * NUM_RUNTIME_EXPERTS + runtime, mask=valid, other=0.0
-    )
-    columns = tl.arange(0, BLOCK_NUM_EXPERTS)
-    for column_start in tl.range(0, NUM_EXPERTS, BLOCK_NUM_EXPERTS):
-        column = column_start + columns
+        prob = tl.load(probs + route_offsets, mask=valid, other=0.0)
         tl.store(
-            grad_probs + tokens[:, None] * NUM_EXPERTS + column[None, :],
-            tl.zeros((BLOCK_TOKENS, BLOCK_NUM_EXPERTS), dtype=tl.float32),
-            mask=valid_tokens[:, None] & (column[None, :] < NUM_EXPERTS),
+            runtime_probs + tokens * NUM_RUNTIME_EXPERTS + runtime, prob.to(tl.float32), mask=valid
         )
-    tl.debug_barrier()
-    tl.store(grad_probs + tokens[:, None] * NUM_EXPERTS + semantic, grad, mask=valid)
+        running += tl.histogram(ids, BLOCK_NUM_EXPERTS, mask=valid)
 
 
-def launch_virtual_expert_placement(
-    gathered_counts: torch.Tensor,
-    balance: torch.Tensor,
-    allocation: torch.Tensor,
-    destination_boundaries: torch.Tensor,
-    experts_to_copy: torch.Tensor,
-    virtual_expert_slots: torch.Tensor,
-    grid_sync: torch.Tensor,
-    *,
-    rank_route_capacity: int,
-    source_rank: int,
-    ep_size: int,
-    num_experts: int,
-    num_local_experts: int,
-    program_histogram: torch.Tensor | None = None,
-    tokens_per_expert: torch.Tensor | None = None,
-    peer_bases: int = 0,
-    signal_bases: int = 0,
-    sequence: torch.Tensor | None = None,
-) -> None:
-    """Launch deterministic single-kernel virtual-expert placement.
-
-    ``gathered_counts`` is this rank's symmetric-memory window, ``peer_bases`` /
-    ``signal_bases`` the window handle's device pointer tables and ``sequence`` the int32
-    launch counter the flags carry. Process-local tests pass no ``program_histogram`` and a
-    ``gathered_counts`` that already holds every rank's histogram.
-    """
-    exchange = program_histogram is not None
-    _plan_virtual_expert_placement_kernel[(ep_size,)](
-        gathered_counts,
-        balance,
-        allocation,
-        destination_boundaries,
-        experts_to_copy,
-        virtual_expert_slots,
-        grid_sync,
-        source_rank,
-        program_histogram if exchange else gathered_counts,
-        tokens_per_expert if exchange else gathered_counts,
-        int(program_histogram.shape[0]) if exchange else 0,
-        int(peer_bases),
-        int(signal_bases),
-        sequence if exchange else grid_sync,
-        RANK_ROUTE_CAPACITY=rank_route_capacity,
-        EP_SIZE=ep_size,
-        NUM_EXPERTS=num_experts,
-        NUM_EXPERTS_PER_GPU=num_local_experts,
-        BLOCK_EP_SIZE=triton.next_power_of_2(ep_size),
-        BLOCK_NUM_EXPERTS_PER_GPU=triton.next_power_of_2(num_local_experts),
-        BLOCK_NUM_EXPERTS=triton.next_power_of_2(num_experts),
-        EXCHANGE=exchange,
-        HISTOGRAM_TILE=max(1, min(64, 4096 // triton.next_power_of_2(num_local_experts))),
-        TIMEOUT_NS=_BARRIER_TIMEOUT_NS,
-        launch_cooperative_grid=True,
-        num_warps=1,
-    )
-
-
-@functools.lru_cache(maxsize=None)
-def compaction_grid(num_tokens: int, num_experts: int) -> tuple[int, int]:
-    """Return ``(num_programs, block_tokens)`` of the routing-map compaction; the route mapping
-    runs on the same token partition."""
-    block_num_experts = triton.next_power_of_2(num_experts)
-    block_tokens = min(32, max(1, 16384 // block_num_experts))
-    return min(_MAX_PLANNER_PROGRAMS, triton.cdiv(num_tokens, block_tokens)), block_tokens
-
-
-def launch_compact_routing_map(
-    routing_map: torch.Tensor,
-    token_indices: torch.Tensor,
-    program_histogram: torch.Tensor,
-    *,
-    num_tokens: int,
-    router_topk: int,
-    num_experts: int,
-) -> None:
-    """Compact selected semantic experts into ``token_indices`` and store each program's
-    histogram row into ``program_histogram`` (int32 ``[num_programs, num_experts]``,
-    ``num_programs`` from :func:`compaction_grid`)."""
-    num_programs, block_tokens = compaction_grid(num_tokens, num_experts)
-    _compact_routing_map_kernel[(num_programs,)](
-        routing_map,
-        token_indices,
-        program_histogram,
-        num_tokens,
-        ROUTER_TOPK=router_topk,
-        NUM_EXPERTS=num_experts,
-        BLOCK_TOKENS=block_tokens,
-        BLOCK_NUM_EXPERTS=triton.next_power_of_2(num_experts),
-        num_warps=8,
-    )
-
-
-def launch_map_routes(
-    routing_map: torch.Tensor,
+def launch_virtual_expert_planner(
+    top_indices: torch.Tensor,
     probs: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
-    program_histogram: torch.Tensor,
-    destination_boundaries: torch.Tensor,
-    virtual_expert_slots: torch.Tensor,
+    workspace,
     virtual_experts: torch.Tensor,
-    runtime_routing_map: torch.Tensor,
     runtime_probs: torch.Tensor,
+    experts_to_copy: torch.Tensor,
     *,
-    num_tokens: int,
-    router_topk: int,
-    num_experts: int,
-    num_local_experts: int,
-    ep_size: int,
+    exchange: bool = True,
 ) -> None:
-    """Map semantic routes to runtime experts and write the dense runtime routing inputs.
+    """Plan one layer's routes in one cooperative launch.
 
-    Outputs: ``virtual_experts`` int64 ``[num_tokens, router_topk]``, ``runtime_routing_map``
-    bool ``[num_tokens, 2 * num_experts]`` and ``runtime_probs`` float32 of the same shape.
+    ``top_indices`` / ``probs`` are the router's ``[num_tokens, topk]`` expert ids and
+    probabilities, ``workspace`` the planner scratch (``VirtualExpertPlannerWorkspace``) whose
+    ``gathered_counts`` is this rank's symmetric window. Outputs: ``virtual_experts`` int16
+    ``[num_tokens, topk]`` runtime ids, ``runtime_probs`` float32 ``[num_tokens, 2 * num_experts]``
+    and ``experts_to_copy`` int32 ``[ep_size, num_local_experts]``. Without ``exchange``
+    (process-local tests) the window must already hold every rank's histogram.
     """
-    num_programs, _ = compaction_grid(num_tokens, num_experts)
+    num_tokens, router_topk = top_indices.shape
+    ep_size, num_experts = workspace.ep_size, workspace.num_experts
+    if ep_size > PLANNER_PROGRAMS:
+        raise ValueError(f"Virtual-expert planner supports at most {PLANNER_PROGRAMS} EP ranks.")
+    handle = workspace.histogram_handle
+    block_topk = triton.next_power_of_2(router_topk)
     block_num_experts = triton.next_power_of_2(num_experts)
-    _map_routes_kernel[(num_programs,)](
-        routing_map,
+    _plan_virtual_expert_routes_kernel[(PLANNER_PROGRAMS,)](
+        top_indices,
         probs,
-        tokens_per_expert,
-        program_histogram,
-        destination_boundaries,
-        virtual_expert_slots,
         virtual_experts,
-        runtime_routing_map.view(torch.int8),
         runtime_probs,
+        workspace.program_histogram,
+        workspace.running_counts,
+        workspace.tokens_per_expert,
+        workspace.gathered_counts,
+        workspace.balance,
+        workspace.allocation,
+        workspace.destination_boundaries,
+        experts_to_copy,
+        workspace.virtual_expert_slots,
+        workspace.placement_grid_sync,
+        workspace.grid_sync,
+        workspace.rank,
         num_tokens,
+        int(handle.buffer_ptrs_dev) if exchange else 0,
+        int(handle.signal_pad_ptrs_dev) if exchange else 0,
+        workspace.sequence,
         ROUTER_TOPK=router_topk,
-        NUM_EXPERTS=num_experts,
-        NUM_EXPERTS_PER_GPU=num_local_experts,
         EP_SIZE=ep_size,
+        NUM_EXPERTS=num_experts,
+        NUM_EXPERTS_PER_GPU=num_experts // ep_size,
         BLOCK_EP_SIZE=triton.next_power_of_2(ep_size),
-        BLOCK_TOKENS=min(32, max(1, 8192 // block_num_experts)),
+        BLOCK_NUM_EXPERTS_PER_GPU=triton.next_power_of_2(num_experts // ep_size),
         BLOCK_NUM_EXPERTS=block_num_experts,
         BLOCK_RUNTIME_EXPERTS=min(256, 2 * block_num_experts),
+        BLOCK_TOKENS=max(1, 128 // block_topk),
+        BLOCK_TOPK=block_topk,
+        NUM_PROGRAMS=PLANNER_PROGRAMS,
         HISTOGRAM_TILE=max(1, min(16, 8192 // block_num_experts)),
-        num_warps=8,
-    )
-
-
-def launch_map_routes_backward(
-    grad_runtime_probs: torch.Tensor,
-    virtual_experts: torch.Tensor,
-    token_indices: torch.Tensor,
-    grad_probs: torch.Tensor,
-    *,
-    num_tokens: int,
-    router_topk: int,
-    num_experts: int,
-) -> None:
-    """Write the semantic probability gradient (float32 ``[num_tokens, num_experts]``, fully
-    overwritten) from the dense runtime probability gradient."""
-    block_tokens = 32
-    _map_routes_backward_kernel[(triton.cdiv(num_tokens, block_tokens),)](
-        grad_runtime_probs,
-        virtual_experts,
-        token_indices,
-        grad_probs,
-        num_tokens,
-        ROUTER_TOPK=router_topk,
-        NUM_EXPERTS=num_experts,
-        BLOCK_TOKENS=block_tokens,
-        BLOCK_TOPK=triton.next_power_of_2(router_topk),
-        BLOCK_NUM_EXPERTS=min(256, triton.next_power_of_2(num_experts)),
+        EXCHANGE=exchange,
+        TIMEOUT_NS=_BARRIER_TIMEOUT_NS,
+        launch_cooperative_grid=True,
         num_warps=4,
     )
 

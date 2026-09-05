@@ -1858,6 +1858,7 @@ class TransformerConfig(ModelParallelConfig):
                     self.moe_expert_rank_capacity_factor >= 1.0,
                     "moe_expert_rank_capacity_factor>=1.0",
                 ),
+                (self.moe_expert_capacity_factor is None, "moe_expert_capacity_factor=None"),
                 (
                     not self.moe_router_padding_for_quantization or virtual_expert_mxfp8,
                     "moe_router_padding_for_quantization=False",

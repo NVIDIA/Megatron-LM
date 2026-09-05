@@ -937,7 +937,15 @@ def topk_routing_with_score_function(
 
     if dense_output:
         return probs, top_indices
+    return dense_routing_from_topk(logits, top_indices, probs)
 
+
+def dense_routing_from_topk(
+    logits: torch.Tensor, top_indices: torch.Tensor, probs: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Scatter ``[num_tokens, topk]`` probabilities and expert ids into the dense
+    ``[num_tokens, num_experts]`` routing probabilities and bool routing map."""
+    num_tokens = logits.shape[0]
     if torch.are_deterministic_algorithms_enabled():
         # build [num_tokens, num_experts] from [num_tokens, topk]
         routing_probs = torch.zeros_like(logits)
