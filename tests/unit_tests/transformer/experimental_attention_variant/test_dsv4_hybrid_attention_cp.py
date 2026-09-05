@@ -64,7 +64,7 @@ _DSV4_CP_TEST_VARIANT = "flash"
 # Keep every segment at least as long as the smallest compression ratio (4).
 # The cuDNN dense-indexer backward kernel does not yet support a THD segment
 # with Q rows but no compressed K rows. Padded total remains 4096, divisible
-# by CP2/CP4, and only the final segment has tail padding.
+# by CP2/CP4/CP8, and only the final segment has tail padding.
 _DSV4_CP_RAGGED_SEG_LENS = (5, 127, 1000, 23, 129, 900, 55, 257, 800, 95, 509, 148)
 _DSV4_CP_RAGGED_PADDED_SEG_LENS = (5, 127, 1000, 23, 129, 900, 55, 257, 800, 95, 509, 196)
 # Same shape, padded total, and max padded sequence length as
@@ -457,6 +457,102 @@ def _clear_cuda_test_state():
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
+
+
+def _run_thd_cp_cuda_graph_metadata_replay_case(
+    *, cp_size, cp_rank, pg, layer_number, fused_kernels_available
+):
+    """Check CUDA graph replay after changing same-shape THD metadata tensors."""
+    if not fused_kernels_available:
+        pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
+
+    capture_packed = _make_thd_packed_seq_params(
+        _DSV4_CP_RAGGED_SEG_LENS, _DSV4_CP_RAGGED_PADDED_SEG_LENS
+    )
+    replay_packed = _make_thd_packed_seq_params(
+        _DSV4_CP_RAGGED_SEG_LENS, _DSV4_CP_REPLAY_PADDED_SEG_LENS
+    )
+    padded_tokens = sum(_DSV4_CP_RAGGED_PADDED_SEG_LENS)
+    assert padded_tokens == sum(_DSV4_CP_REPLAY_PADDED_SEG_LENS)
+    assert capture_packed.cu_seqlens_q.shape == replay_packed.cu_seqlens_q.shape
+    assert capture_packed.cu_seqlens_q_padded.shape == replay_packed.cu_seqlens_q_padded.shape
+    assert capture_packed.max_seqlen_q == replay_packed.max_seqlen_q
+    assert capture_packed.max_seqlen_kv == replay_packed.max_seqlen_kv
+    assert not torch.equal(capture_packed.cu_seqlens_q_padded, replay_packed.cu_seqlens_q_padded)
+    local_rows = padded_tokens // cp_size
+    local_idx = torch.arange(cp_rank * local_rows, (cp_rank + 1) * local_rows, device='cuda')
+
+    torch.manual_seed(_SEED + 1100 + layer_number)
+    model_parallel_cuda_manual_seed(_SEED + 1100 + layer_number)
+    config = _make_dsv4_cp_config(
+        context_parallel_size=cp_size,
+        dsa_indexer_loss_coeff=1.0,
+        dsa_indexer_use_sparse_loss=True,
+        use_fused_kernels=True,
+        apply_rope_fusion=True,
+    )
+    graph_attn = _build_attention(config, layer_number=layer_number, pg_collection=pg).cuda()
+    eager_attn = _build_attention(config, layer_number=layer_number, pg_collection=pg).cuda()
+    graph_attn.train()
+    eager_attn.train()
+    _copy_module_parameters(graph_attn, eager_attn)
+
+    capture_full_hidden = torch.randn(
+        padded_tokens, 1, config.hidden_size, dtype=torch.bfloat16, device='cuda'
+    )
+    replay_full_hidden = torch.randn_like(capture_full_hidden)
+    capture_hidden = capture_full_hidden.index_select(0, local_idx).detach().clone()
+    replay_hidden = replay_full_hidden.index_select(0, local_idx).detach().clone()
+    capture_grad = torch.randn_like(capture_hidden)
+    replay_grad = torch.randn_like(replay_hidden)
+    static_hidden = capture_hidden.detach().clone().requires_grad_(True)
+    static_grad = capture_grad.detach().clone()
+
+    graph, graph_output = _capture_dsv4_attention_forward_backward(
+        graph_attn, static_hidden, static_grad, capture_packed
+    )
+    with torch.no_grad():
+        capture_packed.cu_seqlens_q.copy_(replay_packed.cu_seqlens_q)
+        capture_packed.cu_seqlens_kv.copy_(replay_packed.cu_seqlens_kv)
+        capture_packed.cu_seqlens_q_padded.copy_(replay_packed.cu_seqlens_q_padded)
+        capture_packed.cu_seqlens_kv_padded.copy_(replay_packed.cu_seqlens_kv_padded)
+        static_hidden.copy_(replay_hidden)
+        static_grad.copy_(replay_grad)
+        if static_hidden.grad is not None:
+            static_hidden.grad.zero_()
+        for param in graph_attn.parameters():
+            if param.grad is not None:
+                param.grad.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    graph_out = graph_output.detach().clone()
+    graph_hidden_grad = static_hidden.grad.detach().clone()
+    graph_param_grads = {
+        name: param.grad.detach().clone()
+        for name, param in graph_attn.named_parameters()
+        if param.grad is not None
+    }
+
+    eager_hidden = replay_hidden.detach().clone().requires_grad_(True)
+    eager_out, eager_hidden_grad, eager_param_grads = _run_dsv4_attention_forward_backward(
+        eager_attn, eager_hidden, replay_grad, replay_packed
+    )
+    torch.cuda.synchronize()
+    assert graph_param_grads.keys() == eager_param_grads.keys()
+    label_prefix = f"cp{cp_size}:layer={layer_number}:metadata_replay"
+    _assert_cp_graph_bitwise_match(graph_out, eager_out, f"{label_prefix}:output")
+    _assert_cp_graph_fused_grad_match(
+        graph_hidden_grad, eager_hidden_grad, f"{label_prefix}:hidden_grad"
+    )
+    for name, graph_grad in graph_param_grads.items():
+        _assert_cp_graph_fused_grad_match(
+            graph_grad, eager_param_grads[name], f"{label_prefix}:param_grad:{name}"
+        )
+
+    del graph, graph_output, graph_attn, eager_attn, capture_full_hidden, replay_full_hidden
+    del capture_hidden, replay_hidden, capture_grad, replay_grad, static_hidden, static_grad
+    del graph_out, graph_hidden_grad, eager_hidden
+    _clear_cuda_test_state()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -1064,109 +1160,13 @@ class TestDSv4HybridAttentionTHDCP:
         failure means the CP path baked capture-time padded boundaries or a
         host-derived dynamic shape into the graph.
         """
-        if not self.fused_kernels_available:
-            pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
-
-        capture_packed = _make_thd_packed_seq_params(
-            _DSV4_CP_RAGGED_SEG_LENS, _DSV4_CP_RAGGED_PADDED_SEG_LENS
+        _run_thd_cp_cuda_graph_metadata_replay_case(
+            cp_size=self.cp_size,
+            cp_rank=self.cp_rank,
+            pg=self.pg,
+            layer_number=layer_number,
+            fused_kernels_available=self.fused_kernels_available,
         )
-        replay_packed = _make_thd_packed_seq_params(
-            _DSV4_CP_RAGGED_SEG_LENS, _DSV4_CP_REPLAY_PADDED_SEG_LENS
-        )
-        padded_tokens = sum(_DSV4_CP_RAGGED_PADDED_SEG_LENS)
-        assert padded_tokens == sum(_DSV4_CP_REPLAY_PADDED_SEG_LENS)
-        assert capture_packed.cu_seqlens_q.shape == replay_packed.cu_seqlens_q.shape
-        assert capture_packed.cu_seqlens_q_padded.shape == replay_packed.cu_seqlens_q_padded.shape
-        assert capture_packed.max_seqlen_q == replay_packed.max_seqlen_q
-        assert capture_packed.max_seqlen_kv == replay_packed.max_seqlen_kv
-        assert not torch.equal(
-            capture_packed.cu_seqlens_q_padded, replay_packed.cu_seqlens_q_padded
-        )
-        local_rows = padded_tokens // self.cp_size
-        local_idx = torch.arange(
-            self.cp_rank * local_rows, (self.cp_rank + 1) * local_rows, device='cuda'
-        )
-
-        torch.manual_seed(_SEED + 1100 + layer_number)
-        model_parallel_cuda_manual_seed(_SEED + 1100 + layer_number)
-        config = _make_dsv4_cp_config(
-            context_parallel_size=self.cp_size,
-            dsa_indexer_loss_coeff=1.0,
-            dsa_indexer_use_sparse_loss=True,
-            use_fused_kernels=True,
-            apply_rope_fusion=True,
-        )
-        graph_attn = _build_attention(
-            config, layer_number=layer_number, pg_collection=self.pg
-        ).cuda()
-        eager_attn = _build_attention(
-            config, layer_number=layer_number, pg_collection=self.pg
-        ).cuda()
-        graph_attn.train()
-        eager_attn.train()
-        _copy_module_parameters(graph_attn, eager_attn)
-
-        capture_full_hidden = torch.randn(
-            padded_tokens, 1, config.hidden_size, dtype=torch.bfloat16, device='cuda'
-        )
-        replay_full_hidden = torch.randn_like(capture_full_hidden)
-        capture_hidden = capture_full_hidden.index_select(0, local_idx).detach().clone()
-        replay_hidden = replay_full_hidden.index_select(0, local_idx).detach().clone()
-        capture_grad = torch.randn_like(capture_hidden)
-        replay_grad = torch.randn_like(replay_hidden)
-        static_hidden = capture_hidden.detach().clone().requires_grad_(True)
-        static_grad = capture_grad.detach().clone()
-
-        graph, graph_output = _capture_dsv4_attention_forward_backward(
-            graph_attn, static_hidden, static_grad, capture_packed
-        )
-        with torch.no_grad():
-            capture_packed.cu_seqlens_q.copy_(replay_packed.cu_seqlens_q)
-            capture_packed.cu_seqlens_kv.copy_(replay_packed.cu_seqlens_kv)
-            capture_packed.cu_seqlens_q_padded.copy_(replay_packed.cu_seqlens_q_padded)
-            capture_packed.cu_seqlens_kv_padded.copy_(replay_packed.cu_seqlens_kv_padded)
-            static_hidden.copy_(replay_hidden)
-            static_grad.copy_(replay_grad)
-            if static_hidden.grad is not None:
-                static_hidden.grad.zero_()
-            for param in graph_attn.parameters():
-                if param.grad is not None:
-                    param.grad.zero_()
-        graph.replay()
-        torch.cuda.synchronize()
-        graph_out = graph_output.detach().clone()
-        graph_hidden_grad = static_hidden.grad.detach().clone()
-        graph_param_grads = {
-            name: param.grad.detach().clone()
-            for name, param in graph_attn.named_parameters()
-            if param.grad is not None
-        }
-
-        eager_hidden = replay_hidden.detach().clone().requires_grad_(True)
-        eager_out, eager_hidden_grad, eager_param_grads = _run_dsv4_attention_forward_backward(
-            eager_attn, eager_hidden, replay_grad, replay_packed
-        )
-        torch.cuda.synchronize()
-        assert graph_param_grads.keys() == eager_param_grads.keys()
-        _assert_cp_graph_bitwise_match(
-            graph_out, eager_out, f"layer={layer_number}:metadata_replay:output"
-        )
-        _assert_cp_graph_fused_grad_match(
-            graph_hidden_grad,
-            eager_hidden_grad,
-            f"layer={layer_number}:metadata_replay:hidden_grad",
-        )
-        for name, graph_grad in graph_param_grads.items():
-            _assert_cp_graph_fused_grad_match(
-                graph_grad,
-                eager_param_grads[name],
-                f"layer={layer_number}:metadata_replay:param_grad:{name}",
-            )
-
-        del graph, graph_output, graph_attn, eager_attn, capture_full_hidden, replay_full_hidden
-        del capture_hidden, replay_hidden, capture_grad, replay_grad, static_hidden, static_grad
-        del graph_out, graph_hidden_grad, eager_hidden
-        _clear_cuda_test_state()
 
     @pytest.mark.parametrize(
         "layer_number",
@@ -1275,3 +1275,50 @@ class TestDSv4HybridAttentionTHDCP:
 
         del cp_attn, local_hidden, local_grad
         _clear_cuda_test_state()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+class TestDSv4HybridAttentionTHDCP8CudaGraph:
+    """Focused CP8 CUDA graph metadata replay coverage."""
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_cp8_model_parallel(self, request):
+        """Initialize only the focused CP8 test's model-parallel groups."""
+        cp_size = 8
+        if Utils.world_size < cp_size:
+            pytest.skip(f"THD CP8 path test requires at least {cp_size} distributed ranks")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp_size,
+        )
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        cls = request.cls
+        cls.cp_size = cp_size
+        cls.cp_rank = parallel_state.get_context_parallel_rank()
+        cls.pg = ProcessGroupCollection.use_mpu_process_groups()
+        cls.fused_kernels_available = _dsv4_cp_fused_kernels_available()
+
+        yield
+        _clear_cuda_test_state()
+        Utils.destroy_model_parallel()
+
+    @pytest.fixture(autouse=True)
+    def clear_cuda_test_case(self):
+        """Clear CUDA state around the focused CP8 replay case."""
+        _clear_cuda_test_state()
+        yield
+        _clear_cuda_test_state()
+
+    def test_thd_cp8_ratio4_cuda_graph_replay_accepts_changed_padded_boundaries(self):
+        """CP8 ratio-4 replay honors updated same-shape THD metadata."""
+        _run_thd_cp_cuda_graph_metadata_replay_case(
+            cp_size=self.cp_size,
+            cp_rank=self.cp_rank,
+            pg=self.pg,
+            layer_number=2,
+            fused_kernels_available=self.fused_kernels_available,
+        )
