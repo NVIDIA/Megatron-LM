@@ -3356,7 +3356,6 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         )
     return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
 
-
 def training_log(
     loss_dict,
     total_loss_dict,
@@ -3381,9 +3380,14 @@ def training_log(
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
-
-    # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
-    should_reset = not is_first_iteration
+    
+    # Determine whether the current iteration completes the logging window.
+    if args.log_interval == 1:
+        # Every iteration is a complete logging window, including the startup iteration.
+        should_reset = True
+    else:
+        # Keep the startup iteration in the first regular logging window.
+        should_reset = not is_first_iteration
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
