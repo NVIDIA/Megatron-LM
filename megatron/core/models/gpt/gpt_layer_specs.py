@@ -435,6 +435,10 @@ def get_gpt_layer_local_submodules(
             mlp_bda=get_bias_dropout_add,
         )
     else:
+        sharded_state_dict_keys_map = {"input_layernorm.": "self_attention.linear_qkv.layer_norm_"}
+        # TE MoE layers keep the pre-MLP norm standalone; dense TE layers fuse it into FC1.
+        if num_experts is None:
+            sharded_state_dict_keys_map["pre_mlp_layernorm."] = "mlp.linear_fc1.layer_norm_"
         return TransformerLayerSubmodules(
             input_layernorm=layer_norm,
             self_attention=ModuleSpec(
@@ -456,10 +460,7 @@ def get_gpt_layer_local_submodules(
             pre_mlp_layernorm=layer_norm,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
-            sharded_state_dict_keys_map={
-                "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
-                "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
-            },
+            sharded_state_dict_keys_map=sharded_state_dict_keys_map,
         )
 
 
