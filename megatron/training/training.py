@@ -4148,56 +4148,15 @@ def checkpoint_and_decide_exit(
     --exit-duration-in-mins is set). Actual exit happens in main training loop
     based on the return value of this function."""
     args = get_args()
-    timers = get_timers()
 
-    # Exit based on signal handler.
-    saved_checkpoint = False
+    exit_now = False
+
+    # Exit based on signal handler
     if args.exit_signal_handler:
         signal_handler = get_signal_handler()
         if any(signal_handler.signals_received()):
-            if args.save:
-                save_checkpoint_and_time(
-                    iteration,
-                    model,
-                    optimizer,
-                    opt_param_scheduler,
-                    num_floating_point_operations_so_far,
-                    checkpointing_context,
-                    train_data_iterator=train_data_iterator,
-                )
             print_datetime('exiting program after receiving SIGTERM.')
-
-            return True
-
-    # Regular save (persistent and non-persistent).
-    if args.save and args.save_interval and iteration % args.save_interval == 0:
-        save_checkpoint_and_time(
-            iteration,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            num_floating_point_operations_so_far,
-            checkpointing_context,
-            train_data_iterator=train_data_iterator,
-        )
-        saved_checkpoint = True
-
-    elif (
-        args.save
-        and args.non_persistent_save_interval
-        and iteration % args.non_persistent_save_interval == 0
-    ):
-        save_checkpoint_and_time(
-            iteration,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            num_floating_point_operations_so_far,
-            checkpointing_context,
-            non_persistent_ckpt=True,
-            train_data_iterator=train_data_iterator,
-        )
-        saved_checkpoint = True
+            exit_now = True
 
     # Exit based on duration.
     if args.exit_duration_in_mins:
@@ -4210,21 +4169,9 @@ def checkpoint_and_decide_exit(
         # ~0.1ms and left unspanned: the GPU is already drained by here, and the
         # real post-checkpoint wait is the cross-rank save skew at timers.log.
         torch.distributed.all_reduce(done_cuda, op=torch.distributed.ReduceOp.MAX)
-        done = done_cuda.item()
-        if done:
-            if args.save and not saved_checkpoint:
-                save_checkpoint_and_time(
-                    iteration,
-                    model,
-                    optimizer,
-                    opt_param_scheduler,
-                    num_floating_point_operations_so_far,
-                    checkpointing_context,
-                    train_data_iterator=train_data_iterator,
-                )
+        exit_now = (done_cuda.item() > 0)
+        if exit_now:
             print_datetime(f'exiting program after {train_time} minutes')
-
-            return True
 
     # Exit based on iterations.
     if (
@@ -4234,7 +4181,15 @@ def checkpoint_and_decide_exit(
         args.phase_transition_iterations
         and iteration in args.phase_transition_iterations
     ):
-        if args.save and not saved_checkpoint:
+        print_datetime(f'exiting program at iteration {iteration}')
+        exit_now = True
+
+    # save if desired, all exits are persistent saves, persistent save takes priority over non-persistent
+    if args.save:
+        persistent_save = exit_now or (args.save_interval and ((iteration % args.save_interval) == 0))
+        non_persistent_save = !persistent_save and (args.non_persistent_save_interval and ((iteration % args.non_persistent_save_interval) == 0))
+
+        if persistent_save or non_persistent_save:
             save_checkpoint_and_time(
                 iteration,
                 model,
@@ -4242,13 +4197,11 @@ def checkpoint_and_decide_exit(
                 opt_param_scheduler,
                 num_floating_point_operations_so_far,
                 checkpointing_context,
+                non_persistent_ckpt=non_persistent_save,
                 train_data_iterator=train_data_iterator,
             )
-        print_datetime(f'exiting program at iteration {iteration}')
 
-        return True
-
-    return False
+    return exit_now
 
 
 def train(
