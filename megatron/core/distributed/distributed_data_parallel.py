@@ -188,7 +188,8 @@ class DistributedDataParallel(_BaseDataParallel):
             param_to_name[param] = name
             all_params.append(param)
 
-        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
+        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel,
+        # excludes_cp_from_bucket).
         buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
 
         # Auto-compute layouts when using distributed optimizer but no layout was provided.
@@ -247,6 +248,7 @@ class DistributedDataParallel(_BaseDataParallel):
             ), "Cannot average in collective when calculating per-token loss!"
             gradient_scaling_factor = 1.0
             expert_gradient_scaling_factor = 1.0
+            gradient_scaling_factor_no_cp = 1.0
         else:
             # The goal is to scale reduced gradients by 1/dp_size.
             # This can be achieved in two ways:
@@ -271,11 +273,19 @@ class DistributedDataParallel(_BaseDataParallel):
             if self.ddp_config.average_in_collective:
                 gradient_scaling_factor = 1.0
                 expert_gradient_scaling_factor = self.expt_dp_group.size() / self.dp_cp_group.size()
+                # excludes_cp_from_bucket buffers only exist when GTP_remat is active, and GTP
+                # requires average_in_collective=False (asserted below), so this value is
+                # provably unreachable — set for completeness, not correctness.
+                gradient_scaling_factor_no_cp = 1.0
             else:
                 data_parallel_world_size = self.dp_cp_group.size()
 
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
+                # excludes_cp_from_bucket buffers' bucket collective only spans dp_group (CP's
+                # contribution is already summed by their own gtp_remat-with-CP reduce-scatter),
+                # so their scaling factor must target 1/dp_size, not 1/(dp*cp).
+                gradient_scaling_factor_no_cp = 1.0 / self.dp_group.size()
 
         # Allocate buffers for each group.
         self.buffers = []
@@ -285,12 +295,20 @@ class DistributedDataParallel(_BaseDataParallel):
             if buffer_key.is_expert_parallel:
                 data_parallel_group = self.intra_expt_dp_group
                 scaling_factor = expert_gradient_scaling_factor
+            elif buffer_key.excludes_cp_from_bucket:
+                # CP already summed by these params' own gtp_remat-with-CP reduce-scatter.
+                data_parallel_group = self.dp_group
+                scaling_factor = gradient_scaling_factor_no_cp
             else:
                 data_parallel_group = self.intra_dp_cp_group
                 scaling_factor = gradient_scaling_factor
 
             if not config.calculate_per_token_loss:
-                target_gradient_scaling_factor = 1.0 / self.dp_cp_group.size()
+                target_gradient_scaling_factor = (
+                    1.0 / self.dp_group.size()
+                    if buffer_key.excludes_cp_from_bucket
+                    else 1.0 / self.dp_cp_group.size()
+                )
                 if self.ddp_config.average_in_collective:
                     if self.ddp_config.num_distributed_optimizer_instances == 1:
                         # Collective is averaging gradients in collective with data_parallel_group.

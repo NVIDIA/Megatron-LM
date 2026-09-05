@@ -1561,6 +1561,15 @@ def validate_args(args, defaults={}):
             if 'gtp_remat' not in args.high_priority_stream_groups:
                 args.high_priority_stream_groups.append('gtp_remat')
                 warn_rank_0("Setting 'gtp_remat' group for high priority streams.")
+            # Under CP the dense AG/RS runs on the CP-merged group, which is a distinct
+            # communicator with its own NCCL config key.
+            if (
+                args.context_parallel_size > 1
+                and gtp_weight_remat_size > 1
+                and 'gtp_remat_cp' not in args.high_priority_stream_groups
+            ):
+                args.high_priority_stream_groups.append('gtp_remat_cp')
+                warn_rank_0("Setting 'gtp_remat_cp' group for high priority streams.")
             if (
                 egtp_weight_remat_size > 1
                 and 'expt_gtp_remat' not in args.high_priority_stream_groups

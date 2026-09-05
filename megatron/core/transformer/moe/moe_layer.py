@@ -13,7 +13,12 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_routed_mxfp8
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    gtp_remat_cp_size,
+    resolve_gtp_remat_group,
+    resolve_gtp_replica_group,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -281,7 +286,8 @@ class MoELayer(BaseMoELayer):
             if linear_cls is TELinear:
                 linear_gtp_kwargs = {
                     "gtp_remat_group": gtp_remat_group,
-                    "gtp_replica_group": pg_collection.dp_cp,
+                    "gtp_replica_group": resolve_gtp_replica_group(pg_collection, is_expert=False),
+                    "gtp_cp_size": gtp_remat_cp_size(pg_collection, is_expert=False),
                 }
             self.fc1_latent_proj = linear_cls(
                 self.config.hidden_size,

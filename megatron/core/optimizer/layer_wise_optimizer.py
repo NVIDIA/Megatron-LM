@@ -30,6 +30,7 @@ from .param_layout import (
     bucket_end_divisor,
     pad_param_start,
     pad_to_divisor,
+    resolve_buffer_dp_world_size,
 )
 
 logger = logging.getLogger(__name__)
@@ -488,14 +489,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
-            if buffer_key.is_expert_parallel:
-                dp_world_size = (
-                    expert_data_parallel_world_size
-                    if expert_data_parallel_world_size is not None
-                    else data_parallel_world_size
-                )
-            else:
-                dp_world_size = data_parallel_world_size
+            dp_world_size = resolve_buffer_dp_world_size(
+                buffer_key, group_params, data_parallel_world_size, expert_data_parallel_world_size
+            )
 
             # Dispatch per buffer: LayerWise (Muon) params get the shard-aligned
             # layout; non-LayerWise params (e.g. Adam-managed embeddings, biases)
