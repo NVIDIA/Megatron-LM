@@ -2122,7 +2122,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_flex_dispatcher_backend == "ncclep":
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError(
-                    "moe_flex_dispatcher_backend='ncclep' requires moe_token_dispatcher_type='flex'."
+                    "moe_flex_dispatcher_backend='ncclep' requires "
+                    "moe_token_dispatcher_type='flex'."
                 )
 
         if self.moe_dispatch_fwd_dtype != 'bf16' or self.moe_combine_bwd_dtype != 'bf16':
@@ -2215,7 +2216,8 @@ class TransformerConfig(ModelParallelConfig):
                 (
                     self.recompute_granularity != "selective"
                     or "moe" not in (self.recompute_modules or ()),
-                    "no MoE layer recompute (the virtual-expert hooks assume one forward per backward)",
+                    "no MoE layer recompute (the virtual-expert hooks assume one forward per "
+                    "backward)",
                 ),
             ]
             unmet = [message for satisfied, message in requirements if not satisfied]
