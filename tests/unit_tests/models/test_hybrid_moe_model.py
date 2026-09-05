@@ -263,6 +263,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mup_width_mult": 1.0,
     "mtp_detach_heads": False,
     "mtp_hybrid_override_pattern": None,
+    "mtp_loss_type": "cross_entropy",
     "mtp_loss_scaling_factor": 0.1,
     "mtp_num_layers": None,
     "mtp_standalone": False,
