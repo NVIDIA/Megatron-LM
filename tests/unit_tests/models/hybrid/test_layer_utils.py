@@ -120,6 +120,43 @@ class TestGetLayerSymbolFromConfig:
 
 
 @pytest.mark.internal
+class TestContainsLayerConfig:
+
+    @pytest.mark.parametrize(
+        "config_type", [config_type for _, config_type in _EXPECTED_LAYER_CONFIG_TYPES]
+    )
+    def test_returns_true_when_config_type_is_present(self, config_type):
+        layer_config = config_type.from_config(_make_transformer_config())
+
+        assert layer_utils.contains_layer_config(config_type, [layer_config])
+
+    def test_returns_false_when_config_type_is_absent(self):
+        layer_config = MambaLayerConfig.from_config(_make_transformer_config())
+
+        assert not layer_utils.contains_layer_config(layer_utils.GDNLayerConfig, [layer_config])
+
+    def test_preserves_exact_config_type_lookup(self):
+        class CustomMambaLayerConfig(MambaLayerConfig):
+            pass
+
+        layer_config = CustomMambaLayerConfig.from_config(_make_transformer_config())
+
+        with pytest.raises(
+            ValueError, match="Unexpected hybrid layer config type: CustomMambaLayerConfig"
+        ):
+            layer_utils.contains_layer_config(layer_utils.MambaLayerConfig, [layer_config])
+
+    def test_rejects_unregistered_requested_config_type(self):
+        class CustomMambaLayerConfig(MambaLayerConfig):
+            pass
+
+        with pytest.raises(
+            ValueError, match="Unexpected hybrid layer config type: CustomMambaLayerConfig"
+        ):
+            layer_utils.contains_layer_config(CustomMambaLayerConfig, [])
+
+
+@pytest.mark.internal
 class TestValidateTpCommOverlap:
 
     @pytest.mark.parametrize(

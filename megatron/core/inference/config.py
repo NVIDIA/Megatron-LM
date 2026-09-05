@@ -3,12 +3,15 @@
 import warnings
 from dataclasses import InitVar, dataclass, field
 from enum import Enum
-from typing import List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Sequence, Tuple
 
 import torch
 
+from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
+from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_attr_wrapped_model
 
 
@@ -22,10 +25,11 @@ class MambaInferenceStateConfig:
     mixing these. Once the kernels have been updated we can simplify this code.
     """
 
-    layer_type_list: List[str]
-    """
-    A list of strings that indicates the layer type (Mamba / GDN / Attention / MLP) for each layer.
-    See `megatron/core/models/hybrid/hybrid_layer_allocation.py` for the list of symbols.
+    layer_type_list: List[str] | None
+    """Deprecated list of layer symbols retained for backwards compatibility.
+
+    Use ``layer_config_list`` instead. Legacy symbols are converted to independent
+    per-layer configs when dynamic inference is initialized with the model config.
     """
 
     conv_states_shape: Tuple[int]
@@ -63,9 +67,47 @@ class MambaInferenceStateConfig:
     model has none. Sizes the GDP chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
 
+    layer_config_list: Sequence[TransformerConfig] | None = None
+    """Per-layer configs used to derive dynamic inference cache indexing."""
+
     def __post_init__(self):
+        if (self.layer_type_list is None) == (self.layer_config_list is None):
+            raise ValueError("Exactly one of layer_type_list or layer_config_list must be provided")
+        if self.layer_type_list is not None:
+            if any(
+                not isinstance(layer_symbol, str) or len(layer_symbol) != 1
+                for layer_symbol in self.layer_type_list
+            ):
+                raise ValueError("Each entry in layer_type_list must be a single layer symbol")
+            warnings.warn(
+                "DEPRECATED(layer_type_list): please use `layer_config_list` instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if self.ssm_chunk_alignment is None:
             self.ssm_chunk_alignment = self.mamba_chunk_size
+
+    def convert_layer_type_list(self, config: TransformerConfig) -> Sequence[TransformerConfig]:
+        """Convert deprecated layer symbols to independent per-layer configs.
+
+        Args:
+            config: Normalized model config to copy into each converted layer config.
+
+        Returns:
+            Converted per-layer configs in layer order.
+
+        Raises:
+            ValueError: If there is no legacy layer type list to convert or the layer config list
+                is already populated.
+        """
+        if self.layer_type_list is None:
+            raise ValueError("layer_type_list must be provided for conversion")
+        if self.layer_config_list is not None:
+            raise ValueError("layer_config_list is already populated")
+        layer_config_list = validate_segment_layers(''.join(self.layer_type_list), config)
+        self.layer_config_list = layer_config_list
+        self.layer_type_list = None
+        return layer_config_list
 
     @classmethod
     def from_model(
@@ -75,29 +117,33 @@ class MambaInferenceStateConfig:
         ssm_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["MambaInferenceStateConfig"]:
         """Return recurrent inference state config for a Mamba or GDN hybrid model."""
-        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
         from megatron.core.ssm.ssm_inference import ssm_chunking
 
         decoder = get_attr_wrapped_model(model, "decoder")
-        layer_type_list = getattr(decoder, "layer_type_list", None)
-        recurrent_symbols = (Symbols.MAMBA, Symbols.GDN)
-        if layer_type_list is not None and any(
-            symbol in layer_type_list for symbol in recurrent_symbols
-        ):
-            present_recurrent_symbols = {
-                symbol for symbol in recurrent_symbols if symbol in layer_type_list
-            }
-            if len(present_recurrent_symbols) > 1:
+        layer_config_list = getattr(decoder, "layer_config_list", None)
+        if layer_config_list is not None:
+            has_mamba = layer_utils.contains_layer_config(
+                layer_utils.MambaLayerConfig, layer_config_list
+            )
+            has_gdn = layer_utils.contains_layer_config(
+                layer_utils.GDNLayerConfig, layer_config_list
+            )
+            if has_mamba and has_gdn:
                 raise ValueError(
                     "Dynamic inference does not support mixing Mamba and GDN layers; "
                     "the recurrent-state cache and prefill metadata use one shared shape "
                     "and chunk size."
                 )
-            if (
-                Symbols.GDN in present_recurrent_symbols
-                and model.config.experimental_attention_variant == "gdn2"
+            if any(
+                type(layer_config) is layer_utils.GDNLayerConfig
+                and layer_config.experimental_attention_variant == "gdn2"
+                for layer_config in layer_config_list
             ):
                 raise NotImplementedError("GDN2 does not support dynamic inference.")
+
+            if not (has_mamba or has_gdn):
+                return None
+
             mamba_conv_states_shape, mamba_ssm_states_shape = (
                 decoder.mamba_state_shapes_per_request()
             )
@@ -121,7 +167,7 @@ class MambaInferenceStateConfig:
             # gated off for GDP (batch-invariant chunk lengths, prefix-cache
             # extraction offsets). A future cross-rank consumer must reconcile
             # these across the PP group.
-            chunking = ssm_chunking(decoder.layer_type_list, decoder.layers)
+            chunking = ssm_chunking(layer_config_list, decoder.layers)
             if chunking is None:
                 mamba_chunk_size = 128
                 ssm_chunk_alignment = mamba_chunk_size
@@ -131,7 +177,8 @@ class MambaInferenceStateConfig:
                 ssm_chunk_alignment = chunking.inference_chunk_size
                 gdp_num_householder = chunking.num_householder
             return cls(
-                layer_type_list=layer_type_list,
+                layer_type_list=None,
+                layer_config_list=list(layer_config_list),
                 conv_states_shape=mamba_conv_states_shape,
                 ssm_states_shape=mamba_ssm_states_shape,
                 conv_states_dtype=conv_states_dtype,
