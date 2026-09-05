@@ -963,10 +963,13 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         return cache[grad_norm_group]
 
     @torch.no_grad()
-    def _get_grad_norm_for_group(self, grad_norm_group: str):
+    def _get_grad_norm_for_group(
+        self, grad_norm_group: str, optimizers: Optional[List[MegatronOptimizer]] = None
+    ):
         # Aggregate across the module-local optimizer domain.
+        optimizers = self.chained_optimizers if optimizers is None else optimizers
         grads_for_norm = []
-        for optimizer in self.chained_optimizers:
+        for optimizer in optimizers:
             grads_for_norm += optimizer.get_grads_for_grad_norm(grad_norm_group)
         grad_norm = get_grad_norm_fp32(
             grads_for_norm, grad_stats_parallel_group=self.grad_stats_parallel_group

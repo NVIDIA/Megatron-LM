@@ -64,6 +64,7 @@ from .distrib_optimizer import DistributedOptimizer
 from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
+    OrthogonalizedOptimizer,
     _create_emerging_optimizer,
     _get_qkv_split_shapes,
 )
@@ -914,6 +915,10 @@ def _get_megatron_emerging_optimizer(
             else:
                 optimizer = FP32Optimizer(optimizer, config, init_state_fn)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
+            # Muon-family (orthogonalizing) updates are scale-invariant, so magnitude
+            # grad-norm clipping does not apply to them; SOAP/Lion keep clipping (#5394).
+            if isinstance(optimizer.optimizer, OrthogonalizedOptimizer):
+                optimizer.skip_grad_norm_clip = True
             tp_group = pg_collection.tp
             expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
             setattr(optimizer, 'tp_group', tp_group)
@@ -992,6 +997,16 @@ def _get_megatron_emerging_optimizer(
             init_state_fn_list=list(init_fns),
             model_chunks=model_chunks,
         )
+        # LayerWise wraps the base torch optimizers itself, so classify each member by its
+        # underlying torch optimizer. The container needs no flag of its own:
+        # ``ChainedOptimizer.skip_grad_norm_clip`` is derived from the members (#5394).
+        for sub_optimizer in layer_wise_optimizer.chained_optimizers:
+            base_optimizer = (
+                sub_optimizer.optimizer
+                if isinstance(sub_optimizer, MegatronOptimizer)
+                else sub_optimizer
+            )
+            sub_optimizer.skip_grad_norm_clip = isinstance(base_optimizer, OrthogonalizedOptimizer)
         # LayerWise owns Muon-managed params; DistOpt instances in ``results``
         # own the rest. Chain them so the training loop sees one optimizer.
         if results:
