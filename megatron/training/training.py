@@ -147,6 +147,11 @@ from megatron.training.checkpointing import (
 )
 from megatron.training.config import FaultInjectorConfig
 from megatron.training.config.container import PretrainConfigContainer
+from megatron.training.determinism_trace import (
+    TraceConfig,
+    close_determinism_trace,
+    initialize_determinism_trace,
+)
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
     initialize_megatron,
@@ -2068,6 +2073,8 @@ def pretrain(
                 # (SystemExit from the exit-interval path is NOT caught here; it already
                 # flushed before sys.exit(). SIGKILL is unrecoverable regardless.)
                 _end_otel_job_spans()
+                if getattr(args, "determinism_trace_dir", None):
+                    close_determinism_trace()
                 raise
 
         print_datetime('after training is done')
@@ -4492,6 +4499,23 @@ def train(
         )
         get_moe_router_tracer().register_hooks(model)
 
+    determinism_trace = None
+    determinism_trace_dir = getattr(args, "determinism_trace_dir", None)
+    if determinism_trace_dir:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        determinism_trace = initialize_determinism_trace(
+            TraceConfig(
+                output_dir=determinism_trace_dir,
+                rank=rank,
+                mode=getattr(args, "determinism_trace_mode", "metadata"),
+                sample_count=getattr(args, "determinism_trace_sample_count", 256),
+                flush_every=getattr(args, "determinism_trace_flush_every", 0),
+                append=getattr(args, "determinism_trace_append", False),
+                rank_spec=getattr(args, "determinism_trace_ranks", "all"),
+                iteration_spec=getattr(args, "determinism_trace_iterations", "all"),
+            )
+        )
+
     report_memory_flag = True
     pre_hook_enabled = False
     should_exit = False
@@ -4725,6 +4749,15 @@ def train(
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
+        trace_iteration = iteration + 1
+        if determinism_trace is not None:
+            determinism_trace.record_event(
+                "iteration_start",
+                iteration=trace_iteration,
+                phase="train",
+                fields={"num_microbatches": num_microbatches},
+            )
+
         # Capture CUDA Graphs. One-off, at the warmup-step boundary -- the actual
         # graph capture (create_cudagraphs) is a notable one-time cost worth its
         # own span, distinct from the megatron.train.iteration spans around it.
@@ -4758,6 +4791,14 @@ def train(
             )
             args.consumed_train_samples += batch_size
             args.skipped_train_samples += batch_size
+            if determinism_trace is not None:
+                determinism_trace.record_event(
+                    "iteration_skipped",
+                    iteration=trace_iteration,
+                    phase="train",
+                    fields={"reason": "configured_skip"},
+                )
+                determinism_trace.flush()
             continue
 
         args.curr_iteration = iteration
@@ -4840,6 +4881,46 @@ def train(
                     _otel_safe_set_attrs(
                         _step_span, {'megatron.skipped': bool(skipped_iter)}
                     )
+        if determinism_trace is not None:
+            determinism_trace.record_event(
+                "iteration_result",
+                iteration=trace_iteration,
+                phase="train",
+                fields={"skipped": bool(skipped_iter)},
+            )
+            for loss_name, loss_value in sorted(loss_dict.items()):
+                trace_name = f"loss.{loss_name}"
+                if isinstance(loss_value, torch.Tensor) and loss_value.numel() == 1:
+                    determinism_trace.record_scalar(
+                        trace_name,
+                        loss_value,
+                        iteration=trace_iteration,
+                        phase="train",
+                    )
+                elif isinstance(loss_value, torch.Tensor):
+                    determinism_trace.record_tensor(
+                        trace_name,
+                        loss_value,
+                        iteration=trace_iteration,
+                        phase="train",
+                    )
+                elif isinstance(loss_value, (bool, int, float)) or loss_value is None:
+                    determinism_trace.record_scalar(
+                        trace_name,
+                        loss_value,
+                        iteration=trace_iteration,
+                        phase="train",
+                    )
+            determinism_trace.record_scalar(
+                "grad_norm", grad_norm, iteration=trace_iteration, phase="train"
+            )
+            determinism_trace.record_scalar(
+                "num_zeros_in_grad",
+                num_zeros_in_grad,
+                iteration=trace_iteration,
+                phase="train",
+            )
+            determinism_trace.flush()
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -5148,6 +5229,9 @@ def train(
     # Shutdown RL profiler and export summary
     if args.rl_profile:
         shutdown_rl_profiler()
+
+    if determinism_trace is not None:
+        close_determinism_trace()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
