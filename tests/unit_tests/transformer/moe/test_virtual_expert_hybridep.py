@@ -215,6 +215,11 @@ def _run_full_layer_parity(
         "use_fused_weighted_squared_relu": activation != "swiglu",
         "moe_latent_size": moe_latent_size,
         "moe_shared_expert_intermediate_size": shared_expert_size,
+        # The fused (Transformer Engine) router returns dense outputs the virtual-expert path
+        # must recover its compact routes from, so run it where the reference allows: the
+        # all-to-all reference pads the routing map in place, which the fused router's backward
+        # rejects.
+        "moe_router_fusion": reference_dispatcher == "hybridep",
     }
     if mxfp8:
         common.update(
