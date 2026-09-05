@@ -293,6 +293,34 @@ class RotaryEmbedding(nn.Module):
         else:
             if transformer is not None and transformer.input_tensor is not None:
                 rotary_seq_len = transformer.input_tensor.size(0)
+                if getattr(transformer_config, 'enable_attention_residuals', False) and not getattr(
+                    transformer, 'pre_process', False
+                ):
+                    # With attention residuals, non-first stages receive the
+                    # depth-source payload: [num_slices * s, b, h]. Divide the
+                    # slice count back out to recover the true sequence length.
+                    # Under interleaved VPP every payload is padded to the same
+                    # uniform width; otherwise the width is per-rank.
+                    if transformer_config.virtual_pipeline_model_parallel_size is not None:
+                        from megatron.core.transformer.attention_residual import (
+                            attn_res_uniform_payload_slices,
+                        )
+
+                        num_slices = attn_res_uniform_payload_slices(transformer_config)
+                    else:
+                        from megatron.core import parallel_state
+                        from megatron.core.transformer.attention_residual import (
+                            attn_res_payload_slices_for_pp_rank,
+                        )
+
+                        num_slices = attn_res_payload_slices_for_pp_rank(
+                            transformer_config, parallel_state.get_pipeline_model_parallel_rank()
+                        )
+                    assert rotary_seq_len % num_slices == 0, (
+                        f"attention residual payload length {rotary_seq_len} is not "
+                        f"divisible by the expected slice count {num_slices}"
+                    )
+                    rotary_seq_len //= num_slices
             else:
                 rotary_seq_len = transformer_input.size(0)
 

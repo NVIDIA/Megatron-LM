@@ -48,6 +48,8 @@ from ..utils import (
 
 logger = logging.getLogger(__name__)
 
+_ATTN_RES_SUPPORTED_OFFLOAD_MODULES = frozenset({"qkv_linear", "core_attn", "attn_proj"})
+
 try:
     from packaging.version import Version as PkgVersion
 
@@ -1331,6 +1333,41 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     ####################
+    # Attention Residuals (AttnRes) Configuration
+    ####################
+    enable_attention_residuals: bool = False
+    """Enable Attention Residuals (AttnRes, arXiv:2603.15031): replaces the fixed residual
+    accumulation with per-token softmax attention over depth sources (token embedding, completed
+    depth-block sums, and the running intra-block partial sum). Each self-attention and MLP
+    sublayer aggregates the sources with its own zero-initialized pseudo-query, and the final
+    output head aggregates all sources before the final layernorm. Mutually exclusive with
+    enable_hyper_connections."""
+
+    attn_res_block_layers: Optional[int] = None
+    """Block AttnRes: number of transformer layers per depth block (the paper's block size S
+    counted in sublayers is twice this value). Required when enable_attention_residuals=True.
+    The total number of depth sources at the network output is
+    floor((num_layers - 1) / attn_res_block_layers) + 2 (completed blocks + token embedding +
+    trailing partial block); the paper finds ~8-10 sources recover most of the quality gain."""
+
+    attn_res_impl: str = "eager"
+    """Implementation of the AttnRes depth aggregation: 'eager' (a memory-lean custom autograd
+    Function built from plain PyTorch ops) or 'compile' (a plain PyTorch forward wrapped in
+    torch.compile, with AOTAutograd generating its backward and one specialization per depth
+    arity; falls back to the eager custom Function with a warning if compilation is unavailable),
+    or 'fla' (FLA's three-kernel fused training implementation with checkpoint_level=1; requires
+    flash-linear-attention). The eager loop is CPU-dispatch-bound — measured ~3-4 ms of CPU wall
+    per aggregation on GB200 at small hidden sizes — so 'fla' is recommended when the optional
+    dependency is installed, with 'compile' as the dependency-free optimized path."""
+
+    hybrid_layer_pattern: Optional[str] = None
+    """Unified hybrid layer pattern string (mirrors --hybrid-layer-pattern; populated
+    automatically by the argument bridge). Consumed by config-only consumers that need the
+    hybrid pipeline segmentation — currently the attention-residual pipeline payload widths,
+    whose per-boundary slice counts derive from the cumulative '|' segment lengths. The
+    HybridModel itself keeps receiving the pattern through its constructor argument."""
+
+    ####################
     # miscellaneous
     ####################
     clone_scatter_output_in_embedding: bool = True
@@ -1542,6 +1579,137 @@ class TransformerConfig(ModelParallelConfig):
 
     Same sign convention as moe_paged_stash_buffer_size_factor_cuda: positive = avg-based,
     negative = actual-max; scale = abs(factor)."""
+
+    def _validate_attention_residuals(self):
+        """Validate the Attention Residuals (AttnRes) configuration.
+
+        Supported: eager/compile training with TP/SP/CP/EP, pipeline parallelism
+        (non-interleaved: full depth-source prefix concatenated along the
+        sequence dimension; interleaved VPP: per-boundary deltas padded to a
+        uniform width plus a rank-local source cache — see
+        attention_residual.AttnResStageSources), selective recompute of modules
+        that live inside a sublayer (e.g. core_attn), MoE (incl. shared-expert
+        overlap), attention-scope fine-grained activation offloading
+        (qkv_linear, core_attn, and attn_proj), and MTP in the standard
+        last-stage placement. Everything rejected below either has no mechanism
+        yet (CUDA graphs, full recompute, EP-overlap fine-grained schedule,
+        non-attention activation offloading, zero-layer virtual chunks) or
+        would silently bypass the AttnRes residual interception (fused residual
+        norms, fp32 residual connection) or the static payload-width reasoning
+        (variable sequence lengths).
+        """
+        if not self.enable_attention_residuals:
+            if self.attn_res_block_layers is not None:
+                raise ValueError("attn_res_block_layers requires enable_attention_residuals=True.")
+            return
+
+        if self.enable_hyper_connections:
+            raise ValueError(
+                "enable_attention_residuals and enable_hyper_connections are mutually "
+                "exclusive residual-stream generalizations."
+            )
+        if (
+            not isinstance(self.attn_res_block_layers, int)
+            or isinstance(self.attn_res_block_layers, bool)
+            or self.attn_res_block_layers < 1
+        ):
+            raise ValueError(
+                "enable_attention_residuals requires attn_res_block_layers to be a "
+                f"positive integer, got {self.attn_res_block_layers!r}."
+            )
+        if self.attn_res_impl not in ("eager", "compile", "fla"):
+            raise ValueError(
+                "attn_res_impl must be 'eager', 'compile', or 'fla', "
+                f"got {self.attn_res_impl!r}."
+            )
+        unsupported = []
+        if self.variable_seq_lengths:
+            # Dynamic shape exchange bypasses the static payload-width
+            # reasoning (and the interleaved schedule's uniform padded width).
+            unsupported.append("variable_seq_lengths (incl. sequence packing)")
+        if self.virtual_pipeline_model_parallel_size is not None and (
+            self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split
+        ):
+            # Zero-layer virtual chunks (standalone embedding/loss stages) are
+            # not covered by the delta-payload window bookkeeping yet.
+            unsupported.append(
+                "interleaved VPP together with account_for_embedding/loss_in_pipeline_split"
+            )
+        if self.cuda_graph_impl != "none":
+            unsupported.append(f"cuda_graph_impl={self.cuda_graph_impl!r}")
+        if self.recompute_granularity == "full":
+            unsupported.append("recompute_granularity='full'")
+        if self.overlap_moe_expert_parallel_comm:
+            unsupported.append("overlap_moe_expert_parallel_comm")
+        if self.fused_residual_rmsnorm:
+            unsupported.append("fused_residual_rmsnorm (bypasses residual interception)")
+        if self.fp32_residual_connection:
+            unsupported.append("fp32_residual_connection")
+        if self.apply_residual_connection_post_layernorm:
+            unsupported.append("apply_residual_connection_post_layernorm")
+        if self.cpu_offloading:
+            unsupported.append(
+                "cpu_offloading (depth sources outlive the per-layer lifetime model)"
+            )
+        unsupported_offload_modules = set(self.offload_modules or ()) - (
+            _ATTN_RES_SUPPORTED_OFFLOAD_MODULES
+        )
+        if unsupported_offload_modules:
+            unsupported.append(
+                "fine-grained activation offloading for unsupported modules "
+                f"{sorted(unsupported_offload_modules)}; supported AttnRes offload modules are "
+                f"{sorted(_ATTN_RES_SUPPORTED_OFFLOAD_MODULES)}"
+            )
+        if self.heterogeneous_block_specs:
+            unsupported.append("heterogeneous_block_specs")
+        if self.pipeline_model_parallel_layout is not None:
+            unsupported.append("pipeline_model_parallel_layout (incl. standalone MTP stages)")
+        if (
+            self.num_layers_in_first_pipeline_stage is not None
+            or self.num_layers_in_last_pipeline_stage is not None
+        ):
+            unsupported.append("num_layers_in_first/last_pipeline_stage")
+        if (
+            self.mtp_num_layers is not None
+            and self.pipeline_model_parallel_size > 1
+            and (
+                self.account_for_embedding_in_pipeline_split
+                or self.account_for_loss_in_pipeline_split
+            )
+        ):
+            # With these splits the final-layernorm stage (which aggregates and
+            # consumes the depth sources) can differ from the post_process stage
+            # that runs MTP; the depth-source hand-off does not cross that
+            # boundary yet.
+            unsupported.append("MTP together with account_for_embedding/loss_in_pipeline_split")
+        if self.is_hybrid_model:
+            if self.mtp_num_layers is not None:
+                # Hybrid MTP depths run a nested HybridStack; the depth-source
+                # hand-off into that stack is a follow-up.
+                unsupported.append("hybrid MTP (a '/' depth in the hybrid layer pattern)")
+            if self.pipeline_model_parallel_size > 1:
+                if not self.hybrid_layer_pattern:
+                    raise ValueError(
+                        "enable_attention_residuals with a hybrid model and pipeline "
+                        "parallelism requires hybrid_layer_pattern (the pipeline payload "
+                        "widths derive from the pattern's '|' segmentation)."
+                    )
+                main_pattern = self.hybrid_layer_pattern.split('/')[0]
+                if '|' in main_pattern:
+                    num_segments = main_pattern.count('|') + 1
+                    expected_segments = self.pipeline_model_parallel_size * (
+                        self.virtual_pipeline_model_parallel_size or 1
+                    )
+                    if num_segments != expected_segments:
+                        unsupported.append(
+                            f"hybrid pattern with {num_segments} pipe segments != "
+                            f"pipeline_model_parallel_size x virtual_pipeline_model_parallel_size "
+                            f"= {expected_segments}"
+                        )
+        if unsupported:
+            raise ValueError(
+                "enable_attention_residuals is not yet supported with: " + "; ".join(unsupported)
+            )
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -2597,6 +2765,8 @@ class TransformerConfig(ModelParallelConfig):
         if self.use_fused_mhc:
             if not self.enable_hyper_connections:
                 raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
+
+        self._validate_attention_residuals()
 
         if self.fine_grained_activation_offloading:
             assert (
