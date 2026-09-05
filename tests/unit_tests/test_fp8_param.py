@@ -7,6 +7,7 @@ import sys
 
 import pytest
 import torch
+from packaging.version import Version
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core.distributed import DistributedDataParallel as DDP
@@ -20,6 +21,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
+from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
@@ -33,6 +35,7 @@ from megatron.training.training import (
     should_disable_forward_pre_hook,
 )
 from megatron.training.utils import get_device_arch_version
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 _SEED = 1234
@@ -665,3 +668,199 @@ class TestFP8Param:
             "num_layers_at_end_in_bf16": 1,
         }
         self.run_test(tp_size=tp_size, recipe="blockwise", **kwargs)
+
+    # ------------------------------------------------------------------
+    # Checkpoint round trip
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def quantized_param_state(model_chunk):
+        """Raw element codes and dequantized values of every quantized param, by name.
+
+        Comparing the dequantized values alone would be weak: a block scale can change
+        without moving any value, and that still means the resumed tensor is not the one
+        that was saved. Comparing the raw codes alone would be weak the other way round,
+        since codes only mean something paired with a scale. So compare both.
+
+        The scale arrays are deliberately not compared directly. TE keeps MXFP8 block scales
+        in a padded, swizzled layout, and the padding entries are never read and not
+        reproducible across allocations, so they raise false mismatches. A scale that is
+        actually used shows up in the dequantized values.
+        """
+        data_attrs = ("_data", "_rowwise_data", "_columnwise_data")
+        state = {}
+        for name, param in model_chunk.named_parameters():
+            if not is_float8tensor(param):
+                continue
+            # A quantized tensor may be the Parameter itself or its .data payload.
+            for holder in (param, param.data):
+                tensors = {
+                    attr: getattr(holder, attr).detach().clone()
+                    for attr in data_attrs
+                    if torch.is_tensor(getattr(holder, attr, None))
+                }
+                if tensors:
+                    break
+            assert tensors, f"no quantized storage found on {name} ({type(param).__name__})"
+            # .float() and not .dequantize(): on a quantized Parameter the latter recurses
+            # through __torch_dispatch__ until the stack overflows.
+            tensors["dequantized"] = param.detach().float().clone()
+            state[name] = tensors
+        return state
+
+    def setup_checkpoint_case(self, tp_size, recipe, ckpt_dir, **kwargs):
+        args = self.create_test_args(
+            tp_size,
+            recipe,
+            self.seq_length,
+            self.micro_batch_size,
+            inference=False,
+            fp8_param_gather=True,
+            use_cuda_graph=False,
+            save=ckpt_dir,
+            load=ckpt_dir,
+            save_interval=1,
+            ckpt_format="torch_dist",
+            async_save=False,
+            save_tokenizer_assets=False,
+            **kwargs,
+        )
+        set_args(args)
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        model_parallel_cuda_manual_seed(_SEED)
+        cfg_container = Utils.pretrain_config_from_global_args(args, "gpt")
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder,
+            self.model_provider,
+            cfg_container=cfg_container,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        )
+        assert len(model) == 1
+        return args, model, optimizer, opt_param_scheduler
+
+    def run_train_steps(self, args, model, optimizer, num_steps):
+        batch = self.get_batch(self.seq_length, self.micro_batch_size)
+        input_ids, labels, position_ids, attention_mask, loss_mask = batch
+        for _ in range(num_steps):
+            model[0].zero_grad_buffer()
+            optimizer.zero_grad()
+            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+                self.copy_main_params_to_param_buffer(model, optimizer)
+            model[0].set_is_first_microbatch()
+            output = model[0].forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+            output.mean().backward()
+            if args.overlap_grad_reduce:
+                model[0].finish_grad_sync()
+            update_successful, _, _ = optimizer.step()
+            assert update_successful
+
+    def cleanup_between_runs(self):
+        Utils.destroy_model_parallel()
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    # MXFP8 params cannot be re-homed into the DDP param buffer ("replace_raw_data for
+    # MXFP8Tensor is not supported yet"), so mxfp8 + --fp8-param-gather always runs with
+    # reuse_grad_buf_for_mxfp8_param_ag. That covers the shared param/grad buffer branch of
+    # the re-derivation; tensorwise and delayed cover the direct quantize_param_shard branch.
+    # LayerWiseDistributedOptimizer is a ChainedOptimizer nested inside the outer one, so
+    # it re-derives through ChainedOptimizer._stage_model_params_from_main_params. Covered
+    # on mxfp8 only: tensorwise + muon does not round-trip on some ranks for a reason that
+    # predates this change -- the layer-wise path quantizes from the FP32 main param while
+    # DistributedOptimizer quantizes from bf16(main), so the two derive different tensorwise
+    # scales from a checkpoint that stores BF16.
+    @pytest.mark.parametrize(
+        ("recipe", "reuse_grad_buf", "optimizer_name"),
+        [
+            ("mxfp8", True, "adam"),
+            ("tensorwise", False, "adam"),
+            ("delayed", False, "adam"),
+            ("mxfp8", True, "muon"),
+        ],
+    )
+    def test_fp8_param_checkpoint_resume_is_bitwise_exact(
+        self, tmp_path_dist_ckpt, monkeypatch, tp_size, recipe, reuse_grad_buf, optimizer_name
+    ):
+        """A resumed run must hold exactly the quantized weights the saving run held.
+
+        Quantized params are dequantized to BF16 for the checkpoint and MXFP8 block scales
+        are not stored, so loading re-quantizes a value that has already been through one
+        quantization round trip, whereas a training step quantizes the FP32 master. Same
+        quantizer, same blocks, different input: roughly 5% of 32-element blocks come back
+        one E8M0 exponent finer, and every element in those blocks re-encodes. The load path
+        re-derives the params from the restored FP32 masters, which reproduces them exactly.
+
+        Tensorwise and delayed scaling are expected to round-trip on their own, and are
+        covered here so the re-derivation cannot silently perturb them.
+        """
+        if recipe == "mxfp8" and get_device_arch_version() < 10:
+            pytest.skip("MXFP8 is supported since Blackwell architecture")
+        if optimizer_name == "muon" and Version(
+            os.getenv('NVIDIA_PYTORCH_VERSION', "24.01")
+        ) <= Version("25.05"):
+            pytest.skip("Layer-wise optimizer is not supported on LTS")
+        # Delayed scaling stores its FP8 metadata as a pickled TE extra state, which TE
+        # refuses to load by default. This checkpoint is created by the test and is
+        # therefore trusted.
+        monkeypatch.setenv("NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE", "1")
+        kwargs = {
+            "overlap_param_gather": True,
+            "overlap_grad_reduce": True,
+            "reuse_grad_buf_for_mxfp8_param_ag": reuse_grad_buf,
+            "optimizer": optimizer_name,
+        }
+        if optimizer_name == "muon":
+            # validate_args turns --optimizer muon + --use-distributed-optimizer into the
+            # layer-wise optimizer.
+            kwargs["muon_tp_mode"] = "duplicated"
+        # TempNamedDir(sync=True) barriers, so the process group has to exist first.
+        Utils.initialize_distributed()
+        with TempNamedDir(tmp_path_dist_ckpt / "test_fp8_ckpt_resume", sync=True) as ckpt_dir:
+            args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
+                tp_size, recipe, str(ckpt_dir), **kwargs
+            )
+            self.run_train_steps(args, model, optimizer, num_steps=3)
+            # Mirror save_checkpoint_and_time: the params are staged from the FP32 masters
+            # and gathered before the state dict is taken.
+            force_param_sync(model, optimizer=optimizer)
+            saved_state = self.quantized_param_state(model[0])
+            save_checkpoint(3, model, optimizer, opt_param_scheduler, 0)
+            torch.distributed.barrier()
+
+            self.cleanup_between_runs()
+
+            args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
+                tp_size, recipe, str(ckpt_dir), **kwargs
+            )
+            iteration, _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=True)
+            assert iteration == 3
+            loaded_state = self.quantized_param_state(model[0])
+
+        # Each layer contributes 4 GEMM weights: qkv, proj, fc1, fc2. Assert the count rather
+        # than just non-emptiness, so a config change that quietly drops --fp8-param-gather
+        # cannot turn this into a vacuous pass.
+        assert len(saved_state) == 4 * args.num_layers, sorted(saved_state)
+        assert saved_state.keys() == loaded_state.keys()
+        mismatches = []
+        for name, saved_tensors in saved_state.items():
+            for attr, saved_tensor in saved_tensors.items():
+                loaded_tensor = loaded_state[name][attr]
+                num_differing = int((saved_tensor != loaded_tensor).sum())
+                if num_differing:
+                    mismatches.append(f"{name}{attr}: {num_differing}/{saved_tensor.numel()}")
+        assert (
+            not mismatches
+        ), "quantized params changed across a checkpoint round trip:\n" + "\n".join(mismatches)
