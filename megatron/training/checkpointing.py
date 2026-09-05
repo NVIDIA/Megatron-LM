@@ -1369,7 +1369,7 @@ def generate_state_dict(
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict["model"])
-    if args.swiglu:
+    if args.swiglu or getattr(args, "situ_glu", False):
         if "optimizer" in state_dict:
             model_state_dict, optimizer_state_dict = handle_swiglu_in_state_dict(
                 model, state_dict["model"], state_dict["optimizer"]
@@ -1927,6 +1927,9 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('add_qkv_bias', force=True)
     _set_arg('squared_relu', force=True)
     _set_arg('swiglu', force=True)
+    _set_arg('situ_glu', force=True)
+    _set_arg('situ_glu_beta1', force=True)
+    _set_arg('situ_glu_beta2', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
     _set_arg('normalization', force=True)
