@@ -1484,7 +1484,7 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch, use_saved_h):
     q = torch.empty(shape, dtype=torch.bfloat16)
     k = torch.empty_like(q)
     v = torch.empty_like(q)
-    g = torch.empty(scalar_shape, dtype=torch.bfloat16)
+    g = torch.full(scalar_shape, implementation.RCP_LN2, dtype=torch.float32)
     beta = torch.empty_like(g)
     A = torch.empty((*scalar_shape, 64), dtype=torch.bfloat16)
     do = torch.empty_like(q)
@@ -1492,6 +1492,7 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch, use_saved_h):
     total_tokens = batch_size * 64
     packed = q.reshape(1, total_tokens, 64, 128)
     packed_scalar = g.reshape(1, total_tokens, 64)
+    final_dg = torch.full_like(g, 6.0)
     fused_outputs = (
         torch.full_like(packed, 1),
         torch.full_like(packed, 2),
@@ -1503,6 +1504,7 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch, use_saved_h):
     seen = {}
 
     recompute_calls = []
+    cumsum_calls = []
 
     def fused(**kwargs):
         seen.update(kwargs)
@@ -1512,9 +1514,19 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch, use_saved_h):
         recompute_calls.append(True)
         return h
 
+    def cumsum(value, **kwargs):
+        cumsum_calls.append(kwargs)
+        torch.testing.assert_close(value, fused_outputs[3].reshape_as(g))
+        assert kwargs["chunk_size"] == 64
+        assert kwargs["reverse"] is True
+        assert kwargs["cu_seqlens"] is None
+        assert kwargs["chunk_indices"] is None
+        return final_dg
+
     implementation._clear_dense_chunk_metadata_cache_for_test()
     dense_metadata = implementation._dense_chunk_metadata(batch_size, 64, q.device)
     monkeypatch.setattr(implementation, "_recompute_fused_bwd_h", recompute)
+    monkeypatch.setattr(implementation, "chunk_local_cumsum", cumsum)
     monkeypatch.setattr(fused_gdr_bwd_cute, "fused_gdr_bwd", fused)
 
     dq, dk, dv, db, dg = implementation._call_fused_gdr_bwd_cute(
@@ -1534,6 +1546,12 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch, use_saved_h):
 
     assert seen["q"].shape == (1, total_tokens, 64, 128)
     assert recompute_calls == ([] if use_saved_h else [True])
+    torch.testing.assert_close(
+        seen["g"], g.reshape(1, total_tokens, 64).float() / implementation.RCP_LN2
+    )
+    assert cumsum_calls == [
+        {"chunk_size": 64, "reverse": True, "cu_seqlens": None, "chunk_indices": None}
+    ]
     assert seen["g"].dtype == torch.float32
     assert seen["beta"].dtype == torch.float32
     assert seen["a"].shape == (1, total_tokens, 64, 64)
@@ -1547,7 +1565,7 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch, use_saved_h):
     assert dk.shape == k.shape and torch.all(dk == 2)
     assert dv.shape == v.shape and torch.all(dv == 3)
     assert db.shape == beta.shape and torch.all(db == 5)
-    assert dg.shape == g.shape and torch.all(dg == 4)
+    assert dg.shape == g.shape and torch.all(dg == final_dg)
     assert db.dtype == beta.dtype and dg.dtype == g.dtype
 
 
@@ -1576,6 +1594,7 @@ def test_fused_backward_adapter_forwards_chunk_offsets(monkeypatch):
         seen.update(kwargs)
         return fused_outputs
 
+    monkeypatch.setattr(implementation, "chunk_local_cumsum", lambda value, **_kwargs: value)
     monkeypatch.setattr(fused_gdr_bwd_cute, "fused_gdr_bwd", fused)
 
     implementation._call_fused_gdr_bwd_cute(

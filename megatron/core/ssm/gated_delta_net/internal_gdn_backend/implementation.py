@@ -802,7 +802,12 @@ def _call_fused_gdr_bwd_cute(
             k=k, v=v, g=g, beta=beta, A=A, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
         )
     launch_h = _prepare_fused_bwd_h(h, num_heads=num_heads, head_size=head_size).unsqueeze(0)
-    launch_g = g.detach().reshape(1, total_tokens, num_heads).to(torch.float32).contiguous()
+    # FLA's saved gate is the log2-space cumulative value consumed by its
+    # use_exp2 primitives. The fused backward kernel materializes exp2(g * log2e),
+    # so it expects the same cumulative decay in natural-log units.
+    launch_g = (
+        g.detach().reshape(1, total_tokens, num_heads).to(torch.float32) / RCP_LN2
+    ).contiguous()
     launch_beta = beta.detach().reshape(1, total_tokens, num_heads).to(torch.float32).contiguous()
     launch_dht = (
         _fused_bwd_zero_dht(q.device, num_sequences) if dht is None else dht.detach().contiguous()
@@ -825,12 +830,19 @@ def _call_fused_gdr_bwd_cute(
         state_v_first=False,
         trusted_chunk_offsets=chunk_offsets is not None,
     )
+    dg = chunk_local_cumsum(
+        dg.reshape_as(g),
+        chunk_size=_CHUNK_SIZE,
+        reverse=True,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+    )
     return (
         dq.reshape_as(q),
         dk.reshape_as(k),
         dv.reshape_as(v),
         db.reshape_as(beta).to(beta.dtype),
-        dg.reshape_as(g).to(g.dtype),
+        dg.to(g.dtype),
     )
 
 
