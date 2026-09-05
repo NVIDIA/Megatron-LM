@@ -76,6 +76,35 @@ class MockState:
         return self.state_dict()
 
 
+@pytest.mark.parametrize(
+    ("runtime_mode", "checkpoint_args", "expected_mode"),
+    [
+        ("indices", SimpleNamespace(moe_hybridep_routing_map_mode="bool"), "indices"),
+        (None, SimpleNamespace(moe_hybridep_routing_map_mode="bool"), "bool"),
+        (None, SimpleNamespace(), None),
+    ],
+)
+def test_load_args_preserves_runtime_hybridep_routing_map_mode(
+    runtime_mode, checkpoint_args, expected_mode
+):
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        moe_hybridep_routing_map_mode=runtime_mode,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.moe_hybridep_routing_map_mode == expected_mode
+
+
 def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):
     """Dataloader checkpoints use the supplied module groups and canonical model-parallel path."""
     groups = {

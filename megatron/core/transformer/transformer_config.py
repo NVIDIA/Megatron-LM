@@ -1027,6 +1027,12 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
 
+    moe_hybridep_routing_map_mode: Literal['indices', 'bool'] = 'indices'
+    """Routing-map format for HybridEP. ``indices`` requests int16 top-k indices and is the
+    default, while ``bool`` forces the bool token-to-expert map. Index routing remains gated on
+    Transformer Engine and HybridEP support and the int16 expert limit; unsupported configurations
+    fall back to the bool routing-map path."""
+
     moe_ncclep_zero_copy: bool = False
     """For the 'ncclep' flex dispatcher: use the NCCL symmetric-memory zero-copy IO path
     (ep_bootstrap zero_copy + symm-mem-backed receive/combine buffers) instead of the default HBM
@@ -1928,6 +1934,9 @@ class TransformerConfig(ModelParallelConfig):
                     "Flex token dispatcher with deepep backend does not support "
                     "moe_pad_expert_input_to_capacity"
                 )
+
+        if self.moe_hybridep_routing_map_mode not in ("indices", "bool"):
+            raise ValueError("moe_hybridep_routing_map_mode must be one of 'indices' or 'bool'.")
 
         if self.moe_flex_dispatcher_backend == "ncclep":
             if self.moe_token_dispatcher_type != "flex":
