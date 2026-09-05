@@ -215,7 +215,8 @@ class TestMcoreAdapterDense:
         assert fully_shard_context_calls == [True]
 
     @pytest.mark.parametrize("optimizer_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
-    def test_build_train_and_step(self, optimizer_cuda_graph):
+    @pytest.mark.parametrize("cuda_graph_impl", ["none", "full_iteration"])
+    def test_build_train_and_step(self, optimizer_cuda_graph, cuda_graph_impl):
         config = TransformerConfig(
             num_layers=2,
             hidden_size=16,
@@ -225,6 +226,7 @@ class TestMcoreAdapterDense:
             params_dtype=torch.bfloat16,
             attention_dropout=0.0,
             hidden_dropout=0.0,
+            cuda_graph_impl=cuda_graph_impl,
         )
         reference_model = _build_block(config)
         model = _build_block(config)
@@ -258,9 +260,7 @@ class TestMcoreAdapterDense:
             use_distributed_optimizer=False,
             clip_grad=0.0,
         )
-        reference_optimizer = get_megatron_optimizer(
-            reference_optimizer_config, [reference_model], use_gloo_process_groups=False
-        )
+        reference_optimizer = get_megatron_optimizer(reference_optimizer_config, [reference_model])
         optimizer_config = replace(
             reference_optimizer_config,
             optimizer_cuda_graph=optimizer_cuda_graph,
@@ -274,9 +274,8 @@ class TestMcoreAdapterDense:
             get_megatron_optimizer(
                 replace(reference_optimizer_config, use_distributed_optimizer=True),
                 [model],
-                use_gloo_process_groups=False,
             )
-        optimizer = get_megatron_optimizer(optimizer_config, [model], use_gloo_process_groups=False)
+        optimizer = get_megatron_optimizer(optimizer_config, [model])
         assert isinstance(optimizer, FullyShardedOptimizer)
         optimizer.reload_model_params()
         if optimizer_cuda_graph:
