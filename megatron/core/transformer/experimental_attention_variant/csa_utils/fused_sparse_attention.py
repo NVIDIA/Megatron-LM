@@ -122,6 +122,24 @@ def _get_topk_alignment() -> int:
     return 128
 
 
+def _align_topk_width(topk_idxs: Tensor) -> Tensor:
+    """Right-pad ``topk_idxs`` with ``-1`` so its width hits the GPU alignment.
+
+    The forward kernel pads internally, but the backward wrapper keys its
+    compile cache on ``topk_idxs.shape[1]`` (``max_topk``). Aligning once at
+    the autograd boundary makes forward and backward agree on the width and
+    quantizes the number of distinct backward compile keys, which otherwise
+    grows with every new sequence length on the paths whose top-k width is
+    ``window + sq // compress_ratio``.
+    """
+    topk = topk_idxs.shape[-1]
+    align = _get_topk_alignment()
+    padded = (topk + align - 1) // align * align
+    if padded == topk:
+        return topk_idxs
+    return torch.nn.functional.pad(topk_idxs, (0, padded - topk), value=-1)
+
+
 def _csa_fwd_flash_mla(
     q: Tensor,
     kv: Tensor,
@@ -718,6 +736,12 @@ class CSASparseAttnFunc(torch.autograd.Function):
         indexer_topk: int,
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
+        # Align before the forward call so the tensor handed to the backward
+        # wrapper has the same width the forward kernel ran on; otherwise the
+        # backward compile cache is keyed on the raw (unaligned) width and
+        # recompiles on every distinct sequence length.
+        topk_idxs = _align_topk_width(topk_idxs)
+
         out, lse, lse_indexer = _csa_fwd_flash_mla(
             q,
             kv,
