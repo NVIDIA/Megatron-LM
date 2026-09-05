@@ -23,6 +23,7 @@ from megatron.core.transformer.moe.token_dispatcher import _VirtualExpertHybridE
 from megatron.core.transformer.moe.virtual_expert_load_balancer import (
     BACKWARD,
     FORWARD,
+    SemanticRoutes,
     VirtualExpertLoadBalancer,
     VirtualExpertPlan,
     VirtualExpertPlannerWorkspace,
@@ -87,13 +88,85 @@ def _histogram(routes: torch.Tensor) -> torch.Tensor:
     ).to(torch.int32)
 
 
+def _semantic_routes(
+    routes: torch.Tensor, num_experts: int, probs: torch.Tensor | None = None
+) -> SemanticRoutes:
+    """Expand ``[num_tokens, router_topk]`` semantic routes into the planner's dense inputs."""
+    num_tokens, router_topk = routes.shape
+    routing_map = torch.zeros((num_tokens, num_experts), dtype=torch.bool, device=routes.device)
+    routing_map.scatter_(1, routes.long(), True)
+    if probs is None:
+        probs = torch.rand((num_tokens, num_experts), device=routes.device) * routing_map
+    semantic = extract_semantic_routes(routing_map, probs, router_topk)
+    # In production the exchanging placement kernel fills the local histogram; these tests
+    # run placement on a gathered histogram instead, so sum the rows here.
+    semantic.tokens_per_expert.copy_(semantic.program_histogram.sum(0))
+    return semantic
+
+
+def _local_workspace(device) -> VirtualExpertPlannerWorkspace:
+    """Placement scratch without a symmetric window: these tests hand the kernel a gathered
+    histogram instead of exchanging one."""
+    int32 = dict(dtype=torch.int32, device=device)
+    return VirtualExpertPlannerWorkspace(
+        num_experts=NUM_EXPERTS,
+        ep_size=EP_SIZE,
+        rank=0,
+        gathered_counts=torch.empty((EP_SIZE, NUM_EXPERTS), **int32),
+        histogram_handle=None,
+        sequence=None,
+        balance=torch.empty(EP_SIZE, **int32),
+        allocation=torch.empty((NUM_EXPERTS, EP_SIZE), **int32),
+        placement_grid_sync=torch.zeros(1, **int32),
+        destination_boundaries=torch.empty((NUM_EXPERTS, EP_SIZE), **int32),
+        virtual_expert_slots=torch.empty((NUM_EXPERTS, EP_SIZE), **int32),
+        experts_to_copy=torch.empty((EP_SIZE, NUM_LOCAL_EXPERTS), **int32),
+    )
+
+
+def _reference_map_routes(
+    routes: SemanticRoutes, workspace: VirtualExpertPlannerWorkspace
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Torch oracle for the fused mapping kernel: stable sort by expert, one global array of
+    segment ends, then scatter into the dense runtime inputs."""
+    num_local_experts, ep_size = workspace.num_local_experts, workspace.ep_size
+    flat = routes.token_indices.reshape(-1)
+    sorted_experts, order = torch.sort(flat, stable=True)
+    experts = sorted_experts.long()
+    tokens_per_expert = routes.tokens_per_expert
+    bucket_start = torch.cumsum(tokens_per_expert, 0) - tokens_per_expert
+    boundaries = (
+        workspace.destination_boundaries[:, :ep_size]
+        .clamp(min=0)
+        .minimum(tokens_per_expert[:, None])
+    )
+    ends = (bucket_start[:, None] + boundaries).reshape(-1)
+    positions = torch.arange(flat.numel(), device=flat.device, dtype=torch.int64)
+    destination = torch.searchsorted(ends, positions, right=True) - experts * ep_size
+    slot = workspace.virtual_expert_slots.view(-1)[experts * ep_size + destination]
+    runtime_local = torch.where(
+        destination == experts // num_local_experts,
+        experts % num_local_experts,
+        num_local_experts + slot,
+    )
+    virtual = torch.empty_like(positions)
+    virtual[order] = destination * (2 * num_local_experts) + runtime_local
+    virtual = virtual.view(routes.token_indices.shape)
+    num_tokens, num_experts = routes.routing_map.shape
+    dense_shape = (num_tokens, 2 * num_experts)
+    routing_map = torch.zeros(dense_shape, dtype=torch.bool, device=virtual.device)
+    routing_map.scatter_(1, virtual, True)
+    token_probs = torch.gather(routes.probs, 1, routes.token_indices.long())
+    dense_probs = torch.zeros(dense_shape, dtype=torch.float32, device=virtual.device)
+    dense_probs.scatter_(1, virtual, token_probs.to(torch.float32))
+    return virtual, routing_map, dense_probs
+
+
 def _plan_locally(
     gathered_counts: torch.Tensor, routes: torch.Tensor | None, source_rank: int, device
 ) -> tuple[VirtualExpertPlannerWorkspace, torch.Tensor | None]:
     """Run placement (and optionally route mapping) for one source rank."""
-    workspace = VirtualExpertPlannerWorkspace.allocate(
-        num_experts=NUM_EXPERTS, ep_size=EP_SIZE, device=device
-    )
+    workspace = _local_workspace(device)
     workspace.gathered_counts.copy_(gathered_counts)
     launch_virtual_expert_placement(
         workspace.gathered_counts,
@@ -103,7 +176,8 @@ def _plan_locally(
         workspace.experts_to_copy,
         workspace.virtual_expert_slots,
         workspace.placement_grid_sync,
-        rank_route_capacity=NUM_ROUTES,
+        # Every rank routes the same number of tokens, so any row's total is the capacity.
+        rank_route_capacity=int(gathered_counts[0].sum()),
         source_rank=source_rank,
         ep_size=EP_SIZE,
         num_experts=NUM_EXPERTS,
@@ -111,10 +185,13 @@ def _plan_locally(
     )
     virtual_experts = None
     if routes is not None:
-        routes = routes.to(device)
-        virtual_experts = map_routes_to_runtime_experts(
-            routes, gathered_counts[source_rank].contiguous(), workspace
+        semantic = _semantic_routes(routes.to(device), NUM_EXPERTS)
+        torch.testing.assert_close(
+            semantic.tokens_per_expert, gathered_counts[source_rank].contiguous(), rtol=0, atol=0
         )
+        virtual_experts, _, _ = map_routes_to_runtime_experts(semantic, workspace)
+        reference, _, _ = _reference_map_routes(semantic, workspace)
+        torch.testing.assert_close(virtual_experts, reference, rtol=0, atol=0)
     torch.cuda.synchronize(device)
     return workspace, virtual_experts
 
@@ -220,39 +297,57 @@ def test_virtual_expert_semantic_routes_follow_the_routing_map():
         [[0.0, 0.75, 0.0, 0.0], [0.6, 0.0, 0.4, 0.0]], device="cuda", requires_grad=True
     )
 
-    token_probs, token_indices, tokens_per_expert = extract_semantic_routes(
-        routing_map, probs, router_topk=2
-    )
+    routes = extract_semantic_routes(routing_map, probs, router_topk=2)
 
     torch.testing.assert_close(
-        token_indices, torch.tensor([[1, 3], [0, 2]], dtype=torch.int32, device="cuda")
+        routes.token_indices, torch.tensor([[1, 3], [0, 2]], dtype=torch.int32, device="cuda")
     )
     torch.testing.assert_close(
-        tokens_per_expert, torch.tensor([1, 1, 1, 1], dtype=torch.int32, device="cuda")
+        routes.program_histogram.sum(0).to(torch.int32),
+        torch.tensor([1, 1, 1, 1], dtype=torch.int32, device="cuda"),
     )
-    torch.testing.assert_close(token_probs.sum(dim=-1), torch.tensor([0.75, 1.0], device="cuda"))
-    token_probs.sum().backward()
-    torch.testing.assert_close(probs.grad, routing_map.to(probs.dtype))
+    assert routes.probs is probs and routes.routing_map is routing_map
 
 
-def test_virtual_expert_plan_expands_to_dense_hybridep_inputs():
-    """Scatter compact virtual routes into HybridEP's dense map without losing gradients."""
-    plan = VirtualExpertPlan(
-        virtual_experts=torch.tensor([[1, 6], [3, 4]], dtype=torch.int64),
-        experts_to_copy=torch.empty((0,), dtype=torch.int32),
-    )
-    probs = torch.tensor([[0.75, 0.25], [0.6, 0.4]], requires_grad=True)
+@requires_cuda
+@pytest.mark.parametrize("skew", ["balanced", "hot_expert", "two_ranks_own_everything"])
+@pytest.mark.parametrize("num_tokens", [NUM_TOKENS, 1000])
+def test_virtual_expert_fused_route_mapping_matches_reference(skew, num_tokens):
+    """One kernel writes the runtime ids and HybridEP's dense inputs, with the probability
+    gradient flowing back to the selected semantic entries."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    generator = torch.Generator(device="cuda").manual_seed(4321)
+    weights = torch.ones(NUM_EXPERTS, device=device)
+    if skew == "hot_expert":
+        weights[0] = 20.0
+    elif skew == "two_ranks_own_everything":
+        weights[ROUTER_TOPK:] = 0.0
+    routes = [
+        torch.multinomial(weights, ROUTER_TOPK, generator=generator)
+        for _ in range(EP_SIZE * num_tokens)
+    ]
+    routes = torch.stack(routes).view(EP_SIZE, num_tokens, ROUTER_TOPK).to(torch.int32)
+    counts = torch.stack(
+        [torch.bincount(rank.reshape(-1), minlength=NUM_EXPERTS) for rank in routes]
+    ).to(torch.int32)
+    for source_rank in (0, EP_SIZE - 1):
+        workspace, _ = _plan_locally(counts, None, source_rank=source_rank, device=device)
+        probs = torch.rand((num_tokens, NUM_EXPERTS), device=device, generator=generator)
+        probs = probs.requires_grad_(True)
+        semantic = _semantic_routes(routes[source_rank], NUM_EXPERTS, probs)
+        torch.testing.assert_close(semantic.tokens_per_expert, counts[source_rank], rtol=0, atol=0)
 
-    routing_map, dense_probs = _VirtualExpertHybridEPManager.map_virtual_expert_plan_to_hybridep(
-        plan, probs, num_experts=8
-    )
+        virtual, runtime_map, runtime_probs = map_routes_to_runtime_experts(semantic, workspace)
+        expected_virtual, expected_map, expected_probs = _reference_map_routes(semantic, workspace)
+        torch.testing.assert_close(virtual, expected_virtual, rtol=0, atol=0)
+        torch.testing.assert_close(runtime_map, expected_map, rtol=0, atol=0)
+        torch.testing.assert_close(runtime_probs, expected_probs, rtol=0, atol=0)
+        assert runtime_probs.requires_grad and not runtime_map.requires_grad
 
-    assert routing_map.shape == (2, 8) and dense_probs.shape == (2, 8)
-    assert routing_map[0, 1] and routing_map[0, 6]
-    assert dense_probs[1, 3] == 0.6
-    assert routing_map.sum() == 4
-    dense_probs.sum().backward()
-    torch.testing.assert_close(probs.grad, torch.ones_like(probs))
+        grad = torch.rand(runtime_probs.shape, device=device, generator=generator)
+        (actual_grad,) = torch.autograd.grad(runtime_probs, probs, grad)
+        (expected_grad,) = torch.autograd.grad(expected_probs, probs, grad)
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
 
 
 def test_virtual_expert_rank_capacity_includes_per_expert_padding():
@@ -439,6 +534,13 @@ def _gtp_projection(weight_format, device, num_local_experts=2):
     leader.materialize_group_for_forward = lambda: gathers[FORWARD]
     leader.materialize_group_for_backward = lambda: gathers[BACKWARD]
     parameters = (leader, *(make() for _ in range(num_local_experts - 1)))
+    # GTP's wgrad protocol: each group member hands out fresh full-size scratch per backward.
+    leader._weights = [
+        SimpleNamespace(
+            get_wgrad_tensor=lambda: torch.zeros(MEMBER_SHAPE, dtype=torch.float32, device=device)
+        )
+        for _ in range(num_local_experts)
+    ]
 
     numel = MEMBER_SHAPE[0] * MEMBER_SHAPE[1]
     dtype = torch.uint8 if mxfp8 else torch.bfloat16
@@ -451,13 +553,12 @@ def _gtp_projection(weight_format, device, num_local_experts=2):
     workspace = SimpleNamespace(
         mxfp8=mxfp8,
         member_shapes=(MEMBER_SHAPE,),
+        grad_dtype=torch.float32,
         slot_views=lambda index: (slots, scales),
         grad_slots=lambda index: torch.zeros(
             (num_local_experts, *MEMBER_SHAPE), dtype=torch.float32, device=device
         ),
-        native_grads=(
-            torch.zeros((num_local_experts, *MEMBER_SHAPE), dtype=torch.float32, device=device),
-        ),
+        native_staging=lambda index: pytest.fail("GTP projections must not allocate staging"),
     )
     return _VirtualExpertProjection("test projection", parameters, workspace, 0), gathers
 
@@ -514,6 +615,44 @@ def test_virtual_expert_projection_binds_gtp_gathers_into_its_pointer_tables(wei
         gathers[FORWARD], weight_format, FORWARD
     )
     assert [id(parameter) for parameter in projection.runtime_parameters] == runtime_ids
-    # Every runtime parameter accumulates into bridge-owned staging that TE overwrites.
+    # Every runtime parameter carries the overwrite flag; the virtual slots accumulate into the
+    # arena, the natives into per-backward GTP scratch that is bound below.
     for parameter in projection.runtime_parameters:
         assert parameter.overwrite_main_grad and parameter.main_grad is not None
+    # TE's forward only checks for a main_grad; GTP natives get an empty placeholder until the
+    # backward binds the layer's scratch.
+    assert all(parameter.main_grad.numel() == 0 for parameter in natives)
+    assert all(parameter.main_grad.numel() > 0 for parameter in projection.runtime_parameters[2:])
+
+
+@requires_cuda
+def test_virtual_expert_gtp_projection_writes_wgrads_into_gtp_scratch():
+    """Under GTP the natives' ``main_grad`` and the reduction's pointer table point at the
+    layer's GTP wgrad scratch, which is handed to the reduce-scatter without a copy."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    projection, _ = _gtp_projection("bf16", device)
+    natives = projection.runtime_parameters[:2]
+
+    with pytest.raises(RuntimeError, match="no GTP wgrad scratch"):
+        projection.take_wgrads()
+
+    projection.bind_wgrad_scratch()
+    torch.cuda.synchronize(device)
+    scratch = projection.wgrad_scratch
+    assert len(scratch) == 2 and all(grad.shape == MEMBER_SHAPE for grad in scratch)
+    assert [parameter.main_grad.data_ptr() for parameter in natives] == [
+        grad.data_ptr() for grad in scratch
+    ]
+    assert projection.native_grad_bases.tolist() == [grad.data_ptr() for grad in scratch]
+    with pytest.raises(RuntimeError, match="already bound"):
+        projection.bind_wgrad_scratch()
+
+    # The hand-off releases the binding so the next backward gets fresh scratch.
+    assert projection.take_wgrads() == tuple(scratch)
+    assert projection.wgrad_scratch is None
+    projection.bind_wgrad_scratch()
+    torch.cuda.synchronize(device)
+    assert projection.native_grad_bases.tolist() != [grad.data_ptr() for grad in scratch]
+    assert [
+        parameter.main_grad.data_ptr() for parameter in natives
+    ] == projection.native_grad_bases.tolist()
