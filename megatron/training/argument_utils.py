@@ -479,6 +479,9 @@ def gpt_config_from_args(
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True
 
+    kwargs['use_fused_lce'] = args.use_fused_lce,
+    kwargs['logits_split_chunks'] = args.logits_split_chunks
+
     return model_config_cls(**kwargs)
 
 
