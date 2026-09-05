@@ -2464,12 +2464,18 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.batch_dimensions = batch_dimensions
 
+        # During graph builds all EP ranks use identical dummy token counts, so the
+        # cross-rank MAX reduction is unnecessary and (without ZMQ) would issue a
+        # blocking NCCL AllReduce that can hang during capture.
+        needs_ep_sync = (self._nccl_ep_dispatcher or self._training_ep_dispatcher) and (
+            not self.is_creating_cuda_graphs
+        )
         best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
             batch_dimensions,
             self.cuda_graph_batch_dimensions_list,
             strict=self.is_hybrid_model,
             ep_group=self.expert_model_parallel_group,
-            match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
+            match_ep_token_counts=needs_ep_sync,
             ep_zmq_communicator=self._ep_zmq_communicator,
         )
         self._using_cuda_graph_this_step = best_graph is not None
