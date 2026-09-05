@@ -104,7 +104,9 @@ class _BSHDCompactIndexerGeometry:
 
     q_shape: tuple[int, ...]
     k_shape: tuple[int, ...]
+    topk: int
     ratio: int
+    return_softmax: bool
     precision: str = "bf16"
 
 
@@ -116,9 +118,11 @@ class _THDCompactIndexerGeometry:
     k_shape: tuple[int, ...]
     batch_size: int
     has_q_causal_offsets: bool
+    topk: int
     ratio: int
     max_seqlen_q: int
     max_seqlen_k: int
+    return_softmax: bool
     precision: str = "bf16"
 
 
@@ -136,12 +140,9 @@ class MXFP8IndexerWorkspace:
 
 @dataclass
 class BSHDCompactIndexerWorkspace:
-    """Persistent compact BSHD outputs and candidate-capacity metadata."""
+    """Persistent compact BSHD capture metadata and MXFP8 storage."""
 
     cand_buffer_numel: int
-    out_indices: Tensor
-    out_logits: Tensor
-    softmax_out: Tensor | None
     geometry: _BSHDCompactIndexerGeometry
     mxfp8: MXFP8IndexerWorkspace | None = None
 
@@ -161,14 +162,6 @@ class BSHDCompactIndexerWorkspace:
             return False
         batch_size, seqlen_q, num_heads, head_dim = q_shape
         k_batch, seqlen_k, k_head_dim = k_shape
-        out_shape = (batch_size, seqlen_q, topk)
-        softmax_valid = not return_softmax or (
-            self.softmax_out is not None
-            and self.softmax_out.device == device
-            and self.softmax_out.dtype == torch.float32
-            and tuple(self.softmax_out.shape) == out_shape
-            and self.softmax_out.is_contiguous()
-        )
         mxfp8_valid = self.mxfp8 is None
         if precision == "mxfp8":
             mxfp8 = self.mxfp8
@@ -198,19 +191,12 @@ class BSHDCompactIndexerWorkspace:
                 self.geometry.precision == precision,
                 self.geometry.q_shape == q_shape,
                 self.geometry.k_shape == k_shape,
+                self.geometry.topk == topk,
                 self.geometry.ratio == ratio,
+                self.geometry.return_softmax == return_softmax,
                 batch_size == k_batch,
                 head_dim == k_head_dim,
                 isinstance(self.cand_buffer_numel, int) and self.cand_buffer_numel >= 0,
-                self.out_indices.device == device,
-                self.out_indices.dtype == torch.int32,
-                tuple(self.out_indices.shape) == out_shape,
-                self.out_indices.is_contiguous(),
-                self.out_logits.device == device,
-                self.out_logits.dtype == torch.float32,
-                tuple(self.out_logits.shape) == out_shape,
-                self.out_logits.is_contiguous(),
-                softmax_valid,
                 mxfp8_valid,
             )
         )
@@ -260,7 +246,7 @@ class BSHDCompactIndexerWorkspace:
         return_softmax: bool,
         precision: str = "bf16",
     ) -> None:
-        """Validate caller-owned BSHD storage before dispatch."""
+        """Validate caller-owned BSHD state before dispatch."""
         if not self.matches(
             q=q, k=k, topk=topk, ratio=ratio, return_softmax=return_softmax, precision=precision
         ):
@@ -272,13 +258,10 @@ class BSHDCompactIndexerWorkspace:
 
 @dataclass
 class THDCompactIndexerWorkspace:
-    """Persistent compact THD outputs, offsets, and candidate-capacity metadata."""
+    """Persistent compact THD offsets, capture metadata, and MXFP8 storage."""
 
     cand_batch_offsets: Tensor
     cand_buffer_numel: int
-    out_indices: Tensor
-    out_logits: Tensor
-    softmax_out: Tensor | None
     geometry: _THDCompactIndexerGeometry
     mxfp8: MXFP8IndexerWorkspace | None = None
 
@@ -299,7 +282,6 @@ class THDCompactIndexerWorkspace:
     ) -> bool:
         """Return whether this workspace can serve the current static indexer geometry."""
         geometry = self.geometry
-        out_shape = (q.shape[0], topk)
         batch_size = geometry.batch_size
         inputs_valid = all(
             (
@@ -331,13 +313,6 @@ class THDCompactIndexerWorkspace:
                 and q_causal_offsets.numel() == batch_size
                 and q_causal_offsets.is_contiguous()
             )
-        )
-        softmax_valid = not return_softmax or (
-            self.softmax_out is not None
-            and self.softmax_out.device == q.device
-            and self.softmax_out.dtype == torch.float32
-            and tuple(self.softmax_out.shape) == out_shape
-            and self.softmax_out.is_contiguous()
         )
         mxfp8_valid = self.mxfp8 is None
         if precision == "mxfp8":
@@ -381,9 +356,11 @@ class THDCompactIndexerWorkspace:
             precision in ("bf16", "mxfp8")
             and inputs_valid
             and geometry.precision == precision
+            and geometry.topk == topk
             and geometry.ratio == ratio
             and geometry.max_seqlen_q == max_seqlen_q
             and geometry.max_seqlen_k == max_seqlen_k
+            and geometry.return_softmax == return_softmax
             and cu_seqlens_valid
             and q_causal_offsets_valid
             and self.cand_batch_offsets.device == q.device
@@ -393,15 +370,6 @@ class THDCompactIndexerWorkspace:
             and self.cand_batch_offsets.is_contiguous()
             and isinstance(self.cand_buffer_numel, int)
             and self.cand_buffer_numel >= 0
-            and self.out_indices.device == q.device
-            and self.out_indices.dtype == torch.int32
-            and tuple(self.out_indices.shape) == out_shape
-            and self.out_indices.is_contiguous()
-            and self.out_logits.device == q.device
-            and self.out_logits.dtype == torch.float32
-            and tuple(self.out_logits.shape) == out_shape
-            and self.out_logits.is_contiguous()
-            and softmax_valid
             and mxfp8_valid
         )
         return static_valid
@@ -479,6 +447,24 @@ def _allocate_compact_candidate_buffer(numel: int, device: torch.device) -> Tens
     return torch.empty(numel, dtype=torch.float32, device=device)
 
 
+def _allocate_compact_output_buffers(
+    shape: tuple[int, ...], device: torch.device, return_softmax: bool
+) -> dict[str, Tensor]:
+    """Allocate compact outputs in the active eager or CUDA-graph memory pool.
+
+    These tensors follow the captured forward's dataflow instead of being
+    retained by the module. Keeping their ownership dispatch-local lets
+    serialized CUDA graphs reuse their storage from a shared graph pool.
+    """
+    outputs = {
+        "out_indices": torch.empty(shape, dtype=torch.int32, device=device),
+        "out_logits": torch.empty(shape, dtype=torch.float32, device=device),
+    }
+    if return_softmax:
+        outputs["softmax_out"] = torch.empty(shape, dtype=torch.float32, device=device)
+    return outputs
+
+
 def prepare_bshd_compact_indexer_workspace(
     q: Tensor,
     k: Tensor,
@@ -488,13 +474,14 @@ def prepare_bshd_compact_indexer_workspace(
     return_softmax: bool = False,
     precision: str = "bf16",
 ) -> BSHDCompactIndexerWorkspace | None:
-    """Preallocate persistent compact BSHD buffers before CUDA graph capture.
+    """Prepare persistent compact BSHD state before CUDA graph capture.
 
     ``q`` and ``k`` use the BSHD/BSD layouts consumed by
     :func:`_indexer_topk_core`. The workspace forces the upstream compact
     wrapper's single-launch mode so its candidate sizing is identical for
-    BF16 and MXFP8. Candidate scratch itself is allocated by each dispatch,
-    allowing a CUDA-graph capture pool to reuse it across serialized graphs.
+    BF16 and MXFP8. Candidate scratch and compact outputs are allocated by each
+    dispatch, allowing a CUDA-graph capture pool to reuse them across serialized
+    graphs.
     """
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("BSHD compact indexer workspace must be prepared before CUDA capture")
@@ -516,7 +503,6 @@ def prepare_bshd_compact_indexer_workspace(
         raise ValueError("BSHD workspace q/k batch size and head dimension must match")
     cand_floats = size_helper(batch_size, seqlen_q, seqlen_k, ratio, microbatch_rows=0)
     device = q.device
-    out_shape = (batch_size, seqlen_q, topk)
     mxfp8_workspace = None
     if precision == "mxfp8":
         mxfp8_workspace = MXFP8IndexerWorkspace(
@@ -535,13 +521,13 @@ def prepare_bshd_compact_indexer_workspace(
         )
     return BSHDCompactIndexerWorkspace(
         cand_buffer_numel=int(cand_floats),
-        out_indices=torch.empty(out_shape, dtype=torch.int32, device=device),
-        out_logits=torch.empty(out_shape, dtype=torch.float32, device=device),
-        softmax_out=(
-            torch.empty(out_shape, dtype=torch.float32, device=device) if return_softmax else None
-        ),
         geometry=_BSHDCompactIndexerGeometry(
-            q_shape=tuple(q.shape), k_shape=tuple(k.shape), ratio=ratio, precision=precision
+            q_shape=tuple(q.shape),
+            k_shape=tuple(k.shape),
+            topk=topk,
+            ratio=ratio,
+            return_softmax=return_softmax,
+            precision=precision,
         ),
         mxfp8=mxfp8_workspace,
     )
@@ -583,14 +569,15 @@ def prepare_thd_compact_indexer_workspace(
     return_softmax: bool = False,
     precision: str = "bf16",
 ) -> THDCompactIndexerWorkspace | None:
-    """Preallocate persistent compact THD buffers before CUDA graph capture.
+    """Prepare persistent compact THD state before CUDA graph capture.
 
     Returns None when the installed cuDNN Frontend or GPU does not expose
     the SM100 compact API. The sizing helper performs a GPU-to-host sync and
     therefore this function must never be called from inside graph capture.
     Eager warmup must prepare this workspace before any THD compact capture.
-    Candidate scratch is allocated by each dispatch so a CUDA-graph capture
-    pool can reuse that temporary storage across serialized graphs.
+    Candidate scratch and compact outputs are allocated by each dispatch so a
+    CUDA-graph capture pool can reuse that temporary storage across serialized
+    graphs.
     """
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("THD compact indexer workspace must be prepared before CUDA capture")
@@ -608,7 +595,6 @@ def prepare_thd_compact_indexer_workspace(
     # tensor shapes and maxima remain static. Reserve the geometry-wide upper
     # bound so refreshed candidate offsets always address valid storage.
     cand_floats = max(cand_floats, q.shape[0] * int(max_seqlen_k))
-    out_shape = (q.shape[0], topk)
     mxfp8_workspace = None
     if precision == "mxfp8":
         q_buffers = create_indexer_mxfp8_quantization_buffers(q)
@@ -637,19 +623,16 @@ def prepare_thd_compact_indexer_workspace(
     return THDCompactIndexerWorkspace(
         cand_batch_offsets=cand_batch_offsets,
         cand_buffer_numel=int(cand_floats),
-        out_indices=torch.empty(out_shape, dtype=torch.int32, device=device),
-        out_logits=torch.empty(out_shape, dtype=torch.float32, device=device),
-        softmax_out=(
-            torch.empty(out_shape, dtype=torch.float32, device=device) if return_softmax else None
-        ),
         geometry=_THDCompactIndexerGeometry(
             q_shape=tuple(q.shape),
             k_shape=tuple(k.shape),
             batch_size=cu_seqlens_q.numel() - 1,
             has_q_causal_offsets=q_causal_offsets is not None,
+            topk=topk,
             ratio=ratio,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            return_softmax=return_softmax,
             precision=precision,
         ),
         mxfp8=mxfp8_workspace,
@@ -1631,12 +1614,10 @@ def _indexer_topk_core(
                         compact_workspace.cand_buffer_numel, device
                     ),
                     cand_batch_offsets=compact_workspace.cand_batch_offsets,
-                    out_indices=compact_workspace.out_indices,
-                    out_logits=compact_workspace.out_logits,
                 )
-                if return_softmax:
-                    assert compact_workspace.softmax_out is not None
-                    compact_kwargs["softmax_out"] = compact_workspace.softmax_out
+                compact_kwargs.update(
+                    _allocate_compact_output_buffers((q.shape[0], topk), device, return_softmax)
+                )
             if q_causal_offsets is not None:
                 compact_kwargs["q_causal_offsets"] = q_causal_offsets
         elif compact_workspace is not None:
@@ -1649,13 +1630,13 @@ def _indexer_topk_core(
                 cand_buffer=_allocate_compact_candidate_buffer(
                     compact_workspace.cand_buffer_numel, device
                 ),
-                out_indices=compact_workspace.out_indices,
-                out_logits=compact_workspace.out_logits,
                 microbatch_rows=0,
             )
-            if return_softmax:
-                assert compact_workspace.softmax_out is not None
-                compact_kwargs["softmax_out"] = compact_workspace.softmax_out
+            compact_kwargs.update(
+                _allocate_compact_output_buffers(
+                    (q.shape[0], q.shape[1], topk), device, return_softmax
+                )
+            )
 
         kernel_q, kernel_k = q, k
         if precision == "mxfp8":
@@ -1719,19 +1700,22 @@ def _indexer_topk_core(
         compact_softmax = compact_result["softmax"] if return_softmax else None
         if compact_workspace is not None:
             returned_buffers = (
-                ("indices", topk_indices, compact_workspace.out_indices),
-                ("logits", compact_logits, compact_workspace.out_logits),
+                ("indices", topk_indices, compact_kwargs["out_indices"]),
+                ("logits", compact_logits, compact_kwargs["out_logits"]),
             )
             if return_softmax:
-                assert compact_workspace.softmax_out is not None
-                returned_buffers += (("softmax", compact_softmax, compact_workspace.softmax_out),)
+                returned_buffers += (("softmax", compact_softmax, compact_kwargs["softmax_out"]),)
             for name, actual, expected in returned_buffers:
                 if actual.data_ptr() != expected.data_ptr():
                     layout = "THD" if is_thd else "BSHD"
                     raise RuntimeError(
                         f"cuDNN compact {layout} {name} did not alias "
-                        "the caller-owned workspace buffer"
+                        "the dispatch-local output buffer"
                     )
+            for output_name in ("out_indices", "out_logits", "softmax_out"):
+                compact_kwargs.pop(output_name, None)
+            del returned_buffers, actual, expected
+        del compact_logits, compact_result
 
         topk_indices = topk_indices.int()
         topk_length = (topk_indices >= 0).sum(dim=-1).int()
@@ -1855,10 +1839,10 @@ def indexer_topk(
         max_seqlen_kv: THD only — per-batch max KV length.
         q_causal_offsets: THD only — optional ``(B,)`` int32 CUDA tensor. Entry
             ``b`` is the sequence-relative position of that segment's first Q.
-        compact_workspace: caller-owned persistent outputs and sizing metadata
-            prepared during eager warmup. Candidate scratch is allocated by
-            each dispatch. A matching workspace is required while capturing
-            the compact path.
+        compact_workspace: caller-owned sizing metadata and optional MXFP8
+            storage prepared during eager warmup. Candidate scratch and compact
+            outputs are allocated by each dispatch. A matching workspace is
+            required while capturing the compact path.
         deterministic: resolve exact-value ties at the K-th boundary toward
             the smallest local KV indices. The output slot order remains
             unspecified.
@@ -3332,10 +3316,10 @@ def fused_csa_indexer_sparse_attn(
             gradients, and receive the non-empty placeholder required by
             sparse-attention backward. Ignored when ``None`` or when it equals
             ``cu_seqlens_q``.
-        compact_workspace: optional caller-owned persistent BSHD or THD compact
-            outputs and sizing metadata. A matching workspace is required during
-            compact CUDA-graph capture; prepare it outside capture with the matching
-            ``prepare_*_compact_indexer_workspace`` helper.
+        compact_workspace: optional caller-owned persistent BSHD or THD sizing
+            metadata and MXFP8 storage. A matching workspace is required during
+            compact CUDA-graph capture; prepare it outside capture with the
+            matching ``prepare_*_compact_indexer_workspace`` helper.
         deterministic: resolve exact-value compact Top-K ties toward the
             smallest local KV indices. This is normally sourced from
             ``TransformerConfig.deterministic_mode``.

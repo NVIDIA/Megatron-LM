@@ -3181,7 +3181,9 @@ class TestRealKernelIndexerTopk:
             precision=precision,
         )
         assert workspace is not None
-        assert workspace.softmax_out is not None
+        assert workspace.geometry.return_softmax is True
+        for name in ('cand_buffer', 'out_indices', 'out_logits', 'softmax_out'):
+            assert not hasattr(workspace, name)
         assert (workspace.mxfp8 is not None) == (precision == "mxfp8")
         if precision == "mxfp8":
             assert workspace.mxfp8 is not None
@@ -3223,7 +3225,6 @@ class TestRealKernelIndexerTopk:
         torch.cuda.current_stream().wait_stream(side_stream)
         eager_indices = eager_indices.clone()
         eager_lengths = eager_lengths.clone()
-        eager_logits = workspace.out_logits.clone()
         eager_softmax = eager_softmax.clone()
         torch.cuda.synchronize()
 
@@ -3231,14 +3232,10 @@ class TestRealKernelIndexerTopk:
         with torch.cuda.graph(graph):
             captured_indices, captured_lengths, _, captured_softmax = run()
 
-        assert captured_indices.data_ptr() == workspace.out_indices.data_ptr()
-        assert captured_softmax.data_ptr() == workspace.softmax_out.data_ptr()
-
-        # Prove replay writes all caller-owned outputs rather than observing
-        # values left by warmup/capture.
+        # Prove replay writes the capture-local outputs rather than observing
+        # values left by capture.
         captured_indices.fill_(-123)
         captured_lengths.fill_(-123)
-        workspace.out_logits.fill_(float('nan'))
         captured_softmax.fill_(float('nan'))
         if precision == "mxfp8":
             q_lens = [65, 95]
@@ -3255,10 +3252,9 @@ class TestRealKernelIndexerTopk:
         else:
             assert torch.equal(captured_indices, eager_indices)
             assert torch.equal(captured_lengths, eager_lengths)
-            torch.testing.assert_close(workspace.out_logits, eager_logits)
             torch.testing.assert_close(captured_softmax, eager_softmax)
 
-        # Validate the replayed local-id Top-K sets and aligned logits against
+        # Validate the replayed local-id Top-K sets and softmax against
         # the matching dense packed-segment reference. For MXFP8 this must use
         # dequantized Q/K and the already-scaled BF16 weights; comparing against
         # the original BF16 inputs would measure expected quantization error.
@@ -3305,11 +3301,11 @@ class TestRealKernelIndexerTopk:
                 expected_set = set(torch.topk(ref_scores[row], k=expected_length).indices.tolist())
                 actual_set = set(actual_indices[valid].tolist())
                 assert len(actual_set & expected_set) >= max(1, expected_length - 1)
+                expected_softmax = torch.softmax(
+                    ref_scores[row, actual_indices[valid].long()], dim=-1
+                )
                 torch.testing.assert_close(
-                    workspace.out_logits[q_start + row, valid],
-                    ref_scores[row, actual_indices[valid].long()],
-                    atol=2e-2,
-                    rtol=2e-2,
+                    captured_softmax[q_start + row, valid], expected_softmax, atol=2e-2, rtol=2e-2
                 )
 
             q_start += q_len
@@ -3580,9 +3576,10 @@ class TestRealKernelFusedIndexerSparseAttn:
             precision=precision,
         )
         assert workspace is not None
-        assert workspace.softmax_out is None
+        assert workspace.geometry.return_softmax is False
         assert workspace.cand_buffer_numel > 0
-        assert not hasattr(workspace, 'cand_buffer')
+        for name in ('cand_buffer', 'out_indices', 'out_logits', 'softmax_out'):
+            assert not hasattr(workspace, name)
         assert (workspace.mxfp8 is not None) == (precision == "mxfp8")
 
         def run():
@@ -3614,23 +3611,17 @@ class TestRealKernelFusedIndexerSparseAttn:
         torch.cuda.current_stream().wait_stream(side_stream)
         eager_output = eager_output.clone()
         eager_loss = eager_loss.clone()
-        eager_indices = workspace.out_indices.clone()
-        eager_logits = workspace.out_logits.clone()
         torch.cuda.synchronize()
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured_output, captured_loss = run()
 
-        workspace.out_indices.fill_(-123)
-        workspace.out_logits.fill_(float('nan'))
         captured_output.fill_(float('nan'))
         captured_loss.fill_(float('nan'))
         graph.replay()
         torch.cuda.synchronize()
 
-        assert torch.equal(workspace.out_indices, eager_indices)
-        torch.testing.assert_close(workspace.out_logits, eager_logits)
         torch.testing.assert_close(captured_output, eager_output)
         assert torch.equal(captured_loss, eager_loss)
         assert torch.equal(captured_loss, torch.zeros_like(captured_loss))
@@ -4043,9 +4034,11 @@ class TestThdWrapperDispatchAndValidation:
                 max_seqlen_k=2,
             )
         assert workspace is not None
-        assert workspace.softmax_out is None
+        assert workspace.geometry.topk == topk
+        assert workspace.geometry.return_softmax is False
         assert workspace.cand_buffer_numel == q.shape[0] * 2
-        assert not hasattr(workspace, 'cand_buffer')
+        for name in ('cand_buffer', 'out_indices', 'out_logits', 'softmax_out'):
+            assert not hasattr(workspace, name)
         changed_cu_q = _make_cu_seqlens([2, 3], device="cuda")
         assert workspace.matches(
             q=q,
@@ -4059,6 +4052,19 @@ class TestThdWrapperDispatchAndValidation:
             q_causal_offsets=None,
             return_softmax=False,
         )
+        for changed_topk, changed_return_softmax in ((topk + 1, False), (topk, True)):
+            assert not workspace.matches(
+                q=q,
+                k=k,
+                topk=changed_topk,
+                ratio=4,
+                cu_seqlens_q=changed_cu_q,
+                cu_seqlens_k=cu_kv,
+                max_seqlen_q=3,
+                max_seqlen_k=2,
+                q_causal_offsets=None,
+                return_softmax=changed_return_softmax,
+            )
         assert not workspace.matches(
             q=q,
             k=k,
@@ -4071,9 +4077,9 @@ class TestThdWrapperDispatchAndValidation:
             q_causal_offsets=None,
             return_softmax=False,
         )
-        fake_dsa.indexer_forward_top_k_wrapper.return_value = {
-            'indices': workspace.out_indices.zero_(),
-            'logits': workspace.out_logits.zero_(),
+        fake_dsa.indexer_forward_top_k_wrapper.side_effect = lambda *args, **kwargs: {
+            'indices': kwargs['out_indices'].zero_(),
+            'logits': kwargs['out_logits'].zero_(),
         }
 
         with (
@@ -4104,8 +4110,15 @@ class TestThdWrapperDispatchAndValidation:
         assert candidate.numel() == workspace.cand_buffer_numel
         assert candidate.is_contiguous()
         assert compact_call.kwargs['cand_batch_offsets'] is workspace.cand_batch_offsets
-        assert compact_call.kwargs['out_indices'] is workspace.out_indices
-        assert compact_call.kwargs['out_logits'] is workspace.out_logits
+        for name, dtype in (('out_indices', torch.int32), ('out_logits', torch.float32)):
+            first_output = first_call.kwargs[name]
+            output = compact_call.kwargs[name]
+            assert first_output is not output
+            assert first_output.data_ptr() != output.data_ptr()
+            assert output.shape == (q.shape[0], topk)
+            assert output.device == q.device
+            assert output.dtype == dtype
+            assert output.is_contiguous()
         assert 'softmax_out' not in compact_call.kwargs
 
     # =====================================================================

@@ -1192,7 +1192,9 @@ class TestDSv4HybridAttentionTHDCP:
         assert workspace is not None
         assert workspace.geometry.precision == "mxfp8"
         assert workspace.mxfp8 is not None
-        assert workspace.softmax_out is not None
+        assert workspace.geometry.return_softmax is True
+        for name in ('cand_buffer', 'out_indices', 'out_logits', 'softmax_out'):
+            assert not hasattr(workspace, name)
 
         with torch.no_grad():
             static_hidden.copy_(test_hidden)
