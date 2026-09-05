@@ -9,7 +9,7 @@
 
 # Advanced Features
 
-Guides for Megatron Core training features.
+Guides for Megatron Core training and inference features.
 
 ```{toctree}
 :maxdepth: 2
@@ -24,4 +24,5 @@ paged_stash
 tokenizers
 megatron_energon
 megatron_rl
+../../mcore-inference-user-guide
 ```
