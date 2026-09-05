@@ -312,6 +312,26 @@ After routing, tokens are **dispatched** to the GPU hosting the assigned expert.
 | **FlexDispatcher with [HybridEP](https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep) backend** | NVIDIA's optimized dispatcher using TMA and IBGDA, fewer SMs, native MNNVL support | GB200 NVL72, Multi-Node NVLink | `--moe-token-dispatcher-type flex --moe-flex-dispatcher-backend hybridep` |
 | **allgather** | Gathers all tokens to each GPU, no inter-GPU token movement | TP-only setups, small EP, large Top-K | `--moe-token-dispatcher-type allgather` |
 
+For combined-1F1B HybridEP training with static dispatch shapes, setting
+`--moe-hybridep-reuse-dispatch-output-buffers` reuses four persistent token-output tensors
+instead of allocating one for every dispatch. The schedule records each expert consumer's CUDA
+completion event before returning a slot to the ring, which avoids caching-allocator pending-free
+accumulation without consumer-event backpressure. The ring size can be overridden with
+`--moe-hybridep-num-dispatch-output-buffers`; four is the measured best throughput/memory
+trade-off for DeepSeek-V3 MBS2. This requires
+`--overlap-moe-expert-parallel-comm`, FP8 or FP4 expert GEMMs, and a static output bound from
+`--moe-expert-rank-capacity-factor` or `--moe-pad-expert-input-to-capacity`. The installed DeepEP
+must expose the caller-provided `output_token` argument; Megatron fails early otherwise. Dispatch
+output reuse is incompatible with fine-grained `fused_group_mlp` activation offload because that
+offload path releases the grouped-MLP input storage.
+
+Setting `--moe-hybridep-num-expert-output-buffers N` additionally makes the fused grouped MLP
+write FC2 results directly into an `N`-slot persistent ring. HybridEP combine records the final
+consumer event before releasing each slot. It requires combined-1F1B HybridEP overlap, the same
+static HybridEP output bound, the Transformer Engine op fuser, and a Transformer Engine build with
+GroupedLinear caller-output support. The regular schedule currently has no backend API that exposes
+a safe bound for its consumer-command depth, so expert-output reuse fails fast in that mode.
+
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.
 
@@ -559,6 +579,9 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-pad-expert-input-to-capacity | Pad to capacity | False |
 | --moe-token-drop-policy | Drop policy: probs, position | probs |
 | --moe-permute-fusion | Fuse permutation ops | False |
+| --moe-hybridep-reuse-dispatch-output-buffers | Reuse caller-owned HybridEP token outputs | False |
+| --moe-hybridep-num-dispatch-output-buffers | Persistent HybridEP token output ring size | 4 |
+| --moe-hybridep-num-expert-output-buffers | Persistent caller-owned HybridEP FC2 output ring | 0 |
 
 ### Performance Optimization
 | Argument | Description | Default |

@@ -12,6 +12,7 @@ from megatron.core.config import is_experimental_enabled
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
+from megatron.core.pipeline_parallel.reusable_buffers import release_reusable_output_buffer
 from megatron.core.tensor_parallel import (
     all_to_all,
     gather_from_sequence_parallel_region,
@@ -20,6 +21,7 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
     HYBRIDEP_TOKEN_ALIGNMENT,
+    acquire_hybrid_ep_expert_output_buffer,
     deepepv2_combine,
     deepepv2_dispatch,
     ensure_nccl_ep_bootstrapped,
@@ -243,6 +245,10 @@ class MoETokenDispatcher:
         assert self.config.moe_shared_expert_overlap
         self.shared_experts = shared_experts
         self.use_nccl_stream = True
+
+    def get_expert_output_buffer(self, dispatched_input: torch.Tensor) -> torch.Tensor | None:
+        """Return a caller-provided expert FC2 output buffer when supported."""
+        return None
 
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
@@ -1221,6 +1227,11 @@ class _HybridEPManager(_DispatchManager):
                 pad_multiple=self.pad_multiple,
                 fused=self.config.moe_permute_fusion_into_hybridep,
                 num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
+                num_dispatch_output_buffers=(
+                    self.config.moe_hybridep_num_dispatch_output_buffers
+                    if self.config.moe_hybridep_reuse_dispatch_output_buffers
+                    else 0
+                ),
             )
         )
         if self.moe_expert_rank_capacity_factor is not None:
@@ -1245,13 +1256,18 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
+        expert_output = hidden_states
         hidden_states = hybrid_ep_combine(
-            x=hidden_states,
+            x=expert_output,
             handle=self.handle,
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
             fused=self.config.moe_permute_fusion_into_hybridep,
         )
+        # HybridEP combine is the final reader of the persistent FC2 output. Record its
+        # completion on the launch stream so both the fine-grained overlap schedule and the
+        # regular layer-by-layer schedule can safely reuse the slot.
+        release_reusable_output_buffer(expert_output, torch.cuda.current_stream())
         if (
             self._padded_num_tokens is not None
             and self._original_num_tokens is not None
@@ -1931,6 +1947,14 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         """Delegate to the active communication manager to free its transient
         per-forward routing metadata (see _DispatchManager.reset_transient_forward_state)."""
         self._comm_manager.reset_transient_forward_state()
+
+    def get_expert_output_buffer(self, dispatched_input: torch.Tensor) -> torch.Tensor | None:
+        """Acquire the HybridEP FC2 output slot for this expert invocation."""
+        if self.config.moe_flex_dispatcher_backend != "hybridep":
+            return None
+        return acquire_hybrid_ep_expert_output_buffer(
+            dispatched_input, self.config.moe_hybridep_num_expert_output_buffers
+        )
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """

@@ -1086,6 +1086,27 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
 
+    moe_hybridep_reuse_dispatch_output_buffers: bool = False
+    """Reuse persistent caller-provided buffers for HybridEP permuted token outputs."""
+
+    moe_hybridep_num_dispatch_output_buffers: int = 4
+    """Number of persistent caller-provided buffers for HybridEP permuted token outputs.
+
+    Four buffers avoid caching-allocator pending-free accumulation without consumer-event
+    backpressure in the combined-1F1B schedule. Requires static HybridEP output shapes and
+    low-precision expert GEMMs. Reuse remains opt-in through
+    ``moe_hybridep_reuse_dispatch_output_buffers``.
+    """
+
+    moe_hybridep_num_expert_output_buffers: int = 0
+    """Number of persistent caller-provided buffers for HybridEP expert FC2 outputs.
+
+    The fused grouped MLP writes directly into these buffers and HybridEP combine releases each
+    slot after enqueueing its final read. This avoids allocator pending-free accumulation in the
+    combined-1F1B overlap schedule. Requires static HybridEP output shapes and Transformer Engine
+    GroupedLinear caller-output support. Zero disables reuse.
+    """
+
     moe_ncclep_static_shape: bool = False
     """For the 'ncclep' flex dispatcher: feed the experts the full fixed-size receive buffer
     instead of narrowing to the (data-dependent) number of received tokens, removing the D2H sync
@@ -2209,6 +2230,85 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_use_grouped_tensor=True without use_transformer_engine_op_fuser is "
                     "not yet supported with the NCCL-EP dispatcher. Use the TE op-fuser path "
                     "or select the alltoall, DeepEP, or HybridEP dispatcher."
+                )
+
+        if self.moe_hybridep_num_dispatch_output_buffers < 0:
+            raise ValueError("moe_hybridep_num_dispatch_output_buffers must be non-negative")
+        if self.moe_hybridep_reuse_dispatch_output_buffers:
+            if self.moe_hybridep_num_dispatch_output_buffers == 0:
+                raise ValueError(
+                    "moe_hybridep_num_dispatch_output_buffers must be positive when "
+                    "moe_hybridep_reuse_dispatch_output_buffers is enabled"
+                )
+            if (
+                self.moe_token_dispatcher_type != "flex"
+                or self.moe_flex_dispatcher_backend != "hybridep"
+            ):
+                raise ValueError(
+                    "moe_hybridep_num_dispatch_output_buffers requires the HybridEP flex "
+                    "dispatcher"
+                )
+            if not self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "moe_hybridep_num_dispatch_output_buffers requires "
+                    "overlap_moe_expert_parallel_comm"
+                )
+            if (
+                self.moe_expert_rank_capacity_factor is None
+                and not self.moe_pad_expert_input_to_capacity
+            ):
+                raise ValueError(
+                    "moe_hybridep_num_dispatch_output_buffers requires a static HybridEP "
+                    "output size from moe_expert_rank_capacity_factor or "
+                    "moe_pad_expert_input_to_capacity"
+                )
+            if self.fp8 is None and self.fp4 is None:
+                raise ValueError(
+                    "moe_hybridep_num_dispatch_output_buffers requires FP8 or FP4 expert "
+                    "GEMMs so the BF16 dispatch input is not saved for backward"
+                )
+            if self.fine_grained_activation_offloading and "fused_group_mlp" in (
+                self.offload_modules or []
+            ):
+                raise ValueError(
+                    "moe_hybridep_reuse_dispatch_output_buffers is incompatible with "
+                    "fine-grained activation offloading of fused_group_mlp because that "
+                    "offload path releases the dispatch input storage; disable dispatch "
+                    "output reuse or remove fused_group_mlp from offload_modules"
+                )
+
+        if self.moe_hybridep_num_expert_output_buffers < 0:
+            raise ValueError("moe_hybridep_num_expert_output_buffers must be non-negative")
+        if self.moe_hybridep_num_expert_output_buffers > 0:
+            if (
+                self.moe_token_dispatcher_type != "flex"
+                or self.moe_flex_dispatcher_backend != "hybridep"
+            ):
+                raise ValueError(
+                    "moe_hybridep_num_expert_output_buffers requires the HybridEP flex "
+                    "dispatcher"
+                )
+            if not self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "moe_hybridep_num_expert_output_buffers requires "
+                    "overlap_moe_expert_parallel_comm; the regular schedule does not expose "
+                    "a safe bound for the HybridEP consumer-command depth"
+                )
+            if not self.use_transformer_engine_op_fuser:
+                raise ValueError(
+                    "moe_hybridep_num_expert_output_buffers requires "
+                    "use_transformer_engine_op_fuser"
+                )
+            if not self.moe_grouped_gemm:
+                raise ValueError("moe_hybridep_num_expert_output_buffers requires moe_grouped_gemm")
+            if (
+                self.moe_expert_rank_capacity_factor is None
+                and not self.moe_pad_expert_input_to_capacity
+            ):
+                raise ValueError(
+                    "moe_hybridep_num_expert_output_buffers requires a static HybridEP "
+                    "output size from moe_expert_rank_capacity_factor or "
+                    "moe_pad_expert_input_to_capacity"
                 )
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into

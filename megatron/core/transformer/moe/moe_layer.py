@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.reusable_buffers import release_reusable_output_buffer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_logging import get_moe_overload_factor_tracker
@@ -654,9 +655,17 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
             )
         else:
+            # HybridEP can provide a persistent buffer that fused FC2 writes directly into.
+            # The dispatcher releases it after combine enqueues the final read.
+            output_buffer = self.token_dispatcher.get_expert_output_buffer(dispatched_input)
+            expert_kwargs = {"output_buffer": output_buffer} if output_buffer is not None else {}
             expert_output, mlp_bias = apply_module(self.experts)(
-                dispatched_input, tokens_per_expert, permuted_probs
+                dispatched_input, tokens_per_expert, permuted_probs, **expert_kwargs
             )
+        # Expert compute is the final consumer of a caller-owned HybridEP dispatch output.
+        # Release it here rather than in ScheduleNode's generic free-input cleanup, which may
+        # encounter an old alias after the slot has already been acquired for a later dispatch.
+        release_reusable_output_buffer(hidden_states, torch.cuda.current_stream())
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
 
