@@ -1551,6 +1551,14 @@ def validate_args(args, defaults={}):
                 "--expert-tensor-parallel-num-weight-shards > 1) with --fp4-format requires "
                 "--fp4-param-gather so NVFP4 weights are all-gathered as native NVFP4."
             )
+        if args.delay_wgrad_compute:
+            # backward_dw() runs after backward() returns, so GTP cannot install its
+            # end-of-backward drain and in-flight wgrad reduce-scatters leak across microbatches.
+            raise ValueError(
+                "GTP (--tensor-parallel-num-weight-shards / "
+                "--expert-tensor-parallel-num-weight-shards > 1) does not support "
+                "--delay-wgrad-compute."
+            )
         gtp_weight_remat_size = args.gtp_weight_remat_size
         egtp_weight_remat_size = args.expert_gtp_weight_remat_size
         if get_device_arch_version() >= 10:
