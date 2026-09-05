@@ -2481,6 +2481,7 @@ def _add_network_size_args(parser):
         "barrier_with_L1_time",
         # args uses same var with a different name
         "num_moe_experts",
+        "hash_moe_vocab_size",
         "fp8_param",
         "fp4_param",
         # incompatible defaults in dataclass

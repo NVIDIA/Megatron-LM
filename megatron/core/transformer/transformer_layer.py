@@ -333,6 +333,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         is_mtp_layer: bool = False,
         add_layer_offset: bool = True,
         pp_layer_offset: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
     ):
         """
@@ -440,6 +441,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         from megatron.core.extensions.transformer_engine import TEFusedMLP
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
+        mlp_builder = (
+            submodules.mlp.module if isinstance(submodules.mlp, ModuleSpec) else submodules.mlp
+        )
+        while isinstance(mlp_builder, functools.partial):
+            mlp_builder = mlp_builder.func
+        is_moe_mlp_builder = isinstance(mlp_builder, type) and issubclass(mlp_builder, MoELayer)
+
         # MLP expects tp_group but MoELayer expects pg_collection to be passed in.
         # We can change MLP to accept pg_collection but it makes the logic implicit
         # The conditional below is to make the logic explicit
@@ -457,12 +465,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "Consider migrating the `mlp` submodule spec to a direct call of the "
                 "`as_mlp_submodule` classmethod instead.",
             )
-        self.mlp = submodules.mlp(
+        mlp_kwargs = dict(
             config=self.config,
             pg_collection=pg_collection,
             is_mtp_layer=self.is_mtp_layer,
             name=(name + ".mlp") if name is not None else None,
         )
+        if is_moe_mlp_builder and hash_moe_layer_threshold is not None:
+            mlp_kwargs["hash_moe_layer_threshold"] = hash_moe_layer_threshold
+        self.mlp = submodules.mlp(**mlp_kwargs)
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
 
@@ -470,6 +481,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.mlp_bda = build_module(submodules.mlp_bda)
 
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
+
+        # Split Hybrid mHC runs these base-layer norms through the wrapper's recompute manager.
+        self.mhc_checkpoint_input_layernorm = not isinstance(self.input_layernorm, IdentityOp)
+        self.mhc_checkpoint_pre_mlp_layernorm = not isinstance(self.pre_mlp_layernorm, IdentityOp)
 
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
@@ -631,13 +646,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
         """Run input norm and self-attention, returning the raw output before BDA."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        input_layernorm_output, residual, attn_state = self._run_input_layernorm(hidden_states)
+        input_layernorm_output, residual, attn_state = self._run_input_layernorm(
+            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+        )
         if attn_state:
             raise RuntimeError(
                 "Raw HybridStack attention execution requires an ordinary TransformerLayer "
@@ -687,6 +705,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -710,6 +729,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             packed_seq_params (object, optional): Parameters for packed sequence processing.
             sequence_len_offset (Tensor, optional): Offset along sequence dimension
                 during inference.
+            input_ids (Tensor, optional): Token IDs retained in the shared layer-forward
+                signature for the MLP phase. Self-attention does not consume them; hash-routed
+                MoE layers use them later in ``_forward_mlp``.
 
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:
@@ -756,7 +778,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return self._run_cross_attention(hidden_states, context, context_mask, inference_context)
 
-    def _run_input_layernorm(self, hidden_states):
+    def _run_input_layernorm(
+        self,
+        hidden_states,
+        mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
+    ):
         """Run input layernorm with optional output-discarding checkpoint and
         fine-grained activation offloading.
 
@@ -773,10 +799,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         self.attn_norm_manager = self.off_interface(
             self.offload_attn_norm, hidden_states, "attn_norm"
         )
-        self._input_layernorm_checkpoint_active = self.recompute_input_layernorm
+        self._input_layernorm_checkpoint_active = self.recompute_input_layernorm or (
+            mhc_recompute_manager is not None and self.mhc_checkpoint_input_layernorm
+        )
         if self._input_layernorm_checkpoint_active:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                retain_input_tensors=self._input_layernorm_returns_residual
+                ckpt_manager=mhc_recompute_manager,
+                retain_input_tensors=self._input_layernorm_returns_residual,
             )
             with self.attn_norm_manager as hidden_states:
                 input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
@@ -876,14 +905,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     kwargs.get("inference_context", None),
                     padding_mask=kwargs.get("padding_mask", None),
                     packed_seq_params=kwargs.get("packed_seq_params", None),
+                    input_ids=kwargs.get("input_ids", None),
                 )
             return output, context
 
-    def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
+    def _forward_pre_mlp_layernorm(
+        self,
+        hidden_states: Tensor,
+        mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
+    ):
         self.mlp_norm_manager = self.off_interface(self.offload_mlp_norm, hidden_states, "mlp_norm")
-        if self.recompute_pre_mlp_layernorm:
+        checkpoint_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm or (
+            mhc_recompute_manager is not None and self.mhc_checkpoint_pre_mlp_layernorm
+        )
+        if checkpoint_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                retain_input_tensors=self._pre_mlp_layernorm_returns_residual
+                ckpt_manager=mhc_recompute_manager,
+                retain_input_tensors=self._pre_mlp_layernorm_returns_residual,
             )
             with self.mlp_norm_manager as hidden_states:
                 pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
@@ -895,7 +933,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return pre_mlp_layernorm_output
 
-    def _maybe_unflatten_for_moe(self, hidden_states, padding_mask, packed_seq_params):
+    def _maybe_unflatten_for_moe(self, hidden_states, padding_mask, input_ids, packed_seq_params):
         """Un-flatten packed sequences to restore the batch dimension for MoE.
 
         When inter-document masking flattens MBS > 1 into [mbs*S, 1, H], the MoE
@@ -904,7 +942,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         MoE layer restores the correct per-sample structure.
 
         Returns:
-            (hidden_states, padding_mask, mbs) where mbs is None if no
+            (hidden_states, padding_mask, input_ids, mbs) where mbs is None if no
             un-flattening was applied.
         """
         if (
@@ -912,12 +950,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             or packed_seq_params is None
             or getattr(packed_seq_params, 'tokens_per_sample', None) is None
         ):
-            return hidden_states, padding_mask, None
+            return hidden_states, padding_mask, input_ids, None
 
         tokens_per_sample = packed_seq_params.tokens_per_sample
         mbs = hidden_states.shape[0] // tokens_per_sample
         if mbs <= 1:
-            return hidden_states, padding_mask, None
+            return hidden_states, padding_mask, input_ids, None
 
         # The flattened tensor has all tokens from sample 0, then all tokens
         # from sample 1, etc. A plain reshape would keep that ordering, but we
@@ -926,7 +964,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         hidden_states = hidden_states.view(mbs, tokens_per_sample, -1).transpose(0, 1).contiguous()
         if padding_mask is not None:
             padding_mask = padding_mask.view(mbs, tokens_per_sample)
-        return hidden_states, padding_mask, mbs
+        if input_ids is not None:
+            input_ids = input_ids.view(mbs, tokens_per_sample)
+        return hidden_states, padding_mask, input_ids, mbs
 
     def _maybe_reflatten_from_moe(self, output, packed_seq_params, mbs):
         """Re-flatten MoE output back to [mbs*S, 1, H] for the residual add."""
@@ -934,7 +974,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             return output
         return output.transpose(0, 1).reshape(mbs * packed_seq_params.tokens_per_sample, 1, -1)
 
-    def _pre_mlp_layernorm_and_residual(self, hidden_states):
+    def _pre_mlp_layernorm_and_residual(
+        self,
+        hidden_states,
+        mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
+    ):
         """Run pre-MLP layernorm (with optional recompute and offload), unpack a
         tuple-output layernorm, and apply the fp32-residual cast.
 
@@ -944,7 +988,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             extra intermediates (e.g. mHC ``mlp_h_res`` / ``mlp_hc_h_post``)
             through to ``_apply_mlp_bda_step``. Base returns ``()``.
         """
-        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
+        pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(
+            hidden_states, mhc_recompute_manager=mhc_recompute_manager
+        )
 
         if self._pre_mlp_layernorm_returns_residual:
             pre_mlp_layernorm_output, residual = pre_mlp_layernorm_output
@@ -962,10 +1008,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
         packed_seq_params=None,
+        input_ids: Optional[Tensor] = None,
+        mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
     ) -> tuple[tuple[Tensor, Tensor | None], Tensor]:
         """Run pre-MLP norm and MLP/MoE, returning the raw output before BDA."""
         pre_mlp_layernorm_output, residual, mlp_state = self._pre_mlp_layernorm_and_residual(
-            hidden_states
+            hidden_states, mhc_recompute_manager=mhc_recompute_manager
         )
         if mlp_state:
             raise RuntimeError(
@@ -973,12 +1021,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "without subclass-specific MLP state."
             )
 
-        pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
-            pre_mlp_layernorm_output, padding_mask, packed_seq_params
+        pre_mlp_layernorm_output, padding_mask, input_ids, moe_unflatten_mbs = (
+            self._maybe_unflatten_for_moe(
+                pre_mlp_layernorm_output, padding_mask, input_ids, packed_seq_params
+            )
         )
 
         mlp_output_with_bias = self._run_mlp(
-            pre_mlp_layernorm_output, residual, padding_mask, inference_context
+            pre_mlp_layernorm_output, residual, padding_mask, inference_context, input_ids=input_ids
         )
 
         if moe_unflatten_mbs is not None:
@@ -996,6 +1046,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         inference_context: BaseInferenceContext | None = None,
         padding_mask: Tensor | None = None,
         packed_seq_params=None,
+        input_ids: Optional[Tensor] = None,
     ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
@@ -1010,6 +1061,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 The MoELayer will internally transform this to [seq_length, bsz] format.
             packed_seq_params: Packed sequence parameters, used to detect flattened
                 batches that need reshaping for MoE sequence load balancing.
+            input_ids (Tensor, optional): Token IDs with shape [batch_size, seq_length].
+                Required by hash-routed MoE layers.
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
@@ -1017,12 +1070,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_states
         )
 
-        pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
-            pre_mlp_layernorm_output, padding_mask, packed_seq_params
+        pre_mlp_layernorm_output, padding_mask, input_ids, moe_unflatten_mbs = (
+            self._maybe_unflatten_for_moe(
+                pre_mlp_layernorm_output, padding_mask, input_ids, packed_seq_params
+            )
         )
 
         mlp_output_with_bias = self._run_mlp(
-            pre_mlp_layernorm_output, residual, padding_mask, inference_context
+            pre_mlp_layernorm_output, residual, padding_mask, inference_context, input_ids=input_ids
         )
 
         if moe_unflatten_mbs is not None:
@@ -1056,6 +1111,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         residual: Tensor,
         padding_mask: Tensor | None,
         inference_context: BaseInferenceContext | None,
+        input_ids: Optional[Tensor] = None,
     ):
         """Execute the MLP submodule with the appropriate variant.
 
@@ -1087,6 +1143,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
+        moe_kwargs = {}
+        if self.is_moe_layer and input_ids is not None:
+            moe_kwargs["input_ids"] = input_ids
+
         if self.recompute_mlp:
             if self.config.fp8 or self.config.fp4:
                 # import here to avoid circular import
@@ -1099,10 +1159,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     self.pg_collection.tp,
                     pre_mlp_layernorm_output,
                     padding_mask=padding_mask,
+                    **moe_kwargs,
                 )
             else:
                 mlp_output_with_bias = tensor_parallel.checkpoint(
-                    functools.partial(apply_module(self.mlp), padding_mask=padding_mask),
+                    functools.partial(
+                        apply_module(self.mlp), padding_mask=padding_mask, **moe_kwargs
+                    ),
                     False,
                     pre_mlp_layernorm_output,
                 )
@@ -1118,9 +1181,30 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
 
             chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
+            padding_mask_chunks = (
+                padding_mask.chunk(num_chunks, dim=1)
+                if padding_mask is not None
+                else (None,) * num_chunks
+            )
+            input_id_chunks = (
+                input_ids.chunk(num_chunks, dim=1)
+                if self.is_moe_layer and input_ids is not None
+                else (None,) * num_chunks
+            )
 
-            # Compute outputs for each chunk
-            outputs = [apply_module(self.mlp)(chunk) for chunk in chunks]
+            # Compute outputs for each chunk, preserving sequence-aligned MoE metadata.
+            outputs = []
+            for chunk, padding_mask_chunk, input_id_chunk in zip(
+                chunks, padding_mask_chunks, input_id_chunks
+            ):
+                chunk_moe_kwargs = {}
+                if input_id_chunk is not None:
+                    chunk_moe_kwargs["input_ids"] = input_id_chunk
+                outputs.append(
+                    apply_module(self.mlp)(
+                        chunk, padding_mask=padding_mask_chunk, **chunk_moe_kwargs
+                    )
+                )
 
             # Aggregate chunk outputs
             mlp_output = torch.cat([out for out, _ in outputs], dim=0)
@@ -1134,7 +1218,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # operation in MLP's fc2.
                 self._set_fc2_residual(residual)
             mlp_output_with_bias = apply_module(self.mlp)(
-                pre_mlp_layernorm_output, padding_mask=padding_mask
+                pre_mlp_layernorm_output, padding_mask=padding_mask, **moe_kwargs
             )
 
         nvtx_range_pop(suffix="mlp")
@@ -1328,6 +1412,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 .reshape(1, 1, slen_per_cp, seq_length)
                 .tile(micro_batch_size, 1, 1, 1)
             )
+        if self.is_moe_layer and getattr(self.mlp.router, 'is_hash_layer', False):
+            static_inputs["input_ids"] = torch.zeros(
+                (micro_batch_size, static_inputs["hidden_states"].shape[0]),
+                dtype=torch.long,
+                device=torch.cuda.current_device(),
+            )
         return static_inputs
 
     def _get_submodules_under_cudagraphs(self):
@@ -1401,7 +1491,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 )
             )
         ):
-            hidden_states = self._forward_mlp(hidden_states)
+            hidden_states = self._forward_mlp(
+                hidden_states, input_ids=kwargs.get("input_ids", None)
+            )
         if not isinstance(hidden_states, list) and not isinstance(hidden_states, tuple):
             cuda_graph_outputs = [hidden_states]
         else:
@@ -1427,9 +1519,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.config.cuda_graph_modules
             and CudaGraphModule.attn not in self.config.cuda_graph_modules
         ):
+            input_ids = kwargs.get("input_ids", None)
             hidden_states, context = self._forward_attention(*args, **kwargs)
             args = (hidden_states,)
-            kwargs = {}
+            kwargs = {"input_ids": input_ids} if input_ids is not None else {}
 
         assert (kwargs.get('inference_context') is None) and (
             kwargs.get('packed_seq_params') is None
@@ -1549,7 +1642,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 return residual, hidden_states, probs, shared_expert_output
 
             # CUDA Graph does not capture the MLP/MoE part at all.
-            output = self._forward_mlp(*cuda_graph_output)
+            output = self._forward_mlp(*cuda_graph_output, input_ids=kwargs.get("input_ids", None))
         return output, context
 
     def _get_te_cuda_graph_replay_args(self, *args, **kwargs):
@@ -2190,7 +2283,7 @@ class MoETransformerLayer(TransformerLayer):
         self._router_dtoh_event.record()
         self._router_dtoh_event.synchronize()
 
-    def _forward_mlp_router(self, hidden_states, padding_mask=None):
+    def _forward_mlp_router(self, hidden_states, padding_mask=None, input_ids=None):
         """
         Executes the router phase of the MoE block.
 
@@ -2202,7 +2295,10 @@ class MoETransformerLayer(TransformerLayer):
         pre_mlp_layernorm_output, residual, _ = self._pre_mlp_layernorm_and_residual(hidden_states)
 
         hidden_states, probs, shared_expert_output = apply_module(self.mlp)(
-            pre_mlp_layernorm_output, intermediate_tensors=(), padding_mask=padding_mask
+            pre_mlp_layernorm_output,
+            intermediate_tensors=(),
+            padding_mask=padding_mask,
+            input_ids=input_ids,
         )
 
         if self.use_partial_cudagraphs:
@@ -2254,7 +2350,12 @@ class MoETransformerLayer(TransformerLayer):
         return self._apply_mlp_bda_step((output, mlp_bias), residual)
 
     def _forward_mlp(
-        self, hidden_states, inference_context=None, padding_mask=None, packed_seq_params=None
+        self,
+        hidden_states,
+        inference_context=None,
+        padding_mask=None,
+        packed_seq_params=None,
+        input_ids=None,
     ):
         """
         Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
@@ -2271,9 +2372,11 @@ class MoETransformerLayer(TransformerLayer):
             )
 
         def _forward_mlp_partial_cudagraphs(
-            hidden_states, inference_context=None, padding_mask=None
+            hidden_states, inference_context=None, padding_mask=None, input_ids=None
         ):
-            router_outputs = self._forward_mlp_router(hidden_states, padding_mask=padding_mask)
+            router_outputs = self._forward_mlp_router(
+                hidden_states, padding_mask=padding_mask, input_ids=input_ids
+            )
             (
                 residual,
                 hidden_states,
@@ -2294,8 +2397,10 @@ class MoETransformerLayer(TransformerLayer):
             )
 
         if self.use_partial_cudagraphs:
-            hidden_states, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
-                hidden_states, padding_mask, packed_seq_params
+            hidden_states, padding_mask, input_ids, moe_unflatten_mbs = (
+                self._maybe_unflatten_for_moe(
+                    hidden_states, padding_mask, input_ids, packed_seq_params
+                )
             )
 
             if self.moe_layer_recompute:
@@ -2306,25 +2411,33 @@ class MoETransformerLayer(TransformerLayer):
                         _forward_mlp_partial_cudagraphs,
                         False,
                         tensor_parallel.random.get_cuda_rng_tracker,
-                        parallel_state.get_tensor_model_parallel_group(),
+                        self.pg_collection.tp,
                         hidden_states,
                         padding_mask=padding_mask,
+                        input_ids=input_ids,
                     )
                 else:
                     result = tensor_parallel.checkpoint(
                         functools.partial(
-                            _forward_mlp_partial_cudagraphs, padding_mask=padding_mask
+                            _forward_mlp_partial_cudagraphs,
+                            padding_mask=padding_mask,
+                            input_ids=input_ids,
                         ),
                         False,
                         hidden_states,
                     )
             else:
-                result = _forward_mlp_partial_cudagraphs(hidden_states, padding_mask=padding_mask)
+                result = _forward_mlp_partial_cudagraphs(
+                    hidden_states, padding_mask=padding_mask, input_ids=input_ids
+                )
 
             result = self._maybe_reflatten_from_moe(result, packed_seq_params, moe_unflatten_mbs)
 
             return result
         else:
             return super()._forward_mlp(
-                hidden_states, padding_mask=padding_mask, packed_seq_params=packed_seq_params
+                hidden_states,
+                padding_mask=padding_mask,
+                packed_seq_params=packed_seq_params,
+                input_ids=input_ids,
             )
