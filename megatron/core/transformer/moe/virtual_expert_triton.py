@@ -51,7 +51,7 @@ _MAX_PLANNER_PROGRAMS = 128
 
 @triton.jit
 def _emit_on_every_thread(ASM: tl.constexpr, THREADS: tl.constexpr):
-    """Run one side-effecting PTX instruction on every thread of the block."""
+    """Run one proxy fence on every thread of the block; Triton has no primitive for them."""
     tl.inline_asm_elementwise(
         ASM, "=r,r", [tl.zeros([THREADS], tl.int32)], dtype=tl.int32, is_pure=False, pack=1
     )
@@ -70,7 +70,7 @@ def _grid_sync(grid_barrier, TAG: tl.constexpr, NUM_SMS: tl.constexpr):
     tl.debug_barrier()
 
 
-@triton.jit(do_not_specialize=["source_rank"])
+@triton.jit(debug=True, do_not_specialize=["source_rank"])
 def _plan_virtual_expert_placement_kernel(
     gathered_tokens_per_expert,
     rank_load_balance,
@@ -114,7 +114,7 @@ def _plan_virtual_expert_placement_kernel(
     ).to(tl.int32)
     # Every rank must contribute exactly RANK_ROUTE_CAPACITY routes: the
     # capacity math and the compaction's slot count both assume router_topk
-    # selections per token. This kernel runs eagerly, so the trap always fires.
+    # selections per token. This kernel launches eagerly, so the assert is compiled in.
     source_total = tl.sum(
         tl.load(
             gathered_tokens_per_expert + rank * NUM_EXPERTS + tl.arange(0, BLOCK_NUM_EXPERTS),
@@ -123,11 +123,10 @@ def _plan_virtual_expert_placement_kernel(
         ),
         axis=0,
     )
-    if source_total != RANK_ROUTE_CAPACITY:
-        tl.device_print(
-            "virtual-expert planner: a rank's route count differs from tokens * topk on rank", rank
-        )
-        _emit_on_every_thread("trap; mov.u32 $0, 0;", THREADS=1)
+    tl.device_assert(
+        source_total == RANK_ROUTE_CAPACITY,
+        "virtual-expert planner: a rank's route count differs from tokens * topk",
+    )
     tl.store(
         rank_load_balance + rank, tl.sum(native_totals, axis=0).to(tl.int32) - RANK_ROUTE_CAPACITY
     )
@@ -209,9 +208,10 @@ def _plan_virtual_expert_placement_kernel(
     # Allocations name the destination of every route, so an expert allocated
     # here without a slot would map its routes to a stale slot id. The
     # single-sender rule above makes this unreachable; keep it loud anyway.
-    if tl.max(tl.where(valid_remote, counts, -1), axis=0) > 0:
-        tl.device_print("virtual-expert placement needs more virtual-expert slots than experts on rank", rank)
-        _emit_on_every_thread("trap; mov.u32 $0, 0;", THREADS=1)
+    tl.device_assert(
+        tl.max(tl.where(valid_remote, counts, -1), axis=0) <= 0,
+        "virtual-expert placement needs more virtual-expert slots than experts",
+    )
 
 
 # ``debug=True`` keeps the device assert below alive for eager launches, and a
@@ -333,7 +333,6 @@ def _handshake(
     address,
     pending,
     dummy,
-    rank,
     COMPARE: tl.constexpr,
     VALUE: tl.constexpr,
     SEM: tl.constexpr,
@@ -354,9 +353,10 @@ def _handshake(
         target = tl.where(pending, address, dummy.to(tl.int64)).to(tl.pointer_type(tl.int32))
         previous = tl.atomic_cas(target, compare, flipped, sem=SEM, scope="sys")
         pending = pending & (previous != compare)
-        if tl.extra.cuda.globaltimer() - start >= TIMEOUT_NS:
-            tl.device_print(LABEL, rank)
-            _emit_on_every_thread("trap; mov.u32 $0, 0;", THREADS=1)
+        # Compiled out unless Triton runs in debug mode (``TRITON_DEBUG=1``): the assert's
+        # call site alone slows these kernels about 2x, so production accepts that a peer
+        # which never arrives hangs the rendezvous, and a debug run turns it into an error.
+        tl.device_assert(tl.extra.cuda.globaltimer() - start < TIMEOUT_NS, LABEL)
 
 
 @triton.jit
@@ -386,7 +386,6 @@ def _cross_rank_barrier(
             tl.load(signals + peer, mask=valid, other=0) + rank * _SIGNAL_STRIDE,
             valid,
             dummy_signal,
-            rank,
             COMPARE=0,
             VALUE=1,
             SEM="release",
@@ -397,7 +396,6 @@ def _cross_rank_barrier(
             tl.load(signals + rank) + peer * _SIGNAL_STRIDE,
             valid,
             dummy_signal,
-            rank,
             COMPARE=1,
             VALUE=0,
             SEM="acquire",
@@ -474,8 +472,7 @@ def _push_projection(
             virtual_expert_slot.store([row, 0], source.load([row, 0]))
 
 
-# ``rank`` must not be specialized: Triton would otherwise compile a separate
-# kernel per rank value, and the ahead-of-time warmup could not cover them all.
+# ``rank`` must not be specialized: Triton would otherwise compile one kernel per rank value.
 @triton.jit(do_not_specialize=["rank"])
 def _virtual_expert_weight_push_kernel(
     fc1_bases,
@@ -587,31 +584,22 @@ def _staging_pointer(arena, address, ELEMENT_BYTES: tl.constexpr):
 def _symmetric_window(
     arena,
     peer_bases,
-    rank,
     ARENA_ROWS: tl.constexpr,
     TILE_ROWS: tl.constexpr,
     ELEMENT_BYTES: tl.constexpr,
     WORLD: tl.constexpr,
-    WORLD_POW2: tl.constexpr,
 ):
     """Return one descriptor whose outermost index selects the peer to read.
 
     Summing an expert's sources in a single FP32 accumulator puts the source
     loop inside the pipelined tile loop, and Triton cannot build a descriptor
     there, so one descriptor has to reach every peer. That is possible because
-    the symmetric allocator maps each rank's window at a fixed virtual stride,
-    which is an allocator invariant rather than a documented guarantee. Check it
-    here and trap, rather than silently reading a wrong address.
+    the symmetric allocator maps each rank's window at a fixed virtual stride;
+    the bridge verifies that invariant on the host when it allocates the arena.
     """
     bases = peer_bases.to(tl.pointer_type(tl.int64))
     base = tl.load(bases)
     stride = tl.load(bases + 1) - base
-    peer = tl.arange(0, WORLD_POW2)
-    mapped = tl.load(bases + peer, mask=peer < WORLD, other=0)
-    strided = (mapped == base + peer.to(tl.int64) * stride) | (peer >= WORLD)
-    if tl.sum((~strided).to(tl.int32), 0) != 0:
-        tl.device_print("virtual-expert symmetric window is not uniformly strided on rank", rank)
-        _emit_on_every_thread("trap; mov.u32 $0, 0;", THREADS=1)
     return tl.make_tensor_descriptor(
         base.to(tl.pointer_type(arena.dtype.element_ty)),
         [WORLD, ARENA_ROWS, _ROW],
@@ -693,9 +681,7 @@ def _virtual_expert_grad_reduce_kernel(
             found += tl.minimum(tl.sum(source.to(tl.int32), 0), 1)
         tl.store(virtual_experts + NUM_LOCAL_EXPERTS, found)
 
-    window = _symmetric_window(
-        arena, peer_bases, rank, ARENA_ROWS, TILE_ROWS, ELEMENT_BYTES, WORLD, WORLD_POW2
-    )
+    window = _symmetric_window(arena, peer_bases, ARENA_ROWS, TILE_ROWS, ELEMENT_BYTES, WORLD)
     _cross_rank_barrier(
         signal_bases, grid_barrier, dummy_signal, rank, WORLD, WORLD_POW2, NUM_SMS, THREADS
     )
@@ -763,8 +749,9 @@ def _validate_transport_shape(world_size: int, num_local_experts: int, num_sms: 
         )
     if not 0 < world_size <= MAX_VIRTUAL_EXPERT_EP_RANKS or num_local_experts <= 0:
         raise ValueError(
-            f"Virtual-expert transport supports 1..{MAX_VIRTUAL_EXPERT_EP_RANKS} EP ranks with a positive "
-            f"expert count, got world_size={world_size}, num_local_experts={num_local_experts}."
+            f"Virtual-expert transport supports 1..{MAX_VIRTUAL_EXPERT_EP_RANKS} EP ranks with a "
+            f"positive expert count, got world_size={world_size}, "
+            f"num_local_experts={num_local_experts}."
         )
 
 
@@ -775,32 +762,13 @@ def _validate_grad_dtype(grad_dtype: torch.dtype) -> None:
         )
 
 
-def _pointer_table(table: torch.Tensor, num_local_experts: int) -> torch.Tensor:
-    """Validate one ``int64`` device table holding one base address per local expert."""
-    if (
-        table.dtype != torch.int64
-        or table.device.type != "cuda"
-        or tuple(table.shape) != (num_local_experts,)
-        or not table.is_contiguous()
-    ):
+def _check_table(tensor: torch.Tensor, dtype: torch.dtype, shape: tuple, what: str):
+    """Validate a kernel input table (pointer tables are int64 ``[L]``, plans int32 ``[W, L]``)."""
+    if tensor.dtype != dtype or tuple(tensor.shape) != shape or not tensor.is_contiguous():
         raise ValueError(
-            "Virtual-expert pointer tables must be contiguous CUDA int64 tensors "
-            f"with {num_local_experts} entries."
+            f"Virtual-expert {what} must be a contiguous {dtype} tensor of shape {shape}."
         )
-    return table
-
-
-def _plan_table(experts_to_copy: torch.Tensor, world_size: int, num_local_experts: int):
-    if (
-        experts_to_copy.dtype != torch.int32
-        or tuple(experts_to_copy.shape) != (world_size, num_local_experts)
-        or not experts_to_copy.is_contiguous()
-    ):
-        raise ValueError(
-            f"Virtual-expert plans must be contiguous int32 "
-            f"[{world_size}, {num_local_experts}] tensors."
-        )
-    return experts_to_copy
+    return tensor
 
 
 @functools.lru_cache(maxsize=None)
@@ -892,10 +860,6 @@ def _grad_arguments(
 ) -> dict:
     tile = _transport_tile(_MAX_TILE_BYTES // grad_dtype.itemsize, *member_numels)
     fc1_tiles, fc2_tiles = (numel // tile for numel in member_numels)
-    if not projections or any(projection not in (0, 1) for projection in projections):
-        raise ValueError(
-            f"Virtual-expert gradient projections must be a subset of (0, 1), got {projections}."
-        )
     return dict(
         FC1_ROWS=member_numels[0] // _ROW.value,
         FC2_ROWS=member_numels[1] // _ROW.value,
@@ -912,60 +876,6 @@ def _grad_arguments(
         num_warps=_GRAD_NUM_WARPS,
         launch_cooperative_grid=True,
     )
-
-
-def compile_virtual_expert_weight_kernels(
-    *,
-    world_size: int,
-    num_local_experts: int,
-    member_numels: tuple[int, int],
-    num_sms: int,
-    device_index: int,
-    grad_dtype: torch.dtype = torch.float32,
-    mxfp8: bool = False,
-) -> None:
-    """Compile the push and the gradient reduction for one weight layout.
-
-    Compiling ahead of the first transport keeps a cold Triton cache out of the
-    device-side rendezvous, where one slow rank would stall every peer.
-    """
-    _validate_transport_shape(world_size, num_local_experts, num_sms)
-    _validate_grad_dtype(grad_dtype)
-    shape = dict(world_size=world_size, num_local_experts=num_local_experts, num_sms=num_sms)
-    with _DescriptorAllocator(device_index), torch.cuda.device(device_index):
-        table = torch.zeros(world_size * num_local_experts, dtype=torch.int64, device="cuda")
-        plan = torch.zeros(world_size * num_local_experts, dtype=torch.int32, device="cuda")
-        _virtual_expert_weight_push_kernel.warmup(
-            table,
-            table,
-            table,
-            table,
-            table.data_ptr(),
-            table.data_ptr(),
-            plan,
-            plan,
-            plan,
-            0,
-            grid=(num_sms,),
-            **_push_arguments(member_numels, mxfp8=mxfp8, **shape),
-        )
-        # The bridge reduces FC2 and FC1 in separate launches; tests and benches
-        # reduce both at once.
-        for projections in ((1,), (0,), (0, 1)):
-            _virtual_expert_grad_reduce_kernel.warmup(
-                torch.zeros(1, dtype=grad_dtype, device="cuda"),
-                table,
-                table,
-                table.data_ptr(),
-                table.data_ptr(),
-                plan,
-                plan,
-                plan,
-                plan,
-                0,
-                grid=(num_sms,),
-                **_grad_arguments(member_numels, grad_dtype, projections=projections, **shape),
-            )
 
 
 def launch_virtual_expert_weight_prefetch(
@@ -993,20 +903,21 @@ def launch_virtual_expert_weight_prefetch(
     """
     _validate_transport_shape(world_size, num_local_experts, num_sms)
     mxfp8 = arena.dtype == torch.uint8
-    if not mxfp8 and arena.dtype != torch.bfloat16:
+    if arena.dtype not in (torch.uint8, torch.bfloat16) or mxfp8 != (scale_sources is not None):
         raise ValueError(
-            f"Virtual-expert weight arena must be uint8 or bfloat16, got {arena.dtype}."
+            "Virtual-expert weight arena must be uint8 (MXFP8, with scale tables) or bfloat16 "
+            f"(without), got {arena.dtype}."
         )
-    if mxfp8 != (scale_sources is not None):
-        raise ValueError("Virtual-expert MXFP8 weights require scale tables; BF16 weights forbid them.")
-    tables = [_pointer_table(table, num_local_experts) for table in sources]
-    tables += [_pointer_table(table, num_local_experts) for table in scale_sources or tables]
+    tables = [
+        _check_table(table, torch.int64, (num_local_experts,), "pointer tables")
+        for table in (*sources, *(scale_sources or sources))
+    ]
     with _DescriptorAllocator(arena.device.index):
         _virtual_expert_weight_push_kernel[(num_sms,)](
             *tables,
             int(peer_bases),
             int(signal_bases),
-            _plan_table(experts_to_copy, world_size, num_local_experts),
+            _check_table(experts_to_copy, torch.int32, (world_size, num_local_experts), "plans"),
             grid_barrier,
             _barrier_scratch(arena.device.index),
             rank,
@@ -1048,10 +959,13 @@ def launch_virtual_expert_grad_reduce(
     with _DescriptorAllocator(device_index):
         _virtual_expert_grad_reduce_kernel[(num_sms,)](
             arena,
-            *(_pointer_table(table, num_local_experts) for table in native_grads),
+            *(
+                _check_table(table, torch.int64, (num_local_experts,), "pointer tables")
+                for table in native_grads
+            ),
             int(peer_bases),
             int(signal_bases),
-            _plan_table(experts_to_copy, world_size, num_local_experts),
+            _check_table(experts_to_copy, torch.int32, (world_size, num_local_experts), "plans"),
             _source_scratch(device_index, (world_size + 1) * num_local_experts + 1),
             grid_barrier,
             _barrier_scratch(device_index),

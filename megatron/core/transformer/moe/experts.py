@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import inspect
 import logging
-import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy

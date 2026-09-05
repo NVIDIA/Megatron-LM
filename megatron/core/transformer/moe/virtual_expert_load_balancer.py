@@ -1,22 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+
 """Virtual-expert load balancing, virtual-expert planning, and runtime weight movement.
-
-Every EP rank exposes ``2 * L`` runtime experts to HybridEP: its ``L`` native
-experts followed by ``L`` virtual-expert slots. Each rank gathers the per-rank expert
-histogram and independently derives the same placement. ``experts_to_copy[d, s]``
-names the semantic expert whose weights destination ``d`` must hold in slot
-``s`` (``-1`` if unused), and ``virtual_experts[token, k]`` rewrites each
-semantic route to a rank-major runtime id: native ``d * 2L + local`` or virtual-expert
-``d * 2L + L + slot``.
-
-The weight bridge materializes a plan. Before expert compute every owner pushes
-its selected weights into the peers' virtual-expert slots (MXFP8: rowwise storage in
-forward, columnwise in backward); after expert backward the virtual-expert gradients
-are reduced back into the owners' native wgrad staging, which autograd then
-hands to the optimizer parameters. The runtime parameters TE executes against
-alias the optimizer parameters (or their GTP gathers) for the natives and a
-symmetric-memory arena for the slots, so no weight is ever copied locally.
+The load-balancing algorithm implemented here is taken from MoonEP
+(https://github.com/moonshotAI/moonep): perfectly balanced expert parallelism through
+redundant experts planned online from the router output.
 """
 
 import functools
@@ -37,7 +25,6 @@ from megatron.core.jit import jit_fuser
 try:
     from megatron.core.transformer.moe.virtual_expert_triton import (
         MAX_VIRTUAL_EXPERT_WEIGHT_SMS,
-        compile_virtual_expert_weight_kernels,
         launch_compact_routing_map,
         launch_virtual_expert_grad_reduce,
         launch_virtual_expert_placement,
@@ -47,7 +34,6 @@ try:
     _TRITON_AVAILABLE = True
 except ImportError:
     MAX_VIRTUAL_EXPERT_WEIGHT_SMS = 32
-    compile_virtual_expert_weight_kernels = None
     launch_compact_routing_map = None
     launch_virtual_expert_grad_reduce = None
     launch_virtual_expert_placement = None
@@ -102,11 +88,6 @@ class VirtualExpertPlannerWorkspace:
     @classmethod
     def allocate(cls, *, num_experts, ep_size, device):
         """Allocate the scratch for one expert layout on ``device``."""
-        if min(num_experts, ep_size) <= 0 or num_experts % ep_size:
-            raise ValueError(
-                "Virtual-expert planner needs a positive, even expert distribution, got "
-                f"num_experts={num_experts}, ep_size={ep_size}."
-            )
         int32 = dict(dtype=torch.int32, device=device)
         return cls(
             num_experts=num_experts,
@@ -122,21 +103,6 @@ class VirtualExpertPlannerWorkspace:
             virtual_expert_slots=torch.empty((num_experts, ep_size), **int32),
             experts_to_copy=torch.empty((ep_size, num_experts // ep_size), **int32),
         )
-
-
-_planner_workspaces: dict = {}
-
-
-def get_planner_workspace(*, num_experts: int, ep_size: int, device: torch.device):
-    """Return the process-wide placement scratch for one expert layout; planning is
-    stream-ordered, so every layer of a device can share it."""
-    key = (num_experts, ep_size, device.index)
-    workspace = _planner_workspaces.get(key)
-    if workspace is None:
-        workspace = _planner_workspaces[key] = VirtualExpertPlannerWorkspace.allocate(
-            num_experts=num_experts, ep_size=ep_size, device=device
-        )
-    return workspace
 
 
 @jit_fuser
@@ -174,7 +140,9 @@ def _map_routes(
 
 
 def map_routes_to_runtime_experts(
-    topk_indices: torch.Tensor, tokens_per_expert: torch.Tensor, workspace: VirtualExpertPlannerWorkspace
+    topk_indices: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    workspace: VirtualExpertPlannerWorkspace,
 ) -> torch.Tensor:
     """Turn this rank's semantic routes into rank-major runtime expert ids under the
     placement held by ``workspace``.
@@ -244,7 +212,9 @@ def plan_virtual_expert_routes(
         or tokens_per_expert.dtype != torch.int32
         or not (topk_indices.is_contiguous() and tokens_per_expert.is_contiguous())
     ):
-        raise ValueError("Virtual-expert planner inputs do not match the workspace shape or dtypes.")
+        raise ValueError(
+            "Virtual-expert planner inputs do not match the workspace shape or dtypes."
+        )
     # The only cross-rank input; from here every rank computes the same placement.
     dist.all_gather_into_tensor(
         workspace.gathered_counts.view(-1), tokens_per_expert, group=ep_group
@@ -327,11 +297,10 @@ class _VirtualExpertWeightWorkspace:
         self.scale_numels = tuple(numel // 32 if mxfp8 else 0 for numel in self.member_numels)
         arena_numel = num_local_experts * sum(self.member_numels)
         try:
-            # NCCL window registration needs the device communicator; create it here,
-            # before training or graph capture. The backend choice is process-global.
-            dist.barrier(group=group, device_ids=[device.index])
-            if not group._get_backend(torch.device("cuda"))._comm_ptr():
-                raise RuntimeError("ProcessGroupNCCL returned an invalid communicator pointer.")
+            # NCCL window registration needs the group's device communicator, which NCCL creates
+            # on the first collective (a barrier does not guarantee it); run one here, before
+            # training or graph capture. The backend choice is process-global.
+            dist.all_reduce(torch.zeros(1, device=device), group=group)
             if symm_mem.get_backend(device) != "NCCL":
                 symm_mem.set_backend("NCCL")
             self.weight_arena = symm_mem.empty(
@@ -347,6 +316,16 @@ class _VirtualExpertWeightWorkspace:
                 "Virtual-expert weights could not allocate NCCL symmetric memory for the EP group; "
                 "the EP group must lie within one NVLink domain."
             ) from exc
+        # The reduction reaches every peer's gradient slots through one TMA descriptor whose
+        # outermost stride is the distance between consecutive peers' windows, so the
+        # allocator's uniform mapping is a hard requirement: verify it once, here.
+        bases = self.grad_handle.buffer_ptrs
+        stride = bases[1] - bases[0] if len(bases) > 1 else 0
+        if any(base != bases[0] + peer * stride for peer, base in enumerate(bases)):
+            raise RuntimeError(
+                "NCCL symmetric memory did not map the peers' gradient windows at a uniform "
+                f"stride: {bases}."
+            )
         self.weight_arena.zero_()
         self.grad_arena.zero_()
         self.weight_grid_barrier = torch.zeros(1, dtype=torch.int32, device=device)
@@ -361,17 +340,6 @@ class _VirtualExpertWeightWorkspace:
             torch.empty((num_local_experts, *shape), dtype=grad_dtype, device=device)
             for shape in member_shapes
         )
-        compile_virtual_expert_weight_kernels(
-            world_size=world_size,
-            num_local_experts=num_local_experts,
-            member_numels=self.member_numels,
-            num_sms=num_sms,
-            device_index=device.index,
-            grad_dtype=grad_dtype,
-            mxfp8=mxfp8,
-        )
-        # No rank may enter the device-side rendezvous before every peer can launch.
-        dist.barrier(group=group, device_ids=[device.index])
 
     def weight_stream(self, current_stream: torch.cuda.Stream) -> torch.cuda.Stream:
         """Return a weight stream distinct from ``current_stream``."""
@@ -411,7 +379,8 @@ _bridges = weakref.WeakSet()
 
 
 def _get_workspace(group, device, config: tuple) -> _VirtualExpertWeightWorkspace:
-    key = (id(group), device.index)
+    # Group names are unique for the life of the process, so re-created groups never alias.
+    key = (group.group_name, device.index)
     workspace = _workspaces.get(key)
     if workspace is None:
         workspace = _workspaces[key] = _VirtualExpertWeightWorkspace(group, device, config)
@@ -424,13 +393,21 @@ def _get_workspace(group, device, config: tuple) -> _VirtualExpertWeightWorkspac
 
 
 def finalize_virtual_expert_weight_bridges() -> None:
-    """Release every virtual-expert arena before its process group is destroyed."""
-    for bridge in list(_bridges):
-        bridge.destroy()
-    for workspace in _workspaces.values():
-        workspace.destroy()
+    """Release every virtual-expert arena; idempotent.
+
+    A normal exit needs no call. Callers that destroy their process groups while a model is
+    still alive (tests, an orderly shutdown) call it first so the NCCL windows are deregistered
+    while their communicator exists.
+    """
+    try:
+        for bridge in list(_bridges):
+            bridge.release()
+        for workspace in _workspaces.values():
+            workspace.destroy()
+    except Exception:  # a teardown release must never raise
+        pass
     _workspaces.clear()
-    # Symmetric-memory handles sit in reference cycles; deregister them now.
+    # The runtime parameters and their TE ops sit in reference cycles; free the arenas now.
     gc.collect()
 
 
@@ -565,10 +542,6 @@ class _VirtualExpertProjection:
         self.copied[direction].record(torch.cuda.current_stream(self.device))
         self.bound[direction] = pointers
 
-    def destroy(self) -> None:
-        for parameter in self.runtime_parameters:
-            parameter.main_grad = None
-
 
 class VirtualExpertWeightBridge:
     """Asynchronous virtual-expert weight push and gradient reduction for one MoE layer."""
@@ -593,7 +566,6 @@ class VirtualExpertWeightBridge:
         self._completed_plan = None
         self._backward_plan = None
         self._reduced: set[int] = set()
-        self._destroyed = False
 
         linears = (experts.linear_fc1, experts.linear_fc2)
         parameters = tuple(
@@ -614,7 +586,8 @@ class VirtualExpertWeightBridge:
         )
         self.workspace = _get_workspace(group, self.device, config)
         self.projections = [
-            _VirtualExpertProjection(f"FC{i + 1}", parameters[i], self.workspace, i) for i in range(2)
+            _VirtualExpertProjection(f"FC{i + 1}", parameters[i], self.workspace, i)
+            for i in range(2)
         ]
         # CUDA events are created lazily on first record; materialize them before
         # training or graph capture.
@@ -743,11 +716,13 @@ class VirtualExpertWeightBridge:
     def wait_grad_reduce(self, plan: VirtualExpertPlan) -> tuple[torch.Tensor | None, ...]:
         """Finish both reductions and return one full wgrad per source parameter.
 
-        GTP parameters reduce-scatter the staging themselves (FC2 first, as their linked
+        GTP parameters reduce-scatter a copy of the staging (FC2 first, as their linked
         reduce-scatter chain expects) and return what their protocol returns.
         """
         if plan is not self._backward_plan or self._reduced != {0, 1}:
-            raise RuntimeError("Virtual-expert gradient reduction of both projections must be started.")
+            raise RuntimeError(
+                "Virtual-expert gradient reduction of both projections must be started."
+            )
         current_stream = torch.cuda.current_stream(self.device)
         for event in self.grad_reduce_done:
             current_stream.wait_event(event)
@@ -757,23 +732,25 @@ class VirtualExpertWeightBridge:
         for index in (1, 0):
             leader = self.projections[index].gtp_leader
             if leader is not None:
-                reduced = leader.wgrad_reduce_scatter(list(grads[index]))
+                # GTP reduce-scatters asynchronously and frees its inputs when done, while
+                # the next layer's wgrad GEMM rewrites the shared staging; hand it scratch
+                # it owns, exactly as TE does through the same protocol.
+                scratch = [weight.get_wgrad_tensor() for weight in leader._weights]
+                torch._foreach_copy_(scratch, list(grads[index]))
+                reduced = leader.wgrad_reduce_scatter(scratch)
                 grads[index] = tuple(reduced) if isinstance(reduced, (list, tuple)) else (reduced,)
         return tuple(grad for projection in grads for grad in projection)
 
-    def destroy(self) -> None:
-        """Detach the layer's runtime parameters from the shared arenas."""
-        if self._destroyed:
-            return
+    def release(self) -> None:
+        """Drop the runtime parameters so the arenas they alias can be freed."""
         experts = self._experts_ref()
         if experts is not None:
-            experts._fused_ops = None
-            experts._virtual_expert_weight_bridge = None
+            experts._fused_ops = experts._virtual_expert_weight_bridge = None
         for projection in self.projections:
-            projection.destroy()
+            for parameter in projection.runtime_parameters:
+                parameter.main_grad = None
         self.projections.clear()
-        self.last_plan = self.workspace = None
-        self._destroyed = True
+        self.workspace = None
         _bridges.discard(self)
 
 
@@ -794,9 +771,11 @@ class _VirtualExpertBackwardHook(torch.autograd.Function):
 class _VirtualExpertWaitGradReduce(torch.autograd.Function):
     """Finish the virtual-expert reductions and hand the wgrads to the source parameters.
 
-    Applied to the MoE layer input so its backward runs after every consumer of the
-    input (router, shared experts, latent projection). ``context.plan`` is filled in
-    by the dispatcher once routing has produced the plan.
+    Applied to the router input. Its backward needs the router's input gradient, hence the
+    dispatch backward; the FC1 reduction start sits on the dispatch input, is created later in
+    the forward and so runs first under autograd's ordering, and ``wait_grad_reduce`` raises
+    if it did not. ``context.plan`` is filled in by the dispatcher once routing has produced
+    the plan.
     """
 
     @staticmethod
@@ -831,11 +810,16 @@ class _VirtualExpertWaitGradReduce(torch.autograd.Function):
 
 
 class VirtualExpertLoadBalancer:
-    """Mixin that plans virtual experts and manages their runtime weights.
+    """Implements the load balancing scheme by MoonEP's (https://github.com/moonshotAI/moonep)
+    This class is expected to be a mixin for moe.token_dispatcher.MoEFlexTokenDispatcher.
 
-    Dispatch managers provide the transport-specific glue: they feed semantic routes into
-    :meth:`setup_virtual_expert_metadata`, map the resulting plan into transport metadata,
-    and bracket their combine operation with the corresponding pre/post helpers.
+    Every EP rank receives exactly `tokens x topk` routes however skewed the routing is.
+    Redundant ("virtual") experts per rank are prefetched into local slots before expert compute
+    and whose gradients are reduced back to the owning rank in backward. A rank duplicates experts
+    from a single overloaded home rank, so ``num_local_experts`` slots always suffice. The token
+    transport is handled by the underlying token dispatcher while the virtual expert materialization
+    and grad reduction are handled by trition kernels in virtul_expert_triton.py.
+
     """
 
     def initialize_virtual_expert_load_balancer(
@@ -865,6 +849,12 @@ class VirtualExpertLoadBalancer:
         self.semantic_token_probs = None
         self.semantic_token_indices = None
         self.semantic_tokens_per_expert = None
+        # Placement scratch; every plan overwrites it and copies out what it keeps.
+        self._planner_workspace = VirtualExpertPlannerWorkspace.allocate(
+            num_experts=num_experts,
+            ep_size=world_size,
+            device=torch.device("cuda", torch.cuda.current_device()),
+        )
         self._experts_ref = None
         self._bridge = None
         self._plan = None
@@ -934,23 +924,18 @@ class VirtualExpertLoadBalancer:
         self.num_local_tokens = num_tokens
         self.token_probs = self.semantic_token_probs
 
-    def plan_dispatch(self, hidden_states: torch.Tensor) -> None:
+    def plan_dispatch(self) -> None:
         """Plan routes and begin the weight push before shared-expert compute."""
         if self._bridge is None or self._context is None or self._plan is not None:
             raise RuntimeError(
                 "Virtual-expert planning needs bound experts, a wrapped layer input and a "
                 "combined previous dispatch."
             )
-        workspace = get_planner_workspace(
-            num_experts=self.semantic_num_experts,
-            ep_size=torch.distributed.get_world_size(group=self.group),
-            device=hidden_states.device,
-        )
         self._plan = self._context.plan = plan_virtual_expert_routes(
             self.semantic_token_indices,
             self.semantic_tokens_per_expert,
             self.group,
-            workspace,
+            self._planner_workspace,
             on_placement_ready=self._start_prefetch,
         )
 
@@ -985,11 +970,6 @@ class VirtualExpertLoadBalancer:
             hidden_states, functools.partial(self._bridge.wait_prefetch_for_backward, self._plan)
         )
 
-    def finish_virtual_expert_combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Release transport routing metadata after combine."""
-        self.token_probs = self.routing_map = None
-        return hidden_states
-
     def finalize_output(self, output: torch.Tensor) -> torch.Tensor:
         """Start the backward weight push from the MoE layer output."""
         plan, self._plan, self._context = self._plan, None, None
@@ -1008,12 +988,9 @@ class VirtualExpertLoadBalancer:
         num_runtime_experts: int,
         alignment: int,
     ) -> int:
-        """Return a static, dropless route capacity for one transport rank."""
+        """Return a static, dropless route capacity for one transport rank: every rank receives
+        exactly its own route count, plus HybridEP's per-runtime-expert segment padding."""
         num_routes = num_tokens * router_topk
-        rank_capacity = int(num_routes * capacity_factor)
-        if alignment > 1:
-            rank_capacity = max(
-                rank_capacity, num_routes + num_runtime_experts * (alignment - 1)
-            )
-            rank_capacity += -rank_capacity % alignment
-        return rank_capacity
+        padding = num_runtime_experts * max(alignment - 1, 0)
+        capacity = max(int(num_routes * capacity_factor), num_routes + padding)
+        return capacity + (-capacity % alignment if alignment > 1 else 0)
