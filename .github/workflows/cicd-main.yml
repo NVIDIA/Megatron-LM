@@ -20,6 +20,8 @@ on:
       - "deploy-release/*"
   merge_group:
     types: [checks_requested]
+  schedule:
+    - cron: "0 10 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -27,6 +29,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: read
   id-token: write
   contents: read
 
@@ -195,6 +198,8 @@ jobs:
       cadence:        ${{ steps.configure.outputs.cadence }}
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
       sha:            ${{ steps.resolve-sha.outputs.sha }}
+      pr_base_sha:    ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
+      unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -238,11 +243,25 @@ jobs:
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
           EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          RESOLVED_SHA: ${{ steps.resolve-sha.outputs.sha }}
+          PR_BASE_SHA: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
+          PR_HEAD_SHA: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').head.sha }}
+          PR_MERGE_SHA: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').merge_commit_sha }}
+          ENABLE_PR_UNIT_TESTMON: ${{ vars.ENABLE_PR_UNIT_TESTMON }}
+          FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
 
-          # Fetch all labels in a single API call; fall back to empty list if no PR
-          LABELS=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json labels --jq '[.labels[].name]') || LABELS='[]'
+          # Fetch all labels in a single API call. A failed lookup is safe for
+          # the existing scope defaults, but must disable selective unit tests.
+          LABELS_VALID=true
+          if ! LABELS=$(gh pr view "$PR_NUMBER" --repo ${{ github.repository }} --json labels --jq '[.labels[].name]'); then
+            LABELS='[]'
+            LABELS_VALID=false
+          fi
 
           HAS_RUN_TESTS=$(echo "$LABELS"      | jq 'any(. == "Run tests")')
           HAS_RUN_FUNCTIONAL=$(echo "$LABELS" | jq 'any(. == "Run functional tests")')
@@ -317,6 +336,70 @@ jobs:
 
           DEV=true
 
+          # Selective unit tests are exclusively a synthetic PR-push
+          # optimization. Keep this gate inline: Configure holds a PAT for the
+          # existing label lookup and must never execute code from the PR
+          # checkout. All PR-controlled selector code runs only in downstream
+          # jobs after the existing approval gate.
+          UNIT_TESTMON_ELIGIBLE=false
+          METADATA_VALID=false
+          CHANGED_FILES_VALID=false
+          CHANGED_FILES_SAFE=false
+          if [[ "$LABELS_VALID" == "true" \
+            && -n "$PR_BASE_SHA" \
+            && -n "$PR_HEAD_SHA" \
+            && -n "$PR_MERGE_SHA" \
+            && "$PR_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ \
+            && "$PR_HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ \
+            && "$PR_MERGE_SHA" =~ ^[0-9a-fA-F]{40}$ \
+            && "$PR_MERGE_SHA" == "$RESOLVED_SHA" ]]; then
+            METADATA_VALID=true
+          fi
+
+          # Use trusted PR metadata to keep the fast path intentionally small.
+          # Modified production Python and unit test files are understood;
+          # native, dependency, workflow, helper, and unknown paths run full.
+          if [[ "$EVENT_NAME" == "push" \
+            && "$REF" =~ ^refs/heads/pull-request/[0-9]+$ \
+            && "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            if CHANGED_FILES=$(gh api --paginate \
+              "repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" | jq -s 'add'); then
+              CHANGED_FILES_VALID=true
+              if jq -e '
+                length > 0 and length < 3000 and all(.[];
+                  if (.filename | test("^megatron/.+\\.py$")) then
+                    .status == "modified"
+                  elif (.filename | test("^tests/unit_tests/(.*/)?test_[^/]+\\.py$")) then
+                    (.status == "added" or .status == "modified"
+                      or .status == "removed" or .status == "renamed")
+                    and (.status != "renamed"
+                      or ((.previous_filename // "")
+                        | test("^tests/unit_tests/(.*/)?test_[^/]+\\.py$")))
+                  else
+                    false
+                  end
+                )
+              ' <<< "$CHANGED_FILES" >/dev/null; then
+                CHANGED_FILES_SAFE=true
+              fi
+            fi
+          fi
+
+          if [[ "$ENABLE_PR_UNIT_TESTMON" == "true" \
+            && "$EVENT_NAME" == "push" \
+            && "$REF" =~ ^refs/heads/pull-request/[0-9]+$ \
+            && "$METADATA_VALID" == "true" \
+            && "$EVENT_SHA" =~ ^[0-9a-fA-F]{40}$ \
+            && "$PR_HEAD_SHA" == "$EVENT_SHA" \
+            && "$HAS_RUN_TESTS" != "true" \
+            && "$HAS_RUN_FUNCTIONAL" != "true" \
+            && "$FORCE_RUN_ALL" != "true" \
+            && "$HAS_LTS" != "true" \
+            && "$CHANGED_FILES_VALID" == "true" \
+            && "$CHANGED_FILES_SAFE" == "true" ]]; then
+            UNIT_TESTMON_ELIGIBLE=true
+          fi
+
           echo "scope=$SCOPE"                   | tee -a $GITHUB_OUTPUT
           echo "n_repeat=$N_REPEAT"             | tee -a $GITHUB_OUTPUT
           echo "lightweight=$LIGHTWEIGHT"       | tee -a $GITHUB_OUTPUT
@@ -327,6 +410,7 @@ jobs:
           echo "dev=$DEV"                       | tee -a $GITHUB_OUTPUT
           echo "cadence=$CADENCE_OUTPUT"        | tee -a $GITHUB_OUTPUT
           echo "cadence_bypass=$CADENCE_BYPASS" | tee -a $GITHUB_OUTPUT
+          echo "unit_testmon_eligible=$UNIT_TESTMON_ELIGIBLE" | tee -a $GITHUB_OUTPUT
 
           # Pre-compute active row markers for the decision tree
           _MG=$( [ "$IS_MERGE_GROUP" == "true" ]                                                                           && echo "**→**" || echo "" )
@@ -355,6 +439,7 @@ jobs:
           | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
           | \`cadence\` | \`$CADENCE\` |
           | \`cadence_bypass\` | \`$CADENCE_BYPASS\` |
+          | \`unit_testmon_eligible\` | \`$UNIT_TESTMON_ELIGIBLE\` |
 
           ### Decision tree
 
@@ -766,6 +851,8 @@ jobs:
           is_unit_test: "true"
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
           sha: ${{ needs.configure.outputs.sha }}
+          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
+          unit_testmon_base_sha: ${{ needs.configure.outputs.pr_base_sha }}
 
   cicd-parse-unit-tests-gb200:
     runs-on: ubuntu-latest
@@ -854,6 +941,8 @@ jobs:
           container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
           platform: dgx_gb200
           sha: ${{ needs.configure.outputs.sha }}
+          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
+          unit_testmon_base_sha: ${{ needs.configure.outputs.pr_base_sha }}
 
   # Single source of truth for "should integration tests run?".
   # Encodes two independent gates:
