@@ -29,6 +29,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic, causal_conv1d_cp
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
+from megatron.core.ssm.context_parallel.gdp_common import gdp_chunkwise_context_parallel
 from megatron.core.ssm.gdp_context_parallel import GDPContextParallel
 from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support, get_cu_seqlens
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
@@ -80,15 +81,11 @@ except ImportError:
     HAVE_FLA = False
 
 try:
-    from megatron.core.ssm.context_parallel.gdp import (
-        FLAGatedDeltaProductCPBackend,
-        gdp_chunkwise_context_parallel,
-    )
+    from megatron.core.ssm.context_parallel.gdp import FLAGatedDeltaProductCPBackend
 
     HAVE_FLA_GDP_CP = True
 except ImportError:
     FLAGatedDeltaProductCPBackend = None
-    gdp_chunkwise_context_parallel = None
     HAVE_FLA_GDP_CP = False
 
 try:
@@ -97,6 +94,14 @@ try:
     HAVE_CUTEDSL_GDP = True
 except ImportError:
     HAVE_CUTEDSL_GDP = False
+
+try:
+    from megatron.core.ssm.context_parallel.gdp_cutedsl import CuTeDSLGatedDeltaProductCPBackend
+
+    HAVE_CUTEDSL_GDP_CP = True
+except ImportError:
+    CuTeDSLGatedDeltaProductCPBackend = None
+    HAVE_CUTEDSL_GDP_CP = False
 
 # Dynamic-batching inference runs the in-tree fork of these kernels rather than
 # the pip `flash-linear-attention` / `causal_conv1d` ones. The fork is
@@ -156,13 +161,10 @@ class ExtendedRMSNorm(RMSNormGated):
 
 @dataclass
 class GatedDeltaProductMixerSubmodules:
-    """
-    Contains the module specs for the projections and chunkwise-CP backend.
-    """
+    """Contains the module specs for the input and output projections."""
 
     in_proj: Union[ModuleSpec, type] = None
     out_proj: Union[ModuleSpec, type] = None
-    chunkwise_cp_backend: Union[ModuleSpec, type] = FLAGatedDeltaProductCPBackend
 
 
 class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
@@ -175,9 +177,9 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
     GDP projects each token into an output gate and the ``V``, ``K``, ``Q``, beta, and decay
     terms used by a sequence of Householder updates. A depthwise causal convolution mixes
-    local context in ``V/K/Q``; the FLA GDP recurrence then updates a matrix-valued state,
-    and gated RMS normalization plus the output projection map the result back to the
-    model hidden size.
+    local context in ``V/K/Q``; the selected GDP kernel then updates a matrix-valued state,
+    and gated RMS normalization plus the output projection map the result back to the model
+    hidden size.
 
     The module shards projections and recurrent parameters across tensor-parallel ranks,
     redistributes sequence and head dimensions for context parallelism, handles packed
@@ -255,21 +257,24 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         self.num_householder = config.gdp_num_householder
 
         # Select the chunked gated delta product kernel once. The CuTeDSL and FLA
-        # implementations share the same keyword API but are imported under distinct
-        # names so neither shadows the other when both packages are installed.
+        # implementations share the main call surface but are imported under distinct
+        # names; checkpoint-keyword differences are normalized below.
         self.gdp_kernel = (
             cutedsl_chunk_gated_delta_product
             if config.gdp_cutedsl_kernel
             else chunk_gated_delta_product
         )
 
-        # Newer CuTeDSL kernel builds accept num_chunk_states_to_recompute; probe the
-        # signature once so older builds that predate the argument still work.
+        # CuTeDSL releases have used two names for checkpoint coarsening. Probe once and
+        # prefer the current API spelling while retaining compatibility with older releases.
         self.gdp_kernel_extra_kwargs = {}
-        if _kernel_accepts_kwarg(self.gdp_kernel, "num_chunk_states_to_recompute"):
-            self.gdp_kernel_extra_kwargs["num_chunk_states_to_recompute"] = (
-                config.gdp_num_chunk_states_to_recompute
-            )
+        if config.gdp_cutedsl_kernel:
+            for recompute_kwarg in ("recompute_chunk_num", "num_chunk_states_to_recompute"):
+                if _kernel_accepts_kwarg(self.gdp_kernel, recompute_kwarg):
+                    self.gdp_kernel_extra_kwargs[recompute_kwarg] = (
+                        config.gdp_num_chunk_states_to_recompute
+                    )
+                    break
 
         self.config = config
         self.d_model = d_model
@@ -283,18 +288,25 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         self.chunkwise_context_parallel = (
             self.config.linear_cp_mode == "chunkwise" and self.pg_collection.cp.size() > 1
         )
-        if self.chunkwise_context_parallel and self.config.gdp_cutedsl_kernel:
-            raise NotImplementedError(
-                "GDP chunkwise context parallelism supports only the FLA kernel."
-            )
         self.chunkwise_cp_backend = None
         if self.chunkwise_context_parallel:
-            if not HAVE_FLA_GDP_CP:
-                raise ImportError(
-                    "GDP chunkwise CP requires Triton and an FLA build with "
-                    "fla.ops.cp.chunk_delta_h"
+            if self.config.gdp_cutedsl_kernel:
+                if not HAVE_CUTEDSL_GDP_CP:
+                    raise ImportError(
+                        "CuTeDSL GDP chunkwise CP requires a gdp_attn build exposing "
+                        "cp_forward_prepare/apply and cp_backward_prepare/apply"
+                    )
+                self.chunkwise_cp_backend = build_module(
+                    CuTeDSLGatedDeltaProductCPBackend,
+                    recompute_chunk_num=config.gdp_num_chunk_states_to_recompute,
                 )
-            self.chunkwise_cp_backend = build_module(submodules.chunkwise_cp_backend)
+            else:
+                if not HAVE_FLA_GDP_CP:
+                    raise ImportError(
+                        "GDP chunkwise CP requires Triton and an FLA build with "
+                        "fla.ops.cp.chunk_delta_h"
+                    )
+                self.chunkwise_cp_backend = build_module(FLAGatedDeltaProductCPBackend)
 
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
@@ -570,11 +582,34 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         return out, out_bias
 
-    def _packed_metadata(self, packed_seq_params):
+    def _packed_metadata(
+        self, packed_seq_params: PackedSeqParams | None
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Return sequence indices and cumulative lengths for packed input."""
         if packed_seq_params is None:
             return None, None
         return packed_seq_params.seq_idx, get_cu_seqlens(packed_seq_params)
+
+    def _make_uniform_cutedsl_cu_seqlens(self, VKQ: torch.Tensor) -> torch.Tensor:
+        """Build uniform sequence boundaries for an unpacked CuTeDSL input.
+
+        Under chunkwise CP, ``sequence_length`` is the rank-local shard length, so these
+        boundaries describe only this rank. The CP metadata determines which boundary
+        sequence continues on adjacent ranks.
+        """
+        batch_size, sequence_length = VKQ.shape[:2]
+        if self.chunkwise_context_parallel and batch_size != 1:
+            raise ValueError(
+                "CuTeDSL GDP chunkwise CP requires a single flattened token stream; "
+                f"got batch size {batch_size}"
+            )
+        return torch.arange(
+            0,
+            (batch_size + 1) * sequence_length,
+            sequence_length,
+            device=VKQ.device,
+            dtype=torch.int32,
+        )
 
     def _gdp_chunk_forward(
         self,
@@ -615,16 +650,19 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 hidden_states, packed_seq_params=packed_seq_params
             )
 
+        conv_seq_idx, kernel_cu_seqlens = self._packed_metadata(packed_seq_params)
         preceding_rank_start = 0
         following_rank_stop = self.pg_collection.cp.size()
         if self.chunkwise_context_parallel:
-            seq_idx_packed, cu_seqlens_packed, preceding_rank_start, following_rank_stop = (
-                self._chunkwise_packed_metadata(
-                    packed_seq_params, VKQ.shape[1], packed_sequence_cp_metadata
-                )
+            chunkwise_packed_metadata = self._chunkwise_packed_metadata(
+                packed_seq_params, VKQ.shape[1], packed_sequence_cp_metadata
             )
-        else:
-            seq_idx_packed, cu_seqlens_packed = self._packed_metadata(packed_seq_params)
+            if chunkwise_packed_metadata is not None:
+                kernel_cu_seqlens = chunkwise_packed_metadata.local_cu_seqlens
+                preceding_rank_start = chunkwise_packed_metadata.preceding_rank_start
+                following_rank_stop = chunkwise_packed_metadata.following_rank_stop
+        if self.config.gdp_cutedsl_kernel and kernel_cu_seqlens is None:
+            kernel_cu_seqlens = self._make_uniform_cutedsl_cu_seqlens(VKQ)
 
         # The offload group captures the tensors saved for backward inside the causal
         # conv and QKV preparation: the checkpoint's saved input VKQ when QKV recompute
@@ -640,7 +678,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                     partial(
                         self._prepare_qkv,
                         conv_state=conv_state,
-                        seq_idx=seq_idx_packed,
+                        seq_idx=conv_seq_idx,
                         l2_norm_in_kernel=self.config.gdp_cutedsl_kernel,
                     ),
                     VKQ,
@@ -650,7 +688,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 query, key, value = self._prepare_qkv(
                     VKQ,
                     conv_state=conv_state,
-                    seq_idx=seq_idx_packed,
+                    seq_idx=conv_seq_idx,
                     l2_norm_in_kernel=self.config.gdp_cutedsl_kernel,
                 )
 
@@ -664,7 +702,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             beta,
             VKQ,
             output_final_state=(ssm_state is not None),
-            cu_seqlens=cu_seqlens_packed,
+            cu_seqlens=kernel_cu_seqlens,
             preceding_rank_start=preceding_rank_start,
             following_rank_stop=following_rank_stop,
         )
@@ -707,12 +745,10 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         """Run the selected chunked gated delta product kernel and return
         (core_attn_out, final_state).
 
-        For the CuTeDSL path the kernel expects packed varlen sequences described by
-        cu_seqlens and applies the query/key L2 norm itself, and its output is collapsed
-        to (b l) h p and restored here; the FLA path uses the batched layout and has
-        already applied the L2 norm in _prepare_qkv. ``cu_seqlens`` is the packed-sequence
-        layout when THD packing is active; otherwise the CuTeDSL path synthesizes the
-        uniform-length equivalent and the FLA path leaves it unset."""
+        The CuTeDSL kernel uses a flattened token axis described by ``cu_seqlens`` and
+        applies the query/key L2 norm itself. Its output is restored to ``(b, l, h, p)``
+        here. The FLA kernel uses the batched layout and receives query/key tensors already
+        normalized by ``_prepare_qkv``. Unpacked FLA leaves ``cu_seqlens`` unset."""
         if self.chunkwise_context_parallel:
             assert self.chunkwise_cp_backend is not None
             core_attn_out = gdp_chunkwise_context_parallel(
@@ -723,33 +759,27 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 beta=beta,
                 cu_seqlens=cu_seqlens,
                 num_householder=self.num_householder,
-                scale=query.shape[-1] ** -0.5,
+                scale=self.d_state**-0.5,
                 cp_group=self.pg_collection.cp,
                 backend=self.chunkwise_cp_backend,
                 preceding_rank_start=preceding_rank_start,
                 following_rank_stop=following_rank_stop,
             )
-            return core_attn_out, None
-
-        if self.config.gdp_cutedsl_kernel and cu_seqlens is None:
-            # query/key/value are already collapsed to (b l) ..., so read the batch and
-            # sequence dimensions from VKQ, which is still in (b, l, d) layout.
-            b, l = VKQ.shape[0], VKQ.shape[1]
-            cu_seqlens = torch.arange(0, (b + 1) * l, l, device=VKQ.device, dtype=torch.int32)
-
-        core_attn_out, final_state = self.gdp_kernel(
-            q=query,
-            k=key,
-            v=value,
-            g=g,
-            beta=beta,
-            num_householder=self.num_householder,
-            initial_state=None,
-            output_final_state=output_final_state,
-            use_qk_l2norm_in_kernel=self.config.gdp_cutedsl_kernel,
-            cu_seqlens=cu_seqlens,
-            **self.gdp_kernel_extra_kwargs,
-        )
+            final_state = None
+        else:
+            core_attn_out, final_state = self.gdp_kernel(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                num_householder=self.num_householder,
+                initial_state=None,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=self.config.gdp_cutedsl_kernel,
+                cu_seqlens=cu_seqlens,
+                **self.gdp_kernel_extra_kwargs,
+            )
         if self.config.gdp_cutedsl_kernel:
             core_attn_out = rearrange(
                 core_attn_out, "(b l) (h p) -> b l h p", b=VKQ.shape[0], p=self.headdim
@@ -761,15 +791,12 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
         packed_seq_params: PackedSeqParams | None,
         local_sequence_length: int,
         metadata: PackedSequenceCPMetadata | None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int, int]:
-        """Return cached local FLA metadata and cross-rank summary bounds for packed GDP."""
-        cp_rank = self.pg_collection.cp.rank()
-        cp_size = self.pg_collection.cp.size()
+    ) -> PackedSequenceCPMetadata | None:
+        """Validate and return cached rank-local packed-sequence metadata."""
         if packed_seq_params is None:
-            return None, None, 0, cp_size
+            return None
 
-        global_seq_idx = packed_seq_params.seq_idx
-        if global_seq_idx is None:
+        if packed_seq_params.seq_idx is None:
             raise ValueError("Packed GDP chunkwise CP requires packed_seq_params.seq_idx")
         if metadata is None:
             raise ValueError(
@@ -783,12 +810,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
                 f"{tuple(metadata.local_seq_idx.shape)}, expected {expected_shape}"
             )
 
-        return (
-            global_seq_idx,
-            metadata.local_cu_seqlens,
-            metadata.preceding_rank_start,
-            metadata.following_rank_stop,
-        )
+        return metadata
 
     def _in_proj_preprocess(self, hidden_states, packed_seq_params=None):
         """Run the input projection, gather its output across CP ranks, switch to
@@ -938,6 +960,10 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             value = rearrange(
                 value, "b l (m h p) -> (b l) (m h p)", m=self.num_householder, p=self.headdim
             )
+            if self.chunkwise_context_parallel:
+                # The CuTeDSL CP backward suffix merge requires a uniform token-row pitch.
+                # Keep this copy inside _prepare_qkv so selective QKV recompute owns it.
+                value = value.contiguous()
             key = rearrange(key, "b l (m g n) -> b l m g n", m=self.num_householder, n=self.d_state)
             query = rearrange(query, "b l (g n) -> b l g n", n=self.d_state)
         else:
