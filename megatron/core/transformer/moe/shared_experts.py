@@ -398,6 +398,8 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         )
         self._fused_grouped_swiglu_ops = None
         self._fused_grouped_swiglu_recipe = None
+        self._fused_grouped_swiglu_unit_scale = None
+        self._fused_grouped_swiglu_tokens_per_expert = {}
         self._validate_fused_grouped_swiglu()
 
     def _validate_fused_grouped_swiglu(self) -> None:
@@ -483,7 +485,12 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         op._glu_interleave_size = glu_interleave_size
         ops.append(op)
 
-        ops.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size))
+        activation_op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size)
+        # Shared experts are not router-gated. Mark this fused-op instance so
+        # TE can omit the optional forward cuDNN probability tensor without
+        # changing the semantics of routed single-group MLPs.
+        activation_op._grouped_mlp_unit_activation_scale = True
+        ops.append(activation_op)
 
         fc2_weight = self.linear_fc2.weight
         op = te.pytorch.ops.GroupedLinear(
@@ -521,10 +528,21 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         hidden_size = hidden_states.size(-1)
         hidden_states_2d = hidden_states.view(-1, hidden_size)
         total_tokens = hidden_states_2d.size(0)
-        tokens_per_expert = torch.full(
-            (1,), total_tokens, dtype=torch.long, device=hidden_states.device
-        )
-        scales = torch.ones(total_tokens, device=hidden_states.device, dtype=hidden_states.dtype)
+        tokens_key = (hidden_states.device, total_tokens)
+        tokens_per_expert = self._fused_grouped_swiglu_tokens_per_expert.get(tokens_key)
+        if tokens_per_expert is None:
+            tokens_per_expert = torch.tensor(
+                [total_tokens], dtype=torch.long, device=hidden_states.device
+            )
+            self._fused_grouped_swiglu_tokens_per_expert[tokens_key] = tokens_per_expert
+        scales = self._fused_grouped_swiglu_unit_scale
+        if (
+            scales is None
+            or scales.device != hidden_states.device
+            or scales.dtype != hidden_states.dtype
+        ):
+            scales = torch.ones(1, device=hidden_states.device, dtype=hidden_states.dtype)
+            self._fused_grouped_swiglu_unit_scale = scales
 
         recipe = self._get_fused_grouped_swiglu_recipe()
         if self._fused_grouped_swiglu_ops is None:

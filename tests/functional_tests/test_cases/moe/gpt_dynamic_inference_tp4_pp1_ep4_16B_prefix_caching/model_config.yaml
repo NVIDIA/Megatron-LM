@@ -81,3 +81,4 @@ MODEL_ARGS:
 METRICS:
   - "generated_tokens"
   - "logprobs"
+LAUNCHER: ft_launcher
