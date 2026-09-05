@@ -244,7 +244,14 @@ class MLP(MegatronModule):
                 self.config.hidden_size if not use_latent_size else self.config.moe_latent_size
             ),
             config=self.config,
-            init_method=not_none(self.config.output_layer_init_method),
+            # For latent MoE, linear_fc2 projects to the latent dim, not the hidden dim,
+            # so it is an intermediate layer. The residual-scaled output_layer_init_method
+            # belongs to fc2_latent_proj (latent -> hidden), the true output projection.
+            init_method=(
+                not_none(self.config.init_method)
+                if use_latent_size
+                else not_none(self.config.output_layer_init_method)
+            ),
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,
