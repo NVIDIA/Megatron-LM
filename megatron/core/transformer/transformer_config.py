@@ -982,6 +982,12 @@ class TransformerConfig(ModelParallelConfig):
     supported in TransformerEngine 2.7.0 and above.
     """
 
+    moe_router_aux_loss_fusion: Optional[bool] = None
+    """Enable fusion for the MoE aux loss only, independently of the fused TopK routing.
+    ``None`` follows ``moe_router_fusion``. Read via
+    :attr:`moe_router_aux_loss_fusion_enabled`.
+    """
+
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
@@ -1525,6 +1531,17 @@ class TransformerConfig(ModelParallelConfig):
                 "Sequence-parallel CP layout conversion requires an even "
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
+
+    @property
+    def moe_router_aux_loss_fusion_enabled(self) -> bool:
+        """Effective aux-loss fusion, falling back to ``moe_router_fusion`` when unset.
+
+        Resolved on read, not in ``__post_init__``: callers flip ``moe_router_fusion`` on an
+        already-constructed config and that must still take effect.
+        """
+        if self.moe_router_aux_loss_fusion is None:
+            return self.moe_router_fusion
+        return self.moe_router_aux_loss_fusion
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.

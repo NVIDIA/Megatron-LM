@@ -43,6 +43,7 @@ Checked against the parsed `args` Namespace in `apply_determinism_to_args`. Inco
 |---|---|
 | `--cross-entropy-loss-fusion` | Must be off — asserted (fused CE is non-deterministic); drop the flag yourself |
 | `--tp-comm-overlap` | Must be off — asserted (the overlap path is not bit-exact); drop the flag yourself |
+| `moe_router_aux_loss_fusion` | Must be off — asserted (the fused aux loss reaches the backward); follows `moe_router_fusion` when unset |
 | `torch.use_deterministic_algorithms` | Set to `True` |
 
 Flash attention is permitted: Transformer Engine's flash-attention backend is deterministic when `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` (see the [Transformer Engine docs](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html)).
