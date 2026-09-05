@@ -794,6 +794,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
 
+        # Rebuild model_param_group_index_map to reflect parameter reordering.
+        # The _build_model_and_main_param_groups method rewrites each group's params
+        # as [*shard_fp32_params, *shard_fp32_from_float16_params] (or
+        # [*shard_fp32_params, *shard_float16_params] for the precision-aware
+        # optimizer), so the mapping must follow the same order. Derive it from
+        # model_fp32_groups and model_float16_groups, which are populated in the
+        # exact order of the corresponding shard groups.
+        for group_index, (fp32_params, float16_params) in enumerate(
+            zip(self.model_fp32_groups, self.model_float16_groups)
+        ):
+            for param_idx, model_param in enumerate([*fp32_params, *float16_params]):
+                self.model_param_group_index_map[model_param] = (group_index, param_idx)
+
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
         Given a model param, get the index sub-range of the param that this
