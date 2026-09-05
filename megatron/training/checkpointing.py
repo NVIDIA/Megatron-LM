@@ -612,6 +612,27 @@ def save_checkpoint(
     start_ckpt = time()
     args = get_args()
 
+    # Keep the safety invariant even when arguments came through a validation path that does not
+    # perform the flat CLI cross-check, or were mutated after startup.
+    optimizer_config = getattr(optimizer, "config", None) if optimizer is not None else None
+    chunked_optimizer_state_offload = bool(
+        optimizer_config is not None
+        and getattr(optimizer_config, "chunked_optimizer_state_offload", False)
+        and getattr(optimizer_config, "optimizer_state_offload_fraction", 1.0) > 0.0
+    )
+    if chunked_optimizer_state_offload and not args.no_save_optim:
+        if args.async_save:
+            raise RuntimeError(
+                "chunked optimizer state offload does not support --async-save when optimizer "
+                "state is saved because reusable pinned CPU buffers cannot be handed to a "
+                "background writer"
+            )
+        if getattr(args, "ckpt_format", None) != "torch_dist":
+            raise RuntimeError(
+                "chunked optimizer state offload requires --ckpt-format torch_dist; checkpoint "
+                "arguments may have overwritten the startup setting during resume"
+            )
+
     if args.async_save and not is_empty_async_queue():
         print_rank_0(
             'WARNING: Starting a checkpoint save before previous has finished. Consider increasing the checkpoint interval.'
