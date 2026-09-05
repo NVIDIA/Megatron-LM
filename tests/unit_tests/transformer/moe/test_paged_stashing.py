@@ -1,4 +1,6 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import inspect
 
 import pytest
 import torch
@@ -11,7 +13,9 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.transformer.moe.paged_stash import (
+    PagedStashManager,
     check_paged_stash_overflow,
+    mark_paged_stash_recompute_managed,
     paged_stash_init_chunk_handler,
     paged_stash_reset,
 )
@@ -122,6 +126,7 @@ class MoEModelTestContainer:
             moe_dispatch_fwd_dtype=kwargs.get("moe_dispatch_fwd_dtype", 'bf16'),
             moe_combine_bwd_dtype=kwargs.get("moe_combine_bwd_dtype", 'bf16'),
             moe_grouped_gemm=kwargs.get("moe_grouped_gemm", False),
+            moe_use_grouped_tensor=kwargs.get("moe_use_grouped_tensor", False),
             moe_paged_stash=kwargs.get("moe_paged_stash", False),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
             moe_router_padding_for_fp8=kwargs.get("moe_router_padding_for_fp8", True),
@@ -132,6 +137,10 @@ class MoEModelTestContainer:
             ),
             gated_linear_unit=kwargs.get("gated_linear_unit", False),
             activation_func=kwargs.get("activation_func", F.gelu),
+            bias_activation_fusion=kwargs.get("bias_activation_fusion", False),
+            activation_func_fp8_input_store=kwargs.get("activation_func_fp8_input_store", False),
+            recompute_granularity=kwargs.get("recompute_granularity", None),
+            recompute_modules=kwargs.get("recompute_modules", None),
             moe_router_force_biased=kwargs.get("moe_router_force_biased", None),
             # Shrinking the CUDA factor and zeroing the CPU one (no host-spill fallback) is how
             # a test forces a paged-stash overflow: the pool is provisioned once at the
@@ -243,6 +252,17 @@ def _te_grouped_mlp_op_fuser_environment_supported() -> bool:
     return is_te_min_version("2.14.0")
 
 
+def _te_grouped_tensor_environment_supported() -> bool:
+    """Return whether TE GroupedLinear exposes the device-initiated grouped-tensor API."""
+    if not HAVE_TE:
+        return False
+    try:
+        from transformer_engine.pytorch import GroupedLinear
+    except ImportError:
+        return False
+    return "use_grouped_tensor" in inspect.signature(GroupedLinear.__init__).parameters
+
+
 _TE_GROUPED_MLP_OP_FUSER_SKIP_REASON = (
     "TEGroupedMLP op fuser (tests use use_transformer_engine_op_fuser=True) requires TE>=2.14 "
     "with GroupedLinear/ScaledSwiGLU ops"
@@ -259,6 +279,95 @@ def _is_mxfp8_supported() -> bool:
 _MXFP8_SKIP_REASON = (
     "MXFP8 (tests configure fp8_recipe='mxfp8') requires compute capability >= 10.0 (Blackwell)"
 )
+
+
+def test_recompute_managed_tensor_bypasses_paged_stash_save_hook():
+    tensor = torch.randn(8, 4)
+    tensor.grouped_tensor_scale_inv = False
+    mark_paged_stash_recompute_managed(tensor)
+
+    # The ownership check happens before the manager needs CUDA streams or capture state.
+    manager = object.__new__(PagedStashManager)
+    assert manager.on_save_for_backward(tensor) is tensor
+
+
+@pytest.mark.skipif(not _is_mxfp8_supported(), reason=_MXFP8_SKIP_REASON)
+@pytest.mark.skipif(
+    not _te_grouped_tensor_environment_supported(),
+    reason="Installed TE GroupedLinear does not expose use_grouped_tensor",
+)
+@pytest.mark.skipif(not is_hybrid_ep_available(), reason="Hybrid EP are not available")
+class TestPagedStashingGroupedTensor:
+    """Paged stashing with device-initiated GroupedLinear and no TE operation fuser."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    def test_forward_backward_without_op_fuser(self):
+        config.ENABLE_EXPERIMENTAL = True
+
+        container = MoEModelTestContainer(
+            tp_size=1,
+            ep_size=4,
+            pp_size=1,
+            num_moe_experts=8,
+            num_layers=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_permute_fusion=True,
+            hidden_size=1024,
+            moe_flex_dispatcher_backend="hybridep",
+            test_dtype=torch.bfloat16,
+            moe_grouped_gemm=True,
+            moe_use_grouped_tensor=True,
+            moe_paged_stash=True,
+            moe_expert_rank_capacity_factor=1.5,
+            moe_paged_stash_buffer_size_factor_cuda=2.0,
+            moe_paged_stash_buffer_size_factor_cpu=0.0,
+            use_transformer_engine_op_fuser=False,
+            moe_router_padding_for_quantization=True,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            bias_activation_fusion=True,
+            recompute_granularity="selective",
+            recompute_modules=["moe_act"],
+        )
+
+        assert container.config.use_transformer_engine_op_fuser is False
+        assert container.config.moe_use_grouped_tensor is True
+        assert container.config.recompute_modules == ["moe_act"]
+
+        hidden_states = torch.randn((1024, 1, container.config.hidden_size), dtype=torch.bfloat16)
+
+        # Capture the activation layout and token maxima.
+        paged_stash_reset(True, config=container.config)
+        paged_stash_init_chunk_handler(1, 0)
+        output_ref, hidden_states_grad_ref, _, _ = _forward_backward_all_layers(
+            container, hidden_states
+        )
+
+        stash_manager = PagedStashManager.get_instance()
+        assert (
+            stash_manager.max_tokens_across_vp_stages
+        ), "No dynamic GroupedLinear/activation tensors were captured for paged stashing"
+        assert any(
+            dtype == torch.bfloat16
+            for dtype, _hidden_size in stash_manager.max_tokens_across_vp_stages
+        ), "The fused activation's BF16 saved tensors were not captured for paged stashing"
+        container.zero_grad()
+
+        # Allocate the stash buffers from the capture and exercise the real stash/reload path.
+        paged_stash_reset(True, config=container.config)
+        paged_stash_init_chunk_handler(1, 0)
+        output, hidden_states_grad, _, _ = _forward_backward_all_layers(container, hidden_states)
+
+        overflow = check_paged_stash_overflow()
+        assert overflow.any().item() == 0
+        torch.testing.assert_close(output, output_ref, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(hidden_states_grad, hidden_states_grad_ref, atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.skipif(not _is_mxfp8_supported(), reason=_MXFP8_SKIP_REASON)
