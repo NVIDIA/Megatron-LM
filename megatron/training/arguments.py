@@ -931,8 +931,10 @@ def validate_args(args, defaults={}):
                 args.rank
             )
 
-    # Infer use of MLA from unified pattern
-    if args.hybrid_layer_pattern and (
+    # Infer use of MLA from unified pattern. A DSA ('D') layer normally implies
+    # MLA, but DSA can also run over GQA Q/K/V (see hybrid_layer_specs_dsa_gqa);
+    # when GQA is explicitly requested, do not force MLA on for DSA layers.
+    if args.hybrid_layer_pattern and not args.group_query_attention and (
             Symbols.MLA in args.hybrid_layer_pattern
             or Symbols.DS_ATTENTION in args.hybrid_layer_pattern
     ):
