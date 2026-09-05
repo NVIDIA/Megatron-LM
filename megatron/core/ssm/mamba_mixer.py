@@ -32,6 +32,7 @@ from megatron.core.ssm.ops.common.intermediate_extraction import (
 )
 from megatron.core.ssm.ops.mamba2.batch_invariant_decode import MambaBatchInvariantDecode
 from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
+from megatron.core.ssm.ops.mamba2.mamba_ssm_replay import selective_state_update_replayssm_spec
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -1082,6 +1083,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         batch_indices: Optional[torch.Tensor] = None,
         intermediate_conv_state: Optional[torch.Tensor] = None,
         intermediate_ssm_state: Optional[torch.Tensor] = None,
+        replay_context: Optional[DynamicInferenceContext] = None,
     ) -> torch.Tensor:
         """
         Performs SSM computation for inference decode step.
@@ -1097,6 +1099,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 sequence step (for speculative decoding rollback).
             intermediate_ssm_state: Optional buffer for storing SSM state at each
                 sequence step (for speculative decoding rollback).
+            replay_context: When ReplaySSM is enabled
+                (`context.mamba_replay_ssm`), the dynamic inference context; the
+                SSM step then reads the ring buffers / cursors from it and runs the
+                ReplaySSM kernels instead of `selective_state_update`.
 
         Returns:
             The output tensor of shape (b, s, d).
@@ -1163,6 +1169,62 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 conv_state_indices=batch_indices,
                 intermediate_conv_states=intermediate_conv_state,
             ).to(xBC_dtype)
+
+        if replay_context is not None:
+            # ReplaySSM path: consume the packed post-conv output (x|B|C channel-last)
+            # and the raw per-head dt directly — no split, no dt broadcast, no
+            # intermediate SSM states. The live ssm_state is the checkpoint: it is
+            # only written on (early-)flush steps inside the kernel; rollback is the
+            # commit kernel's ring-pointer move in the controller.
+            context = replay_context
+            layer_idx = self.layer_number - self.pp_layer_offset
+            A = self._get_decode_A_neg_exp()
+            assert A.stride(-1) == 0 and A.stride(-2) == 0, (
+                "mamba_replay_ssm requires a per-head scalar A (Mamba-2 / TIE_HDIM)"
+            )
+            conv_out = xBC.reshape(batch_size * seq_len, -1)
+            dt_raw = dt.reshape(batch_size * seq_len, self.nheads_local_tp)
+            replay_conv_cache, replay_dt_cache = context.mamba_replay_cache(layer_idx)
+            replay_write_pos = context.mamba_replay_write_pos
+            replay_origin = context.mamba_replay_origin
+            replay_is_flush = context.mamba_replay_is_flush
+            replay_bc_pre = context.mamba_replay_bc_pre
+            replay_qsl = context.mamba_replay_qsl
+            flush_threshold = context.mamba_replay_flush_threshold
+            window = context.mamba_replay_window
+            assert seq_len == window, (
+                f"ReplaySSM decode window mismatch: seq_len={seq_len}, window={window}"
+            )
+            z_replay = None
+            if not self.rmsnorm:
+                z_replay = z.reshape(batch_size * seq_len, self.nheads_local_tp, self.headdim)
+            out = selective_state_update_replayssm_spec(
+                state_checkpoint=ssm_state,
+                post_conv_cache=replay_conv_cache,
+                dt_cache=replay_dt_cache,
+                conv_out=conv_out,
+                dt_spec=dt_raw,
+                A=A,
+                write_pos=replay_write_pos,
+                post_conv_state_pos=replay_origin,
+                is_flush=replay_is_flush,
+                query_start_loc=replay_qsl[: batch_size + 1],
+                state_batch_indices=batch_indices,
+                max_cache_len=flush_threshold,
+                max_spec_len=window,
+                d_inner=self.d_inner_local_tp,
+                ngroups=self.ngroups_local_tp,
+                dstate=self.d_state,
+                D=self.D.unsqueeze(-1).expand(self.nheads_local_tp, self.headdim),
+                z=z_replay,
+                dt_bias=self.dt_bias,
+                dt_softplus=True,
+                bc_pre=replay_bc_pre,
+            )
+            y = out.view(batch_size, seq_len, -1).to(dtype)
+            if self.rmsnorm:
+                y = self.norm(y, None if self.config.batch_invariant_mode else z)
+            return y
 
         x, B, C = torch.split(
             xBC,

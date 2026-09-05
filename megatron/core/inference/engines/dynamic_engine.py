@@ -718,6 +718,40 @@ class DynamicInferenceEngine(AbstractEngine):
             raise ValueError(f"Cannot wait for transient state {state}")
         await event.wait()
 
+    def _warmup_replay_ssm_commit(self):
+        """Pre-compile the ReplaySSM commit kernel (it runs eagerly per decode step,
+        outside the CUDA graphs, so its first-call Triton compile would otherwise land
+        on the first real decode step). The dummy call marks every row as prefill, so
+        the kernel is a complete no-op on the ring cursors."""
+        context = self.context
+        if not (
+            getattr(context, "is_hybrid_model", False)
+            and getattr(context, "mamba_replay_ssm", False)
+        ):
+            return
+        from megatron.core.ssm.ops.mamba2.mamba_ssm_replay import commit_replayssm_spec
+
+        device = torch.cuda.current_device()
+        n = context.max_requests
+        prefill_status = torch.ones(n, dtype=torch.int32, device=device)
+        # int32 to match the real call (request_to_mamba_state_idx is int32);
+        # a different index dtype would compile a separate Triton specialization.
+        state_idx = torch.arange(n, dtype=torch.int32, device=device)
+        accepted_counts = torch.zeros(n, dtype=torch.int64, device=device)
+        with torch.inference_mode():
+            commit_replayssm_spec(
+                write_pos=context.mamba_replay_write_pos,
+                post_conv_state_pos=context.mamba_replay_origin,
+                is_flush=context.mamba_replay_is_flush,
+                accepted_draft_counts=accepted_counts,
+                prefill_status=prefill_status,
+                state_batch_indices=state_idx,
+                max_cache_len=context.mamba_replay_flush_threshold,
+                max_spec_len=context.mamba_replay_window,
+                cache_buf_len=context.mamba_replay_cache_buf_len,
+            )
+        torch.cuda.synchronize()
+
     def create_cuda_graphs(self, reset_context: bool = True):
         """Create cuda graphs.
 
@@ -736,6 +770,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         context = self.context
         controller = self.controller
+
+        # Pre-compile the ReplaySSM commit kernel (no autotune; compile-only warmup).
+        self._warmup_replay_ssm_commit()
 
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
