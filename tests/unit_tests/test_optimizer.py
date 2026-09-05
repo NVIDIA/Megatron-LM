@@ -1,7 +1,8 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -19,6 +20,7 @@ from megatron.core.optimizer import (
     ParamKey,
     ParamPredicate,
     _get_param_groups,
+    _release_unused_cpu_memory_after_optimizer_init,
     check_config_overrides_consistency,
     get_megatron_optimizer,
     get_standard_config_overrides,
@@ -324,6 +326,56 @@ def test_chained_optimizer():
 
     assert list(optimizer_1.state.values())[0]["exp_avg"].is_cuda
     assert list(optimizer_2.state.values())[0]["momentum_buffer"].is_cuda
+
+
+def _optimizer_tree_with_high_precision_init_values(*counts):
+    leaf_optimizers = [SimpleNamespace(_high_precision_init_value_count=count) for count in counts]
+    if len(leaf_optimizers) == 1:
+        return leaf_optimizers[0]
+    return ChainedOptimizer([ChainedOptimizer(leaf_optimizers[:-1]), leaf_optimizers[-1]])
+
+
+@pytest.mark.parametrize(
+    ("optimizer", "cpu_empty_cache_available", "expected_released", "expected_warning"),
+    [
+        pytest.param(
+            _optimizer_tree_with_high_precision_init_values(3, 5),
+            True,
+            True,
+            None,
+            id="nested-optimizer-tree",
+        ),
+        pytest.param(
+            _optimizer_tree_with_high_precision_init_values(0),
+            True,
+            False,
+            None,
+            id="no-values-cleared",
+        ),
+        pytest.param(
+            _optimizer_tree_with_high_precision_init_values(1),
+            False,
+            False,
+            "does not provide torch.cpu.empty_cache",
+            id="older-pytorch",
+        ),
+    ],
+)
+def test_release_unused_cpu_memory_after_optimizer_init(
+    monkeypatch, caplog, optimizer, cpu_empty_cache_available, expected_released, expected_warning
+):
+    empty_cache = Mock()
+    if cpu_empty_cache_available:
+        monkeypatch.setattr(torch.cpu, "empty_cache", empty_cache, raising=False)
+    else:
+        monkeypatch.delattr(torch.cpu, "empty_cache", raising=False)
+
+    released = _release_unused_cpu_memory_after_optimizer_init(optimizer)
+
+    assert released is expected_released
+    assert empty_cache.call_count == int(expected_released)
+    if expected_warning is not None:
+        assert expected_warning in caplog.text
 
 
 def test_chained_optimizer_file_state_dict_round_trip(tmp_path):
