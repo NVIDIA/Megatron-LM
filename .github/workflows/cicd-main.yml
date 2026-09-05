@@ -27,6 +27,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: read
   id-token: write
   contents: read
 
@@ -195,6 +196,8 @@ jobs:
       cadence:        ${{ steps.configure.outputs.cadence }}
       cadence_bypass: ${{ steps.configure.outputs.cadence_bypass }}
       sha:            ${{ steps.resolve-sha.outputs.sha }}
+      target_branch:  ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.ref }}
+      unit_testmon_eligible: ${{ steps.configure.outputs.unit_testmon_eligible }}
     steps:
       - name: Get PR info
         id: get-pr-info
@@ -238,17 +241,25 @@ jobs:
           IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
           IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
           EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
         run: |
           PR_NUMBER=${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').number }}
 
-          # Fetch all labels in a single API call; fall back to empty list if no PR
-          LABELS=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json labels --jq '[.labels[].name]') || LABELS='[]'
+          # Fetch all labels in a single API call. A failed lookup is safe for
+          # the existing scope defaults, but must disable selective unit tests.
+          LABELS_VALID=true
+          if ! LABELS=$(gh pr view "$PR_NUMBER" --repo ${{ github.repository }} --json labels --jq '[.labels[].name]'); then
+            LABELS='[]'
+            LABELS_VALID=false
+          fi
 
           HAS_RUN_TESTS=$(echo "$LABELS"      | jq 'any(. == "Run tests")')
           HAS_RUN_FUNCTIONAL=$(echo "$LABELS" | jq 'any(. == "Run functional tests")')
           HAS_LTS=$(echo "$LABELS"            | jq 'any(. == "container::lts")')
           HAS_MBRIDGE=$(echo "$LABELS"        | jq 'any(. == "Run MBridge tests")')
           HAS_NEMO_RL=$(echo "$LABELS"        | jq 'any(. == "Run NeMoRL tests")')
+          HAS_UNIT_TESTMON=$(echo "$LABELS"   | jq 'any(. == "Run selective unit tests")')
 
           if [ "$IS_MERGE_GROUP" == "true" ]; then
             SCOPE=L1; N_REPEAT=1; LIGHTWEIGHT=false
@@ -317,6 +328,20 @@ jobs:
 
           DEV=true
 
+          # Testmon is an explicit PR-only fast path. Cache compatibility is
+          # checked later from the checked-out tree; a miss runs the full bucket.
+          UNIT_TESTMON_ELIGIBLE=false
+          if [[ "$LABELS_VALID" == "true" \
+            && "$HAS_UNIT_TESTMON" == "true" \
+            && "$EVENT_NAME" == "push" \
+            && "$REF" =~ ^refs/heads/pull-request/[0-9]+$ \
+            && "$HAS_RUN_TESTS" != "true" \
+            && "$HAS_RUN_FUNCTIONAL" != "true" \
+            && "$FORCE_RUN_ALL" != "true" \
+            && "$HAS_LTS" != "true" ]]; then
+            UNIT_TESTMON_ELIGIBLE=true
+          fi
+
           echo "scope=$SCOPE"                   | tee -a $GITHUB_OUTPUT
           echo "n_repeat=$N_REPEAT"             | tee -a $GITHUB_OUTPUT
           echo "lightweight=$LIGHTWEIGHT"       | tee -a $GITHUB_OUTPUT
@@ -327,6 +352,7 @@ jobs:
           echo "dev=$DEV"                       | tee -a $GITHUB_OUTPUT
           echo "cadence=$CADENCE_OUTPUT"        | tee -a $GITHUB_OUTPUT
           echo "cadence_bypass=$CADENCE_BYPASS" | tee -a $GITHUB_OUTPUT
+          echo "unit_testmon_eligible=$UNIT_TESTMON_ELIGIBLE" | tee -a $GITHUB_OUTPUT
 
           # Pre-compute active row markers for the decision tree
           _MG=$( [ "$IS_MERGE_GROUP" == "true" ]                                                                           && echo "**→**" || echo "" )
@@ -355,6 +381,8 @@ jobs:
           | \`mbridge_suite\` | \`$MBRIDGE_SUITE\` |
           | \`cadence\` | \`$CADENCE\` |
           | \`cadence_bypass\` | \`$CADENCE_BYPASS\` |
+          | \`unit_testmon_requested\` | \`$HAS_UNIT_TESTMON\` |
+          | \`unit_testmon_eligible\` | \`$UNIT_TESTMON_ELIGIBLE\` |
 
           ### Decision tree
 
@@ -766,6 +794,8 @@ jobs:
           is_unit_test: "true"
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}-aws-h100
           sha: ${{ needs.configure.outputs.sha }}
+          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
+          unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
 
   cicd-parse-unit-tests-gb200:
     runs-on: ubuntu-latest
@@ -854,6 +884,8 @@ jobs:
           container-image: ${{ env.container-registry-gb200 }}/megatron-lm:${{ needs.configure.outputs.sha }}-gb-gpu
           platform: dgx_gb200
           sha: ${{ needs.configure.outputs.sha }}
+          unit_testmon_mode: ${{ needs.configure.outputs.unit_testmon_eligible == 'true' && 'enforce' || 'full' }}
+          unit_testmon_target_branch: ${{ needs.configure.outputs.target_branch }}
 
   # Single source of truth for "should integration tests run?".
   # Encodes two independent gates:

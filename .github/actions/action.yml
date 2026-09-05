@@ -24,7 +24,8 @@ inputs:
     default: "30"
   script:
     description: "Test script to execute"
-    required: true
+    required: false
+    default: ""
   is-optional:
     description: "Pass this job on failure."
     required: false
@@ -64,6 +65,14 @@ inputs:
     default: ""
   sha:
     description: "Git ref to check out. Must match the SHA used by the upstream parse step so recipes don't diverge between scheduling and execution."
+    required: false
+    default: ""
+  unit_testmon_mode:
+    description: "Unit-test selection mode: full or enforce. Enforce bootstraps a PR baseline on cache miss."
+    required: false
+    default: "full"
+  unit_testmon_target_branch:
+    description: "PR target branch used to namespace the Testmon cache."
     required: false
     default: ""
 runs:
@@ -113,6 +122,83 @@ runs:
           sleep 10
         done
 
+    - name: Compute unit Testmon cache identity
+      id: unit-testmon-identity
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce'
+      shell: bash -e -u -o pipefail {0}
+      continue-on-error: true
+      env:
+        BUCKET: ${{ inputs.test_case }}
+        RECIPE_PLATFORM: ${{ inputs.platform }}
+        TARGET_BRANCH: ${{ inputs.unit_testmon_target_branch }}
+      run: |
+        PLATFORM="$RECIPE_PLATFORM"
+        BUCKET_HASH=$(printf '%s' "$BUCKET" | sha256sum | cut -c1-16)
+        [[ "$BUCKET_HASH" =~ ^[0-9a-f]{16}$ ]]
+        [[ "$TARGET_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]
+        [[ "$PLATFORM" =~ ^[A-Za-z0-9._-]+$ ]]
+        TARGET_BRANCH_KEY=${TARGET_BRANCH//\//-}
+        echo "cache_key=unit-testmon-${TARGET_BRANCH_KEY}-${PLATFORM}-${BUCKET_HASH}" | tee -a "$GITHUB_OUTPUT"
+
+    # The key is named for the PR target branch. GitHub additionally scopes the
+    # stored cache to the synthetic refs/heads/pull-request/<number> branch.
+    - name: Restore unit Testmon baseline
+      id: restore-unit-testmon
+      if: inputs.is_unit_test == 'true' && inputs.unit_testmon_mode == 'enforce' && steps.unit-testmon-identity.outcome == 'success'
+      uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      continue-on-error: true
+      with:
+        path: assets_dir/testmon
+        key: ${{ steps.unit-testmon-identity.outputs.cache_key }}
+
+    - name: Resolve unit Testmon mode
+      id: unit-testmon
+      if: inputs.is_unit_test == 'true'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        REQUESTED_MODE: ${{ inputs.unit_testmon_mode }}
+        IDENTITY_OUTCOME: ${{ steps.unit-testmon-identity.outcome }}
+        CACHE_HIT: ${{ steps.restore-unit-testmon.outputs.cache-hit }}
+      run: |
+        FALLBACK_REASON=""
+        case "$REQUESTED_MODE" in
+          full)
+            EFFECTIVE_MODE=full
+            ;;
+          enforce)
+            if [[ "$IDENTITY_OUTCOME" == "success" && "$CACHE_HIT" == "true" ]]; then
+              EFFECTIVE_MODE=enforce
+            elif [[ "$IDENTITY_OUTCOME" == "success" ]]; then
+              EFFECTIVE_MODE=bootstrap
+              FALLBACK_REASON="no baseline was restored; generating one"
+              echo "::notice::Testmon cache unavailable; running the full bucket and generating a baseline."
+            else
+              EFFECTIVE_MODE=full
+              FALLBACK_REASON="cache identity could not be computed; running the full bucket without saving a baseline"
+              echo "::warning::Unable to compute a trustworthy Testmon cache identity; running the full unit-test bucket."
+            fi
+            ;;
+          *)
+            echo "Unsupported unit_testmon_mode: $REQUESTED_MODE" >&2
+            exit 2
+            ;;
+        esac
+        mkdir -p assets_dir/testmon
+        : > assets_dir/testmon/summary.md
+        echo "mode=$EFFECTIVE_MODE" | tee -a "$GITHUB_OUTPUT"
+        {
+          echo "### Unit Testmon"
+          echo
+          echo "- Requested mode: $REQUESTED_MODE"
+          echo "- Effective mode: $EFFECTIVE_MODE"
+          if [[ "$REQUESTED_MODE" == "enforce" ]]; then
+            echo "- Cache hit: ${CACHE_HIT:-false}"
+          fi
+          if [[ -n "$FALLBACK_REASON" ]]; then
+            echo "- Fallback: $FALLBACK_REASON"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+
     - name: Create run-script (unit test)
       shell: bash -x -e -u -o pipefail {0}
       if: inputs.is_unit_test == 'true'
@@ -137,6 +223,7 @@ runs:
           --environment dev \
           --platform ${{ inputs.platform }} \
           --tag ${{ inputs.tag }} \
+          --unit-testmon-mode "${{ steps.unit-testmon.outputs.mode }}" \
           --container-image ${{ inputs.container-image }} \
           --hf-home /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME
 
@@ -220,6 +307,34 @@ runs:
         echo "::endgroup::"
         exit $EXIT_CODE
 
+    - name: Prepare unit Testmon baseline cache
+      id: prepare-unit-testmon-cache
+      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'bootstrap' && steps.run-main-script.outcome == 'success'
+      shell: bash -e -u -o pipefail {0}
+      env:
+        CACHE_DIR: assets_dir/testmon
+      run: |
+        sudo chown -R "$(id -u):$(id -g)" "$CACHE_DIR"
+        test -s "$CACHE_DIR/prod/.testmondata"
+        test -s "$CACHE_DIR/experimental/.testmondata"
+
+    - name: Save unit Testmon baseline
+      if: inputs.is_unit_test == 'true' && steps.unit-testmon.outputs.mode == 'bootstrap' && steps.prepare-unit-testmon-cache.outcome == 'success' && steps.unit-testmon-identity.outcome == 'success'
+      uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+      with:
+        path: assets_dir/testmon
+        key: ${{ steps.unit-testmon-identity.outputs.cache_key }}
+
+    - name: Publish unit Testmon summary
+      if: always() && inputs.is_unit_test == 'true'
+      shell: bash
+      env:
+        SUMMARY_FILE: assets_dir/testmon/summary.md
+      run: |
+        if [[ -f "$SUMMARY_FILE" ]]; then
+          cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
     - name: Check result
       id: check
       shell: bash -e -u -o pipefail {0}
@@ -231,7 +346,7 @@ runs:
       run: |
         logs_report=logs-${{ inputs.test_case }}-${{ github.run_id }}-$(cat /proc/sys/kernel/random/uuid)
         echo "logs_report=$logs_report" | sed 's/\//-/g' | sed 's/\*/-/g' | tee -a "$GITHUB_OUTPUT"
-        if [[ "$IS_UNIT_TEST" == "true" ]]; then
+        if [[ "$IS_UNIT_TEST" == "true" && -f .coverage ]]; then
           coverage_report=coverage-unit-test-${{ github.run_id }}-$(cat /proc/sys/kernel/random/uuid)
         else
           coverage_report=none
