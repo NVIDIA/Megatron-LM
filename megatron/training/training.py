@@ -3382,8 +3382,11 @@ def training_log(
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
 
-    # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
-    should_reset = not is_first_iteration
+    # total_loss_dict sums over a log interval and is reset once printed. The first
+    # iteration always prints: under --log-interval 100 that is an extra line inside an
+    # interval still accumulating, so it must not reset; under --log-interval 1 that line
+    # *is* the interval, so it must, or the next print covers two iterations.
+    should_reset = not is_first_iteration or iteration % args.log_interval == 0
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
