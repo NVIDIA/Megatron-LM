@@ -136,9 +136,9 @@ class MXFP8IndexerWorkspace:
 
 @dataclass
 class BSHDCompactIndexerWorkspace:
-    """Caller-owned buffers for compact BSHD CUDA-graph capture."""
+    """Persistent compact BSHD outputs and candidate-capacity metadata."""
 
-    cand_buffer: Tensor
+    cand_buffer_numel: int
     out_indices: Tensor
     out_logits: Tensor
     softmax_out: Tensor | None
@@ -201,9 +201,7 @@ class BSHDCompactIndexerWorkspace:
                 self.geometry.ratio == ratio,
                 batch_size == k_batch,
                 head_dim == k_head_dim,
-                self.cand_buffer.device == device,
-                self.cand_buffer.dtype == torch.float32,
-                self.cand_buffer.is_contiguous(),
+                isinstance(self.cand_buffer_numel, int) and self.cand_buffer_numel >= 0,
                 self.out_indices.device == device,
                 self.out_indices.dtype == torch.int32,
                 tuple(self.out_indices.shape) == out_shape,
@@ -274,10 +272,10 @@ class BSHDCompactIndexerWorkspace:
 
 @dataclass
 class THDCompactIndexerWorkspace:
-    """Caller-owned buffers and geometry for compact THD CUDA-graph capture."""
+    """Persistent compact THD outputs, offsets, and candidate-capacity metadata."""
 
     cand_batch_offsets: Tensor
-    cand_buffer: Tensor
+    cand_buffer_numel: int
     out_indices: Tensor
     out_logits: Tensor
     softmax_out: Tensor | None
@@ -393,9 +391,8 @@ class THDCompactIndexerWorkspace:
             and self.cand_batch_offsets.ndim == 1
             and self.cand_batch_offsets.numel() == batch_size + 1
             and self.cand_batch_offsets.is_contiguous()
-            and self.cand_buffer.device == q.device
-            and self.cand_buffer.dtype == torch.float32
-            and self.cand_buffer.is_contiguous()
+            and isinstance(self.cand_buffer_numel, int)
+            and self.cand_buffer_numel >= 0
             and self.out_indices.device == q.device
             and self.out_indices.dtype == torch.int32
             and tuple(self.out_indices.shape) == out_shape
@@ -471,6 +468,17 @@ def thd_compact_indexer_available(q: Tensor, k: Tensor, precision: str = "bf16")
     return _compact_indexer_available(q, k, precision)
 
 
+def _allocate_compact_candidate_buffer(numel: int, device: torch.device) -> Tensor:
+    """Allocate candidate scratch in the active eager or CUDA-graph memory pool.
+
+    The compact wrapper consumes this stage-1 output before returning, so the
+    tensor must not be retained in the persistent workspace. During capture,
+    its short lifetime lets serialized graphs reuse storage from their shared
+    graph pool.
+    """
+    return torch.empty(numel, dtype=torch.float32, device=device)
+
+
 def prepare_bshd_compact_indexer_workspace(
     q: Tensor,
     k: Tensor,
@@ -480,12 +488,13 @@ def prepare_bshd_compact_indexer_workspace(
     return_softmax: bool = False,
     precision: str = "bf16",
 ) -> BSHDCompactIndexerWorkspace | None:
-    """Preallocate compact BSHD buffers before CUDA graph capture.
+    """Preallocate persistent compact BSHD buffers before CUDA graph capture.
 
     ``q`` and ``k`` use the BSHD/BSD layouts consumed by
     :func:`_indexer_topk_core`. The workspace forces the upstream compact
     wrapper's single-launch mode so its candidate sizing is identical for
-    BF16 and MXFP8 and no per-window scratch is created during capture.
+    BF16 and MXFP8. Candidate scratch itself is allocated by each dispatch,
+    allowing a CUDA-graph capture pool to reuse it across serialized graphs.
     """
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("BSHD compact indexer workspace must be prepared before CUDA capture")
@@ -525,7 +534,7 @@ def prepare_bshd_compact_indexer_workspace(
             ),
         )
     return BSHDCompactIndexerWorkspace(
-        cand_buffer=torch.empty(cand_floats, dtype=torch.float32, device=device),
+        cand_buffer_numel=int(cand_floats),
         out_indices=torch.empty(out_shape, dtype=torch.int32, device=device),
         out_logits=torch.empty(out_shape, dtype=torch.float32, device=device),
         softmax_out=(
@@ -574,12 +583,14 @@ def prepare_thd_compact_indexer_workspace(
     return_softmax: bool = False,
     precision: str = "bf16",
 ) -> THDCompactIndexerWorkspace | None:
-    """Preallocate compact THD buffers before CUDA graph capture.
+    """Preallocate persistent compact THD buffers before CUDA graph capture.
 
     Returns None when the installed cuDNN Frontend or GPU does not expose
     the SM100 compact API. The sizing helper performs a GPU-to-host sync and
     therefore this function must never be called from inside graph capture.
     Eager warmup must prepare this workspace before any THD compact capture.
+    Candidate scratch is allocated by each dispatch so a CUDA-graph capture
+    pool can reuse that temporary storage across serialized graphs.
     """
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("THD compact indexer workspace must be prepared before CUDA capture")
@@ -625,7 +636,7 @@ def prepare_thd_compact_indexer_workspace(
         )
     return THDCompactIndexerWorkspace(
         cand_batch_offsets=cand_batch_offsets,
-        cand_buffer=torch.empty(cand_floats, dtype=torch.float32, device=device),
+        cand_buffer_numel=int(cand_floats),
         out_indices=torch.empty(out_shape, dtype=torch.int32, device=device),
         out_logits=torch.empty(out_shape, dtype=torch.float32, device=device),
         softmax_out=(
@@ -1616,7 +1627,9 @@ def _indexer_topk_core(
             )
             if compact_workspace is not None:
                 compact_kwargs.update(
-                    cand_buffer=compact_workspace.cand_buffer,
+                    cand_buffer=_allocate_compact_candidate_buffer(
+                        compact_workspace.cand_buffer_numel, device
+                    ),
                     cand_batch_offsets=compact_workspace.cand_batch_offsets,
                     out_indices=compact_workspace.out_indices,
                     out_logits=compact_workspace.out_logits,
@@ -1633,7 +1646,9 @@ def _indexer_topk_core(
                 q=q, k=k, topk=topk, ratio=ratio, return_softmax=return_softmax, precision=precision
             )
             compact_kwargs.update(
-                cand_buffer=compact_workspace.cand_buffer,
+                cand_buffer=_allocate_compact_candidate_buffer(
+                    compact_workspace.cand_buffer_numel, device
+                ),
                 out_indices=compact_workspace.out_indices,
                 out_logits=compact_workspace.out_logits,
                 microbatch_rows=0,
@@ -1696,6 +1711,8 @@ def _indexer_topk_core(
             compact_result = compact_wrapper(
                 kernel_q, kernel_k.unsqueeze(2), w, top_k=topk, **compact_kwargs
             )
+        if compact_workspace is not None:
+            del compact_kwargs["cand_buffer"]
 
         topk_indices = compact_result["indices"]
         compact_logits = compact_result["logits"]
@@ -1838,9 +1855,10 @@ def indexer_topk(
         max_seqlen_kv: THD only — per-batch max KV length.
         q_causal_offsets: THD only — optional ``(B,)`` int32 CUDA tensor. Entry
             ``b`` is the sequence-relative position of that segment's first Q.
-        compact_workspace: caller-owned compact BSHD or THD buffers prepared
-            during eager warmup. A matching workspace is required while
-            capturing the compact path.
+        compact_workspace: caller-owned persistent outputs and sizing metadata
+            prepared during eager warmup. Candidate scratch is allocated by
+            each dispatch. A matching workspace is required while capturing
+            the compact path.
         deterministic: resolve exact-value ties at the K-th boundary toward
             the smallest local KV indices. The output slot order remains
             unspecified.
@@ -3314,9 +3332,9 @@ def fused_csa_indexer_sparse_attn(
             gradients, and receive the non-empty placeholder required by
             sparse-attention backward. Ignored when ``None`` or when it equals
             ``cu_seqlens_q``.
-        compact_workspace: optional caller-owned BSHD or THD compact buffers.
-            A matching workspace is required during compact CUDA-graph capture;
-            prepare it outside capture with the matching
+        compact_workspace: optional caller-owned persistent BSHD or THD compact
+            outputs and sizing metadata. A matching workspace is required during
+            compact CUDA-graph capture; prepare it outside capture with the matching
             ``prepare_*_compact_indexer_workspace`` helper.
         deterministic: resolve exact-value compact Top-K ties toward the
             smallest local KV indices. This is normally sourced from

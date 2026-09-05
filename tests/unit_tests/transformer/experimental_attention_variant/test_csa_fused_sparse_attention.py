@@ -3581,6 +3581,8 @@ class TestRealKernelFusedIndexerSparseAttn:
         )
         assert workspace is not None
         assert workspace.softmax_out is None
+        assert workspace.cand_buffer_numel > 0
+        assert not hasattr(workspace, 'cand_buffer')
         assert (workspace.mxfp8 is not None) == (precision == "mxfp8")
 
         def run():
@@ -4042,6 +4044,8 @@ class TestThdWrapperDispatchAndValidation:
             )
         assert workspace is not None
         assert workspace.softmax_out is None
+        assert workspace.cand_buffer_numel == q.shape[0] * 2
+        assert not hasattr(workspace, 'cand_buffer')
         changed_cu_q = _make_cu_seqlens([2, 3], device="cuda")
         assert workspace.matches(
             q=q,
@@ -4076,21 +4080,29 @@ class TestThdWrapperDispatchAndValidation:
             patch.object(torch.cuda, 'get_device_capability', return_value=(10, 0)),
             patch.object(torch.cuda, 'is_current_stream_capturing', return_value=True),
         ):
-            indexer_topk(
-                q,
-                k,
-                w,
-                topk=topk,
-                cu_seqlens_q=cu_q,
-                cu_seqlens_kv=cu_kv,
-                max_seqlen_q=3,
-                max_seqlen_kv=2,
-                compact_workspace=workspace,
-            )
+            for _ in range(2):
+                indexer_topk(
+                    q,
+                    k,
+                    w,
+                    topk=topk,
+                    cu_seqlens_q=cu_q,
+                    cu_seqlens_kv=cu_kv,
+                    max_seqlen_q=3,
+                    max_seqlen_kv=2,
+                    compact_workspace=workspace,
+                )
 
         fake_dsa.indexer_forward_wrapper.assert_not_called()
-        compact_call = fake_dsa.indexer_forward_top_k_wrapper.call_args
-        assert compact_call.kwargs['cand_buffer'] is workspace.cand_buffer
+        first_call, compact_call = fake_dsa.indexer_forward_top_k_wrapper.call_args_list
+        first_candidate = first_call.kwargs['cand_buffer']
+        candidate = compact_call.kwargs['cand_buffer']
+        assert first_candidate is not candidate
+        assert first_candidate.data_ptr() != candidate.data_ptr()
+        assert candidate.device == q.device
+        assert candidate.dtype == torch.float32
+        assert candidate.numel() == workspace.cand_buffer_numel
+        assert candidate.is_contiguous()
         assert compact_call.kwargs['cand_batch_offsets'] is workspace.cand_batch_offsets
         assert compact_call.kwargs['out_indices'] is workspace.out_indices
         assert compact_call.kwargs['out_logits'] is workspace.out_logits
