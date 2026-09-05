@@ -219,6 +219,8 @@ def run_fused_dsa_attention(
         not absorbed_mla
         or value is not None
         or attn_mask_type != AttnMaskType.causal
+        or indexer_topk <= 0
+        or key.size(0) == 0
         or key.size(2) != 1
     ):
         return None
@@ -2009,9 +2011,9 @@ def _run_sparse_attention_backward(
     d: int,
     skv: int,
     grad_output: Tensor,
-    all_rows_nonempty: bool = False,
+    all_topk_rows_nonempty: bool = False,
 ) -> Tuple[Tensor, Tensor]:
-    """Run sparse attention backward, skipping rows that have no valid top-k entries."""
+    """Run sparse attention backward with fixed-shape handling for empty top-k rows."""
     d_v = out_flat.shape[-1]
     dO_flat = grad_output.reshape(sq * b, num_heads, d_v)
 
@@ -2040,56 +2042,29 @@ def _run_sparse_attention_backward(
         bwd_attn_sink[:num_heads] = attn_sink
 
     _ensure_dsa_namespace()
-    if all_rows_nonempty:
-        attn_bwd = _cudnn_dsa.sparse_attention_backward_wrapper(
-            bwd_q_flat,
-            kv_flat,
-            bwd_out_flat,
-            bwd_dO_flat,
-            bwd_lse,
-            bwd_attn_sink,
-            global_idxs,
-            softmax_scale=softmax_scale,
-            topk_length=topk_length,
-        )
-        grad_query_flat = attn_bwd["dq"]
-        if padded_num_heads != num_heads:
-            grad_query_flat = grad_query_flat[:, :num_heads, :].contiguous()
-        grad_kv_flat = attn_bwd["dkv"]
-        grad_query = grad_query_flat.reshape(sq, b, num_heads, d)
-        grad_kv_full = grad_kv_flat.reshape(skv, b, kv_flat.size(-1))
-        return grad_query, grad_kv_full
-
-    valid_row_indices = torch.nonzero(topk_length > 0, as_tuple=False).flatten()
-    dummy_row_index = torch.full(
-        (1,), bwd_q_flat.size(0), dtype=valid_row_indices.dtype, device=valid_row_indices.device
-    )
-    compact_row_indices = torch.cat((valid_row_indices, dummy_row_index), dim=0)
-
-    # Add one zero-gradient row so the cuDNN wrapper never receives an empty query batch.
-    bwd_q_flat = torch.cat((bwd_q_flat, torch.zeros_like(bwd_q_flat[:1])), dim=0)
-    bwd_out_flat = torch.cat((bwd_out_flat, torch.zeros_like(bwd_out_flat[:1])), dim=0)
-    bwd_dO_flat = torch.cat((bwd_dO_flat, torch.zeros_like(bwd_dO_flat[:1])), dim=0)
-    bwd_lse = torch.cat((bwd_lse, torch.zeros_like(bwd_lse[:1])), dim=0)
-    global_idxs = torch.cat((global_idxs, torch.zeros_like(global_idxs[:1])), dim=0)
-    topk_length = torch.cat((topk_length, torch.ones_like(topk_length[:1])), dim=0)
+    empty_rows = None
+    if not all_topk_rows_nonempty:
+        empty_rows = topk_length <= 0
+        topk_length = topk_length.masked_fill(empty_rows, 1)
+        bwd_dO_flat = bwd_dO_flat.masked_fill(empty_rows[:, None, None], 0)
+        bwd_lse = bwd_lse.masked_fill(empty_rows[:, None], 0)
 
     attn_bwd = _cudnn_dsa.sparse_attention_backward_wrapper(
-        bwd_q_flat.index_select(0, compact_row_indices).contiguous(),
+        bwd_q_flat,
         kv_flat,
-        bwd_out_flat.index_select(0, compact_row_indices).contiguous(),
-        bwd_dO_flat.index_select(0, compact_row_indices).contiguous(),
-        bwd_lse.index_select(0, compact_row_indices).contiguous(),
+        bwd_out_flat,
+        bwd_dO_flat,
+        bwd_lse,
         bwd_attn_sink,
-        global_idxs.index_select(0, compact_row_indices).contiguous(),
+        global_idxs,
         softmax_scale=softmax_scale,
-        topk_length=topk_length.index_select(0, compact_row_indices).contiguous(),
+        topk_length=topk_length,
     )
-    grad_query_valid = attn_bwd["dq"][:-1]
+    grad_query_flat = attn_bwd["dq"]
     if padded_num_heads != num_heads:
-        grad_query_valid = grad_query_valid[:, :num_heads, :].contiguous()
-    grad_query_flat = torch.zeros_like(q_flat)
-    grad_query_flat.index_copy_(0, valid_row_indices, grad_query_valid)
+        grad_query_flat = grad_query_flat[:, :num_heads, :].contiguous()
+    if empty_rows is not None:
+        grad_query_flat.masked_fill_(empty_rows[:, None, None], 0)
     grad_kv_flat = attn_bwd["dkv"]
 
     grad_query = grad_query_flat.reshape(sq, b, num_heads, d)
@@ -2197,6 +2172,23 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             )
         )
 
+        all_topk_rows_nonempty = (
+            effective_topk > 0
+            and skv > 0
+            and query_valid_rows is None
+            and (
+                (varlen_starts is None and varlen_ends is None and key_positions is None)
+                or (
+                    use_local_indexer_varlen
+                    and varlen_starts is not None
+                    and varlen_ends is not None
+                    and key_positions is None
+                )
+            )
+        )
+        if not all_topk_rows_nonempty:
+            global_idxs[:, 0].masked_fill_(topk_length_flat <= 0, 0)
+
         if need_indexer_loss:
             if sparse_loss:
                 if indexer_score_payload is None:
@@ -2280,13 +2272,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         ctx.num_heads = num_heads
         ctx.d = d
         ctx.skv = skv
-        ctx.all_sparse_bwd_rows_nonempty = (
-            query_valid_rows is None
-            and use_local_indexer_varlen
-            and varlen_starts is not None
-            and varlen_ends is not None
-            and key_positions is None
-        )
+        ctx.all_topk_rows_nonempty = all_topk_rows_nonempty
 
         output = out_flat.reshape(sq, b, num_heads, d_v).reshape(sq, b, num_heads * d_v)
         return output, indexer_loss
@@ -2324,7 +2310,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             d=d,
             skv=skv,
             grad_output=grad_output,
-            all_rows_nonempty=ctx.all_sparse_bwd_rows_nonempty,
+            all_topk_rows_nonempty=ctx.all_topk_rows_nonempty,
         )
 
         if ctx.has_precomputed_indexer_grads and grad_loss is not None:
@@ -2534,6 +2520,7 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         softmax_scale: float,
         d_v: int,
         topk_length: Optional[Tensor],
+        all_topk_rows_nonempty: bool,
     ) -> Tensor:
         """Run fused sparse attention for precomputed top-k metadata."""
         sq, b, num_heads, d = query.shape
@@ -2543,6 +2530,8 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
                 query, kv_full, topk_indices, softmax_scale, d_v, topk_length=topk_length
             )
         )
+        if not all_topk_rows_nonempty:
+            global_idxs[:, 0].masked_fill_(topk_length_flat <= 0, 0)
 
         ctx.save_for_backward(q_flat, kv_flat, attn_sink, global_idxs, out_flat, lse)
         ctx.softmax_scale = softmax_scale
@@ -2552,6 +2541,7 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         ctx.num_heads = num_heads
         ctx.d = d
         ctx.skv = skv
+        ctx.all_topk_rows_nonempty = all_topk_rows_nonempty
 
         return out_flat.reshape(sq, b, num_heads, d_v)
 
@@ -2577,9 +2567,10 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
             d=d,
             skv=skv,
             grad_output=grad_output,
+            all_topk_rows_nonempty=ctx.all_topk_rows_nonempty,
         )
 
-        return grad_query, grad_kv_full, None, None, None, None
+        return grad_query, grad_kv_full, None, None, None, None, None
 
 
 def run_fused_absorbed_sparse_attention(
@@ -2589,11 +2580,12 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[Tensor] = None,
+    all_topk_rows_nonempty: bool = False,
 ) -> Optional[Tensor]:
     """Run cuDNN/FlashMLA sparse attention using externally supplied top-k indices."""
     if query.ndim != 4 or key.ndim != 4 or topk_indices.ndim != 3:
         return None
-    if key.size(2) != 1 or v_channels <= 0:
+    if key.size(0) == 0 or key.size(2) != 1 or topk_indices.size(2) == 0 or v_channels <= 0:
         return None
     if query.size(0) != topk_indices.size(1) or query.size(1) != topk_indices.size(0):
         return None
@@ -2606,7 +2598,7 @@ def run_fused_absorbed_sparse_attention(
 
     kv_full = key.squeeze(2).contiguous()
     return FusedSparseAttentionFunc.apply(
-        query, kv_full, topk_indices, softmax_scale, v_channels, topk_length
+        query, kv_full, topk_indices, softmax_scale, v_channels, topk_length, all_topk_rows_nonempty
     )
 
 
