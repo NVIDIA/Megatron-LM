@@ -6,6 +6,7 @@ import gc
 import itertools
 import logging
 from collections import ChainMap
+from contextlib import nullcontext
 from dataclasses import replace
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -34,7 +35,14 @@ except ImportError:
 
         HAVE_APEX_OR_TE = False
 
+# All instances of HAVE_TORCH_MEMORY_SAVER must be imported from one central point due to C code.
+from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+
+if HAVE_TORCH_MEMORY_SAVER:
+    from torch_memory_saver import torch_memory_saver
+else:
+    torch_memory_saver = None
 
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
@@ -64,6 +72,7 @@ from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
+    _OPTIMIZER_TMS_TAG,
     MixedPrecisionOptimizer,
     _zero_grad_group_helper,
     copy_optimizer_param_metadata,
@@ -696,6 +705,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
+        if config.rl_offload_optimizer_during_inference and not HAVE_TORCH_MEMORY_SAVER:
+            raise ImportError(
+                "rl_offload_optimizer_during_inference requires torch_memory_saver. "
+                "See https://github.com/fzyzcjy/torch_memory_saver."
+            )
+        # Opt in to TMS-based RL offload.
+        self._tms_offload_enabled = config.rl_offload_optimizer_during_inference and not isinstance(
+            optimizer, HybridDeviceOptimizer
+        )
+
         assert (
             isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
             or optimizer is None
@@ -776,15 +795,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         )
 
         # Allocate main param shards.
-        (
-            self.model_float16_groups,
-            self.model_fp32_groups,
-            self.shard_float16_groups,
-            self.shard_fp32_groups,
-            self.shard_fp32_from_float16_groups,
-        ) = self._build_model_and_main_param_groups(
-            self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
+        tms_ctx = (
+            torch_memory_saver.region(tag=_OPTIMIZER_TMS_TAG, enable_cpu_backup=True)
+            if self._tms_offload_enabled
+            else nullcontext()
         )
+        with tms_ctx:
+            (
+                self.model_float16_groups,
+                self.model_fp32_groups,
+                self.shard_float16_groups,
+                self.shard_fp32_groups,
+                self.shard_fp32_from_float16_groups,
+            ) = self._build_model_and_main_param_groups(
+                self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
+            )
 
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
@@ -793,6 +818,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
             self.optimizer.load_state_dict(self.optimizer.state_dict())
+
+        if self._tms_offload_enabled and self.init_state_fn is not None:
+            # Eagerly materialize the optimizer state inside the region.
+            # Otherwise it is allocated lazily on the first step(), meaning it does not get freed.
+            with torch_memory_saver.region(tag=_OPTIMIZER_TMS_TAG, enable_cpu_backup=True):
+                self.init_state_fn(self.optimizer, config)
 
     def _get_model_param_range_map(self, param: torch.nn.Parameter):
         """
@@ -990,39 +1021,48 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             #   empty tensors (i.e., torch.empty), which in turn reduces memory
             #   fragmentation.
             # - Real data is overwritten during load_parameter_state().
+            # When using TMS offload, allocate inside the TMS region.
+            tms_ctx = (
+                torch_memory_saver.region(tag=_OPTIMIZER_TMS_TAG, enable_cpu_backup=True)
+                if self._tms_offload_enabled
+                else nullcontext()
+            )
             state_dict_state = []
-            for gbuf_range_maps in self.gbuf_ranges:
-                for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
-                    for gbuf_range_map in gbuf_range_map_for_all_buckets:
-                        for model_param, param_range_map in gbuf_range_map["param_map"].items():
+            with tms_ctx:
+                for gbuf_range_maps in self.gbuf_ranges:
+                    for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+                        for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                            for model_param, param_range_map in gbuf_range_map["param_map"].items():
 
-                            # Get parameter ordering information (see method docstring
-                            # for details).
-                            group_index, group_order = self.model_param_group_index_map[model_param]
-                            state_order = inner_state_dict["param_groups"][group_index]["params"][
-                                group_order
-                            ]
+                                # Get parameter ordering information (see method docstring
+                                # for details).
+                                group_index, group_order = self.model_param_group_index_map[
+                                    model_param
+                                ]
+                                state_order = inner_state_dict["param_groups"][group_index][
+                                    "params"
+                                ][group_order]
 
-                            # Allocate dummy tensors.
-                            numel = len(param_range_map["gbuf_world"])
-                            init_shard = lambda dtype=torch.float32: torch.empty(
-                                (numel,), dtype=dtype, device=torch.cuda.current_device()
-                            )
+                                # Allocate dummy tensors.
+                                numel = len(param_range_map["gbuf_world"])
+                                init_shard = lambda dtype=torch.float32: torch.empty(
+                                    (numel,), dtype=dtype, device=torch.cuda.current_device()
+                                )
 
-                            # For precision_aware_optimizer, the empty tensors should also be
-                            #  initialized with the correct dtype.
-                            tensors = {
-                                key: init_shard(self._get_state_key_dtype(key))
-                                for key in self.optimizer_state_keys
-                            }
-                            if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
-                                if self.config.store_param_remainders and self.config.bf16:
-                                    tensors["master_param"] = init_shard(torch.int16)
-                                else:
-                                    tensors["master_param"] = init_shard(
-                                        self.config.main_params_dtype
-                                    )
-                            state_dict_state.append((state_order, tensors))
+                                # For precision_aware_optimizer, the empty tensors should also be
+                                #  initialized with the correct dtype.
+                                tensors = {
+                                    key: init_shard(self._get_state_key_dtype(key))
+                                    for key in self.optimizer_state_keys
+                                }
+                                if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+                                    if self.config.store_param_remainders and self.config.bf16:
+                                        tensors["master_param"] = init_shard(torch.int16)
+                                    else:
+                                        tensors["master_param"] = init_shard(
+                                            self.config.main_params_dtype
+                                        )
+                                state_dict_state.append((state_order, tensors))
 
             # Sort by state order (see method docstring for details).
             state_dict_state.sort(key=lambda s: s[0])
