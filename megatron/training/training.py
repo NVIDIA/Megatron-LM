@@ -2429,10 +2429,15 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         if args.create_all_gather_group:
-            timeout = timedelta(minutes=args.distributed_timeout_minutes) if args.distributed_timeout_minutes else None
+            timeout = (
+                timedelta(minutes=args.distributed_timeout_minutes)
+                if args.distributed_timeout_minutes
+                else None
+            )
             dp_cp_ag, expt_dp_ag = create_all_gather_groups(
                 for_expert_parallelism=(args.expert_model_parallel_size > 1),
                 timeout=timeout,
+                use_local_synchronization=args.use_local_synchronization,
             )
             pg_collection.dp_cp_ag = dp_cp_ag
             pg_collection.expt_dp_ag = expt_dp_ag
@@ -2481,7 +2486,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             )
             model.model_type = model_type
         return model
-
 
     if args.init_model_with_meta_device:
         with torch.device('meta'):
