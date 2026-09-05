@@ -1600,6 +1600,7 @@ class TestMLAClipQK:
 def test_parallel_multi_latent_attention_correctness(
     tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp, output_gate, gate_granularity
 ):
+    check_shared_k_rope_grad = tp > 1 and not sp and cp == 1
     if output_gate and (rope_type != "yarn" or apply_rope_fusion):
         pytest.skip("Gated MLA parallel coverage uses one representative YARN configuration.")
     if cp > 1 and not is_te_min_version("2.5.0", check_equality=True):
@@ -1705,10 +1706,14 @@ def test_parallel_multi_latent_attention_correctness(
         output_hidden_states_baseline, bias_hidden_states_baseline = attention(
             input_hidden_states, attention_mask=None
         )
-        output_hidden_states_baseline.sum().backward()
+        torch.manual_seed(seed + 1)
+        output_grad_baseline = torch.randn_like(output_hidden_states_baseline)
+        output_hidden_states_baseline.backward(output_grad_baseline)
 
         # Save baseline output
         input_grad_baseline = input_hidden_states.grad.detach()
+        if check_shared_k_rope_grad:
+            kv_down_grad_baseline = attention.linear_kv_down_proj.weight.grad.detach()
         output_hidden_states_baseline = output_hidden_states_baseline.detach()
         bias_hidden_states_baseline = bias_hidden_states_baseline.detach()
 
@@ -1749,8 +1754,11 @@ def test_parallel_multi_latent_attention_correctness(
         output_hidden_states_parallel, bias_hidden_states_parallel = parallel_attention(
             input_hidden_states, attention_mask=None
         )
-        output_hidden_states_parallel.sum().backward()
+        output_grad_parallel = get_tensor_on_this_rank(output_grad_baseline)
+        output_hidden_states_parallel.backward(output_grad_parallel)
         input_grad_parallel = input_hidden_states.grad.detach()
+        if check_shared_k_rope_grad:
+            kv_down_grad_parallel = parallel_attention.linear_kv_down_proj.weight.grad.detach()
 
         # Check if the output is the same
         if cp:
@@ -1810,6 +1818,13 @@ def test_parallel_multi_latent_attention_correctness(
             rtol=rtol,
             msg=lambda msg: f"Mismatch in input_grad: {msg}",
         )
+
+        if check_shared_k_rope_grad:
+            kv_lora_rank = transformer_config.kv_lora_rank
+            actual = kv_down_grad_parallel[kv_lora_rank:].double().flatten()
+            expected = kv_down_grad_baseline[kv_lora_rank:].double().flatten()
+            similarity = 2 * (actual * expected).sum() / (actual.square() + expected.square()).sum()
+            assert similarity > 0.995, f"shared K-RoPE gradient similarity: {similarity}"
 
         Utils.destroy_model_parallel()
 
