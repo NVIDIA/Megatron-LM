@@ -23,6 +23,7 @@ from megatron.core.inference.inference_request import compute_block_hashes_batch
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.inference.wire_metrics import WireMetrics
 
 from .handlers import HANDLERS
 from .state import CoordinatorState
@@ -266,6 +267,9 @@ class DataParallelInferenceCoordinator:
         # Header -> handler dispatch table, sourced from the handler registry.
         self._handlers = dict(HANDLERS)
 
+        # Message/byte counters for every payload crossing the router socket.
+        self.wire_metrics = WireMetrics()
+
     def get_least_loaded_data_parallel_rank(self):
         """
         Selects the data parallel rank with the fewest in-flight requests.
@@ -351,18 +355,20 @@ class DataParallelInferenceCoordinator:
             len(self.identities_of_data_parallel_ranks),
         )
 
-    def _send_to_engine(self, identity, frames):
+    def _send_to_engine(self, identity, frames, header):
         """Send a message to an engine, removing it from the pool if unreachable.
 
         Args:
             identity: ZMQ identity of the target engine.
             frames (list): Raw frames to send, metadata frame first.
+            header: Header wire value for byte accounting.
 
         Returns:
             True if the send succeeded, False if the engine was unreachable and removed.
         """
         try:
             self.router_socket.send_multipart([identity, *frames])
+            self.wire_metrics.record_sent(header, sum(map(len, frames)))
             return True
         except zmq.error.ZMQError as e:
             if e.errno == zmq.EHOSTUNREACH:
@@ -374,7 +380,25 @@ class DataParallelInferenceCoordinator:
         """Send a deserialized payload to every connected data parallel rank."""
         serialized = msgpack.packb(payload, use_bin_type=True)
         for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
-            self._send_to_engine(data_parallel_rank_id, [serialized])
+            self._send_to_engine(data_parallel_rank_id, [serialized], header=payload[0])
+
+    def _send_to_client(self, client_identity, frames, header):
+        """Send raw frames to a client and account for their total payload size.
+
+        Client-bound replies all go through here so wire_metrics sees the reply
+        sizes the frontend actually receives.
+
+        Args:
+            client_identity: ZMQ identity of the destination client.
+            frames (list): Raw frames to send, metadata frame first.
+            header: Header wire value for byte accounting.
+        """
+        self.router_socket.send_multipart([client_identity, *frames])
+        self.wire_metrics.record_sent(header, sum(map(len, frames)))
+
+    def get_wire_metrics(self):
+        """Return a snapshot of this coordinator's message and byte counters."""
+        return self.wire_metrics.snapshot()
 
     def compute_request_hashes(self, prompt, cache_salt: str | None = None):
         """Compute compact-prompt affinity hashes on CPU.
@@ -596,6 +620,7 @@ class DataParallelInferenceCoordinator:
                 continue
 
             metadata = msgpack.unpackb(frames[0], raw=False)
+            self.wire_metrics.record_received(metadata[0], sum(map(len, frames)))
             header = Headers(metadata[0])
 
             handler = self._handlers.get(header)
@@ -718,6 +743,7 @@ class DataParallelInferenceCoordinator:
         """
         Stops the inference coordinator, performing any necessary cleanup operations.
         """
+        logging.info("Inference Coordinator: wire traffic\n%s", self.wire_metrics.format_summary())
         if self.schedule_output_path and self.schedule_records:
             schedule_data = {
                 "policy": self.prefix_caching_coordinator_policy.value,

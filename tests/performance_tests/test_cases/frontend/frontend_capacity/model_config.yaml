@@ -1,0 +1,74 @@
+# Model-free capacity test for the inference frontend and coordinator.
+#
+# Driven by run_frontend_perf_test.sh, which needs no checkpoint and no GPU: the
+# benchmark starts a real coordinator process and fake ZMQ engines. A regression
+# here therefore points at the frontend, the InferenceClient or the coordinator,
+# never at a kernel or a model change.
+MODEL: frontend
+
+# Paths to sweep. 'client' isolates the ZMQ hop and the coordinator's routing
+# loop; 'http' adds Quart, tokenization and OpenAI response assembly; ':stream'
+# adds one detokenize step and one SSE flush per generated token. Comparing the
+# three localizes any regression to a layer.
+PATHS:
+  - client
+  - http
+  - http:stream
+
+CONCURRENCY: "1,8,32,128,512"
+SECONDS_PER_LEVEL: 5
+WARMUP_SECONDS: 2
+NUM_INPUT_TOKENS: 512
+NUM_OUTPUT_TOKENS: 64
+NUM_ENGINES: 1
+# How long a fake engine holds a request. Roughly a real decode of 64 tokens, and
+# non-zero so the high concurrency levels have genuinely overlapping requests.
+# Keep it an order of magnitude above the fake engine's 1 ms poll granularity, or
+# per-request latency starts depending on load and scaling_efficiency skews.
+ENGINE_LATENCY_MS: 10
+MAX_REQUESTS: 1024
+
+# Large prompts expose sequence-length-dependent serialization and coordinator
+# overhead that the 512-token capacity sweep cannot see. They run serially with
+# no simulated engine compute, so these numbers measure only request-path work;
+# applying the high-concurrency grid here would instead measure Python heap
+# pressure and the fake engine's unavoidable prompt decode.
+LONG_SEQUENCE_LENGTHS: "50000,100000,150000,200000"
+LONG_SEQUENCE_CONCURRENCY: "1"
+LONG_SEQUENCE_ENGINE_LATENCY_MS: 0
+
+# Gated metrics. Deliberately excludes max_stable_concurrency and
+# scaling_efficiency: both are step functions over the sampled concurrency grid,
+# so they flip between neighbouring levels under normal noise. They are recorded
+# in baseline_values.json and printed for humans;
+# peak_throughput_req_per_sec is the continuous stand-in that CI compares.
+METRICS:
+  - throughput_req_per_sec
+  - peak_throughput_req_per_sec
+  - p99_latency_ms
+  - request_bytes_per_request
+  - reply_bytes_per_request
+
+# Past saturation, p99 stops describing the frontend and starts describing the
+# queue the load generator built in front of it. HTTP saturates at concurrency
+# 8. Throughput at individual saturated levels can move between neighbouring
+# levels under normal node noise, so unstable points are not gated; each path's
+# peak_throughput_req_per_sec summary remains gated.
+METRICS_EXCLUDE:
+  - keys: "http*_concurrency_32"
+    metrics: [p99_latency_ms]
+  - keys: "*_concurrency_128"
+    metrics: [p99_latency_ms]
+  - keys: "*_concurrency_512"
+    metrics: [p99_latency_ms]
+  - keys: "client_isl_512_concurrency_128"
+    metrics: [throughput_req_per_sec]
+  - keys: "http_stream_isl_512_concurrency_8"
+    metrics: [throughput_req_per_sec]
+  - keys: "http_stream_isl_512_concurrency_32"
+    metrics: [throughput_req_per_sec]
+
+# Wider than the 10% default: this benchmark competes with whatever else shares
+# the node's CPU, and it has no GPU work to hide behind.
+TOLERANCE_PCT: 25
+UPPER_TOLERANCE_PCT: 40

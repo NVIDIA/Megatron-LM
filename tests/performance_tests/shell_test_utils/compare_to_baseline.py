@@ -18,19 +18,63 @@ for future runs, so we force a baseline refresh instead.
 
 Default tol is 10% (configurable via TOLERANCE_PCT in model_config.yaml).
 Default UPPER_TOL is 20% (configurable via UPPER_TOLERANCE_PCT, throughput only).
+
+A metric can be gated for most result keys but not all. METRICS_EXCLUDE in
+model_config.yaml drops individual metrics from individual keys:
+
+    METRICS_EXCLUDE:
+      - keys: "*_concurrency_512"
+        metrics: [p99_latency_ms]
+
+``keys`` is an fnmatch pattern over the result keys. Excluded metrics are still
+recorded in baseline_values.json and printed, just not asserted on.
 """
 
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import sys
 from pathlib import Path
 
 import yaml
 
-THROUGHPUT_METRICS = {"throughput_tok_per_sec"}
-LATENCY_METRICS = {"avg_latency_ms", "p50_latency_ms", "p99_latency_ms", "tpot_ms_per_tok"}
+THROUGHPUT_METRICS = {
+    "throughput_tok_per_sec",
+    # Frontend capacity test (frontend_capacity_benchmark.py).
+    "throughput_req_per_sec",
+    "peak_throughput_req_per_sec",
+    "max_stable_concurrency",
+    "scaling_efficiency",
+}
+LATENCY_METRICS = {
+    "avg_latency_ms",
+    "p50_latency_ms",
+    "p99_latency_ms",
+    "tpot_ms_per_tok",
+    # Payload sizes are latency-style: smaller is better, and growth is a
+    # regression whether or not throughput has caught up with it yet.
+    "request_bytes_per_request",
+    "reply_bytes_per_request",
+}
+
+
+def _excluded_metrics(batch_key: str, rules: list) -> set[str]:
+    """Metrics that must not be asserted on for ``batch_key``.
+
+    Args:
+        batch_key: A key in results.json / baseline_values.json.
+        rules: The METRICS_EXCLUDE list from model_config.yaml.
+
+    Returns:
+        set[str]: Names of metrics to skip for this key.
+    """
+    excluded: set[str] = set()
+    for rule in rules:
+        if fnmatch.fnmatch(batch_key, rule.get("keys", "")):
+            excluded.update(rule.get("metrics") or [])
+    return excluded
 
 
 def _check(
@@ -103,6 +147,7 @@ def main() -> int:
     tol = float(config.get("TOLERANCE_PCT", 10)) / 100.0
     upper_tol = float(config.get("UPPER_TOLERANCE_PCT", 20)) / 100.0
     metrics: list[str] = list(config.get("METRICS") or sorted(THROUGHPUT_METRICS | LATENCY_METRICS))
+    exclude_rules: list = list(config.get("METRICS_EXCLUDE") or [])
 
     print(f"Comparing {args.results} vs {args.baseline}")
     print(
@@ -119,8 +164,18 @@ def main() -> int:
             continue
         print(f"\n[{batch_key}]")
         measured_entry = results[batch_key]
+        excluded = _excluded_metrics(batch_key, exclude_rules)
         for metric in metrics:
             if metric not in baseline_entry or metric not in measured_entry:
+                continue
+            if metric in excluded:
+                measured = measured_entry[metric]
+                baseline_value = baseline_entry[metric]
+                delta_pct = (measured - baseline_value) / baseline_value * 100
+                print(
+                    f"  SKIP {metric:30s} measured={measured:10.3f}  "
+                    f"baseline={baseline_value:10.3f}  delta={delta_pct:+6.2f}%  (not gated)"
+                )
                 continue
             higher_is_better = metric in THROUGHPUT_METRICS
             ok, line = _check(
