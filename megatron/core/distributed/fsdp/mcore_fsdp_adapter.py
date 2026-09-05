@@ -555,7 +555,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             device: Device whose type is used to construct the data-parallel mesh.
                 Defaults to CUDA.
             pg_collection: Explicit process groups. The ``dp_cp`` group defines the
-                data-parallel mesh.
+                data- and context-parallel sharding mesh, and ``cp`` defines the
+                context-parallel communication group.
 
         Raises:
             ImportError: If the Megatron FSDP implementation is unavailable.
@@ -715,7 +716,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         """
         if disable_bucketing:
             raise ValueError("MFSDP v2 does not support disabling bucketing.")
-        if not hasattr(pg_collection, 'dp_cp'):
+        if pg_collection.dp_cp is None:
             raise ValueError("MFSDP v2 requires an explicit dp_cp process group.")
 
         if config.mtp_detach_heads:
@@ -727,11 +728,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             # silently inflated norm.
             raise ValueError("MFSDP v2 does not currently support mtp_detach_heads.")
 
-        unsupported_parallelisms = [
-            "tensor_model_parallel_size",
-            "pipeline_model_parallel_size",
-            "context_parallel_size",
-        ]
+        unsupported_parallelisms = ["tensor_model_parallel_size", "pipeline_model_parallel_size"]
         if any(getattr(config, parallelism) != 1 for parallelism in unsupported_parallelisms):
             raise ValueError(
                 "MFSDP v2 does not currently support: "
@@ -743,13 +740,35 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         # The config validates the requested topology, while these checks validate the
         # materialized topology supplied by the caller's process-group collection.
-        for group_name in ("tp", "pp", "cp"):
+        for group_name in ("tp", "pp"):
             group = getattr(pg_collection, group_name, None)
             if group is not None and group.size() != 1:
                 raise ValueError(
                     f"MFSDP v2 currently requires {group_name.upper()} process-group size 1, "
                     f"got {group.size()}."
                 )
+
+        cp_group = pg_collection.cp
+        if cp_group is None:
+            if config.context_parallel_size != 1:
+                raise ValueError(
+                    "MFSDP v2 requires an explicit CP process group when "
+                    f"context_parallel_size={config.context_parallel_size}."
+                )
+        elif cp_group.size() != config.context_parallel_size:
+            raise ValueError(
+                "MFSDP v2 requires the CP process-group size to match "
+                f"context_parallel_size={config.context_parallel_size}, got {cp_group.size()}."
+            )
+        elif pg_collection.dp_cp.size() % cp_group.size() != 0:
+            raise ValueError(
+                "MFSDP v2 requires the dp_cp process-group size to be divisible by the "
+                f"CP process-group size, got {pg_collection.dp_cp.size()} and {cp_group.size()}."
+            )
+        elif not set(dist.get_process_group_ranks(cp_group)).issubset(
+            dist.get_process_group_ranks(pg_collection.dp_cp)
+        ):
+            raise ValueError("MFSDP v2 requires the dp_cp process group to contain the CP group.")
 
         if config.expert_model_parallel_size > 1:
             if (

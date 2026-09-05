@@ -30,6 +30,7 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
+from megatron.core.utils import get_batch_on_this_cp_rank
 from tests.unit_tests.test_utilities import Utils
 
 logger = logging.getLogger(__name__)
@@ -471,6 +472,179 @@ class TestMcoreAdapterDense:
             expected_pre_clip_norm > clip_grad
         ), "Test gradients must exceed the clipping threshold to exercise clipping."
         torch.testing.assert_close(global_norm(updates), clip_grad, rtol=1e-3, atol=0)
+
+
+class TestMcoreAdapterContextParallel:
+    """Exercise MFSDP v2 gradient sharding over the combined DP-CP domain."""
+
+    def setup_method(self):
+        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        self.cp_size = 2
+        if self.world_size < self.cp_size or self.world_size % self.cp_size:
+            pytest.skip("MFSDP v2 CP requires an even world size of at least two.")
+        Utils.initialize_model_parallel(1, 1, context_parallel_size=self.cp_size)
+        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model_parallel_cuda_manual_seed(1234)
+
+    def teardown_method(self):
+        _destroy_model_parallel()
+
+    def test_cp_hybrid_model_matches_reference(self, monkeypatch):
+        """MFSDP CP training matches an unsharded HybridModel reference."""
+        monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
+        monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
+        monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
+        sequence_length = 8 * self.cp_size
+        vocab_size = 128
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            ffn_hidden_size=128,
+            context_parallel_size=self.cp_size,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            gradient_accumulation_fusion=False,
+            attention_backend=AttnBackend.flash,
+        )
+
+        def build_model():
+            return HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=vocab_size,
+                max_sequence_length=sequence_length,
+                hybrid_layer_pattern="*",
+                share_embeddings_and_output_weights=False,
+                pg_collection=self.pg_collection,
+            ).cuda()
+
+        torch.manual_seed(1234)
+        reference_model = build_model()
+        model = build_model()
+        model.load_state_dict(reference_model.state_dict())
+        reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=model,
+            pg_collection=self.pg_collection,
+        )
+        optimizer_config = OptimizerConfig(
+            optimizer="adam",
+            lr=1.0e-2,
+            weight_decay=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_distributed_optimizer=False,
+            clip_grad=0.0,
+        )
+        reference_optimizer = get_megatron_optimizer(
+            optimizer_config,
+            [reference_model],
+            pg_collection=self.pg_collection,
+            use_gloo_process_groups=False,
+        )
+        optimizer = get_megatron_optimizer(
+            replace(optimizer_config),
+            [model],
+            pg_collection=self.pg_collection,
+            use_gloo_process_groups=False,
+        )
+        assert isinstance(optimizer, FullyShardedOptimizer)
+        optimizer.reload_model_params()
+
+        batch_size = 2
+        global_batch_size = batch_size * (self.world_size // self.cp_size)
+        input_ids = (
+            torch.arange(global_batch_size * sequence_length, device="cuda").view(
+                global_batch_size, sequence_length
+            )
+            % vocab_size
+        )
+        labels = (input_ids + 1) % vocab_size
+        position_ids = torch.arange(sequence_length, device="cuda").repeat(global_batch_size, 1)
+        dp_rank = self.pg_collection.dp.rank()
+        batch_slice = slice(dp_rank * batch_size, (dp_rank + 1) * batch_size)
+        batch = get_batch_on_this_cp_rank(
+            {
+                "tokens": input_ids[batch_slice],
+                "labels": labels[batch_slice],
+                "position_ids": position_ids[batch_slice],
+                "cu_seqlens": None,
+            },
+            is_hybrid_cp=False,
+            cp_group=self.pg_collection.cp,
+        )
+
+        expected_ranks = set(torch.distributed.get_process_group_ranks(self.pg_collection.dp_cp))
+        model_inputs = {
+            "input_ids": batch["tokens"],
+            "position_ids": batch["position_ids"],
+            "attention_mask": None,
+            "labels": batch["labels"],
+        }
+        for step in range(5):
+            reference_optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
+
+            reference_loss = reference_model(**model_inputs).float().mean()
+            reference_loss.backward()
+            reference_gradients = [
+                parameter.grad
+                for parameter in reference_model.parameters()
+                if parameter.requires_grad
+            ]
+            assert reference_gradients and all(
+                gradient is not None for gradient in reference_gradients
+            )
+            for gradient in reference_gradients:
+                torch.distributed.all_reduce(
+                    gradient, op=torch.distributed.ReduceOp.AVG, group=self.pg_collection.dp_cp
+                )
+
+            loss = model(**model_inputs).float().mean()
+            loss.backward()
+            if step == 0:
+                gradients = [
+                    parameter.grad for parameter in model.parameters() if parameter.requires_grad
+                ]
+                assert gradients and all(isinstance(gradient, DTensor) for gradient in gradients)
+                assert all(gradient.placements == (Shard(0),) for gradient in gradients)
+                assert all(torch.isfinite(gradient.to_local()).all() for gradient in gradients)
+                assert all(
+                    set(gradient.device_mesh.mesh.flatten().tolist()) == expected_ranks
+                    for gradient in gradients
+                )
+
+            reference_success, _, _ = reference_optimizer.step()
+            success, _, _ = optimizer.step()
+            assert reference_success and success
+
+            step_losses = torch.stack((reference_loss.detach(), loss.detach()))
+            torch.distributed.all_reduce(
+                step_losses, op=torch.distributed.ReduceOp.AVG, group=self.pg_collection.dp_cp
+            )
+            assert torch.isfinite(step_losses).all()
+            torch.testing.assert_close(step_losses[1], step_losses[0], rtol=1e-3, atol=1e-3)
+            if step == 0:
+                initial_losses = step_losses.clone()
+
+        if torch.distributed.get_rank() == 0:
+            logger.info(
+                "Reference/MFSDP CP losses: initial=%s, final=%s",
+                initial_losses.tolist(),
+                step_losses.tolist(),
+            )
+        assert torch.all(step_losses < initial_losses)
 
 
 class TestMcoreAdapterExpertParallel:
