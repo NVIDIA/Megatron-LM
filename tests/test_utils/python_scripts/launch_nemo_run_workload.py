@@ -136,6 +136,13 @@ def _collect_failure_logs(workdir: pathlib.Path) -> list[str]:
 @click.option("--scope", required=True, type=str, help="Scope of the workload")
 @click.option("--model", required=True, type=str, help="Model of the workload")
 @click.option("--test-case", required=True, type=str, help="Test case of the workload")
+@click.option(
+    "--unit-test-files",
+    required=False,
+    type=str,
+    default="",
+    help="Base64url-encoded JSON list of exact unit-test files",
+)
 @click.option("--environment", required=True, type=str, help="Environment of the workload")
 @click.option("--platform", required=True, type=str, help="Platform of the workload")
 @click.option("--container-image", required=True, type=str, help="Container image of the workload")
@@ -168,6 +175,7 @@ def main(
     scope,
     model,
     test_case,
+    unit_test_files,
     environment,
     platform,
     container_image,
@@ -228,6 +236,7 @@ def main(
             "OUTPUT_PATH": os.getcwd(),
             "ENABLE_LIGHTWEIGHT_MODE": str(enable_lightweight_mode).lower(),
             "N_REPEAT": str(n_repeat),
+            "UNIT_TEST_FILES_B64": unit_test_files,
             "CLUSTER": "dgxh100_dgxc",
             "NCCL_DEBUG": "INFO",
             "NCCL_DEBUG_FILE": "/opt/megatron-lm/assets_dir/logs/nccl_debug.log",

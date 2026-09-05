@@ -39,6 +39,10 @@ inputs:
   test_case:
     description: Test case to launch
     required: true
+  unit_test_files:
+    description: "Base64url-encoded JSON list of exact unit-test files. Empty runs the full bucket."
+    required: false
+    default: ""
   model:
     description: Model to launch
     required: false
@@ -116,8 +120,11 @@ runs:
     - name: Create run-script (unit test)
       shell: bash -x -e -u -o pipefail {0}
       if: inputs.is_unit_test == 'true'
+      env:
+        UNIT_TEST_FILES_B64: ${{ inputs.unit_test_files }}
       run: |
         echo "::group::Create run-script"
+        printf '%s' "$UNIT_TEST_FILES_B64" > unit-test-files.b64
         cmd=$(cat <<'RUN_TEST_EOF'
         #!/bin/bash
 
@@ -134,6 +141,7 @@ runs:
           --scope unit-tests \
           --model unit-tests \
           --test-case "${{ inputs.test_case }}" \
+          --unit-test-files "$(cat unit-test-files.b64)" \
           --environment dev \
           --platform ${{ inputs.platform }} \
           --tag ${{ inputs.tag }} \

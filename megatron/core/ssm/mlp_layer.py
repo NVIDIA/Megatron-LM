@@ -11,7 +11,7 @@ from megatron.core.transformer import (
 
 
 class MLPLayer(TransformerLayer):
-    """Drop-in replacement for TransformerLayer but initializes only an MLP via the spec."""
+    """Drop-in replacement that initializes only an MLP through the layer spec."""
 
     def __init__(
         self,
