@@ -17,6 +17,8 @@ implementation:
 
 """
 
+import json
+
 import pytest
 
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
@@ -25,6 +27,9 @@ from megatron.core.tokenizers.text.parsers.deepseek_r1_reasoning_parser import (
 )
 from megatron.core.tokenizers.text.parsers.nemotron_v3_reasoning_parser import (
     NemotronV3ReasoningParser,
+)
+from megatron.core.tokenizers.text.parsers.qwen3_coder_tool_parser import (
+    _Qwen3CoderToolParser,
 )
 
 # (text, kwargs, expected_content, expected_info)
@@ -133,3 +138,102 @@ def test_tool_call_marker_does_not_end_reasoning_unless_configured():
     model_output = "reasoning<tool_call>not enabled</tool_call>"
 
     assert DeepSeekR1ReasoningParser.parse(model_output) == ("", {"reasoning": model_output})
+
+
+# ---------------------------------------------------------------------------
+# Qwen3-Coder tool parser: argument coercion
+# ---------------------------------------------------------------------------
+# Expected values here are what vLLM 0.25.1 actually returned when the same
+# inputs were run through it (`tool_parser: qwen3_coder`, which resolves to
+# Qwen3EngineToolParser -> Qwen3ParserToolAdapter -> the ParserEngine in
+# vllm/parser/qwen3.py), not values derived from reading the source.
+#
+# The engine strips each value in `_qwen3_arg_converter` and then applies
+# `coerce_to_schema_type` from vllm/tool_parsers/utils.py, which tries the
+# property's declared types in the order
+# null > integer > number > boolean > object > array > string and falls back to
+# a plain JSON parse, then to the raw string.
+
+COERCION_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "t",
+            "parameters": {
+                "properties": {
+                    "s": {"type": "string"},
+                    "i": {"type": "integer"},
+                    "n": {"type": "number"},
+                    "b": {"type": "boolean"},
+                    "o": {"type": "object"},
+                    "maybe": {"anyOf": [{"type": "object"}, {"type": "null"}]},
+                    "choice": {"enum": ["a", "b", None]},
+                }
+            },
+        },
+    }
+]
+
+
+def coerce(param, value):
+    """Run one parameter through the tool parser and return its argument value."""
+    text = (
+        f"<tool_call>\n<function=t>\n<parameter={param}>\n{value}\n"
+        "</parameter>\n</function>\n</tool_call>"
+    )
+    info = _Qwen3CoderToolParser().extract_tool_calls(text, tools=COERCION_TOOLS)
+    return json.loads(info["tool_calls"][0]["function"]["arguments"])[param]
+
+
+@pytest.mark.parametrize(
+    "param,value,expected",
+    [
+        # A "null" literal only becomes JSON null where the property admits
+        # null. For a string property the model meant the four characters.
+        ("s", "null", "null"),
+        ("s", "NULL", "NULL"),
+        ("maybe", "null", None),
+        ("choice", "null", None),
+        # An unconvertible boolean falls through to the raw string rather than
+        # silently degenerating to False.
+        ("b", "yes", "yes"),
+        ("b", "true", True),
+        ("b", "1", True),
+        ("b", "0", False),
+        # int() fails on "42.7", so the JSON fallback supplies the number.
+        ("i", "42.7", 42.7),
+        ("i", "7", 7),
+        ("i", "abc", "abc"),
+        # Values are stripped before coercion.
+        ("i", "  7  ", 7),
+        ("s", "   spaced   ", "spaced"),
+        # A whole float collapses to an int.
+        ("n", "5.0", 5),
+        ("n", "2.5", 2.5),
+        ("o", '{"a": 1}', {"a": 1}),
+        ("maybe", '{"k": "v"}', {"k": "v"}),
+    ],
+)
+def test_qwen3_coder_coercion_matches_vllm(param, value, expected):
+    assert coerce(param, value) == expected
+
+
+def test_qwen3_coder_arguments_are_always_valid_json():
+    """inf/nan cannot be serialized as JSON, so such values stay strings.
+
+    vllm/tool_parsers/utils.py guards this with _is_json_finite for the same
+    reason: json.dumps(inf) emits `Infinity`, which no JSON reader accepts.
+    """
+    for value in ("NaN", "Infinity", "-Infinity", "1e400"):
+        for param in ("n", "i", "o"):
+            text = (
+                f"<tool_call>\n<function=t>\n<parameter={param}>\n{value}\n"
+                "</parameter>\n</function>\n</tool_call>"
+            )
+            info = _Qwen3CoderToolParser().extract_tool_calls(text, tools=COERCION_TOOLS)
+            raw = info["tool_calls"][0]["function"]["arguments"]
+
+            def _bare(constant):
+                raise AssertionError(f"emitted bare {constant} in {raw}")
+
+            json.loads(raw, parse_constant=_bare)
