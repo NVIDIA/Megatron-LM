@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import warnings
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Protocol, Union
@@ -26,6 +27,7 @@ from megatron.core.ssm.mamba_context_parallel import (
 from megatron.core.ssm.utils import _split_tensor_factory
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -49,6 +51,28 @@ except ImportError:
     chunk_gated_delta_rule = None
 
     HAVE_FLA = False
+
+try:
+    from fla.utils import FLA_DISABLE_TENSOR_CACHE
+except ImportError:
+    # Guarded separately from the block above: an fla build without this symbol is
+    # still a usable fla, and folding the import into that try would downgrade it to
+    # "FLA is not installed". Assume the cache is disabled so we never block a capture
+    # we cannot actually verify - but say so, because that assumption is exactly what
+    # _GDNBase._check_fla_tensor_cache_disabled exists to avoid making silently.
+    FLA_DISABLE_TENSOR_CACHE = True
+    warnings.warn(
+        "fla.utils.FLA_DISABLE_TENSOR_CACHE not found; GDN cannot verify that fla's "
+        "tensor cache is disabled before capturing THD CUDA graphs. Set "
+        "FLA_DISABLE_TENSOR_CACHE=1 manually if you intend to capture.",
+        stacklevel=2,
+    )
+
+# Chunk size fla's varlen kernels decompose sequences with. Must track both
+# ``fla.ops.gated_delta_rule.chunk_gated_delta_rule``'s ``chunk_size`` default and
+# ``fla.modules.conv``'s ``BT`` default; the chunk_indices tables we build below are
+# consumed by both.
+_FLA_CHUNK_SIZE = 64
 
 __all__ = [
     "HAVE_FLA",
@@ -161,6 +185,17 @@ class _GDNBase(MegatronModule):
             )
 
         super().__init__(config)
+
+        self._check_fla_tensor_cache_disabled(config)
+
+        # Single-entry ``(cu_seqlens, cpu_mirror)`` cache for static
+        # (CUDA-graph-capturable) cu_seqlens buffers - see _cu_seqlens_cpu_mirror.
+        # The source tensor is kept alive by this reference so ``is`` can never
+        # alias a freed tensor that happens to be reallocated at the same address.
+        self._cu_seqlens_cpu_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None
+        # Config-derived constants for _fixed_shape_chunk_indices, materialized lazily
+        # once the device is known: {(nt_max, device): slot_arange}.
+        self._chunk_slot_cache: dict[tuple, torch.Tensor] = {}
 
         # Attributes from arguments
         self.layer_number = layer_number
@@ -480,30 +515,334 @@ class _GDNBase(MegatronModule):
         raise NotImplementedError
 
     def _resolve_cu_seqlens(
-        self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
+        self,
+        cu_seqlens_padded,
+        cu_seqlens_actual,
+        total_seq_len,
+        name,
+        cp_size: int = 1,
+        validate: bool = True,
     ) -> torch.Tensor:
-        """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
+        """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding.
+
+        Args:
+            validate: Whether to run the consistency checks. They read cu_seqlens
+                *values* on the host, so the caller must pass ``False`` while a CUDA
+                graph is being captured. Kept as an explicit argument rather than
+                probing the stream here so the policy lives with the caller and this
+                stays a pure metadata resolver.
+        """
         if cu_seqlens_padded is not None:
             cu_seqlens = cu_seqlens_padded
         else:
             cu_seqlens = cu_seqlens_actual
 
-        total_cu = cu_seqlens[-1].cpu().item()
-        if total_cu != total_seq_len:
-            raise ValueError(
-                f"GDN: {name}[-1]={total_cu} does not match "
-                f"total_sequence_length={total_seq_len}. "
-                f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
-            )
+        if validate:
+            total_cu = cu_seqlens[-1].cpu().item()
+            if total_cu != total_seq_len:
+                raise ValueError(
+                    f"GDN: {name}[-1]={total_cu} does not match "
+                    f"total_sequence_length={total_seq_len}. "
+                    f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
+                )
 
-        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        if (seq_lengths % cp_size != 0).any():
-            raise ValueError(
-                f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "
-                f"but got lengths: {seq_lengths.tolist()}"
-            )
+            seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            if (seq_lengths % cp_size != 0).any():
+                raise ValueError(
+                    f"All per-sequence lengths in cu_seqlens must be divisible by "
+                    f"cp_size={cp_size}, but got lengths: {seq_lengths.tolist()}"
+                )
 
         return cu_seqlens
+
+    def _fla_varlen_kwargs(
+        self,
+        cu_seqlens: Optional[torch.Tensor],
+        cp_context=None,
+        extra_tokens: int = 0,
+        cu_seqlens_unpadded: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Capture-safe varlen metadata to forward to fla's chunked kernels.
+
+        fla's varlen kernels need a ``[NT, 2]`` ``chunk_indices`` table mapping each
+        chunk slot to ``(sequence index, chunk index within that sequence)``. Left to
+        itself fla builds that table on the host from the *contents* of ``cu_seqlens``
+        (``prepare_chunk_indices``), which CUDA graph capture forbids. This returns
+        whichever of fla's two escape hatches applies:
+
+        * ``chunk_indices``: a device-built, fixed-shape table (see
+          :meth:`_fixed_shape_chunk_indices`). This is the capture-safe path.
+        * ``cu_seqlens_cpu``: a cached CPU mirror, which only removes the D2H half of
+          fla's host build. Eager-only fallback, used when the static THD bounds
+          needed to fix the table's shape are not configured.
+
+        The two are mutually exclusive by fla's own contract: ``cu_seqlens_cpu`` is
+        read only when ``chunk_indices is None`` (``fla/ops/gated_delta_rule/chunk.py``
+        and ``fla/modules/conv/triton/ops.py``), so computing the mirror when a static
+        table exists would be dead work that can additionally fail capture.
+
+        Args:
+            cu_seqlens: The cu_seqlens actually passed to the fla call, i.e. after any
+                caller-side padding. ``None`` (SBHD) returns an empty dict.
+            cp_context: The ``FLACPContext`` passed to the same fla call, if any.
+            extra_tokens: Tokens the caller appended to ``cu_seqlens``'s last sequence
+                beyond the configured static buffer size (conv alignment padding).
+            cu_seqlens_unpadded: The tensor ``cu_seqlens`` was derived from, before those
+                ``extra_tokens`` were added. Required whenever ``extra_tokens`` is
+                non-zero. Passing it lets the CPU mirror be taken from the buffer both
+                call sites share, so the padded variant is host-side arithmetic on a cache
+                hit instead of a second D2H sync that evicts the unpadded entry.
+        """
+        assert extra_tokens == 0 or cu_seqlens_unpadded is not None, (
+            "cu_seqlens_unpadded is required when extra_tokens is non-zero, otherwise the "
+            "CPU mirror would double-count the padding."
+        )
+        if cu_seqlens is None:
+            return {}
+
+        # --- CP > 1 is deliberately not handled here. ---------------------------
+        # When a cp_context is supplied, fla overrides cu_seqlens with the *rank-local*
+        # partition (fla/ops/gated_delta_rule/chunk.py: `cu_seqlens = cp_context.cu_seqlens`;
+        # fla/modules/conv/cp/ops.py builds its table from cp_context.cu_seqlens), but it
+        # does *not* override a caller-supplied chunk_indices - it is consumed verbatim.
+        # Any table we build here is derived from the global cu_seqlens and would
+        # therefore describe the wrong tensor. GDN chunkwise CP is out of scope for CUDA
+        # graph capture today, so we simply hand the job back to fla, which derives the
+        # table from the CP-local cu_seqlens correctly (at the cost of a host round trip
+        # that only matters under capture).
+        #
+        # To lift this later: build the table from ``cp_context.cu_seqlens`` and derive
+        # nt_max from the CP-local token count (``max_seqlen_per_dp_cp_rank`` without the
+        # ``context_parallel_size`` factor in :meth:`_fixed_shape_chunk_indices`). The
+        # ``cp_context`` argument exists so that change is local to this method.
+        if cp_context is not None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "GDN: CUDA graph capture is not supported with GDN chunkwise context "
+                    "parallelism. fla ignores a caller-supplied chunk_indices override "
+                    "for the CP-local cu_seqlens, so no capture-safe table can be built."
+                )
+            return {}
+
+        chunk_indices = self._fixed_shape_chunk_indices(cu_seqlens, extra_tokens=extra_tokens)
+        if chunk_indices is not None:
+            return {"chunk_indices": chunk_indices}
+        if cu_seqlens_unpadded is None:
+            return {"cu_seqlens_cpu": self._cu_seqlens_cpu_mirror(cu_seqlens)}
+        return {
+            "cu_seqlens_cpu": self._cu_seqlens_cpu_mirror(
+                cu_seqlens_unpadded, extra_tokens=extra_tokens
+            )
+        }
+
+    @staticmethod
+    def _check_fla_tensor_cache_disabled(config) -> None:
+        """Reject CUDA graph capture of GDN while fla's tensor cache is live.
+
+        ``fla.ops.utils.prepare_chunk_offsets`` is ``@tensor_cache``'d on argument
+        identity, and it produces the ``chunk_offsets`` that fla's ``h``/``dh`` writer
+        kernels index with. Static THD packing reuses one ``cu_seqlens`` tensor object
+        across warmup/capture/replay, which is exactly the cache-hit condition: the hit
+        elides those device kernels from the graph and freezes ``chunk_offsets`` at the
+        warmup packing, while the ``chunk_indices`` table supplied by
+        :meth:`_fla_varlen_kwargs` is recomputed from the real packing on every replay.
+        The two then disagree and fla's ``row == chunk_offsets[seq] + intra`` invariant -
+        which the reader kernels rely on to index ``h`` - silently breaks.
+
+        This has to be an error rather than a documentation note: the failure mode is a
+        slowly diverging loss, with no crash and no warning. It is checked at construction
+        rather than at capture time because everything it reads is known before the model
+        is built, and because raising inside a live ``cudaStreamBeginCapture`` region
+        aborts the capture and surfaces as an unrelated downstream error.
+
+        Both predicates mirror ``TransformerConfig.__post_init__``: the THD one guards the
+        sibling ``--thd-max-packed-sequences`` requirement, and the capture one is its
+        ``cuda_graph_captures_attention``. Reusing them keeps the two checks from drifting.
+        """
+        if FLA_DISABLE_TENSOR_CACHE:
+            return
+
+        # SBHD is unaffected. fla only calls the @tensor_cache'd prepare_chunk_offsets on
+        # the varlen branch (``cu_seqlens is None`` -> ``chunk_offsets = None`` in
+        # fla/ops/common/chunk_delta_h.py), and with cu_seqlens None it never builds a
+        # chunk_indices table for those offsets to desynchronize from. So there is nothing
+        # to freeze, and SBHD capture must keep working without the environment variable.
+        is_thd = config.sequence_packing_scheduler is not None or config.dynamic_context_parallel
+        if not is_thd:
+            return
+
+        captures_attention = config.cuda_graph_impl == "full_iteration" or (
+            config.cuda_graph_impl in ("local", "transformer_engine")
+            and (not config.cuda_graph_modules or CudaGraphModule.attn in config.cuda_graph_modules)
+        )
+        if not captures_attention:
+            return
+
+        raise RuntimeError(
+            "GDN: capturing attention into a THD CUDA graph requires "
+            "FLA_DISABLE_TENSOR_CACHE=1. fla's @tensor_cache on prepare_chunk_offsets would "
+            "freeze chunk_offsets at the warmup packing and silently desynchronize it from "
+            "the chunk_indices recomputed on each replay, diverging the loss with no crash. "
+            "Set the environment variable before starting training, or drop attn from "
+            "--cuda-graph-modules."
+        )
+
+    def _cu_seqlens_cpu_mirror(
+        self, cu_seqlens: torch.Tensor, extra_tokens: int = 0
+    ) -> torch.Tensor:
+        """Return a CPU mirror of ``cu_seqlens``, without syncing during capture.
+
+        Eager-only fallback used by :meth:`_fla_varlen_kwargs` when the static THD
+        bounds are not configured. It removes the D2H half of fla's host-side
+        ``prepare_chunk_indices`` build, but not the H2D copy of the resulting table, so
+        it is *not* sufficient for CUDA graph capture.
+
+        Precondition: never called while capturing. :meth:`_fla_varlen_kwargs` only
+        reaches this fallback when :meth:`_fixed_shape_chunk_indices` returned ``None``,
+        and that raises under capture rather than returning ``None``. The ``.cpu()``
+        below would otherwise be an illegal D2H sync.
+
+        The cache holds a strong reference to the source tensor and compares with ``is``,
+        mirroring the contract of fla's own ``@tensor_cache``. Keying on bare ``id()``
+        would be unsafe: nothing keeps the source alive, so a freed tensor's address can
+        be reused by a new one and return a stale mirror.
+
+        Args:
+            cu_seqlens: Tensor to mirror. Callers pass the *unpadded* buffer so repeated
+                calls within a forward hit the same cache entry.
+            extra_tokens: Tokens the caller appended to the last sequence. Applied to a
+                copy of the cached mirror with host-side arithmetic, so a padded variant
+                costs no extra D2H sync and does not evict the unpadded entry.
+        """
+        cached = self._cu_seqlens_cpu_cache
+        if cached is not None and cached[0] is cu_seqlens:
+            cpu_mirror = cached[1]
+        else:
+            cpu_mirror = cu_seqlens.cpu()
+            self._cu_seqlens_cpu_cache = (cu_seqlens, cpu_mirror)
+        if extra_tokens:
+            cpu_mirror = cpu_mirror.clone()
+            cpu_mirror[-1] += extra_tokens
+        return cpu_mirror
+
+    def _fixed_shape_chunk_indices(
+        self, cu_seqlens: torch.Tensor, extra_tokens: int = 0, chunk_size: int = _FLA_CHUNK_SIZE
+    ) -> Optional[torch.Tensor]:
+        """Device-side, fixed-shape ``chunk_indices`` for fla's varlen kernels.
+
+        fla's chunked varlen kernels need a ``[NT, 2]`` table mapping each chunk slot to
+        ``(sequence index, chunk index within that sequence)``. fla builds it on the host
+        from the *contents* of ``cu_seqlens`` (``prepare_chunk_indices``), which is fatal
+        for CUDA graphs twice over:
+
+        1. the build itself is a host<->device round trip that capture forbids
+           (supplying ``cu_seqlens_cpu`` only removes the D2H half; the result is still
+           H2D-copied back);
+        2. even if it were capture-safe, ``NT`` and the table contents would be frozen at
+           capture time, while the static ``cu_seqlens`` buffer is refilled with a
+           *different* packing on every replay - so the graph would silently compute the
+           wrong chunk decomposition.
+
+        This builds the same table entirely with device ops and at a fixed ``NT_max``
+        upper bound, so the shape (and therefore the Triton grid) is a capture-time
+        constant while the *values* are recomputed by the replayed kernels from whatever
+        ``cu_seqlens`` holds. Note the name: only the *shape* is fixed, not the contents.
+
+        Slots past the real chunk count are pointed at sequence 0 with an intra-chunk
+        index beyond any possible sequence length, so every masked load/store in fla's
+        kernels (all gated on ``o_t < T``) turns them into no-ops. Real rows stay packed
+        contiguously from row 0 in sequence order, preserving fla's
+        ``row == chunk_offsets[seq] + intra`` invariant and keeping the padding rows
+        trailing (which ``chunk_o``'s unmasked ``h``/``dh`` loads rely on to stay in
+        bounds).
+
+        This is only needed for THD/varlen. In SBHD ``cu_seqlens`` is ``None``, fla never
+        builds the table at all, and ``NT`` is ``cdiv(T, BT)`` - a pure function of the
+        static tensor shape - so SBHD capture was always safe. The one exception is SBHD
+        with GDN chunkwise CP, which synthesizes a non-``None`` ``cu_seqlens``; that case
+        is filtered out by the CP guard in :meth:`_fla_varlen_kwargs` before reaching here.
+
+        Args:
+            cu_seqlens: The cu_seqlens the fla call will run on.
+            extra_tokens: Tokens the caller appended beyond the configured static buffer
+                size (conv alignment padding). Folded into the ``NT_max`` bound, since
+                under-sizing it silently drops chunks: ``NT`` is the Triton grid, so
+                surplus chunks are simply never launched.
+            chunk_size: Must match the chunk size the consuming fla kernel uses.
+
+        Returns:
+            The ``[NT_max, 2]`` table, or ``None`` when the static THD bounds are unknown,
+            in which case the caller lets fla build the table itself (eager-only path).
+        """
+        max_num_seqs = getattr(self.config, 'thd_max_packed_sequences', None)
+        max_seqlen = getattr(self.config, 'max_seqlen_per_dp_cp_rank', None)
+        if max_num_seqs is None or max_seqlen is None:
+            if torch.cuda.is_current_stream_capturing():
+                # TransformerConfig.__post_init__ already refuses this at startup for the
+                # supported launch paths ("THD CUDA Graph requires
+                # --thd-max-packed-sequences to be set"). This backstop only fires for
+                # callers that capture with cuda_graph_impl="none", e.g. an external or
+                # hand-rolled graph around the module.
+                raise RuntimeError(
+                    "GDN: cannot build a capture-safe chunk_indices table without "
+                    "thd_max_packed_sequences and max_seqlen_per_dp_cp_rank; see the "
+                    "THD CUDA Graph requirements validated in "
+                    "TransformerConfig.__post_init__."
+                )
+            return None
+
+        # Chunkwise CP never reaches here (see the CP guard in _fla_varlen_kwargs), so
+        # cu_seqlens still spans the full global sequence. Under dynamic CP the runtime
+        # group can be smaller than context_parallel_size, which makes this an
+        # overestimate: NT_max is only an upper bound, so the table stays correct and
+        # merely carries unused trailing slots. Threading the runtime cp size down from
+        # forward() would tighten it; dynamic CP cannot be captured anyway, so this only
+        # costs eager runs. Once chunkwise CP is supported, this becomes the CP-local
+        # token count.
+        total_t = int(max_seqlen) * int(self.config.context_parallel_size) + int(extra_tokens)
+        # Each sequence wastes at most one partial chunk, so the total chunk
+        # count never exceeds ceil(total_t / chunk_size) + num_sequences.
+        nt_max = (total_t + chunk_size - 1) // chunk_size + int(max_num_seqs)
+
+        lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        n_seq = lens.shape[0]
+        n_chunks = (lens + (chunk_size - 1)).div(chunk_size, rounding_mode='floor').to(torch.int64)
+        # offsets[i] = first chunk slot owned by sequence i; offsets[-1] = total.
+        # Bit-identical to fla's prepare_chunk_offsets, which the h/dh writer kernels
+        # index with - this is what keeps `row == chunk_offsets[seq] + intra` true.
+        offsets = torch.nn.functional.pad(n_chunks.cumsum(0), (1, 0))
+        slot = self._chunk_slot_arange(nt_max, cu_seqlens.device)
+        # searchsorted over offsets[1:] maps a slot to its owning sequence; slots
+        # past the last boundary come back as n_seq, which flags them unused.
+        seg_id = torch.searchsorted(offsets[1:].contiguous(), slot, right=True)
+        valid = seg_id < n_seq
+        seg_id = seg_id.clamp(max=n_seq - 1)
+        intra = slot - offsets[seg_id]
+        zero = torch.zeros((), device=cu_seqlens.device, dtype=torch.int64)
+        beyond = torch.full((), nt_max, device=cu_seqlens.device, dtype=torch.int64)
+        seg_id = torch.where(valid, seg_id, zero)
+        intra = torch.where(valid, intra, beyond)
+        return torch.stack([seg_id, intra], 1).to(cu_seqlens)
+
+    def _chunk_slot_arange(self, nt_max: int, device: torch.device) -> torch.Tensor:
+        """Cached ``arange(nt_max)`` used as the chunk-slot axis.
+
+        ``nt_max`` is a config-derived constant, so this tensor is identical on every
+        forward of every microbatch. Only *shape*-invariant state is cached here - the
+        table itself is deliberately never cached, because its values depend on the
+        contents of a ``cu_seqlens`` buffer that is refilled every microbatch.
+        """
+        key = (nt_max, device)
+        slot = self._chunk_slot_cache.get(key)
+        if slot is not None:
+            return slot
+        slot = torch.arange(nt_max, device=device, dtype=torch.int64)
+        if not torch.cuda.is_current_stream_capturing():
+            # Do not cache an allocation made inside a graph's private memory pool:
+            # that storage is not valid for use outside the graph. A cold cache during
+            # capture just means one extra (capturable) arange per replay.
+            self._chunk_slot_cache[key] = slot
+        return slot
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
