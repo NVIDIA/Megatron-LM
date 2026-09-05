@@ -11,6 +11,7 @@ Covers:
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from megatron.core.resharding.copy_services.base import (
     CopyService,
@@ -22,6 +23,7 @@ from megatron.core.resharding.copy_services.gloo_copy_service import GlooCopySer
 from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
 from megatron.core.resharding.copy_services.nixl_copy_service import NixlCopyService
 from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMCopyService
+from tests.unit_tests.test_utilities import Utils
 
 
 def _t():
@@ -175,6 +177,33 @@ class TestCopyServiceClose:
 def test_nixl_service_skips_redundant_process_group_barrier():
     """NIXL's ready/data protocol provides its own peer completion."""
     assert NixlCopyService.requires_process_group_barrier is False
+
+
+@pytest.mark.parametrize("service_cls", [NCCLCopyService, GlooCopyService])
+def test_local_copy_waits_for_current_stream(service_cls):
+    """A local copy must observe writes already queued on the caller's stream."""
+    Utils.initialize_distributed()
+    service = service_cls()
+    source = torch.zeros(1, device="cuda")
+    destination = torch.zeros_like(source)
+    torch.cuda.synchronize()
+
+    producer_gate = torch.cuda.Event()
+    release_stream = torch.cuda.Stream()
+    with torch.cuda.stream(release_stream):
+        torch.cuda._sleep(100_000_000)
+        producer_gate.record()
+
+    torch.cuda.current_stream().wait_event(producer_gate)
+    source.fill_(1)
+
+    service.submit_send(source, dist.get_rank(), task_id=0)
+    service.submit_recv(destination, dist.get_rank(), task_id=0)
+    service.run()
+
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(destination, source)
 
 
 def test_multiple_runs_per_plan_require_explicit_backend_support():
