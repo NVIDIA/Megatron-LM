@@ -270,13 +270,13 @@ variables:
     description: Type of publish (freeze or final release)
 
   RUN_LINEAR_STATUS:
-    value: "False"
+    value: "True"
     options:
       - "True"
       - "False"
     description: Reconcile functional-test failures against Linear
   RUN_LINEAR_WRITE:
-    value: "False"
+    value: "True"
     options:
       - "True"
       - "False"
