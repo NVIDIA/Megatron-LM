@@ -39,9 +39,14 @@ class HyperConnection(nn.Module):
         self.sinkhorn_iters = sinkhorn_iters
         self.eps = eps
         self.fn = nn.Parameter(torch.empty(mix, hc_mult * hidden_size, dtype=torch.float32))
-        self.base = nn.Parameter(torch.zeros(mix, dtype=torch.float32))
-        self.scale = nn.Parameter(torch.ones(3, dtype=torch.float32))
+        self.base = nn.Parameter(torch.empty(mix, dtype=torch.float32))
+        self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
         nn.init.xavier_uniform_(self.fn)
+        nn.init.zeros_(self.base)
+        nn.init.ones_(self.scale)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if x.dim() == 3:

@@ -20,6 +20,7 @@ from megatron.lite.model.protocol_utils import (
     nested_from_packed,
     pack_r3_replay_mask as _pack_r3_replay_mask,
     pack_routed_experts as _pack_routed_experts,
+    router_replay_roots as router_replay_roots,
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
@@ -36,6 +37,11 @@ from megatron.lite.primitive.parallel.thd import (
     unpack_thd_to_nested,
 )
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
+from megatron.lite.primitive.quantization import (
+    QATSpec,
+    apply_qat_to_chunks,
+    normalize_qat_spec,
+)
 from megatron.lite.runtime.contracts import OptimizerConfig, PackedBatch, ParallelConfig
 
 
@@ -61,6 +67,7 @@ class ImplConfig:
     mtp_num_layers: int | None = None
     num_nextn_predict_layers: int | None = None
     mtp_loss_scaling_factor: float = 0.1
+    qat: QATSpec | dict | None = None
 
 
 MODULE_MAP = {
@@ -265,7 +272,12 @@ def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
 
 
 def pack_routed_experts(model: nn.Module, batch: PackedBatch, routed_experts):
-    """Pack R3 routes using DS4's contiguous CP token layout."""
+    """Pack R3 routes using DS4's contiguous CP token layout.
+
+    The current rollout configuration does not run MTP, so the route layer axis
+    contains only main decoder routers.  If rollout later enables DeepSeek MTP
+    speculative decoding, this assumption must be reevaluated.
+    """
 
     return _pack_routed_experts(model, batch, routed_experts, contiguous=True)
 
@@ -274,16 +286,6 @@ def pack_r3_replay_mask(model: nn.Module, batch: PackedBatch) -> torch.Tensor:
     """Pack the causal R3 mask using DS4's contiguous CP token layout."""
 
     return _pack_r3_replay_mask(model, batch, contiguous=True)
-
-
-def router_replay_roots(chunk: nn.Module) -> list[nn.Module]:
-    """Return main decoder layers only; rollout R3 has no MTP layer axis."""
-
-    model = getattr(chunk, "model", chunk)
-    layers = getattr(model, "layers", None)
-    if layers is None:
-        return [chunk]
-    return list(layers.values())
 
 
 def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None:
@@ -418,6 +420,9 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
         for chunk in chunks:
             apply_offload(_iter_transformer_units(chunk), impl_cfg.offload, MODULE_MAP)
+
+    # Parametrize before optimizer construction so it captures the BF16 master.
+    apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
 
     optimizer = None
     finalize_grads = None

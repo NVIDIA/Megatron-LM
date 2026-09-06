@@ -188,6 +188,9 @@ def test_gqa_magi_branch_uses_dispatched_positions_and_runtime(monkeypatch):
     torch.nn.Module.__init__(attention)
     attention.num_heads_local = 4
     attention.num_kv_heads_local = 2
+    # lite replicates KV heads when num_key_value_heads < tp_size; the real
+    # __init__ sets this, and the magi branch reads it like every other path.
+    attention._replicate_kv = False
     attention.head_dim = 2
     attention.ps = SimpleNamespace(cp_size=2, cp_group=group)
     attention._output_gate = False

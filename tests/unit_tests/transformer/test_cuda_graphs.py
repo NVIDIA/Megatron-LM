@@ -3,11 +3,15 @@
 import gc
 import os
 import sys
+from contextlib import nullcontext
 
 import pytest
 import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
+import megatron.core.transformer.cuda_graphs as cuda_graphs_module
+import megatron.core.transformer.moe.paged_stash as paged_stash_module
+import megatron.core.transformer.transformer_config as transformer_config_module
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -30,6 +34,7 @@ from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.transformer.cuda_graph_config import validate_moe_cuda_graph_support
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
@@ -61,6 +66,21 @@ fp8_available, _ = check_fp8_support()
 
 def _base_cuda_graph_config(**kwargs) -> TransformerConfig:
     return TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, **kwargs)
+
+
+def _te_whole_moe_paged_stash_config(**overrides) -> TransformerConfig:
+    kwargs = {
+        "cuda_graph_impl": "transformer_engine",
+        "cuda_graph_modules": [CudaGraphModule.moe],
+        "num_moe_experts": 4,
+        "moe_token_dispatcher_type": "flex",
+        "moe_flex_dispatcher_backend": "hybridep",
+        "moe_expert_rank_capacity_factor": 1.2,
+        "moe_paged_stash": True,
+        "use_transformer_engine_op_fuser": True,
+    }
+    kwargs.update(overrides)
+    return _base_cuda_graph_config(**kwargs)
 
 
 def _validated_cuda_graph_cli_args(monkeypatch, cli_args=None, **overrides):
@@ -154,6 +174,103 @@ class TestCudaGraphConfigAndArguments:
                 offload_modules=['mlp_norm'],
                 num_moe_experts=4,
             )
+
+    def test_local_explicit_moe_graph_rejects_dropless_moe(self):
+        with pytest.raises(
+            AssertionError, match="moe cuda graph is only supported with drop-padding MoE"
+        ):
+            _base_cuda_graph_config(
+                cuda_graph_impl='local', cuda_graph_modules=[CudaGraphModule.moe], num_moe_experts=4
+            )
+
+    def test_local_inference_full_layer_graph_allows_dropless_moe(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='local',
+            cuda_graph_modules=[],
+            inference_cuda_graph_scope=InferenceCudaGraphScope.block,
+            num_moe_experts=4,
+        )
+
+        assert cfg.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+
+    @pytest.mark.parametrize(
+        "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
+    )
+    def test_te_whole_moe_graph_allows_sync_free_hybridep_paged_stash(
+        self, monkeypatch, cuda_graph_modules
+    ):
+        monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: True)
+        cfg = _te_whole_moe_paged_stash_config(
+            cuda_graph_modules=cuda_graph_modules, cuda_graph_warmup_steps=2
+        )
+        validate_moe_cuda_graph_support(cfg)
+
+        assert cfg.cuda_graph_modules == cuda_graph_modules
+
+    @pytest.mark.parametrize(
+        "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
+    )
+    def test_te_whole_moe_paged_stash_rejects_dynamic_microbatches(
+        self, monkeypatch, cuda_graph_modules
+    ):
+        monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: True)
+        with pytest.raises(AssertionError, match="require a fixed runtime microbatch schedule"):
+            _te_whole_moe_paged_stash_config(
+                cuda_graph_modules=cuda_graph_modules, cuda_graph_dynamic_microbatches=True
+            )
+
+    @pytest.mark.parametrize(
+        "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
+    )
+    @pytest.mark.parametrize("warmup_steps", [0, 1])
+    def test_te_whole_moe_paged_stash_requires_two_warmup_steps(
+        self, monkeypatch, cuda_graph_modules, warmup_steps
+    ):
+        monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: True)
+        with pytest.raises(AssertionError, match="require at least 2 cuda_graph_warmup_steps"):
+            _te_whole_moe_paged_stash_config(
+                cuda_graph_modules=cuda_graph_modules, cuda_graph_warmup_steps=warmup_steps
+            )
+
+    @pytest.mark.parametrize(
+        "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
+    )
+    def test_te_whole_moe_paged_stash_requires_minimum_te_version(
+        self, monkeypatch, cuda_graph_modules
+    ):
+        monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: False)
+
+        with pytest.raises(ValueError, match=r"Transformer Engine >= 2\.19\.0"):
+            _te_whole_moe_paged_stash_config(
+                cuda_graph_modules=cuda_graph_modules, cuda_graph_warmup_steps=2
+            )
+
+    def test_te_moe_router_paged_stash_still_allows_dynamic_microbatches(self):
+        cfg = _te_whole_moe_paged_stash_config(
+            cuda_graph_modules=[CudaGraphModule.moe_router], cuda_graph_dynamic_microbatches=True
+        )
+
+        assert cfg.cuda_graph_dynamic_microbatches
+
+    @pytest.mark.parametrize(
+        "cuda_graph_modules", [[CudaGraphModule.moe], []], ids=["explicit-moe", "full-layer"]
+    )
+    def test_te_whole_moe_graph_rejects_sync_free_hybridep_without_paged_stash(
+        self, cuda_graph_modules
+    ):
+        with pytest.raises(
+            AssertionError, match="sync-free HybridEP with rank capacity and paged stash"
+        ):
+            cfg = _base_cuda_graph_config(
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=cuda_graph_modules,
+                num_moe_experts=4,
+                moe_token_dispatcher_type="flex",
+                moe_flex_dispatcher_backend="hybridep",
+                moe_expert_rank_capacity_factor=1.2,
+                use_transformer_engine_op_fuser=True,
+            )
+            validate_moe_cuda_graph_support(cfg)
 
     def test_full_iteration_impl_requires_empty_scope(self):
         with pytest.raises(
@@ -911,6 +1028,135 @@ class TestParallelHybridBlockCudagraphs:
         )
 
 
+class TestHybridTECudaGraphDiscovery:
+    def test_hybrid_mtp_layers_are_flattened_and_adjacent_layers_are_grouped(self, monkeypatch):
+        from megatron.core.transformer import cuda_graphs
+
+        class FakeGraphLayer(torch.nn.Module):
+            def __init__(self, group_with_next=False, graphable=True):
+                super().__init__()
+                self.group_with_next = group_with_next
+                self.graphable = graphable
+                self.group_tail = None
+
+            def _can_group_te_cuda_graph_with(self, next_layer):
+                return self.group_with_next and next_layer.graphable
+
+            def _set_te_cuda_graph_group_tail(self, next_layer):
+                self.group_tail = next_layer
+
+        head = FakeGraphLayer(group_with_next=True)
+        tail = FakeGraphLayer()
+        eager = FakeGraphLayer(graphable=False)
+        mtp_stack = HybridStack.__new__(HybridStack)
+        torch.nn.Module.__init__(mtp_stack)
+        mtp_stack.layers = torch.nn.ModuleList([head, tail, eager])
+
+        monkeypatch.setattr(
+            cuda_graphs, '_layer_is_graphable', lambda layer, config: layer.graphable
+        )
+        callables = cuda_graphs._get_mtp_te_callables(mtp_stack, object())
+
+        assert callables == [head]
+        assert head.group_tail is tail
+
+        gpt_mtp_layer = FakeGraphLayer()
+        assert cuda_graphs._get_mtp_te_callables(gpt_mtp_layer, object()) == [gpt_mtp_layer]
+
+        class Holder:
+            pass
+
+        mtp_layer = Holder()
+        mtp_layer.mtp_model_layer = mtp_stack
+        chunk = Holder()
+        chunk.mtp = Holder()
+        chunk.mtp.layers = [mtp_layer]
+        assert cuda_graphs._is_mtp_te_callable(head, chunk)
+        assert cuda_graphs._is_mtp_te_callable(tail, chunk)
+        assert not cuda_graphs._is_mtp_te_callable(eager, Holder())
+
+    def test_capture_group_tail_does_not_change_module_registration(self):
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        class Config:
+            recompute_granularity = None
+            recompute_modules = []
+            fp8 = False
+            first_last_layers_bf16 = False
+
+        inner = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(inner)
+        inner.self_attention = torch.nn.Linear(2, 2)
+        inner.cross_attention = IdentityOp()
+        inner.mlp = IdentityOp()
+
+        head = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(head)
+        head.config = Config()
+        head.inner_layer = inner
+
+        tail = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(tail)
+        tail.capture_weight = torch.nn.Parameter(torch.ones(1))
+        object.__setattr__(tail, '_inner_is_partial_moe_capture', lambda: True)
+        object.__setattr__(tail, '_get_submodules_under_cudagraphs', lambda: [tail])
+
+        state_dict_keys = tuple(head.state_dict())
+        head._set_te_cuda_graph_group_tail(tail)
+
+        assert head._get_te_cuda_graph_group_tail() is tail
+        assert '_te_cuda_graph_group_tail' not in head._modules
+        assert tuple(head.state_dict()) == state_dict_keys
+        assert any(param is tail.capture_weight for param in head.parameters())
+
+        head.cuda_graphs = [object()]
+        head.train()
+        assert head._get_active_te_cuda_graph_group_tail() is tail
+        head.eval()
+        assert head._get_active_te_cuda_graph_group_tail() is None
+
+    def test_capture_group_does_not_cross_first_last_bf16_boundary(self):
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        class Config:
+            recompute_granularity = None
+            recompute_modules = []
+            fp8 = True
+            first_last_layers_bf16 = True
+            num_layers_at_start_in_bf16 = 1
+            num_layers_at_end_in_bf16 = 1
+            num_layers = 4
+
+        inner = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(inner)
+        inner.self_attention = torch.nn.Linear(2, 2)
+        inner.cross_attention = IdentityOp()
+        inner.mlp = IdentityOp()
+        inner.is_mtp_layer = False
+
+        head = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(head)
+        head.config = Config()
+        head.inner_layer = inner
+
+        tail = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
+        torch.nn.Module.__init__(tail)
+        object.__setattr__(tail, '_inner_is_partial_moe_capture', lambda: True)
+
+        head.layer_number, tail.layer_number = 1, 2
+        assert not head._can_group_te_cuda_graph_with(tail)
+
+        head.layer_number, tail.layer_number = 2, 3
+        assert head._can_group_te_cuda_graph_with(tail)
+
+        head.layer_number, tail.layer_number = 3, 4
+        assert not head._can_group_te_cuda_graph_with(tail)
+
+        inner.is_mtp_layer = True
+        head.layer_number, tail.layer_number = 1, 2
+        assert head._can_group_te_cuda_graph_with(tail)
+
+
 # Global storage for comparing unique buffer counts across different num_microbatches,
 # keyed by (pp_size, vpp_size)
 _unique_buffer_counts = {}
@@ -927,6 +1173,56 @@ class TestTECudaGraphHelper:
         destroy_num_microbatches_calculator()
         # Note: _unique_buffer_counts is intentionally NOT cleared here so we can
         # compare values across parametrized test runs
+
+    @pytest.mark.parametrize(
+        ("local_layout", "cuda_graph_modules", "expected"),
+        [
+            ("dense", [CudaGraphModule.attn, CudaGraphModule.moe], False),
+            ("dense", [], False),
+            ("direct-moe", [CudaGraphModule.attn, CudaGraphModule.moe], True),
+            ("nested-moe", [], True),
+            ("direct-moe", [CudaGraphModule.moe_router], False),
+        ],
+    )
+    def test_paged_stash_te_capture_context_requires_rank_local_whole_moe(
+        self, monkeypatch, local_layout, cuda_graph_modules, expected
+    ):
+        layer = torch.nn.Module()
+        layer.is_moe_layer = local_layout == "direct-moe"
+        if local_layout == "nested-moe":
+            inner_layer = torch.nn.Module()
+            inner_layer.is_moe_layer = True
+            layer.inner_layer = inner_layer
+
+        monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: True)
+
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = _te_whole_moe_paged_stash_config(cuda_graph_modules=cuda_graph_modules)
+        helper.flattened_callables = [layer]
+        helper.callables_per_chunk = []
+        helper.num_microbatches = 1
+        helper._start_capturing = lambda: 0.0
+        helper._finish_capturing = lambda _start_time: None
+        helper._get_cuda_graph_input_data = lambda: ([()], {'_order': [1, -1]})
+        helper._validate_mhc_static_hidden_inputs = lambda _sample_args: None
+        helper._uses_mhc_direct_write_arena = lambda: False
+
+        capture_enabled = []
+
+        def record_capture_context(enabled, order=None, config=None):
+            capture_enabled.append(enabled)
+            return nullcontext()
+
+        monkeypatch.setattr(
+            paged_stash_module, "paged_stash_te_graph_capture", record_capture_context
+        )
+        monkeypatch.setattr(
+            cuda_graphs_module, "make_graphed_callables", lambda *args, **kwargs: ()
+        )
+
+        helper.create_cudagraphs()
+
+        assert capture_enabled == [expected]
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_mhc_static_input_aliasing_requires_disjoint_liveness_windows(self):

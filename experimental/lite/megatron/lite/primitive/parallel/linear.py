@@ -8,9 +8,10 @@ from typing import TYPE_CHECKING
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-import transformer_engine.pytorch as te  # pyright: ignore[reportMissingImports]
 
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.utils import ensure_divisible
+
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.parallel.state import ParallelState
@@ -126,6 +127,9 @@ class _VanillaColLinear(nn.Module):
         self.sp = sp
         local_out = ensure_divisible(out_features, ps.tp_size)
         self.weight = nn.Parameter(torch.empty(local_out, in_features, dtype=torch.bfloat16))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
         nn.init.xavier_uniform_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -390,6 +394,37 @@ class _AllGatherLastDim(torch.autograd.Function):
         return grad_output[..., start : start + ctx.local_dim].contiguous(), None, None
 
 
+class _AllGatherLastDimWithGradReduce(torch.autograd.Function):
+    """All-gather TP activations; reduce-scatter their gradients."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, group) -> torch.Tensor:
+        ctx.group = group
+        ctx.tp_size = dist.get_world_size(group)
+        chunks = [torch.empty_like(x) for _ in range(ctx.tp_size)]
+        dist.all_gather(chunks, x.contiguous(), group=group)
+        return torch.cat(chunks, dim=-1).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        local_width = ensure_divisible(grad_output.shape[-1], ctx.tp_size)
+        flat_grad = grad_output.reshape(-1, grad_output.shape[-1])
+        packed_grad = torch.cat(flat_grad.split(local_width, dim=-1), dim=0).contiguous()
+        local_grad = torch.empty(
+            (flat_grad.shape[0], local_width),
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        )
+        dist.reduce_scatter_tensor(local_grad, packed_grad, group=ctx.group)
+        return local_grad.reshape(*grad_output.shape[:-1], local_width), None
+
+
+def all_gather_last_dim_with_grad_reduce(x: torch.Tensor, group) -> torch.Tensor:
+    """Gather a sharded last dimension with Megatron-style gradient reduction."""
+
+    return _AllGatherLastDimWithGradReduce.apply(x, group)
+
+
 class _ReduceFromTP(torch.autograd.Function):
     """all-reduce forward; identity backward."""
 
@@ -410,5 +445,6 @@ __all__ = [
     "VanillaColumnParallelLinear",
     "VocabParallelEmbedding",
     "VocabParallelOutput",
+    "all_gather_last_dim_with_grad_reduce",
     "pad_vocab_for_tp",
 ]

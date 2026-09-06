@@ -332,6 +332,7 @@ class TestHybridModel:
         manager = type("_FakeManager", (), {})()
         manager.is_last_layer_in_recompute_block = True
         seen_bda_managers = []
+        seen_inner_managers = []
 
         def fake_hyper_connection_forward(hidden_states, mhc_recompute_manager=None):
             assert mhc_recompute_manager is manager
@@ -356,18 +357,27 @@ class TestHybridModel:
             seen_bda_managers.append(manager)
             return original_residual
 
+        def fake_inner_fast_path(*_args, mhc_recompute_manager=None, **_kwargs):
+            seen_inner_managers.append(mhc_recompute_manager)
+            return None
+
         monkeypatch.setattr(layer.hyper_connection, "forward", fake_hyper_connection_forward)
         monkeypatch.setattr(
             layer.hyper_connection, "fused_h_res_h_post_bda", fake_fused_h_res_h_post_bda
+        )
+        monkeypatch.setattr(
+            layer, "_call_inner_transformer_layer_without_local_bda", fake_inner_fast_path
         )
 
         output, _ = layer(hidden_states, attention_mask=None, mhc_recompute_manager=manager)
         assert output is hidden_states
         assert seen_bda_managers == [None]
+        assert seen_inner_managers == [manager]
 
         manager.is_last_layer_in_recompute_block = False
         layer(hidden_states, attention_mask=None, mhc_recompute_manager=manager)
         assert seen_bda_managers[-1] is manager
+        assert seen_inner_managers[-1] is manager
 
     def test_forward_with_hyper_connections(self):
         model_config = TransformerConfig(
