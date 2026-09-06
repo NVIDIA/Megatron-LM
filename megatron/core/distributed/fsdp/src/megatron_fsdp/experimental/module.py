@@ -472,8 +472,8 @@ class FsdpModule:
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
         self.phase = FsdpModule.Phase.BACKWARD
-        context = self.context
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
+        context = self.context
         current_stream = context.current_stream()
         if self.is_root():
             context.register_post_backward_final_callback()
