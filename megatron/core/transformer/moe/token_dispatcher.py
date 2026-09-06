@@ -1305,13 +1305,15 @@ class _VirtualExpertHybridEPManager(VirtualExpertLoadBalancer, _HybridEPManager)
             num_runtime_experts=self.num_local_experts,
             alignment=self._quantization_alignment(),
         )
+        # The dense runtime probabilities travel outside the plan: they carry the gradient.
+        probs, self.runtime_probs = self.runtime_probs, None
         if self._dense_topk_routing:
-            super().setup_metadata(None, plan.probs, topk_idx=plan.virtual_experts)
+            super().setup_metadata(None, probs, topk_idx=plan.virtual_experts)
         else:
             # This HybridEP lacks dense top-k routing: expand the runtime ids into its map.
-            routing_map = torch.zeros_like(plan.probs, dtype=torch.bool)
+            routing_map = torch.zeros_like(probs, dtype=torch.bool)
             routing_map.scatter_(1, plan.virtual_experts.long(), True)
-            super().setup_metadata(routing_map, plan.probs)
+            super().setup_metadata(routing_map, probs)
         # The planner gives every rank exactly its own route count, and HybridEP pads each of
         # the 2L runtime expert segments on top; the base budget (routes x capacity factor)
         # would make HybridEP drop the padded routes.
