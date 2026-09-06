@@ -11,8 +11,8 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
+from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.lite.primitive import transformer_engine as te
-from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     SharedGroupedLinearLoRA,
@@ -40,18 +40,25 @@ def _expert_nvtx_range(name: str):
 def swiglu_with_probs(
     y: torch.Tensor, probs: torch.Tensor | None, swiglu_limit: float = 0.0
 ) -> torch.Tensor:
-    """SwiGLU with optional expert probability scaling."""
-    if swiglu_limit > 0:
-        gate, up = y.chunk(2, dim=-1)
-        up = torch.clamp(up.float(), min=-swiglu_limit, max=swiglu_limit)
-        gate = torch.clamp(gate.float(), max=swiglu_limit)
-        out = torch.nn.functional.silu(gate) * up
-        if probs is not None:
-            out = out * probs
-        return out.to(dtype=y.dtype)
+    """SwiGLU with optional expert probability scaling.
+
+    The clamped variant used to be written out eagerly here -- chunk, two
+    ``clamp`` in fp32, ``silu``, a multiply, a multiply by the probabilities and
+    a cast back -- while only the unclamped variant reached a fused kernel. That
+    fallback ran on the largest activation in the model,
+    ``[tokens * topk, moe_ffn * 2]``, at fp32 and so at twice the bytes, in six
+    or more separate kernels forward with eager autograd behind it.
+
+    DeepSeek-V4 sets a clamp value, so it always took that path. Core's
+    ``bias_swiglu_impl`` and ``weighted_bias_swiglu_impl`` already accept
+    ``clamp_value`` and dispatch to ``jit_fuser``-compiled clamped kernels with
+    hand-written backwards, so the arithmetic is unchanged and the fallback is
+    simply removed.
+    """
+    clamp_value = swiglu_limit if swiglu_limit > 0 else None
     if probs is not None:
-        return weighted_bias_swiglu_impl(y, bias=None, weights=probs)
-    return bias_swiglu_impl(y, bias=None)
+        return weighted_bias_swiglu_impl(y, bias=None, weights=probs, clamp_value=clamp_value)
+    return bias_swiglu_impl(y, bias=None, clamp_value=clamp_value)
 
 
 class _AllReduceETP(torch.autograd.Function):
