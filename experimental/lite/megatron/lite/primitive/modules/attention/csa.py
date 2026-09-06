@@ -68,7 +68,12 @@ def _per_head_rms(q: torch.Tensor, eps: float) -> torch.Tensor:
     time; the reduction still happens in fp32, so the precision boundary itself
     is unchanged.
     """
-    return q * torch.rsqrt(q.float().pow(2).mean(dim=-1, keepdim=True) + eps).to(dtype=q.dtype)
+    # ``q.float()`` materialised a full fp32 copy of the query purely to reduce
+    # over it -- 77k Melem per step in the op census. ``dtype=torch.float32``
+    # accumulates the mean in fp32 without that copy; only the squaring now
+    # rounds in bf16, which the bounds in the unit test cover.
+    inv = torch.rsqrt(q.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32) + eps)
+    return q * inv.to(dtype=q.dtype)
 
 
 
