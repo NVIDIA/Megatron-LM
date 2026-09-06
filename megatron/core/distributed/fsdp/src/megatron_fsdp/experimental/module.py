@@ -160,7 +160,7 @@ class FsdpModule:
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext
     _trainable_parameter_countdown: Countdown
-    _post_backward_hook_registered: bool
+    _grad_reduction_callback_registered: bool
     _is_root: bool
     _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
@@ -194,7 +194,7 @@ class FsdpModule:
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
         self._schedule_policy = schedule_policy
-        self._post_backward_hook_registered = False
+        self._grad_reduction_callback_registered = False
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
@@ -290,7 +290,7 @@ class FsdpModule:
             post_backward_hook: Callback receiving this FSDP module after all of its
                 trainable parameters have accumulated gradients.
         """
-        if self._post_backward_hook_registered:
+        if self._grad_reduction_callback_registered:
             raise RuntimeError("This FSDP module already has a grad-reduction callback registered.")
 
         module = cast(nn.Module, self)
@@ -300,7 +300,7 @@ class FsdpModule:
                     cast(FsdpModule, hooked_module)
                 )
             )
-            self._post_backward_hook_registered = True
+            self._grad_reduction_callback_registered = True
             return
 
         # Gradient reduction for trainable parameters is parameter-completion
@@ -336,7 +336,7 @@ class FsdpModule:
                 parameter_module.register_wgrad_accumulation_and_reduce_hooks(
                     lambda parameter=parameter: grad_hook(parameter)
                 )
-        self._post_backward_hook_registered = True
+        self._grad_reduction_callback_registered = True
 
     @staticmethod
     def _pre_load_state_dict(
@@ -381,7 +381,15 @@ class FsdpModule:
         self.unshard(prefetch="forward" if not is_recomputing else "none")
 
     def unshard(self, prefetch: Literal["forward", "backward", "none"] = "none") -> None:
-        """Unshard this FsdpModule's parameter groups immediately."""
+        """Unshard this FsdpModule's parameter groups immediately.
+
+        External schedulers invoking this directly (rather than through the
+        automatic ``pre_forward`` hook) must first synchronize the all-gather
+        stream on the root by calling
+        ``context.allgather_stream.wait_stream(context.current_stream())``
+        before this when ``self.is_root()``; the automatic forward path
+        performs that root sync in ``pre_forward()`` immediately before this.
+        """
         torch.cuda.nvtx.range_push(self._nvtx_label("unshard"))
         self._unshard_parameter_groups()
         assert self._unshard_event is not None
