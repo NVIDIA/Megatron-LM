@@ -1,107 +1,114 @@
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import re
+import sys
 
 import pytest
+import torch
 
+from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.training.arguments import parse_args, validate_args
+from megatron.training.global_vars import destroy_global_vars, get_timers, set_global_variables
 from megatron.training.training import training_log
+from tests.unit_tests.test_utilities import Utils
 
 
-def _make_args(log_interval: int):
-    return SimpleNamespace(
-        log_interval=log_interval,
-        timing_log_level=0,
-        perform_rl_step=False,
-        rl_use_sequence_packing=False,
-        rl_profile=False,
-        num_experts=None,
-        mtp_num_layers=None,
-        dsa_indexer_loss_coeff=None,
-        log_throughput=False,
-        log_energy=False,
-        log_timers_to_tensorboard=False,
-        record_memory_history=False,
-        log_memory_interval=None,
-        tensorboard_log_interval=1,
-        train_iters=100,
-        consumed_train_samples=0,
-        skipped_train_samples=0,
-        micro_batch_size=1,
-        data_parallel_size=1,
-        world_size=1,
-        seq_length=1024,
-        freeze_all_layers=False,
-        gtp_weight_remat_size=1,
-        profile_ranks=[],
-        hybrid_layer_pattern=None,
-        group_query_attention=False,
-        num_attention_heads=1,
-        num_query_groups=None,
-        hidden_size=1,
-        num_layers=1,
-        ffn_hidden_size=4,
-        kv_channels=1,
-        moe_ffn_hidden_size=None,
-        moe_latent_size=None,
-        moe_shared_expert_intermediate_size=None,
-        swiglu=False,
-        padded_vocab_size=1,
-        untie_embeddings_and_output_weights=False,
-        position_embedding_type="learned_absolute",
-        moe_router_topk=1,
-        expert_model_parallel_size=1,
-        multi_latent_attention=False,
-        attention_output_gate=False,
-        experimental_attention_variant=None,
-    )
+@pytest.fixture
+def logging_args(monkeypatch):
+    """Initialize real logging dependencies using Megatron's defaults."""
+    if not torch.cuda.is_available():
+        pytest.skip("training_log uses CUDA loss accumulators")
+
+    try:
+        Utils.initialize_model_parallel()
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                sys,
+                "argv",
+                (
+                    "test_training_log "
+                    "--num-layers 1 --hidden-size 16 --num-attention-heads 1 "
+                    "--seq-length 8 --max-position-embeddings 8 "
+                    "--micro-batch-size 1 --train-iters 6 --lr 0.25 "
+                    "--timing-log-level 0 --no-one-logger"
+                ).split(),
+            )
+            args = parse_args()
+
+        args.rank = torch.distributed.get_rank()
+        args.world_size = torch.distributed.get_world_size()
+        validate_args(args)
+
+        # FLOPs reporting needs this; the scalar model needs no tokenizer.
+        args.padded_vocab_size = 128
+        set_global_variables(args, build_tokenizer=False)
+        yield args
+    finally:
+        destroy_global_vars()
+        destroy_num_microbatches_calculator()
+        Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("start_iteration", [0, 6], ids=["from-zero", "offset-numbering"])
 @pytest.mark.parametrize(
-    ("log_interval", "is_first_iteration", "expected_reset"),
-    [(1, True, True), (1, False, True), (10, True, False), (10, False, True)],
+    "log_interval, logged_steps, expected_losses",
+    [
+        (1, [1, 2, 3, 4, 5, 6], [4.0, 1.0, 0.25, 0.0625, 0.015625, 0.00390625]),
+        (2, [1, 2, 4, 6], [4.0, 2.5, 0.15625, 0.009765625]),
+        (3, [1, 3, 6], [4.0, 1.75, 0.02734375]),
+    ],
 )
-def test_training_log_resets_completed_logging_window(
-    monkeypatch, log_interval, is_first_iteration, expected_reset
+def test_training_log_reports_window_losses(
+    logging_args, capsys, log_interval, logged_steps, expected_losses, start_iteration
 ):
-    args = _make_args(log_interval)
+    args = logging_args
+    args.log_interval = log_interval
+    args.train_iters = start_iteration + 6
+    args.consumed_train_samples = start_iteration * args.global_batch_size
 
-    timer = MagicMock()
-    timer.elapsed.return_value = 1.0
-
-    timers = MagicMock()
-    timers.return_value = timer
-
-    monkeypatch.setattr("megatron.training.training.get_args", lambda: args)
-    monkeypatch.setattr("megatron.training.training.get_timers", lambda: timers)
-    monkeypatch.setattr("megatron.training.training.get_tensorboard_writer", lambda: None)
-    monkeypatch.setattr("megatron.training.training.get_wandb_writer", lambda: None)
-    monkeypatch.setattr("megatron.training.training.get_one_logger", lambda: None)
-    monkeypatch.setattr("megatron.training.training.get_energy_monitor", lambda: MagicMock())
-    monkeypatch.setattr(
-        "megatron.training.training.reduce_max_stat_across_model_parallel_group",
-        lambda value, group=None: value,
-    )
-    monkeypatch.setattr("megatron.training.training.get_num_microbatches", lambda: 1)
-    monkeypatch.setattr("megatron.training.training.print_rank_last", lambda _: None)
-    monkeypatch.setattr("megatron.training.training.one_logger_utils", MagicMock())
-
+    # For L(w) = w^2, SGD with lr=1/4 halves w at each step.
+    # Starting at w=2 gives losses: 4, 1, 1/4, 1/16, 1/64, 1/256.
+    weight = torch.nn.Parameter(torch.tensor([2.0], device="cuda", dtype=torch.float32))
+    optimizer = torch.optim.SGD([weight], lr=0.25)
     total_loss_dict = {}
+    timer = get_timers()("interval-time", log_level=0)
 
-    training_log(
-        loss_dict={},
-        total_loss_dict=total_loss_dict,
-        learning_rate=0.001,
-        iteration=1 if is_first_iteration else log_interval,
-        loss_scale=1.0,
-        report_memory_flag=False,
-        skipped_iter=0,
-        grad_norm=None,
-        params_norm=None,
-        num_zeros_in_grad=None,
-        max_attention_logit=None,
-        is_first_iteration=is_first_iteration,
-    )
+    capsys.readouterr()
+    timer.start()
+    try:
+        for step in range(1, 7):
+            optimizer.zero_grad()
+            loss = weight.square().sum()
+            loss.backward()
+            optimizer.step()
+            args.consumed_train_samples += args.global_batch_size
 
-    timer.elapsed.assert_called_once_with(barrier=True, reset=expected_reset)
+            training_log(
+                loss_dict={"lm loss": loss.detach()},
+                total_loss_dict=total_loss_dict,
+                learning_rate=0.25,
+                iteration=start_iteration + step,
+                loss_scale=1.0,
+                report_memory_flag=False,
+                skipped_iter=0,
+                grad_norm=None,
+                params_norm=None,
+                num_zeros_in_grad=None,
+                max_attention_logit=None,
+                is_first_iteration=(step == 1),
+            )
+    finally:
+        timer.stop()
 
-    expected_count = 0 if expected_reset else 1
-    assert total_loss_dict["advanced iterations"] == expected_count
+    output = capsys.readouterr().out
+    records = re.findall(r"\biteration\s+(\d+)\s*/\s*\d+[^\n]*?\blm loss:\s*([^\s|]+)", output)
+
+    if torch.distributed.get_rank() == torch.distributed.get_world_size() - 1:
+        assert [int(step) for step, _ in records] == [
+            start_iteration + step for step in logged_steps
+        ], output
+        assert [float(loss) for _, loss in records] == pytest.approx(
+            expected_losses, rel=1e-6, abs=1e-8
+        ), output
+    else:
+        assert records == [], output
