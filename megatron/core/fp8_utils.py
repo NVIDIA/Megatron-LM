@@ -437,9 +437,6 @@ if HAVE_TE and is_te_min_version("2.2"):
         if te_post_all_gather_processing is not None:
             kwargs["manual_post_all_gather_processing"] = True
 
-        # Row-only MXFP8 requires TE's native distributed cast support (TE PR #3488).
-        # Keep it in the same batch as bidirectional weights: TE reduces packed amaxes
-        # and writes local shards; the caller subsequently gathers quantized data.
         cast_master_weights_to_fp8(*args, **kwargs)
 
     def _correct_amax_history_if_needed_impl(model: List[torch.nn.Module]) -> None:
