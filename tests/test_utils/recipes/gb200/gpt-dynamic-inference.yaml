@@ -13,32 +13,28 @@ spec:
   script_setup: |
     set -euo pipefail
     unset https_proxy
+    readonly source_repo=https://gitlab-master.nvidia.com/adlr/megatron-lm.git
+    readonly source_commit=8cce2e2644161aa94e813b8aa6d953a7e900fe51
     authenticated_git() {
       git -c credential.helper='!f() {
         printf "%s\n" username=okoenig "password=$RO_API_TOKEN"
       }; f' "$@"
     }
 
-    # Checkout latest
+    # Fetch only the fixed repository and reviewed parent; candidate-controlled
+    # repository and revision variables never receive the credential.
     cd /opt
     rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
     git init
-    git remote add origin $MCORE_REPO
-    authenticated_git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
-    authenticated_git fetch origin $MCORE_MR_COMMIT
-    git checkout $MCORE_MR_COMMIT
-    git rev-parse HEAD
-    # Checkout backwards-ref
-    cd /opt
-    rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
-    git init
-    git remote add origin $MCORE_REPO
-    authenticated_git fetch origin $MCORE_BACKWARDS_COMMIT
-    git checkout $MCORE_BACKWARDS_COMMIT
-    git rev-parse HEAD
-    rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+    git remote add origin "$source_repo"
+    authenticated_git fetch --no-tags origin "$source_commit"
+    test "$(git rev-parse FETCH_HEAD)" = "$source_commit"
+    git checkout --detach "$source_commit"
+    test "$(git rev-parse HEAD)" = "$source_commit"
+
+    # This recipe does not use a legacy checkout.
     unset -f authenticated_git
-    unset RO_API_TOKEN
+    unset RO_API_TOKEN MCORE_REPO MCORE_MR_COMMIT MCORE_BACKWARDS_COMMIT
   script: |-
     set -euo pipefail
     ls

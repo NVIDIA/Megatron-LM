@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -578,3 +579,19 @@ def test_notification_writes_linear_inputs_without_webhook(monkeypatch, tmp_path
     writer.assert_called_once_with(
         123, "nightly", pipeline_jobs, project, notify.PROJECT_URL, summaries, buckets
     )
+
+
+def test_gb200_dynamic_inference_pins_authenticated_source():
+    recipe = Path("tests/test_utils/recipes/gb200/gpt-dynamic-inference.yaml").read_text()
+    setup = yaml.safe_load(recipe)["spec"]["script_setup"]
+
+    assert "readonly source_repo=https://gitlab-master.nvidia.com/adlr/megatron-lm.git" in setup
+    assert "readonly source_commit=8cce2e2644161aa94e813b8aa6d953a7e900fe51" in setup
+    assert 'authenticated_git fetch --no-tags origin "$source_commit"' in setup
+    assert 'test "$(git rev-parse FETCH_HEAD)" = "$source_commit"' in setup
+    assert "fetch origin $MCORE_MR_COMMIT" not in setup
+    assert "fetch origin $MCORE_BACKWARDS_COMMIT" not in setup
+    assert "remote add origin $MCORE_REPO" not in setup
+
+    result = subprocess.run(["bash", "-n"], input=setup, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
