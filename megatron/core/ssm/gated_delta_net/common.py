@@ -104,12 +104,12 @@ def torch_chunk_gated_delta_rule(
     Reference: https://github.com/huggingface/transformers/blob/144c8ce2809a2e21914017652700e1ecb450501e/src/transformers/models/qwen3_next/modeling_qwen3_next.py#L470-L547
     """
 
-    assert cu_seqlens is None, (
-        "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
-    )
-    assert cp_context is None, (
-        "cp_context is not supported for torch_chunk_gated_delta_rule for now."
-    )
+    assert (
+        cu_seqlens is None
+    ), "cu_seqlens is not supported for torch_chunk_gated_delta_rule for now."
+    assert (
+        cp_context is None
+    ), "cp_context is not supported for torch_chunk_gated_delta_rule for now."
 
     initial_dtype = q.dtype
     if use_qk_l2norm_in_kernel:
@@ -141,8 +141,7 @@ def torch_chunk_gated_delta_rule(
     ]
     g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
     mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device),
-        diagonal=0,
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=0
     )
 
     # chunk decay
@@ -163,8 +162,7 @@ def torch_chunk_gated_delta_rule(
     )
     core_attn_out = torch.zeros_like(v)
     mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device),
-        diagonal=1,
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=1
     )
 
     # for each chunk
@@ -177,10 +175,7 @@ def torch_chunk_gated_delta_rule(
         core_attn_out[:, :, i] = attn_inter + attn @ v_new
         last_recurrent_state = (
             last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(
-                -1, -2
-            )
-            @ v_new
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
         )
 
     if not output_final_state:
@@ -191,6 +186,7 @@ def torch_chunk_gated_delta_rule(
     core_attn_out = core_attn_out[:, :, :sequence_length]
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     return core_attn_out, last_recurrent_state
+
 
 class GatedDeltaRuleInterface(Protocol):
     """Callable interface shared by GDN-family kernels."""

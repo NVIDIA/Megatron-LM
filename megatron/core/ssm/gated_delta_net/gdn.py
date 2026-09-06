@@ -631,4 +631,3 @@ class GatedDeltaNet(_GDNBase):
             seq_idx=seq_idx,
             cp_group=cp_group,
         )
-
