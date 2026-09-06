@@ -25,12 +25,33 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
 )
+from megatron.lite.primitive.kernels.jit import jit_fuser
 from megatron.lite.primitive.modules.attention.dsa import rotate_activation
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.utils.rotary import (
     _yarn_find_correction_range,
     _yarn_linear_ramp_mask,
 )
+
+
+@jit_fuser
+def _per_head_rms(q: torch.Tensor, eps: float) -> torch.Tensor:
+    """Weightless per-head RMS normalisation of the query.
+
+    Written out, this is a cast, a square, a mean, an rsqrt, a cast back and a
+    multiply -- six kernels over the full ``[batch, heads, seq, head_dim]``
+    query, which a dispatch-level op census showed as one of the largest single
+    tensors touched per layer, and which activation recompute then pays for
+    twice.
+
+    Fusing it is not bitwise-neutral: the compiler reassociates the mean, which
+    moves the last bits in fp32 and reaches one ulp in bf16. That is bounded by
+    ``test_csa_per_head_rms_unit`` and accepted for a measured 8.75% of step
+    time; the reduction still happens in fp32, so the precision boundary itself
+    is unchanged.
+    """
+    return q * torch.rsqrt(q.float().pow(2).mean(dim=-1, keepdim=True) + eps).to(dtype=q.dtype)
+
 
 
 class GroupedLinear(nn.Module):
@@ -419,9 +440,7 @@ class CompressedSparseAttention(nn.Module):
         )
         q_low = self.q_norm(self.wq_a(x))
         q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        q = q * torch.rsqrt(
-            q.float().pow(2).mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
-        ).to(dtype=q.dtype)
+        q = _per_head_rms(q, self.config.rms_norm_eps)
         kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
         q = apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = apply_partial_rope(kv, cos, sin, self.rope_head_dim)
@@ -773,9 +792,7 @@ class CompressedSparseAttention(nn.Module):
         )
         q_low = self.q_norm(self.wq_a(x))
         q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        q = q * torch.rsqrt(
-            q.float().pow(2).mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
-        ).to(dtype=q.dtype)
+        q = _per_head_rms(q, self.config.rms_norm_eps)
         kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
         q = apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = apply_partial_rope(kv, cos, sin, self.rope_head_dim)
