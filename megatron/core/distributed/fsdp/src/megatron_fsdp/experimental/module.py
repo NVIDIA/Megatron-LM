@@ -279,19 +279,19 @@ class FsdpModule:
         module.register_full_backward_pre_hook(
             lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
         )
-        self.register_post_backward_hook(FsdpModule.post_backward)
+        self.register_grad_reduction_callback(FsdpModule.post_backward)
 
-    def register_post_backward_hook(
+    def register_grad_reduction_callback(
         self, post_backward_hook: Callable[["FsdpModule"], None]
     ) -> None:
-        """Register a callback to run when this module's backward is complete.
+        """Register a callback to run gradient reduction when this module's backward is complete.
 
         Args:
             post_backward_hook: Callback receiving this FSDP module after all of its
                 trainable parameters have accumulated gradients.
         """
         if self._post_backward_hook_registered:
-            raise RuntimeError("This FSDP module already has a post-backward hook registered.")
+            raise RuntimeError("This FSDP module already has a grad-reduction callback registered.")
 
         module = cast(nn.Module, self)
         if self._trainable_parameter_countdown.initial_value == 0:

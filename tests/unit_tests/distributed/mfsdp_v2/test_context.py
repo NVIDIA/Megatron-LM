@@ -179,7 +179,7 @@ def test_fully_shard_can_disable_execution_hooks(distributed_setup):
                 assert not getattr(fsdp_parameter.unsharded, "_post_accumulate_grad_hooks", None)
 
 
-def test_register_post_backward_hook_waits_for_all_parameter_gradients(distributed_setup):
+def test_register_grad_reduction_callback_waits_for_all_parameter_gradients(distributed_setup):
     """An external scheduler callback should run once all owned gradients are ready."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -196,7 +196,7 @@ def test_register_post_backward_hook_waits_for_all_parameter_gradients(distribut
     ]
     assert len(parameters) == 2
     callback_modules = []
-    model.register_post_backward_hook(callback_modules.append)
+    model.register_grad_reduction_callback(callback_modules.append)
 
     parameter_hooks = []
     for parameter in parameters:
@@ -212,7 +212,7 @@ def test_register_post_backward_hook_waits_for_all_parameter_gradients(distribut
     assert callback_modules == [model]
 
 
-def test_register_post_backward_hook_rejects_duplicate_registration(distributed_setup):
+def test_register_grad_reduction_callback_rejects_duplicate_registration(distributed_setup):
     """An FSDP unit should accept only one post-backward callback."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -221,12 +221,12 @@ def test_register_post_backward_hook_rejects_duplicate_registration(distributed_
     with fully_shard_context(device=device):
         fully_shard(model, mesh=mesh, placements=_flat_placements(), register_hooks=False)
 
-    model.register_post_backward_hook(lambda _module: None)
-    with pytest.raises(RuntimeError, match="already has a post-backward hook registered"):
-        model.register_post_backward_hook(lambda _module: None)
+    model.register_grad_reduction_callback(lambda _module: None)
+    with pytest.raises(RuntimeError, match="already has a grad-reduction callback registered"):
+        model.register_grad_reduction_callback(lambda _module: None)
 
 
-def test_register_post_backward_hook_handles_parameterless_module(distributed_setup):
+def test_register_grad_reduction_callback_handles_parameterless_module(distributed_setup):
     """A parameterless FSDP unit should invoke the external scheduler callback."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -236,7 +236,7 @@ def test_register_post_backward_hook_handles_parameterless_module(distributed_se
         fully_shard(model, mesh=mesh, placements=_flat_placements(), register_hooks=False)
 
     callback_modules = []
-    model.register_post_backward_hook(callback_modules.append)
+    model.register_grad_reduction_callback(callback_modules.append)
     model(torch.ones(2, 4, device=device, requires_grad=True)).sum().backward()
 
     assert callback_modules == [model]
