@@ -516,8 +516,9 @@ class _VirtualExpertProjection:
 
     def _upload(self, table: int, rows) -> None:
         """Refresh device pointer table ``table`` through its pinned mirror, which may only be
-        rewritten once the previous copy has landed."""
-        self.copied[table].synchronize()
+        rewritten once the previous copy has landed (long done in practice: query, do not block)."""
+        if not self.copied[table].query():
+            self.copied[table].synchronize()
         self.host_tables[table].copy_(torch.tensor(rows, dtype=torch.int64))
         self.tables[table].copy_(self.host_tables[table], non_blocking=True)
         self.copied[table].record(torch.cuda.current_stream(self.device))
