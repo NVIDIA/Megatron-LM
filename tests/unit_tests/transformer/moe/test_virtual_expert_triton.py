@@ -442,8 +442,8 @@ def test_virtual_expert_histogram_exchange_matches_all_gather():
             dist.all_gather_into_tensor(expected.view(-1), histogram, group=group)
             torch.cuda.synchronize(device)
             assert torch.equal(gathered, expected)
-            assert torch.equal(workspace.tokens_per_expert, histogram)
-            assert int(workspace.sequence.item()) == launch + 1
+            assert torch.equal(workspace.field("tokens_per_expert"), histogram)
+            assert int(workspace.field("sequence").item()) == launch + 1
             # Every route lands on some rank's runtime expert; the mapping's exactness against
             # a torch reference is tier 1's job.
             assert plan.virtual_experts.shape == (num_tokens, topk)
