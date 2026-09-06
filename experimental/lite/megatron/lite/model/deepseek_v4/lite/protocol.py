@@ -69,6 +69,14 @@ class ImplConfig:
     mtp_num_layers: int | None = None
     num_nextn_predict_layers: int | None = None
     mtp_loss_scaling_factor: float = 0.1
+    # Off by default despite Megatron Core running DeepSeek-V4 with
+    # --cross-entropy-loss-fusion: on this backend the fused path is measurably
+    # worse on both axes. At 8 layers / 64 experts / seq 4096 / 131072 tokens per
+    # step on 8xH100 it costs 2085.1 ms against 2045.0 ms and 55.2 GB against
+    # 47.8 GB of peak memory -- the opposite of what avoiding the
+    # [seq, batch, vocab] logits is supposed to buy. Wiring it up is what makes
+    # it reachable at all; flipping the default belongs with a fix to
+    # linear_cross_entropy, not with this change.
     cross_entropy_fusion: bool = False
     qat: QATSpec | dict | None = None
 

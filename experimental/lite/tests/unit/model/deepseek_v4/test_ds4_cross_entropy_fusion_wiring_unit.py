@@ -29,7 +29,13 @@ pytestmark = [pytest.mark.mlite]
 
 
 def test_impl_config_exposes_cross_entropy_fusion() -> None:
-    """The switch exists and defaults off, matching the sibling models."""
+    """The switch exists and is reachable; see the config for why it stays off.
+
+    Megatron Core runs DeepSeek-V4 with ``--cross-entropy-loss-fusion``, so the
+    default here is deliberately *not* matched to it: measured on this backend
+    the fused path is both slower and larger, which is the opposite of its
+    purpose. The default moves when ``linear_cross_entropy`` is fixed.
+    """
     names = {f.name for f in dataclasses.fields(ImplConfig)}
     assert "cross_entropy_fusion" in names
     assert ImplConfig().cross_entropy_fusion is False

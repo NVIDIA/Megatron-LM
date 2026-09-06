@@ -49,10 +49,6 @@ def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
     return deep_ep.Buffer(group=group, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=num_rdma_bytes)
 
 
-def _use_moe_permute_fusion() -> bool:
-    return os.environ.get("MEGATRON_LITE_MOE_PERMUTE_FUSION", "0") == "1"
-
-
 def _tensor_hidden_bytes(x: torch.Tensor) -> int:
     return x.size(1) * max(x.element_size(), 2)
 
@@ -195,15 +191,11 @@ class TokenDispatcher:
         ps: ParallelState,
         *,
         use_deepep: bool = True,
-        moe_permute_fusion: bool | None = None,
     ):
         self.ps = ps
         self.num_experts = num_experts
         self.ep_size = ps.ep_size
         self.num_local_experts = ensure_divisible(num_experts, ps.ep_size)
-        self.moe_permute_fusion = (
-            _use_moe_permute_fusion() if moe_permute_fusion is None else bool(moe_permute_fusion)
-        )
 
         self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
         if self.use_deepep:
@@ -217,13 +209,16 @@ class TokenDispatcher:
         self._handle = None
         self._deepep_event = None
 
+        self._combine_row_index = None
+        self._sort_by_experts_dev = None
+
         if self.ep_size > 1 and self.num_local_experts > 1:
             chunk_idxs = torch.arange(self.ep_size * self.num_local_experts, device="cpu")
+            # Rank-major chunk order transposed to expert-major. The inverse used
+            # by combine is derived from the row index itself rather than kept as
+            # a second chunk order, so the two can no longer disagree.
             self._sort_by_experts = (
                 chunk_idxs.reshape(self.ep_size, self.num_local_experts).T.ravel().tolist()
-            )
-            self._restore_by_ranks = (
-                chunk_idxs.reshape(self.num_local_experts, self.ep_size).T.ravel().tolist()
             )
 
     def dispatch(
@@ -251,10 +246,7 @@ class TokenDispatcher:
         if not self.use_deepep:
             raise RuntimeError("submit_deepep_combine requires DeepEP combine.")
         rank_grouped = unpermute(
-            expert_output,
-            self._row_id_map,
-            restore_shape=self._restore_shape,
-            fused=self.moe_permute_fusion,
+            expert_output, self._row_id_map, restore_shape=self._restore_shape, fused=True
         )
         previous_event = (
             EventOverlap(EventHandle())
@@ -299,11 +291,7 @@ class TokenDispatcher:
         probs_2d.scatter_add_(1, topk_indices, topk_scores)
 
         permuted, permuted_probs, sorted_indices = permute(
-            hidden_states,
-            routing_map,
-            probs=probs_2d,
-            num_out_tokens=num_out,
-            fused=self.moe_permute_fusion,
+            hidden_states, routing_map, probs=probs_2d, num_out_tokens=num_out, fused=True
         )[:3]
 
         self._row_id_map = sorted_indices
@@ -314,10 +302,7 @@ class TokenDispatcher:
 
     def _combine_local(self, expert_output):
         result = unpermute(
-            expert_output,
-            self._row_id_map,
-            restore_shape=self._restore_shape,
-            fused=self.moe_permute_fusion,
+            expert_output, self._row_id_map, restore_shape=self._restore_shape, fused=True
         )
         self._row_id_map = None
         self._restore_shape = None
@@ -341,11 +326,7 @@ class TokenDispatcher:
         probs_2d.scatter_add_(1, topk_indices, topk_scores)
 
         permuted, permuted_probs, sorted_indices = permute(
-            hidden_states,
-            routing_map,
-            probs=probs_2d,
-            num_out_tokens=num_out,
-            fused=self.moe_permute_fusion,
+            hidden_states, routing_map, probs=probs_2d, num_out_tokens=num_out, fused=True
         )[:3]
         self._row_id_map = sorted_indices
         self._restore_shape = hidden_states.shape
@@ -370,33 +351,62 @@ class TokenDispatcher:
         )
 
         if self.num_local_experts > 1:
-            chunk_sizes = recv_tpe_2d.ravel().tolist()
-            chunks = torch.split(recv_flat, chunk_sizes, dim=0)
-            score_chunks = torch.split(recv_scores, chunk_sizes, dim=0)
-            sort_idxs = self._sort_by_experts
-            restore_idxs = self._restore_by_ranks
-            dispatched = torch.cat([chunks[i] for i in sort_idxs], dim=0)
-            permuted_probs_out = torch.cat([score_chunks[i] for i in sort_idxs], dim=0)
-            self._combine_chunk_sizes = [chunk_sizes[i] for i in sort_idxs]
-            self._combine_restore_idxs = restore_idxs
+            row_index = self._expert_major_row_index(recv_tpe_2d, recv_flat.shape[0])
+            dispatched = recv_flat.index_select(0, row_index)
+            permuted_probs_out = recv_scores.index_select(0, row_index)
+            self._combine_row_index = torch.empty_like(row_index)
+            self._combine_row_index.scatter_(
+                0, row_index, torch.arange(row_index.numel(), device=row_index.device)
+            )
         else:
             dispatched = recv_flat
             permuted_probs_out = recv_scores
-            self._combine_chunk_sizes = None
-            self._combine_restore_idxs = None
+            self._combine_row_index = None
 
         recv_tpe = recv_tpe_2d.sum(dim=0)
         return dispatched, recv_tpe, permuted_probs_out.squeeze(-1)
 
+    def _expert_major_row_index(self, recv_tpe_2d: torch.Tensor, total_rows: int) -> torch.Tensor:
+        """Row permutation taking the all-to-all output from rank-major to expert-major.
+
+        The all-to-all delivers rows grouped ``[ep_rank][local_expert]``; the
+        grouped GEMM needs them grouped ``[local_expert][ep_rank]``. This used to
+        be ``split`` into ``ep_size * num_local_experts`` chunks followed by a
+        ``cat`` of that many operands, which materialises a full copy of the
+        activations on both the dispatch and the combine side, and again in each
+        of their backwards. With 64 experts over ep8 that is a 64-operand ``cat``
+        per layer per microbatch. Megatron Core removes the same copies with
+        ``--moe-permute-fusion``; expressing the permutation as an index turns
+        each one into a single gather, whose backward is a single scatter-add.
+
+        The index is built on device: the sizes come from ``recv_tpe_2d``, which
+        the caller has already used to size the all-to-all, and no value of it is
+        read back to the host here.
+        """
+        sizes = recv_tpe_2d.ravel()
+        starts = torch.cumsum(sizes, 0) - sizes
+        order = self._sort_by_experts_device(sizes.device)
+        sizes_out = sizes[order]
+        starts_in = starts[order]
+        # Exclusive prefix sum of the output chunk sizes, plus a closing bound so
+        # that searchsorted maps every row to the chunk that contains it.
+        bounds = torch.cumsum(sizes_out, 0)
+        starts_out = bounds - sizes_out
+        rows = torch.arange(total_rows, device=sizes.device)
+        chunk = torch.searchsorted(bounds, rows, right=True)
+        return starts_in[chunk] + (rows - starts_out[chunk])
+
+    def _sort_by_experts_device(self, device: torch.device) -> torch.Tensor:
+        """``_sort_by_experts`` as a device tensor, built once per device."""
+        cached = getattr(self, "_sort_by_experts_dev", None)
+        if cached is None or cached.device != device:
+            cached = torch.as_tensor(self._sort_by_experts, dtype=torch.long, device=device)
+            self._sort_by_experts_dev = cached
+        return cached
+
     def _combine_alltoall(self, expert_output):
-        if self._combine_chunk_sizes is not None:
-            chunks = torch.split(expert_output, self._combine_chunk_sizes, dim=0)
-            restore_idxs = (
-                self._combine_restore_idxs
-                if self._combine_restore_idxs is not None
-                else self._restore_by_ranks
-            )
-            rank_grouped = torch.cat([chunks[i] for i in restore_idxs], dim=0)
+        if self._combine_row_index is not None:
+            rank_grouped = expert_output.index_select(0, self._combine_row_index)
         else:
             rank_grouped = expert_output
 
@@ -404,17 +414,13 @@ class TokenDispatcher:
             rank_grouped, self._output_splits, self._input_splits, self.ps.ep_group
         )
         result = unpermute(
-            combined,
-            self._row_id_map,
-            restore_shape=self._restore_shape,
-            fused=self.moe_permute_fusion,
+            combined, self._row_id_map, restore_shape=self._restore_shape, fused=True
         )
         self._row_id_map = None
         self._restore_shape = None
         self._input_splits = None
         self._output_splits = None
-        self._combine_chunk_sizes = None
-        self._combine_restore_idxs = None
+        self._combine_row_index = None
         self._local_tpe_list = None
         return result
 
@@ -508,11 +514,7 @@ class TokenDispatcher:
         probs_2d.index_put_((row_ids, expert_ids), recv_probs[valid], accumulate=True)
         num_out = sum(int(x) for x in recv_per_expert)
         dispatched, permuted_probs, sorted_indices = permute(
-            recv_hidden,
-            routing_map,
-            probs=probs_2d,
-            num_out_tokens=num_out,
-            fused=self.moe_permute_fusion,
+            recv_hidden, routing_map, probs=probs_2d, num_out_tokens=num_out, fused=True
         )[:3]
         self._row_id_map = sorted_indices
         self._restore_shape = recv_hidden.shape
@@ -568,10 +570,7 @@ class TokenDispatcher:
 
     def _combine_deepep(self, expert_output):
         rank_grouped = unpermute(
-            expert_output,
-            self._row_id_map,
-            restore_shape=self._restore_shape,
-            fused=self.moe_permute_fusion,
+            expert_output, self._row_id_map, restore_shape=self._restore_shape, fused=True
         )
         if torch.is_grad_enabled():
             combined = _DeepEPCombine.apply(self.buffer, rank_grouped, self._handle, False, False)
