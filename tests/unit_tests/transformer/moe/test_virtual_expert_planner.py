@@ -118,7 +118,7 @@ def _plan_locally(
     source_rank: int,
     device,
     probs: torch.Tensor | None = None,
-) -> tuple[VirtualExpertPlannerWorkspace, VirtualExpertPlan]:
+) -> tuple[VirtualExpertPlannerWorkspace, VirtualExpertPlan, torch.Tensor]:
     """Run the planner for one source rank of a complete EP group in this process: the window
     is filled with every rank's histogram instead of exchanged."""
     workspace = VirtualExpertPlannerWorkspace.scratch(
@@ -128,7 +128,7 @@ def _plan_locally(
     routes = routes.to(device=device, dtype=torch.int64)
     if probs is None:
         probs = torch.rand(routes.shape, device=device)
-    plan = plan_virtual_expert_routes(routes, probs, workspace, exchange=False)
+    plan, runtime_probs = plan_virtual_expert_routes(routes, probs, workspace, exchange=False)
     torch.cuda.synchronize(device)
     torch.testing.assert_close(
         workspace.tokens_per_expert, gathered_counts[source_rank].contiguous(), rtol=0, atol=0
@@ -136,7 +136,7 @@ def _plan_locally(
     torch.testing.assert_close(
         plan.virtual_experts.long(), _reference_map_routes(routes, workspace), rtol=0, atol=0
     )
-    return workspace, plan
+    return workspace, plan, runtime_probs
 
 
 @requires_cuda
@@ -146,7 +146,7 @@ def test_virtual_expert_placement_balances_every_destination(skew):
     device = torch.device("cuda", torch.cuda.current_device())
     routes = _routes_for_skew(skew)
     counts = _histogram(routes)
-    workspace, plan = _plan_locally(counts.to(device), routes[0], source_rank=0, device=device)
+    workspace, plan, _ = _plan_locally(counts.to(device), routes[0], source_rank=0, device=device)
 
     allocation = workspace.allocation.cpu()
     experts_to_copy = plan.experts_to_copy.cpu()
@@ -187,7 +187,7 @@ def test_virtual_expert_placement_balances_every_destination(skew):
         assert all(expert // NUM_LOCAL_EXPERTS != destination for expert in filled)
 
     # Placement is replayed independently on every rank and must agree exactly.
-    repeated, repeated_plan = _plan_locally(
+    repeated, repeated_plan, _ = _plan_locally(
         counts.to(device), routes[EP_SIZE - 1], source_rank=EP_SIZE - 1, device=device
     )
     for field in ("balance", "allocation"):
@@ -215,7 +215,7 @@ def test_virtual_expert_planner_maps_every_route_to_the_expert_it_selected(skew)
     experts_to_copy = None
     observed = torch.zeros((NUM_EXPERTS, EP_SIZE), dtype=torch.int32)
     for source_rank in range(EP_SIZE):
-        workspace, plan = _plan_locally(counts, routes[source_rank], source_rank, device)
+        workspace, plan, _ = _plan_locally(counts, routes[source_rank], source_rank, device)
         if allocation is None:
             allocation = workspace.allocation.cpu()
             experts_to_copy = plan.experts_to_copy.cpu()
@@ -253,15 +253,17 @@ def test_virtual_expert_planner_writes_hybridep_inputs_with_probability_gradient
     for source_rank in (0, EP_SIZE - 1):
         probs = torch.rand((num_tokens, ROUTER_TOPK), device=device, generator=generator)
         probs = probs.requires_grad_(True)
-        workspace, plan = _plan_locally(counts, routes[source_rank], source_rank, device, probs)
+        workspace, plan, runtime_probs = _plan_locally(
+            counts, routes[source_rank], source_rank, device, probs
+        )
         expected = torch.zeros((num_tokens, 2 * NUM_EXPERTS), device=device)
         expected = expected.scatter(1, plan.virtual_experts.long(), probs)
-        torch.testing.assert_close(plan.probs, expected, rtol=0, atol=0)
-        assert plan.probs.requires_grad and not plan.virtual_experts.requires_grad
+        torch.testing.assert_close(runtime_probs, expected, rtol=0, atol=0)
+        assert runtime_probs.requires_grad and not plan.virtual_experts.requires_grad
         assert plan.virtual_experts.dtype == torch.int16
 
-        grad = torch.rand(plan.probs.shape, device=device, generator=generator)
-        (actual_grad,) = torch.autograd.grad(plan.probs, probs, grad)
+        grad = torch.rand(runtime_probs.shape, device=device, generator=generator)
+        (actual_grad,) = torch.autograd.grad(runtime_probs, probs, grad)
         (expected_grad,) = torch.autograd.grad(expected, probs, grad)
         torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
 

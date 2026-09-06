@@ -432,7 +432,7 @@ def test_virtual_expert_histogram_exchange_matches_all_gather():
                 weights.expand(num_tokens, num_experts), topk, generator=generator
             )
             probs = torch.rand((num_tokens, topk), device=device, generator=generator)
-            plan = plan_virtual_expert_routes(indices, probs, workspace)
+            plan, runtime_probs = plan_virtual_expert_routes(indices, probs, workspace)
             # Snapshot the window in stream order: a peer may publish its next histogram into
             # it as soon as this rank's placement has read it (the all-gather below is what
             # keeps the peers from getting further ahead than that).
@@ -451,7 +451,7 @@ def test_virtual_expert_histogram_exchange_matches_all_gather():
                 0 <= int(plan.virtual_experts.min())
                 and int(plan.virtual_experts.max()) < 2 * num_experts
             )
-            assert torch.equal(plan.probs.gather(1, plan.virtual_experts.long()), probs)
+            assert torch.equal(runtime_probs.gather(1, plan.virtual_experts.long()), probs)
     finally:
         workspace.destroy()
         dist.barrier(group=group, device_ids=[device.index])
