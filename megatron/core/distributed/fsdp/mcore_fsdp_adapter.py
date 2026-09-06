@@ -794,6 +794,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 unsupported_fused_wgrad_features.append("CPU offloading")
             if config.overlap_moe_expert_parallel_comm:
                 unsupported_fused_wgrad_features.append("1F1B EP overlap")
+            if config.overlap_dispatch_backward_with_experts_wgrad:
+                unsupported_fused_wgrad_features.append("delayed expert wgrad overlap")
             if config.use_transformer_engine_op_fuser:
                 unsupported_fused_wgrad_features.append("Transformer Engine operation fuser")
             if ddp_config.nccl_ub:
