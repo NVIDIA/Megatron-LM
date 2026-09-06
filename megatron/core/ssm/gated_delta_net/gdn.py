@@ -25,7 +25,6 @@ from megatron.core.ssm.gated_delta_net.common import (
     causal_conv1d,
     chunk_gated_delta_rule,
     get_parameter_local_cp,
-    l2norm,
     torch_chunk_gated_delta_rule,
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
