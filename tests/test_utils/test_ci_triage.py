@@ -143,8 +143,13 @@ def test_notification_rules_use_expected_pipeline_sources():
     for job_name in triage_jobs:
         condition = triage[job_name]["rules"][0]["if"]
         assert '$FUNCTIONAL_TEST == "yes"' in condition
-        assert '$CI_PIPELINE_SOURCE == "schedule"' in condition
         assert '$CI_COMMIT_BRANCH == "main"' in condition
+        assert '$CI_COMMIT_REF_PROTECTED == "true"' in condition
+        assert '$CI_PIPELINE_SOURCE == "schedule"' not in condition
+
+    pipeline = yaml.safe_load(Path(".gitlab-ci.yml").read_text())
+    assert pipeline["variables"]["RUN_LINEAR_STATUS"]["value"] == "False"
+    assert pipeline["variables"]["RUN_LINEAR_WRITE"]["value"] == "False"
 
 
 def test_all_generated_test_types_enable_error_extraction():
