@@ -5,9 +5,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from megatron.core.fusions.fused_mhc_kernels import fused_h_post_bda
+from megatron.core.fusions.fused_mhc_kernels import fused_h_aggregate, fused_h_post_bda
 
 
+# Core's mHC helpers are ``@torch.compile``d for the same reason: the mapping
+# maths is a long chain of narrow elementwise ops over ``[s, b, (2 + n) * n]``,
+# where each eager op is its own launch reading and writing all of HBM. Compiling
+# fuses the chain without touching the arithmetic. It is deliberately not
+# replaced by ``fused_sinkhorn``: Core regularises with ``softmax(...) + eps`` and
+# denominators of ``sum + eps``, while this module uses ``exp(l - max)`` with
+# ``clamp(min=eps)`` denominators. The two agree to within the regularisation but
+# are not the same function, and swapping them here would change DeepSeek-V4
+# numerics under the heading of a fusion change.
+@torch.compile
 def split_sinkhorn(
     mixes: torch.Tensor,
     hc_scale: torch.Tensor,
@@ -30,6 +40,32 @@ def split_sinkhorn(
         comb = comb / comb.sum(dim=-1, keepdim=True).clamp(min=eps)
         comb = comb / comb.sum(dim=-2, keepdim=True).clamp(min=eps)
     return pre, post, comb
+
+
+def _aggregate_native(x: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
+    """CPU form of ``fused_h_aggregate``; see ``_use_fused`` for why it exists."""
+    return torch.sum(pre.unsqueeze(-1) * x, dim=2)
+
+
+def _post_native(
+    x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
+) -> torch.Tensor:
+    """CPU form of ``fused_h_post_bda``; see ``_use_fused`` for why it exists."""
+    dtype = x.dtype
+    placed = post.to(dtype).unsqueeze(-1) * x.unsqueeze(-2)
+    return placed + torch.matmul(comb.to(dtype), residual.to(dtype))
+
+
+def _use_fused(x: torch.Tensor) -> bool:
+    """Core's fused mHC entry points are CUDA-only in practice.
+
+    ``fused_h_post_bda`` and ``fused_h_aggregate`` dispatch to Triton whenever
+    Triton is importable and never look at the device, so they raise
+    ``ValueError: Pointer argument cannot be accessed from Triton`` on CPU
+    tensors. Core never hits that because it only calls them on CUDA; this module
+    is also exercised on CPU, so the device decides here instead.
+    """
+    return x.is_cuda
 
 
 class HyperConnection(nn.Module):
@@ -60,7 +96,12 @@ class HyperConnection(nn.Module):
         pre, post, comb = split_sinkhorn(
             mixes, self.scale, self.base, self.hc_mult, self.sinkhorn_iters, self.eps
         )
-        y = torch.sum(pre.unsqueeze(-1) * xf.view(shape), dim=2)
+        # ``fused_h_aggregate`` is ``(x * h_pre.unsqueeze(-1)).sum(dim=2)``, the
+        # same expression written here, so this is a kernel swap and not a change
+        # of formula -- unlike the Sinkhorn and compute_h helpers next to it,
+        # which differ from Core in their regularisation.
+        xs = xf.view(shape)
+        y = fused_h_aggregate(xs, pre) if _use_fused(xs) else _aggregate_native(xs, pre)
         return y.to(dtype), post, comb
 
     @staticmethod
@@ -75,5 +116,7 @@ class HyperConnection(nn.Module):
         # ``contiguous()`` is required because the native path reshapes with
         # ``view()``; the copy spans ``[s, b, hc_mult, hc_mult]`` and is negligible
         # beside the batched matmul it feeds.
+        if not _use_fused(x):
+            return _post_native(x, residual, post, comb)
         h_res = comb.to(dtype).transpose(-1, -2).contiguous()
         return fused_h_post_bda(h_res, residual.to(dtype), post.to(dtype), x, None)

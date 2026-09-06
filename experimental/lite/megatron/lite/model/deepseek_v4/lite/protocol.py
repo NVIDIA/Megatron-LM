@@ -16,11 +16,13 @@ from megatron.lite.model.deepseek_v4.lite.checkpoint import (
     save_hf_weights as _save_hf_weights_impl,
 )
 from megatron.lite.model.protocol_utils import (
+    add_cross_entropy_fusion,
     add_loss_context_kwargs,
     nested_from_packed,
     pack_r3_replay_mask as _pack_r3_replay_mask,
     pack_routed_experts as _pack_routed_experts,
     router_replay_roots as router_replay_roots,
+    set_cross_entropy_fusion,
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
@@ -67,6 +69,7 @@ class ImplConfig:
     mtp_num_layers: int | None = None
     num_nextn_predict_layers: int | None = None
     mtp_loss_scaling_factor: float = 0.1
+    cross_entropy_fusion: bool = False
     qat: QATSpec | dict | None = None
 
 
@@ -255,7 +258,9 @@ def _prepare_model_forward_kwargs(model, batch: PackedBatch):
 
 
 def _forward_step(model: nn.Module, batch: PackedBatch) -> dict:
-    return model(**_prepare_model_forward_kwargs(model, batch))
+    kwargs = _prepare_model_forward_kwargs(model, batch)
+    add_cross_entropy_fusion(kwargs, model)
+    return model(**kwargs)
 
 
 def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
@@ -420,6 +425,8 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
         for chunk in chunks:
             apply_offload(_iter_transformer_units(chunk), impl_cfg.offload, MODULE_MAP)
+
+    set_cross_entropy_fusion(chunks, impl_cfg.cross_entropy_fusion)
 
     # Parametrize before optimizer construction so it captures the BF16 master.
     apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
