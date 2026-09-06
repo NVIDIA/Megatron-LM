@@ -58,7 +58,10 @@ class MambaSlotAllocator:
         self.free_slots = torch.arange(max_slots, dtype=torch.int32, device='cpu')
         self.free_count = max_slots
 
-        # State tensors (GPU - accessed by Mamba CUDA kernels).
+        # Durable cache state tensors (GPU - accessed by Mamba CUDA kernels):
+        # one slot per cached block boundary, reused across requests. Sized to
+        # `max_slots`; DynamicInferenceContext accounts for these separately
+        # from the per-step extraction scratch buffers below.
         self.conv_states = torch.zeros(
             (num_mamba_layers, max_slots) + conv_states_shape,
             dtype=conv_states_dtype,
@@ -100,8 +103,11 @@ class MambaSlotAllocator:
         # CPU flag to skip GPU sync when no intermediates exist
         self._has_intermediates = False
 
-        # Pre-allocated output buffers for CUDA graph compatible extraction (GPU).
-        self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * context.max_requests
+        # Pre-allocated scratch output buffers for CUDA graph compatible
+        # extraction (GPU). Use the single per-step capacity computed by the
+        # context so the allocator, Mamba metadata, graph views, and memory
+        # budget all agree on the same bound.
+        self.max_intermediate_count = context.max_mamba_intermediate_states_per_step
         self.intermediate_ssm_out = torch.zeros(
             (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
             dtype=ssm_states_dtype,
@@ -424,8 +430,9 @@ class MambaSlotAllocator:
         last_aligned_abs = (prompt_len // bs) * bs  # last complete block boundary
         penultimate_abs = (overall_required_blocks - 1) * bs
 
-        # Determine mamba_chunk_size from mamba config (128 is the standard SSM kernel chunk size)
-        mamba_chunk_size = 128
+        # Intermediate extraction must follow the configured SSM kernel chunk
+        # size; a hardcoded default can discard otherwise valid block boundaries.
+        mamba_chunk_size = ctx.mamba_chunk_size
 
         # Keep only boundaries that land inside this chunk's computed tokens and on
         # a mamba-chunk boundary (required for mid-sequence state extraction).

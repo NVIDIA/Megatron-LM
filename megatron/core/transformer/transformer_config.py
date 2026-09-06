@@ -154,6 +154,9 @@ class TransformerConfig(ModelParallelConfig):
     If attention backend is local we use the local pytorch implementation in mcore.
     Users can specify exact backend by changing this config. """
 
+    flash_attention_version: Optional[Literal[2, 3, 4]] = None
+    """FlashAttention version to use. None selects the default implementation."""
+
     softmax_scale: Optional[float] = None
     """Softmax scale for attention scaling."""
 
@@ -3939,6 +3942,12 @@ class TransformerConfig(ModelParallelConfig):
             assert self.transformer_impl == "inference_optimized", (
                 "inference_disable_triton_nvls_kernels is only supported "
                 "for inference_optimized transformer implementation."
+            )
+
+        if self.flash_attention_version is not None:
+            assert self.flash_attention_version in (2, 3, 4), (
+                "flash_attention_version must be one of 2, 3, or 4, got "
+                f"{self.flash_attention_version}"
             )
 
         if self.batch_invariant_mode:

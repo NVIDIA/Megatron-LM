@@ -16,6 +16,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
     Placements,
     fully_shard,
+    fully_shard_optimizer,
     microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
@@ -511,6 +512,7 @@ def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
     # SGD's foreach/fused CUDA paths require matching parameter and gradient dtypes.
     # Use the scalar path to exercise FP32 main weights with default BF16 main grads.
     optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
+    fully_shard_optimizer(optimizer)
     x = torch.ones(1, 1, device=device, dtype=torch.bfloat16)
 
     def train_iteration() -> torch.Tensor:

@@ -13,6 +13,10 @@ from megatron.core.distributed import (
 )
 from megatron.core.full_cuda_graph import get_shared_capture_stream
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import (
+    LayerWiseDistributedOptimizer,
+    tag_params_for_buffer_routing,
+)
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel
@@ -50,6 +54,7 @@ def unimodal_build_distributed_models(
     mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
     pre_wrap_hook: Callable[[list[MegatronModule]], list[MegatronModule]] | None = None,
     model_type: ModelType = ModelType.encoder_or_decoder,
+    use_layer_wise_distributed_optimizer: bool = False,
 ) -> list[MegatronModule]:
     """Build model stages and wrap for distributed training.
 
@@ -78,6 +83,8 @@ def unimodal_build_distributed_models(
             Pass ``None`` to skip.
         pre_wrap_hook: Hook applied to the model stage list before any wrapping.
         model_type: Deprecated flag, only used for backwards compatibility.
+        use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
+            parameters for the layer-wise distributed optimizer.
 
     Returns:
         List of model stages, wrapped and ready for distributed training.
@@ -114,6 +121,7 @@ def unimodal_build_distributed_models(
         wrap_with_ddp=wrap_with_ddp,
         data_parallel_random_init=data_parallel_random_init,
         mixed_precision_wrapper=mixed_precision_wrapper,
+        use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
     )
 
 
@@ -128,6 +136,7 @@ def prepare_existing_model_chunks_for_distributed_training(
     wrap_with_ddp: bool = True,
     data_parallel_random_init: bool = False,
     mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
+    use_layer_wise_distributed_optimizer: bool = False,
 ) -> list[MegatronModule]:
     """Apply the shared post-build distributed lifecycle to already-built model chunks.
 
@@ -146,6 +155,8 @@ def prepare_existing_model_chunks_for_distributed_training(
         data_parallel_random_init: Whether to broadcast parameters from data-parallel rank 0.
         mixed_precision_wrapper: Mixed precision wrapper applied per model stage, e.g. ``Float16Module``.
             Pass ``None`` to skip.
+        use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
+            parameters for the layer-wise distributed optimizer.
 
     Returns:
         List of model chunks, wrapped and ready for distributed training.
@@ -194,6 +205,7 @@ def prepare_existing_model_chunks_for_distributed_training(
             use_megatron_fsdp=use_megatron_fsdp,
             use_torch_fsdp2=use_torch_fsdp2,
             pg_collection=pg_collection,
+            use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
         )
 
     return model_list
@@ -249,6 +261,7 @@ def _ddp_wrap(
     use_torch_fsdp2: bool = False,
     *,
     pg_collection: ProcessGroupCollection,
+    use_layer_wise_distributed_optimizer: bool = False,
 ) -> list[MegatronModule]:
     """Wrap model with Distributed Data Parallel (DDP) or Fully Sharded Data Parallel (FSDP).
 
@@ -261,6 +274,8 @@ def _ddp_wrap(
         use_megatron_fsdp: Whether to use Megatron FSDP.
         use_torch_fsdp2: Whether to use PyTorch FSDP v2 instead of DDP
         pg_collection: Model communication process groups.
+        use_layer_wise_distributed_optimizer: Whether to use the layer-wise
+            distributed optimizer parameter routing and layout.
 
     Returns:
         list[MegatronModule]: List of DDP/FSDP wrapped model modules
@@ -275,6 +290,14 @@ def _ddp_wrap(
     else:
         DP = DistributedDataParallel
 
+    compute_layout = None
+    if DP is DistributedDataParallel:
+        if use_layer_wise_distributed_optimizer:
+            ddp_config.use_distributed_optimizer = True
+            tag_params_for_buffer_routing(model)
+            compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+        elif ddp_config.use_distributed_optimizer:
+            compute_layout = DistributedOptimizer.compute_full_param_layout
 
     if not use_torch_fsdp2:
         if ddp_config.num_buckets is not None:
@@ -318,7 +341,7 @@ def _ddp_wrap(
 
             # Pre-compute parameter layouts for the distributed optimizer.
             # Only pass to DDP; FSDP variants don't accept full_param_layout.
-            if ddp_config.use_distributed_optimizer and DP is DistributedDataParallel:
+            if compute_layout is not None:
                 all_params = [
                     p for p in model_chunk.parameters() if p.requires_grad
                 ]
@@ -335,7 +358,7 @@ def _ddp_wrap(
                 intra_dp_cp_group = getattr(pg_collection, "intra_dp_cp", None)
                 intra_expt_dp_group = getattr(pg_collection, "intra_expt_dp", None)
                 chunk_kwargs["full_param_layout"] = (
-                    DistributedOptimizer.compute_full_param_layout(
+                    compute_layout(
                         all_params,
                         effective_bucket_size,
                         (

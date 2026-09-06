@@ -78,7 +78,8 @@ class TestGatedDeltaNet:
         # Get TP and CP process groups from device mesh
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
-        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+        tp_cp_group = parallel_state.get_tensor_and_context_parallel_group()
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group, tp_cp=tp_cp_group)
 
         # Initialize model, with the same config as Qwen Next except `num_layers`
         self.transformer_config = TransformerConfig(
@@ -126,7 +127,9 @@ class TestGatedDeltaNet:
     def test_gpu_forward(self):
         gdn = self.gdn
 
-        micro_batch_size = 2
+        # Chunkwise CP currently supports SBHD inputs only for micro-batch size 1.
+        # Batch-size coverage remains on the non-CP parameterizations.
+        micro_batch_size = 1 if self.cp_size > 1 else 2
         seq_length = 64
         hidden_states = torch.ones(
             (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
@@ -155,7 +158,8 @@ class TestGatedDeltaNet:
     def test_selective_recompute_norm_out(self):
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
-        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+        tp_cp_group = parallel_state.get_tensor_and_context_parallel_group()
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group, tp_cp=tp_cp_group)
 
         def build_gdn(config):
             gdn_submodules = get_experimental_attention_variant_module_spec(
@@ -185,7 +189,7 @@ class TestGatedDeltaNet:
             input_grad = hidden_states.grad.detach().clone()
             return output.detach(), grads, input_grad
 
-        micro_batch_size = 2
+        micro_batch_size = 1 if self.cp_size > 1 else 2
         seq_length = 64
         base_config = copy.deepcopy(self.transformer_config)
         rec_config = copy.deepcopy(self.transformer_config)
@@ -234,9 +238,15 @@ class TestGatedDeltaNet:
             ), f"Grad not identical for {name} ({rank=})"
 
     def test_deterministic_mode(self):
+        if self.cp_size > 1:
+            pytest.skip(
+                "deterministic_mode uses torch_chunk_gated_delta_rule, which does not support CP."
+            )
+
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
-        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+        tp_cp_group = parallel_state.get_tensor_and_context_parallel_group()
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group, tp_cp=tp_cp_group)
 
         det_config = copy.deepcopy(self.transformer_config)
         det_config.deterministic_mode = True
@@ -266,7 +276,7 @@ class TestGatedDeltaNet:
         # deterministic_mode must select the torch-native kernel, not FLA.
         assert gdn.gated_delta_rule is torch_chunk_gated_delta_rule
 
-        micro_batch_size = 2
+        micro_batch_size = 1 if self.cp_size > 1 else 2
         seq_length = 64
         torch.manual_seed(0)
         base_input = torch.randn(
@@ -314,7 +324,6 @@ class TestGatedDeltaNet:
 
         device = torch.cuda.current_device()
         num_v_heads_local = gdn.num_value_heads // gdn.tp_size // gdn.cp_size
-        num_k_heads_local = gdn.num_key_heads // gdn.tp_size // gdn.cp_size
         qk_dim_local = gdn.qk_dim_local_tp // gdn.cp_size
         v_dim_local = gdn.v_dim_local_tp // gdn.cp_size
 
@@ -336,21 +345,39 @@ class TestGatedDeltaNet:
 
         # Disable dynamo so coverage.py can trace through the method bodies,
         # which are normally wrapped by @jit_fuser (torch.compile).
+        A_log_mock = torch.randn(num_v_heads_local, device=device, dtype=torch.bfloat16)
+        dt_bias_mock = torch.randn(num_v_heads_local, device=device, dtype=torch.bfloat16)
+
         with torch._dynamo.config.patch(disable=True):
-            query, key, value, gate_out, *gate_feats_out = gdn._prepare_input_for_gated_delta_rule(
-                qkv, gate, batch, seq_len, *gate_feats
+            kernel_inputs = gdn._prepare_input_for_gated_delta_rule(
+                qkv,
+                gate,
+                A_log_mock,
+                dt_bias_mock,
+                batch,
+                seq_len,
+                *gate_feats,
+                cp_size_headwise=gdn.cp_size,
             )
+
+        query = kernel_inputs["q"]
+        key = kernel_inputs["k"]
+        value = kernel_inputs["v"]
+        g = kernel_inputs["g"]
+        gate_out = kernel_inputs["gate"]
+        beta_out = kernel_inputs["beta"]
 
         assert query.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
         assert key.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
         assert value.shape == (batch, seq_len, num_v_heads_local, gdn.value_head_dim)
-        for t in (query, key, value, gate_out, *gate_feats_out):
-            assert t.is_contiguous()
+        for tensor in (query, key, value, gate_out, beta_out):
+            assert tensor.is_contiguous()
 
-        # The variant gate features (beta, alpha) pass through with shapes intact
-        beta_out, alpha_out = gate_feats_out
+        assert g.dtype == torch.float32
+        assert g.shape == (batch, seq_len, num_v_heads_local)
+        assert beta_out.dtype == torch.float32
         assert beta_out.shape == (batch, seq_len, num_v_heads_local)
-        assert alpha_out.shape == (batch, seq_len, num_v_heads_local)
+        torch.testing.assert_close(beta_out, gate_feats[0].float().sigmoid())
 
     def test_gpu_forward_thd_correctness(self):
         if self.sp_size > 1:

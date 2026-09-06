@@ -1863,7 +1863,7 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
 
 def get_dynamic_data_context_parallel_groups(check_initialized=True, group_size=None):
     """Get the dynamic context parallel groups the caller rank belongs to."""
-    if get_data_parallel_world_size(with_context_parallel=True) == group_size:
+    if get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False) == group_size:
         if check_initialized:
             assert _DATA_PARALLEL_GROUP_WITH_CP is not None
         return _DATA_PARALLEL_GROUP_WITH_CP
