@@ -271,12 +271,12 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
 def copy_back_gathered_bf16_into_fp8_param(model_p: torch.Tensor, src_bf16: torch.Tensor) -> None:
     """Requantize a gathered bf16 whole-param into an fp8 (Float8/MXFP8) model param in place.
 
-    mxfp8 columnwise can't be derived from rowwise, so force columnwise before copy_ (TE rebuilds
-    both directions from the bf16); blockwise/Float8 columnwise is a lossless transpose.
+    Preserve MXFP8 primary storage directions. A row-only primary (backward override) must
+    not acquire a columnwise copy during parameter synchronization.
     """
     if is_mxfp8tensor(model_p):
         quantizer = model_p.data._get_quantizer()
-        quantizer.set_usage(rowwise=True, columnwise=True)
+        quantizer.set_usage(rowwise=True, columnwise=model_p.data._columnwise_data is not None)
     model_p.data.copy_(src_bf16)
 
 
@@ -394,6 +394,69 @@ Currently, there are three functions:
         corrects the amax_history back. For TE2.x, it's an empty function.
         Only useful for delayed scaling.
 """
+
+
+@torch.no_grad()
+def _quantize_rowwise_mxfp8_param_shard(model_param, main_param, start_offset, group):
+    """Compatibility fallback for TE's bidirectional-only distributed MXFP8 cast.
+
+    Reconstruct bounded row tiles from disjoint master shards and let TE quantize complete
+    32-element blocks. Shard boundaries need not be aligned to rows or quantization blocks.
+    Every rank participates, including ranks without a shard, and receives identical scales.
+    This trades extra high-precision communication for not allocating columnwise storage.
+    """
+    model_param = _unwrap_parameter_data(model_param)
+    if getattr(model_param, '_with_gemm_swizzled_scales', False):
+        raise NotImplementedError("Row-only MXFP8 writeback requires unswizzled primary scales.")
+    if model_param._columnwise_data is not None or model_param._columnwise_scale_inv is not None:
+        raise ValueError("Row-only MXFP8 writeback requires both columnwise components absent.")
+    width = model_param.shape[-1]
+    rows = model_param.numel() // width
+    if width % 32 or rows % 32:
+        raise ValueError("MXFP8 primary dimensions must be multiples of 32.")
+    # About 2 MiB of BF16 staging, rounded down to complete 128-row scale tiles.
+    # Very wide weights require at least one 128-row tile.
+    tile_rows = max(128, (1024 * 1024 // width // 128) * 128)
+    shard_start = 0 if start_offset is None else start_offset
+    shard_size = 0 if main_param is None else main_param.numel()
+    shard_end = shard_start + shard_size
+    if not 0 <= shard_start <= shard_end <= model_param.numel():
+        raise ValueError("Master shard is outside the MXFP8 parameter.")
+    master = None if main_param is None else main_param.reshape(-1)
+    quantizer = model_param._get_quantizer().copy()
+    quantizer.set_usage(rowwise=True, columnwise=False)
+    quantizer.internal = False
+    quantizer.optimize_for_gemm = False
+    row_data = model_param._rowwise_data.view(rows, width)
+    row_scales = model_param._rowwise_scale_inv
+    if hasattr(model_param, 'clear_high_precision_init_val'):
+        model_param.clear_high_precision_init_val()
+
+    for row_start in range(0, rows, tile_rows):
+        row_end = min(row_start + tile_rows, rows)
+        begin, end = row_start * width, row_end * width
+        tile = torch.full(
+            (row_end - row_start, width),
+            -float('inf'),
+            dtype=model_param.dtype,
+            device=model_param.device,
+        )
+        lo, hi = max(begin, shard_start), min(end, shard_end)
+        if lo < hi:
+            # Match TE writeback's master -> model dtype -> MXFP8 rounding.
+            tile.view(-1)[lo - begin : hi - begin].copy_(
+                master[lo - shard_start : hi - shard_start]
+            )
+        # MAX with absent values at -inf also tolerates replicated master shards
+        # when the reduction group contains multiple distributed-optimizer instances.
+        torch.distributed.all_reduce(tile, op=torch.distributed.ReduceOp.MAX, group=group)
+        quantized = quantizer(tile)
+        row_data[row_start:row_end].copy_(quantized._rowwise_data)
+        scale_end = min(row_start + quantized._rowwise_scale_inv.shape[0], row_scales.shape[0])
+        row_scales[row_start:scale_end].copy_(quantized._rowwise_scale_inv[: scale_end - row_start])
+        del tile, quantized
+
+
 if HAVE_TE and is_te_min_version("2.2"):
     # Supported TE versions: 2.2+
     from transformer_engine.pytorch.tensor import QuantizedTensor
@@ -416,6 +479,24 @@ if HAVE_TE and is_te_min_version("2.2"):
             return
 
         from transformer_engine.pytorch.tensor.utils import cast_master_weights_to_fp8
+
+        row_only = [
+            is_mxfp8tensor(param) and _unwrap_parameter_data(param)._columnwise_data is None
+            for param in model_params
+        ]
+        if any(row_only):
+            if fsdp_shard_model_params is not None:
+                raise NotImplementedError("Row-only MXFP8 writeback does not support FSDP shards.")
+            for param, master, offset, rowwise in zip(
+                model_params, main_params, start_offsets, row_only
+            ):
+                if rowwise:
+                    _quantize_rowwise_mxfp8_param_shard(param, master, offset, data_parallel_group)
+            model_params = [p for p, rowwise in zip(model_params, row_only) if not rowwise]
+            main_params = [p for p, rowwise in zip(main_params, row_only) if not rowwise]
+            start_offsets = [p for p, rowwise in zip(start_offsets, row_only) if not rowwise]
+            if not model_params:
+                return
 
         args = [model_params, main_params, start_offsets, data_parallel_group]
         if fsdp_shard_model_params is not None:
