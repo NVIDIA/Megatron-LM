@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core.fusions.fused_mhc_kernels import fused_h_post_bda
+
 
 def split_sinkhorn(
     mixes: torch.Tensor,
@@ -66,6 +68,12 @@ class HyperConnection(nn.Module):
         x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
     ) -> torch.Tensor:
         dtype = x.dtype
-        placed = post.to(dtype).unsqueeze(-1) * x.unsqueeze(-2)
-        mixed = torch.matmul(comb.to(dtype), residual.to(dtype))
-        return placed + mixed
+        # Core defines the mixing term as ``h_res.T @ residual`` while this module
+        # carries ``comb`` in the opposite orientation, so the transpose converts
+        # between the two conventions rather than being a layout tweak: passing
+        # ``comb`` unchanged silently computes a different residual mixing.
+        # ``contiguous()`` is required because the native path reshapes with
+        # ``view()``; the copy spans ``[s, b, hc_mult, hc_mult]`` and is negligible
+        # beside the batched matmul it feeds.
+        h_res = comb.to(dtype).transpose(-1, -2).contiguous()
+        return fused_h_post_bda(h_res, residual.to(dtype), post.to(dtype), x, None)
