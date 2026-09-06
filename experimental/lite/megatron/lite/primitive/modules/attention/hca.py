@@ -5,26 +5,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from megatron.core.fusions.fused_mhc_kernels import fused_h_aggregate, fused_h_post_bda
+from megatron.core.fusions.fused_mhc_kernels import (
+    fused_h_aggregate,
+    fused_h_post_bda,
+    fused_sinkhorn,
+)
+from megatron.core.transformer.hyper_connection import native_sinkhorn
 
 
-# Core's mHC helpers are ``@torch.compile``d for the same reason: the mapping
-# maths is a long chain of narrow elementwise ops over ``[s, b, (2 + n) * n]``,
-# where each eager op is its own launch reading and writing all of HBM. Compiling
-# fuses the chain without touching the arithmetic. It is deliberately not
-# replaced by ``fused_sinkhorn``: Core regularises with ``softmax(...) + eps`` and
-# denominators of ``sum + eps``, while this module uses ``exp(l - max)`` with
-# ``clamp(min=eps)`` denominators. The two agree to within the regularisation but
-# are not the same function, and swapping them here would change DeepSeek-V4
-# numerics under the heading of a fusion change.
+# The mapping maths is a long chain of narrow elementwise ops over
+# ``[s, b, (2 + n) * n]``, where each eager op is its own launch reading and
+# writing all of HBM. Compiling fuses the chain without touching the arithmetic.
+# Kept separate from the Sinkhorn projection below so that the Triton kernel is
+# not called from inside a compiled region.
 @torch.compile
-def split_sinkhorn(
-    mixes: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    hc_mult: int,
-    iters: int,
-    eps: float,
+def _split_mixes(
+    mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, hc_mult: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     split_sizes = [hc_mult, hc_mult, hc_mult * hc_mult]
     pre_mix, post_mix, comb_mix = mixes.split(split_sizes, dim=-1)
@@ -35,11 +31,34 @@ def split_sinkhorn(
     pre = torch.sigmoid(pre_mix * scale[0] + base_pre)
     post = 2 * torch.sigmoid(post_mix * scale[1] + base_post)
     comb_logits = (comb_mix * scale[2] + base_comb).view(*comb_mix.shape[:-1], hc_mult, hc_mult)
-    comb = torch.exp(comb_logits - comb_logits.max(dim=-1, keepdim=True).values)
-    for _ in range(iters):
-        comb = comb / comb.sum(dim=-1, keepdim=True).clamp(min=eps)
-        comb = comb / comb.sum(dim=-2, keepdim=True).clamp(min=eps)
-    return pre, post, comb
+    return pre, post, comb_logits
+
+
+def split_sinkhorn(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    iters: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split the mHC mapping and project ``comb`` to a doubly stochastic matrix.
+
+    The projection now uses Core's Sinkhorn rather than an inline loop. This is a
+    deliberate change of regularisation, not only of kernels: the loop replaced
+    here started from ``exp(l - max)`` and divided by ``sum(...).clamp(min=eps)``,
+    while Core starts from ``softmax(l) + eps`` and divides by ``sum(...) + eps``.
+    Both stabilise the same Sinkhorn-Knopp iteration and differ far below bf16
+    resolution, and Core is what DeepSeek-V4 trains under today.
+
+    The inline loop cost 20 iterations x 2 normalisations of separate launches per
+    call. Compiled, that was ~101k kernel launches per step at
+    ``mhc_sinkhorn_iterations=20`` -- a quarter of this backend's entire launch
+    budget -- against a single fused kernel in Core.
+    """
+    pre, post, comb_logits = _split_mixes(mixes, hc_scale, hc_base, hc_mult)
+    sinkhorn = fused_sinkhorn if _use_fused(comb_logits) else native_sinkhorn
+    return pre, post, sinkhorn(comb_logits, iters, eps)
 
 
 def _aggregate_native(x: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:

@@ -93,6 +93,50 @@ def test_post_is_differentiable_through_both_terms() -> None:
     assert residual.grad.abs().sum() > 0
 
 
+def _legacy_sinkhorn(comb_logits: torch.Tensor, iters: int, eps: float) -> torch.Tensor:
+    """The inline loop that Core's Sinkhorn replaced, kept to bound the change."""
+    comb = torch.exp(comb_logits - comb_logits.max(dim=-1, keepdim=True).values)
+    for _ in range(iters):
+        comb = comb / comb.sum(dim=-1, keepdim=True).clamp(min=eps)
+        comb = comb / comb.sum(dim=-2, keepdim=True).clamp(min=eps)
+    return comb
+
+
+def test_sinkhorn_output_is_doubly_stochastic() -> None:
+    """Whatever the regularisation, the projection must still do its job.
+
+    Run at the production iteration count: Sinkhorn-Knopp converges to a doubly
+    stochastic matrix in the limit, and at the 3 iterations used by the fixtures
+    above it is still visibly off (~4e-2), which says nothing either way.
+    """
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    mixes = torch.randn(S, B, (2 + N) * N, generator=generator)
+    _, _, comb = split_sinkhorn(mixes, torch.ones(3), torch.zeros((2 + N) * N), N, 20, 1e-6)
+    ones = torch.ones(S, B, N)
+    torch.testing.assert_close(comb.sum(dim=-1), ones, rtol=0, atol=1e-3)
+    torch.testing.assert_close(comb.sum(dim=-2), ones, rtol=0, atol=1e-3)
+
+
+def test_sinkhorn_regularisation_change_is_below_bf16_resolution() -> None:
+    """Bound the numerical cost of moving to Core's Sinkhorn.
+
+    The projection changed from ``exp(l - max)`` with ``clamp(min=eps)``
+    denominators to ``softmax(l) + eps`` with ``sum + eps`` denominators. That is
+    a real change of function, so it is pinned rather than assumed: the
+    disagreement must stay far under the ~8e-3 relative resolution of bf16, which
+    every consumer of ``comb`` already rounds to.
+    """
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    mixes = torch.randn(S, B, (2 + N) * N, generator=generator)
+    scale = torch.ones(3)
+    base = torch.zeros((2 + N) * N)
+    _, _, comb = split_sinkhorn(mixes, scale, base, N, 20, 1e-6)
+
+    comb_mix = mixes.split([N, N, N * N], dim=-1)[2]
+    legacy = _legacy_sinkhorn(comb_mix.view(S, B, N, N), 20, 1e-6)
+    assert (comb - legacy).abs().max().item() < 1e-3
+
+
 def _reference_forward(module: HyperConnection, x: torch.Tensor) -> torch.Tensor:
     """The pre-fusion aggregation, kept verbatim as the numerical contract."""
     if x.dim() == 3:
