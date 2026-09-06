@@ -94,14 +94,14 @@ def _reference_map_routes(
     tokens_per_expert = torch.bincount(flat, minlength=workspace.num_experts)
     bucket_start = torch.cumsum(tokens_per_expert, 0) - tokens_per_expert
     boundaries = (
-        workspace.destination_boundaries[:, :ep_size]
+        workspace.field("destination_boundaries")[:, :ep_size]
         .clamp(min=0)
         .minimum(tokens_per_expert[:, None])
     )
     ends = (bucket_start[:, None] + boundaries).reshape(-1)
     positions = torch.arange(flat.numel(), device=flat.device, dtype=torch.int64)
     destination = torch.searchsorted(ends, positions, right=True) - experts * ep_size
-    slot = workspace.virtual_expert_slots.view(-1)[experts * ep_size + destination]
+    slot = workspace.field("virtual_expert_slots").view(-1)[experts * ep_size + destination]
     runtime_local = torch.where(
         destination == experts // num_local_experts,
         experts % num_local_experts,
@@ -121,9 +121,7 @@ def _plan_locally(
 ) -> tuple[VirtualExpertPlannerWorkspace, VirtualExpertPlan, torch.Tensor]:
     """Run the planner for one source rank of a complete EP group in this process: the window
     is filled with every rank's histogram instead of exchanged."""
-    workspace = VirtualExpertPlannerWorkspace.scratch(
-        NUM_EXPERTS, EP_SIZE, device, rank=source_rank
-    )
+    workspace = VirtualExpertPlannerWorkspace.local(NUM_EXPERTS, EP_SIZE, device, rank=source_rank)
     workspace.gathered_counts.copy_(gathered_counts)
     routes = routes.to(device=device, dtype=torch.int64)
     if probs is None:
@@ -131,7 +129,10 @@ def _plan_locally(
     plan, runtime_probs = plan_virtual_expert_routes(routes, probs, workspace, exchange=False)
     torch.cuda.synchronize(device)
     torch.testing.assert_close(
-        workspace.tokens_per_expert, gathered_counts[source_rank].contiguous(), rtol=0, atol=0
+        workspace.field("tokens_per_expert"),
+        gathered_counts[source_rank].contiguous(),
+        rtol=0,
+        atol=0,
     )
     torch.testing.assert_close(
         plan.virtual_experts.long(), _reference_map_routes(routes, workspace), rtol=0, atol=0
@@ -148,7 +149,7 @@ def test_virtual_expert_placement_balances_every_destination(skew):
     counts = _histogram(routes)
     workspace, plan, _ = _plan_locally(counts.to(device), routes[0], source_rank=0, device=device)
 
-    allocation = workspace.allocation.cpu()
+    allocation = workspace.field("allocation").cpu()
     experts_to_copy = plan.experts_to_copy.cpu()
     global_per_expert = counts.sum(0).to(torch.int32)
 
@@ -165,7 +166,7 @@ def test_virtual_expert_placement_balances_every_destination(skew):
     torch.testing.assert_close(allocation.sum(1).to(torch.int32), global_per_expert, rtol=0, atol=0)
     assert (allocation >= 0).all()
     torch.testing.assert_close(
-        workspace.balance.cpu(),
+        workspace.field("balance").cpu(),
         global_per_expert.view(EP_SIZE, NUM_LOCAL_EXPERTS).sum(1).to(torch.int32) - NUM_ROUTES,
         rtol=0,
         atol=0,
@@ -192,15 +193,15 @@ def test_virtual_expert_placement_balances_every_destination(skew):
     )
     for field in ("balance", "allocation"):
         torch.testing.assert_close(
-            getattr(repeated, field).cpu(), getattr(workspace, field).cpu(), rtol=0, atol=0
+            repeated.field(field).cpu(), workspace.field(field).cpu(), rtol=0, atol=0
         )
     torch.testing.assert_close(repeated_plan.experts_to_copy.cpu(), experts_to_copy, rtol=0, atol=0)
     # The slot table is written only for assigned slots; check exactly those.
     for destination, slots in enumerate(experts_to_copy.tolist()):
         for slot, expert in enumerate(slots):
             if expert >= 0:
-                assert int(workspace.virtual_expert_slots[expert, destination]) == slot
-                assert int(repeated.virtual_expert_slots[expert, destination]) == slot
+                assert int(workspace.field("virtual_expert_slots")[expert, destination]) == slot
+                assert int(repeated.field("virtual_expert_slots")[expert, destination]) == slot
 
 
 @requires_cuda
@@ -217,7 +218,7 @@ def test_virtual_expert_planner_maps_every_route_to_the_expert_it_selected(skew)
     for source_rank in range(EP_SIZE):
         workspace, plan, _ = _plan_locally(counts, routes[source_rank], source_rank, device)
         if allocation is None:
-            allocation = workspace.allocation.cpu()
+            allocation = workspace.field("allocation").cpu()
             experts_to_copy = plan.experts_to_copy.cpu()
         virtual_experts = plan.virtual_experts.cpu().reshape(-1).tolist()
         for route, virtual in zip(routes[source_rank].reshape(-1).tolist(), virtual_experts):
