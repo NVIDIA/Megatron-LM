@@ -61,12 +61,15 @@ _MXFP8_COMPONENTS = (
 @dataclass(slots=True)
 class VirtualExpertPlan:
     """``virtual_experts``: int16 ``[num_tokens, router_topk]`` runtime ids (HybridEP's dense
-    top-k routing); ``probs``: float32 ``[num_tokens, 2 * num_experts]`` dense runtime
-    probabilities, carrying the gradient back to the router; ``experts_to_copy``: int32
-    ``[ep_size, num_local_experts]`` semantic ids per virtual-expert slot, ``-1`` if unused."""
+    top-k routing); ``experts_to_copy``: int32 ``[ep_size, num_local_experts]`` semantic ids per
+    virtual-expert slot, ``-1`` if unused.
+
+    Plain data only. The backward hooks capture the plan inside autograd contexts, so a plan
+    holding a differentiable tensor (the runtime probabilities) would close a reference cycle
+    through the graph that Python's collector cannot see, leaking every layer's graph.
+    """
 
     virtual_experts: torch.Tensor
-    probs: torch.Tensor
     experts_to_copy: torch.Tensor
 
 
@@ -224,18 +227,23 @@ def plan_virtual_expert_routes(
     workspace: VirtualExpertPlannerWorkspace,
     *,
     exchange: bool = True,
-) -> VirtualExpertPlan:
+) -> tuple[VirtualExpertPlan, torch.Tensor]:
     """Plan deterministic virtual-expert placement for one EP group and map this rank's routes.
 
     ``top_indices`` / ``probs`` are the router's ``[num_tokens, topk]`` expert ids and
     probabilities; every rank must route the same number of tokens. The histograms are the only
     cross-rank input and the planner kernel exchanges them itself, so every rank computes the
     same placement. ``exchange=False`` (process-local tests) plans from a pre-filled window.
+    Returns the plan and the dense float32 ``[num_tokens, 2 * num_experts]`` runtime
+    probabilities HybridEP consumes, which carry the gradient back to ``probs``.
     """
     if top_indices.shape != probs.shape or top_indices.dtype not in (torch.int32, torch.int64):
         raise ValueError("Virtual-expert planner takes matching [num_tokens, topk] ids and probs.")
     top_indices, probs = top_indices.contiguous(), probs.contiguous()
-    return VirtualExpertPlan(*_PlanRoutes.apply(probs, top_indices, workspace, exchange))
+    virtual_experts, runtime_probs, experts_to_copy = _PlanRoutes.apply(
+        probs, top_indices, workspace, exchange
+    )
+    return VirtualExpertPlan(virtual_experts, experts_to_copy), runtime_probs
 
 
 # --------------------------------------------------------------------------------------
@@ -921,6 +929,7 @@ class VirtualExpertLoadBalancer:
         self.semantic_num_experts = num_experts
         self.num_owned_experts = num_local_experts
         self.routes: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.runtime_probs: torch.Tensor | None = None
         # Placement scratch shared by every layer of this device and group (planning is
         # stream-ordered); resolved at the first plan, when the group's communicator exists.
         self._planner_workspace: VirtualExpertPlannerWorkspace | None = None
@@ -999,7 +1008,9 @@ class VirtualExpertLoadBalancer:
             self._planner_workspace = get_planner_workspace(
                 num_experts=self.semantic_num_experts, device=probs.device, group=self.group
             )
-        plan = plan_virtual_expert_routes(top_indices, probs, self._planner_workspace)
+        plan, self.runtime_probs = plan_virtual_expert_routes(
+            top_indices, probs, self._planner_workspace
+        )
         self._plan = self._context.plan = self._bridge.last_plan = plan
         self._bridge.start_prefetch(plan)
 
