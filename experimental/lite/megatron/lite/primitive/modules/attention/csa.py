@@ -14,6 +14,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils import (
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.core.transformer.experimental_attention_variant.csa import (
+    _apply_fused_rope,
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,
 )
@@ -32,6 +33,23 @@ from megatron.lite.primitive.utils.rotary import (
     _yarn_find_correction_range,
     _yarn_linear_ramp_mask,
 )
+
+
+class _SingleRankGroup:
+    """Stand-in for a process group when CP is off.
+
+    Core's fused RoPE asks the group for its rank and size unconditionally, and
+    lite leaves ``ps.cp_group`` unset at ``cp_size == 1``.
+    """
+
+    @staticmethod
+    def rank() -> int:
+        return 0
+
+    @staticmethod
+    def size() -> int:
+        return 1
+
 
 
 @jit_fuser
@@ -791,15 +809,32 @@ class CompressedSparseAttention(nn.Module):
             dtype=x.dtype,
         )
         q_low = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # Build q/kv directly in the SBHD/THD layout the TE kernels consume, rather
+        # than transposing into [b, h, s, d] for RoPE and transposing back. The two
+        # round trips cost a full materialised copy of q, kv, each way; the op
+        # census measured them among the largest single copies per layer, paid
+        # twice again under activation recompute.
+        q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim)
         q = _per_head_rms(q, self.config.rms_norm_eps)
-        kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
-        q = apply_partial_rope(q, cos, sin, self.rope_head_dim)
-        kv = apply_partial_rope(kv, cos, sin, self.rope_head_dim)
+        kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim)
 
         # TE-THD convention: query (total, np, hn); key (total, 1, 1, hn); x/qr (total, 1, *).
-        query_thd = q.squeeze(0).transpose(0, 1).contiguous()  # (total, np, hn)
-        key_thd = kv.permute(2, 0, 1, 3).contiguous()  # (total, 1, 1, hn)
+        query_thd = q.squeeze(0)  # (total, np, hn) -- already contiguous
+        key_thd = kv.squeeze(0).unsqueeze(1)  # (total, 1, 1, hn)
+        # Core's fused MLA RoPE, adjudicated against the expression it replaces on
+        # this exact THD path: full-length cos/sin (``cat(freqs, freqs)``, which is
+        # what the builders above already return), rope on the trailing
+        # ``rope_head_dim`` channels, positions restarting per packed sequence.
+        cos_thd = cos.squeeze(0)
+        sin_thd = sin.squeeze(0)
+        nope_dim = self.head_dim - self.rope_head_dim
+        rope_group = cp_group if cp_group is not None else _SingleRankGroup()
+        query_thd = _apply_fused_rope(
+            query_thd, cos_thd, sin_thd, nope_dim, self.rope_head_dim, cu_seqlens, rope_group
+        )
+        key_thd = _apply_fused_rope(
+            key_thd, cos_thd, sin_thd, nope_dim, self.rope_head_dim, cu_seqlens, rope_group
+        )
         x_thd = x.transpose(0, 1).contiguous()  # (total, 1, hidden)
         qr_thd = q_low.transpose(0, 1).contiguous()  # (total, 1, q_lora_rank)
 
