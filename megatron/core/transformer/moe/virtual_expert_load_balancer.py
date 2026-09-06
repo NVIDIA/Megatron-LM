@@ -45,6 +45,8 @@ if TYPE_CHECKING:
 
 # Push directions. MXFP8 forward GEMMs read the rowwise components, backward the columnwise.
 FORWARD, BACKWARD = 0, 1
+# Index of a projection's native wgrad pointer table, after the two push directions.
+_GRAD = 2
 _MXFP8_COMPONENTS = (
     "_rowwise_data",
     "_rowwise_scale_inv",
@@ -73,37 +75,58 @@ class VirtualExpertPlan:
     experts_to_copy: torch.Tensor
 
 
+def _scratch_layout(num_experts: int, ep_size: int) -> tuple[dict, int]:
+    """Fields of the planner's int32 scratch arena as ``name -> (offset, shape)`` plus its total
+    size; mirrors ``_planner_fields`` in the Triton module."""
+    block_ep = 1 << (ep_size - 1).bit_length()
+    # Each flag word gets its own 128-byte line (the kernel's _FLAG_STRIDE).
+    fields = (
+        ("placement_grid_sync", (1,)),
+        ("_pad0", (31,)),
+        ("grid_sync", (1,)),
+        ("_pad1", (31,)),
+        ("sequence", (1,)),  # exchange launch counter the flags carry
+        ("_pad2", (31,)),
+        ("balance", (ep_size,)),  # native load minus rank capacity
+        ("allocation", (num_experts, ep_size)),  # routes of each expert per destination
+        ("destination_boundaries", (num_experts, block_ep)),  # segment ends, local ordinals
+        ("virtual_expert_slots", (num_experts, ep_size)),  # slot holding an expert on a rank
+        ("program_histogram", (PLANNER_PROGRAMS, num_experts)),
+        ("running_counts", (PLANNER_PROGRAMS, num_experts)),
+        ("tokens_per_expert", (num_experts,)),  # this rank's histogram
+    )
+    layout, offset = {}, 0
+    for name, shape in fields:
+        layout[name] = (offset, shape)
+        offset += math.prod(shape)
+    return layout, offset
+
+
 @dataclass(slots=True)
 class VirtualExpertPlannerWorkspace:
     """Planner scratch for one expert layout and EP group; every plan overwrites it.
 
     ``gathered_counts`` is this rank's NCCL symmetric-memory window: the planner kernel
     publishes the local histogram into every peer's window and reads the peers' rows from its
-    own, so planning needs no collective.
+    own, so planning needs no collective. ``scratch`` is one int32 arena (see
+    :func:`_scratch_layout`); :meth:`field` views its parts.
     """
 
     num_experts: int
     ep_size: int
     rank: int
-    gathered_counts: torch.Tensor  # [ep_size, num_experts] local routes per (source, expert)
+    gathered_counts: torch.Tensor  # [ep_size, num_experts] window
     histogram_handle: object  # symmetric-memory handle of gathered_counts
-    sequence: torch.Tensor  # int32 [1] exchange launch counter the flags carry
-    program_histogram: torch.Tensor  # [PLANNER_PROGRAMS, num_experts] per-program histograms
-    running_counts: torch.Tensor  # [PLANNER_PROGRAMS, num_experts] mapping-phase prefix counts
-    tokens_per_expert: torch.Tensor  # [num_experts] this rank's histogram
-    balance: torch.Tensor  # [ep_size] native load minus rank capacity
-    allocation: torch.Tensor  # [num_experts, ep_size] routes of each expert per destination
-    placement_grid_sync: torch.Tensor  # barrier of the EP_SIZE placing programs
-    grid_sync: torch.Tensor  # barrier of all planner programs
-    # Per-expert destination segment ends in this rank's local ordinal space, padded to a
-    # power of two columns.
-    destination_boundaries: torch.Tensor
-    virtual_expert_slots: torch.Tensor  # [num_experts, ep_size] slot holding an expert on a rank
-    experts_to_copy: torch.Tensor  # [ep_size, num_local_experts]
+    scratch: torch.Tensor
 
     @property
     def num_local_experts(self) -> int:
         return self.num_experts // self.ep_size
+
+    def field(self, name: str) -> torch.Tensor:
+        """View one field of the scratch arena."""
+        offset, shape = _scratch_layout(self.num_experts, self.ep_size)[0][name]
+        return self.scratch[offset : offset + math.prod(shape)].view(shape)
 
     def destroy(self) -> None:
         """Drop the symmetric window while its process group is still alive."""
@@ -128,7 +151,7 @@ class VirtualExpertPlannerWorkspace:
                 "Virtual-expert planner needs one signal word per EP rank; the symmetric "
                 f"memory signal pad holds {handle.signal_pad_size} bytes for {ep_size} ranks."
             )
-        return cls.scratch(
+        return cls.local(
             num_experts,
             ep_size,
             device,
@@ -138,33 +161,21 @@ class VirtualExpertPlannerWorkspace:
         )
 
     @classmethod
-    def scratch(
+    def local(
         cls, num_experts, ep_size, device, *, rank=0, gathered_counts=None, histogram_handle=None
     ):
-        """The scratch tensors; without a window (process-local tests), ``gathered_counts`` is
-        plain memory the caller fills with every rank's histogram."""
-        int32 = dict(dtype=torch.int32, device=device)
+        """The scratch without a window (process-local tests): ``gathered_counts`` is plain
+        memory the caller fills with every rank's histogram."""
         if gathered_counts is None:
-            gathered_counts = torch.empty((ep_size, num_experts), **int32)
+            gathered_counts = torch.empty((ep_size, num_experts), dtype=torch.int32, device=device)
+        _, size = _scratch_layout(num_experts, ep_size)
         return cls(
             num_experts=num_experts,
             ep_size=ep_size,
             rank=rank,
             gathered_counts=gathered_counts,
             histogram_handle=histogram_handle,
-            sequence=torch.zeros(1, **int32),
-            program_histogram=torch.empty((PLANNER_PROGRAMS, num_experts), **int32),
-            running_counts=torch.empty((PLANNER_PROGRAMS, num_experts), **int32),
-            tokens_per_expert=torch.empty(num_experts, **int32),
-            balance=torch.empty(ep_size, **int32),
-            allocation=torch.empty((num_experts, ep_size), **int32),
-            placement_grid_sync=torch.zeros(1, **int32),
-            grid_sync=torch.zeros(1, **int32),
-            destination_boundaries=torch.empty(
-                (num_experts, 1 << (ep_size - 1).bit_length()), **int32
-            ),
-            virtual_expert_slots=torch.empty((num_experts, ep_size), **int32),
-            experts_to_copy=torch.empty((ep_size, num_experts // ep_size), **int32),
+            scratch=torch.zeros(size, dtype=torch.int32, device=device),
         )
 
 
@@ -189,21 +200,8 @@ class _PlanRoutes(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, probs, top_indices, workspace, exchange):
-        num_tokens, router_topk = top_indices.shape
-        empty = functools.partial(torch.empty, device=probs.device)
-        virtual_experts = empty((num_tokens, router_topk), dtype=torch.int16)
-        runtime_probs = empty((num_tokens, 2 * workspace.num_experts), dtype=torch.float32)
-        # A plan owns its slot table: the backward push and reduction read it, possibly past
-        # another forward of the same layer, so the planner writes it straight into the plan.
-        experts_to_copy = torch.empty_like(workspace.experts_to_copy)
-        launch_virtual_expert_planner(
-            top_indices,
-            probs,
-            workspace,
-            virtual_experts,
-            runtime_probs,
-            experts_to_copy,
-            exchange=exchange,
+        virtual_experts, runtime_probs, experts_to_copy = launch_virtual_expert_planner(
+            top_indices, probs, workspace, exchange=exchange
         )
         ctx.save_for_backward(virtual_experts)
         ctx.probs_dtype = probs.dtype
@@ -467,9 +465,6 @@ class _VirtualExpertProjection:
             placeholder = torch.empty(0, dtype=self.grad_dtype, device=self.device)
             native_grads = (placeholder,) * len(parameters)
             grad_bases = [0] * len(parameters)
-        self.native_grad_bases = torch.tensor(grad_bases, dtype=torch.int64, device=self.device)
-        self.host_grad_bases = torch.empty(len(parameters), dtype=torch.int64, pin_memory=True)
-        self.grad_bases_copied = torch.cuda.Event()
         self.wgrad_scratch: list[torch.Tensor] | None = None
         data, scales = workspace.slot_views(index)
         if self.mxfp8:
@@ -504,19 +499,28 @@ class _VirtualExpertProjection:
             parameter.grad_added_to_main_grad = True
             parameter.overwrite_main_grad = True
             parameter.register_post_accumulate_grad_hook(_drop_grad)
-        # Per direction: the ``[components, L]`` device table the push reads (data, then
-        # MXFP8 scales), its pinned mirror, the bound pointers and the copy's completion.
-        rows = 2 if self.mxfp8 else 1
+        # Device pointer tables the kernels read, with pinned mirrors and copy-completion
+        # events: per push direction the ``[components, L]`` weight table (data, then MXFP8
+        # scales), and the ``[1, L]`` native wgrad table of the reduction.
+        rows = (2 if self.mxfp8 else 1, 2 if self.mxfp8 else 1, 1)
         self.tables = tuple(
-            torch.empty((rows, len(parameters)), dtype=torch.int64, device=self.device)
-            for _ in range(2)
+            torch.empty((r, len(parameters)), dtype=torch.int64, device=self.device) for r in rows
         )
         self.host_tables = tuple(
-            torch.empty((rows, len(parameters)), dtype=torch.int64, pin_memory=True)
-            for _ in range(2)
+            torch.empty((r, len(parameters)), dtype=torch.int64, pin_memory=True) for r in rows
         )
+        self.copied = [torch.cuda.Event() for _ in rows]
         self.bound = [None, None]
-        self.copied = [torch.cuda.Event(), torch.cuda.Event()]
+        self.native_grad_bases = self.tables[_GRAD][0]
+        self._upload(_GRAD, [grad_bases])
+
+    def _upload(self, table: int, rows) -> None:
+        """Refresh device pointer table ``table`` through its pinned mirror, which may only be
+        rewritten once the previous copy has landed."""
+        self.copied[table].synchronize()
+        self.host_tables[table].copy_(torch.tensor(rows, dtype=torch.int64))
+        self.tables[table].copy_(self.host_tables[table], non_blocking=True)
+        self.copied[table].record(torch.cuda.current_stream(self.device))
 
     def _components(self, direction: int) -> tuple[str, ...]:
         return _MXFP8_COMPONENTS[2 * direction : 2 * direction + 2] if self.mxfp8 else ("data",)
@@ -564,11 +568,7 @@ class _VirtualExpertProjection:
                     setattr(parameter, name, getattr(source, name))
             else:
                 parameter.data = source
-        # The pinned mirror may only be rewritten once its previous copy has landed.
-        self.copied[direction].synchronize()
-        self.host_tables[direction].copy_(torch.tensor(pointers, dtype=torch.int64).t())
-        self.tables[direction].copy_(self.host_tables[direction], non_blocking=True)
-        self.copied[direction].record(torch.cuda.current_stream(self.device))
+        self._upload(direction, list(zip(*pointers)))
         self.bound[direction] = pointers
 
     def bind_wgrad_scratch(self) -> None:
@@ -599,13 +599,7 @@ class _VirtualExpertProjection:
             )
         for parameter, grad in zip(self.runtime_parameters, scratch):
             parameter.main_grad = grad
-        # The pinned mirror may only be rewritten once its previous copy has landed.
-        self.grad_bases_copied.synchronize()
-        self.host_grad_bases.copy_(
-            torch.tensor([grad.data_ptr() for grad in scratch], dtype=torch.int64)
-        )
-        self.native_grad_bases.copy_(self.host_grad_bases, non_blocking=True)
-        self.grad_bases_copied.record(torch.cuda.current_stream(self.device))
+        self._upload(_GRAD, [[grad.data_ptr() for grad in scratch]])
         self.wgrad_scratch = scratch
 
     def take_wgrads(self) -> tuple[torch.Tensor, ...]:
