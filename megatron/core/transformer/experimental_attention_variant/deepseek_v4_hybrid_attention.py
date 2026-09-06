@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
+import os
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
 
@@ -27,8 +28,9 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils import c
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import get_pg_size, is_te_min_version
+from megatron.core.utils import get_pg_size, is_te_min_version, make_tp_sharded_tensor_for_checkpoint
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
@@ -87,9 +89,27 @@ class DSv4HybridAttention(Attention):
         )
         self.config: MLATransformerConfig
 
-        assert (
-            get_pg_size(self.pg_collection.tp) == 1
-        ), "DSv4 Hybrid Attention only supports TP size 1."
+        self.tp_size = get_pg_size(self.pg_collection.tp)
+        if self.tp_size > 1:
+            if not self.config.sequence_parallel:
+                raise ValueError("DSv4 Hybrid Attention with TP>1 requires sequence_parallel=True.")
+            if self.config.num_attention_heads % self.tp_size != 0:
+                raise ValueError(
+                    "num_attention_heads must be divisible by tensor model parallel size: "
+                    f"{self.config.num_attention_heads} % {self.tp_size} != 0"
+                )
+            if self.config.o_groups % self.tp_size != 0:
+                raise ValueError(
+                    "o_groups must be divisible by tensor model parallel size: "
+                    f"{self.config.o_groups} % {self.tp_size} != 0"
+                )
+            # The generic Attention base class treats num_query_groups=1 as
+            # GQA and assumes each TP rank initially owns all query heads.
+            # DSv4's custom q-up projection is already column-sharded, so its
+            # output is local-head shaped and must use the explicit TP-local
+            # head count here.
+            self.num_attention_heads_per_partition = self.config.num_attention_heads // self.tp_size
+            self.num_query_groups_per_partition = 1
 
         assert (
             not self.checkpoint_core_attention
@@ -169,12 +189,14 @@ class DSv4HybridAttention(Attention):
         )
 
         # Output.
-        self.o_local_groups = self.config.o_groups
+        # Q heads are column-parallel. The manual grouped output projection
+        # therefore owns only the corresponding local groups on each TP rank.
+        self.o_local_groups = self.config.o_groups // self.tp_size
         assert (
             self.query_projection_size % self.config.o_groups == 0
         ), "num_attention_heads * v_head_dim must be divisible by o_groups"
         group_proj_in_size = self.query_projection_size // self.config.o_groups
-        group_proj_out_size = self.config.o_groups * self.config.o_lora_rank
+        group_proj_out_size = self.o_local_groups * self.config.o_lora_rank
 
         _linear_o_group_proj = torch.empty(
             group_proj_out_size,
@@ -184,6 +206,8 @@ class DSv4HybridAttention(Attention):
         )
         self.config.init_method(_linear_o_group_proj)
         self.linear_o_group_proj = torch.nn.Parameter(_linear_o_group_proj)
+        if self.tp_size > 1:
+            set_tensor_model_parallel_attributes(self.linear_o_group_proj, True, 0, 1)
 
         linear_proj_in_size = self.config.o_groups * self.config.o_lora_rank
 
@@ -257,8 +281,110 @@ class DSv4HybridAttention(Attention):
         # for recompute; the rest of this forward reads it from pg_collection.
         # Restore the static group before returning.
         _orig_cp_group = self.pg_collection.cp
-        cp_group = _orig_cp_group
-        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+        tp_local_csa_requested = (
+            os.environ.get('DSV4_TP_LOCAL_CSA', '0').strip().lower()
+            in ('1', 'true', 'yes', 'on')
+        )
+        tp_local_csa = (
+            tp_local_csa_requested
+            and self.tp_size > 1
+            and self.config.sequence_parallel
+            and packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and _orig_cp_group.size() == 1
+        )
+        if tp_local_csa and os.environ.get('DSV4_TP_LOCAL_CSA_UNSAFE', '0') != '1':
+            raise RuntimeError(
+                'DSV4_TP_LOCAL_CSA is disabled: rank-distinct TP correctness failed. '
+                'Set DSV4_TP_LOCAL_CSA_UNSAFE=1 only to reproduce the negative experiment.'
+            )
+        tp_local_indexer_q = (
+            os.environ.get('DSV4_TP_LOCAL_INDEXER_Q', '0').strip().lower()
+            in ('1', 'true', 'yes', 'on')
+            and not tp_local_csa
+            and self.tp_size > 1
+            and self.config.sequence_parallel
+            and packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and _orig_cp_group.size() == 1
+        )
+        if tp_local_indexer_q and (getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0) > 0:
+            raise RuntimeError(
+                'DSV4_TP_LOCAL_INDEXER_Q currently requires dsa_indexer_loss_coeff == 0.'
+            )
+        tp_local_indexer_topk = (
+            os.environ.get('DSV4_TP_LOCAL_INDEXER_TOPK', '0').strip().lower()
+            in ('1', 'true', 'yes', 'on')
+            and not tp_local_csa
+            and not tp_local_indexer_q
+            and self.tp_size > 1
+            and self.config.sequence_parallel
+            and packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and _orig_cp_group.size() == 1
+        )
+        if tp_local_indexer_topk and (getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0) > 0:
+            raise RuntimeError(
+                'DSV4_TP_LOCAL_INDEXER_TOPK currently requires dsa_indexer_loss_coeff == 0.'
+            )
+        if tp_local_indexer_topk and os.environ.get('DSV4_TP_LOCAL_INDEXER_TOPK_UNSAFE', '0') != '1':
+            raise RuntimeError(
+                'DSV4_TP_LOCAL_INDEXER_TOPK is disabled: local RoPE/top-k changed routes '
+                'beyond the legacy fused-kernel nondeterminism envelope. '
+                'Set DSV4_TP_LOCAL_INDEXER_TOPK_UNSAFE=1 only to reproduce the negative experiment.'
+            )
+        tp_local_attention_compressor = (
+            os.environ.get('DSV4_TP_LOCAL_ATTENTION_COMPRESSOR', '0').strip().lower()
+            in ('1', 'true', 'yes', 'on')
+            and not tp_local_csa
+            and self.tp_size > 1
+            and self.config.sequence_parallel
+            and packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and _orig_cp_group.size() == 1
+            and self._dsv4_compress_ratio > 1
+        )
+        if (
+            tp_local_attention_compressor
+            and os.environ.get('DSV4_TP_LOCAL_ATTENTION_COMPRESSOR_UNSAFE', '0') != '1'
+        ):
+            raise RuntimeError(
+                'DSV4_TP_LOCAL_ATTENTION_COMPRESSOR is disabled: rank-distinct backward '
+                'gradient correctness failed. Set ..._UNSAFE=1 only to reproduce the negative experiment.'
+            )
+        tp_local_indexer_compressor = (
+            os.environ.get('DSV4_TP_LOCAL_INDEXER_COMPRESSOR', '0').strip().lower()
+            in ('1', 'true', 'yes', 'on')
+            and not tp_local_csa
+            and self.tp_size > 1
+            and self.config.sequence_parallel
+            and packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and _orig_cp_group.size() == 1
+            and self._dsv4_compress_ratio > 1
+        )
+        if tp_local_indexer_compressor and (
+            getattr(self.config, 'dsa_indexer_loss_coeff', 0.0) or 0.0
+        ) > 0:
+            raise RuntimeError(
+                'DSV4_TP_LOCAL_INDEXER_COMPRESSOR currently requires dsa_indexer_loss_coeff == 0.'
+            )
+        fuse_csa_input_gather = (
+            os.environ.get('DSV4_FUSE_CSA_INPUT_GATHER', '0').strip().lower()
+            in ('1', 'true', 'yes', 'on')
+            and not tp_local_csa
+            and not tp_local_indexer_q
+            and not tp_local_indexer_topk
+            and not tp_local_attention_compressor
+            and not tp_local_indexer_compressor
+            and self.tp_size > 1
+            and self.config.sequence_parallel
+            and packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and _orig_cp_group.size() == 1
+        )
+        cp_group = self.pg_collection.tp if tp_local_csa else _orig_cp_group
+        if not tp_local_csa and packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
             cp_group = packed_seq_params.cp_group
 
@@ -271,13 +397,35 @@ class DSv4HybridAttention(Attention):
             raise ValueError("DSv4 THD CP requires a contiguous CP partition.")
         self.pg_collection.cp = cp_group
 
+        sequence_parallel_local_length = hidden_states.size(0)
+        core_hidden_states = hidden_states
+        if (
+            self.tp_size > 1
+            and self.config.sequence_parallel
+            and not tp_local_csa
+            and not fuse_csa_input_gather
+        ):
+            # q-up uses TE's standard SP all-gather. The duplicated KV path
+            # and CSA compressor need the same CP-local sequence explicitly.
+            core_hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+                hidden_states, group=self.pg_collection.tp
+            )
+
         boundary_hidden = None
         if use_thd_cp:
             boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
-                hidden_states,
+                core_hidden_states,
                 self._dsv4_compress_ratio,
                 self.config.csa_window_size,
                 self.pg_collection.cp,
+            )
+        local_compressor_boundary_hidden = None
+        if tp_local_attention_compressor or tp_local_indexer_compressor:
+            local_compressor_boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
+                hidden_states,
+                self._dsv4_compress_ratio,
+                self.config.csa_window_size,
+                self.pg_collection.tp,
             )
 
         # =====================
@@ -292,12 +440,81 @@ class DSv4HybridAttention(Attention):
             packed_seq_params,
             inference_context=inference_context,
             boundary_hidden=boundary_hidden,
+            tp_local_csa=tp_local_csa,
         )
         if use_thd_cp:
             query, key, value, q_compressed, kv_compressed, boundary_kv = qkv
         else:
             query, key, value, q_compressed, kv_compressed = qkv
             boundary_kv = None
+
+        if tp_local_csa:
+            # TE may return a sequence-gathered q-up result even though its
+            # GEMM consumed local rows. The local CSA path only needs this
+            # rank's contiguous query rows.
+            tp_rank = torch.distributed.get_rank(group=self.pg_collection.tp)
+            local_start = tp_rank * sequence_parallel_local_length
+            global_rows = sequence_parallel_local_length * self.tp_size
+
+            def _take_tp_local_rows(tensor):
+                if tensor is None or tensor.size(0) == sequence_parallel_local_length:
+                    return tensor
+                if tensor.size(0) != global_rows:
+                    raise RuntimeError(
+                        "DSv4 TP local CSA received an unexpected sequence length: "
+                        f"shape={tuple(tensor.shape)}, local={sequence_parallel_local_length}, "
+                        f"tp={self.tp_size}"
+                    )
+                return tensor.narrow(0, local_start, sequence_parallel_local_length).contiguous()
+
+            query = _take_tp_local_rows(query)
+            key = _take_tp_local_rows(key)
+            value = _take_tp_local_rows(value)
+            q_compressed = _take_tp_local_rows(q_compressed)
+
+        local_indexer_qr = q_compressed
+        if (tp_local_indexer_q or tp_local_indexer_topk) and q_compressed is not None:
+            # The duplicated q-down projection may return a sequence-gathered
+            # tensor under TE sequence-parallel mode.  Indexer Q is token-wise
+            # and only needs this rank's compressed-query rows.
+            global_rows = sequence_parallel_local_length * self.tp_size
+            if q_compressed.size(0) == global_rows:
+                tp_rank = torch.distributed.get_rank(group=self.pg_collection.tp)
+                local_indexer_qr = q_compressed.narrow(
+                    0, tp_rank * sequence_parallel_local_length, sequence_parallel_local_length
+                ).contiguous()
+            elif q_compressed.size(0) != sequence_parallel_local_length:
+                raise RuntimeError(
+                    "DSv4 TP-local Indexer received an unexpected compressed-query length: "
+                    f"shape={tuple(q_compressed.shape)}, local={sequence_parallel_local_length}, "
+                    f"tp={self.tp_size}"
+                )
+
+        core_q_compressed = q_compressed
+        if fuse_csa_input_gather:
+            q_compressed_3d = (
+                q_compressed.unsqueeze(1) if q_compressed.ndim == 2 else q_compressed
+            )
+            if q_compressed_3d.shape[0] != sequence_parallel_local_length:
+                raise RuntimeError(
+                    'DSV4 fused CSA input gather requires TP-local q-compressed rows: '
+                    f'shape={tuple(q_compressed_3d.shape)}, '
+                    f'local={sequence_parallel_local_length}'
+                )
+            fused_csa_inputs = tensor_parallel.gather_from_sequence_parallel_region(
+                torch.cat((hidden_states, q_compressed_3d), dim=-1),
+                group=self.pg_collection.tp,
+            )
+            core_hidden_states = fused_csa_inputs[..., : self.config.hidden_size]
+            core_q_compressed = fused_csa_inputs[..., self.config.hidden_size :].squeeze(1)
+        elif self.tp_size > 1 and self.config.sequence_parallel and not tp_local_csa:
+            # q-down is duplicated and remains TP-local, while CSA's learned
+            # indexer consumes the same complete CP-local sequence as the
+            # gathered hidden states. Keep the local q-compressed tensor for
+            # q-up, and provide a gathered copy to the core-attention path.
+            core_q_compressed = tensor_parallel.gather_from_sequence_parallel_region(
+                q_compressed, group=self.pg_collection.tp
+            )
 
         # TODO: Currently, TE can only accept contiguous tensors for MLA
         query = query.contiguous()
@@ -318,10 +535,28 @@ class DSv4HybridAttention(Attention):
                 value,
                 attention_mask,
                 packed_seq_params=packed_seq_params,
-                x=hidden_states,
-                qr=q_compressed,
+                x=core_hidden_states,
+                qr=core_q_compressed,
                 boundary_hidden=boundary_hidden,
                 boundary_kv=boundary_kv,
+                indexer_x_local=(
+                    hidden_states if (tp_local_indexer_q or tp_local_indexer_topk) else None
+                ),
+                indexer_qr_local=(
+                    local_indexer_qr if (tp_local_indexer_q or tp_local_indexer_topk) else None
+                ),
+                tp_local_indexer_q=tp_local_indexer_q,
+                tp_local_indexer_topk=tp_local_indexer_topk,
+                attention_compressor_x_local=(
+                    hidden_states if tp_local_attention_compressor else None
+                ),
+                attention_compressor_boundary_hidden=local_compressor_boundary_hidden,
+                tp_local_attention_compressor=tp_local_attention_compressor,
+                indexer_compressor_x_local=(
+                    hidden_states if tp_local_indexer_compressor else None
+                ),
+                indexer_compressor_boundary_hidden=local_compressor_boundary_hidden,
+                tp_local_indexer_compressor=tp_local_indexer_compressor,
             )
         forced_released_tensors = [query, key, value]
         if boundary_kv is not None:
@@ -329,6 +564,15 @@ class DSv4HybridAttention(Attention):
         core_attn_out = core_attn_manager.group_offload(
             core_attn_out, forced_released_tensors=forced_released_tensors
         )
+        if tp_local_csa:
+            # The local CSA path computes only this rank's query rows. Restore
+            # the legacy global-row contract before inverse RoPE and the
+            # existing output projection; its backward reduce-scatters the
+            # output gradient back into the local CSA rows.
+            core_attn_out = tensor_parallel.gather_from_sequence_parallel_region(
+                core_attn_out, group=self.pg_collection.tp
+            )
+            self.pg_collection.cp = _orig_cp_group
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
@@ -384,7 +628,7 @@ class DSv4HybridAttention(Attention):
         else:
             rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
         if self.config.apply_rope_fusion:
-            if use_thd_cp:
+            if use_thd_cp and not tp_local_csa:
                 global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
                 core_attn_out = cp_utils.apply_thd_cp_local_rope_fused(
                     core_attn_out,
@@ -416,7 +660,7 @@ class DSv4HybridAttention(Attention):
                 )
                 if packed_seq:
                     core_attn_out = core_attn_out.unsqueeze(1)
-        elif use_thd_cp:
+        elif use_thd_cp and not tp_local_csa:
             global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
             core_attn_out = cp_utils.apply_thd_cp_local_rope_unfused(
                 core_attn_out,
@@ -475,6 +719,21 @@ class DSv4HybridAttention(Attention):
         with attn_proj_manager as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
+
+        # Some TE versions reduce the row-parallel output across TP but leave
+        # the sequence dimension gathered. Restore the standard
+        # sequence-parallel module contract (local sequence on return) when
+        # that backend behavior is observed; do not double-scatter versions
+        # that already return the local shape.
+        if (
+            self.tp_size > 1
+            and self.config.sequence_parallel
+            and output.size(0) != sequence_parallel_local_length
+            and output.size(0) % self.tp_size == 0
+        ):
+            output = tensor_parallel.scatter_to_sequence_parallel_region(
+                output, group=self.pg_collection.tp
+            )
 
         self.pg_collection.cp = _orig_cp_group
         return output, bias
@@ -553,6 +812,17 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             tp_group=pg_collection.tp,
             name=(name + ".linear_q_up_proj") if name is not None else None,
         )
+        kv_proj_kwargs = {}
+        kv_proj_tp_group = pg_collection.tp
+        if submodules.linear_kv_proj is TELinear:
+            # DSv4 has one shared KV stream. Replicate it across TP ranks while
+            # query heads and grouped output weights are sharded by TP.
+            kv_proj_kwargs['parallel_mode'] = 'duplicated'
+            kv_proj_tp_group = None
+        else:
+            raise ValueError(
+                f"Unsupported linear_kv_proj for TP-aware DSv4: {submodules.linear_kv_proj}"
+            )
 
         self.linear_kv_proj = build_module(
             submodules.linear_kv_proj,
@@ -560,13 +830,14 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             self.config.v_head_dim,
             config=self.config,
             init_method=self.config.init_method,
-            gather_output=False,
             bias=False,
             skip_bias_add=False,
+            skip_weight_param_allocation=False,
             is_expert=False,
             tp_comm_buffer_name='kv_up_proj',
-            tp_group=pg_collection.tp,
+            tp_group=kv_proj_tp_group,
             name=(name + ".linear_kv_proj") if name is not None else None,
+            **kv_proj_kwargs,
         )
         self.kv_layernorm = submodules.kv_layernorm(
             hidden_size=self.config.v_head_dim,
@@ -580,6 +851,22 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             eps=self.config.attention_latent_norm_epsilon,
         )
 
+    def sharded_state_dict(self, prefix: str = "", sharded_offsets: tuple = (), metadata=None):
+        """Add TP metadata for the manually-created grouped output projection."""
+        state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        # The Bridge replaces this Parameter with TE GroupedLinear for FP8
+        # parameter-gather mode; that module supplies its own sharding metadata.
+        if not isinstance(self.linear_o_group_proj, torch.Tensor):
+            return state_dict
+        key = f"{prefix}linear_o_group_proj"
+        state_dict[key] = make_tp_sharded_tensor_for_checkpoint(
+            tensor=self.linear_o_group_proj,
+            key=key,
+            tp_axis=0,
+            prepend_offsets=sharded_offsets,
+        )
+        return state_dict
+
     def get_query_key_value_tensors(
         self,
         hidden_states,
@@ -590,6 +877,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         *,
         inference_params=None,
         boundary_hidden=None,
+        tp_local_csa=False,
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -705,10 +993,47 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             # q_compressed: [num_tokens, q_lora_rank]
             # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
             q, _ = self.linear_q_up_proj(q_compressed)
+            if tp_local_csa and q.size(0) != q_compressed.size(0):
+                local_q_rows = q_compressed.size(0)
+                expected_global_rows = local_q_rows * cp_group.size()
+                if q.size(0) != expected_global_rows:
+                    raise RuntimeError(
+                        "DSv4 TP local CSA q-up returned an unexpected sequence length: "
+                        f"q_rows={q.size(0)}, local_rows={local_q_rows}, "
+                        f"tp={cp_group.size()}"
+                    )
+                q = q.narrow(0, cp_group.rank() * local_q_rows, local_q_rows).contiguous()
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
             q = _q_rms_norm(q, self.config.layernorm_epsilon)
+
+            # Column-parallel q-up is the first point at which the actual
+            # sequence-parallel local length is observable.  Slice the global
+            # (or CP-local) RoPE table to that q length; using the incoming
+            # hidden-state length is incorrect because q-down/q-up may perform
+            # sequence-parallel scatter/gather internally.
+            local_rotary_pos_emb = rotary_pos_emb
+            local_rotary_pos_cos = rotary_pos_cos
+            local_rotary_pos_sin = rotary_pos_sin
+            if self.tp_size > 1 and self.config.sequence_parallel and not packed_seq:
+                local_seq_len = q.size(0)
+                tp_rank = torch.distributed.get_rank(group=self.pg_collection.tp)
+                start = tp_rank * local_seq_len
+
+                def _slice_tp_rope(tensor):
+                    if tensor is None or tensor.size(0) == local_seq_len:
+                        return tensor
+                    if start + local_seq_len > tensor.size(0):
+                        raise RuntimeError(
+                            "DSv4 TP RoPE table is shorter than the local sequence slice: "
+                            f"table={tensor.size(0)}, start={start}, local={local_seq_len}"
+                        )
+                    return tensor.narrow(0, start, local_seq_len)
+
+                local_rotary_pos_emb = _slice_tp_rope(local_rotary_pos_emb)
+                local_rotary_pos_cos = _slice_tp_rope(local_rotary_pos_cos)
+                local_rotary_pos_sin = _slice_tp_rope(local_rotary_pos_sin)
 
             boundary_rows = 0
             if boundary_kv_compressed is not None:
@@ -719,6 +1044,21 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
             kv, _ = self.linear_kv_proj(kv_projection_input)
             kv = self.kv_layernorm(kv)
+            if self.tp_size > 1 and self.config.sequence_parallel and not tp_local_csa:
+                # q-up is a standard SP column-parallel projection and
+                # therefore sees the complete CP-local sequence. The V4 KV
+                # projection is duplicated, so gather its local output to the
+                # same sequence space before CSA/attention.
+                if boundary_rows:
+                    boundary_kv_part = kv[:boundary_rows]
+                    local_kv_part = tensor_parallel.gather_from_sequence_parallel_region(
+                        kv[boundary_rows:], group=self.pg_collection.tp
+                    )
+                    kv = torch.cat([boundary_kv_part, local_kv_part], dim=0)
+                else:
+                    kv = tensor_parallel.gather_from_sequence_parallel_region(
+                        kv, group=self.pg_collection.tp
+                    )
             boundary_kv = None
 
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
@@ -733,8 +1073,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     global_start = cp_rank * q.shape[0]
                     query = cp_utils.apply_thd_cp_local_rope_fused(
                         q,
-                        rotary_pos_cos,
-                        rotary_pos_sin,
+                        local_rotary_pos_cos,
+                        local_rotary_pos_sin,
                         self.config.qk_head_dim,
                         self.config.qk_pos_emb_head_dim,
                         cu_seqlens_q,
@@ -743,8 +1083,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     kv = kv.unsqueeze(-2)
                     kv = cp_utils.apply_thd_cp_local_rope_fused(
                         kv,
-                        rotary_pos_cos,
-                        rotary_pos_sin,
+                        local_rotary_pos_cos,
+                        local_rotary_pos_sin,
                         self.config.qk_head_dim,
                         self.config.qk_pos_emb_head_dim,
                         cu_seqlens_q,
@@ -757,8 +1097,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cp_rank = cp_group.rank()
                     query = fused_mla_rope_inplace(
                         q,
-                        rotary_pos_cos,
-                        rotary_pos_sin,
+                        local_rotary_pos_cos,
+                        local_rotary_pos_sin,
                         self.config.qk_head_dim,
                         self.config.qk_pos_emb_head_dim,
                         cu_seqlens_q,
@@ -769,8 +1109,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     kv = kv.unsqueeze(-2)
                     kv = fused_mla_rope_inplace(
                         kv,
-                        rotary_pos_cos,
-                        rotary_pos_sin,
+                        local_rotary_pos_cos,
+                        local_rotary_pos_sin,
                         self.config.qk_head_dim,
                         self.config.qk_pos_emb_head_dim,
                         cu_seqlens_q,
@@ -785,7 +1125,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     global_start = cp_group.rank() * q.shape[0]
                     query = cp_utils.apply_thd_cp_local_rope_unfused(
                         q,
-                        rotary_pos_emb,
+                        local_rotary_pos_emb,
                         self.config.qk_head_dim,
                         self.config.qk_pos_emb_head_dim,
                         cu_seqlens_q,
@@ -794,7 +1134,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     )
                     kv = cp_utils.apply_thd_cp_local_rope_unfused(
                         kv.unsqueeze(-2),
-                        rotary_pos_emb,
+                        local_rotary_pos_emb,
                         self.config.qk_head_dim,
                         self.config.qk_pos_emb_head_dim,
                         cu_seqlens_kv,
@@ -808,8 +1148,17 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 else:
                     q_len = q.size()[0]
                     # Shorten rotary_pos_emb to the sequence length when inference_params
-                    # is not provided so direct forward accepts any sequence length.
-                    rotary_pos_emb = rotary_pos_emb[0:q_len]
+                    # is not provided so direct forward accepts any sequence length.  A
+                    # TP/sequence-parallel projection may append alignment rows after
+                    # the table was created from the unpadded input length; regenerate
+                    # the table in that case instead of relying on a broadcast that
+                    # fails one row short in the BSHD path.
+                    if local_rotary_pos_emb is not None and local_rotary_pos_emb.size(0) < q_len:
+                        if self._dsv4_uses_yarn_rope:
+                            local_rotary_pos_emb, _ = self.rotary_pos_emb(q_len, packed_seq=packed_seq)
+                        else:
+                            local_rotary_pos_emb = self.rotary_pos_emb(q_len, packed_seq=packed_seq)
+                    local_rotary_pos_emb = local_rotary_pos_emb[0:q_len]
 
                     # q_no_pe: [num_tokens, n, qk_head_dim]
                     # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
@@ -821,7 +1170,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
                     q_pos_emb = apply_rotary_pos_emb(
                         q_pos_emb,
-                        rotary_pos_emb,
+                        local_rotary_pos_emb,
                         config=self.config,
                         cu_seqlens=cu_seqlens_q,
                         mscale=mscale,
@@ -839,7 +1188,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
                     k_pos_emb = apply_rotary_pos_emb(
                         k_pos_emb,
-                        rotary_pos_emb,
+                        local_rotary_pos_emb,
                         config=self.config,
                         cu_seqlens=cu_seqlens_kv,
                         mscale=mscale,

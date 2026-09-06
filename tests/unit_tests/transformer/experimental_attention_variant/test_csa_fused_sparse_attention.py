@@ -44,6 +44,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sp
     _csa_fwd_flash_mla,
     _ensure_dsa_namespace,
     _ensure_flash_mla,
+    _get_head_padding,
     _get_topk_alignment,
     _kl_loss_from_dense_scores,
     _kl_loss_from_target_predict,
@@ -756,6 +757,36 @@ class TestGetTopkAlignment:
         sm = torch.cuda.get_device_capability()
         expected = 64 if sm[0] >= 10 else 128
         assert align == expected
+
+
+# ---------------------------------------------------------------------------
+# _get_head_padding
+# ---------------------------------------------------------------------------
+
+
+class TestHeadPadding:
+    """Architecture-dependent query-head padding for TP-local FlashMLA inputs."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_head_padding_cache(self):
+        _get_head_padding.cache_clear()
+        yield
+        _get_head_padding.cache_clear()
+
+    @pytest.mark.parametrize("sm_major", [9, 10])
+    def test_tp_local_heads_pad_to_flash_mla_supported_count(self, sm_major):
+        """TP8's eight local query heads must be padded to the 64-head kernel."""
+        with patch('torch.cuda.get_device_capability', return_value=(sm_major, 0)):
+            assert _get_head_padding(8) == 64
+            assert _get_head_padding(16) == 64
+            assert _get_head_padding(32) == 64
+            assert _get_head_padding(64) == 64
+
+    def test_unsupported_head_count_is_rejected(self):
+        """A non-divisor cannot be passed to FlashMLA by zero-padding."""
+        with patch('torch.cuda.get_device_capability', return_value=(9, 0)):
+            with pytest.raises(RuntimeError, match='local query heads'):
+                _get_head_padding(48)
 
 
 # ---------------------------------------------------------------------------
