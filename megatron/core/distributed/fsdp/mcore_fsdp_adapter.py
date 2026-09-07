@@ -693,18 +693,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 **common_fully_shard_kwargs,
             )
         super().__init__(config=config, module=module)
-        # With fine-grained EP-overlap the automatic FSDP hooks are disabled at
-        # construction (register_hooks=False). Install the submodule demand-unshard
-        # hooks here so the model also has a working parameter lifecycle in
-        # forward_only (eval) paths that never build a schedule plan. In training the
-        # schedule-plan path re-invokes setup_combined_1f1b_hooks (idempotent) to add
-        # the per-layer release hooks.
+
         if config.overlap_moe_expert_parallel_comm:
-            from megatron.core.models.common.fine_grained_mfsdp_scheduler import (
-                setup_combined_1f1b_hooks,
+            from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
+                register_combined_1f1b_hooks,
             )
 
-            setup_combined_1f1b_hooks(self.module)
+            register_combined_1f1b_hooks(self.module)
 
     @staticmethod
     def _validate_config(
