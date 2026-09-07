@@ -1,23 +1,23 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import math
+from collections.abc import Hashable
 from typing import Any
 
 import torch
 import torch.nn as nn
 
-from megatron.lite.primitive import transformer_engine as te
 # Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core.
 # The development branch groups them under the csa_utils package.
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.transformer.experimental_attention_variant.csa_utils import (
-    cp_layout_kernels as csa_cp_layout_kernels,
-)
-from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.core.transformer.experimental_attention_variant.csa import (
     _apply_fused_rope,
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,
 )
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_layout_kernels as csa_cp_layout_kernels,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
     FusedCSAIndexerSparseAttnFromTopkFunc,
     csa_sparse_attn,
@@ -26,13 +26,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
 )
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.kernels.jit import jit_fuser
 from megatron.lite.primitive.modules.attention.dsa import rotate_activation
 from megatron.lite.primitive.parallel.state import ParallelState
-from megatron.lite.primitive.utils.rotary import (
-    _yarn_find_correction_range,
-    _yarn_linear_ramp_mask,
-)
+from megatron.lite.primitive.utils.rotary import _yarn_find_correction_range, _yarn_linear_ramp_mask
 
 
 class _SingleRankGroup:
@@ -143,7 +141,80 @@ def build_yarn_rope_cos_sin(
     return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
 
 
+# The rotary tables depend only on the positions and the rope parameters, but
+# were rebuilt on every layer, every microbatch, and again under activation
+# recompute. A dispatch-level op census measured 10368 kernel launches per step
+# from the four lines that build them, over tensors small enough to round to
+# zero Melem -- pure launch overhead for a table that a step needs once.
+# Megatron Core caches the same tables (``RotaryEmbedding.get_cached_cos_sin``);
+# this mirrors that. Nothing about the values changes.
+_ROPE_CACHE: dict[Hashable, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _rope_cache_key(position_ids, rope_head_dim, rope_theta, config, use_yarn, device, dtype):
+    """Key on everything the tables actually depend on.
+
+    ``position_ids`` participates by identity *and* content: the same buffer is
+    reused across layers within a step, so its ``data_ptr`` and shape pin it,
+    while ``_version`` catches in-place edits that would otherwise be missed.
+    """
+    yarn = (
+        (
+            float(config.rotary_scaling_factor),
+            float(config.beta_fast),
+            float(config.beta_slow),
+            int(config.original_max_position_embeddings),
+        )
+        if use_yarn
+        else None
+    )
+    return (
+        position_ids.data_ptr(),
+        tuple(position_ids.shape),
+        position_ids._version,
+        int(rope_head_dim),
+        float(rope_theta),
+        bool(use_yarn),
+        yarn,
+        str(device),
+        str(dtype),
+    )
+
+
 def build_compressed_rope_cos_sin(
+    position_ids: torch.Tensor,
+    rope_head_dim: int,
+    rope_theta: float,
+    *,
+    config: Any,
+    use_yarn: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = _rope_cache_key(
+        position_ids, rope_head_dim, rope_theta, config, use_yarn, device, dtype
+    )
+    hit = _ROPE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    built = _build_compressed_rope_cos_sin_uncached(
+        position_ids,
+        rope_head_dim,
+        rope_theta,
+        config=config,
+        use_yarn=use_yarn,
+        device=device,
+        dtype=dtype,
+    )
+    # Bound the cache: positions change every step, so without this it grows
+    # without limit over a run.
+    if len(_ROPE_CACHE) > 64:
+        _ROPE_CACHE.clear()
+    _ROPE_CACHE[key] = built
+    return built
+
+
+def _build_compressed_rope_cos_sin_uncached(
     position_ids: torch.Tensor,
     rope_head_dim: int,
     rope_theta: float,
