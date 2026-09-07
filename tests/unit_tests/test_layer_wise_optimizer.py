@@ -263,13 +263,14 @@ class TestLayerWiseOptimizer:
         if use_layer_wise:
             from megatron.training.training import wrap_model_chunks_with_ddp
 
-            ddp_config = DistributedDataParallelConfig()
+            ddp_config = DistributedDataParallelConfig(
+                use_layer_wise_param_layout=use_param_layout
+            )
             model = wrap_model_chunks_with_ddp(
                 [model],
                 TransformerConfig(num_attention_heads=1, num_layers=1),
                 ddp_config,
                 use_layer_wise_distributed_optimizer=True,
-                use_layer_wise_param_layout=use_param_layout,
             )[0]
         else:
             ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
@@ -354,13 +355,13 @@ class TestLayerWiseOptimizer:
             overlap_grad_reduce=overlap_grad_reduce,
             grad_reduce_in_fp32=grad_reduce_in_fp32,
             bucket_size=bucket_size,
+            use_layer_wise_param_layout=use_param_layout,
         )
         model = wrap_model_chunks_with_ddp(
             [model],
             TransformerConfig(num_attention_heads=1, num_layers=1),
             ddp_config,
             use_layer_wise_distributed_optimizer=True,
-            use_layer_wise_param_layout=use_param_layout,
         )[0]
         if copy_from:
             model.module.load_state_dict(copy_from.module.state_dict())
