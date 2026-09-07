@@ -518,6 +518,7 @@ class TestMcoreAdapterCudaGraph:
                 )
             return model, optimizer
 
+        # FullCudaGraphWrapper requires this keyword-only schedule callback signature.
         def forward_backward(*, model, data_iterator, num_microbatches, seq_length, forward_only):
             assert seq_length is None
             assert not forward_only
