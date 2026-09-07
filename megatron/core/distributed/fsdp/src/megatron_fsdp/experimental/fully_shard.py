@@ -15,6 +15,8 @@
 """Minimal Megatron-FSDP fully_shard entrypoint."""
 
 import dataclasses
+import os
+from collections import Counter
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -161,9 +163,8 @@ def fully_shard(
             hooks on ``module``. Disable this when an external scheduler invokes the
             corresponding FSDP lifecycle methods explicitly. The state-dict safety hook
             is registered independently.
-        subgroup_size: Optional maximum number of contiguous DP ranks across which one
-            parameter may be sharded. Values larger than this mesh are capped to the mesh
-            size; otherwise the mesh size must be divisible by the subgroup size.
+        subgroup_size: Optional maximum number of same-node DP ranks across which one
+            parameter may be sharded.
 
         Parameters that are TE MXFP8 primary weights (detected via
         ``is_float8tensor`` + ``fp8_need_transpose_data``) are grouped into
@@ -184,7 +185,9 @@ def fully_shard(
     _validate_dp_axes(mesh, placements.dp_axes)
     mixed_precision_policy = mixed_precision_policy or MixedPrecisionPolicy()
     if subgroup_size is not None:
-        subgroup_size = min(subgroup_size, mesh.size())
+        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        ranks_per_node = Counter(rank // local_world_size for rank in mesh.mesh.flatten().tolist())
+        subgroup_size = min(subgroup_size, max(ranks_per_node.values()))
 
     original_cls = module.__class__
     _attach_mixin(module)

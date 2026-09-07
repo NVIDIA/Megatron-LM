@@ -187,7 +187,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         use_owner_comm_stream: bool = True,
         reconstruct_full_param: bool = False,
         num_ns_steps: int | None = None,
-        max_params_per_owner_chunk: int | None = 4,
+        max_params_per_owner_chunk: int | None = 16,
     ) -> None:
         _require_emerging_optimizers()
 
@@ -789,9 +789,9 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             self._orthogonalize_and_update(param, local_shard, group["lr"], group)
 
         for state in chunk_states:
-            self._enqueue_boundary_update(state)
-        for state in chunk_states:
             self._wait_for_dist_buffer(state.scatter_works)
+        for state in chunk_states:
+            self._enqueue_boundary_update(state)
 
         for parameter_group in fsdp_parameter_groups:
             parameter_group.sync_model_weight_from_main_weight()
@@ -987,7 +987,7 @@ class FsdpMuon(FsdpOrthogonalizedOptimizer):
         inner_optimizer: Muon,
         use_owner_comm_stream: bool = True,
         reconstruct_full_param: bool = False,
-        max_params_per_owner_chunk: int | None = 4,
+        max_params_per_owner_chunk: int | None = 16,
     ) -> None:
         _require_emerging_optimizers()
 
