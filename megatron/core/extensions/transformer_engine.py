@@ -412,13 +412,13 @@ def _resolve_is_first_microbatch(module) -> Optional[bool]:
 
     That is the right answer whenever nobody keeps the flag honest: the transpose cache is off,
     the config is not quantized so :meth:`MegatronModule.set_is_first_microbatch` never re-arms
-    it, or the module is reused within a microbatch (a repeated MTP layer, run once per depth),
-    which pairs its first forward with its last backward and inverts what the flag means.
+    it, or the module belongs to a repeated layer, run once per MTP depth, which pairs its first
+    forward with its last backward and so inverts what the flag means.
     """
     if (
         module.disable_parameter_transpose_cache
         or not is_first_microbatch_tracked(module.config)
-        or getattr(module, 'is_reused_within_microbatch', False)
+        or getattr(module, 'is_repeated_layer', False)
     ):
         return None
     return module.is_first_microbatch
