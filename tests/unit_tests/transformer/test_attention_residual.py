@@ -132,6 +132,118 @@ class TestAttnResAggregationMath:
         torch.testing.assert_close(out.double(), ref, rtol=1e-5, atol=1e-5)
 
 
+class TestAttnResHybridMTPNativeParity:
+    """Hybrid MTP source/partial semantics against an independent torch reference."""
+
+    class _ResidualLinear(torch.nn.Module):
+        """Minimal hybrid entry with the same ``output = input + f(input)`` contract."""
+
+        def __init__(self, hidden_size, layer_number):
+            super().__init__()
+            self.layer_number = layer_number
+            self.linear = torch.nn.Linear(hidden_size, hidden_size)
+
+        def forward(self, hidden_states, **_kwargs):
+            return hidden_states + self.linear(hidden_states)
+
+    @pytest.mark.parametrize("n_sources", [2, 5, 9])
+    def test_two_entry_depth_matches_native_forward_and_backward(self, n_sources):
+        """Every entry reuses the trunk tuple and only advances the MTP partial."""
+        from megatron.core.models.hybrid.hybrid_block import AttnResHybridLayer
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        torch.manual_seed(41 + n_sources)
+        hidden_size = 16
+        config = TransformerConfig(
+            num_layers=n_sources - 1,
+            hidden_size=hidden_size,
+            num_attention_heads=4,
+            enable_attention_residuals=True,
+            attn_res_block_layers=1,
+            is_hybrid_model=True,
+            mtp_num_layers=2,
+        )
+        layers = torch.nn.ModuleList(
+            [
+                AttnResHybridLayer(
+                    config,
+                    self._ResidualLinear(hidden_size, layer_number=index + 1),
+                    is_mtp_layer=True,
+                )
+                for index in range(2)
+            ]
+        )
+        final_attn_res = AttentionResidual(config)
+
+        with torch.no_grad():
+            for module in [*(layer.attn_res for layer in layers), final_attn_res]:
+                module.pseudo_query.copy_(torch.randn_like(module.pseudo_query) * 0.05)
+                module.key_norm_weight.copy_(
+                    torch.ones_like(module.key_norm_weight)
+                    + torch.randn_like(module.key_norm_weight) * 0.1
+                )
+
+        partial = torch.randn(3, 2, hidden_size, requires_grad=True)
+        sources = [torch.randn_like(partial, requires_grad=True) for _ in range(n_sources)]
+        real_partial = partial
+        for layer in layers:
+            assert not layer.attn_res_is_block_start
+            assert layer.attn_res_num_sources == n_sources
+            real_partial = layer(real_partial, attn_res_sources=tuple(sources))
+        real_output = final_attn_res([*sources, real_partial])
+
+        reference_input = partial.detach().double().requires_grad_(True)
+        reference_partial = reference_input
+        reference_sources = [source.detach().double().requires_grad_(True) for source in sources]
+        reference_params = []
+        for layer in layers:
+            query = layer.attn_res.pseudo_query.detach().double().requires_grad_(True)
+            norm_weight = layer.attn_res.key_norm_weight.detach().double().requires_grad_(True)
+            linear_weight = layer.inner_layer.linear.weight.detach().double().requires_grad_(True)
+            linear_bias = layer.inner_layer.linear.bias.detach().double().requires_grad_(True)
+            aggregated = _reference_attn_res(
+                query, norm_weight, layer.attn_res.eps, [*reference_sources, reference_partial]
+            )
+            reference_partial = reference_partial + torch.nn.functional.linear(
+                aggregated, linear_weight, linear_bias
+            )
+            reference_params.extend([query, norm_weight, linear_weight, linear_bias])
+
+        final_query = final_attn_res.pseudo_query.detach().double().requires_grad_(True)
+        final_norm_weight = final_attn_res.key_norm_weight.detach().double().requires_grad_(True)
+        reference_output = _reference_attn_res(
+            final_query,
+            final_norm_weight,
+            final_attn_res.eps,
+            [*reference_sources, reference_partial],
+        )
+        reference_params.extend([final_query, final_norm_weight])
+
+        torch.testing.assert_close(real_output.double(), reference_output, rtol=1e-5, atol=1e-5)
+        grad_output = torch.randn_like(real_output)
+        real_params = []
+        for layer in layers:
+            real_params.extend(
+                [
+                    layer.attn_res.pseudo_query,
+                    layer.attn_res.key_norm_weight,
+                    layer.inner_layer.linear.weight,
+                    layer.inner_layer.linear.bias,
+                ]
+            )
+        real_params.extend([final_attn_res.pseudo_query, final_attn_res.key_norm_weight])
+        real_grads = torch.autograd.grad(
+            real_output, [partial, *sources, *real_params], grad_output
+        )
+        reference_grads = torch.autograd.grad(
+            reference_output,
+            [reference_input, *reference_sources, *reference_params],
+            grad_output.double(),
+        )
+        for got, want in zip(real_grads, reference_grads):
+            torch.testing.assert_close(got.double(), want, rtol=1e-4, atol=1e-5)
+
+
 class TestAttnResCompileParity:
     """attn_res_impl='compile' must match the eager math bit-for-bit-ish."""
 
@@ -459,6 +571,44 @@ class TestAttnResConfigValidation:
 
         TransformerConfig(**self._base_kwargs())
 
+    def test_variable_seq_lengths_supported_without_pipeline_parallelism(self):
+        """Packed/variable sequence layouts are local tensors at PP=1."""
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        TransformerConfig(**self._base_kwargs(variable_seq_lengths=True))
+
+    def test_variable_seq_lengths_with_pipeline_parallelism_rejected(self):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(ValueError, match="variable_seq_lengths"):
+            TransformerConfig(
+                **self._base_kwargs(
+                    variable_seq_lengths=True,
+                    pipeline_model_parallel_size=2,
+                    pipeline_dtype=torch.float32,
+                )
+            )
+
+    def test_sequence_packing_supported_without_pipeline_parallelism(self):
+        """The scheduler enables variable_seq_lengths later in config validation."""
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        config = TransformerConfig(**self._base_kwargs(sequence_packing_scheduler="dp_balanced"))
+        assert config.variable_seq_lengths
+
+    def test_sequence_packing_with_pipeline_parallelism_rejected(self):
+        """Reject by scheduler name before its late variable-sequence assignment."""
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(ValueError, match="variable_seq_lengths"):
+            TransformerConfig(
+                **self._base_kwargs(
+                    sequence_packing_scheduler="dp_balanced",
+                    pipeline_model_parallel_size=2,
+                    pipeline_dtype=torch.float32,
+                )
+            )
+
     @pytest.mark.parametrize(
         "offload_modules,attn_res_impl",
         [
@@ -639,9 +789,18 @@ class TestAttnResHybridSchedule:
                 pipeline_dtype=torch.float32,
             )
 
-    def test_hybrid_mtp_rejected(self):
-        with pytest.raises(ValueError, match="hybrid MTP"):
-            self._hybrid_config(mtp_num_layers=1)
+    def test_hybrid_mtp_supported(self):
+        config = self._hybrid_config(mtp_num_layers=2, hybrid_layer_pattern="M-M*M-M*/M-*/M-*")
+        assert config.mtp_num_layers == 2
+
+    def test_hybrid_mtp_variable_seq_lengths_supported_without_pipeline_parallelism(self):
+        config = self._hybrid_config(
+            mtp_num_layers=2,
+            hybrid_layer_pattern="M-M*M-M*/M-*/M-*",
+            variable_seq_lengths=True,
+            context_parallel_size=2,
+        )
+        assert config.variable_seq_lengths
 
     def test_missing_pattern_with_pp_rejected(self):
         with pytest.raises(ValueError, match="hybrid_layer_pattern"):

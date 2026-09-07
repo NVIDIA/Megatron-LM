@@ -121,7 +121,9 @@ class TestMultiTokenPredictionLayer:
         destroy_num_microbatches_calculator()
         MTPLossLoggingHelper.tracker = {}
 
-    def _create_config_and_mtp_block_spec(self, tp, cp, use_te=False, use_repeated_layer=False):
+    def _create_config_and_mtp_block_spec(
+        self, tp, cp, use_te=False, use_repeated_layer=False, enable_attention_residuals=False
+    ):
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
         config = TransformerConfig(
             mtp_num_layers=2,
@@ -133,11 +135,17 @@ class TestMultiTokenPredictionLayer:
             sequence_parallel=True if tp > 1 else False,
             context_parallel_size=cp,  # Enable CP for MTP testing
             mtp_use_repeated_layer=use_repeated_layer,
+            enable_attention_residuals=enable_attention_residuals,
+            attn_res_block_layers=2 if enable_attention_residuals else None,
         )
         if use_te:
-            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                enable_attention_residual=enable_attention_residuals
+            )
         else:
-            transformer_layer_spec = get_gpt_layer_local_spec()
+            transformer_layer_spec = get_gpt_layer_local_spec(
+                enable_attention_residual=enable_attention_residuals
+            )
         mtp_block_spec = get_gpt_mtp_block_spec(
             config=config, spec=transformer_layer_spec, use_transformer_engine=use_te
         )
@@ -1096,12 +1104,17 @@ class TestMultiTokenPredictionLayer:
         assert (len(scattered) == 1) is expect_scatter
 
     @pytest.mark.parametrize("detach_heads", [False, True])
-    def test_forward_detach_heads_gradient_flow(self, monkeypatch, detach_heads):
+    @pytest.mark.parametrize("enable_attention_residuals", [False, True])
+    def test_forward_detach_heads_gradient_flow(
+        self, monkeypatch, detach_heads, enable_attention_residuals
+    ):
         """Block-level check of mtp_detach_heads: with the flag on, MTP gradients must
         not reach the main-model hidden_states or the shared embedding, while the MTP
         layer parameters still receive gradients."""
         torch.manual_seed(_SEED)
-        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(
+            tp=1, cp=1, enable_attention_residuals=enable_attention_residuals
+        )
         config.mtp_detach_heads = detach_heads
         # Runs on GPU because _concat_embeddings exercises the (fused) norm and
         # projection kernels; the rest of the MTP transformer layer is stubbed out.
@@ -1132,12 +1145,19 @@ class TestMultiTokenPredictionLayer:
         def fake_embedding(input_ids, position_ids):
             return emb_weight.clone()
 
+        attn_res_sources = None
+        if enable_attention_residuals:
+            attn_res_sources = tuple(
+                torch.randn_like(hidden_states, requires_grad=True) for _ in range(3)
+            )
+
         output = mtp.forward(
             input_ids=input_ids,
             position_ids=position_ids,
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             embedding=fake_embedding,
+            attn_res_sources=attn_res_sources,
         )
 
         # forward concatenates [main_hidden_states, mtp_out_0, mtp_out_1] along dim 0;
@@ -1150,6 +1170,8 @@ class TestMultiTokenPredictionLayer:
             assert layer.enorm.weight.grad is not None
             assert layer.hnorm.weight.grad is not None
             assert layer.eh_proj.weight.grad is not None
+            if enable_attention_residuals:
+                assert layer.final_attn_res.pseudo_query.grad is not None
 
         if detach_heads:
             # Gradients must not reach the main model or the shared embedding.
@@ -1158,9 +1180,13 @@ class TestMultiTokenPredictionLayer:
             if hidden_states.grad is not None:
                 torch.testing.assert_close(hidden_states.grad, torch.zeros_like(hidden_states))
             assert emb_weight.grad is None
+            if attn_res_sources is not None:
+                assert all(source.grad is None for source in attn_res_sources)
         else:
             assert hidden_states.grad is not None
             assert emb_weight.grad is not None
+            if attn_res_sources is not None:
+                assert all(source.grad is not None for source in attn_res_sources)
 
     @pytest.mark.parametrize("mtp_num_layers", [1, 2])
     def test_invalid_conditioning_embedding_has_no_input_gradient(self, mtp_num_layers):
@@ -4633,7 +4659,17 @@ class TestMultiTokenPredictionHybrid:
         return model
 
     def create_test_args(
-        self, tp, cp, sequence_length, micro_batch_size, fp8=None, full_recompute=False
+        self,
+        tp,
+        cp,
+        sequence_length,
+        micro_batch_size,
+        fp8=None,
+        full_recompute=False,
+        enable_attention_residuals=False,
+        attn_res_impl="eager",
+        detach_heads=False,
+        repeated_layer=False,
     ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
@@ -4665,6 +4701,11 @@ class TestMultiTokenPredictionHybrid:
         args.no_load_rng = True
         args.bf16 = True
         args.save_tokenizer_assets = False
+        args.enable_attention_residuals = enable_attention_residuals
+        args.attn_res_block_layers = 2 if enable_attention_residuals else None
+        args.attn_res_impl = attn_res_impl
+        args.mtp_detach_heads = detach_heads
+        args.mtp_use_repeated_layer = repeated_layer
         # Unified pattern: "main/mtp/mtp" - main decoder "M*M*", MTP pattern "M*" with 2 depths
         args.hybrid_layer_pattern = "M*M*/M*/M*"
 
@@ -5068,11 +5109,25 @@ class TestMultiTokenPredictionHybrid:
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
     @pytest.mark.parametrize(("tp", "cp"), [(1, 1), (2, 1)])
-    def test_forward_backward_mamba(self, tmp_path_dist_ckpt, tp, cp):
+    @pytest.mark.parametrize(
+        ("enable_attention_residuals", "detach_heads", "repeated_layer"),
+        [(False, False, False), (True, False, False), (True, True, True)],
+    )
+    def test_forward_backward_mamba(
+        self, tmp_path_dist_ckpt, tp, cp, enable_attention_residuals, detach_heads, repeated_layer
+    ):
         """Test MTP forward and backward with Mamba hybrid model."""
         tp_ref = 1
         cp_ref = 1
-        args = self.create_test_args(tp_ref, cp_ref, self.seq_length, self.micro_batch_size)
+        args = self.create_test_args(
+            tp_ref,
+            cp_ref,
+            self.seq_length,
+            self.micro_batch_size,
+            enable_attention_residuals=enable_attention_residuals,
+            detach_heads=detach_heads,
+            repeated_layer=repeated_layer,
+        )
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(
@@ -5127,7 +5182,15 @@ class TestMultiTokenPredictionHybrid:
             assert os.path.exists(expected_ckpt_path)
 
             Utils.destroy_model_parallel()
-            args = self.create_test_args(tp, cp, self.seq_length, self.micro_batch_size)
+            args = self.create_test_args(
+                tp,
+                cp,
+                self.seq_length,
+                self.micro_batch_size,
+                enable_attention_residuals=enable_attention_residuals,
+                detach_heads=detach_heads,
+                repeated_layer=repeated_layer,
+            )
             set_args(args)
             set_ckpt_path(ckpt_dir)
             torch.manual_seed(_SEED)
@@ -5178,6 +5241,12 @@ class TestMultiTokenPredictionHybrid:
             loss.backward()
             for name, param in mamba_model[0].named_parameters():
                 assert param.main_grad is not None
+            if enable_attention_residuals:
+                attn_res_param_names = [
+                    name for name, _ in mamba_model[0].named_parameters() if "attn_res" in name
+                ]
+                assert any("mtp.layers." in name for name in attn_res_param_names)
+                assert any("mtp_model_layer" in name for name in attn_res_param_names)
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
     def test_attention_mask_validation_mamba(self):
