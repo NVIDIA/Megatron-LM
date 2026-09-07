@@ -25,6 +25,7 @@ if not HAVE_GTP:
 
 from megatron.core import parallel_state as ps
 from megatron.core.optimizer import emerging_optimizers as _eo_module
+from megatron.core.optimizer import qkv_rows_after_gtp_gather
 from megatron.core.optimizer.emerging_optimizers import HAVE_EMERGING_OPTIMIZERS, TensorParallelMuon
 
 if not HAVE_EMERGING_OPTIMIZERS:
@@ -66,6 +67,74 @@ _SCALE_MODE = "spectral"
 # The local shard must NOT be a multiple of _GROUP -- that is the bug shape.
 # 192/2 = 96 is, so world 2 cannot reproduce it; 192/4 and 192/8 can.
 _GTP_WORLD_SIZES = [4, 8]
+
+
+class _FakeGroup:
+    """Only ``.size()`` is read, so no real ProcessGroup is needed."""
+
+    def __init__(self, n):
+        self._n = n
+
+    def size(self):
+        return self._n
+
+
+def _param(rows, pad=0, sharded=True):
+    """A stand-in for a qkv weight. `sharded` mirrors is_gtp_weight_remat."""
+    p = torch.nn.Parameter(torch.zeros(rows, _K), requires_grad=False)
+    p.is_gtp_weight_remat = sharded
+    if pad:
+        p.pad_length = pad
+    return p
+
+
+def _rows(param, split, gtp_size=None):
+    """qkv_rows_after_gtp_gather with a stand-in for the optimizer's GTP group."""
+    # get_pg_size returns 1 when dist is down, which would pass these for the wrong reason.
+    assert torch.distributed.is_initialized()
+    return qkv_rows_after_gtp_gather(param, split, _FakeGroup(gtp_size) if gtp_size else None)
+
+
+class TestQKVRowCount:
+    """The is_qkv decision is taken on the GTP-unsharded shape, so it is layout-invariant."""
+
+    @pytest.mark.parametrize("gtp_size", [1, 2, 4, 64])
+    def test_decision_is_layout_invariant(self, gtp_size):
+        """Same weight, every GTP degree: always splittable, always the same row count."""
+        local_rows = _GROUP // gtp_size if gtp_size <= _GROUP else 1
+        global_rows = local_rows * gtp_size
+        rows, size, splittable = _rows(_param(local_rows), _SPLIT, gtp_size)
+        assert size == gtp_size
+        assert rows == global_rows
+        assert splittable == (global_rows % _GROUP == 0)
+
+    def test_local_shard_would_have_disabled(self):
+        """The regression test: production's 102 x 64 = 6528, which the old
+        ``param.shape[0] % 6528`` rule reported False on every GTP rank."""
+        local, gtp = 102, 64
+        split = [6144, 192, 192]
+        assert local % sum(split) != 0, "shard-local test must fail for this to be a regression"
+        assert _rows(_param(local), split, gtp) == (6528, 64, True)
+
+    def test_unsharded_matches_sharded(self):
+        """TP1 (no group attr) and GTP must reach the same verdict for one weight."""
+        assert _rows(_param(_M), _SPLIT)[2] is True
+        assert _rows(_param(_M // 4), _SPLIT, 4)[2] is True
+
+    def test_padding_is_excluded(self):
+        """GTP pads dim 0 up to a multiple of the group size; pad rows are not weight."""
+        rows, _, splittable = _rows(_param(25, pad=4), _SPLIT, 4)
+        assert (rows, splittable) == (_GROUP, True)
+        assert 100 % _GROUP != 0
+
+    def test_non_qkv_shape_is_rejected(self):
+        """A weight whose GTP-unsharded rows do not divide is refused, not forced."""
+        rows, _, splittable = _rows(_param(30), _SPLIT, 4)
+        assert (rows, splittable) == (120, False)
+
+    def test_unsharded_param_ignores_the_group(self):
+        """An unsharded weight ignores both the GTP group and GTP-only padding."""
+        assert _rows(_param(_GROUP, pad=4, sharded=False), _SPLIT, 4) == (_GROUP, 1, True)
 
 
 def _make_muon(pg_collection, tp_mode="duplicated"):

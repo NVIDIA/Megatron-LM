@@ -417,11 +417,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
     def _get_gtp_remat_group(self, p):
         """Return the GTP-remat process group for a parameter, if configured."""
         is_expert = getattr(p, 'expert_tp', False)
-        return (
-            (self.pg_collection.expt_gtp_remat if is_expert else self.pg_collection.gtp_remat)
-            if self.pg_collection
-            else None
-        )
+        return resolve_gtp_remat_group(self.pg_collection, is_expert)
 
     def _warn_distributed_qkv_fallback(self):
         """Warn once when a QKV layout cannot use distributed Newton-Schulz."""
