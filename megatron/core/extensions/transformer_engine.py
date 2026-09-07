@@ -407,19 +407,19 @@ def _resolve_is_first_microbatch(module) -> Optional[bool]:
     TE reads the flag twice: it refreshes the quantized parameter cache on ``True``, and it
     derives the weight-gradient accumulation mode from it in backward --
     ``accumulate = fuse_wgrad_accumulation and not is_first_microbatch`` -- so a wrong ``True``
-    makes a wgrad GEMM OVERWRITE ``main_grad`` instead of accumulating into it. Passing ``None``
-    opts out of both: always accumulate, never cache.
+    makes a wgrad GEMM OVERWRITE ``main_grad`` instead of accumulating into it. ``None`` opts out
+    of both: always accumulate, never cache.
 
-    That is the right answer whenever nobody keeps the flag honest -- the transpose cache is off,
+    That is the right answer whenever nobody keeps the flag honest: the transpose cache is off,
     the config is not quantized so :meth:`MegatronModule.set_is_first_microbatch` never re-arms
-    it, or the module is invoked more than once per forward pass so first-forward and
-    first-backward are not the same call.
+    it, or the module is invoked more than once per forward pass (``is_first_microbatch_unsafe``,
+    set by a repeated MTP block) so its first forward is paired with its last backward.
     """
-    if module.disable_parameter_transpose_cache:
-        return None
-    if not is_first_microbatch_tracked(module.config):
-        return None
-    if getattr(module, 'is_first_microbatch_unsafe', False):
+    if (
+        module.disable_parameter_transpose_cache
+        or not is_first_microbatch_tracked(module.config)
+        or getattr(module, 'is_first_microbatch_unsafe', False)
+    ):
         return None
     return module.is_first_microbatch
 
@@ -609,8 +609,6 @@ def split_te_layernorm_column_parallel_linear(
     linear_layer.sequence_parallel = fused_layer.sequence_parallel
     linear_layer.is_first_microbatch = fused_layer.is_first_microbatch
     linear_layer.disable_parameter_transpose_cache = fused_layer.disable_parameter_transpose_cache
-    if getattr(fused_layer, 'is_first_microbatch_unsafe', False):
-        linear_layer.is_first_microbatch_unsafe = True
 
     return norm_layer, linear_layer
 

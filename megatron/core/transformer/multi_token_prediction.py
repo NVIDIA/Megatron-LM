@@ -31,11 +31,7 @@ from megatron.core.tensor_parallel.inference_layers import (
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
-from megatron.core.transformer.module import (
-    MegatronModule,
-    mark_is_first_microbatch_unsafe,
-    mark_keep_in_fp32,
-)
+from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
@@ -2187,12 +2183,13 @@ class MultiTokenPredictionBlock(MegatronModule):
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
 
-        if self.mtp_use_repeated_layer and self.config.mtp_num_layers > 1:
+        if self.mtp_use_repeated_layer:
             # forward() drives the single shared layer once per depth, so its first forward is
             # paired with its last backward. Acting on is_first_microbatch there would let the
             # first depth's wgrad GEMM overwrite the gradients the later depths accumulated.
-            for layer in self.layers:
-                mark_is_first_microbatch_unsafe(layer)
+            for m in self.layers.modules():
+                if hasattr(m, 'is_first_microbatch'):
+                    m.is_first_microbatch_unsafe = True
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
         self.tp_cp_group = getattr(pg_collection, 'tp_cp', None)
