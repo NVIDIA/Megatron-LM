@@ -304,12 +304,7 @@ def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
 
 
 def pack_routed_experts(model: nn.Module, batch: PackedBatch, routed_experts):
-    """Pack R3 routes using DS4's contiguous CP token layout.
-
-    The current rollout configuration does not run MTP, so the route layer axis
-    contains only main decoder routers.  If rollout later enables DeepSeek MTP
-    speculative decoding, this assumption must be reevaluated.
-    """
+    """Pack R3 routes using DS4's contiguous CP token layout."""
 
     return _pack_routed_experts(model, batch, routed_experts, contiguous=True)
 
@@ -337,17 +332,7 @@ def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None
 
 
 def _make_aux_loss_hook():
-    """Per-step hook that syncs the MTP auxiliary-loss backward scale to the main
-    loss scale (DP size / gradient accumulation), mirroring the sibling protocols
-    (kimi_k2 / glm5 / qwen3_5 / qwen3_moe).
-
-    DS4 only injects an MTP auxiliary loss: its MoE router is aux-loss-free
-    (``SigmoidTopKRouter(..., compute_aux_loss=False)``) and its CSA indexer runs
-    with ``sparse_loss=False``, so -- unlike GLM-5, which also scales the MoE-aux
-    and DSA-indexer losses -- only ``MTPLossAutoScaler`` needs scaling here.
-    Without this hook the injected MTP gradient keeps ``MTPLossAutoScaler``'s
-    class-default scale of 1.0 and is mis-weighted relative to the main loss.
-    """
+    """Per-step hook that syncs the MTP auxiliary-loss backward scale to the main loss scale (DP size / gradient accumulation), mirroring the sibling protocols (kimi_k2 / glm5 / qwen3_5 / qwen3_moe)."""
     from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 
     def hook(scale: torch.Tensor) -> None:
@@ -381,11 +366,7 @@ def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
 
 
 def _validate_parallel_scope(p: ParallelConfig) -> None:
-    """DS4 CSA attention is not tensor-parallel-capable (documented TP=1 case).
-
-    PP / VPP / EP / CP are inherited from the Kimi skeleton and work; only
-    TP>1 / ETP>1 are unsupported.  Mirrors GLM-5's gate.
-    """
+    """DS4 CSA attention is not tensor-parallel-capable (documented TP=1 case)."""
     etp = 1 if p.etp is None else p.etp
     if p.tp > 1:
         raise NotImplementedError(

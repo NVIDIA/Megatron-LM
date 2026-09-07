@@ -42,20 +42,7 @@ def split_sinkhorn(
     iters: int,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Split the mHC mapping and project ``comb`` to a doubly stochastic matrix.
-
-    The projection now uses Core's Sinkhorn rather than an inline loop. This is a
-    deliberate change of regularisation, not only of kernels: the loop replaced
-    here started from ``exp(l - max)`` and divided by ``sum(...).clamp(min=eps)``,
-    while Core starts from ``softmax(l) + eps`` and divides by ``sum(...) + eps``.
-    Both stabilise the same Sinkhorn-Knopp iteration and differ far below bf16
-    resolution, and Core is what DeepSeek-V4 trains under today.
-
-    The inline loop cost 20 iterations x 2 normalisations of separate launches per
-    call. Compiled, that was ~101k kernel launches per step at
-    ``mhc_sinkhorn_iterations=20`` -- a quarter of this backend's entire launch
-    budget -- against a single fused kernel in Core.
-    """
+    """Split the mHC mapping and project ``comb`` to a doubly stochastic matrix."""
     pre, post, comb_logits = _split_mixes(mixes, hc_scale, hc_base, hc_mult)
     sinkhorn = fused_sinkhorn if _use_fused(comb_logits) else native_sinkhorn
     return pre, post, sinkhorn(comb_logits, iters, eps)
@@ -76,14 +63,7 @@ def _post_native(
 
 
 def _use_fused(x: torch.Tensor) -> bool:
-    """Core's fused mHC entry points are CUDA-only in practice.
-
-    ``fused_h_post_bda`` and ``fused_h_aggregate`` dispatch to Triton whenever
-    Triton is importable and never look at the device, so they raise
-    ``ValueError: Pointer argument cannot be accessed from Triton`` on CPU
-    tensors. Core never hits that because it only calls them on CUDA; this module
-    is also exercised on CPU, so the device decides here instead.
-    """
+    """Core's fused mHC entry points are CUDA-only in practice."""
     return x.is_cuda
 
 

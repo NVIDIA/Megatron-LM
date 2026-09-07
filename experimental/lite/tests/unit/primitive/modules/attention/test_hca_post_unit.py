@@ -1,21 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Unit tests for ``HyperConnection.post`` delegating to the Core mHC kernels.
-
-``post`` used to spell the residual mixing as a batched ``comb @ residual``. With
-``hc_mult`` residual streams the contracted dimension is single-digit, so cuBLAS
-had no aligned path to dispatch to and fell back to an ``sm80`` WMMA kernel with
-``align2`` on Hopper -- measured at ~7-8% of all GPU kernel time on DeepSeek-V4.
-Core already ships fused mHC kernels for exactly this expression, so ``post`` now
-calls ``fused_h_post_bda``.
-
-The conventions differ by a transpose: Core computes ``h_res.T @ residual`` while
-this module carries ``comb`` the other way round. That is invisible to a reader
-matching on names -- both operands are square and equally plausible -- and a run
-with the wrong orientation still produces correctly shaped, finite activations.
-The reference test below therefore pins the orientation against an explicit
-recomputation, and ``test_orientation_is_not_symmetric`` asserts that the check
-can actually fail.
-"""
+"""Unit tests for ``HyperConnection.post`` delegating to the Core mHC kernels."""
 
 from __future__ import annotations
 
@@ -53,12 +37,7 @@ def _reference_post(x, residual, post, comb):
 
 
 def test_post_matches_pre_fusion_reference() -> None:
-    """The CPU fallback reproduces the expression it replaced, in fp32.
-
-    Core's fused entry points raise on CPU tensors, so ``post`` keeps a native
-    branch for CPU; this pins that branch. The fused branch is covered by the
-    ``gpus(1)`` test at the bottom of this file.
-    """
+    """The CPU fallback reproduces the expression it replaced, in fp32."""
     x, residual, post, comb = _make_inputs(torch.float32, "cpu")
     expected = _reference_post(x, residual, post, comb)
     actual = HyperConnection.post(x, residual, post, comb)
@@ -67,13 +46,7 @@ def test_post_matches_pre_fusion_reference() -> None:
 
 
 def test_orientation_is_not_symmetric() -> None:
-    """Guard the guard: passing ``comb`` un-transposed must disagree.
-
-    Without this, a regression that drops the transpose would still satisfy
-    ``test_post_matches_pre_fusion_reference`` whenever ``comb`` happened to be
-    symmetric, and the suite would pass while every layer mixed residual streams
-    the wrong way.
-    """
+    """Guard the guard: passing ``comb`` un-transposed must disagree."""
     _, residual, _, comb = _make_inputs(torch.float32, "cpu")
     assert not torch.allclose(comb, comb.transpose(-1, -2), rtol=1e-3, atol=1e-3)
     correct = torch.matmul(comb, residual)
@@ -103,12 +76,7 @@ def _legacy_sinkhorn(comb_logits: torch.Tensor, iters: int, eps: float) -> torch
 
 
 def test_sinkhorn_output_is_doubly_stochastic() -> None:
-    """Whatever the regularisation, the projection must still do its job.
-
-    Run at the production iteration count: Sinkhorn-Knopp converges to a doubly
-    stochastic matrix in the limit, and at the 3 iterations used by the fixtures
-    above it is still visibly off (~4e-2), which says nothing either way.
-    """
+    """Whatever the regularisation, the projection must still do its job."""
     generator = torch.Generator(device="cpu").manual_seed(0)
     mixes = torch.randn(S, B, (2 + N) * N, generator=generator)
     _, _, comb = split_sinkhorn(mixes, torch.ones(3), torch.zeros((2 + N) * N), N, 20, 1e-6)
@@ -118,14 +86,7 @@ def test_sinkhorn_output_is_doubly_stochastic() -> None:
 
 
 def test_sinkhorn_regularisation_change_is_below_bf16_resolution() -> None:
-    """Bound the numerical cost of moving to Core's Sinkhorn.
-
-    The projection changed from ``exp(l - max)`` with ``clamp(min=eps)``
-    denominators to ``softmax(l) + eps`` with ``sum + eps`` denominators. That is
-    a real change of function, so it is pinned rather than assumed: the
-    disagreement must stay far under the ~8e-3 relative resolution of bf16, which
-    every consumer of ``comb`` already rounds to.
-    """
+    """Bound the numerical cost of moving to Core's Sinkhorn."""
     generator = torch.Generator(device="cpu").manual_seed(0)
     mixes = torch.randn(S, B, (2 + N) * N, generator=generator)
     scale = torch.ones(3)
@@ -164,12 +125,7 @@ def test_forward_aggregation_matches_pre_fusion_reference() -> None:
 
 @pytest.mark.gpus(1)
 def test_post_matches_pre_fusion_reference_bf16_gpu() -> None:
-    """The fused path itself, in the dtype and on the device production uses.
-
-    The CPU tests above exercise ``_post_native``, so they cannot catch a fused
-    kernel that computes the wrong thing -- including the transpose convention.
-    This one does.
-    """
+    """The fused path itself, in the dtype and on the device production uses."""
     x, residual, post, comb = _make_inputs(torch.bfloat16, "cuda")
     expected = _reference_post(x, residual, post, comb)
     actual = HyperConnection.post(x, residual, post, comb)

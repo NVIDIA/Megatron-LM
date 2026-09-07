@@ -36,11 +36,7 @@ from megatron.lite.primitive.utils.rotary import _yarn_find_correction_range, _y
 
 
 class _SingleRankGroup:
-    """Stand-in for a process group when CP is off.
-
-    Core's fused RoPE asks the group for its rank and size unconditionally, and
-    lite leaves ``ps.cp_group`` unset at ``cp_size == 1``.
-    """
+    """Stand-in for a process group when CP is off."""
 
     @staticmethod
     def rank() -> int:
@@ -54,20 +50,7 @@ class _SingleRankGroup:
 
 @jit_fuser
 def _per_head_rms(q: torch.Tensor, eps: float) -> torch.Tensor:
-    """Weightless per-head RMS normalisation of the query.
-
-    Written out, this is a cast, a square, a mean, an rsqrt, a cast back and a
-    multiply -- six kernels over the full ``[batch, heads, seq, head_dim]``
-    query, which a dispatch-level op census showed as one of the largest single
-    tensors touched per layer, and which activation recompute then pays for
-    twice.
-
-    Fusing it is not bitwise-neutral: the compiler reassociates the mean, which
-    moves the last bits in fp32 and reaches one ulp in bf16. That is bounded by
-    ``test_csa_per_head_rms_unit`` and accepted for a measured 8.75% of step
-    time; the reduction still happens in fp32, so the precision boundary itself
-    is unchanged.
-    """
+    """Weightless per-head RMS normalisation of the query."""
     # ``q.float()`` materialised a full fp32 copy of the query purely to reduce
     # over it -- 77k Melem per step in the op census. ``dtype=torch.float32``
     # accumulates the mean in fp32 without that copy; only the squaring now
@@ -154,12 +137,7 @@ _ROPE_CACHE: dict[Hashable, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _rope_cache_key(position_ids, rope_head_dim, rope_theta, config, use_yarn, device, dtype):
-    """Key on everything the tables actually depend on.
-
-    ``position_ids`` participates by identity *and* content: the same buffer is
-    reused across layers within a step, so its ``data_ptr`` and shape pin it,
-    while ``_version`` catches in-place edits that would otherwise be missed.
-    """
+    """Key on everything the tables actually depend on."""
     yarn = (
         (
             float(config.rotary_scaling_factor),
@@ -325,14 +303,7 @@ class CompressedSequenceCompressor(nn.Module):
     def _overlap_transform_thd(
         self, tensor: torch.Tensor, is_first_in_seg: torch.Tensor, fill_value: float
     ) -> torch.Tensor:
-        """Batched overlapping-window transform for the THD (pre-grouped) layout.
-
-        Mirrors Core ``Compressor._overlap_transform_thd``: operates on the flat
-        ``(total_comp, ratio, 1, coff * head_dim)`` tensor from all segments at
-        once. ``is_first_in_seg`` is a ``(total_comp,)`` bool mask, ``True`` for
-        each compressed entry that starts a new segment (no predecessor group).
-        Output shape ``(total_comp, 2 * ratio, 1, head_dim)``.
-        """
+        """Batched overlapping-window transform for the THD (pre-grouped) layout."""
         n, ratio, b_dim, _ = tensor.size()
         d = self.head_dim
         out = tensor.new_full((n, 2 * ratio, b_dim, d), fill_value)
@@ -350,23 +321,7 @@ class CompressedSequenceCompressor(nn.Module):
         max_seqlen_q: int,
         compressed_group_ids: torch.Tensor,
     ) -> tuple[torch.Tensor | None, None]:
-        """Pre-grouped THD compression for the DSv4 CP path.
-
-        ``hidden_compact`` is ``(compact_group_capacity * ratio, 1, hidden)``,
-        already packed into ratio-sized groups by
-        ``cp_utils.prepare_cp_compressor_input``; ``compressed_group_ids`` is
-        ``(compact_group_capacity,)`` int32 giving each compressed group's
-        per-sequence compressed id (its RoPE position is ``id * ratio``).
-
-        Reproduces Core ``Compressor._forward_thd`` pre-grouped semantics using
-        lite's compressor params (``wkv``/``wgate``/``ape``/``norm``) and lite's
-        RoPE convention (``build_compressed_rope_cos_sin`` + ``apply_partial_rope``)
-        so the CP path stays numerically identical to lite's BSHD path. ``cu_seqlens``
-        and ``max_seqlen_q`` are accepted to match Core's signature; they are only
-        needed by Core's fused-RoPE cache, which lite does not use.
-
-        Returns ``(compressed_thd (total_comp, 1, head_dim), None)``.
-        """
+        """Pre-grouped THD compression for the DSv4 CP path."""
         del cu_seqlens, max_seqlen_q  # Only used by Core's fused-RoPE cache path.
         ratio = self.compress_ratio
         total_comp = int(compressed_group_ids.shape[0])
@@ -834,15 +789,7 @@ class CompressedSparseAttention(nn.Module):
         global_start: int,
         rope_theta: float,
     ) -> torch.Tensor:
-        """Project the exchanged left-boundary hidden rows into MQA KV rows.
-
-        Faithful to the DSv4 hybrid-attention boundary-KV path: the boundary rows
-        sit immediately left of this rank's block, so they are KV-projected
-        (``wkv`` -> ``kv_norm``) and RoPE'd at their own within-sequence positions
-        (``global_start - d_window .. global_start - 1``) using lite's RoPE
-        convention. Returns ``(d_window, 1, 1, head_dim)`` matching Core's
-        ``boundary_kv.squeeze(-2).squeeze(1)`` contract in ``_forward_thd_cp``.
-        """
+        """Project the exchanged left-boundary hidden rows into MQA KV rows."""
         d_window = boundary_hidden.shape[0]
         bkv = self.kv_norm(self.wkv(boundary_hidden.reshape(d_window, -1)))  # (d_window, head_dim)
         b_pos = cp_utils._thd_cp_position_ids(cu_seqlens, int(global_start) - d_window, d_window)
@@ -865,14 +812,7 @@ class CompressedSparseAttention(nn.Module):
         position_ids: torch.Tensor,
         packed_seq_params: Any,
     ) -> torch.Tensor:
-        """Build THD-packed q/key/x/qr, exchange boundaries, and run CP attention.
-
-        ``x`` is ``[1, total, hidden]`` (batch-first, packed). Produces the
-        TE-THD-convention tensors consumed by :meth:`_forward_thd_cp`, then applies
-        the output projection (inverse RoPE + ``wo``) in the THD layout, without
-        the round trip through BSHD that :meth:`_project_context` needs.
-        Returns ``[1, total, hidden]`` for the SBHD shim.
-        """
+        """Build THD-packed q/key/x/qr, exchange boundaries, and run CP attention."""
         batch, seq_len, _ = x.shape
         if batch != 1:
             raise RuntimeError(
@@ -992,16 +932,7 @@ class CompressedSparseAttention(nn.Module):
         boundary_kv: torch.Tensor | None,
         packed_seq_params: Any,
     ) -> torch.Tensor:
-        """THD-packed context-parallel branch (faithful port of Core
-        ``CompressedSparseAttention._forward_thd_cp``).
-
-        Builds this rank's local KV context from boundary rows and fixed-capacity
-        compressed KV, then runs sparse attention with an optional indexer loss.
-        RoPE is applied to the indexer query with lite's convention (deviating from
-        Core's ``cp_utils.apply_thd_cp_local_rope_*``) so the CP path stays
-        identical to lite's BSHD path; ``apply_dsa_kernel_fusion`` gates the
-        fused vs. differentiable-unfused kernels exactly as Core does.
-        """
+        """THD-packed context-parallel branch (faithful port of Core ``CompressedSparseAttention._forward_thd_cp``)."""
         cp_group = self.ps.cp_group
         cp_size = self.ps.cp_size
         cp_rank = self.ps.cp_rank

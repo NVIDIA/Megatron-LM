@@ -1,18 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""A dense multi-row batch must be refused where the caller can still act on it.
-
-CSA has no dense BSHD path: the fallback and its CP all-gather loop were removed
-upstream, leaving the CP=1 fused sparse kernels and the THD packed route. The
-batch builder, however, still routed anything that was not 1-D or ``[1, S]``
-down the dense path, so a ``[B, S]`` batch with ``B > 1`` arrived at CSA without
-``packed_seq_params`` and raised several frames deep, from a module that cannot
-say which caller sent it or what to do instead.
-
-A review panel found this by reading the two files against each other. These
-tests pin both halves of the boundary, because "raises somewhere" is not the
-property that matters -- it has to raise *here*, and it has to keep letting the
-packed shapes through.
-"""
+"""A dense multi-row batch must be refused where the caller can still act on it."""
 
 from __future__ import annotations
 
@@ -51,11 +38,7 @@ def test_dense_multi_row_batch_is_refused_at_the_boundary() -> None:
 
 @pytest.mark.parametrize("shape", [(8,), (1, 8)])
 def test_packed_shapes_still_take_the_packed_route(shape: tuple[int, ...]) -> None:
-    """Guard the guard: the refusal must not swallow the shapes that do work.
-
-    A check placed one branch too early would reject every batch, which still
-    looks like "the contract is enforced" from the outside.
-    """
+    """Guard the guard: the refusal must not swallow the shapes that do work."""
     from megatron.lite.model.deepseek_v4.lite import protocol
 
     called = {}
@@ -76,12 +59,7 @@ def test_packed_shapes_still_take_the_packed_route(shape: tuple[int, ...]) -> No
 
 
 def test_models_without_csa_keep_the_dense_route() -> None:
-    """The refusal is CSA's constraint, not the batch builder's.
-
-    Attention variants that do have a dense path must be unaffected, or this
-    turns a targeted contract into a blanket restriction on every model that
-    shares the builder.
-    """
+    """The refusal is CSA's constraint, not the batch builder's."""
     from megatron.lite.model.deepseek_v4.lite import protocol
 
     reached = {}

@@ -1,15 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The clamped SwiGLU path must reach a fused kernel, and keep its arithmetic.
-
-Only the unclamped variant of ``swiglu_with_probs`` reached a fused kernel. With
-a clamp value set -- which DeepSeek-V4 always does -- it fell back to an eager
-chunk / clamp / silu / multiply / cast written out in fp32, on
-``[tokens * topk, moe_ffn * 2]``, the largest activation in the model. Core's
-implementations already take ``clamp_value``, so the fallback is gone.
-
-These tests pin the arithmetic against that removed expression, since "fused"
-and "clamped at the right operand" are not visible in any output shape.
-"""
+"""The clamped SwiGLU path must reach a fused kernel, and keep its arithmetic."""
 
 from __future__ import annotations
 
@@ -56,11 +46,7 @@ def test_clamped_swiglu_matches_eager_reference(with_probs: bool) -> None:
 
 @pytest.mark.gpus(1)
 def test_clamped_and_unclamped_differ_on_saturating_input() -> None:
-    """Guard the guard: the clamp must change the result on this fixture.
-
-    Without this, a regression that passes ``clamp_value=None`` through would
-    still satisfy the test above whenever the inputs happen not to saturate.
-    """
+    """Guard the guard: the clamp must change the result on this fixture."""
     torch.manual_seed(0)
     y = torch.randn(TOKENS, FFN * 2, device="cuda", dtype=torch.bfloat16) * 8
     clamped = swiglu_with_probs(y, None, 3.0)

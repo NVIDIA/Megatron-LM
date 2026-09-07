@@ -1,18 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The all-to-all output reshuffle, as an index instead of a 64-operand ``cat``.
-
-The all-to-all delivers rows grouped ``[ep_rank][local_expert]``; the grouped
-GEMM needs them grouped ``[local_expert][ep_rank]``. That regrouping used to be
-``split`` into ``ep_size * num_local_experts`` chunks followed by a ``cat`` of
-that many operands, on both the dispatch and the combine side, and again in each
-of their backwards.
-
-This is a permutation, so getting it wrong does not crash and does not even make
-the loss obviously wrong -- it feeds each expert somebody else's tokens, and the
-run simply trains badly. Run-to-run loss noise at this scale is larger than the
-error, so the contract is pinned here against the exact expression it replaced
-rather than inferred from a training curve.
-"""
+"""The all-to-all output reshuffle, as an index instead of a 64-operand ``cat``."""
 
 from __future__ import annotations
 
@@ -67,12 +54,7 @@ def test_index_reshuffle_matches_split_cat(ep_size: int, num_local_experts: int)
 
 
 def test_combine_index_inverts_dispatch_index() -> None:
-    """Combine must undo dispatch exactly, or tokens come back to the wrong rank.
-
-    The inverse is derived from the dispatch index rather than kept as a second
-    chunk order, so this checks the derivation, which is the only way the two can
-    now disagree.
-    """
+    """Combine must undo dispatch exactly, or tokens come back to the wrong rank."""
     generator = torch.Generator().manual_seed(0)
     d = _make_dispatcher(8, 8)
     recv_tpe_2d = torch.randint(0, 5, (8, 8), generator=generator, dtype=torch.long)
@@ -88,11 +70,7 @@ def test_combine_index_inverts_dispatch_index() -> None:
 
 
 def test_index_builder_reads_nothing_back_to_the_host() -> None:
-    """No ``.item()``/``.tolist()`` on the sizes: that would sync every layer.
-
-    The point of the rewrite is as much the removed device-to-host sync as the
-    removed copy, and a sync reintroduced later would be invisible in any output.
-    """
+    """No ``.item()``/``.tolist()`` on the sizes: that would sync every layer."""
     d = _make_dispatcher(8, 8)
     recv_tpe_2d = torch.full((8, 8), 3, dtype=torch.long)
 

@@ -1,21 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Gradients that go straight into ``main_grad`` must equal the ones that did not.
-
-Three paths in this branch stopped materialising a weight gradient and folding
-it in with ``main_grad.add_(grad)``, and started accumulating inside the
-backward instead: the vocabulary projection, the embedding table, and the
-attention projections. Together they were 17.6 + 8.6 + 8.6 ms per step of pure
-addition, and removing them is what took this configuration below Megatron
-Core's step time.
-
-The risk they carry is not visible in a shape or a loss. A gradient that is
-accumulated once instead of twice, scattered to the wrong rows, or rounded to
-bf16 on the way in still produces finite numbers of the right size, and the
-step still runs. Two runs of the same tree with the same seed differ by 0.006
-in the loss, so the loss cannot be the judge here; these compare the
-accumulator itself, over more than one microbatch, against the arithmetic that
-was removed.
-"""
+"""Gradients that go straight into ``main_grad`` must equal the ones that did not."""
 
 from __future__ import annotations
 
@@ -72,12 +56,7 @@ def test_linear_accumulates_the_same_gradient_it_used_to_add() -> None:
 
 @pytest.mark.gpus(1)
 def test_linear_without_main_grad_keeps_the_stock_path() -> None:
-    """Guard the gate: no accumulator means ``param.grad``, not a silent no-op.
-
-    An optimizer that allocates no ``main_grad`` must still see a gradient. If
-    the gate inverted, training would proceed with weights that never update --
-    finite, correctly shaped, and wrong.
-    """
+    """Guard the gate: no accumulator means ``param.grad``, not a silent no-op."""
     torch.manual_seed(0)
     module = AccumulatingLinear(IN, OUT, bias=False).to(DEVICE)
     module(torch.randn(TOKENS, IN, device=DEVICE)).sum().backward()
@@ -111,12 +90,7 @@ def test_embedding_scatters_to_the_same_rows_it_used_to_add() -> None:
 
 @pytest.mark.gpus(1)
 def test_embedding_scatter_is_row_selective() -> None:
-    """Guard the guard: rows never looked up must stay exactly zero.
-
-    A scatter that ignored the indices -- or used the wrong axis -- would still
-    produce a finite accumulator of the right shape, and the test above would
-    pass on a fixture where every row happened to be touched.
-    """
+    """Guard the guard: rows never looked up must stay exactly zero."""
     torch.manual_seed(0)
     weight = torch.randn(VOCAB, IN, device=DEVICE, requires_grad=True)
     weight.main_grad = torch.zeros(VOCAB, IN, dtype=torch.float32, device=DEVICE)
@@ -131,13 +105,7 @@ def test_embedding_scatter_is_row_selective() -> None:
 
 @pytest.mark.gpus(1)
 def test_embedding_reports_a_gradient_for_ddp() -> None:
-    """DDP asserts a gradient exists whenever overlap_grad_reduce is on.
-
-    Returning ``None`` here is not a missing optimisation but a crash, which is
-    why Core hands back a placeholder from its own fused path. This pins that
-    the placeholder is returned and the flag is set, so the hook sees the
-    parameter and then skips the add.
-    """
+    """DDP asserts a gradient exists whenever overlap_grad_reduce is on."""
     torch.manual_seed(0)
     weight = torch.randn(VOCAB, IN, device=DEVICE, requires_grad=True)
     weight.main_grad = torch.zeros(VOCAB, IN, dtype=torch.float32, device=DEVICE)

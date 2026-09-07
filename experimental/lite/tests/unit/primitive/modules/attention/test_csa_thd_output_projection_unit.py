@@ -1,20 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The THD CSA output projection, without the round trip through BSHD.
-
-Reaching the shared BSHD projection from the THD attention output cost three
-full materialisations of the largest tensor in the module: a
-``permute(...).contiguous()`` into ``[1, np, total, hn]``, an unfused inverse
-RoPE that concatenates the untouched nope channels back onto the rotated ones,
-and a ``transpose(1, 2).reshape(...)`` that copies again on the way out. A
-per-module NVTX profile put ``direct_copy`` and ``CatArrayBatchedCopy`` at 64%
-of ``F::CompressedSparseAttention``, and mcore's DSv4 attention does none of it
--- it leaves the output in THD and calls
-``fused_mla_rope_out_of_place(..., inverse=True)``.
-
-Two things have to hold for that substitution, and neither is visible in a
-shape: the grouping must be reachable by a plain ``view``, and Core's fused
-inverse must agree with the ``apply_partial_rope(cos, -sin)`` it replaces.
-"""
+"""The THD CSA output projection, without the round trip through BSHD."""
 
 from __future__ import annotations
 
@@ -30,13 +15,7 @@ ROPE_DIM = 4
 
 
 def test_thd_grouping_is_a_free_view_of_the_bshd_reshape() -> None:
-    """``(total, np, hn) -> (1, total, g, per*hn)`` must be the removed reshape.
-
-    The dropped route went out through ``[1, np, total, hn]`` and came back with
-    ``transpose(1, 2).reshape(...)``. If the two disagree on element order the
-    output projection silently mixes heads across groups, which is finite,
-    correctly shaped and wrong -- so this is asserted bitwise.
-    """
+    """``(total, np, hn) -> (1, total, g, per*hn)`` must be the removed reshape."""
     per = HEADS // GROUPS
     t = torch.randn(TOTAL, HEADS, HEAD_DIM)
     view = t.view(1, TOTAL, GROUPS, per * HEAD_DIM)
@@ -51,12 +30,7 @@ def test_thd_grouping_is_a_free_view_of_the_bshd_reshape() -> None:
 
 
 def test_grouping_is_head_major_not_head_dim_major() -> None:
-    """Guard the guard: a group axis taken over the wrong stride must differ.
-
-    Without this, a regression that grouped the head-dim axis instead of the
-    head axis would still produce the right shape and pass the test above on any
-    input where the two happen to coincide.
-    """
+    """Guard the guard: a group axis taken over the wrong stride must differ."""
     per = HEADS // GROUPS
     t = torch.randn(TOTAL, HEADS, HEAD_DIM)
     correct = t.view(1, TOTAL, GROUPS, per * HEAD_DIM)
@@ -77,13 +51,7 @@ def _cos_sin(dtype: torch.dtype, device: str):
 
 @pytest.mark.gpus(1)
 def test_fused_inverse_rope_matches_apply_partial_rope() -> None:
-    """Core's fused inverse must agree with ``apply_partial_rope(cos, -sin)``.
-
-    bf16 through a rotate-and-concatenate is worth about a percent of the
-    signal, so the bound is set at that scale rather than at an ulp; the point
-    of the test is that the two undo the *same* rotation, which a wrong
-    interleaving convention or a wrong sign would break by order unity.
-    """
+    """Core's fused inverse must agree with ``apply_partial_rope(cos, -sin)``."""
     from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_out_of_place
 
     torch.manual_seed(0)
@@ -106,12 +74,7 @@ def test_fused_inverse_rope_matches_apply_partial_rope() -> None:
 
 @pytest.mark.gpus(1)
 def test_forward_rotation_is_not_mistaken_for_the_inverse() -> None:
-    """Negative control: ``inverse=False`` must not satisfy the bound above.
-
-    The rotation is norm-preserving, so a dropped ``inverse`` flag changes no
-    shape, no dtype and no magnitude -- only the values. Without this control
-    the equivalence test could pass on a fixture with near-zero positions.
-    """
+    """Negative control: ``inverse=False`` must not satisfy the bound above."""
     from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_out_of_place
 
     torch.manual_seed(0)

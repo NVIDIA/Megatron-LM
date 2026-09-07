@@ -1,19 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Weight gradients must land in ``main_grad``, and land there unchanged.
-
-Megatron-Core's DDP folds each weight gradient into the fp32 accumulator one
-parameter at a time (``param.main_grad.add_(param.grad.data)``). Transformer
-Engine can do it inside the wgrad GEMM instead, which is what Core itself does
-everywhere; lite never switched it on. ``_enable_wgrad_accumulation_fusion``
-flips it after the DDP wrap, when ``main_grad`` first exists.
-
-Two things need pinning. The selection has to be self-gating -- a module whose
-weights have no ``main_grad`` must be left alone, or TE will look for a buffer
-that was never allocated. And the accumulated values have to match the add that
-was removed, which is not visible in any shape: a fusion that silently dropped
-a contribution, or accumulated in bf16, would still produce finite gradients of
-the right size.
-"""
+"""Weight gradients must land in ``main_grad``, and land there unchanged."""
 
 from __future__ import annotations
 
@@ -69,13 +55,7 @@ def test_is_idempotent_and_reports_nothing_switched_on_a_second_pass() -> None:
 
 @pytest.mark.gpus(1)
 def test_fused_accumulation_matches_the_add_it_replaces() -> None:
-    """Same accumulated gradient as ``main_grad.add_(grad)``, over two microbatches.
-
-    One microbatch would not exercise accumulation at all, so this runs two and
-    compares against the explicit add on an identical unfused module. The
-    tolerance is set at bf16 GEMM resolution; the failure this guards against
-    (a dropped or bf16-rounded accumulation) is far larger.
-    """
+    """Same accumulated gradient as ``main_grad.add_(grad)``, over two microbatches."""
     import transformer_engine.pytorch as te
 
     torch.manual_seed(0)

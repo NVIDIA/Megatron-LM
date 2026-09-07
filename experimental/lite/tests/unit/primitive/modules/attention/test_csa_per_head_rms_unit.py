@@ -1,18 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The weightless per-head query RMS normalisation, fused.
-
-Two call sites in the CSA attention wrote this out as a cast, a square, a mean,
-an rsqrt, a cast back and a multiply, over the full
-``[batch, heads, seq, head_dim]`` query. A dispatch-level op census of one
-training step put that tensor among the largest touched per layer, and with
-``recompute=full`` every one of those kernels is paid twice.
-
-Fusing this is **not** bitwise-neutral, and that is recorded rather than
-glossed: the compiler reassociates the mean, so even in fp32 the result moves in
-the last bits, and in bf16 the disagreement reaches one ulp. The bounds below
-pin it at that scale. It is kept because it is worth 8.75% of step time at the
-reference configuration, measured, which is not a trade that gets made silently.
-"""
+"""The weightless per-head query RMS normalisation, fused."""
 
 from __future__ import annotations
 
@@ -41,13 +28,7 @@ def test_fused_per_head_rms_stays_within_one_ulp_of_eager(dtype: torch.dtype, rt
 
 
 def test_normalises_per_head_not_across_heads() -> None:
-    """Pin the reduction axis: it is the head dimension, nothing else.
-
-    Reducing over the wrong axis still returns the right shape and finite values,
-    so a bitwise test against a reference that made the same mistake would not
-    catch it. Here each head is scaled independently, checked by giving one head
-    a much larger magnitude and requiring the others to be unaffected.
-    """
+    """Pin the reduction axis: it is the head dimension, nothing else."""
     q = torch.ones(1, 2, 1, 4)
     q[:, 1] *= 100.0
     out = _per_head_rms(q, EPS)
