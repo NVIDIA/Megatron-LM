@@ -70,7 +70,7 @@ def _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size):
 def _get_contiguous_thd_token_idx(cu_seqlens, pid_m, seq_num, global_start):
     """Map a row in a contiguous THD slice to its position within the packed sequence."""
     global_row = pid_m.to(tl.int64) + global_start
-    seq_count = seq_num.to(tl.int32)
+    seq_count = tl.full((), seq_num, dtype=tl.int32)
 
     # Find the first sequence whose end offset is greater than global_row,
     # equivalent to torch.bucketize(global_row, cu_seqlens[1:], right=True).
