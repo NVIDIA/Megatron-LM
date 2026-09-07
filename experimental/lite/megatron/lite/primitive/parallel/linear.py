@@ -9,6 +9,9 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
+from megatron.core.tensor_parallel.layers import (
+    linear_with_grad_accumulation_and_async_allreduce,
+)
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.utils import ensure_divisible
 
@@ -133,6 +136,33 @@ class _VanillaColLinear(nn.Module):
         nn.init.xavier_uniform_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Once the distributed optimizer has allocated ``main_grad``, Core's own
+        # linear can accumulate the weight gradient straight into it. That is
+        # worth two things here, both measured: the separate
+        # ``main_grad.add_(grad)`` over ``[padded_vocab, hidden]`` -- the largest
+        # parameter in the model, 17.2 ms per step -- disappears, and the wgrad
+        # GEMM moves onto the side stream the accumulating GEMMs already run on,
+        # where it overlaps the collectives sitting on the main stream. A
+        # per-stream kernel census put Core at 1.58x lite's volume of those
+        # accumulating GEMMs, which is why Core hides 149 ms per step and lite
+        # hides none.
+        #
+        # This calls Core's implementation rather than reproducing it: the
+        # handshake it performs -- writing through ``fused_weight_gradient_mlp``
+        # and still returning a gradient so DDP's post-hook fires and
+        # ``register_grad_ready`` is reported -- is easy to get subtly wrong.
+        # The forward matmul is unchanged, so the bit-for-bit agreement with
+        # ``ColumnParallelLinear`` that this class exists for still holds.
+        if getattr(self.weight, "main_grad", None) is not None:
+            return linear_with_grad_accumulation_and_async_allreduce(
+                input=x,
+                weight=self.weight,
+                bias=None,
+                gradient_accumulation_fusion=True,
+                allreduce_dgrad=not self.sp and self.tp_size > 1,
+                sequence_parallel=self.sp and self.tp_size > 1,
+                tp_group=self.tp_group,
+            )
         if self.sp:
             return _VanillaColParallelMatmulSP.apply(x, self.weight, self.tp_group)
         return _VanillaColParallelMatmul.apply(x, self.weight, self.tp_group)
