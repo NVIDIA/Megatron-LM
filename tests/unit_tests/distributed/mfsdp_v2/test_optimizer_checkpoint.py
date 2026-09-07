@@ -62,9 +62,18 @@ class _TiedLinears(MegatronModule):
 
 
 def _shard_and_build_optimizer(
-    config: TransformerConfig, pg_collection: ProcessGroupCollection, module: torch.nn.Module
+    config: TransformerConfig,
+    pg_collection: ProcessGroupCollection,
+    module: torch.nn.Module,
+    *,
+    precision_aware: bool = False,
 ) -> tuple[FullyShardedDataParallel, FullyShardedOptimizer]:
-    """Shard ``module`` with MFSDP v2 and build its :class:`FullyShardedOptimizer`."""
+    """Shard ``module`` with MFSDP v2 and build its :class:`FullyShardedOptimizer`.
+
+    Args:
+        precision_aware: Keep the optimizer state in the lower ``exp_avg_dtype`` /
+            ``exp_avg_sq_dtype`` precision, as ``test_mcore_adapter.py`` trains MFSDP v2.
+    """
     model = FullyShardedDataParallel(
         config=config,
         ddp_config=DistributedDataParallelConfig(
@@ -91,6 +100,9 @@ def _shard_and_build_optimizer(
         # distributed optimizer on the OptimizerConfig.
         use_distributed_optimizer=False,
         clip_grad=0.0,
+        use_precision_aware_optimizer=precision_aware,
+        exp_avg_dtype=torch.bfloat16 if precision_aware else torch.float32,
+        exp_avg_sq_dtype=torch.bfloat16 if precision_aware else torch.float32,
     )
     optimizer = get_megatron_optimizer(optimizer_config, [model], use_gloo_process_groups=False)
     assert isinstance(optimizer, FullyShardedOptimizer)
@@ -104,7 +116,11 @@ def _zero_parameters(module: torch.nn.Module) -> None:
 
 
 def _build_model_and_optimizer(
-    config: TransformerConfig, pg_collection: ProcessGroupCollection, *, zero_init: bool
+    config: TransformerConfig,
+    pg_collection: ProcessGroupCollection,
+    *,
+    zero_init: bool,
+    precision_aware: bool = False,
 ) -> tuple[FullyShardedDataParallel, FullyShardedOptimizer]:
     """Build an MFSDP v2 sharded transformer block and its :class:`FullyShardedOptimizer`."""
     block = TransformerBlock(config=config, spec=get_gpt_layer_local_spec()).to(
@@ -114,7 +130,7 @@ def _build_model_and_optimizer(
         # Zero the destination weights so they are obviously different from the saved
         # (trained) source; a correct load must overwrite them.
         _zero_parameters(block)
-    return _shard_and_build_optimizer(config, pg_collection, block)
+    return _shard_and_build_optimizer(config, pg_collection, block, precision_aware=precision_aware)
 
 
 def _build_tied_model_and_optimizer(
@@ -257,7 +273,8 @@ class TestOptimizerCheckpoint:
     def teardown_method(self):
         Utils.destroy_model_parallel()
 
-    def test_checkpoint_roundtrip(self, tmp_path_dist_ckpt: Path) -> None:
+    @pytest.mark.parametrize("precision_aware", [False, True], ids=["fp32_state", "bf16_state"])
+    def test_checkpoint_roundtrip(self, tmp_path_dist_ckpt: Path, precision_aware: bool) -> None:
         """Model weights and optimizer state survive an ``fsdp_dtensor`` round trip.
 
         The source trains a few steps and is checkpointed the way the training loop does it
@@ -270,13 +287,17 @@ class TestOptimizerCheckpoint:
         With >=2 ranks this also covers the empty-shard case: MFSDP v2's flat packing leaves
         some ranks owning no rows of a given parameter, so the checkpoint has to describe and
         restore optimizer state whose local shard is empty.
+
+        ``precision_aware`` keeps the optimizer state in bf16 rather than fp32, which is how
+        ``test_mcore_adapter.py`` trains MFSDP v2. It changes the state tensors' dtype but not
+        their shape or their keys, so the same round trip has to hold.
         """
         config = _transformer_config()
         world_size = torch.distributed.get_world_size()
         source_steps, destination_steps = 3, 1
 
         source_model, source_optimizer = _build_model_and_optimizer(
-            config, self.pg_collection, zero_init=False
+            config, self.pg_collection, zero_init=False, precision_aware=precision_aware
         )
         for _ in range(source_steps):
             _train_step(config, source_model, source_optimizer)
@@ -305,7 +326,8 @@ class TestOptimizerCheckpoint:
                 f"this config. empty_local_counts={empty_local_counts}"
             )
 
-        with TempNamedDir(tmp_path_dist_ckpt / "fsdp_dtensor_optimizer", sync=True) as ckpt_dir:
+        directory = f"fsdp_dtensor_optimizer_{'bf16' if precision_aware else 'fp32'}_state"
+        with TempNamedDir(tmp_path_dist_ckpt / directory, sync=True) as ckpt_dir:
             save_state_dict = {
                 "model": source_model.state_dict_for_save_checkpoint(),
                 "optimizer": source_optimizer.sharded_state_dict({}),
@@ -314,7 +336,7 @@ class TestOptimizerCheckpoint:
             dcp.save(save_state_dict, checkpoint_id=ckpt_dir)
 
             destination_model, destination_optimizer = _build_model_and_optimizer(
-                config, self.pg_collection, zero_init=True
+                config, self.pg_collection, zero_init=True, precision_aware=precision_aware
             )
             for _ in range(destination_steps):
                 _train_step(config, destination_model, destination_optimizer)
