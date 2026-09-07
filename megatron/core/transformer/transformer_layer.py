@@ -51,6 +51,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Tensor-only projection of ``PackedSeqParams`` used at the TE CUDA Graph boundary.
+# Keep capture/replay consumers on one field list so a newly supported THD path cannot
+# silently omit one of the captured keyword arguments.
+_THD_CUDA_GRAPH_TENSOR_KWARGS = (
+    "cu_seqlens_q",
+    "cu_seqlens_kv",
+    "cu_seqlens_q_padded",
+    "cu_seqlens_kv_padded",
+)
+
 
 @functools.lru_cache(maxsize=None)
 def _get_offloading_interface():
@@ -1294,10 +1304,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
                 cu_seqlens[1:] = max_T
 
-                static_inputs["cu_seqlens_q"] = cu_seqlens
-                static_inputs["cu_seqlens_kv"] = cu_seqlens.clone()
-                static_inputs["cu_seqlens_q_padded"] = cu_seqlens.clone()
-                static_inputs["cu_seqlens_kv_padded"] = cu_seqlens.clone()
+                static_inputs[_THD_CUDA_GRAPH_TENSOR_KWARGS[0]] = cu_seqlens
+                for name in _THD_CUDA_GRAPH_TENSOR_KWARGS[1:]:
+                    static_inputs[name] = cu_seqlens.clone()
 
             slen_for_mask = self.config.max_seqlen_per_dp_cp_rank
             if self.config.sequence_parallel:
@@ -1388,10 +1397,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         packed_seq_params = kwargs.pop('packed_seq_params', None)
         if packed_seq_params is None:
             return
-        kwargs['cu_seqlens_q'] = packed_seq_params.cu_seqlens_q
-        kwargs['cu_seqlens_kv'] = packed_seq_params.cu_seqlens_kv
-        kwargs['cu_seqlens_q_padded'] = packed_seq_params.cu_seqlens_q_padded
-        kwargs['cu_seqlens_kv_padded'] = packed_seq_params.cu_seqlens_kv_padded
+        for name in _THD_CUDA_GRAPH_TENSOR_KWARGS:
+            kwargs[name] = getattr(packed_seq_params, name)
 
     def _reconstruct_packed_seq_params_from_kwargs(self, kwargs):
         """Reconstruct PackedSeqParams from individual tensor kwargs (CUDA graph path).
@@ -1406,13 +1413,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if 'cu_seqlens_q' not in kwargs:
             return
         max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        packed_seq_tensor_kwargs = {
+            name: kwargs.pop(name) for name in _THD_CUDA_GRAPH_TENSOR_KWARGS
+        }
         packed_seq_params = PackedSeqParams(
             qkv_format='thd',
             cp_partition_mode=self.config.cp_partition_mode,
-            cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
-            cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
-            cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),
-            cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
+            **packed_seq_tensor_kwargs,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
             # CUDA graph inputs do not carry this Python bool. Sequence-packing
@@ -1498,6 +1505,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         For THD format, PackedSeqParams is decomposed into individual tensor kwargs.
         """
         context = None
+        # Keep the Python metadata object for any eager continuation after a
+        # partial graph. The graph boundary still receives only its decomposed
+        # tensor fields; in particular, tokens_per_sample is needed to restore
+        # the batch dimension before an eager MoE tail.
+        packed_seq_params = kwargs.get("packed_seq_params")
         padding_mask = kwargs.get("padding_mask", None)
         if (
             self.config.cuda_graph_modules
@@ -1526,7 +1538,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.off_interface.enter_replay()
 
         try:
-            return self._te_cuda_graph_replay_impl(args, kwargs, context)
+            return self._te_cuda_graph_replay_impl(
+                args, kwargs, context, packed_seq_params=packed_seq_params
+            )
         finally:
             if self.config.delay_offload_until_cuda_graph:
                 self.off_interface.exit_replay()
@@ -1583,7 +1597,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         nvtx_range_pop(suffix="mlp")
         return mlp_output_with_bias
 
-    def _te_cuda_graph_replay_impl(self, args, kwargs, context):
+    def _te_cuda_graph_replay_impl(
+        self, args, kwargs, context, packed_seq_params: Optional[PackedSeqParams] = None
+    ):
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
         cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
 
@@ -1697,7 +1713,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states,
                 padding_mask=kwargs.get("padding_mask", None),
                 input_ids=kwargs.get("input_ids", None),
-                packed_seq_params=kwargs.get("packed_seq_params", None),
+                packed_seq_params=packed_seq_params,
             )
         return output, context
 
@@ -2145,17 +2161,33 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             return super()._te_cuda_graph_capture(*args, **kwargs)
 
         self._reconstruct_packed_seq_params_from_kwargs(kwargs)
-        # Backstop for packed inputs the config gate cannot see (the gate keys
-        # on sequence_packing_scheduler): fail with a clear message instead of
-        # the TE TypeError a replay with missing captured kwargs would raise.
-        if kwargs.get("packed_seq_params") is not None:
+        # Dynamic CP may replace both the local token count and process group per
+        # batch. A per-layer TE graph has tensor-only inputs and captures fixed
+        # collective topology, so it cannot represent those runtime changes.
+        if (
+            self.config.dynamic_context_parallel
+            or self.config.sequence_packing_scheduler == "default_dynamic_cp"
+        ):
             raise NotImplementedError(
-                "mhc_recompute_attn_cuda_graph_split does not support packed "
-                "(THD) sequences: the split's replay does not forward the THD "
-                "captured kwargs (cu_seqlens_*, padding_mask). Disable the "
-                "switch to capture the whole attention range instead."
+                "mhc_recompute_attn_cuda_graph_split does not support Dynamic CP: "
+                "local_cp_size and cp_group can vary between batches, while a "
+                "Transformer Engine CUDA Graph captures fixed tensor shapes and "
+                "collective topology."
             )
         return self._forward_mhc_attention_cuda_graph_consumer(*args, **kwargs)
+
+    def _te_cuda_graph_replay(self, *args, **kwargs):
+        """Reject runtime Dynamic-CP metadata before the split replay decomposes it."""
+        if self._uses_mhc_recompute_attn_cuda_graph_split():
+            packed_seq_params = kwargs.get("packed_seq_params")
+            if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+                raise NotImplementedError(
+                    "mhc_recompute_attn_cuda_graph_split does not support Dynamic CP: "
+                    "PackedSeqParams.local_cp_size selects per-batch CP geometry, which "
+                    "cannot be replayed by a Transformer Engine CUDA Graph with fixed "
+                    "tensor shapes and collective topology."
+                )
+        return super()._te_cuda_graph_replay(*args, **kwargs)
 
     def _forward_mhc_attention_post_cuda_graph(
         self,
@@ -2561,6 +2593,19 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             value = kwargs.get(name)
             if value is not None:
                 graph_kwargs[name] = value
+
+        # The public TransformerLayer replay entry point has already decomposed
+        # PackedSeqParams by the time it dispatches here. Preserve the exact THD
+        # keyword set captured by TE, including padding_mask (and input_ids on
+        # hash-routed MoE layers), even though the attention consumer itself does
+        # not inspect every tensor.
+        captured_exact_kwargs = (*_THD_CUDA_GRAPH_TENSOR_KWARGS, "padding_mask", "input_ids")
+        for name in captured_exact_kwargs:
+            if name in kwargs:
+                graph_kwargs[name] = kwargs[name]
+
+        # Retain compatibility with direct callers that enter the split replay
+        # with an object rather than through TransformerLayer._te_cuda_graph_replay.
         if kwargs.get("packed_seq_params") is not None:
             graph_kwargs["packed_seq_params"] = kwargs["packed_seq_params"]
             self._decompose_packed_seq_params_to_kwargs(graph_kwargs)
@@ -2604,17 +2649,23 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         return hidden_states, context, mhc_recompute_manager, kwargs
 
-    def _te_cuda_graph_replay_mhc_attention_split(self, args, kwargs, context):
+    def _te_cuda_graph_replay_mhc_attention_split(
+        self, args, kwargs, context, packed_seq_params: Optional[PackedSeqParams] = None
+    ):
         """Replay captured attention between eager mHC pre/post operations."""
         hidden_states, context, mhc_recompute_manager, kwargs = self._replay_mhc_attention_consumer(
             args, kwargs, context
         )
+        if packed_seq_params is None:
+            # Preserve compatibility with tests or integrations that call the
+            # split implementation directly instead of the public replay entry.
+            packed_seq_params = kwargs.get("packed_seq_params")
         output = self._forward_mlp(
             hidden_states,
             inference_context=kwargs.get("inference_context"),
             padding_mask=kwargs.get("padding_mask"),
             input_ids=kwargs.get("input_ids"),
-            packed_seq_params=kwargs.get("packed_seq_params"),
+            packed_seq_params=packed_seq_params,
             mhc_recompute_manager=mhc_recompute_manager,
         )
         return output, context
@@ -2683,7 +2734,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         local_tokens, probs = self.mlp.preprocess(pre_mlp_layernorm_output, probs, routing_map)
         return (residual, local_tokens, probs, shared_expert_output, mlp_h_res, mlp_hc_h_post)
 
-    def _te_cuda_graph_replay_impl(self, args, kwargs, context):
+    def _te_cuda_graph_replay_impl(
+        self, args, kwargs, context, packed_seq_params: Optional[PackedSeqParams] = None
+    ):
         """Implementation of _te_cuda_graph_replay with hyper connection support.
 
         Overrides the parent's _te_cuda_graph_replay_impl so that the
@@ -2697,7 +2750,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         if self._uses_mhc_recompute_attn_cuda_graph_split():
             if self.config.overlap_moe_expert_parallel_comm:
                 return self._te_cuda_graph_replay_mhc_attention_split_overlap(args, kwargs, context)
-            return self._te_cuda_graph_replay_mhc_attention_split(args, kwargs, context)
+            return self._te_cuda_graph_replay_mhc_attention_split(
+                args, kwargs, context, packed_seq_params=packed_seq_params
+            )
 
         # Read, do not pop: on THD, padding_mask IS a capture-time kwarg
         # (get_layer_static_inputs adds it whenever _is_thd_cuda_graph()), and
@@ -2859,7 +2914,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 *cuda_graph_output,
                 padding_mask=padding_mask,
                 input_ids=kwargs.get("input_ids", None),
-                packed_seq_params=kwargs.get("packed_seq_params", None),
+                packed_seq_params=packed_seq_params,
                 mhc_recompute_manager=getattr(self, '_mhc_recompute_manager', None),
             )
         return output, context
