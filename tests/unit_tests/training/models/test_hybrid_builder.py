@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from unittest.mock import Mock, call, patch
 
@@ -73,6 +73,23 @@ class TestHybridModelConfigInitialization:
     def test_hybrid_stack_spec_default_is_none(self):
         config = _make_hybrid_config()
         assert config.hybrid_stack_spec is None
+
+    def test_own_field_not_shadowed_by_transformer_field(self):
+        """Own dataclass fields must stay on the model config even when
+        TransformerConfig declares a same-named field.
+
+        ``hybrid_layer_pattern`` exists on both classes; the __setattr__ proxy
+        used to route the model-config value to the transformer config, leaving
+        the class default (None) visible on the model config. The model then
+        silently built zero decoder layers.
+        """
+        config = _make_hybrid_config(hybrid_layer_pattern="M-M*|M-M*")
+        assert "hybrid_layer_pattern" in HybridModelConfig.__dataclass_fields__
+        assert "hybrid_layer_pattern" in type(config.transformer).__dataclass_fields__
+        assert config.hybrid_layer_pattern == "M-M*|M-M*"
+        # Explicit assignment after init must also land on the model config.
+        config.hybrid_layer_pattern = "MM|MM"
+        assert object.__getattribute__(config, "hybrid_layer_pattern") == "MM|MM"
 
 
 class TestHybridModelConfigGetAttr:

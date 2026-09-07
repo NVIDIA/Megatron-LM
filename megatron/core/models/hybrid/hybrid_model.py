@@ -363,6 +363,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             pre_process=self.pre_process,
             layer_type_list=layer_type_list,
             pp_layer_offset=layer_offset,
+            vp_stage=vp_stage,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
