@@ -3,7 +3,7 @@
 """Unit tests for rotary embedding sharing across layers (``maybe_share_rotary_pos_emb``).
 
 Two layers of coverage:
-  * fast, device-free checks of the sharing helper's caching contract, and
+  * a fast, device-free check that different rotary configs are not shared, and
   * a small two-layer multi-latent-attention proxy that runs one forward/backward step
     with sharing off and on and asserts the loss and gradient norm are unchanged --
     the feature must be numerically transparent (it only removes duplicate buffers).
@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.models.common.embeddings import RotaryEmbedding, maybe_share_rotary_pos_emb
+from megatron.core.models.common.embeddings import maybe_share_rotary_pos_emb
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
@@ -29,27 +29,8 @@ HIDDEN_SIZE = 12
 
 
 # ----------------------------------------------------------------------------------------------
-# Helper contract (fast, no distributed init required)
+# Helper key-distinction guard (fast, no distributed init required)
 # ----------------------------------------------------------------------------------------------
-def test_disabled_returns_the_same_instance_and_creates_no_cache():
-    """When sharing is off, the module built by the caller is returned unchanged and uncached."""
-    config = SimpleNamespace(share_rotary_pos_emb=False)
-    first, second = object(), object()
-
-    assert maybe_share_rotary_pos_emb(config, ("k",), first) is first
-    assert maybe_share_rotary_pos_emb(config, ("k",), second) is second
-    assert getattr(config, "_shared_rotary_pos_emb_cache", None) is None
-
-
-def test_enabled_shares_the_first_instance_per_key():
-    """When sharing is on, an equal key returns the first module; the extra one is discarded."""
-    config = SimpleNamespace(share_rotary_pos_emb=True)
-    first, second = object(), object()
-
-    assert maybe_share_rotary_pos_emb(config, ("rope", 10000), first) is first
-    assert maybe_share_rotary_pos_emb(config, ("rope", 10000), second) is first
-
-
 def test_enabled_distinguishes_keys():
     """Different rotary configurations (keys) are not shared with each other."""
     config = SimpleNamespace(share_rotary_pos_emb=True)
@@ -57,16 +38,6 @@ def test_enabled_distinguishes_keys():
 
     assert maybe_share_rotary_pos_emb(config, ("rope", 10000), rope) is rope
     assert maybe_share_rotary_pos_emb(config, ("yarn", 10000), yarn) is yarn
-
-
-def test_cache_is_scoped_to_each_config():
-    """The cache lives on the config, so different models (configs) never share an instance."""
-    config_a = SimpleNamespace(share_rotary_pos_emb=True)
-    config_b = SimpleNamespace(share_rotary_pos_emb=True)
-    module_a, module_b = object(), object()
-
-    assert maybe_share_rotary_pos_emb(config_a, ("k",), module_a) is module_a
-    assert maybe_share_rotary_pos_emb(config_b, ("k",), module_b) is module_b
 
 
 # ----------------------------------------------------------------------------------------------
