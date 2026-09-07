@@ -13,10 +13,7 @@ from torch.distributed.tensor import DTensor, Replicate, Shard
 
 import megatron.core.distributed.fsdp.mcore_fsdp_adapter as mcore_fsdp_adapter
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-    FullyShardedDataParallel,
-    FullyShardedDataParallelV2,
-)
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -285,8 +282,6 @@ class TestMcoreAdapterDense:
         def run(model, optimizer) -> torch.Tensor:
             losses = []
             for microbatches in steps:
-                if isinstance(model, FullyShardedDataParallelV2):
-                    model.zero_grad_buffer()
                 optimizer.zero_grad(set_to_none=True)
                 microbatch_losses = []
                 for batch in microbatches:
@@ -479,7 +474,7 @@ class TestMcoreAdapterCudaGraph:
 
         def build_model_and_optimizer(
             config: TransformerConfig, enable_cuda_graph: bool
-        ) -> tuple[FullyShardedDataParallelV2, FullyShardedOptimizer]:
+        ) -> tuple[torch.nn.Module, FullyShardedOptimizer]:
             model = _build_block(config)
             model.load_state_dict(initial_state)
             model = FullyShardedDataParallel(
@@ -495,7 +490,6 @@ class TestMcoreAdapterCudaGraph:
                 module=model,
                 pg_collection=self.pg_collection,
             )
-            assert isinstance(model, FullyShardedDataParallelV2)
             optimizer = get_megatron_optimizer(
                 OptimizerConfig(
                     optimizer="adam",
