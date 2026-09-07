@@ -249,7 +249,9 @@ def init() -> None:
     # Disables the use of the tensor register allocator hook
     os.environ["TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK"] = "0"
     _build_vmm_allocator()
-    log_single_rank(logger, logging.INFO, "[MCORE][VMM_SYMM_ALLOCATOR] Initialized the VMM Allocator")
+    log_single_rank(
+        logger, logging.INFO, "[MCORE][VMM_SYMM_ALLOCATOR] Initialized the VMM Allocator"
+    )
 
 
 def register_mem_pool(pool: torch.cuda.MemPool, group) -> None:

@@ -195,9 +195,7 @@ class TestSymmPoolBackend:
             raise RuntimeError("extension failed to build")
 
         monkeypatch.setattr(gtp_symm.vmm_symm_allocator, "init", _boom)
-        monkeypatch.setattr(
-            gtp_symm.nccl_allocator, "init", lambda: calls.append("nccl_init")
-        )
+        monkeypatch.setattr(gtp_symm.nccl_allocator, "init", lambda: calls.append("nccl_init"))
         monkeypatch.setattr(
             gtp_symm.nccl_allocator,
             "create_nccl_mem_pool",
