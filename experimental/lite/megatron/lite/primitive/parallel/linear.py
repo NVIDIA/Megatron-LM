@@ -304,6 +304,74 @@ def pad_vocab_for_tp(vocab_size: int, tp_size: int) -> int:
     return ((vocab_size + divisor - 1) // divisor) * divisor
 
 
+def _dummy_wgrad(weight: torch.Tensor) -> torch.Tensor:
+    """One shared placeholder gradient per shape, as Core's ``get_dummy_wgrad`` does."""
+    try:
+        from transformer_engine.pytorch.module.base import get_dummy_wgrad
+
+        return get_dummy_wgrad(list(weight.shape), weight.dtype)
+    except Exception:
+        key = (weight.shape, weight.dtype, weight.device)
+        buf = _DUMMY_WGRADS.get(key)
+        if buf is None:
+            buf = torch.empty(weight.shape, dtype=weight.dtype, device=weight.device)
+            _DUMMY_WGRADS[key] = buf
+        return buf
+
+
+_DUMMY_WGRADS: dict = {}
+
+
+class _EmbeddingAccumulatingIntoMainGrad(torch.autograd.Function):
+    """Embedding lookup whose backward writes straight into ``main_grad``.
+
+    The embedding table is one of the two largest parameters in the model, and
+    autograd's path for it builds a dense ``[padded_vocab, hidden]`` gradient
+    which Megatron-Core's DDP then folds into the fp32 accumulator with a
+    separate ``main_grad.add_(grad)``. An op census measured that single add at
+    138 ms per profiling window -- the same cost the vocabulary projection used
+    to pay before it moved to Core's accumulating linear.
+
+    Scattering the rows straight into ``main_grad`` removes both the dense
+    temporary and the add. The scatter is ``index_add_`` on the fp32 buffer, so
+    the accumulation happens at higher precision than the dense-gradient route
+    it replaces, which rounded to the activation dtype first.
+
+    Core has no equivalent for its own embedding, so unlike the rest of this
+    branch there is no upstream call to make here -- but the mechanism is
+    Core's: write through to ``main_grad`` and flag ``grad_added_to_main_grad``
+    so DDP's hook skips the add while still accounting for the parameter.
+    """
+
+    @staticmethod
+    def forward(ctx, weight, local_ids):
+        ctx.save_for_backward(weight, local_ids)
+        return weight[local_ids]
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        weight, local_ids = ctx.saved_tensors
+        main_grad = getattr(weight, "main_grad", None)
+        if main_grad is None or main_grad.dtype != torch.float32:
+            grad = torch.zeros_like(weight)
+            grad.index_add_(
+                0,
+                local_ids.reshape(-1),
+                grad_output.reshape(-1, grad_output.shape[-1]).to(weight.dtype),
+            )
+            return grad, None
+        main_grad.index_add_(
+            0, local_ids.reshape(-1), grad_output.reshape(-1, grad_output.shape[-1]).float()
+        )
+        weight.grad_added_to_main_grad = True
+        # DDP asserts a gradient is present whenever overlap_grad_reduce is on,
+        # so returning None here trades one copy for a crash. Core hits the same
+        # wall and answers it the same way: hand back a placeholder that the
+        # hook can see and then skip, reusing one buffer across layers and
+        # microbatches rather than allocating a vocabulary-sized tensor per call.
+        return _dummy_wgrad(weight), None
+
+
 class VocabParallelEmbedding(nn.Module):
     """Embedding table split across TP on the vocab dimension."""
 
@@ -328,7 +396,7 @@ class VocabParallelEmbedding(nn.Module):
         if self.deterministic:
             out = self.embedding.weight[local_ids]
         else:
-            out = self.embedding(local_ids)
+            out = _EmbeddingAccumulatingIntoMainGrad.apply(self.embedding.weight, local_ids)
         out = out * mask.unsqueeze(-1)
         if self.tp_size > 1:
             out = _ReduceFromTP.apply(out, self.tp_group)
