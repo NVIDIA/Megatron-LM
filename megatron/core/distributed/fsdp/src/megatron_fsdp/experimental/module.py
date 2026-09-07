@@ -509,7 +509,7 @@ class FsdpModule:
 
     def _reduce_gradient_groups(self) -> None:
         """Pack gradients and immediately launch their reduce-scatters."""
-        with self._nvtx_range("gradient_reduce"):
+        with self._nvtx_range("reduce_gradients"):
             context = self.context
             reduce_scatter_stream = context.reduce_scatter_stream
             current_stream = context.current_stream()

@@ -116,8 +116,8 @@ def test_fsdp_training_hooks_emit_operation_nvtx_ranges(distributed_setup, monke
         NvtxEvent("pop", "<root>", "unshard"),
         NvtxEvent("push", "<root>", "reshard"),
         NvtxEvent("pop", "<root>", "reshard"),
-        NvtxEvent("push", "<root>", "gradient_reduce"),
-        NvtxEvent("pop", "<root>", "gradient_reduce"),
+        NvtxEvent("push", "<root>", "reduce_gradients"),
+        NvtxEvent("pop", "<root>", "reduce_gradients"),
         NvtxEvent("pop", "<root>", "backward"),
     ]
 
