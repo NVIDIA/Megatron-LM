@@ -765,8 +765,7 @@ class TestHashRouting:
     def test_hash_routing_skips_aux_loss(self, aux_loss_type, monkeypatch):
         """Hash layers must not attach learned-routing aux-loss gradients."""
         config = _hash_routing_config(
-            moe_router_load_balancing_type=aux_loss_type,
-            moe_aux_loss_coeff=1.0,
+            moe_router_load_balancing_type=aux_loss_type, moe_aux_loss_coeff=1.0
         )
         router = TopKRouter(
             config=config, pg_collection=get_default_pg_collection(), layer_number=1
