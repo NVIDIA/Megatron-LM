@@ -14,6 +14,7 @@
 
 import logging
 import random
+from contextlib import contextmanager
 from typing import Dict, List, NamedTuple, Optional, Tuple, Type
 
 __all__ = ["FullyShardedDataParallel"]
@@ -648,6 +649,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             forward_prefetch_size=ddp_config.suggested_communication_unit_size,
             backward_prefetch_size=ddp_config.suggested_communication_unit_size,
         )
+        common_fully_shard_kwargs = dict(
+            mixed_precision_policy=self.mp_policy,
+            schedule_policy=schedule_policy,
+            register_hooks=not config.overlap_moe_expert_parallel_comm,
+        )
         with fully_shard_context(device=device, use_symmetric_memory=ddp_config.nccl_ub):
             if expert_dp_mesh is not None:
                 # Expert parameters are replicated over expert-DP, not the full DP group.
@@ -661,9 +667,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             submodule.experts,
                             mesh=expert_dp_mesh,
                             placements=expert_placements,
-                            mixed_precision_policy=self.mp_policy,
                             grad_divisor=config.expert_model_parallel_size,
-                            schedule_policy=schedule_policy,
+                            **common_fully_shard_kwargs,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -677,8 +682,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         submodule,
                         mesh=dp_mesh,
                         placements=dense_placements,
-                        mixed_precision_policy=self.mp_policy,
-                        schedule_policy=schedule_policy,
+                        **common_fully_shard_kwargs,
                     )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
@@ -686,10 +690,21 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 module,
                 mesh=dp_mesh,
                 placements=dense_placements,
-                mixed_precision_policy=self.mp_policy,
-                schedule_policy=schedule_policy,
+                **common_fully_shard_kwargs,
             )
         super().__init__(config=config, module=module)
+        # With fine-grained EP-overlap the automatic FSDP hooks are disabled at
+        # construction (register_hooks=False). Install the submodule demand-unshard
+        # hooks here so the model also has a working parameter lifecycle in
+        # forward_only (eval) paths that never build a schedule plan. In training the
+        # schedule-plan path re-invokes setup_combined_1f1b_hooks (idempotent) to add
+        # the per-layer release hooks.
+        if config.overlap_moe_expert_parallel_comm:
+            from megatron.core.models.common.fine_grained_mfsdp_scheduler import (
+                setup_combined_1f1b_hooks,
+            )
+
+            setup_combined_1f1b_hooks(self.module)
 
     @staticmethod
     def _validate_config(
@@ -799,8 +814,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise ValueError("MFSDP v2 requires symmetric registration when nccl_ub is enabled.")
         if ddp_config.fsdp_manual_registration:
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
-        if ddp_config.delay_wgrad_compute:
-            raise ValueError("MFSDP v2 does not support delay_wgrad_compute.")
         if ddp_config.num_buckets is not None:
             raise ValueError("MFSDP v2 does not support num_buckets.")
         if ddp_config.megatron_fsdp_use_decoupled_grad:
@@ -820,6 +833,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     def finish_grad_sync(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 gradient reduction is complete when backward returns."""
+        # Under the custom schedule like 1F1B, post_backward_final_callback is not invoked.
+        # Synchronize gradients here to ensure it is safe to call optimizer.step().
+        context = self.module.context
+        context.current_stream().wait_stream(context.reduce_scatter_stream)
 
     def synchronize_param_gather(self, *unused, **unused_kwargs) -> None:
         """MFSDP v2 parameter gathers complete inside module hooks."""
@@ -832,6 +849,19 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
     def stop_communication(self) -> None:
         """MFSDP v2 communication is complete when backward returns."""
+
+    @contextmanager
+    def no_sync(self):
+        """
+        Context manager that turns off gradient synchronization.
+        For grads shard mode there will actually always be gradient sync happening.
+        """
+        context = self.module.context
+        context.is_last_microbatch = False
+        try:
+            yield
+        finally:
+            context.is_last_microbatch = True
 
 
 def FullyShardedDataParallel(
