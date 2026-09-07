@@ -244,15 +244,24 @@ class DBuffer:
         return buffer
 
     def _create_or_validate_out(
-        self, placements: Iterable[Placement], out: "DBuffer | None"
+        self,
+        out: "DBuffer | None",
+        *,
+        placements: Iterable[Placement] | None = None,
+        dtype: torch.dtype | None = None,
     ) -> "DBuffer":
-        placements = tuple(placements)
+        if placements is None:
+            placements = self.placements
+        else:
+            placements = tuple(placements)
+        if dtype is None:
+            dtype = self.dtype
         if out is None:
             return DBuffer(
                 mesh=self.mesh,
                 placements=placements,
                 tensor_shapes=self.layout.tensor_shapes,
-                dtype=self.dtype,
+                dtype=dtype,
                 device=self.device,
             )
 
@@ -262,24 +271,18 @@ class DBuffer:
             raise ValueError(f"Expected out placements {placements!r}, got {out.placements!r}.")
         if out.layout != self.layout:
             raise ValueError(f"Expected out layout {self.layout!r}, got {out.layout!r}.")
-        if out.dtype != self.dtype:
-            raise ValueError(f"Expected out dtype {self.dtype}, got {out.dtype}.")
+        if out.dtype != dtype:
+            raise ValueError(f"Expected out dtype {dtype}, got {out.dtype}.")
         if out.device != self.device:
             raise ValueError(f"Expected out device {self.device}, got {out.device}.")
         return out
 
-    def cast(self, dtype: torch.dtype) -> "DBuffer":
+    def cast(self, dtype: torch.dtype, *, out: "DBuffer | None" = None) -> "DBuffer":
         """Return this buffer with the same layout and placements in ``dtype``."""
-        if self.dtype == dtype:
+        if self.dtype == dtype and out is None:
             return self
 
-        destination = DBuffer(
-            mesh=self.mesh,
-            placements=self.placements,
-            tensor_shapes=self.layout.tensor_shapes,
-            dtype=dtype,
-            device=self.device,
-        )
+        destination = self._create_or_validate_out(out, dtype=dtype)
         destination.local_buffer.copy_(self.local_buffer)
         return destination
 
@@ -304,7 +307,7 @@ class DBuffer:
         if changed_axis is None:
             if out is None:
                 return self
-            out = self._create_or_validate_out(new_placements, out)
+            out = self._create_or_validate_out(out, placements=new_placements)
             out.local_buffer.copy_(self.local_buffer)
             return out
 
@@ -334,7 +337,7 @@ class DBuffer:
         placements = list(self.placements)
         placements[mesh_axis] = Replicate()
         _validate_placements(placements)
-        out = self._create_or_validate_out(placements, out)
+        out = self._create_or_validate_out(out, placements=placements)
         dist.all_gather_into_tensor(
             output_tensor=out.local_buffer,
             input_tensor=self.local_buffer,
@@ -351,7 +354,7 @@ class DBuffer:
 
         placements = list(self.placements)
         placements[axis] = Replicate()
-        out = self._create_or_validate_out(placements, out)
+        out = self._create_or_validate_out(out, placements=placements)
         out.local_buffer.copy_(self.local_buffer)
         dist.all_reduce(
             out.local_buffer, op=partial_placement.reduce_op, group=self.mesh.get_group(axis)
@@ -372,7 +375,7 @@ class DBuffer:
         placements = list(self.placements)
         placements[axis] = new_placement
         _validate_placements(placements)
-        out = self._create_or_validate_out(placements, out)
+        out = self._create_or_validate_out(out, placements=placements)
         dist.reduce_scatter_tensor(
             output=out.local_buffer,
             input=self.local_buffer,
@@ -400,7 +403,7 @@ class DBuffer:
                 self.mesh, placements
             )
         else:
-            out = self._create_or_validate_out(placements, out)
+            out = self._create_or_validate_out(out, placements=placements)
             destination_offset = out.offset
             destination_numel = out.local_buffer.numel()
 
