@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -49,26 +50,41 @@ def run_microbatch_loop(
     last_out = None
     all_metrics: list[dict] = []
     for mb in range(num_microbatches):
-        batch, loss_context = split_loss_context(next(data_iter))
-        if pre_forward_hook is not None:
-            scale = torch.tensor(1.0 / num_microbatches, device="cuda")
-            pre_forward_hook(scale)
-        with use_loss_context(loss_context):
-            out = forward_fn(model, batch)
-        if dist_opt and optimizer is not None and mb == num_microbatches - 1:
-            optimizer.grad_sync_enabled = True
-        if loss_fn is not None:
-            if loss_context is None:
-                loss, metrics = loss_fn(out, batch)
-            else:
-                loss, metrics = loss_fn(out, batch, loss_context)
-            if not forward_only:
-                (loss / num_microbatches).backward()
-            out["loss"] = loss.detach()
-            all_metrics.append(metrics)
-        elif not forward_only:
-            (out["loss"] / num_microbatches).backward()
-        last_out = out
+        is_last = mb == num_microbatches - 1
+        # Megatron-Core's DDP does not decide when to launch its gradient
+        # reduction; the training loop tells it, by running every microbatch but
+        # the last under ``no_sync``. Without that the reduction can only go out
+        # after the whole backward has finished, with no compute left to hide it
+        # behind: an anchor-normalised profile measured lite's GPU busy time at
+        # 15 ms *below* its step time -- collectives fully exposed, plus a bubble
+        # -- against Core's 166 ms above it. Core's schedules do this through
+        # ``no_sync_func``; the native loop here has to do it directly.
+        sync_ctx = (
+            model.no_sync()
+            if not forward_only and not is_last and hasattr(model, "no_sync")
+            else nullcontext()
+        )
+        with sync_ctx:
+            batch, loss_context = split_loss_context(next(data_iter))
+            if pre_forward_hook is not None:
+                scale = torch.tensor(1.0 / num_microbatches, device="cuda")
+                pre_forward_hook(scale)
+            with use_loss_context(loss_context):
+                out = forward_fn(model, batch)
+            if dist_opt and optimizer is not None and is_last:
+                optimizer.grad_sync_enabled = True
+            if loss_fn is not None:
+                if loss_context is None:
+                    loss, metrics = loss_fn(out, batch)
+                else:
+                    loss, metrics = loss_fn(out, batch, loss_context)
+                if not forward_only:
+                    (loss / num_microbatches).backward()
+                out["loss"] = loss.detach()
+                all_metrics.append(metrics)
+            elif not forward_only:
+                (out["loss"] / num_microbatches).backward()
+            last_out = out
     if last_out is not None and all_metrics:
         last_out["_loss_fn_metrics"] = all_metrics
     return last_out
