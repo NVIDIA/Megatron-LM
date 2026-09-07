@@ -2189,7 +2189,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             # first depth's wgrad GEMM overwrite the gradients the later depths accumulated.
             for m in self.layers.modules():
                 if hasattr(m, 'is_first_microbatch'):
-                    m.is_first_microbatch_unsafe = True
+                    m.is_reused_within_microbatch = True
         self.cp_group = pg_collection.cp
         self.tp_group = pg_collection.tp
         self.tp_cp_group = getattr(pg_collection, 'tp_cp', None)
