@@ -439,3 +439,85 @@ class TestNVLSAllGatherVDispatcher:
 
         expected_combined = (global_hidden[start:end].float() * ep_size).bfloat16()
         torch.testing.assert_close(graph_combined, expected_combined, atol=0, rtol=0)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# mask_routing_padding kernel
+# ──────────────────────────────────────────────────────────────────────
+
+from megatron.core.transformer.moe.inference_routing_mask_kernel import (  # noqa: E402
+    HAVE_TRITON,
+    mask_routing_padding,
+)
+
+requires_triton_cuda = pytest.mark.skipif(
+    not HAVE_TRITON or not torch.cuda.is_available(),
+    reason="mask_routing_padding requires triton and CUDA",
+)
+
+
+@pytest.mark.internal
+@requires_triton_cuda
+class TestMaskRoutingPadding:
+    """Unit tests for the CUDA-graph padding-row routing mask.
+
+    ``mask_routing_padding`` fills ``routing_map[real_token_count:, :]`` with -1 so
+    the NVLS dispatcher routes padding rows to no expert. ``real_token_count`` is in
+    the global (pre-SP-shard) frame; a non-zero ``tp_rank`` shifts local rows into
+    that frame before the comparison. Runs standalone — no context or NVLS hardware.
+    """
+
+    TOPK = 6
+
+    def _routing_map(self, n_rows, fill=3):
+        # All entries non-negative so masked (-1) slots are unambiguous.
+        return torch.full((n_rows, self.TOPK), fill, dtype=torch.int64, device="cuda")
+
+    def _real_token_count(self, count):
+        return torch.tensor([count], dtype=torch.int32, device="cuda")
+
+    @pytest.mark.parametrize("n_rows, real_count", [(16, 10), (128, 1), (7, 7), (64, 0)])
+    def test_masks_rows_past_real_count(self, n_rows, real_count):
+        """Rows >= real_count become -1; rows < real_count are untouched (tp_rank=0)."""
+        routing_map = self._routing_map(n_rows)
+        original = routing_map.clone()
+
+        mask_routing_padding(routing_map, self._real_token_count(real_count), tp_rank=0)
+
+        torch.testing.assert_close(routing_map[:real_count], original[:real_count])
+        assert torch.all(routing_map[real_count:] == -1)
+
+    def test_real_count_equal_rows_is_noop(self):
+        """real_count == n_rows masks nothing (the unpadded decode case)."""
+        routing_map = self._routing_map(32)
+        original = routing_map.clone()
+
+        mask_routing_padding(routing_map, self._real_token_count(32), tp_rank=0)
+
+        torch.testing.assert_close(routing_map, original)
+
+    def test_sp_rank_offset(self):
+        """Local rows are shifted by tp_rank * n_rows into the global frame.
+
+        With 8 local rows on SP rank 1, local row r is global row r + 8. A global
+        real_count of 11 keeps global rows [8, 11) real (local [0, 3)) and masks
+        global rows [11, 16) (local [3, 8)).
+        """
+        routing_map = self._routing_map(8)
+        original = routing_map.clone()
+
+        mask_routing_padding(routing_map, self._real_token_count(11), tp_rank=1)
+
+        torch.testing.assert_close(routing_map[:3], original[:3])
+        assert torch.all(routing_map[3:] == -1)
+
+    def test_sp_rank_fully_masked(self):
+        """An SP rank entirely beyond real_count is fully masked.
+
+        8 local rows on rank 1 cover global rows [8, 16); real_count=8 masks all.
+        """
+        routing_map = self._routing_map(8)
+
+        mask_routing_padding(routing_map, self._real_token_count(8), tp_rank=1)
+
+        assert torch.all(routing_map == -1)
