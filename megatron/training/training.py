@@ -42,7 +42,7 @@ _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
 # First-party.
 from megatron.core import mpu, nccl_allocator, tensor_parallel
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
+from megatron.core.datasets.data_schedule import wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -54,13 +54,14 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    is_gated_delta_net_variant,
     is_linear_attention_variant,
 )
-from megatron.core.msc_utils import maybe_msc
+from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
@@ -116,7 +117,10 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAIndexerLossLoggingHelper,
+    is_dsa_skip_topk_layer,
+)
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
@@ -387,6 +391,224 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
 
 
+def _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, dsa_indexer_topk):
+    """Fraction of dense causal (query, key) pairs that DSA actually attends to.
+
+    A DSA layer scores every past position with the indexer but runs attention
+    only over the ``dsa_indexer_topk`` highest-scoring keys, so its core
+    attention cost is ``sum_i(min(i, topk))`` pairs per sequence instead of the
+    dense causal ``L^2 / 2``. Returns the ratio between the two, i.e. the
+    factor the dense core-attention coefficient must be scaled by.
+
+    The caller only has the batch aggregates ``sum_i(L_i)`` and
+    ``sum_i(L_i ** 2)``, not the individual sequence lengths, so the ratio is
+    evaluated at the length-weighted mean ``sum(L^2) / sum(L)``. That is exact
+    when every sequence in the batch has the same length (the usual packed-THD
+    benchmark case) and, for ragged batches, weights toward the long sequences
+    that dominate attention cost. Collapses to ``1.0`` when the sequences are
+    no longer than ``topk``, where top-k selects everything and attention is
+    dense.
+    """
+    if not dsa_indexer_topk or total_real_tokens <= 0 or seqlen_squared_sum <= 0:
+        return 1.0
+    mean_seqlen = seqlen_squared_sum / total_real_tokens
+    # Average attended KV entries per query: ``min(i, topk)`` averaged over the
+    # sequence, approximated as ``eff * (1 - eff / (2 * L))`` with
+    # ``eff = min(topk, floor(L))``. The exact discrete average has ``eff - 1``
+    # in the correction term; the O(1/L) difference is below the precision of
+    # this estimate.
+    eff = min(dsa_indexer_topk, math.floor(mean_seqlen))
+    attended = eff * (1 - eff / (2 * mean_seqlen))
+    # Dense causal attention averages ~``mean_seqlen / 2`` keys per query.
+    return attended / (mean_seqlen / 2)
+
+
+def _dsa_indexer_flops(
+    *, hidden_size, q_lora_rank, n_heads, head_dim, num_indexer_layers, indexer_loss_coeff
+):
+    """DSA lightning-indexer FLOPs coefficients, fwd/bwd expansion included.
+
+    Counts the indexer's projections (a Q projection off the shared ``q_lora``
+    residual, the ``linear_wk`` key path, and the per-head ``weights_proj``)
+    plus its dense scoring pass of every query against every past token under
+    a causal mask. Scoring is ``O(L^2)`` even though the attention consuming
+    it is sparse. The indexer KL loss (``dsa_indexer_loss_coeff``) and the
+    top-k selection itself are NOT counted: like everywhere else in this file
+    only the model's defining GEMMs enter the estimate, not auxiliary-loss or
+    sorting work.
+
+    Only ``num_indexer_layers`` layers pay: with cross-layer index sharing
+    (``dsa_indexer_topk_freq``) the layers in between reuse the most recent
+    top-k (see ``is_dsa_skip_topk_layer``).
+
+    The indexer does NOT get the global fwd+bwd factor of 3. It is trained
+    only by its own KL loss, so ``DSAttention.forward`` runs it under
+    ``torch.no_grad()`` unless ``dsa_indexer_loss_coeff > 0`` (which defaults
+    to None), and even then ``x`` / ``qr`` are detached so no gradient leaves
+    the indexer:
+
+      * loss off -> forward only, everything is 1x.
+      * loss on  -> the projections (wq_b / wk / weights_proj) read a detached
+        input, so autograd skips their dgrad and they pay fwd + wgrad = 2x.
+        The scoring GEMM has two activation operands that both need gradients
+        to reach those weights, so it pays fwd + dq + dk = 3x.
+
+    Whether the indexer is trained is part of the training procedure rather
+    than the kernel schedule, so it belongs in this model-FLOPs count. (With
+    ``dsa_indexer_use_sparse_loss`` the scoring backward only covers the top-k
+    entries, which the 3x does not model; it defaults to False.)
+
+    Returns ``(token_linear, core)`` INCLUDING the fwd/bwd and FMA factors.
+    Multiply ``token_linear`` by the real token count and ``core`` by
+    ``sum_i(L_i ** 2)``.
+    """
+    if num_indexer_layers <= 0:
+        return 0, 0
+    if q_lora_rank is None:
+        # Mirrors DSAIndexer's own fallback when the model has no q lora rank.
+        q_lora_rank = hidden_size
+    index_dim = n_heads * head_dim
+    token_linear = num_indexer_layers * (
+        q_lora_rank * index_dim  # wq_b
+        + hidden_size * head_dim  # wk
+        + hidden_size * n_heads  # weights_proj
+    )
+    # Scoring each query against every past token under a causal mask (/2).
+    core = num_indexer_layers * index_dim / 2
+    fma_expansion_factor = 2
+    loss_enabled = (indexer_loss_coeff or 0.0) > 0
+    return (
+        (2 if loss_enabled else 1) * fma_expansion_factor * token_linear,
+        (3 if loss_enabled else 1) * fma_expansion_factor * core,
+    )
+
+
+def _num_dsa_indexer_layers(num_layers, skip_topk_offset, topk_freq):
+    """Count layers that compute their own DSA index (the rest reuse one).
+
+    On the standard-model path every layer is a DSA attention layer (MTP
+    layers included -- ``DSAttention.__init__`` numbers them
+    ``layer_number + config.num_layers``, which is exactly how the caller
+    extends ``num_layers``), so the predicate runs over the whole
+    ``1..num_layers`` range.
+    """
+    return sum(
+        1
+        for layer_number in range(1, num_layers + 1)
+        if not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
+    )
+
+
+def _dsv4_hybrid_self_attention_flops(
+    *,
+    hidden_size,
+    num_attention_heads,
+    v_head_dim,
+    q_lora_rank,
+    o_groups,
+    o_lora_rank,
+    csa_window_size,
+    seq_length,
+    n_layers_r0,
+    n_layers_r4,
+    n_layers_r128,
+    dsa_indexer_n_heads,
+    dsa_indexer_head_dim,
+    dsa_indexer_topk,
+):
+    """Per-iteration DSv4-hybrid self-attention FLOPs coefficients.
+
+    DSv4 attention layers are MLA-based but replace full ``O(L^2)`` core
+    attention with sparse attention (sliding window + compressed-KV), plus a
+    main compressor and, on ``ratio==4`` layers, a learned indexer (DSA). This
+    is the SINGLE SOURCE OF TRUTH shared by the standard-model path
+    (``transformer_flops``) and the hybrid-model path (``hybrid_flops``): the
+    two differ only in how they obtain the per-ratio attention-layer counts
+    (a ``csa_compress_ratios`` list vs. Window/CSA/HCA pattern symbols).
+
+    Layer-type ratios:
+      * ``r==0``   (Window): window-only attention; no compressor / indexer.
+      * ``r==4``   (CSA):    window + learned-topk over compressed KV
+        (compressor + indexer).
+      * ``r==128`` (HCA):    window + all compressed KV (compressor only).
+
+    Returns ``(token_linear, core)`` WITHOUT the fwd+bwd (x3) or FMA (x2)
+    expansion factors -- the caller applies those. Multiply ``token_linear`` by
+    the real (unpadded) token count and ``core`` by ``sum_i(L_i ** 2)``.
+    """
+    n_attn_layers = n_layers_r0 + n_layers_r4 + n_layers_r128
+
+    # ---- MLA projections (token-linear, per attention layer) ----
+    # DSv4 hybrid MLA: ``qk_head_dim + qk_pos_emb_head_dim == v_head_dim`` and the
+    # joint KV is a single ``hidden -> v_head_dim`` projection; the output uses a
+    # grouped low-rank ``(o_groups x o_lora_rank)`` projection (NOT the dense
+    # ``num_heads * v_head_dim -> hidden`` projection of plain MLA).
+    q_term = q_lora_rank * (hidden_size + num_attention_heads * v_head_dim + 1)
+    kv_term = hidden_size * v_head_dim + v_head_dim
+    o_term = num_attention_heads * v_head_dim * o_lora_rank + o_groups * o_lora_rank * hidden_size
+    mla_proj_term = (q_term + kv_term + o_term) * n_attn_layers
+
+    # ---- Sparse attention (replaces full core attention) ----
+    # Split into token-linear parts (window attention, constant per token) and
+    # L^2 parts (compressed-KV attention, scales with sequence length) so THD
+    # packed sequences get correct ``seqlen_squared_sum`` scaling.
+    # r=0: window-only, fixed per-token cost.
+    sparse_attn_r0 = n_layers_r0 * num_attention_heads * csa_window_size * v_head_dim * 2
+    # r=128: window (token-linear) + all compressed KV (L^2). Compressed
+    # positions per token ~= L/(128*2) (causal /2), x2 for QK^T + softmax@V ->
+    # L^2 coefficient ``num_heads * v_head_dim / 128``.
+    sparse_attn_r128_window = n_layers_r128 * num_attention_heads * csa_window_size * v_head_dim * 2
+    sparse_attn_r128_core = n_layers_r128 * num_attention_heads * v_head_dim / 128
+
+    # ---- Main compressor (ratio > 0 layers) ----
+    # Two projections per layer (wkv + wgate): ``hidden -> coff * v_head_dim``.
+    # ratio == 4: coff = 2 (overlapping windows); ratio == 128: coff = 1.
+    main_compressor_term = (
+        n_layers_r4 * hidden_size * (2 * v_head_dim) * 2
+        + n_layers_r128 * hidden_size * (1 * v_head_dim) * 2
+    )
+
+    # ---- r=4 layers: sparse attention + indexer ----
+    if n_layers_r4 > 0:
+        assert (
+            dsa_indexer_n_heads is not None
+        ), "dsa_indexer_n_heads must be set for dsv4_hybrid with ratio==4 layers."
+        assert (
+            dsa_indexer_head_dim is not None
+        ), "dsa_indexer_head_dim must be set for dsv4_hybrid with ratio==4 layers."
+        assert (
+            dsa_indexer_topk is not None
+        ), "dsa_indexer_topk must be set for dsv4_hybrid with ratio==4 layers."
+        effective_topk_4 = min(dsa_indexer_topk, seq_length // 4)
+        avg_comp_4 = effective_topk_4 * (1 - effective_topk_4 * 4 / (2 * seq_length))
+        sparse_attn_r4 = (
+            n_layers_r4 * num_attention_heads * (csa_window_size + avg_comp_4) * v_head_dim * 2
+        )
+        # Indexer token-linear: compressor (coff=2, wkv + wgate), Q proj, weights proj.
+        indexer_token_term = (
+            n_layers_r4 * hidden_size * (2 * dsa_indexer_head_dim) * 2
+            + n_layers_r4 * q_lora_rank * dsa_indexer_n_heads * dsa_indexer_head_dim
+            + n_layers_r4 * hidden_size * dsa_indexer_n_heads
+        )
+        # Indexer L^2: scoring each query against ~L/4 compressed positions.
+        indexer_scoring_core = n_layers_r4 * dsa_indexer_n_heads * dsa_indexer_head_dim / 4
+    else:
+        sparse_attn_r4 = 0
+        indexer_token_term = 0
+        indexer_scoring_core = 0
+
+    token_linear = (
+        mla_proj_term
+        + sparse_attn_r0
+        + sparse_attn_r4
+        + sparse_attn_r128_window
+        + main_compressor_term
+        + indexer_token_term
+    )
+    core = sparse_attn_r128_core + indexer_scoring_core
+    return token_linear, core
+
+
 def num_floating_point_operations(
     args, batch_size, seqlen_squared_sum_in_batch=None, total_real_tokens_in_batch=None
 ):
@@ -470,6 +692,8 @@ def num_floating_point_operations(
         gqa=True,
         gqa_groups=8,
         kv_channels=None,
+        attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
     ):
         """Calculate FLOPs for an attention layer.
 
@@ -482,12 +706,81 @@ def num_floating_point_operations(
         """
         p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
         g = gqa_groups if gqa else num_heads
+        gate_projection_size = 0
+        if attention_output_gate:
+            if gated_attention_proj_granularity == "elementwise":
+                gate_projection_size = hidden_size * p
+            elif gated_attention_proj_granularity == "headwise":
+                gate_projection_size = num_heads
+            else:
+                raise ValueError(
+                    "gated_attention_proj_granularity must be either 'elementwise' or "
+                    f"'headwise', got {gated_attention_proj_granularity!r}."
+                )
         # 4 * total_tokens * h * p * (h + h*(g/n)): QKV + output projections (fwd*3, with FMA*2).
+        # The output gate contributes one additional hidden_size -> gate_size projection.
         # 2 * sum(L^2) * h * p: core attention (causal mask -> /2 cancels with FMA *2).
         return (
             4 * total_tokens * hidden_size * p * (hidden_size + hidden_size * (g / num_heads))
+            + 2 * total_tokens * hidden_size * gate_projection_size
             + 2 * seqlen_squared_sum * hidden_size * p
         )
+
+    def mla_attn_layer_flops(
+        total_tokens,
+        seqlen_squared_sum,
+        hidden_size,
+        num_heads,
+        q_lora_rank,
+        kv_lora_rank,
+        qk_head_dim,
+        qk_pos_emb_head_dim,
+        v_head_dim,
+        attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
+    ):
+        """Calculate FLOPs for a Multi-Latent Attention (MLA) layer.
+
+        Mirrors the MLA term in ``transformer_flops`` so the hybrid estimate
+        matches the standard-model estimate per attention layer (the DSv4
+        attention layers -- Window/CSA/HCA -- are all MLA-based). The generic
+        ``attn_layer_flops`` above assumes dense MHA/GQA QKV projections and
+        badly overcounts MLA, whose Q/KV go through low-rank ``lora`` ranks.
+
+        Returns a forward-equivalent value (FMA factor 2 baked in, no
+        forward/backward factor): hybrid_flops applies the global factor 3.
+        """
+        fma = 2
+        if q_lora_rank is None:
+            q_term = hidden_size * num_heads * (qk_head_dim + qk_pos_emb_head_dim)
+        else:
+            q_term = q_lora_rank * (
+                hidden_size + num_heads * (qk_head_dim + qk_pos_emb_head_dim) + 1
+            )
+        gate_projection_size = 0
+        if attention_output_gate:
+            if gated_attention_proj_granularity == "elementwise":
+                gate_projection_size = num_heads * v_head_dim
+            elif gated_attention_proj_granularity == "headwise":
+                gate_projection_size = num_heads
+            else:
+                raise ValueError(
+                    "gated_attention_proj_granularity must be either 'elementwise' or "
+                    f"'headwise', got {gated_attention_proj_granularity!r}."
+                )
+        # Token-linear part (q lora+rope+norm, kv lora+rope+norm, output proj).
+        token_linear = fma * (
+            q_term
+            + kv_lora_rank * (hidden_size + num_heads * (qk_head_dim + v_head_dim) + 1)
+            + hidden_size * qk_pos_emb_head_dim
+            + (num_heads * v_head_dim) * hidden_size
+            + hidden_size * gate_projection_size
+        )
+        # Core attention (L^2) part: QK^T and (softmax(QK^T))V. /2 (causal) cancels *2 (FMA).
+        core = fma * (
+            num_heads * (qk_head_dim + qk_pos_emb_head_dim) / 2 + num_heads * v_head_dim / 2
+        )
+        return token_linear * total_tokens + core * seqlen_squared_sum
 
     def mamba_layer_flops(
         total_tokens, hidden_size, state_dim=16, head_dim=64, num_groups=1, num_heads=128
@@ -535,11 +828,43 @@ def num_floating_point_operations(
             )
         )
 
+    def kda_layer_flops(
+        total_tokens,
+        hidden_size,
+        qk_head_dim=128,
+        v_head_dim=128,
+        num_qk_heads=16,
+        num_v_heads=16,
+        conv_kernel_dim=4,
+    ):
+        """Calculate FLOPs for a direct-projection Kimi Delta Attention layer."""
+        if num_qk_heads != num_v_heads or qk_head_dim != v_head_dim:
+            raise ValueError(
+                "KDA FLOPs require the equal K/V head layout enforced by KimiDeltaAttention."
+            )
+        qk_dim = qk_head_dim * num_qk_heads
+        v_dim = v_head_dim * num_v_heads
+        in_proj_dim = 3 * qk_dim + 2 * v_dim
+        non_core_flops = (
+            2
+            * total_tokens
+            * (
+                hidden_size * (in_proj_dim + num_qk_heads)
+                + conv_kernel_dim * (2 * qk_dim + v_dim)
+                + hidden_size * v_dim
+            )
+        )
+        state_update_flops = num_v_heads * (qk_head_dim**2 + 3 * qk_head_dim * v_head_dim)
+        core_flops = 2 * total_tokens * state_update_flops
+        return non_core_flops + core_flops
+
     def hybrid_flops(
         total_tokens,
         seqlen_squared_sum,
         hidden_size,
         num_attn_layers,
+        num_mla_layers,
+        num_kda_layers,
         num_mamba_layers,
         num_mlp_layers,
         num_moe_layers,
@@ -563,13 +888,61 @@ def num_floating_point_operations(
         gdn_num_qk_heads=16,
         gdn_num_v_heads=32,
         gdn_conv_kernel_dim=4,
+        kda_qk_head_dim=128,
+        kda_v_head_dim=128,
+        kda_num_qk_heads=16,
+        kda_num_v_heads=16,
+        kda_conv_kernel_dim=4,
         vocab_size=256000,
         mtp_num_layers=0,
+        q_lora_rank=None,
+        kv_lora_rank=0,
+        qk_head_dim=0,
+        qk_pos_emb_head_dim=0,
+        v_head_dim=0,
+        attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
+        experimental_attention_variant=None,
+        dsv4_n_layers_r0=0,
+        dsv4_n_layers_r4=0,
+        dsv4_n_layers_r128=0,
+        o_groups=None,
+        o_lora_rank=None,
+        csa_window_size=None,
+        seq_length=None,
+        dsa_indexer_n_heads=None,
+        dsa_indexer_head_dim=None,
+        dsa_indexer_topk=None,
     ):
         """Calculate total FLOPs for the hybrid model."""
-        flops_fwd = (
-            num_attn_layers
-            * attn_layer_flops(
+        # Self-attention (already summed over all attention layers, fwd-equivalent
+        # with the FMA factor baked in; the global ``* 3`` below adds fwd+bwd).
+        if experimental_attention_variant == "dsv4_hybrid":
+            # DSv4 uses sparse MLA attention. Keep the shared helper as the
+            # single source of truth for both HybridModel and GPTModel.
+            dsv4_token_term, dsv4_core_term = _dsv4_hybrid_self_attention_flops(
+                hidden_size=hidden_size,
+                num_attention_heads=num_attn_heads,
+                v_head_dim=v_head_dim,
+                q_lora_rank=q_lora_rank,
+                o_groups=o_groups,
+                o_lora_rank=o_lora_rank,
+                csa_window_size=csa_window_size,
+                seq_length=seq_length,
+                n_layers_r0=dsv4_n_layers_r0,
+                n_layers_r4=dsv4_n_layers_r4,
+                n_layers_r128=dsv4_n_layers_r128,
+                dsa_indexer_n_heads=dsa_indexer_n_heads,
+                dsa_indexer_head_dim=dsa_indexer_head_dim,
+                dsa_indexer_topk=dsa_indexer_topk,
+            )
+            attn_flops_total = 2 * (
+                dsv4_token_term * total_tokens + dsv4_core_term * seqlen_squared_sum
+            )
+        else:
+            # HybridStack assigns '*' to regular attention and '+' to MLA independently of the
+            # model-wide multi_latent_attention flag.
+            plain_attn_layer_flops = attn_layer_flops(
                 total_tokens,
                 seqlen_squared_sum,
                 hidden_size,
@@ -577,7 +950,40 @@ def num_floating_point_operations(
                 gqa,
                 gqa_groups,
                 kv_channels,
+                attention_output_gate,
+                gated_attention_proj_granularity,
             )
+            attn_flops_total = num_attn_layers * plain_attn_layer_flops
+            if num_mla_layers:
+                attn_flops_total += num_mla_layers * mla_attn_layer_flops(
+                    total_tokens,
+                    seqlen_squared_sum,
+                    hidden_size,
+                    num_attn_heads,
+                    q_lora_rank,
+                    kv_lora_rank,
+                    qk_head_dim,
+                    qk_pos_emb_head_dim,
+                    v_head_dim,
+                    attention_output_gate,
+                    gated_attention_proj_granularity,
+                )
+
+        kda_flops_total = 0
+        if num_kda_layers:
+            kda_flops_total = num_kda_layers * kda_layer_flops(
+                total_tokens,
+                hidden_size,
+                kda_qk_head_dim,
+                kda_v_head_dim,
+                kda_num_qk_heads,
+                kda_num_v_heads,
+                kda_conv_kernel_dim,
+            )
+
+        flops_fwd = (
+            attn_flops_total
+            + kda_flops_total
             + num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size, mlp_expansion, swiglu)
             + num_mamba_layers
             * mamba_layer_flops(
@@ -608,9 +1014,10 @@ def num_floating_point_operations(
                 gdn_num_v_heads,
                 gdn_conv_kernel_dim,
             )
-            + (
-                2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers)
-            )  # logits computation
+            +
+            # MTP norms (eh_norm + final_norm) and eh projection (2 * h^2).
+            2 * mtp_num_layers * (3 * hidden_size + 2 * hidden_size * hidden_size) * total_tokens
+            + 2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers)
         )
         return flops_fwd * 3
 
@@ -699,48 +1106,73 @@ def num_floating_point_operations(
             https://arxiv.org/abs/2305.10403
             https://arxiv.org/abs/2205.05198
             '''
-            ## MLA
-            if args.q_lora_rank is None:
-                q_term = (
-                    args.hidden_size
-                    * args.num_attention_heads
-                    * (args.qk_head_dim + args.qk_pos_emb_head_dim)
-                )
+            if args.experimental_attention_variant == "dsv4_hybrid":
+                ## DSv4 hybrid: the MLA projections AND the sparse attention that
+                ## replaces full core attention are both computed together by
+                ## ``_dsv4_hybrid_self_attention_flops`` in the dsv4_hybrid branch
+                ## below (the single source of truth shared with ``hybrid_flops``).
+                ## Zero the standard MLA terms here so they are not double-counted.
+                standard_self_attn_term = 0
+                standard_self_attn_core_term = 0
             else:
-                q_term = args.q_lora_rank * (
-                    args.hidden_size
-                    + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
-                    + 1
-                )
-            # Token-linear part of MLA self-attention (lora projs, kv proj, RoPE, output proj).
-            standard_self_attn_term = (
-                forward_backward_expansion_factor
-                * fma_expansion_factor
-                * (
-                    ## q lora + rope + q norm
-                    q_term
-                    ## kv lora + rope + kv norm
-                    + args.kv_lora_rank
-                    * (
+                ## MLA
+                if args.q_lora_rank is None:
+                    q_term = (
                         args.hidden_size
-                        + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim)
+                        * args.num_attention_heads
+                        * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+                    )
+                else:
+                    q_term = args.q_lora_rank * (
+                        args.hidden_size
+                        + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
                         + 1
                     )
-                    + args.hidden_size * args.qk_pos_emb_head_dim
-                    ## o proj
-                    + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
+                gate_projection_size = 0
+                if args.attention_output_gate:
+                    gate_granularity = getattr(
+                        args, "gated_attention_proj_granularity", "elementwise"
+                    )
+                    if gate_granularity == "elementwise":
+                        gate_projection_size = args.num_attention_heads * args.v_head_dim
+                    elif gate_granularity == "headwise":
+                        gate_projection_size = args.num_attention_heads
+                    else:
+                        raise ValueError(
+                            "gated_attention_proj_granularity must be either 'elementwise' or "
+                            f"'headwise', got {gate_granularity!r}."
+                        )
+                # Token-linear part of MLA self-attention (lora projs, kv proj, RoPE, output proj).
+                standard_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        ## q lora + rope + q norm
+                        q_term
+                        ## kv lora + rope + kv norm
+                        + args.kv_lora_rank
+                        * (
+                            args.hidden_size
+                            + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim)
+                            + 1
+                        )
+                        + args.hidden_size * args.qk_pos_emb_head_dim
+                        ## o proj
+                        + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
+                        ## output gate proj
+                        + gate_projection_size * args.hidden_size
+                    )
                 )
-            )
-            # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``. The
-            # ``/2`` accounts for the causal mask and the ``*2`` cancels it via FMA.
-            standard_self_attn_core_term = (
-                forward_backward_expansion_factor
-                * fma_expansion_factor
-                * (
-                    args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) / 2
-                    + args.num_attention_heads * args.v_head_dim / 2
+                # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``. The
+                # ``/2`` accounts for the causal mask and the ``*2`` cancels it via FMA.
+                standard_self_attn_core_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) / 2
+                        + args.num_attention_heads * args.v_head_dim / 2
+                    )
                 )
-            )
 
         else:
             ## MHA or GQA
@@ -774,6 +1206,10 @@ def num_floating_point_operations(
                 * 2  # QK^T and (QK^T)V
             )
 
+        dsv4_hybrid_extra_term = 0
+        dsv4_hybrid_extra_core_term = 0
+        dsa_extra_term = 0
+        dsa_extra_core_term = 0
         if is_linear_attention_variant(args.experimental_attention_variant):
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
@@ -804,7 +1240,17 @@ def num_floating_point_operations(
             num_linear_attention_layers = sum(linear_attention_pattern)
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
-            if args.experimental_attention_variant == "gated_delta_net":
+            if args.experimental_attention_variant == "kda":
+                linear_self_attn_term = forward_backward_expansion_factor * kda_layer_flops(
+                    total_tokens=1,
+                    hidden_size=args.hidden_size,
+                    qk_head_dim=args.linear_key_head_dim,
+                    v_head_dim=args.linear_value_head_dim,
+                    num_qk_heads=args.linear_num_key_heads,
+                    num_v_heads=args.linear_num_value_heads,
+                    conv_kernel_dim=args.linear_conv_kernel_dim,
+                )
+            elif is_gated_delta_net_variant(args.experimental_attention_variant):
                 # Calculate the FLOPs for the gated delta net attention.
                 qk_head_dim = args.linear_key_head_dim
                 v_head_dim = args.linear_value_head_dim
@@ -831,6 +1277,90 @@ def num_floating_point_operations(
                     "Invalid experimental_attention_variant: "
                     f"{args.experimental_attention_variant}"
                 )
+        elif args.experimental_attention_variant == "dsv4_hybrid":
+            # DSv4 hybrid: MLA projections + sparse attention (window /
+            # compressed-KV), main compressor, and learned indexer (DSA) are all
+            # computed by the shared ``_dsv4_hybrid_self_attention_flops`` helper.
+            # The standard MLA terms were zeroed above to avoid double-counting.
+            num_linear_attention_layers = 0
+            linear_self_attn_term = 0
+            num_standard_attention_layers = num_layers
+
+            compress_ratios = args.csa_compress_ratios
+            assert compress_ratios is not None, "csa_compress_ratios must be set for dsv4_hybrid"
+            assert len(compress_ratios) == num_layers, (
+                f"Invalid length of csa_compress_ratios: {len(compress_ratios)}, "
+                f"expected num_layers + mtp_num_layers ({num_layers})."
+            )
+            # ratio == 0: window-only; ratio == 4: window + topk compressed KV
+            # (compressor + indexer); ratio == 128: window + all compressed KV.
+            dsv4_token_term, dsv4_core_term = _dsv4_hybrid_self_attention_flops(
+                hidden_size=args.hidden_size,
+                num_attention_heads=args.num_attention_heads,
+                v_head_dim=args.v_head_dim,
+                q_lora_rank=args.q_lora_rank,
+                o_groups=args.o_groups,
+                o_lora_rank=args.o_lora_rank,
+                csa_window_size=args.csa_window_size,
+                seq_length=args.seq_length,
+                n_layers_r0=sum(1 for r in compress_ratios if r == 0),
+                n_layers_r4=sum(1 for r in compress_ratios if r == 4),
+                n_layers_r128=sum(1 for r in compress_ratios if r == 128),
+                dsa_indexer_n_heads=args.dsa_indexer_n_heads,
+                dsa_indexer_head_dim=args.dsa_indexer_head_dim,
+                dsa_indexer_topk=args.dsa_indexer_topk,
+            )
+            dsv4_hybrid_extra_term = (
+                forward_backward_expansion_factor * fma_expansion_factor * dsv4_token_term
+            )
+            dsv4_hybrid_extra_core_term = (
+                forward_backward_expansion_factor * fma_expansion_factor * dsv4_core_term
+            )
+        elif args.experimental_attention_variant == "dsa":
+            # DSA (e.g. GLM-5.2). The MLA projections are unchanged -- absorption
+            # relocates the same W_UK/W_UV GEMMs (per-token K/V up-projection
+            # becomes per-token q-side and output-side absorption of identical
+            # cost) -- so the standard token-linear term computed above still
+            # applies. Core attention differs from plain MLA in two ways:
+            #   * DSA always executes the absorbed-MLA path
+            #     (``AbsorbedMLASelfAttention``): ``QK^T`` is formed over the
+            #     compressed KV latent, spanning
+            #     ``kv_lora_rank + qk_pos_emb_head_dim`` per head, and ``AV``
+            #     spans ``kv_lora_rank`` -- not the up-projected
+            #     (``qk_head_dim``, ``v_head_dim``) counted for plain MLA
+            #     above. Each branch counts the form its variant executes.
+            #   * Attention runs over the indexer's top-k keys instead of the
+            #     full causal mask, so the dense causal coefficient is scaled
+            #     down to the top-k pair count.
+            # The indexer itself adds projections plus its own dense O(L^2)
+            # scoring pass; it carries its own (KL-loss-dependent) fwd/bwd
+            # expansion instead of the global factor of 3 -- see
+            # ``_dsa_indexer_flops``.
+            num_linear_attention_layers = 0
+            linear_self_attn_term = 0
+            num_standard_attention_layers = num_layers
+
+            standard_self_attn_core_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
+                * (
+                    args.num_attention_heads * (args.kv_lora_rank + args.qk_pos_emb_head_dim) / 2
+                    + args.num_attention_heads * args.kv_lora_rank / 2
+                )
+                * _dsa_sparse_core_scale(
+                    total_real_tokens_in_batch, seqlen_squared_sum_in_batch, args.dsa_indexer_topk
+                )
+            )
+            dsa_extra_term, dsa_extra_core_term = _dsa_indexer_flops(
+                hidden_size=args.hidden_size,
+                q_lora_rank=args.q_lora_rank,
+                n_heads=args.dsa_indexer_n_heads,
+                head_dim=args.dsa_indexer_head_dim,
+                num_indexer_layers=_num_dsa_indexer_layers(
+                    num_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
+                ),
+                indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+            )
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
@@ -841,9 +1371,18 @@ def num_floating_point_operations(
         self_attn_term = (
             linear_self_attn_term * num_linear_attention_layers
             + standard_self_attn_term * num_standard_attention_layers
+            + dsv4_hybrid_extra_term
+            + dsa_extra_term
         )
-        # Core attention (L^2) FLOPs per standard-attention layer.
-        self_attn_core_term = standard_self_attn_core_term * num_standard_attention_layers
+        # Core attention (L^2) FLOPs. Standard attention has a uniform per-layer
+        # coefficient; DSv4 sparse attention varies by layer type and is pre-summed.
+        # For DSA the standard coefficient is already the top-k-scaled absorbed
+        # form, and the extra term carries the indexer's dense scoring.
+        self_attn_core_term = (
+            standard_self_attn_core_term * num_standard_attention_layers
+            + dsv4_hybrid_extra_core_term
+            + dsa_extra_core_term
+        )
 
         # Token-linear FLOPs scale with the real (unpadded) token count.
         # For BSHD this falls back to ``batch_size * seq_length`` (no padding).
@@ -905,29 +1444,70 @@ def num_floating_point_operations(
 
     # Main entrypoint for FLOPs calculation.
     if is_hybrid_model(args):
-        # Calculate the number of each type of layer.
-        from operator import itemgetter
-
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             Symbols,
             get_hybrid_layer_counts,
         )
 
-        num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
-            itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
-                get_hybrid_layer_counts(args.hybrid_layer_pattern)
+        layer_counts = get_hybrid_layer_counts(args.hybrid_layer_pattern)
+        num_mamba_layers = layer_counts[Symbols.MAMBA]
+        num_gdn_layers = layer_counts[Symbols.GDN]
+        num_kda_layers = layer_counts[Symbols.KDA]
+        num_mlp_layers = layer_counts[Symbols.MLP]
+        num_moe_layers = layer_counts[Symbols.MOE]
+
+        # DSv4 D/C/H/W layers are MLA variants, but their
+        # sparse attention FLOPs are handled by the DSv4 branch.
+        dsv4_mla_symbols = Symbols.MLA_ATTENTION - {Symbols.MLA}
+        dsv4_mla_layers = sum(layer_counts[symbol] for symbol in dsv4_mla_symbols)
+        num_mla_layers = layer_counts[Symbols.MLA]
+        if args.experimental_attention_variant == "dsv4_hybrid":
+            num_attn_layers = layer_counts[Symbols.ATTENTION] + dsv4_mla_layers
+        else:
+            num_attn_layers = layer_counts[Symbols.ATTENTION]
+            num_mla_layers += dsv4_mla_layers
+
+        dsv4_n_layers_r0 = layer_counts[Symbols.WINDOW]
+        dsv4_n_layers_r4 = layer_counts[Symbols.CSA]
+        dsv4_n_layers_r128 = layer_counts[Symbols.HCA]
+        if args.experimental_attention_variant == "dsv4_hybrid":
+            assert num_mla_layers == 0, "dsv4_hybrid does not support dense + MLA layers"
+            assert num_attn_layers == (dsv4_n_layers_r0 + dsv4_n_layers_r4 + dsv4_n_layers_r128), (
+                "dsv4_hybrid expects all attention layers to be Window/CSA/HCA; "
+                f"got {num_attn_layers} attention layers but only "
+                f"{dsv4_n_layers_r0 + dsv4_n_layers_r4 + dsv4_n_layers_r128} are W/C/H."
             )
+
+        # DSA accounting (top-k sparse core attention + indexer) is only
+        # implemented on the standard-model path in ``transformer_flops``. A
+        # 'D' pattern here would silently fall through to the dense full-MLA
+        # estimate below -- overcounting core attention at long context and
+        # dropping the indexer entirely -- so fail loud instead. Key off the
+        # layer pattern itself, not just ``args.experimental_attention_variant``:
+        # on the hybrid path a 'D' pattern sets the variant only in the config
+        # kwargs (``arguments.py``/``argument_utils.py`` write it into
+        # ``kw_args``, never back onto ``args``), so the attribute alone misses
+        # exactly the runs this guard exists for.
+        assert (
+            args.experimental_attention_variant != "dsa" and layer_counts[Symbols.DS_ATTENTION] == 0
+        ), (
+            "num_floating_point_operations does not support DSA "
+            "('D' layers / experimental_attention_variant='dsa') on the "
+            "hybrid-model path (--hybrid-layer-pattern); express the model "
+            "without a layer pattern."
         )
 
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
             mtp_num_layers = 0
-        # Compute hybrid model FLOPs.
+
         return hybrid_flops(
             total_tokens=total_real_tokens_in_batch,
             seqlen_squared_sum=seqlen_squared_sum_in_batch,
             hidden_size=args.hidden_size,
             num_attn_layers=num_attn_layers,
+            num_mla_layers=num_mla_layers,
+            num_kda_layers=num_kda_layers,
             num_mamba_layers=num_mamba_layers,
             num_mlp_layers=num_mlp_layers,
             num_moe_layers=num_moe_layers,
@@ -959,8 +1539,33 @@ def num_floating_point_operations(
             gdn_num_qk_heads=args.linear_num_key_heads or 16,
             gdn_num_v_heads=args.linear_num_value_heads or 32,
             gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
+            kda_qk_head_dim=args.linear_key_head_dim or 128,
+            kda_v_head_dim=args.linear_value_head_dim or 128,
+            kda_num_qk_heads=args.linear_num_key_heads or 16,
+            kda_num_v_heads=args.linear_num_value_heads or 16,
+            kda_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
+            q_lora_rank=args.q_lora_rank,
+            kv_lora_rank=args.kv_lora_rank,
+            qk_head_dim=args.qk_head_dim,
+            qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
+            v_head_dim=args.v_head_dim,
+            attention_output_gate=getattr(args, "attention_output_gate", False),
+            gated_attention_proj_granularity=getattr(
+                args, "gated_attention_proj_granularity", "elementwise"
+            ),
+            experimental_attention_variant=args.experimental_attention_variant,
+            dsv4_n_layers_r0=dsv4_n_layers_r0,
+            dsv4_n_layers_r4=dsv4_n_layers_r4,
+            dsv4_n_layers_r128=dsv4_n_layers_r128,
+            o_groups=getattr(args, "o_groups", None),
+            o_lora_rank=getattr(args, "o_lora_rank", None),
+            csa_window_size=getattr(args, "csa_window_size", None),
+            seq_length=args.seq_length,
+            dsa_indexer_n_heads=getattr(args, "dsa_indexer_n_heads", None),
+            dsa_indexer_head_dim=getattr(args, "dsa_indexer_head_dim", None),
+            dsa_indexer_topk=getattr(args, "dsa_indexer_topk", None),
         )
     else:
         # Compute standard Transformer model FLOPs.
@@ -989,7 +1594,7 @@ def get_start_time_from_progress_log():
     def _get_field(string, type):
         return type(string.split(': ')[1])
 
-    with maybe_msc.open(progress_log_filename, 'r') as f:
+    with open_file(progress_log_filename, 'r') as f:
         for line in f:
             line = line.strip()
             line_tokens = line.split('\t')
@@ -1680,7 +2285,6 @@ def wrap_model_chunks_with_ddp(
     ddp_config,
     *,
     use_layer_wise_distributed_optimizer=False,
-    use_layer_wise_param_layout=True,
     DP=DDP,
     pg_collection=None,
     bucket_sizes=None,
@@ -1691,10 +2295,13 @@ def wrap_model_chunks_with_ddp(
     Centralises the DDP-wrapping wiring shared between :func:`get_model` and
     unit tests.
 
-    For ``use_layer_wise_distributed_optimizer=True``, forces
-    ``ddp_config.use_distributed_optimizer=True`` and computes the mixed LayerWise/DistOpt
-    layout. ``use_layer_wise_param_layout`` selects padded shard-aligned Muon buffers when
-    true or compact all-reduce Muon buffers when false; scalar parameters retain DistOpt.
+    For ``use_layer_wise_distributed_optimizer=True``: forces
+    ``ddp_config.use_distributed_optimizer=True`` (mutated in place; needed for reduce-scatter)
+    and computes per-chunk layouts via
+    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. That method picks the
+    padded shard-aligned LayerWise layout or the compact decoupled layout per
+    ``ddp_config.use_layer_wise_param_layout`` (True → padded, False → compact, with LayerWise
+    buffers treated as non-DistOpt and synced via legacy ``allgather_params``).
 
     For non-layerwise with ``ddp_config.use_distributed_optimizer=True``:
     computes per-chunk byte-level layouts via
@@ -1710,11 +2317,9 @@ def wrap_model_chunks_with_ddp(
         model_chunks: List of model chunks to wrap (un-DDP-wrapped).
         config: :class:`TransformerConfig`.
         ddp_config: :class:`DistributedDataParallelConfig`. Mutated in place when
-            ``use_layer_wise_distributed_optimizer=True``.
+            ``use_layer_wise_distributed_optimizer=True``. Its ``use_layer_wise_param_layout``
+            field selects the padded vs compact decoupled LayerWise layout (default).
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-        use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-            controls whether to compute and supply a shard-aligned param layout
-            to DDP. ``False`` keeps LayerWise on its legacy sync path.
         DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
             variant).
         pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
@@ -1738,15 +2343,17 @@ def wrap_model_chunks_with_ddp(
     per_chunk_layouts = [None] * n
     if DP is DDP:
         if use_layer_wise_distributed_optimizer:
-            # Both LayerWise layouts need buffer routing: compact mode gives Muon buffers
-            # all-reduce semantics while retaining DistOpt for scalar parameters.
+            # LayerWise (Muon) optimizer. Force use_distributed_optimizer=True so sibling
+            # non-LayerWise buffers (embeddings, biases, layernorm) shard with the byte-level
+            # DistributedOptimizer layout, and tag params so DDP buffer grouping routes
+            # LayerWise-managed matrices (Muon's Newton-Schulz domain) to a separate buffer.
+            # The padded-vs-compact LayerWise layout decision is made inside
+            # compute_full_param_layout / _ParamAndGradBuffer from use_layer_wise_param_layout:
+            # by default (compact) LayerWise buffers get the no-padding layout and the per-buffer
+            # override flips use_distributed_optimizer off for them; with
+            # --use-layer-wise-param-layout they stay on the padded DistOpt layout.
             ddp_config.use_distributed_optimizer = True
-            ddp_config.use_layer_wise_param_layout = use_layer_wise_param_layout
             compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
-            # Tag params so DDP buffer grouping routes LayerWise-managed matrices
-            # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
-            # everything else (embeddings, biases, layernorm) to a separate
-            # DistOpt-style buffer.
             tag_params_for_buffer_routing(model_chunks)
         elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
             compute_layout = DistributedOptimizer.compute_full_param_layout
@@ -1762,22 +2369,8 @@ def wrap_model_chunks_with_ddp(
                 "wrap_model_chunks_with_ddp requires a dp_cp process group to size "
                 "the distributed-optimizer parameter layout"
             )
-            # The distributed optimizer shards each bucket over the intra-instance group, which
-            # is what DDP hands to the buffer as its data_parallel_group. Size the layout by that
-            # same group, otherwise the layout reports more shards than the reduce-scatter uses
-            # and the trailing shards of every bucket end up owned by no rank. intra_dp_cp is
-            # the full dp_cp when num_distributed_optimizer_instances is 1, so this only differs
-            # when there are several instances.
-            intra_dp_cp_group = getattr(layout_pgs, "intra_dp_cp", None)
-            intra_expt_dp_group = getattr(layout_pgs, "intra_expt_dp", None)
-            data_parallel_world_size = get_pg_size(
-                intra_dp_cp_group if intra_dp_cp_group is not None else layout_pgs.dp_cp
-            )
-            expert_data_parallel_world_size = get_pg_size(
-                intra_expt_dp_group
-                if intra_expt_dp_group is not None
-                else getattr(layout_pgs, "expt_dp", None)
-            )
+            data_parallel_world_size = get_pg_size(layout_pgs.dp_cp)
+            expert_data_parallel_world_size = get_pg_size(getattr(layout_pgs, "expt_dp", None))
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(
@@ -1917,7 +2510,12 @@ def get_model(
 
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
-        _freeze_all_model_chunks(model)
+        for model_module in model:
+            model_module.requires_grad_(False)
+            # Additionally freeze expert biases of routers
+            for module in model_module.modules():
+                if hasattr(module, "frozen_expert_bias"):
+                    module.frozen_expert_bias = True
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -1933,12 +2531,9 @@ def get_model(
     )
     if get_pg_rank(pg_collection.dp) == 0 and get_pg_rank(pg_collection.cp) == 0:
         print(
-            ' > number of parameters on (tensor, gtp_weight_remat, pipeline) '
-            'model parallel rank ({}, {}, {}): {}'.format(
-                get_pg_rank(pg_collection.tp),
-                get_pg_rank(pg_collection.gtp_remat),
-                get_pg_rank(pg_collection.pp),
-                num_parameters,
+            ' > number of parameters on (tensor, pipeline) '
+            'model parallel rank ({}, {}): {}'.format(
+                get_pg_rank(pg_collection.tp), get_pg_rank(pg_collection.pp), num_parameters
             ),
             flush=True,
         )
@@ -2003,15 +2598,12 @@ def get_model(
             for disable in per_chunk_disable_bucketing
         ]
 
-        if config.cuda_graph_impl == "full_iteration":
-            # DDP initialization must use the full-iteration capture stream so its retained
-            # AccumulateGrad nodes do not reference a different, non-capturing stream.
-            ddp_stream = get_shared_capture_stream()
-        else:
-            # Preserve a dedicated initialization stream for all other implementations.
-            ddp_stream = torch.cuda.Stream()
+        # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
+        #  capture support with DDP, but we sync it with the current stream to avoid races.
+        ddp_stream = torch.cuda.Stream()
+        # Wait for the default stream to complete before starting ddp_stream
         ddp_stream.wait_stream(torch.cuda.current_stream())
-
+        # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
             model = wrap_model_chunks_with_ddp(
                 model,
@@ -2020,13 +2612,13 @@ def get_model(
                 use_layer_wise_distributed_optimizer=getattr(
                     args, 'use_layer_wise_distributed_optimizer', False
                 ),
-                use_layer_wise_param_layout=getattr(args, 'use_layer_wise_param_layout', True),
                 DP=DP,
                 pg_collection=pg_collection if args.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
-        # Ensure initialization-stream work completes before touching params on the default stream.
+        # End of setup_stream
+        # Critical: ensure side-stream work completes before touching params on default stream
         torch.cuda.current_stream().wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
@@ -2185,12 +2777,6 @@ def setup_model_and_optimizer(
             model_config = cfg.model
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
-
-            # Inject freeze_all_layers as a pre-wrap hook so DDP sees requires_grad=False
-            # and skips grad-buffer allocation for all params (matching get_model behavior).
-            if args.freeze_all_layers:
-                model_config.pre_wrap_hooks.append(_freeze_all_model_chunks)
-
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
@@ -2199,6 +2785,7 @@ def setup_model_and_optimizer(
                 use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
                 wrap_with_ddp=wrap_with_ddp,
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
+                use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
             )
         else:
             assert (
@@ -2240,7 +2827,7 @@ def setup_model_and_optimizer(
             cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
         )
 
-    if args.logits_save_dir is not None and mpu.is_pipeline_last_stage():
+    if args.logits_save_dir is not None:
         from megatron.training.distillation import LogitsSaverHooks
 
         logits_saver = LogitsSaverHooks(
@@ -2252,7 +2839,7 @@ def setup_model_and_optimizer(
         )
         logits_saver.attach_hooks(unwrapped_model[-1])
 
-    if args.logits_load_dir is not None and mpu.is_pipeline_last_stage():
+    if args.logits_load_dir is not None:
         from megatron.training.distillation import StudentLogitsCapture
 
         student_logits_capture = StudentLogitsCapture()
@@ -2361,8 +2948,7 @@ def setup_model_and_optimizer(
             and args.ckpt_format == "torch_dist",
             tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
             pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
-            # Replica_id must match the save path (see save_checkpoint_and_time): use the
-            # gtp_remat-inclusive group, not replicate dp_cp, or gtp_remat peers collide.
+            # Replica_id must match the save path; include the GTP-remat axis.
             dp_cp_group=getattr(ckpt_pgc, "dp_cp_gtp_remat", None),
             dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
             expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
@@ -2448,7 +3034,7 @@ def dummy_train_step(data_iterator):
     has_cu_seqlens = getattr(args, 'sft', False) or getattr(
         args, 'dataloader_inter_document_masking', False
     )
-    is_hybrid_cp = args.hybrid_context_parallel
+    is_hybrid_cp = args.dynamic_context_parallel
 
     BATCH_KEYS = [
         "tokens",
@@ -2522,8 +3108,63 @@ def train_step(
     """
     args = get_args()
     timers = get_timers()
+    num_microbatches = get_num_microbatches()
+
+    optimizer_config = getattr(optimizer, 'config', None)
+    chunked_optimizer_state_offload = bool(
+        optimizer_config is not None
+        and getattr(optimizer_config, 'chunked_optimizer_state_offload', False)
+        and getattr(optimizer_config, 'optimizer_state_offload_fraction', 1.0) > 0.0
+    )
+    pre_forward_param_sync_before_master_offload = (
+        chunked_optimizer_state_offload
+        and optimizer.optimizer_state_offload_requires_pre_forward_param_sync()
+    )
+    delay_master_offload_for_param_buffer = (
+        chunked_optimizer_state_offload
+        and args.reuse_grad_buf_for_mxfp8_param_ag
+        and args.overlap_param_gather
+    )
+    if chunked_optimizer_state_offload:
+        # Prefetch masters and the first state chunk as late as possible so H2D overlaps
+        # gradient finalization. Preserve custom hooks and avoid wrapping more than once.
+        finalize_model_grads_func = getattr(config, 'finalize_model_grads_func', None)
+        if (
+            getattr(
+                finalize_model_grads_func,
+                '_chunked_optimizer_state_offload_wrapped_optimizer',
+                None,
+            )
+            is not optimizer
+        ):
+            base_finalize_model_grads_func = getattr(
+                finalize_model_grads_func,
+                '_chunked_optimizer_state_offload_base_finalize_model_grads_func',
+                None,
+            )
+            if base_finalize_model_grads_func is None:
+                base_finalize_model_grads_func = finalize_model_grads_func or finalize_model_grads
+
+            def finalize_model_grads_with_state_reload(*fmg_args, **fmg_kwargs):
+                optimizer.prefetch_optimizer_state_for_gradient_finalization()
+                return base_finalize_model_grads_func(*fmg_args, **fmg_kwargs)
+
+            setattr(
+                finalize_model_grads_with_state_reload,
+                '_chunked_optimizer_state_offload_wrapped_optimizer',
+                optimizer,
+            )
+            setattr(
+                finalize_model_grads_with_state_reload,
+                '_chunked_optimizer_state_offload_base_finalize_model_grads_func',
+                base_finalize_model_grads_func,
+            )
+            config.finalize_model_grads_func = finalize_model_grads_with_state_reload
 
     rerun_state_machine = get_rerun_state_machine()
+    packed_data_iterator = None
+    has_wrapped_data_iterator = False
+    rerun_data_iterator = data_iterator
     save_params_in_this_iteration = (
         args.save_params_interval is not None and (iteration + 1) % args.save_params_interval == 0
     )
@@ -2541,13 +3182,30 @@ def train_step(
     save_dgrads_in_this_iteration = (
         args.save_dgrads_interval is not None and (iteration + 1) % args.save_dgrads_interval == 0
     )
-    while rerun_state_machine.should_run_forward_backward(data_iterator):
+    while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
+        # Start D2H before zeroing gradients. In the MXFP8 staging path, updated masters
+        # remain readable until their delayed D2H after the main-param copy below.
+        if chunked_optimizer_state_offload and not pre_forward_param_sync_before_master_offload:
+            optimizer.offload_optimizer_state_for_forward(
+                offload_master=not delay_master_offload_for_param_buffer
+            )
+
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
             # If saving main_grads in this iteration, then all-reduce instead of reduce-scatter.
             model_chunk.force_all_reduce = save_wgrads_in_this_iteration
         optimizer.zero_grad()
+
+        if pre_forward_param_sync_before_master_offload:
+            # Compact LayerWise FP8 gather consumes fp32 masters. Finish the normally
+            # overlapped gather after grad-buffer reset. If a sibling DistOpt still needs
+            # MXFP8 staging, keep masters until that copy below completes.
+            optimizer.ensure_master_weights_for_pre_forward_param_sync()
+            optimizer.start_param_sync_for_bucket_group_subset(force_sync=True)
+            optimizer.offload_optimizer_state_for_forward(
+                offload_master=not delay_master_offload_for_param_buffer
+            )
 
         if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
             # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
@@ -2581,7 +3239,15 @@ def train_step(
             if forward_pre_hook_enabled or full_cg_captured:
                 for optim_instance in optimizer.chained_optimizers:
                     if isinstance(optim_instance, DistributedOptimizer):
+                        # Only this DistOpt sibling consumes masters in the MXFP8 param-buffer
+                        # staging pass. The staging entry restores its own offloaded masters;
+                        # do not perturb the LayerWise/Muon master lifecycle here.
                         optim_instance._copy_main_params_to_param_buffer()
+
+        # In the delayed MXFP8 path, optimizer state was offloaded above while masters
+        # remained resident for main-param staging. Start master D2H after that copy.
+        if delay_master_offload_for_param_buffer:
+            optimizer.offload_optimizer_state_for_forward()
 
         # Forward pass.
         if save_activations_in_this_iteration:
@@ -2590,13 +3256,40 @@ def train_step(
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        if getattr(config, 'sequence_packing_scheduler', None) is not None:
+            # Dynamic-CP / sequence packing must happen after the rerun state machine has
+            # observed the original RerunDataIterator. The scheduler returns another
+            # RerunDataIterator containing the packed microbatches for this step.
+            if not has_wrapped_data_iterator:
+                (
+                    packed_data_iterator,
+                    num_microbatches,
+                    seqlen_sum_this_global_batch,
+                    seqlen_squared_sum_this_global_batch,
+                ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
+                has_wrapped_data_iterator = True
+                rerun_data_iterator = packed_data_iterator
+            forward_backward_data_iterator = packed_data_iterator
+        else:
+            num_microbatches = get_num_microbatches()
+            seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
+            seqlen_squared_sum_this_global_batch = args.seq_length**2 * args.global_batch_size
+            forward_backward_data_iterator = data_iterator
+
+        if getattr(config, "mtp_num_layers", None):
+            # Writer objects only exist on the last rank, so use globally consistent
+            # configuration flags to keep the acceptance collective branch rank-aligned.
+            has_acceptance_consumer = bool(
+                getattr(args, "tensorboard_dir", None) or getattr(args, "wandb_project", "")
+            )
+            MTPLossLoggingHelper.configure_acceptance_collection(enabled=has_acceptance_consumer)
         grad_context, forward_only = _forward_backward_grad_context(args)
         with grad_context:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
+                data_iterator=forward_backward_data_iterator,
                 model=model,
-                num_microbatches=get_num_microbatches(),
+                num_microbatches=num_microbatches,
                 seq_length=args.seq_length,
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
@@ -2645,7 +3338,19 @@ def train_step(
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
+        return (
+            {},
+            True,
+            should_checkpoint,
+            should_exit,
+            exit_code,
+            None,
+            None,
+            0,
+            num_microbatches,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
+        )
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -2682,8 +3387,6 @@ def train_step(
             getattr(pg_collection, _required, None) is not None
         ), f"model pg_collection used by train_step must define {_required}"
     mp_group = pg_collection.mp
-    # gtp_remat-inclusive: the reported global per-token loss must cover gtp_remat peers' distinct
-    # tokens (replicate dp_cp would report a 1/gtp_remat subsample -> per-step noisy). Display-only.
     dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
     is_last_stage = is_pp_last_stage(pg_collection.pp)
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
@@ -2704,11 +3407,8 @@ def train_step(
 
     # Update learning rate.
     if update_successful:
-        # data_parallel_size excludes the GTP-remat axis (it's folded into total_model_size at
-        # arguments.py:446); each gtp-remat peer consumes a distinct microbatch, so multiply it
-        # back in for the sample count.
         increment = (
-            get_num_microbatches()
+            num_microbatches
             * args.micro_batch_size
             * args.data_parallel_size
             * args.gtp_weight_remat_size
@@ -2749,6 +3449,9 @@ def train_step(
             grad_norm,
             num_zeros_in_grad,
             log_max_attention_logit,
+            num_microbatches,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
         )
     return (
         {},
@@ -2759,6 +3462,9 @@ def train_step(
         grad_norm,
         num_zeros_in_grad,
         log_max_attention_logit,
+        num_microbatches,
+        seqlen_sum_this_global_batch,
+        seqlen_squared_sum_this_global_batch,
     )
 
 
@@ -2778,6 +3484,7 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    num_microbatches: int | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2787,8 +3494,12 @@ def training_log(
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
 
-    # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
-    should_reset = not is_first_iteration
+    # On the first iteration we normally keep the accumulator so the next
+    # regular interval still covers a full window.  With log_interval=1 the
+    # first iteration already is a complete window; retaining it would make
+    # iteration 2 report the average of iterations 1 and 2 instead of the
+    # current loss, which invalidates step-by-step alignment comparisons.
+    should_reset = not is_first_iteration or args.log_interval == 1
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
@@ -2856,14 +3567,12 @@ def training_log(
     if args.perform_rl_step:
         timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
 
-    # Calculate batch size. data_parallel_size excludes the GTP-remat axis (it's folded into
-    # total_model_size at arguments.py:446); each gtp-remat peer consumes a distinct microbatch,
-    # so multiply it back in for the global sample count.
+    # Calculate batch size.
     batch_size = (
         args.micro_batch_size
         * args.data_parallel_size
         * args.gtp_weight_remat_size
-        * get_num_microbatches()
+        * num_microbatches
     )
 
     # Track app tag & app tag ID
@@ -2964,7 +3673,7 @@ def training_log(
     # Log MoE metrics.
     moe_log_string = ""
     if args.num_experts is not None:
-        moe_loss_scale = 1 / get_num_microbatches()
+        moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
@@ -2975,15 +3684,23 @@ def training_log(
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
 
+        moe_layer_freq = args.moe_layer_freq
+        mtp_num_layers = args.mtp_num_layers
         if is_hybrid_model(args):
-            from operator import itemgetter
-
             from megatron.core.ssm.mamba_hybrid_layer_allocation import (
                 Symbols,
-                get_hybrid_layer_counts,
+                parse_hybrid_pattern,
             )
 
-            layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
+            parsed_hybrid_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+            main_pattern = (parsed_hybrid_pattern.main_pattern or "").replace(Symbols.PIPE, "")
+            layers = len(main_pattern) + parsed_hybrid_pattern.mtp_num_depths
+            moe_layer_freq = [int(layer_type == Symbols.MOE) for layer_type in main_pattern]
+            moe_layer_freq.extend(
+                parsed_hybrid_pattern.mtp_pattern.count(Symbols.MOE)
+                for _ in range(parsed_hybrid_pattern.mtp_num_depths)
+            )
+            mtp_num_layers = None
         else:
             layers = args.num_layers
 
@@ -2996,15 +3713,22 @@ def training_log(
             force_initialize=True,
             track_names=track_names,
             num_layers=layers,
-            moe_layer_freq=args.moe_layer_freq,
-            mtp_num_layers=args.mtp_num_layers,
+            moe_layer_freq=moe_layer_freq,
+            mtp_num_layers=mtp_num_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        mtp_loss_scale = 1 / get_num_microbatches()
+        if args.calculate_per_token_loss:
+            # The tracker already reduces raw loss sums and token counts into a
+            # per-token loss, matching the main loss normalization path.
+            mtp_loss_scale = 1.0
+        else:
+            # Legacy mode accumulates microbatch-normalized losses, so average
+            # by the scheduled microbatch count for this step.
+            mtp_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
@@ -3018,6 +3742,13 @@ def training_log(
             writer=writer,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
+            num_layers=args.num_layers + (args.mtp_num_layers or 0),
+            num_indexer_layers=(
+                sum(ratio == 4 for ratio in args.csa_compress_ratios)
+                if args.csa_compress_ratios is not None
+                else None
+            ),
+            preserve_groups=args.cuda_graph_impl != "none",
         )
 
     # Dump memory snapshot and print metrics to stdout.
@@ -3282,7 +4013,6 @@ def save_checkpoint_and_time(
     tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
     pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
     dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
-    # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
     dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
     expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
     # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
@@ -3645,15 +4375,12 @@ def train(
     )
 
     def _dp_world_size():
-        # Full DP x gtp_remat degree (num_microbatches spans the full data-distribution axis).
-        gtp_remat = args.gtp_weight_remat_size
         if lang_pgc is not None:
-            return lang_pgc.dp.size() * gtp_remat
+            return lang_pgc.dp.size()
         if mpu.model_parallel_is_initialized():
             return mpu.get_data_parallel_world_size()
-        # args.data_parallel_size is the language (llm) dp on all ranks (set in validate_args) and
-        # excludes gtp_remat, so scale by gtp_remat to span the full data-distribution axis.
-        return args.data_parallel_size * gtp_remat
+        # args.data_parallel_size equals the language (llm) dp on all ranks (entry validate_args).
+        return args.data_parallel_size
 
     # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
     if args.perform_rl_step:
@@ -3679,9 +4406,6 @@ def train(
 
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
-
-    if args.hybrid_context_parallel:
-        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
 
     if args.run_workload_inspector_server:
         try:
@@ -3922,6 +4646,7 @@ def train(
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             optimizers=[optimizer],
+            thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
         )
 
     # Run training iterations till done.
@@ -3965,9 +4690,9 @@ def train(
         # Standard microbatch update (sequence packing overrides this in rl_utils.py)
         update_num_microbatches(args.consumed_train_samples, consistency_check=False, verbose=True)
         # Skip automatic checkpoint on microbatch changes when sequence packing is active
-        # as it intentionally reconfigures microbatches
+        # as it intentionally reconfigures microbatches.
         if get_num_microbatches() != num_microbatches and iteration != 0:
-            if args.rl_use_sequence_packing:
+            if args.rl_use_sequence_packing or args.sequence_packing_scheduler is not None:
                 print_rank_0(
                     f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
                     f"(microbatch change: {num_microbatches} -> {get_num_microbatches()})"
@@ -4002,6 +4727,8 @@ def train(
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 enable_forward_pre_hook(model)
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
+            if isinstance(forward_backward_func, PagedStashRunner):
+                forward_backward_func.mark_te_graph_captured(num_microbatches)
 
         # Completely skip iteration if needed.
         if (iteration + 1) in args.iterations_to_skip:
@@ -4053,6 +4780,9 @@ def train(
             grad_norm = 0.0
             num_zeros_in_grad = 0
             max_attention_logit = None
+            num_microbatches = get_num_microbatches()
+            seqlen_sum_this_global_batch = None
+            seqlen_squared_sum_this_global_batch = None
         else:
             ft_integration.on_training_step_start()
             (
@@ -4064,6 +4794,9 @@ def train(
                 grad_norm,
                 num_zeros_in_grad,
                 max_attention_logit,
+                num_microbatches,
+                seqlen_sum_this_global_batch,
+                seqlen_squared_sum_this_global_batch,
             ) = train_step(
                 forward_step_func,
                 train_data_iterator,
@@ -4167,14 +4900,22 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
-        # Drain the per-iteration packed-sequence stats so the FLOPs computation
-        # reflects THD per-chunk causal attention AND excludes padding tokens
-        # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
-        # runs (no collective issued), letting ``num_floating_point_operations``
-        # fall back to its closed-form defaults.
-        total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
-            consume_seqlen_stats_in_iteration()
-        )
+        if getattr(config, 'sequence_packing_scheduler', None) is not None and not args.skip_train:
+            # The scheduler computed these from the real sequence lengths before
+            # CP padding and rerouting, so use them directly for FLOPs accounting.
+            assert seqlen_sum_this_global_batch is not None
+            assert seqlen_squared_sum_this_global_batch is not None
+            total_real_tokens_in_batch = seqlen_sum_this_global_batch
+            seqlen_squared_sum_in_batch = seqlen_squared_sum_this_global_batch
+        else:
+            # Drain the per-iteration packed-sequence stats so the FLOPs computation
+            # reflects THD per-chunk causal attention AND excludes padding tokens
+            # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
+            # runs (no collective issued), letting ``num_floating_point_operations``
+            # fall back to its closed-form defaults.
+            total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
+                consume_seqlen_stats_in_iteration()
+            )
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
             batch_size,
@@ -4213,6 +4954,7 @@ def train(
             is_first_iteration=is_first_iteration,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            num_microbatches=num_microbatches,
         )
         is_first_iteration = False
 
@@ -4316,13 +5058,6 @@ def train(
         if should_exit:
             break
 
-    # Early-exit paths (exit-duration / exit-interval / signal handler) sys.exit()
-    # below before the normal-path logging, so record the train-loop finish time here.
-    if should_exit:
-        one_logger and one_logger.log_metrics(
-            {'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()}
-        )
-
     # Destroy CUDA Graphs.
     if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
         cuda_graph_helper.delete_cuda_graphs()
@@ -4372,9 +5107,6 @@ def train(
                         nccl_allocator.deregister_mem_pool(
                             buf.nccl_mem_pool, buf.data_parallel_group
                         )
-        one_logger and one_logger.log_metrics(
-            {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
-        )
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()
@@ -4419,9 +5151,6 @@ def evaluate(
     # make validation batch size independent from training batch size
     eval_batch_size = args.eval_global_batch_size
     eval_micro_batch_size = args.eval_micro_batch_size
-    # data_parallel_size excludes the GTP-remat axis (it's folded into total_model_size at
-    # arguments.py:446); each gtp-remat peer consumes a distinct microbatch, so include it in the
-    # global sample breadth we divide out to recover the microbatch count.
     eval_num_microbatches = eval_batch_size // (
         eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
     )
@@ -4469,11 +5198,24 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
+            if getattr(config, 'sequence_packing_scheduler', None) is not None:
+                try:
+                    packed_data_iterator, scheduled_eval_num_microbatches, _, _ = (
+                        wrap_data_iterator(data_iterator, config, eval_num_microbatches)
+                    )
+                except StopIteration:
+                    # Validation data iterator exhausted, stop evaluation early.
+                    ft_integration.on_eval_step_end()
+                    config.timers = get_timers()
+                    break
+            else:
+                packed_data_iterator = data_iterator
+                scheduled_eval_num_microbatches = eval_num_microbatches
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
+                data_iterator=packed_data_iterator,
                 model=model,
-                num_microbatches=eval_num_microbatches,
+                num_microbatches=scheduled_eval_num_microbatches,
                 seq_length=args.seq_length,
                 micro_batch_size=eval_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
@@ -4961,3 +5703,40 @@ def should_disable_forward_pre_hook(args):
         )
         and args.overlap_param_gather
     )
+
+
+def _get_thd_sequence_length_upper_bound(args):
+    """Return the padded per-sample THD length upper bound used for graph sizing."""
+    max_sequence_length = getattr(args, "seq_length", None)
+    mock_config_spec = None
+    if getattr(args, "use_varlen_dataset", False):
+        mock_config_spec = getattr(args, "varlen_mock_dataset_config_json", None)
+    elif getattr(args, "sft", False):
+        mock_config_spec = getattr(args, "sft_mock_dataset_config_json", None)
+
+    if mock_config_spec is not None:
+        from megatron.training.datasets.utils import load_json_arg
+
+        mock_config = load_json_arg(mock_config_spec)
+        if isinstance(mock_config, dict) and mock_config.get("max_seq_len") is not None:
+            max_sequence_length = int(mock_config["max_seq_len"])
+
+    if max_sequence_length is None:
+        return None
+
+    if getattr(args, "seq_length", None) is not None:
+        max_sequence_length = min(int(max_sequence_length), int(args.seq_length))
+
+    cp_size = int(getattr(args, "context_parallel_size", 1) or 1)
+    if getattr(args, "dynamic_context_parallel", False):
+        cp_pad = int(getattr(args, "data_parallel_size", 1) or 1) * cp_size * 2
+    else:
+        cp_pad = cp_size * 2 if cp_size > 1 else 1
+
+    sp_pad = (
+        int(getattr(args, "tensor_model_parallel_size", 1) or 1)
+        if getattr(args, "sequence_parallel", False)
+        else 1
+    )
+    pad_granularity = cp_pad * sp_pad
+    return int(math.ceil(max_sequence_length / pad_granularity) * pad_granularity)

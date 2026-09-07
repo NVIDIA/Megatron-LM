@@ -353,7 +353,7 @@ def test_producer_failure_is_terminal_and_preserves_ready_fifo(fake_cuda):
     loader.close()
 
 
-def test_close_does_not_raise_when_worker_is_stuck(fake_cuda, caplog):
+def test_close_raises_when_worker_is_stuck(fake_cuda):
     entered = threading.Event()
     release = threading.Event()
 
@@ -373,9 +373,9 @@ def test_close_does_not_raise_when_worker_is_stuck(fake_cuda, caplog):
     loader.start()
     assert entered.wait(timeout=1)
 
-    loader.close()
+    with pytest.raises(RuntimeError, match="worker did not stop"):
+        loader.close()
 
-    assert "worker did not stop" in caplog.text
     assert fake_cuda.producer.synchronize_calls == 0
     release.set()
     assert loader._worker is not None
