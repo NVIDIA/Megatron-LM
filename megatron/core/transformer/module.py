@@ -39,10 +39,9 @@ def is_first_microbatch_tracked(config) -> bool:
     re-arm the flag and TE call sites consult it before reading, so the two cannot drift. Its body
     is quantization-shaped only because re-arming exists to refresh TE's quantized parameter cache.
 
-    Callers must consult this before passing the flag to TE. It is not merely an optimization
-    hint: TE derives the weight-gradient accumulation mode from it --
-    ``accumulate = fuse_wgrad_accumulation and not is_first_microbatch`` -- so a stale ``True``
-    makes a wgrad GEMM OVERWRITE ``main_grad`` instead of accumulating into it.
+    Callers must consult this before passing the flag to TE. Passing a stale flag corrupts
+    gradients rather than merely missing an optimization -- see
+    ``megatron.core.extensions.transformer_engine._resolve_is_first_microbatch``.
     """
     return (
         config.fp8 is not None

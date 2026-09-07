@@ -10,7 +10,7 @@ import torch
 
 from megatron.core.context_parallel import ContextParallelBatch
 from megatron.core.enums import ModelType
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import HAVE_TE, _resolve_is_first_microbatch
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -103,7 +103,7 @@ class TestMultiTokenPredictionLayer:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
 
-    def _create_config_and_mtp_block_spec(self, tp, cp, use_te=False):
+    def _create_config_and_mtp_block_spec(self, tp, cp, use_te=False, use_repeated_layer=False):
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
         config = TransformerConfig(
             mtp_num_layers=2,
@@ -114,6 +114,7 @@ class TestMultiTokenPredictionLayer:
             tensor_model_parallel_size=tp,
             sequence_parallel=True if tp > 1 else False,
             context_parallel_size=cp,  # Enable CP for MTP testing
+            mtp_use_repeated_layer=use_repeated_layer,
         )
         if use_te:
             transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
@@ -630,33 +631,16 @@ class TestMultiTokenPredictionLayer:
     @pytest.mark.parametrize('repeated', [False, True])
     def test_repeated_layer_opts_out_of_is_first_microbatch(self, repeated):
         """A shared MTP layer must hand TE None, because its first forward is its last backward."""
-        from megatron.core.extensions.transformer_engine import _resolve_is_first_microbatch
-
         torch.manual_seed(_SEED)
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
-        config = TransformerConfig(
-            mtp_num_layers=2,
-            num_layers=4,
-            hidden_size=64,
-            num_attention_heads=8,
-            use_cpu_initialization=True,
-            mtp_use_repeated_layer=repeated,
-        )
-        mtp_block_spec = get_gpt_mtp_block_spec(
-            config=config,
-            spec=get_gpt_layer_with_transformer_engine_spec(),
-            use_transformer_engine=True,
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(
+            tp=1, cp=1, use_te=True, use_repeated_layer=repeated
         )
         mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
 
         # Quantization is what would otherwise make TE act on the flag, so ask under it.
         config.fp8 = "hybrid"
         mtp.set_is_first_microbatch()
-        te_modules = [
-            m
-            for m in mtp.modules()
-            if hasattr(m, 'is_first_microbatch') and hasattr(m, 'disable_parameter_transpose_cache')
-        ]
+        te_modules = [m for m in mtp.modules() if hasattr(m, 'is_first_microbatch')]
         assert te_modules, "expected the TE spec to produce modules carrying is_first_microbatch"
 
         if repeated:
