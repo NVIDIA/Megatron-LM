@@ -990,6 +990,7 @@ class VirtualExpertLoadBalancer:
         self.num_local_tokens = int(top_indices.shape[0])
         self.token_probs = probs
 
+    @nvtx_decorator(message="virtual_expert_plan")
     def plan_dispatch(self) -> None:
         """Plan routes and begin the weight push before shared-expert compute."""
         if self._bridge is None or self._context is None or self._plan is not None:
