@@ -31,6 +31,8 @@ from megatron.core.inference.inference_request import (
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
+from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     AsyncScheduleLogitsState,
@@ -57,6 +59,14 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
+
+
+def teardown_module(module):
+    # Some tests build inference_optimized MoE models with the default 'vllm'
+    # grouped-GEMM backend, which allocates class-level persistent intermediate
+    # buffers at context init. Release them so no GPU memory or state leaks
+    # across modules.
+    VllmFusedMoeBuffers._delete_buffers()
 
 
 class TextGenerationControllerTestBase:
@@ -285,6 +295,10 @@ def _make_async_sched_context(total_request_count=2, paused_request_count=0):
         kv_block_allocator=SimpleNamespace(enable_handoff_pinning=False),
     )
     context.is_decode_only = mock.Mock(side_effect=lambda: context.num_prefill_requests == 0)
+    # Bind the real flags so the fake exercises the production no-op-filter gate.
+    context.active_sampling_filter_flags = lambda count=None: (
+        DynamicInferenceContext.active_sampling_filter_flags(context, count)
+    )
     return context
 
 
@@ -1048,8 +1062,29 @@ def test_async_bookkeeping_retains_finished_handoff_state():
     )
 
     assert result.finished_handoff_block_ids == {11: [10, 11]}
+    assert result.finished_handoff_ssm_slots == {}
     assert result.finished_handoff_decode_tokens == {11: [99]}
     context.kv_block_allocator.retain_memory_blocks.assert_called_once_with([10, 11])
+
+
+def test_finished_hybrid_handoff_detaches_live_ssm_slot():
+    context = _make_async_sched_context(total_request_count=2)
+    context.is_hybrid_model = True
+    context.kv_block_allocator = SimpleNamespace(
+        enable_handoff_pinning=True, retain_memory_blocks=mock.Mock()
+    )
+    context.request_to_kv_block_ids = torch.tensor([[10, 11, -1], [12, 13, -1]], dtype=torch.int32)
+    context.mamba_metadata = SimpleNamespace(detach_state_slot=mock.Mock(return_value=7))
+    controller = _make_async_sched_controller(context)
+
+    blocks, ssm_slots, decode_tokens = controller._collect_finished_handoff_state(
+        torch.tensor([1]), torch.tensor([91, 92]), None
+    )
+
+    assert blocks == {11: [12, 13]}
+    assert ssm_slots == {11: 7}
+    assert decode_tokens == {11: [92]}
+    context.mamba_metadata.detach_state_slot.assert_called_once_with(1)
 
 
 @pytest.mark.parametrize(
@@ -1161,6 +1196,7 @@ def test_async_sched_step_overlap_order():
             newly_paused_request_ids=None,
             evict_request_ids=None,
             finished_handoff_block_ids={},
+            finished_handoff_ssm_slots={},
             finished_handoff_decode_tokens={},
         )
     )
@@ -1290,6 +1326,7 @@ def test_async_sched_step_yields_after_resolution_outside_inference_mode():
             newly_paused_request_ids=None,
             evict_request_ids=None,
             finished_handoff_block_ids={},
+            finished_handoff_ssm_slots={},
             finished_handoff_decode_tokens={},
         )
     )
@@ -1433,6 +1470,7 @@ def test_async_sched_no_overlap_updates_before_admission(
         newly_paused_request_ids=torch.tensor([10]),
         evict_request_ids=torch.tensor([11]),
         finished_handoff_block_ids={},
+        finished_handoff_ssm_slots={},
         finished_handoff_decode_tokens={},
     )
     input_ids = torch.empty(1, dtype=torch.int64)
@@ -1539,6 +1577,7 @@ def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
         newly_paused_request_ids=None,
         evict_request_ids=None,
         finished_handoff_block_ids={},
+        finished_handoff_ssm_slots={},
         finished_handoff_decode_tokens={},
     )
     controller._run_async_sched_sample = mock.Mock(return_value=sample_result)
@@ -1591,6 +1630,7 @@ def test_async_sched_mtp_overlap_step_order():
         newly_paused_request_ids=None,
         evict_request_ids=None,
         finished_handoff_block_ids={},
+        finished_handoff_ssm_slots={},
         finished_handoff_decode_tokens={},
     )
     input_ids = torch.empty(9, dtype=torch.int64)
@@ -1922,15 +1962,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 sampling_params=SamplingParams(top_k=2, top_p=0.4),
                 vocab_size=self.vocab_size,
             )
-        assert str(aerror.value) == 'Cannot have top-p and top-k both greater than zero'
-
-        with pytest.raises(AssertionError) as aerror:
-            self.text_generation_controller.sample_from_logits(
-                last_token_logits=None,
-                sampling_params=SamplingParams(top_p=1.4, top_k=0),
-                vocab_size=self.vocab_size,
-            )
-        assert str(aerror.value) == 'top-p should be in (0,1]'
+        assert str(aerror.value) == 'Cannot have top-p and top-k both active'
 
         with pytest.raises(AssertionError) as aerror:
             self.text_generation_controller.sample_from_logits(
@@ -1939,6 +1971,24 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
                 vocab_size=self.vocab_size,
             )
         assert str(aerror.value) == 'top-k is larger than logit size.'
+
+        # top_p >= 1.0 is a no-op filter: identity on logits, legal alongside top-k;
+        # temperature=0 sharpens toward argmax instead of dividing into inf/NaN.
+        cpu_logits = torch.randn(4, 32)
+        assert torch.equal(
+            TorchSampling.filter_logits(cpu_logits, temperature=1.0, top_k=0, top_p=1.0), cpu_logits
+        )
+        for top_k, top_p in ((4, 0.0), (0, 0.9)):
+            filtered = TorchSampling.filter_logits(
+                cpu_logits, temperature=0.0, top_k=top_k, top_p=top_p
+            )
+            kept = filtered[filtered != float('-inf')]
+            assert torch.isfinite(kept).all()
+            assert torch.equal(filtered.argmax(dim=-1), cpu_logits.argmax(dim=-1))
+        sampled = TorchSampling.sample_from_logits(
+            cpu_logits, temperature=1.0, top_k=8, top_p=1.0, generator=torch.Generator()
+        )
+        assert sampled.shape == (4,)
 
         last_token_logits = (
             torch.arange(0, self.vocab_size).repeat(self.batch_size, 1).float().cuda()
@@ -3279,13 +3329,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             return_value=torch.tensor([3, 4], device='cuda')
         )
 
-        controller_module = (
-            "megatron.core.inference.text_generation_controllers.text_generation_controller"
-        )
+        # The serial MTP path lives in the MTP mixin, so patch the SP collectives there.
+        mtp_module = "megatron.core.inference.text_generation_controllers.mtp_inference_mixin"
         with (
-            mock.patch(f"{controller_module}.gather_from_sequence_parallel_region", mock_gather),
+            mock.patch(f"{mtp_module}.gather_from_sequence_parallel_region", mock_gather),
             mock.patch(
-                f"{controller_module}.scatter_to_sequence_parallel_region",
+                f"{mtp_module}.scatter_to_sequence_parallel_region",
                 side_effect=lambda hidden, group=None: hidden[:1],
             ),
         ):

@@ -30,6 +30,7 @@ except ImportError:
     from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
 
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
+from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
 from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
@@ -42,13 +43,13 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
 )
-from megatron.core.msc_utils import maybe_msc, MultiStorageClientFeature 
+from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.post_training.modelopt.checkpointing import save_modelopt_state, save_sharded_modelopt_state
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
-from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.config import TokenizerConfig
 from megatron.training.global_vars import get_tokenizer
@@ -67,8 +68,11 @@ try:
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
         handle_experts_in_state_dict,
         handle_fp8_extra_state_case,
+        handle_mla_down_proj_in_state_dict,
+        handle_mtp_in_state_dict,
         handle_swiglu_in_state_dict,
         print_diff_in_state_dicts,
+        validate_fsdp_dtensor_model_load,
     )
 
     HAVE_MEGATRON_FSDP = True
@@ -78,8 +82,6 @@ except ImportError:
 
 # [ModelOpt]: Import
 try:
-    from modelopt.torch.opt.plugins import save_modelopt_state, save_sharded_modelopt_state
-
     from megatron.post_training.utils import print_distributed_quant_summary
 
     has_nvidia_modelopt = True
@@ -95,6 +97,22 @@ _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
 
 # Track deletion processes to prevent zombies
 _deletion_processes = []
+
+
+def _maybe_compact_rollout_bank(iteration):
+    """Compact the rollout bank without making checkpointing depend eagerly on RL."""
+    from megatron.rl.rl_utils import maybe_compact_rollout_bank
+
+    maybe_compact_rollout_bank(iteration)
+
+
+def _register_rollout_bank_compaction(async_save_request, iteration):
+    """Compact the rollout bank after an asynchronous checkpoint becomes durable."""
+
+    def rollout_bank_finalize_fn(iteration=iteration):
+        _maybe_compact_rollout_bank(iteration)
+
+    async_save_request.add_finalize_fn(rollout_bank_finalize_fn)
 
 
 def finalize_deletion_processes(blocking=False):
@@ -441,7 +459,7 @@ def get_rng_state(
     """Collect rng state across data parallel ranks.
 
     dp_group threads the data-parallel group used for RNG gather/indexing.
-    dp_cp_group threads the data-parallel (with context-parallel) group used for checkpoint replica id.
+    dp_cp_group threads the data-parallel (with context-parallel) group used for the rng shard key.
     key_prefix namespaces the rng ShardedObject key so disjoint grids avoid a key collision (default '').
     """
     args = get_args()
@@ -467,24 +485,30 @@ def get_rng_state(
     else:
         rng_state_list = [rng_state]
 
-    dp_cp_rank = (
-        get_pg_rank(dp_cp_group)
+    dp_cp_group = (
+        dp_cp_group
         if dp_cp_group is not None
-        else mpu.get_data_parallel_rank(with_context_parallel=True)
+        else mpu.get_data_parallel_group(with_context_parallel=True)
     )
+    dp_cp_rank = get_pg_rank(dp_cp_group)
     if ckpt_format == 'torch_dist':
         pp_rank = get_pg_rank(pp_group)
         pp_size = get_pg_size(pp_group)
         tp_rank = get_pg_rank(tp_group)
         tp_size = get_pg_size(tp_group)
+        # Tracker streams are seeded per rank (tensor_parallel/random.py), so an axis left out
+        # of the key becomes a replica and those ranks restore a peer's stream. ep/etp/gtp_remat
+        # do not tile the grid; pp x tp x dp_cp does.
+        dp_cp_size = get_pg_size(dp_cp_group)
         rng_state_list = ShardedObject(
             f'{key_prefix}rng_state',
             rng_state_list,
-            (pp_size, tp_size),
-            (pp_rank, tp_rank),
-            replica_id=dp_cp_rank,
+            (pp_size, tp_size, dp_cp_size),
+            (pp_rank, tp_rank, dp_cp_rank),
         )
     elif ckpt_format == 'fsdp_dtensor':
+        # TODO: this key omits dp_cp, so dp_cp peers become replicas and restore each other's
+        # tracker streams. Fixing it also needs the matching lookup in load_checkpoint.
         pp_rank = get_pg_rank(pp_group)
         tp_rank = get_pg_rank(tp_group)
         rng_state_list = {f'({pp_rank}, {tp_rank})': rng_state_list}
@@ -1209,6 +1233,14 @@ def save_checkpoint(
                 finalize_fns=logits_finalize_fns,
             )
 
+        if (
+            getattr(args, "rl_durable_rollout_bank", False)
+            and async_save_request is not None
+            and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+        ):
+            # Compact the bank once this async checkpoint becomes durable, so the
+            # bank's compacted-through T tracks the model checkpoint. Rank-0 only.
+            _register_rollout_bank_compaction(async_save_request, iteration)
         if async_save_request is not None:
             schedule_async_save(async_save_request)
         if logits_saver is not None:
@@ -1226,6 +1258,13 @@ def save_checkpoint(
         # before returning from this function.
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
+
+        # Durable rollout bank: compact at the checkpoint boundary so the bank's
+        # compacted-through T tracks this (now durable) checkpoint. Only on sync
+        # saves; async saves compact in their durability finalize callback above.
+        # Rank-0 no-op otherwise.
+        if getattr(args, "rl_durable_rollout_bank", False):
+            _maybe_compact_rollout_bank(iteration)
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)
 
@@ -1697,18 +1736,26 @@ def _localize_redundant_extra_states(state_dict):
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict['model'])
-    if args.swiglu:
+
+    def apply(handler):
+        """Run a state dict handler over the model and, when present, the optimizer state."""
+        model_state_dict, optimizer_state_dict = handler(
+            model, state_dict['model'], state_dict.get('optimizer')
+        )
+        state_dict['model'] = model_state_dict
         if 'optimizer' in state_dict:
-            model_state_dict, optimizer_state_dict = handle_swiglu_in_state_dict(
-                model, state_dict['model'], state_dict['optimizer']
-            )
-            state_dict['model'] = model_state_dict
             state_dict['optimizer'] = optimizer_state_dict
-        else:
-            model_state_dict, _ = handle_swiglu_in_state_dict(model, state_dict['model'], None)
-            state_dict['model'] = model_state_dict
+
+    if args.swiglu:
+        apply(handle_swiglu_in_state_dict)
+    # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
+    # layout used on disk. No-op for unfused models.
+    apply(handle_mla_down_proj_in_state_dict)
     if args.num_experts:
         state_dict['model'] = handle_experts_in_state_dict(state_dict['model'], args.num_experts)
+    # Rename the MTP inner layer to the name used on disk. Runs last because the handlers
+    # above resolve keys against live module paths, which still use the new name.
+    apply(handle_mtp_in_state_dict)
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     return state_dict
@@ -2128,6 +2175,16 @@ def _load_base_checkpoint(
 
             _time.sleep(rank * 0.001)  # Make that logs of different ranks do not overlap
             print_diff_in_state_dicts(state_dict_metadata, state_dict)
+            # A partial load silently skips model weights the checkpoint does not have,
+            # leaving them at their initialized values. Report that, unless this is a
+            # fine-tune where loading only part of the model is the intent.
+            if not getattr(args, 'finetune', False):
+                validate_fsdp_dtensor_model_load(
+                    state_dict_metadata,
+                    state_dict,
+                    checkpoint_name,
+                    strict=args.dist_ckpt_strictness,
+                )
 
         planner = default_planner.DefaultLoadPlanner(allow_partial_load=allow_partial_load)
         torch.distributed.checkpoint.load_state_dict(
@@ -2288,6 +2345,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
 
     # MoE latent projection.
     _set_arg('moe_latent_size', force=True)
+    _set_arg('moe_use_norm_before_up_proj', force=True)
 
     # Tokenizer args.
     if args.use_tokenizer_model_from_checkpoint_args:
@@ -2326,13 +2384,22 @@ def _maybe_setup_gpt_to_hybrid_load(args, ckpt_args, model):
     """
     from megatron.core.dist_checkpointing.gpt_checkpoint_interop import gpt_compatible_layer_maps
     from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.models.mimo.model.base import MimoModel
 
     def _contains_hybrid_model(module):
         # Megatron-FSDP and Float16Module both retain the wrapped module under
         # ``module`` but are intentionally not handled by the regular
-        # ``unwrap_model`` helper.
+        # ``unwrap_model`` helper. Multimodal wrappers (e.g. LLaVAModel) attach
+        # the language model under ``language_model`` instead.
         while module is not None:
             if isinstance(module, HybridModel):
+                return True
+            if isinstance(module, MimoModel):
+                language_module = module.mimo_config.language_model_spec.module
+                if isinstance(language_module, type) and issubclass(language_module, HybridModel):
+                    return True
+            inner = getattr(module, 'language_model', None)
+            if inner is not None and isinstance(inner, HybridModel):
                 return True
             module = getattr(module, 'module', None)
         return False
@@ -2516,8 +2583,11 @@ def load_checkpoint(
         )
 
         # Determine if RNG state will be loaded
+        # world_size must match too: the rng shard key includes dp_cp, so a DP rescale leaves this
+        # rank with no shard to load.
         if (
             ckpt_tp_pp == run_tp_pp
+            and ckpt_world_size == run_world_size
             and not release
             and not args.finetune
             and not args.no_load_rng
@@ -2539,6 +2609,8 @@ def load_checkpoint(
             gen_sd_rng_state = None
             if ckpt_tp_pp != run_tp_pp:
                 print_rank_0('{}: RNG state will be ignored'.format(mismatch_msg))
+            elif ckpt_world_size != run_world_size:
+                print_rank_0('Job sharding has changed: RNG state will be ignored')
 
         if ckpt_type == CheckpointType.LOCAL:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
@@ -2948,6 +3020,47 @@ def load_checkpoint(
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
                     opt_param_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
+
+            # Optimizer state dict can overwrite per-group max_lr/min_lr values.
+            # If scheduler override is requested, re-apply runtime lr bounds from
+            # args so scheduler math does not stay pinned to checkpoint lr settings.
+            if getattr(args, "override_opt_param_scheduler", False):
+                if (
+                    optimizer is None
+                    or getattr(optimizer, "is_stub_optimizer", False)
+                    or opt_param_scheduler is None
+                ):
+                    print_rank_0(
+                        " > WARNING: --override-opt-param-scheduler is set, but optimizer or "
+                        "opt_param_scheduler is not available; skipping override of scheduler "
+                        "and optimizer param_group max_lr/min_lr."
+                    )
+                else:
+                    for param_group in optimizer.param_groups:
+                        if param_group.get("is_decoupled_lr", False):
+                            max_lr = getattr(args, "decoupled_lr", None)
+                            min_lr = getattr(args, "decoupled_min_lr", None)
+                        else:
+                            max_lr = args.lr
+                            min_lr = args.min_lr
+                        if max_lr is not None:
+                            param_group["max_lr"] = max_lr
+                        if min_lr is not None:
+                            param_group["min_lr"] = min_lr
+                    # Synchronize scheduler num_steps with consumed_train_samples
+                    # to ensure lr calculation is based on current training progress
+                    if opt_param_scheduler.num_steps != args.consumed_train_samples:
+                        print_rank_0(
+                            f" > WARNING: scheduler num_steps ({opt_param_scheduler.num_steps}) "
+                            f"differs from consumed_train_samples ({args.consumed_train_samples}). "
+                            f"Resetting scheduler num_steps to match consumed_train_samples."
+                        )
+                        opt_param_scheduler.num_steps = args.consumed_train_samples
+                    opt_param_scheduler.step(increment=0)
+                    print_rank_0(
+                        " > restored optimizer param_group max_lr/min_lr from runtime config "
+                        "because --override-opt-param-scheduler is set"
+                    )
         except KeyError as e:
             print_rank_0(
                 'Unable to load optimizer from checkpoint {}. '
@@ -3109,51 +3222,3 @@ def _to_dtensor(wrapped_model, model_state_dict):
             new_model_sd[k] = torch.distributed.tensor.distribute_tensor(v, device_mesh)
 
     return new_model_sd
-
-
-def load_biencoder_checkpoint(
-    model, only_query_model=False, only_context_model=False, custom_load_path=None
-):
-    """
-    selectively load retrieval models for indexing/retrieving
-    from saved checkpoints
-    """
-
-    args = get_args()
-
-    model = unwrap_model(model)
-
-    load_path = custom_load_path if custom_load_path is not None else args.load
-
-    tracker_filename = get_checkpoint_tracker_filename(load_path)
-
-    with maybe_msc.open(tracker_filename, 'r') as f:
-        iteration = int(f.read().strip())
-
-    checkpoint_name = get_checkpoint_name(
-        load_path, iteration, args.use_distributed_optimizer, release=False
-    )
-
-    if mpu.get_data_parallel_rank() == 0:
-        print(
-            'global rank {} is loading checkpoint {}'.format(
-                torch.distributed.get_rank(), checkpoint_name
-            )
-        )
-
-    state_dict = torch.load(checkpoint_name, map_location='cpu')
-    ret_state_dict = state_dict['model']
-
-    if only_query_model:
-        ret_state_dict.pop('context_model')
-    if only_context_model:
-        ret_state_dict.pop('query_model')
-
-    assert len(model) == 1
-    model[0].load_state_dict(ret_state_dict)
-    torch.distributed.barrier()
-
-    if mpu.get_data_parallel_rank() == 0:
-        print(' successfully loaded {}'.format(checkpoint_name))
-
-    return model

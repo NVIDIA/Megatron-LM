@@ -68,6 +68,7 @@ class GDPContextParallel:
         A_log_cp1: The A_log parameter for cp_size=1.
         D_cp1: The D parameter for cp_size=1 (can be None).
         D_has_hdim: Whether D is sized to the hidden dimension.
+        sequence_is_contiguous: Whether CP ranks already hold contiguous causal intervals.
     """
 
     def __init__(
@@ -84,6 +85,7 @@ class GDPContextParallel:
         A_log_cp1: torch.Tensor,
         D_cp1: torch.Tensor,
         D_has_hdim: bool,
+        sequence_is_contiguous: bool = False,
     ) -> None:
         if not HAVE_EINOPS:
             raise ImportError("einops is required but cannot be imported")
@@ -100,6 +102,7 @@ class GDPContextParallel:
         self.A_log_cp1 = A_log_cp1
         self.D_cp1 = D_cp1
         self.D_has_hdim = D_has_hdim
+        self.sequence_is_contiguous = sequence_is_contiguous
 
         self.cp_size = self.cp_group.size()
 
@@ -221,7 +224,8 @@ class GDPContextParallel:
         a = _all_to_all_cp2hp(a, self.cp_group)
 
         output = torch.cat([z, V, K, Q, b_proj, a], dim=-1)
-        output = _undo_attention_load_balancing(output, self.cp_size, packed_seq_params)
+        if not self.sequence_is_contiguous:
+            output = _undo_attention_load_balancing(output, self.cp_size, packed_seq_params)
 
         return output
 
@@ -231,11 +235,9 @@ class GDPContextParallel:
         """Method to be applied after the conv + SSM (on y and z, which have no M dim)."""
         if self.cp_size == 1:
             return input_
-        else:
-            return _all_to_all_hp2cp(
-                _redo_attention_load_balancing(input_, self.cp_size, packed_seq_params),
-                self.cp_group,
-            )
+        if not self.sequence_is_contiguous:
+            input_ = _redo_attention_load_balancing(input_, self.cp_size, packed_seq_params)
+        return _all_to_all_hp2cp(input_, self.cp_group)
 
     def conv1d(self, input_: torch.Tensor) -> torch.Tensor:
         """Performs conv1d using sliced weights for the current CP rank."""

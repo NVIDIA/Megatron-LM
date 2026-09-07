@@ -86,7 +86,9 @@ class ModalitySubmodules(ABC, nn.Module):
                 hasattr(self.pg_collection, 'dp_cp') and self.pg_collection.dp_cp is not None
             ), "pg_collection is missing dp_cp group"
             metadata = dict(metadata) if metadata else {}
-            metadata['dp_cp_group'] = self.pg_collection.dp_cp
+            metadata['dp_cp_group'] = (
+                getattr(self.pg_collection, 'dp_cp_gtp_remat', None) or self.pg_collection.dp_cp
+            )
 
         sharded_sd = {}
         for name, container in self.named_children():

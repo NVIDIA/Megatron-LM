@@ -972,9 +972,9 @@ def compute_routing_scores_for_aux_loss(
         score_function (str): The score function to use. Can be "softmax", "sigmoid"
                               or "sqrtsoftplus".
         fused (bool, optional): Whether to use the fused version. Defaults to False.
-        padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                               Shape in [num_tokens]. True for valid tokens,
-                                               False for padding tokens. Defaults to None.
+        padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                               Shape [num_tokens]. True = padding (exclude),
+                                               False = valid (include). Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The routing map and the normalized routing scores.
@@ -1170,6 +1170,7 @@ def track_moe_metrics(
     force_initialize: bool = False,
     track_names: Optional[List[str]] = None,
     num_layers: Optional[int] = None,
+    num_moe_layers: Optional[int] = None,
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
     mtp_num_layers: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
@@ -1187,6 +1188,7 @@ def track_moe_metrics(
         force_initialize=force_initialize,
         track_names=track_names,
         num_layers=num_layers,
+        num_moe_layers=num_moe_layers,
         moe_layer_freq=moe_layer_freq,
         mtp_num_layers=mtp_num_layers,
         pg_collection=pg_collection,

@@ -4,7 +4,7 @@
 # Forked from `fla/ops/gated_delta_rule/wy_fast.py` in flash-linear-attention v0.5.1
 # (https://github.com/fla-org/flash-linear-attention).
 #
-# Licensed under the MIT license; see the LICENSE file in this directory.
+# Licensed under the MIT license; see the LICENSE file in the repository root.
 
 """Recompute the `w` and `u` factors of the WY representation.
 
@@ -14,6 +14,8 @@ and `w`, the effective keys carrying the decay.
 """
 
 import torch
+
+from megatron.core.ssm.ops.common.determinism import autotune_configs
 
 from .common import HAVE_TRITON, exp2, prepare_chunk_indices, tl, triton
 
@@ -25,11 +27,13 @@ from .common import HAVE_TRITON, exp2, prepare_chunk_indices, tl, triton
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=autotune_configs(
+        [
+            triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in [2, 4, 8]
+            for num_stages in [2, 3, 4]
+        ]
+    ),
     key=['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
 )
 @triton.jit(do_not_specialize=['T'])

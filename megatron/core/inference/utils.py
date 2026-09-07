@@ -26,6 +26,7 @@ class InferenceMode:
     """
 
     _is_active: bool = False
+    _use_bounded_mxfp8_rows: bool = False
 
     @classmethod
     def is_active(cls) -> bool:
@@ -34,13 +35,25 @@ class InferenceMode:
 
     @classmethod
     def set_active(cls) -> None:
-        """Mark the inference engine as active. Idempotent."""
+        """Mark the inference engine active and reset its phase to the safe default."""
         cls._is_active = True
+        cls._use_bounded_mxfp8_rows = False
+
+    @classmethod
+    def set_bounded_mxfp8_rows(cls, enabled: bool) -> None:
+        """Select bounded FlashInfer MXFP8 rows for the current inference step."""
+        cls._use_bounded_mxfp8_rows = enabled
+
+    @classmethod
+    def use_bounded_mxfp8_rows(cls) -> bool:
+        """Return whether the current step may use the configured bounded row prefix."""
+        return cls._use_bounded_mxfp8_rows
 
     @classmethod
     def unset_active(cls) -> None:
         """Mark the inference engine as inactive. Idempotent."""
         cls._is_active = False
+        cls._use_bounded_mxfp8_rows = False
 
     @classmethod
     @contextlib.contextmanager

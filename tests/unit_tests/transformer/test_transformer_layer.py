@@ -44,9 +44,8 @@ from tests.unit_tests.test_utilities import Utils
 def _make_mhc_layer_spec(**kwargs):
     """Build a layer spec with HyperConnectionModule submodules.
 
-    The ``enable_hyper_connection`` kwarg on ``gpt_layer_specs`` is added by
-    the GPT-wiring follow-up split, so this helper patches the mHC submodules
-    directly to keep the unit tests self-contained for this split.
+    This helper patches the mHC submodules directly so these layer tests do not
+    depend on GPT-spec wiring.
     """
     from megatron.core.transformer.hyper_connection import HyperConnectionModule
 
@@ -959,14 +958,14 @@ class TestMHCWithCudaGraph:
         )
 
     def test_cuda_graph_fwd_bwd_with_hyper_connection(self):
-        """End-to-end CUDA graph capture and replay for forward+backward with mHC.
+        """End-to-end CUDA graph capture and replay for fused mHC.
 
         Captures both the forward and backward pass of HyperConnectionTransformerLayer
         into a torch.cuda.CUDAGraph and replays it with fresh input data, verifying
-        that the computation graph is fully static (capturable) and produces correct
-        output shapes and non-trivial gradients.
+        that the configuration-bound backend policy is capturable and produces
+        correct output shapes and non-trivial gradients.
         """
-        layer, config = self._create_mhc_layer()
+        layer, config = self._create_mhc_layer(use_fused_mhc=True)
         layer.train()
 
         seq_len = 8
