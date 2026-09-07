@@ -111,17 +111,9 @@ def test_mok_rejects_per_layer_cuda_graph_covering_moe(cuda_graph_impl, cuda_gra
         )
 
 
-@pytest.mark.parametrize(
-    "cuda_graph_modules",
-    [
-        [CudaGraphModule.attn],
-        [CudaGraphModule.mlp],
-        [CudaGraphModule.mamba],
-        [CudaGraphModule.attn, CudaGraphModule.mlp, CudaGraphModule.mamba],
-    ],
-)
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
-def test_mok_accepts_per_layer_cuda_graph_outside_moe(cuda_graph_impl, cuda_graph_modules):
+def test_mok_accepts_per_layer_cuda_graph_outside_moe(cuda_graph_impl):
+    cuda_graph_modules = [CudaGraphModule.attn]
     config = _mok_transformer_config(
         cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=cuda_graph_modules
     )

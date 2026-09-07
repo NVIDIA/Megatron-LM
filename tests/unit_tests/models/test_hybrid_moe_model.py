@@ -214,6 +214,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_latent_up_projection_rmsnorm": False,
     "moe_layer_freq": 1,
     "moe_layer_recompute": False,
+    "moe_megakernel_backend": None,
+    "moe_megakernel_backend_config": None,
     "moe_n_hash_layers": 0,
     "moe_ncclep_static_shape": False,
     "moe_ncclep_use_symm_mem": False,
