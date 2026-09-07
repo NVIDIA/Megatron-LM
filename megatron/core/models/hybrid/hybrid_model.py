@@ -335,6 +335,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             pre_process=self.pre_process,
             layer_type_list=layer_type_list,
             pp_layer_offset=layer_offset,
+            vp_stage=vp_stage,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
@@ -590,17 +591,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             padding_mask=padding_mask,
             **decoder_extra_block_kwargs,
         )
-        # HybridStack.forward returns a single Tensor in the common case, but a 2-tuple
-        # (hidden_states, mhc_multistream) in exactly one case: enable_hyper_connections and
-        # post_process and mtp_num_layers > 0 and not is_mtp_layer — where MTP's mHC branch
-        # needs the pre-contraction multi-stream tensor for `_concat_embeddings`. Any other
-        # tuple return would be misinterpreted here, so keep that contract in sync with
-        # HybridStack.forward (see hybrid_block.py).
+        # With MTP the outer HybridStack may return one auxiliary value: mHC's
+        # pre-contraction multi-stream tensor or AttnRes's complete trunk source
+        # tuple. The modes are mutually exclusive, so disambiguate by config.
+        mhc_multistream = None
+        attn_res_sources = None
         if isinstance(decoder_output, tuple):
-            hidden_states, mhc_multistream = decoder_output
+            if self.config.enable_attention_residuals:
+                hidden_states, attn_res_sources = decoder_output
+            else:
+                hidden_states, mhc_multistream = decoder_output
         else:
             hidden_states = decoder_output
-            mhc_multistream = None
 
         output_weight = None
         if self.share_embeddings_and_output_weights:
@@ -649,6 +651,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 mhc_multistream=mhc_multistream,
+                attn_res_sources=attn_res_sources,
                 attention_mask=attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
