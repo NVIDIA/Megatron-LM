@@ -469,14 +469,11 @@ class TestMcoreAdapterCudaGraph:
             hidden_dropout=0.0,
         )
         graph_config = replace(eager_config, cuda_graph_impl="full_iteration")
-        initial_model = _build_block(eager_config)
-        initial_state = initial_model.state_dict()
 
         def build_model_and_optimizer(
             config: TransformerConfig, enable_cuda_graph: bool
         ) -> tuple[torch.nn.Module, FullyShardedOptimizer]:
             model = _build_block(config)
-            model.load_state_dict(initial_state)
             model = FullyShardedDataParallel(
                 config=config,
                 ddp_config=DistributedDataParallelConfig(
@@ -543,7 +540,6 @@ class TestMcoreAdapterCudaGraph:
         def run(model, optimizer, forward_backward) -> torch.Tensor:
             losses = []
             for microbatches in steps:
-                model.zero_grad_buffer()
                 optimizer.zero_grad(set_to_none=True)
                 microbatch_losses = forward_backward(
                     model=[model],
@@ -561,11 +557,12 @@ class TestMcoreAdapterCudaGraph:
         eager_model, eager_optimizer = build_model_and_optimizer(
             eager_config, enable_cuda_graph=False
         )
-        eager_losses = run(eager_model, eager_optimizer, forward_backward)
-
         graph_model, graph_optimizer = build_model_and_optimizer(
             graph_config, enable_cuda_graph=True
         )
+        graph_model.load_state_dict(eager_model.state_dict())
+
+        eager_losses = run(eager_model, eager_optimizer, forward_backward)
         cuda_graph_forward_backward = FullCudaGraphWrapper(
             forward_backward, cuda_graph_warmup_steps=1
         )
