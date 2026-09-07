@@ -1,0 +1,146 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""The non-consuming peek of a GTP weight's gathered buffer.
+
+The virtual-expert weight push needs a weight's gathered bytes before the GEMM that consumes it
+(see ``GTPShardedParam._peek_gathered_weight``). A peek must hand out the very buffer the
+consume hands out afterwards, must leave the prefetch chain's bookkeeping as the consume expects
+it, and must not make the consume gather again, at a chain head or in the middle of the chain.
+
+Run with::
+
+    python -m torch.distributed.run --nproc-per-node 4 -m pytest -q \
+        tests/unit_tests/generalized_tensor_parallel/test_gtp_peek.py
+"""
+
+import pytest
+import torch
+import torch.distributed as dist
+
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+if not HAVE_GTP:
+    pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
+
+from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
+from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTPShardedParam
+from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
+    _run_distributed,
+    _torchrun_dist_init,
+    reset_fp8_state,
+    reset_gtp_globals,
+)
+from tests.unit_tests.generalized_tensor_parallel.test_gtp_grad_correctness import (
+    BATCH,
+    HIDDEN,
+    SEQ,
+    _make_config,
+    _make_stack,
+    dtype,
+)
+
+
+def _chain(stack):
+    """The stack's GTP weights in prefetch-chain order, head first."""
+    params = [p for p in stack.parameters() if isinstance(p, GTPShardedParam)]
+    (head,) = [p for p in params if p.prev_w is None and p.next_w is not None]
+    chain, p = [], head
+    while p is not None:
+        chain.append(p)
+        p = p.next_w
+    assert len(chain) == len(params)
+    return chain
+
+
+def _full_weight(p):
+    """All-gather the shard over its GTP group: the unpadded, unsharded weight."""
+    shards = [torch.empty_like(p.data) for _ in range(p.group.size())]
+    dist.all_gather(shards, p.data, group=p.group)
+    full = torch.cat(shards, dim=0)
+    return full[: full.shape[0] - p.pad_length] if p.pad_length else full
+
+
+def _assert_clean(p):
+    """No in-flight gather and no stale hand-off marker after a consume."""
+    assert p._prefetch_handle is None
+    assert not getattr(p, "_already_ag_drained", False)
+
+
+def _check_peek_then_consume(p, fwd):
+    peeked = p.peek_group_for_forward() if fwd else p.peek_group_for_backward()
+    consumed = p.materialize_group_for_forward() if fwd else p.materialize_group_for_backward()
+    assert peeked.data_ptr() == consumed.data_ptr(), "the consume must hand out the peeked buffer"
+    torch.testing.assert_close(peeked, _full_weight(p), rtol=0, atol=0)
+    _assert_clean(p)
+
+
+def _worker(rank, world_size, port):
+    from megatron.core import parallel_state as ps
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    model_parallel_cuda_manual_seed(42)
+    pgc = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp', 'gtp_remat'])
+    stack = _make_stack(_make_config(), pgc)
+    for layer in stack:
+        layer.cuda()
+    gtp.tag_gtp_params_with_names(stack)
+
+    try:
+        # One real forward builds the chain links (in consume order) and leaves no prefetch in
+        # flight: a first-iteration consume has no successor to prefetch yet.
+        with torch.no_grad():
+            out = torch.randn(SEQ, BATCH, HIDDEN, dtype=dtype, device="cuda")
+            for layer in stack:
+                out, _ = layer(out, attention_mask=None)
+        torch.cuda.synchronize()
+        chain = _chain(stack)
+        assert len(chain) >= 2
+        for p in chain:
+            _assert_clean(p)
+
+        # Count the collectives each weight issues: the peek must not add gathers on top of the
+        # chain's own (one per weight per direction).
+        gathers = {id(p): 0 for p in chain}
+        original = GTPShardedParam._all_gather_weight
+
+        def counting(self, *args, **kwargs):
+            gathers[id(self)] += 1
+            return original(self, *args, **kwargs)
+
+        GTPShardedParam._all_gather_weight = counting
+        try:
+            # Forward: the head has no predecessor, so its peek issues the gather itself; every
+            # other weight's peek drains the prefetch its predecessor issued at the consume.
+            for p in chain:
+                _check_peek_then_consume(p, fwd=True)
+            assert all(gathers[id(p)] == 1 for p in chain), gathers
+            # MTP replays a block, so a weight can be consumed twice per forward: the second peek
+            # has no prefetch and gathers on its own, once.
+            _check_peek_then_consume(chain[-1], fwd=True)
+            assert gathers[id(chain[-1])] == 2
+            # Backward walks the chain in reverse; the tail is the chain head there.
+            for p in reversed(chain):
+                _check_peek_then_consume(p, fwd=False)
+            assert all(gathers[id(p)] == (3 if p is chain[-1] else 2) for p in chain), gathers
+            # A consume without a peek still works (the plain GTP path).
+            for p in chain:
+                p.materialize_group_for_forward()
+                _assert_clean(p)
+            for p in reversed(chain):
+                p.materialize_group_for_backward()
+                _assert_clean(p)
+        finally:
+            GTPShardedParam._all_gather_weight = original
+        torch.cuda.synchronize()
+    finally:
+        ps.destroy_model_parallel()
+        GTPShardedParam._chain_state = {}
+
+
+def test_peek_hands_out_the_buffer_the_consume_hands_out():
+    _run_distributed(_worker, 4)
