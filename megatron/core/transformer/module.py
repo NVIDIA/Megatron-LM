@@ -52,6 +52,25 @@ def is_first_microbatch_tracked(config) -> bool:
     )
 
 
+def mark_is_first_microbatch_unsafe(module: torch.nn.Module) -> None:
+    """Mark a subtree as one whose ``is_first_microbatch`` flag must never be acted on.
+
+    The flag is armed before a module's *first* forward of an iteration and cleared by that
+    forward, which only means "this backward may overwrite ``main_grad``" when the module runs
+    exactly once per forward pass. A module invoked several times per pass -- an MTP block
+    sharing one layer across depths under ``--mtp-use-repeated-layer`` -- has its first forward
+    paired with its *last* backward, so the ``True`` invocation lands last and its wgrad GEMM
+    overwrites the gradients the other depths already accumulated.
+
+    Marked modules pass ``None`` to TE rather than ``False``. Both accumulate, but ``False`` also
+    tells TE to reuse its cached quantized weights, which would go stale across optimizer steps
+    now that nothing ever re-arms the flag; ``None`` re-quantizes on every call instead.
+    """
+    for m in module.modules():
+        if hasattr(m, "is_first_microbatch"):
+            m.is_first_microbatch_unsafe = True
+
+
 class MegatronModule(torch.nn.Module):
     """Base Megatron module inhertied by all Models.
 

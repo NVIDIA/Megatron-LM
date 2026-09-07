@@ -626,6 +626,46 @@ class TestMultiTokenPredictionLayer:
         elif tp == 4:
             assert num_weights == 15216 * config.mtp_num_layers
 
+    @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+    @pytest.mark.parametrize('repeated', [False, True])
+    def test_repeated_layer_opts_out_of_is_first_microbatch(self, repeated):
+        """A shared MTP layer must hand TE None, because its first forward is its last backward."""
+        from megatron.core.extensions.transformer_engine import _resolve_is_first_microbatch
+
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            mtp_use_repeated_layer=repeated,
+        )
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config,
+            spec=get_gpt_layer_with_transformer_engine_spec(),
+            use_transformer_engine=True,
+        )
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+
+        # Quantization is what would otherwise make TE act on the flag, so ask under it.
+        config.fp8 = "hybrid"
+        mtp.set_is_first_microbatch()
+        te_modules = [
+            m
+            for m in mtp.modules()
+            if hasattr(m, 'is_first_microbatch') and hasattr(m, 'disable_parameter_transpose_cache')
+        ]
+        assert te_modules, "expected the TE spec to produce modules carrying is_first_microbatch"
+
+        if repeated:
+            assert len(mtp.layers) == 1
+            assert all(_resolve_is_first_microbatch(m) is None for m in te_modules)
+        else:
+            assert len(mtp.layers) == config.mtp_num_layers
+            assert all(_resolve_is_first_microbatch(m) is True for m in te_modules)
+
     def test_get_embeddings_rolls_padding_mask(self):
         """Test that _get_embeddings rolls padding_mask alongside input ids."""
         torch.manual_seed(_SEED)

@@ -4,7 +4,12 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.module import Float16Module, MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.module import (
+    Float16Module,
+    MegatronModule,
+    mark_is_first_microbatch_unsafe,
+    mark_keep_in_fp32,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -114,6 +119,25 @@ class TestSetIsFirstMicrobatch:
 
         module.set_is_first_microbatch()
         assert module.child.is_first_microbatch is False
+
+    def test_mark_unsafe_tags_only_flag_carrying_submodules(self):
+        # The marker rides on the modules TE actually reads the flag from, not the whole tree.
+        module = self._build_module(quant_recipe=object())
+        assert getattr(module.child, 'is_first_microbatch_unsafe', False) is False
+
+        mark_is_first_microbatch_unsafe(module)
+        assert module.child.is_first_microbatch_unsafe is True
+        assert not hasattr(module, 'is_first_microbatch_unsafe')
+
+    def test_mark_unsafe_does_not_stop_the_flag_being_re_armed(self):
+        # Marking changes what TE is handed, not the bookkeeping; the two stay independent so a
+        # marked module still reports the same state as its unmarked siblings.
+        module = self._build_module(quant_recipe=object())
+        mark_is_first_microbatch_unsafe(module)
+
+        module.set_is_first_microbatch()
+        assert module.child.is_first_microbatch is True
+        assert module.child.is_first_microbatch_unsafe is True
 
 
 class TestFloat16Module:
