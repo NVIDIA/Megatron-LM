@@ -3,6 +3,7 @@
 """Tests for the internal GDR backend adapter."""
 
 import ast
+import bisect
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -73,19 +74,31 @@ def test_cutedsl_cp_context_metadata_rebind_invalidates_memos():
     context = SimpleNamespace(
         _cutedsl_chain_memo={(0, 64): "fused"}, _cutedsl_window_memo={(0, True): (0, 64)}
     )
-    prepare_cp_context_metadata(context, global_num_sequences=1)
+    global_cu_seqlens = torch.tensor([0, 128, 256], dtype=torch.int32)
+    prepare_cp_context_metadata(context, global_cu_seqlens=global_cu_seqlens)
     first_generation = context._cutedsl_metadata_generation
 
     assert context._cutedsl_chain_memo == {}
     assert context._cutedsl_window_memo == {}
-    assert context.global_num_seqs == 1
+    assert context.global_num_seqs == 2
+    assert context.global_cu_seqlens_cpu.dtype == torch.long
+    torch.testing.assert_close(
+        context.global_cu_seqlens_cpu, torch.tensor([0, 128, 256], dtype=torch.long)
+    )
+
+    global_cu_seqlens[1] = 64
+    torch.testing.assert_close(
+        context.global_cu_seqlens_cpu, torch.tensor([0, 128, 256], dtype=torch.long)
+    )
 
     context._cutedsl_chain_memo[(first_generation, 64)] = "fused"
-    prepare_cp_context_metadata(context, global_num_sequences=1)
+    prepare_cp_context_metadata(
+        context, global_cu_seqlens=torch.tensor([0, 128, 256], dtype=torch.long)
+    )
     assert context._cutedsl_metadata_generation == first_generation
     assert context._cutedsl_chain_memo == {(first_generation, 64): "fused"}
 
-    prepare_cp_context_metadata(context, global_num_sequences=2)
+    prepare_cp_context_metadata(context, global_cu_seqlens=torch.tensor([0, 64, 256]))
 
     assert context._cutedsl_metadata_generation == first_generation + 1
     assert context.global_num_seqs == 2
@@ -132,6 +145,94 @@ def test_cutedsl_cp_chain_without_host_offsets_only_accepts_single_full_chain():
         )
         is None
     )
+
+
+def _offsets_from_lengths(lengths):
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    return offsets
+
+
+def _cp_context_for_rank(lengths, world_size, rank):
+    offsets = _offsets_from_lengths(lengths)
+    total = offsets[-1]
+    part = total // world_size
+    rank_start = part * rank
+    rank_end = rank_start + part
+
+    start_seq_idx = bisect.bisect_right(offsets[1:], rank_start)
+    end_seq_idx = bisect.bisect_left(offsets[:-1], rank_end)
+    local_offsets = [
+        min(max(offset, rank_start), rank_end) - rank_start
+        for offset in offsets[start_seq_idx : end_seq_idx + 1]
+    ]
+    local_offsets = [
+        offset
+        for idx, offset in enumerate(local_offsets)
+        if idx == 0 or offset != local_offsets[idx - 1]
+    ]
+    return SimpleNamespace(
+        cu_seqlens_cpu=torch.tensor(local_offsets, dtype=torch.int32),
+        global_num_seqs=len(lengths),
+        global_cu_seqlens_cpu=torch.tensor(offsets, dtype=torch.long),
+        pre_num_ranks=rank - offsets[start_seq_idx] // part,
+        post_num_ranks=(offsets[end_seq_idx] - 1) // part - rank,
+    )
+
+
+@pytest.mark.parametrize(
+    "lengths, expected_chains, expected_mode",
+    [
+        ([32768, 32768], [(0, 1), (1, 0), (0, 1), (1, 0)], "fused"),
+        ([16384, 16384, 16384, 16384], [(0, 0)] * 4, "noop"),
+        ([20480, 24576, 20480], [(0, 1), (1, 1), (1, 1), (1, 0)], "fused"),
+    ],
+)
+def test_cutedsl_cp_chain_with_global_offsets_accepts_packed_layouts(
+    lengths, expected_chains, expected_mode
+):
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_cp_cute import (
+        backend as cp_backend,
+    )
+
+    world_size = 4
+    local_t = sum(lengths) // world_size
+    global_offsets = torch.tensor(_offsets_from_lengths(lengths), dtype=torch.long)
+    assert cp_backend._rank_chains(global_offsets, world_size) == expected_chains
+
+    for rank in range(world_size):
+        context = _cp_context_for_rank(lengths, world_size, rank)
+        assert (context.pre_num_ranks, context.post_num_ranks) == expected_chains[rank]
+        assert (
+            cp_backend._classify_chain(
+                context=context,
+                cu_seqlens=context.cu_seqlens_cpu,
+                T=local_t,
+                rank=rank,
+                world_size=world_size,
+            )
+            == expected_mode
+        )
+
+
+def test_cutedsl_cp_context_metadata_trims_trailing_fixed_capacity_offsets():
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import prepare_cp_context_metadata
+
+    context = SimpleNamespace()
+    prepare_cp_context_metadata(
+        context, global_cu_seqlens=torch.tensor([0, 64, 128, 128, 128], dtype=torch.int32)
+    )
+
+    assert context.global_num_seqs == 2
+    torch.testing.assert_close(
+        context.global_cu_seqlens_cpu, torch.tensor([0, 64, 128], dtype=torch.long)
+    )
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        prepare_cp_context_metadata(
+            SimpleNamespace(), global_cu_seqlens=torch.tensor([0, 64, 64, 128])
+        )
 
 
 def test_cutedsl_cp_wrapper_marshals_different_streams(monkeypatch):

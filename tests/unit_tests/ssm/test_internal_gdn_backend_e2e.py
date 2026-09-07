@@ -110,7 +110,9 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
             group=parallel_state.get_context_parallel_group(),
             conv1d_kernel_size=4,
         )
-        prepare_cp_context_metadata(cp_context, global_num_sequences=_BATCH_SIZE)
+        prepare_cp_context_metadata(
+            cp_context, global_num_sequences=_BATCH_SIZE, global_cu_seqlens=cu_seqlens
+        )
 
     inputs, grad_output = _make_inputs(device, packed=cp_context is not None)
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "fla")

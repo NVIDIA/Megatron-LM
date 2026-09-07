@@ -51,17 +51,79 @@ def _gdn_is_cuda_graphed(config) -> bool:
     return not modules or CudaGraphModule.attn in modules
 
 
+_GLOBAL_CU_SEQLENS_UNSET = object()
+
+
+def _logical_global_cu_seqlens_cpu(cu_seqlens: torch.Tensor | None) -> torch.Tensor | None:
+    """Return a detached CPU copy of logical global packed offsets."""
+    if cu_seqlens is None:
+        return None
+    if cu_seqlens.dim() != 1:
+        raise ValueError("Internal GDN CP global cu_seqlens must be one-dimensional.")
+
+    cpu = cu_seqlens.detach()
+    if cpu.device.type != "cpu":
+        cpu = cpu.to(device="cpu")
+    if cpu.dtype != torch.long:
+        cpu = cpu.to(dtype=torch.long)
+    if cpu.numel() < 2:
+        raise ValueError("Internal GDN CP global cu_seqlens requires at least two entries.")
+
+    logical_entries = cpu.numel()
+    final_offset = int(cpu[-1])
+    while logical_entries > 1 and int(cpu[logical_entries - 2]) == final_offset:
+        logical_entries -= 1
+    cpu = cpu[:logical_entries].clone()
+
+    if int(cpu[0]) != 0:
+        raise ValueError("Internal GDN CP global cu_seqlens must start at zero.")
+    if bool(((cpu[1:] - cpu[:-1]) <= 0).any()):
+        raise ValueError("Internal GDN CP global cu_seqlens must be strictly increasing.")
+    return cpu
+
+
+def _same_cpu_tensor_values(lhs: torch.Tensor | None, rhs: torch.Tensor | None) -> bool:
+    if lhs is None or rhs is None:
+        return lhs is rhs
+    return lhs.shape == rhs.shape and lhs.dtype == rhs.dtype and torch.equal(lhs, rhs)
+
+
 def prepare_cp_context_metadata(
-    context: object, *, config: object | None = None, global_num_sequences: int | None = None
+    context: object,
+    *,
+    config: object | None = None,
+    global_num_sequences: int | None = None,
+    global_cu_seqlens: object = _GLOBAL_CU_SEQLENS_UNSET,
 ) -> object:
     """Attach internal CP preprocessing hints to an FLA CP context."""
+    if global_cu_seqlens is _GLOBAL_CU_SEQLENS_UNSET:
+        global_cu_seqlens_cpu = getattr(context, "global_cu_seqlens_cpu", None)
+    else:
+        global_cu_seqlens_cpu = _logical_global_cu_seqlens_cpu(global_cu_seqlens)
+
+    if global_cu_seqlens_cpu is not None:
+        inferred_num_sequences = int(global_cu_seqlens_cpu.numel() - 1)
+        if global_num_sequences is None:
+            global_num_sequences = inferred_num_sequences
+        elif int(global_num_sequences) != inferred_num_sequences:
+            raise ValueError(
+                "Internal GDN CP global_num_sequences does not match global cu_seqlens."
+            )
+
     if global_num_sequences is not None:
         global_num_sequences = int(global_num_sequences)
         if global_num_sequences < 1:
             raise ValueError("Internal GDN CP metadata requires at least one sequence.")
 
-    if getattr(context, "global_num_seqs", None) != global_num_sequences:
+    metadata_changed = (
+        getattr(context, "global_num_seqs", None) != global_num_sequences
+        or not _same_cpu_tensor_values(
+            getattr(context, "global_cu_seqlens_cpu", None), global_cu_seqlens_cpu
+        )
+    )
+    if metadata_changed:
         context.global_num_seqs = global_num_sequences
+        context.global_cu_seqlens_cpu = global_cu_seqlens_cpu
         context._cutedsl_metadata_generation = (
             getattr(context, "_cutedsl_metadata_generation", 0) + 1
         )

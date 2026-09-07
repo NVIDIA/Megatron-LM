@@ -5,9 +5,14 @@
 
 from __future__ import annotations
 
+import bisect
+import importlib
+import importlib.metadata
 import importlib.util
 import os
+import sys
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -181,6 +186,86 @@ def _has_module(name: str) -> bool:
         return False
 
 
+def _ensure_cutlass_importable() -> bool:
+    """Make NVIDIA's CuTe DSL Python package visible to ``import cutlass``."""
+    if _has_module("cutlass"):
+        return True
+
+    for distribution_name in (
+        "nvidia-cutlass-dsl-libs-cu13",
+        "nvidia-cutlass-dsl-libs-base",
+        "nvidia-cutlass-dsl",
+    ):
+        try:
+            distribution = importlib.metadata.distribution(distribution_name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+
+        roots = [
+            Path(distribution.locate_file("")),
+            Path(distribution.locate_file("nvidia_cutlass_dsl")),
+        ]
+        candidates = []
+        for root in roots:
+            candidates.append(root / "nvidia_cutlass_dsl" / "python_packages")
+            candidates.append(root / "python_packages")
+
+        for candidate in candidates:
+            if not (candidate / "cutlass").is_dir():
+                continue
+            candidate_str = str(candidate)
+            if candidate_str not in sys.path:
+                sys.path.insert(0, candidate_str)
+                importlib.invalidate_caches()
+            if _has_module("cutlass"):
+                return True
+
+    return False
+
+
+_REQUIRED_CUTEDSL_MODULES = (
+    "cutlass",
+    "cutlass.cute",
+    "cutlass.cute.nvgpu",
+    "cutlass.cute.runtime",
+    "cutlass.pipeline",
+    "cutlass.utils",
+    "cutlass.utils.blackwell_helpers",
+)
+
+
+def _has_required_cutedsl_modules() -> bool:
+    """Return whether the visible CuTe DSL package has the APIs imported here."""
+    return all(_has_module(name) for name in _REQUIRED_CUTEDSL_MODULES)
+
+
+def _cutlass_runtime_available() -> bool:
+    """Return whether CuTe DSL can load this backend's fused kernel modules."""
+    return _ensure_cutlass_importable() and _has_required_cutedsl_modules()
+
+
+def _rank_chains(global_cu_cpu, world_size: int) -> list[tuple[int, int]] | None:
+    """Return ``(pre_num_ranks, post_num_ranks)`` for every CP rank."""
+    cu = global_cu_cpu.tolist()
+    total = cu[-1]
+    if total % world_size:
+        return None
+    part = total // world_size
+    if part <= 0:
+        return None
+
+    ends, starts = cu[1:], cu[:-1]
+    chains = []
+    for r in range(world_size):
+        lo, hi = part * r, part * r + part
+        first = bisect.bisect_right(ends, lo)
+        last = bisect.bisect_left(starts, hi)
+        pre = r - cu[first] // part
+        post = (cu[last] - 1) // part - r
+        chains.append((pre, post))
+    return chains
+
+
 def _chain_mode(
     *, context: FLACPContext, cu_seqlens: torch.Tensor | None, T: int, rank: int, world_size: int
 ) -> str | None:
@@ -191,16 +276,16 @@ def _chain_mode(
     function of ``(context, T)`` -- ``rank`` and ``world_size`` come from
     ``context.group``.
 
-    Without a host-side global offsets side channel, the only rank-invariant
-    layout this Python dispatcher can prove is one global sequence spanning the
-    full CP group. Dense ``B == 1`` and packed THD with exactly one global
-    sequence set ``context.global_num_seqs == 1`` before entering this backend.
-    Broader packed layouts fall back to the FLA/Triton CP path.
+    When ``context.global_cu_seqlens_cpu`` is present, every rank derives the
+    whole group's chain topology from the same global offsets vector and makes
+    the same dispatch decision. Without it, the only rank-invariant layout this
+    Python dispatcher can prove is one global sequence spanning the full CP
+    group.
 
     Both fused kernels run one chain shape: every rank pushes its summary to
     ranks ``rank+1..W-1`` and folds ranks ``0..rank-1`` (reversed in the
-    backward). For the supported single-sequence layout that is exactly FLA's
-    full-chain CP state exchange.
+    backward). Packed batches are represented by suppressing halves of each
+    rank's summary rather than shortening the chain; see :func:`_emit_flags`.
     """
     if cu_seqlens is None:
         return None
@@ -232,23 +317,33 @@ def _classify_chain(
     if len(cu_cpu) - 1 != len(cu_seqlens) - 1:
         return None
 
-    if getattr(context, "global_num_seqs", None) != 1 or len(cu_cpu) != 2:
-        return None
+    global_cu = getattr(context, "global_cu_seqlens_cpu", None)
+    if global_cu is None:
+        if getattr(context, "global_num_seqs", None) != 1 or len(cu_cpu) != 2:
+            return None
+        chains = [(r, world_size - r - 1) for r in range(world_size)]
+    else:
+        chains = _rank_chains(global_cu, world_size)
+        if chains is None:
+            return None
 
-    expected_chain = (rank, world_size - rank - 1)
     actual_chain = (context.pre_num_ranks, context.post_num_ranks)
-    if actual_chain != expected_chain:
-        # The only no-host-metadata case this backend can decide
-        # rank-invariantly is one global sequence spanning the full CP group.
-        # A mismatch means the context is not that layout, or the hint is
-        # wrong. Raise instead of letting different ranks split between the
-        # fused symmetric-memory path and FLA's all-gather path.
+    if chains[rank] != actual_chain:
+        # Reconstructing this rank's chain from the global offsets must match
+        # what the CP context recorded. Raise instead of falling back: a
+        # per-rank split between Triton's all-gather path and symmetric memory
+        # would hang the job.
         raise RuntimeError(
-            "FLACPContext is inconsistent with a single full-chain CP sequence: "
-            "rank {} records pre/post_num_ranks {}, expected {}.".format(
-                rank, actual_chain, expected_chain
+            "FLACPContext is inconsistent: rank {} records pre/post_num_ranks "
+            "{} but its global_cu_seqlens_cpu implies {}.".format(
+                rank, actual_chain, chains[rank]
             )
         )
+    for r, (pre, post) in enumerate(chains):
+        if not (0 <= pre <= r and 0 <= post <= world_size - r - 1):
+            return None
+    if all(pre == 0 and post == 0 for pre, post in chains):
+        return "noop"
     return "fused"
 
 
@@ -396,12 +491,11 @@ def _runtime_supported(*, device: torch.device, group) -> bool:
     cached = _RUNTIME_SUPPORT_CACHE.get(key)
     if cached is None:
         cached = (
-            _has_module("cutlass")
+            _cutlass_runtime_available()
             and _has_module("cuda.bindings.driver")
             and _has_module("torch.distributed._symmetric_memory")
             and device.type == "cuda"
             and torch.cuda.get_device_capability(device) == (10, 0)
-            and "B200" in torch.cuda.get_device_name(device)
             and str(dist.get_backend(group)).lower().endswith("nccl")
             and 2 <= dist.get_world_size(group) <= 8
         )

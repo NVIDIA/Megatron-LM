@@ -198,6 +198,7 @@ class GatedDeltaNet(_GDNBase):
             )
 
         internal_gdr_global_num_sequences = None
+        internal_gdr_global_cu_seqlens = None
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
             assert (
@@ -215,7 +216,7 @@ class GatedDeltaNet(_GDNBase):
                 else packed_seq_params.cu_seqlens_kv
             )
             if cp_size_chunkwise > 1:
-                internal_gdr_global_num_sequences = 1 if cu_seqlens_q.numel() == 2 else None
+                internal_gdr_global_cu_seqlens = cu_seqlens_q
             else:
                 cu_seqlens_q = self._resolve_cu_seqlens(
                     None, cu_seqlens_q, seq_len_global, "cu_seqlens_q", cp_size=cp_size_runtime
@@ -240,6 +241,7 @@ class GatedDeltaNet(_GDNBase):
             if cu_seqlens_q is None:
                 cache_key = (seq_len_global, batch)
                 cached = self._chunkwise_cp_context_cache.get(cache_key)
+                global_cu_seqlens = None
                 if cached is None:
                     cached_cu_seqlens = (
                         torch.arange(
@@ -253,11 +255,20 @@ class GatedDeltaNet(_GDNBase):
                         conv1d_kernel_size=self.conv_kernel_dim,
                     )
                     cached = (cached_cu_seqlens, cached_ctx)
+                    global_cu_seqlens = cached_cu_seqlens
                     self._chunkwise_cp_context_cache[cache_key] = cached
                 cu_seqlens_q, chunkwise_cp_context = cached
-                prepare_internal_gdr_cp_context_metadata(
-                    chunkwise_cp_context, config=self.config, global_num_sequences=batch
-                )
+                if global_cu_seqlens is None:
+                    prepare_internal_gdr_cp_context_metadata(
+                        chunkwise_cp_context, config=self.config, global_num_sequences=batch
+                    )
+                else:
+                    prepare_internal_gdr_cp_context_metadata(
+                        chunkwise_cp_context,
+                        config=self.config,
+                        global_num_sequences=batch,
+                        global_cu_seqlens=global_cu_seqlens,
+                    )
             else:
                 chunkwise_cp_context = build_cp_context(
                     cu_seqlens=cu_seqlens_q,
@@ -268,6 +279,7 @@ class GatedDeltaNet(_GDNBase):
                     chunkwise_cp_context,
                     config=self.config,
                     global_num_sequences=internal_gdr_global_num_sequences,
+                    global_cu_seqlens=internal_gdr_global_cu_seqlens,
                 )
         else:
             chunkwise_cp_context = None
