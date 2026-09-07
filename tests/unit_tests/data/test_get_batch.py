@@ -315,11 +315,18 @@ def _full_graph_base_packed_config():
     return config
 
 
-def _full_graph_eager_packed_batch(cp_group, *, include_route=True):
+def _full_graph_eager_packed_batch(
+    cp_group,
+    *,
+    include_route=True,
+    real_cu_values=(0, 4, 12, 16),
+    padded_cu_values=(0, 4, 12, 16),
+    token_offset=0,
+):
     from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
-    real_cu = torch.tensor([0, 4, 12, 16], dtype=torch.int32)
-    padded_cu = torch.tensor([0, 4, 12, 16], dtype=torch.int32)
+    real_cu = torch.tensor(real_cu_values, dtype=torch.int32)
+    padded_cu = torch.tensor(padded_cu_values, dtype=torch.int32)
     packed = pretrain_gpt.PackedSeqParams(
         qkv_format="thd",
         cu_seqlens_q=real_cu,
@@ -342,7 +349,7 @@ def _full_graph_eager_packed_batch(cp_group, *, include_route=True):
         )
         route = cp_balanced_indexer.build_graph_dynamic_route(padded_cu, spec)
         cp_balanced_indexer.attach_graph_dynamic_route(packed, route)
-    tokens = torch.arange(8, dtype=torch.int64).view(1, 8)
+    tokens = (torch.arange(8, dtype=torch.int64) + token_offset).view(1, 8)
     labels = tokens.clone()
     loss_mask = torch.ones((1, 8), dtype=torch.float32)
     position_ids = tokens.clone()
@@ -565,6 +572,123 @@ def test_full_iteration_prepare_calls_get_batch_when_raw_iterator_is_none(monkey
     assert tuple(owners) == pretrain_gpt._FULL_CUDA_GRAPH_PACKED_BATCH_KEYS
     assert pretrain_gpt.forward_step.full_cuda_graph_batch_prepare_func is (
         pretrain_gpt.prepare_full_cuda_graph_dynamic_packed_batch
+    )
+
+
+def test_full_iteration_wrapper_reconstructs_underfilled_dynamic_packs_a_b_a(monkeypatch):
+    """The production prepare/reconstruct seam refreshes nine fixed owners for A/B/A."""
+    from megatron.core.full_cuda_graph import (
+        FullCudaGraphPreparedIterator,
+        FullCudaGraphWrapper,
+        StaticBufferLoader,
+    )
+    from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+    config = _full_graph_dynamic_packed_config()
+    cp_group = _FullGraphPackedCPGroup()
+    model = SimpleNamespace(config=config, vp_stage=None)
+    source_batches = (
+        _full_graph_eager_packed_batch(
+            cp_group, real_cu_values=(0, 3, 6, 10), padded_cu_values=(0, 4, 8, 16), token_offset=100
+        ),
+        _full_graph_eager_packed_batch(
+            cp_group,
+            real_cu_values=(0, 2, 9, 12),
+            padded_cu_values=(0, 4, 12, 16),
+            token_offset=200,
+        ),
+        _full_graph_eager_packed_batch(
+            cp_group, real_cu_values=(0, 3, 6, 10), padded_cu_values=(0, 4, 8, 16), token_offset=100
+        ),
+    )
+    assert all(
+        batch[5].cu_seqlens_q[-1] < batch[5].cu_seqlens_q_padded[-1] for batch in source_batches
+    )
+
+    # Isolate the process-global full-graph state; monkeypatch restores the prior
+    # dictionaries even if an assertion below fails.
+    for owner, name, value in (
+        (FullCudaGraphWrapper, "curr_iteration", {"training": 0, "validation": 0}),
+        (FullCudaGraphWrapper, "cuda_graph", {"training": None, "validation": None}),
+        (FullCudaGraphWrapper, "result", {"training": None, "validation": None}),
+        (FullCudaGraphWrapper, "prepared_run_signatures", {"training": None, "validation": None}),
+        (StaticBufferLoader, "prepared_static_buffers", {"training": None, "validation": None}),
+        (StaticBufferLoader, "prepared_schemas", {"training": None, "validation": None}),
+        (StaticBufferLoader, "prepared_owner_ptrs", {"training": None, "validation": None}),
+    ):
+        monkeypatch.setattr(owner, name, value)
+    monkeypatch.setattr(pretrain_gpt.mpu, "get_context_parallel_group", lambda: cp_group)
+    monkeypatch.setattr(pretrain_gpt, "get_args", lambda: SimpleNamespace())
+    monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _args: config)
+
+    real_get_batch = pretrain_gpt.get_batch
+    monkeypatch.setattr(
+        pretrain_gpt, "get_batch", lambda data_iterator, _vp_stage=None: next(data_iterator)
+    )
+
+    def consume_prepared_batch(**kwargs):
+        prepared_iterator = kwargs["data_iterator"][0]
+        assert isinstance(prepared_iterator, FullCudaGraphPreparedIterator)
+        return real_get_batch(prepared_iterator)
+
+    wrapper = FullCudaGraphWrapper(
+        consume_prepared_batch,
+        cuda_graph_warmup_steps=100,
+        batch_prepare_func=pretrain_gpt.prepare_full_cuda_graph_dynamic_packed_batch,
+    )
+    source_iterator = iter(source_batches)
+    owner_ptrs = None
+    observed = []
+    for source_batch in source_batches:
+        source_layout, source_route = cp_balanced_indexer.get_graph_dynamic_plan_buffers(
+            source_batch[5]
+        )
+        result = wrapper(
+            forward_step_func=pretrain_gpt.forward_step,
+            data_iterator=source_iterator,
+            model=model,
+            num_microbatches=1,
+            seq_length=16,
+            micro_batch_size=1,
+            decoder_seq_length=None,
+            forward_only=False,
+        )
+        owners = StaticBufferLoader.prepared_static_buffers["training"][0][0]
+        assert tuple(owners) == pretrain_gpt._FULL_CUDA_GRAPH_PACKED_BATCH_KEYS
+        assert len(owners) == 9
+        iteration_ptrs = tuple(owners[name].data_ptr() for name in owners)
+        if owner_ptrs is None:
+            owner_ptrs = iteration_ptrs
+        else:
+            assert iteration_ptrs == owner_ptrs
+
+        packed = result[5]
+        layout, route = cp_balanced_indexer.get_graph_dynamic_plan_buffers(packed)
+        assert result[0] is owners["tokens"]
+        assert packed.cu_seqlens_q is packed.cu_seqlens_kv is owners["cu_seqlens"]
+        assert (
+            packed.cu_seqlens_q_padded is packed.cu_seqlens_kv_padded is owners["cu_seqlens_padded"]
+        )
+        assert layout is owners["dsa_cp_graph_layout_buffer"]
+        assert route is owners["dsa_cp_graph_route_buffer"]
+        expected_iteration = {
+            "tokens": source_batch[0],
+            "cu_seqlens": source_batch[5].cu_seqlens_q,
+            "cu_seqlens_padded": source_batch[5].cu_seqlens_q_padded,
+            "dsa_cp_graph_layout_buffer": source_layout,
+            "dsa_cp_graph_route_buffer": source_route,
+        }
+        for name, value in expected_iteration.items():
+            torch.testing.assert_close(owners[name], value, rtol=0, atol=0)
+        observed.append({name: owners[name].clone() for name in expected_iteration})
+
+    for name in observed[0]:
+        torch.testing.assert_close(observed[0][name], observed[2][name], rtol=0, atol=0)
+    assert not torch.equal(observed[0]["cu_seqlens"], observed[1]["cu_seqlens"])
+    assert not torch.equal(observed[0]["cu_seqlens_padded"], observed[1]["cu_seqlens_padded"])
+    assert any(
+        not torch.equal(observed[0][name], observed[1][name])
+        for name in ("dsa_cp_graph_layout_buffer", "dsa_cp_graph_route_buffer")
     )
 
 
