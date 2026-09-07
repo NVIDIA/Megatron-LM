@@ -57,6 +57,17 @@ def _set_owning_fsdp_module_refs(module: FsdpModule) -> None:
     register_refs(module, module)
 
 
+def reshard_fsdp_module(module: FsdpModule) -> None:
+    """Reshard the FSDP module after fine-grained computation."""
+    assert isinstance(module, FsdpModule), "Expected an FsdpModule."
+    module.reshard()
+
+
+def module_post_backward_hook(module: FsdpModule) -> None:
+    reshard_fsdp_module(module)
+    module._reduce_gradient_groups()
+
+
 def _register_combined_1f1b_hooks(module: FsdpModule) -> None:
     """Install the sub-module hooks required by MCore combined 1F1B."""
 
@@ -65,12 +76,8 @@ def _register_combined_1f1b_hooks(module: FsdpModule) -> None:
             _unshard_before_submodule_forward, prepend=True, with_kwargs=True
         )
         submodule.register_full_backward_pre_hook(_unshard_before_submodule_backward)
-
-
-def reshard_fsdp_module(module: FsdpModule) -> None:
-    """Reshard the FSDP module after fine-grained computation."""
-    assert isinstance(module, FsdpModule), "Expected an FsdpModule."
-    module.reshard()
+        if isinstance(submodule, FsdpModule):
+            submodule.register_post_backward_hook(module_post_backward_hook)
 
 
 def setup_combined_1f1b_hooks(module: nn.Module) -> None:
