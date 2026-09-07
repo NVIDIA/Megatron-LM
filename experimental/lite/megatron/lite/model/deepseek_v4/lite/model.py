@@ -176,10 +176,8 @@ class DeepseekV4Layer(nn.Module):
         # x is SBHD mHC [S, B, hc_mult, H].  HyperConnection collapses the
         # streams to a 3-D [S, B, H] pre-mix, the sub-block runs SBHD, and
         # HyperConnection.post recombines into the 4-D residual streams.
-        # The residual comes back from the HyperConnection rather than being
-        # captured here: it hands out three aliases of the hidden so backward
-        # sums their gradients in one fused add instead of two sequential ones.
-        attn_in, post, comb, residual = self.attn_hc(x)
+        residual = x
+        attn_in, post, comb = self.attn_hc(x)
         attn_out = self.self_attn(
             self.input_layernorm(attn_in),
             position_ids=position_ids,
@@ -187,7 +185,8 @@ class DeepseekV4Layer(nn.Module):
         )
         x = HyperConnection.post(attn_out, residual, post, comb)
 
-        ffn_in, post, comb, residual = self.ffn_hc(x)
+        residual = x
+        ffn_in, post, comb = self.ffn_hc(x)
         # DS4 hash-routed MoE indexes tid2eid[input_ids.reshape(-1)] and must
         # align with the flattened hidden.  The skeleton is SBHD, so the FFN
         # input flattens in (S, B) order; transpose input_ids [B, S] -> [S, B]

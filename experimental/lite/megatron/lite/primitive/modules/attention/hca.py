@@ -10,11 +10,7 @@ from megatron.core.fusions.fused_mhc_kernels import (
     fused_h_post_bda,
     fused_sinkhorn,
 )
-from megatron.core.transformer.hyper_connection import (
-    BroadcastTensorFused,
-    native_fused_add_3,
-    native_sinkhorn,
-)
+from megatron.core.transformer.hyper_connection import native_sinkhorn
 
 
 # The mapping maths is a long chain of narrow elementwise ops over
@@ -109,23 +105,11 @@ class HyperConnection(nn.Module):
         nn.init.zeros_(self.base)
         nn.init.ones_(self.scale)
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if x.dim() == 3:
             x = x.unsqueeze(2).expand(*x.shape[:2], self.hc_mult, x.size(-1))
-        # The hidden feeds three consumers -- the mixing projection, the
-        # aggregate, and the residual that ``post`` recombines against -- so
-        # backward hands autograd three gradients for it and autograd sums them
-        # with two sequential elementwise adds over the full n-stream hidden. An
-        # nsys census by op and shape measured those adds at 25.4 ms per step,
-        # the largest remaining item. Core's ``HyperConnection`` splits the
-        # tensor into three aliases and sums their gradients in one fused add
-        # for exactly this reason; the split is by ``view_as``, so the forward
-        # values are the same tensor and only the backward accumulation changes.
-        x_map, x_agg, residual = BroadcastTensorFused.apply(x, native_fused_add_3)
         shape, dtype = x.shape, x.dtype
-        xf = x_map.flatten(2)
+        xf = x.flatten(2)
         rms_inv = 1.0 / (xf.norm(dim=-1, keepdim=True) / math.sqrt(xf.shape[-1]) + self.eps)
         mixes = F.linear(xf, self.fn.to(device=x.device, dtype=dtype)) * rms_inv
         pre, post, comb = split_sinkhorn(
@@ -135,9 +119,9 @@ class HyperConnection(nn.Module):
         # same expression written here, so this is a kernel swap and not a change
         # of formula -- unlike the Sinkhorn and compute_h helpers next to it,
         # which differ from Core in their regularisation.
-        xs = x_agg.flatten(2).view(shape)
+        xs = xf.view(shape)
         y = fused_h_aggregate(xs, pre) if _use_fused(xs) else _aggregate_native(xs, pre)
-        return y.to(dtype), post, comb, residual
+        return y.to(dtype), post, comb
 
     @staticmethod
     def post(
