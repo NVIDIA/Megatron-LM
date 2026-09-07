@@ -4322,6 +4322,7 @@ class GatedDeltaNetChunkedKernel:
         tRT_tCtState = thr_state_r2t.partition_D(tCtState_mn_view)
         tTR_rState = cute.make_rmem_tensor_like(tTR_tCcState, self.acc_dtype)
         tRG_rState = cute.make_rmem_tensor_like(tTR_tCcState, self.state_dtype)
+        tRO_rState = cute.make_rmem_tensor_like(tTR_tCcState, self.io_dtype)
 
         state_inp_shape = tiled_mma_qs.partition_shape_A(
             (self.mma_tiler_qs[0], self.mma_tiler_qs[2])
@@ -4530,15 +4531,15 @@ class GatedDeltaNetChunkedKernel:
                         )
                 if cutlass.const_expr(self.store_h):
                     assert mH_out is not None, "mH_out must be provided when store_h is True"
-                    if cutlass.const_expr(self.state_dtype != self.acc_dtype):
-                        tRG_rState[None, 0, sub].store(
-                            tTR_rState[None, 0, sub].load().to(self.state_dtype)
+                    if cutlass.const_expr(self.io_dtype != self.acc_dtype):
+                        tRO_rState[None, 0, sub].store(
+                            tTR_rState[None, 0, sub].load().to(self.io_dtype)
                         )
                     else:
-                        tRG_rState = tTR_rState
+                        tRO_rState = tTR_rState
                     if cutlass.const_expr(self.use_bf16_h_tma):
                         cute.autovec_copy(
-                            tRG_rState[None, 0, sub],
+                            tRO_rState[None, 0, sub],
                             tCsH[None, 0, sub],
                             l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                         )
@@ -4553,7 +4554,7 @@ class GatedDeltaNetChunkedKernel:
                         )
                         tSgH = thr_state_t2r.partition_D(gH_out)
                         cute.autovec_copy(
-                            tRG_rState[None, 0, sub],
+                            tRO_rState[None, 0, sub],
                             tSgH[None, 0, sub],
                             l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                         )
