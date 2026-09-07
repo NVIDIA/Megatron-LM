@@ -13,11 +13,8 @@ from megatron.core.fusions.fused_mhc_kernels import (
 from megatron.core.transformer.hyper_connection import native_sinkhorn
 
 
-# The mapping maths is a long chain of narrow elementwise ops over
-# ``[s, b, (2 + n) * n]``, where each eager op is its own launch reading and
-# writing all of HBM. Compiling fuses the chain without touching the arithmetic.
-# Kept separate from the Sinkhorn projection below so that the Triton kernel is
-# not called from inside a compiled region.
+# The mapping maths is a long chain of narrow elementwise ops over ``[s, b, (2 +
+# n) * n]``, where each eager op is its own launch reading and writing all of HBM.
 @torch.compile
 def _split_mixes(
     mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, hc_mult: int
@@ -95,10 +92,8 @@ class HyperConnection(nn.Module):
         pre, post, comb = split_sinkhorn(
             mixes, self.scale, self.base, self.hc_mult, self.sinkhorn_iters, self.eps
         )
-        # ``fused_h_aggregate`` is ``(x * h_pre.unsqueeze(-1)).sum(dim=2)``, the
-        # same expression written here, so this is a kernel swap and not a change
-        # of formula -- unlike the Sinkhorn and compute_h helpers next to it,
-        # which differ from Core in their regularisation.
+        # ``fused_h_aggregate`` is ``(x * h_pre.unsqueeze(-1)).sum(dim=2)``, the same expression written here, so this is a kernel swap and not a
+        # change of formula -- unlike the Sinkhorn and compute_h helpers next to it, which differ from Core in their regularisation.
         xs = xf.view(shape)
         y = fused_h_aggregate(xs, pre) if _use_fused(xs) else _aggregate_native(xs, pre)
         return y.to(dtype), post, comb
@@ -108,13 +103,8 @@ class HyperConnection(nn.Module):
         x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
     ) -> torch.Tensor:
         dtype = x.dtype
-        # Core defines the mixing term as ``h_res.T @ residual`` while this module
-        # carries ``comb`` in the opposite orientation, so the transpose converts
-        # between the two conventions rather than being a layout tweak: passing
-        # ``comb`` unchanged silently computes a different residual mixing.
-        # ``contiguous()`` is required because the native path reshapes with
-        # ``view()``; the copy spans ``[s, b, hc_mult, hc_mult]`` and is negligible
-        # beside the batched matmul it feeds.
+        # Core defines the mixing term as ``h_res.T @ residual`` while this module carries ``comb`` in the opposite orientation, so the
+        # transpose converts between the two conventions rather than being a layout tweak: passing ``comb`` unchanged silently computes a different residual mixing.
         if not _use_fused(x):
             return _post_native(x, residual, post, comb)
         h_res = comb.to(dtype).transpose(-1, -2).contiguous()

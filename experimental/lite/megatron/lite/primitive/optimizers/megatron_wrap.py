@@ -161,13 +161,8 @@ def build_dist_opt_stack(
         wrapped_chunks = list(model_chunks)
     else:
         ddp_config = DistributedDataParallelConfig(
-            # Core's DDP overlaps the gradient reduce-scatter and the parameter
-            # all-gather with compute; mcore's DSv4 configuration turns both on
-            # and hides 174 ms of NCCL per step behind the backward pass. Lite
-            # left them off, so its collectives sat on the critical path: an
-            # anchor-normalised kernel census put lite's compute 13% *below*
-            # mcore's while its step time was 6% above, with GPU busy time
-            # essentially equal to wall time -- the signature of no overlap.
+            # Core's DDP overlaps the gradient reduce-scatter and the parameter all-gather with compute; mcore's DSv4 configuration
+            # turns both on and hides 174 ms of NCCL per step behind the backward pass.
             use_distributed_optimizer=True,
             overlap_grad_reduce=True,
             overlap_param_gather=True,

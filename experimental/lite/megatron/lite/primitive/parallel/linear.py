@@ -20,21 +20,8 @@ if TYPE_CHECKING:
     from megatron.lite.primitive.parallel.state import ParallelState
 
 
-# ---------------------------------------------------------------------------
-# Vanilla column-parallel linear (torch.matmul kernel, NOT TE).
-#
-# Matches Megatron-Core `tensor_parallel.ColumnParallelLinear` bit-for-bit
-# in bf16: same `torch.matmul(input, weight.t())` forward, same
-# all-reduce-on-backward-grad_input pattern. Use this for heads like the
-# vocab LM projection where MC's GPT model uses vanilla torch matmul
-# (hardcoded in `LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear)`)
-# — TE's `te.Linear` uses a different cuBLAS algo selection that introduces
-# ~3e-4 loss-level drift under bf16 vs torch.matmul.
-#
-# For QKV / MoE experts we still prefer the TE path (fused LN+linear, FP8
-# readiness) — this vanilla path is a drop-in substitute only when kernel
-# parity with the reference backend is required.
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- Vanilla column-parallel linear
+# (torch.matmul kernel, NOT TE).
 
 
 class _VanillaColParallelMatmul(torch.autograd.Function):
@@ -113,22 +100,7 @@ class _VanillaColLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Once the distributed optimizer has allocated ``main_grad``, Core's own
-        # linear can accumulate the weight gradient straight into it. That is
-        # worth two things here, both measured: the separate
-        # ``main_grad.add_(grad)`` over ``[padded_vocab, hidden]`` -- the largest
-        # parameter in the model, 17.2 ms per step -- disappears, and the wgrad
-        # GEMM moves onto the side stream the accumulating GEMMs already run on,
-        # where it overlaps the collectives sitting on the main stream. A
-        # per-stream kernel census put Core at 1.58x lite's volume of those
-        # accumulating GEMMs, which is why Core hides 149 ms per step and lite
-        # hides none.
-        #
-        # This calls Core's implementation rather than reproducing it: the
-        # handshake it performs -- writing through ``fused_weight_gradient_mlp``
-        # and still returning a gradient so DDP's post-hook fires and
-        # ``register_grad_ready`` is reported -- is easy to get subtly wrong.
-        # The forward matmul is unchanged, so the bit-for-bit agreement with
-        # ``ColumnParallelLinear`` that this class exists for still holds.
+        # linear can accumulate the weight gradient straight into it.
         if getattr(self.weight, "main_grad", None) is not None:
             return linear_with_grad_accumulation_and_async_allreduce(
                 input=x,
@@ -313,10 +285,7 @@ class _EmbeddingAccumulatingIntoMainGrad(torch.autograd.Function):
         )
         weight.grad_added_to_main_grad = True
         # DDP asserts a gradient is present whenever overlap_grad_reduce is on,
-        # so returning None here trades one copy for a crash. Core hits the same
-        # wall and answers it the same way: hand back a placeholder that the
-        # hook can see and then skip, reusing one buffer across layers and
-        # microbatches rather than allocating a vocabulary-sized tensor per call.
+        # so returning None here trades one copy for a crash.
         return _dummy_wgrad(weight), None
 
 

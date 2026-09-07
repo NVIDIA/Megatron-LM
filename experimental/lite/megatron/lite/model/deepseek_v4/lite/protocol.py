@@ -69,14 +69,8 @@ class ImplConfig:
     mtp_num_layers: int | None = None
     num_nextn_predict_layers: int | None = None
     mtp_loss_scaling_factor: float = 0.1
-    # Off by default despite Megatron Core running DeepSeek-V4 with
-    # --cross-entropy-loss-fusion: on this backend the fused path is measurably
-    # worse on both axes. At 8 layers / 64 experts / seq 4096 / 131072 tokens per
-    # step on 8xH100 it costs 2085.1 ms against 2045.0 ms and 55.2 GB against
-    # 47.8 GB of peak memory -- the opposite of what avoiding the
-    # [seq, batch, vocab] logits is supposed to buy. Wiring it up is what makes
-    # it reachable at all; flipping the default belongs with a fix to
-    # linear_cross_entropy, not with this change.
+    # Off by default despite Megatron Core running DeepSeek-V4 with --cross-entropy-loss-fusion: on
+    # this backend the fused path is measurably worse on both axes.
     cross_entropy_fusion: bool = False
     qat: QATSpec | dict | None = None
 
@@ -150,11 +144,8 @@ def _infer_cp_local_seq_len(
     return seq_len // cp_size if seq_len % cp_size == 0 else seq_len
 
 
-# The 1-D-packed -> jagged-nested split is model-agnostic and lives in the shared
-# protocol_utils layer. DS4 only forks the *CP layout* pair (contiguous DSA, see
-# ``_prepare_packed_batch_kwargs`` below); this pre-CP primitive must not diverge,
-# so alias the shared implementation instead of re-copying it. Keeping the local
-# name preserves existing call sites and unit tests.
+# The 1-D-packed -> jagged-nested split is model-agnostic
+# and lives in the shared protocol_utils layer.
 _nested_from_packed_tensor = nested_from_packed
 
 
@@ -260,20 +251,14 @@ def _uses_csa(model) -> bool:
 
 
 def _prepare_model_forward_kwargs(model, batch: PackedBatch):
-    # THD-packed inputs (1-D values, or a single padded [1, S] row) carry their own
-    # cu_seqlens and go through the packed builder. A dense multi-row [B, S] batch is
-    # split per row under contiguous CP, where contiguous_position_ids_for_cp rebuilds
-    # the per-rank global position ids.
+    # THD-packed inputs (1-D values, or a single padded [1, S]
+    # row) carry their own cu_seqlens and go through the packed builder.
     input_ids = batch.input_ids
     is_thd_packed = input_ids.dim() == 1 or (input_ids.dim() == 2 and input_ids.size(0) == 1)
     if is_thd_packed:
         return _prepare_packed_batch_kwargs(model, batch)
-    # CSA has no dense BSHD path: the fallback and its CP all-gather loop were
-    # removed upstream, leaving the CP=1 fused sparse kernels and the THD packed
-    # route. A dense multi-row batch reaches neither -- it arrives without
-    # ``packed_seq_params`` and hits a ``NotImplementedError`` several frames
-    # deep, in a module that cannot say which caller sent it. Refusing here names
-    # the actual constraint at the boundary that can still act on it.
+    # CSA has no dense BSHD path: the fallback and its CP all-gather loop
+    # were removed upstream, leaving the CP=1 fused sparse kernels and the THD packed route.
     if _uses_csa(model):
         raise NotImplementedError(
             f"DeepSeek-V4 CSA has no dense BSHD path, but this batch is "

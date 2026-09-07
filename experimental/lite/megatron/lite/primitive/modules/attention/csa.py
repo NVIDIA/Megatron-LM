@@ -51,10 +51,8 @@ class _SingleRankGroup:
 @jit_fuser
 def _per_head_rms(q: torch.Tensor, eps: float) -> torch.Tensor:
     """Weightless per-head RMS normalisation of the query."""
-    # ``q.float()`` materialised a full fp32 copy of the query purely to reduce
-    # over it -- 77k Melem per step in the op census. ``dtype=torch.float32``
-    # accumulates the mean in fp32 without that copy; only the squaring now
-    # rounds in bf16, which the bounds in the unit test cover.
+    # ``q.float()`` materialised a full fp32 copy of the query purely to
+    # reduce over it -- 77k Melem per step in the op census.
     inv = torch.rsqrt(q.pow(2).mean(dim=-1, keepdim=True, dtype=torch.float32) + eps)
     return q * inv.to(dtype=q.dtype)
 
@@ -126,13 +124,8 @@ def build_yarn_rope_cos_sin(
     return emb.cos().to(dtype=dtype), emb.sin().to(dtype=dtype)
 
 
-# The rotary tables depend only on the positions and the rope parameters, but
-# were rebuilt on every layer, every microbatch, and again under activation
-# recompute. A dispatch-level op census measured 10368 kernel launches per step
-# from the four lines that build them, over tensors small enough to round to
-# zero Melem -- pure launch overhead for a table that a step needs once.
-# Megatron Core caches the same tables (``RotaryEmbedding.get_cached_cos_sin``);
-# this mirrors that. Nothing about the values changes.
+# The rotary tables depend only on the positions and the rope parameters,
+# but were rebuilt on every layer, every microbatch, and again under activation recompute.
 _ROPE_CACHE: dict[Hashable, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
@@ -417,11 +410,8 @@ class CompressedSparseAttention(nn.Module):
         self.rope_head_dim = config.qk_rope_head_dim
         self.softmax_scale = self.head_dim**-0.5
         self.num_heads_per_group = config.num_attention_heads // config.o_groups
-        # Kernel / indexer-loss knobs are implementation config (not part of the
-        # HF model config), threaded as constructor arguments like GLM-5's DSA.
-        # Fused DSA kernels are the production default; the unfused sparse-attn /
-        # indexer-loss path (Core's ``_unfused_indexer_sparse_attn_from_topk``) is
-        # a debug fallback selected via ``apply_dsa_kernel_fusion=False``.
+        # Kernel / indexer-loss knobs are implementation config (not part of
+        # the HF model config), threaded as constructor arguments like GLM-5's DSA.
         self.apply_dsa_kernel_fusion = apply_dsa_kernel_fusion
         self.dsa_indexer_loss_coeff = dsa_indexer_loss_coeff
         self.dsa_indexer_use_sparse_loss = dsa_indexer_use_sparse_loss
@@ -457,15 +447,7 @@ class CompressedSparseAttention(nn.Module):
             else None
         )
         # The indexer runs on detached inputs and only picks top-k, which is not
-        # differentiable, so its weights are trained by the indexer loss and by
-        # nothing else. With that loss off they receive no gradient at all --
-        # every step, forever -- while still sitting in the gradient buckets and
-        # the optimizer state as if they were being trained. Core keeps them fed
-        # because its fused kernel returns their (zero) gradients whatever the
-        # coefficient; lite short-circuits the whole path, so the honest thing is
-        # to say they are frozen. Megatron-Core's DDP skips parameters that do
-        # not require grad, which is also what lets it account for every
-        # remaining parameter once per step and overlap the reductions.
+        # differentiable, so its weights are trained by the indexer loss and by nothing else.
         if self.indexer is not None and not self.dsa_indexer_loss_coeff:
             for parameter in self.indexer.parameters():
                 parameter.requires_grad_(False)
@@ -536,10 +518,8 @@ class CompressedSparseAttention(nn.Module):
                 sin=sin,
             )
 
-        # The BSHD dense-softmax fallback (and its CP all-gather loop) has been
-        # removed: DSv4 sequence parallelism now goes exclusively through the THD
-        # packed CP path (``packed_seq_params is not None`` above), and the only
-        # supported BSHD routes are the CP=1 fused sparse kernels dispatched above.
+        # The BSHD dense-softmax fallback (and its CP all-gather loop) has been removed: DSv4 sequence parallelism now goes exclusively through the THD
+        # packed CP path (``packed_seq_params is not None`` above), and the only supported BSHD routes are the CP=1 fused sparse kernels dispatched above.
         raise NotImplementedError(
             "DSv4 CSA BSHD path supports only the CP=1 fused sparse backends; pass "
             "packed_seq_params for the THD context-parallel path. The dense BSHD "
@@ -647,11 +627,8 @@ class CompressedSparseAttention(nn.Module):
                 "DeepSeek V4 fused DSA path currently supports causal masking only."
             )
         dsa_kernels = _load_dsa_kernels()
-        # The cuDNN SM90 indexer requires seqlen_q <= seqlen_k * ratio, but the
-        # compressor floors to seq_len // ratio blocks, so a seq_len that is not a
-        # multiple of ratio leaves the last query token(s) without a compressed key
-        # block. Right-pad to a multiple of ratio (the causal tail attends only real
-        # tokens and is sliced off the output) so seqlen_k * ratio == seqlen_q.
+        # The cuDNN SM90 indexer requires seqlen_q <= seqlen_k * ratio, but the compressor floors to seq_len // ratio blocks,
+        # so a seq_len that is not a multiple of ratio leaves the last query token(s) without a compressed key block.
         orig_seq_len = x.shape[1]
         ratio = self.compress_ratio
         pad = (-orig_seq_len) % ratio
@@ -842,10 +819,7 @@ class CompressedSparseAttention(nn.Module):
         )
         q_low = self.q_norm(self.wq_a(x))
         # Build q/kv directly in the SBHD/THD layout the TE kernels consume, rather
-        # than transposing into [b, h, s, d] for RoPE and transposing back. The two
-        # round trips cost a full materialised copy of q, kv, each way; the op
-        # census measured them among the largest single copies per layer, paid
-        # twice again under activation recompute.
+        # than transposing into [b, h, s, d] for RoPE and transposing back.
         q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim)
         q = _per_head_rms(q, self.config.rms_norm_eps)
         kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim)
@@ -853,10 +827,8 @@ class CompressedSparseAttention(nn.Module):
         # TE-THD convention: query (total, np, hn); key (total, 1, 1, hn); x/qr (total, 1, *).
         query_thd = q.squeeze(0)  # (total, np, hn) -- already contiguous
         key_thd = kv.squeeze(0).unsqueeze(1)  # (total, 1, 1, hn)
-        # Core's fused MLA RoPE, adjudicated against the expression it replaces on
-        # this exact THD path: full-length cos/sin (``cat(freqs, freqs)``, which is
-        # what the builders above already return), rope on the trailing
-        # ``rope_head_dim`` channels, positions restarting per packed sequence.
+        # Core's fused MLA RoPE, adjudicated against the expression it replaces on this exact THD path: full-length cos/sin (``cat(freqs, freqs)``,
+        # which is what the builders above already return), rope on the trailing ``rope_head_dim`` channels, positions restarting per packed sequence.
         cos_thd = cos.squeeze(0)
         sin_thd = sin.squeeze(0)
         nope_dim = self.head_dim - self.rope_head_dim
@@ -875,11 +847,7 @@ class CompressedSparseAttention(nn.Module):
                 x_thd, self.compress_ratio, self.config.sliding_window, cp_group
             )
         else:
-            # cp_size == 1 has no left neighbour, so the boundary window is exactly
-            # zeros. Core reaches ``_forward_thd_cp`` only at cp>1 and never calls
-            # the P2P exchange with an empty op list; the lite path routes cp=1 THD
-            # through the same method, so materialize the zero boundary directly
-            # (matching ``cp_utils.exchange_cp_boundary_hidden``'s D_window sizing).
+            # cp_size == 1 has no left neighbour, so the boundary window is exactly zeros.
             d_comp = (
                 8 if self.compress_ratio == 4 else self.compress_ratio if self.compress_ratio > 1 else 0
             )
@@ -892,18 +860,7 @@ class CompressedSparseAttention(nn.Module):
         context = self._forward_thd_cp(
             query_thd, key_thd, x_thd, qr_thd, boundary_hidden, boundary_kv, packed_seq_params
         )
-        # context: (total, 1, np * hn). Reaching the shared BSHD output projection
-        # from here cost three full materialisations of the largest tensor in the
-        # module: a permute into (1, np, total, hn), an unfused inverse RoPE that
-        # concatenates the untouched nope channels back onto the rotated ones, and
-        # a transpose + reshape on the way out -- per layer, paid twice again under
-        # activation recompute, and measured as 64% of this module's kernel time.
-        #
-        # THD needs none of it. (total, np, hn) is already
-        # (total, o_groups, heads_per_group * hn) by a free view, and Core's fused
-        # kernel undoes the rotation over the RoPE channels alone. This is the route
-        # mcore's DSv4 attention takes; out-of-place because fused DSA backward
-        # retains the raw attention output.
+        # context: (total, 1, np * hn).
         context = context.squeeze(1).view(seq_len, self.num_heads, self.head_dim)
         context = fused_mla_rope_out_of_place(
             context,
