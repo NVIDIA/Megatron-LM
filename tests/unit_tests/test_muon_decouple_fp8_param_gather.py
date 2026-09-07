@@ -25,6 +25,8 @@ from megatron.core.enums import ModelType
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
@@ -133,8 +135,21 @@ class TestMuonDecoupleFP8ParamGather:
     def model_provider(self, pre_process=True, post_process=True, **kw):
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
+        config = core_transformer_config_from_args(args)
+        if args.hybrid_layer_pattern is not None:
+            return HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=args.vocab_size,
+                max_sequence_length=args.max_position_embeddings,
+                hybrid_layer_pattern=args.hybrid_layer_pattern,
+                pre_process=pre_process,
+                post_process=post_process,
+                share_embeddings_and_output_weights=(not args.untie_embeddings_and_output_weights),
+                position_embedding_type=args.position_embedding_type,
+            )
         return GPTModel(
-            config=core_transformer_config_from_args(args),
+            config=config,
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=args.vocab_size,
             max_sequence_length=args.max_position_embeddings,
@@ -152,6 +167,8 @@ class TestMuonDecoupleFP8ParamGather:
         num_experts=0,
         expert_model_parallel_size=1,
         chunked_optimizer_state_offload=False,
+        hybrid_layer_pattern=None,
+        recompute_gdn=False,
     ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
@@ -182,6 +199,27 @@ class TestMuonDecoupleFP8ParamGather:
         args.hidden_dropout = 0.0
         args.attention_dropout = 0.0
         args.attention_backend = "unfused"
+        if hybrid_layer_pattern is not None:
+            args.hybrid_layer_pattern = hybrid_layer_pattern
+            args.is_hybrid_model = True
+            args.position_embedding_type = 'none'
+            args.experimental_attention_variant = 'kda' if hybrid_layer_pattern == 'K' else 'gdn'
+            args.linear_conv_kernel_dim = 4
+            args.linear_key_head_dim = 32
+            args.linear_value_head_dim = 32
+            # GDN/KDA beta projections have shape [num_key_heads, hidden_size].
+            # MXFP8 quantizes both dimensions in 32-element blocks, so keep this
+            # tiny regression model aligned without changing the production path.
+            args.linear_num_key_heads = 32
+            args.linear_num_value_heads = 32
+            args.kda_f_lora_rank = 32
+            args.kda_gate_lora_rank = None
+            args.kda_safe_gate = True
+            args.kda_lower_bound = -5.0
+        if recompute_gdn:
+            args.recompute_granularity = 'selective'
+            args.recompute_modules = ['gdn']
+
         # muon + use_distributed_optimizer auto-routes to LayerWiseDistributedOptimizer.
         args.optimizer = 'muon'
         args.muon_momentum = 0.9
@@ -248,6 +286,8 @@ class TestMuonDecoupleFP8ParamGather:
         num_experts=0,
         expert_model_parallel_size=1,
         chunked_optimizer_state_offload=False,
+        hybrid_layer_pattern=None,
+        recompute_gdn=False,
     ):
         args = self._create_args(
             fp8_param_gather,
@@ -256,6 +296,8 @@ class TestMuonDecoupleFP8ParamGather:
             num_experts=num_experts,
             expert_model_parallel_size=expert_model_parallel_size,
             chunked_optimizer_state_offload=chunked_optimizer_state_offload,
+            hybrid_layer_pattern=hybrid_layer_pattern,
+            recompute_gdn=recompute_gdn,
         )
         set_args(args)
         torch.manual_seed(_SEED)
@@ -537,6 +579,21 @@ class TestMuonDecoupleFP8ParamGather:
         self._check_on_vs_off(
             fp8_recipe, overlap, n=30, num_experts=8, expert_model_parallel_size=ep
         )
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    @pytest.mark.parametrize("hybrid_layer_pattern", ["G", "K"], ids=["gdn", "kda"])
+    def test_gdn_recompute_mxfp8_backward_has_main_grad(self, hybrid_layer_pattern):
+        """Recomputed GDN/KDA retain ``main_grad`` under MXFP8 with overlap."""
+
+        if get_device_arch_version() < 10:
+            pytest.skip("MXFP8 requires Blackwell architecture or newer")
+
+        args, model, optimizer = self._build(
+            True, "mxfp8", True, hybrid_layer_pattern=hybrid_layer_pattern, recompute_gdn=True
+        )
+        self._run_steps(args, model, optimizer, 1)
 
     @pytest.mark.parametrize("fp8_recipe", ["blockwise", "mxfp8"])
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
