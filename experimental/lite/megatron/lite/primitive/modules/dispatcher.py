@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
@@ -57,6 +58,15 @@ def _tensor_hidden_bytes(x: torch.Tensor) -> int:
     return x.size(1) * max(x.element_size(), 2)
 
 
+@contextmanager
+def _deepep_nvtx_range(name: str):
+    if os.environ.get("MLITE_STEP_NVTX") != "1" or not torch.cuda.is_available():
+        yield
+        return
+    with torch.cuda.nvtx.range(name):
+        yield
+
+
 class _DeepEPDispatch(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -108,9 +118,10 @@ class _DeepEPDispatch(torch.autograd.Function):
         ctx.handle = handle
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
-        recv_per_expert_tensor = torch.tensor(
-            recv_per_expert, dtype=torch.int64, device=recv_hidden.device
-        )
+        # DeepEP already returns these counts as host metadata. Keep that
+        # canonical copy on CPU; consumers that need a device tensor can upload
+        # it once without forcing grouped MoE to synchronize it back.
+        recv_per_expert_tensor = torch.tensor(recv_per_expert, dtype=torch.int64)
         return recv_hidden, recv_indices, recv_probs, recv_per_expert_tensor, handle
 
     @staticmethod
@@ -124,14 +135,15 @@ class _DeepEPDispatch(torch.autograd.Function):
             else None
         )
         grad_scores = None if grad_recv_probs is None else grad_recv_probs.float()
-        grad_hidden, grad_topk_scores, after_event = ctx.buffer.combine(
-            grad_recv_hidden.contiguous(),
-            ctx.handle,
-            topk_weights=grad_scores,
-            previous_event=previous_event,
-            async_finish=ctx.async_finish,
-            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
-        )
+        with _deepep_nvtx_range("deepep_bwd/dispatch_combine"):
+            grad_hidden, grad_topk_scores, after_event = ctx.buffer.combine(
+                grad_recv_hidden.contiguous(),
+                ctx.handle,
+                topk_weights=grad_scores,
+                previous_event=previous_event,
+                async_finish=ctx.async_finish,
+                allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+            )
         if ctx.async_finish:
             after_event.current_stream_wait()
         return None, grad_hidden, None, grad_topk_scores, None, None, None
@@ -174,13 +186,14 @@ class _DeepEPCombine(torch.autograd.Function):
             if ctx.async_finish and EventHandle is not None and EventOverlap is not None
             else None
         )
-        grad_rank_grouped, _, _, _, _, after_event = ctx.buffer.dispatch(
-            grad_output.contiguous(),
-            handle=ctx.handle,
-            previous_event=previous_event,
-            async_finish=ctx.async_finish,
-            allocate_on_comm_stream=ctx.allocate_on_comm_stream,
-        )
+        with _deepep_nvtx_range("deepep_bwd/combine_dispatch"):
+            grad_rank_grouped, _, _, _, _, after_event = ctx.buffer.dispatch(
+                grad_output.contiguous(),
+                handle=ctx.handle,
+                previous_event=previous_event,
+                async_finish=ctx.async_finish,
+                allocate_on_comm_stream=ctx.allocate_on_comm_stream,
+            )
         if ctx.async_finish:
             after_event.current_stream_wait()
         return None, grad_rank_grouped, None, None, None

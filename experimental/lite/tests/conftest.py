@@ -54,7 +54,7 @@ def transformer_engine_import_stub(monkeypatch):
             import transformer_engine.pytorch  # noqa: F401
 
             return
-        except (ModuleNotFoundError, OSError) as exc:
+        except (ImportError, ModuleNotFoundError, OSError) as exc:
             if isinstance(exc, ModuleNotFoundError) and exc.name not in {
                 "transformer_engine",
                 "transformer_engine.pytorch",

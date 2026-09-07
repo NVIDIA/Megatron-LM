@@ -28,7 +28,10 @@ export_resync_weights = _MODULE.export_resync_weights
 def test_fp8_resync_exports_float32_block_scales() -> None:
     config = SimpleNamespace(
         expert_dtype="fp8",
-        quantization_config={"weight_block_size": [128, 128]},
+        quantization_config={
+            "weight_block_size": [128, 128],
+            "scale_fmt": "ue8m0",
+        },
     )
     source = torch.randn(128, 128, dtype=torch.bfloat16)
 
@@ -41,6 +44,68 @@ def test_fp8_resync_exports_float32_block_scales() -> None:
     )
 
     assert exported["layers.0.ffn.experts.0.up_proj.scale"].dtype == torch.float32
+
+
+def test_fp8_resync_preserves_unquantized_fp32_coefficients() -> None:
+    config = SimpleNamespace(
+        expert_dtype="fp8",
+        quantization_config={"weight_block_size": [128, 128]},
+    )
+    sink = torch.tensor([1.0001, -0.9999], dtype=torch.float32)
+    norm = torch.tensor([1.0001, -0.9999], dtype=torch.float32)
+    matrix = torch.randn(128, 128, dtype=torch.float32)
+
+    exported = dict(
+        export_resync_weights(
+            [
+                ("layers.0.attn.attn_sink", sink),
+                ("norm.weight", norm),
+                ("layers.0.attn.out_proj.weight", matrix),
+            ],
+            config,
+            resync_config={"expert_dtype": "fp8"},
+        )
+    )
+
+    assert exported["layers.0.attn.attn_sink"].dtype == torch.float32
+    assert torch.equal(exported["layers.0.attn.attn_sink"], sink)
+    assert not torch.equal(sink, sink.bfloat16().float())
+    assert exported["norm.weight"].dtype == torch.bfloat16
+    assert torch.equal(exported["norm.weight"], norm.bfloat16())
+    assert exported["layers.0.attn.out_proj.weight"].dtype == torch.float8_e4m3fn
+    assert exported["layers.0.attn.out_proj.scale"].dtype == torch.float32
+
+
+def test_fp8_resync_reuses_checkpoint_scale_and_bytes() -> None:
+    config = SimpleNamespace(
+        expert_dtype="fp8",
+        quantization_config={"weight_block_size": [128, 128]},
+    )
+    qweight = torch.randn(128, 128).clamp(-4, 4).to(torch.float8_e4m3fn)
+    scale = torch.tensor([[0.25]], dtype=torch.float32)
+    master = (
+        qweight.float()
+        * scale.repeat_interleave(128, 0).repeat_interleave(128, 1)
+    ).to(torch.bfloat16)
+
+    for source in (master, master.float()):
+        for name in (
+            "layers.0.attn.wq_a.weight",
+            "layers.0.ffn.experts.0.up_proj.weight",
+        ):
+            exported = dict(
+                export_resync_weights(
+                    [(name, source)],
+                    config,
+                    resync_config={"expert_dtype": "fp8"},
+                    source_scales={name: scale},
+                )
+            )
+
+            assert torch.equal(exported[name], qweight)
+            assert torch.equal(
+                exported[name.removesuffix(".weight") + ".scale"], scale
+            )
 
 
 def test_fp4_resync_uses_mxfp4_only_for_routed_experts(monkeypatch) -> None:

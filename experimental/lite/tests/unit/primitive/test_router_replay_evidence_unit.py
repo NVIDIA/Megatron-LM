@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn as nn
 from megatron.lite.primitive.modules.router_replay import (
     RouterReplay,
     RouterReplayAction,
@@ -145,3 +146,39 @@ def test_zero_changed_emits_a_warning_rather_than_silence(capsys):
     out = capsys.readouterr().out
     assert "R3_REPLAY_EVIDENCE" in out
     assert "R3_REPLAY_WARN changed=0" in out
+
+
+def test_replay_liveness_check_does_not_mask_a_pre_router_forward_error():
+    from types import SimpleNamespace
+
+    from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+
+    class Root(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.router = nn.Module()
+            self.router.router_replay = None
+
+    root = Root()
+    protocol = SimpleNamespace(
+        pack_routed_experts=lambda _model, _batch, _routed: [
+            torch.tensor([[0, 1]])
+        ],
+        pack_r3_replay_mask=lambda _model, _batch: None,
+    )
+    handle = SimpleNamespace(
+        _model=root,
+        _extras={"model_chunks": [root], "protocol": protocol},
+    )
+    driver = RouterReplayDriver(handle, "replay")
+    driver.begin()
+    stepped = driver.wrap(
+        lambda _model, _batch: (_ for _ in ()).throw(ValueError("sentinel forward error"))
+    )
+    batch = SimpleNamespace(routed_experts=torch.tensor([[[0, 1]]]))
+
+    try:
+        with pytest.raises(ValueError, match="sentinel forward error"):
+            stepped(root, batch)
+    finally:
+        driver.end()

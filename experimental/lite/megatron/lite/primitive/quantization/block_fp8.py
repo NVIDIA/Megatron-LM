@@ -64,7 +64,9 @@ def quantize_block_fp8(
     expanded = scale_f.repeat_interleave(block_m, dim=-2).repeat_interleave(
         block_k, dim=-1
     )
-    quantized = (source / expanded).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    quantized = (source * (1.0 / expanded)).clamp(-fp8_max, fp8_max).to(
+        torch.float8_e4m3fn
+    )
     return quantized, serialized_scale.contiguous()
 
 

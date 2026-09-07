@@ -190,9 +190,6 @@ def test_mlite_engine_runtime_thd_cp_uses_typed_packed_batch(
     torch = pytest.importorskip("torch")
     dist = pytest.importorskip("torch.distributed")
     TensorDict = pytest.importorskip("tensordict").TensorDict
-    from verl_mlite.compat import apply_runtime_patches
-
-    apply_runtime_patches()
     from verl_mlite.engine.config import MegatronLiteEngineConfig
     from verl_mlite.engine.mlite_engine import MegatronLiteEngine
 

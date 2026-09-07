@@ -98,8 +98,7 @@ For MXFP4, `quantize_weight` returns:
 }
 ```
 
-The vLLM compatibility/refit boundary is installed from
-`experimental/lite/examples/verl/verl_mlite/compat.py`.
+Weight transfer uses VERL's native bucketed sender and layerwise loader.
 
 ## MLite QAT versus verl ModelOpt QAT
 

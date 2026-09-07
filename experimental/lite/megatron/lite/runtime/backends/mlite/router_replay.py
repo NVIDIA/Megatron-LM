@@ -17,11 +17,6 @@ from megatron.lite.primitive.modules.router_replay import (
 )
 from megatron.lite.primitive.parallel.thd import parallel_state_from_model
 
-R3_SUPPORTED_MODELS = frozenset(
-    {"qwen3_moe", "qwen3_5", "deepseek_v4", "glm5", "kimi_k2"}
-)
-
-
 def _protocol_fn(protocol, name: str, fallback):
     fn = getattr(protocol, name, None) if protocol is not None else None
     return fn or fallback
@@ -46,14 +41,8 @@ class RouterReplayDriver:
         self._emitted_evidence = False
 
     def _replay_roots(self):
-        selector = (
-            getattr(self._protocol, "router_replay_roots", None)
-            if self._protocol is not None
-            else None
-        )
         for chunk in self._chunks:
-            roots = selector(chunk) if selector is not None else [chunk]
-            yield from roots
+            yield from protocol_utils.router_replay_roots(chunk)
 
     @classmethod
     def maybe_create(cls, handle, spec: Any) -> RouterReplayDriver | None:
@@ -121,9 +110,8 @@ class RouterReplayDriver:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
             RouterReplay.reset_replay_stats()
             try:
-                return forward_step(model, batch)
+                output = forward_step(model, batch)
             finally:
-                self._emit_replay_evidence()
                 # Pipeline schedules may recompute checkpointed router forwards
                 # after one or more newer micro-batches have run.  Those calls
                 # must consume the saved per-microbatch FIFO, not the latest
@@ -131,6 +119,11 @@ class RouterReplayDriver:
                 RouterReplay.set_global_router_replay_action(
                     RouterReplayAction.REPLAY_BACKWARD
                 )
+            # Check liveness only after a successful forward.  Raising from a
+            # finally block would replace the real pre-router failure with a
+            # misleading zero-call replay error.
+            self._emit_replay_evidence()
+            return output
 
         return stepped
 
@@ -210,4 +203,4 @@ class RouterReplayDriver:
         RouterReplay.clear_global_router_replay_instances()
 
 
-__all__ = ["R3_SUPPORTED_MODELS", "RouterReplayDriver"]
+__all__ = ["RouterReplayDriver"]

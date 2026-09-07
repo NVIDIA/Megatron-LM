@@ -52,6 +52,10 @@ class BenchCliConfig:
     use_thd: bool = False
     same_data_across_dp: bool = False
     no_optimizer: bool = False
+    forward_only: bool = False
+    empty_cache_between_steps: bool = False
+    enforce_steady_memory: bool = False
+    max_steady_peak_growth: float = 0.02
     skip_load_hf_weights: bool = False
     skip_optimizer_build: bool = False
     keep_experts: int | None = None
@@ -64,6 +68,8 @@ class BenchCliConfig:
     override_transformer_json: str = "{}"
     override_optimizer_json: str = "{}"
     impl_cfg_json: str = "{}"
+    normalize_deepep_topk_layout: bool = False
+    trace_fingerprints: bool = False
     dry_run: bool = False
     output_json: str | None = None
 
@@ -76,6 +82,34 @@ def _json_mapping(raw: str, *, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{name} must be a JSON object.")
     return value
+
+
+def _install_deepep_topk_layout_normalizer() -> None:
+    """Enforce the contiguous top-k layout required by the installed DeepEP ABI."""
+    from deep_ep.buffer import Buffer
+
+    original_layout = Buffer.get_dispatch_layout
+    if getattr(original_layout, "_mlite_contiguous_topk", False):
+        return
+
+    def contiguous_get_dispatch_layout(self, topk_idx, *args, **kwargs):
+        return original_layout(self, topk_idx.contiguous(), *args, **kwargs)
+
+    contiguous_get_dispatch_layout._mlite_contiguous_topk = True
+    Buffer.get_dispatch_layout = contiguous_get_dispatch_layout
+
+    original_dispatch = Buffer.dispatch
+
+    def contiguous_dispatch(self, *args, **kwargs):
+        topk_idx = kwargs.get("topk_idx")
+        if topk_idx is not None:
+            kwargs["topk_idx"] = topk_idx.contiguous()
+        topk_weights = kwargs.get("topk_weights")
+        if topk_weights is not None:
+            kwargs["topk_weights"] = topk_weights.contiguous()
+        return original_dispatch(self, *args, **kwargs)
+
+    Buffer.dispatch = contiguous_dispatch
 
 
 def _parallel_config(cfg: BenchCliConfig) -> ParallelConfig:
@@ -266,6 +300,8 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
             setattr(optimizer, key, value)
         impl_cfg = _json_mapping(cfg.impl_cfg_json, name="impl_cfg_json")
         impl_cfg.setdefault("use_thd", cfg.use_thd)
+        if cfg.no_optimizer:
+            impl_cfg.setdefault("optimizer", None)
         if cfg.model_name == "qwen3_5":
             from megatron.lite.primitive.deterministic import deterministic_requested
 
@@ -316,6 +352,10 @@ def build_session_config(cfg: BenchCliConfig) -> PretrainSessionConfig:
         use_thd=cfg.use_thd,
         same_data_across_dp=cfg.same_data_across_dp,
         no_optimizer=cfg.no_optimizer,
+        forward_only=cfg.forward_only,
+        empty_cache_between_steps=cfg.empty_cache_between_steps,
+        max_steady_peak_growth=cfg.max_steady_peak_growth,
+        trace_fingerprints=cfg.trace_fingerprints,
     )
 
 
@@ -371,17 +411,120 @@ def _step_reporter(trace: StepTrace) -> None:
     print(" ".join(parts), flush=True)
 
 
+def _benchmark_config_snapshot(cfg: BenchCliConfig) -> dict[str, Any]:
+    impl_cfg = _json_mapping(cfg.impl_cfg_json, name="impl_cfg_json")
+    optimizer_backend = impl_cfg.get("optimizer")
+    return {
+        "schema_version": 2,
+        "backend": cfg.backend,
+        "model_name": cfg.model_name,
+        "impl": cfg.impl,
+        "hf_path": cfg.hf_path,
+        "load_hf_weights": not cfg.skip_load_hf_weights,
+        "build_optimizer": not cfg.skip_optimizer_build,
+        "optimizer_backend": optimizer_backend,
+        "parallel": {
+            "tp": cfg.tp,
+            "etp": cfg.etp,
+            "ep": cfg.ep,
+            "pp": cfg.pp,
+            "vpp": cfg.vpp,
+            "cp": cfg.cp,
+        },
+        "schedule": {
+            "steps": cfg.steps,
+            "warmup": cfg.warmup,
+            "num_microbatches": cfg.num_microbatches,
+            "seq_len": cfg.seq_len,
+            "seed": cfg.seed,
+            "use_thd": cfg.use_thd,
+            "same_data_across_dp": cfg.same_data_across_dp,
+            "forward_only": cfg.forward_only,
+            "no_optimizer": cfg.no_optimizer,
+        },
+        "recompute": list(impl_cfg.get("recompute", [])),
+        "cache_deployment_weights": impl_cfg.get("cache_deployment_weights"),
+        "impl_config": impl_cfg,
+        "overrides": {
+            "ddp": _json_mapping(cfg.override_ddp_json, name="override_ddp_json"),
+            "transformer": _json_mapping(
+                cfg.override_transformer_json, name="override_transformer_json"
+            ),
+            "optimizer": _json_mapping(
+                cfg.override_optimizer_json, name="override_optimizer_json"
+            ),
+        },
+        "memory": {
+            "empty_cache_between_steps": cfg.empty_cache_between_steps,
+            "enforce_steady_memory": cfg.enforce_steady_memory,
+            "max_steady_peak_growth": cfg.max_steady_peak_growth,
+        },
+        "correctness": {
+            "trace_fingerprints": cfg.trace_fingerprints,
+        },
+        "fp8": {
+            "fused_weight_quant": os.environ.get(
+                "MLITE_VLLM_FUSED_WEIGHT_QUANT", "1"
+            ),
+            "fused_ue8m0_weight_quant": os.environ.get(
+                "MLITE_VLLM_FUSED_UE8M0_WEIGHT_QUANT", "1"
+            ),
+        },
+        "profiling": {
+            "nsys_capture": os.environ.get("MLITE_NSYS_CAPTURE") == "1",
+            "nsys_capture_step": os.environ.get("MLITE_NSYS_CAPTURE_STEP"),
+            "sync_phases": os.environ.get("MLITE_PROFILE_SYNC_PHASES") == "1",
+        },
+        "determinism": {
+            name: os.environ.get(name)
+            for name in (
+                "MEGATRON_LITE_DETERMINISTIC",
+                "VLLM_BATCH_INVARIANT",
+                "VERL_FULL_DETERMINISM",
+                "CUDA_DEVICE_MAX_CONNECTIONS",
+                "CUBLAS_WORKSPACE_CONFIG",
+                "CUBLASLT_WORKSPACE_SIZE",
+                "NVTE_ALLOW_NONDETERMINISTIC_ALGO",
+                "NCCL_ALGO",
+                "NCCL_COLLNET_ENABLE",
+                "NCCL_LAUNCH_MODE",
+                "NCCL_MAX_NCHANNELS",
+                "NCCL_MIN_NCHANNELS",
+                "NCCL_NTHREADS",
+                "NCCL_NVLS_ENABLE",
+                "NCCL_P2P_NET_DISABLE",
+                "NCCL_PROTO",
+                "NCCL_SOCKET_NTHREADS",
+            )
+        },
+        "provenance": {
+            "source_sha": os.environ.get("MLITE_SOURCE_SHA"),
+            "container_image": os.environ.get("MLITE_CONTAINER_IMAGE"),
+        },
+    }
+
+
 def run(cfg: BenchCliConfig) -> dict[str, Any]:
     if cfg.dry_run:
         return build_dry_run_plan(cfg)
 
+    if cfg.normalize_deepep_topk_layout:
+        _install_deepep_topk_layout_normalizer()
     rt_cfg = build_runtime_config(cfg)
     rt = create_runtime(rt_cfg)
     handle = rt.build_model()
     result = run_pretrain_session(
-        rt, handle, build_session_config(cfg), step_reporter=_step_reporter
+        rt,
+        handle,
+        build_session_config(cfg),
+        step_reporter=_step_reporter,
     )
-    return result.to_dict()
+    result.metadata["benchmark_config"] = _benchmark_config_snapshot(cfg)
+    artifact = result.to_dict()
+    close = getattr(rt, "close", None)
+    if close is not None:
+        close(handle)
+    return artifact
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -405,6 +548,22 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-thd", action="store_true")
     parser.add_argument("--same-data-across-dp", action="store_true")
     parser.add_argument("--no-optimizer", action="store_true")
+    parser.add_argument(
+        "--forward-only",
+        action="store_true",
+        help="Run the public runtime's eval/no-grad forward-only schedule.",
+    )
+    parser.add_argument(
+        "--empty-cache-between-steps",
+        action="store_true",
+        help="Diagnostic allocator A/B only; never enable for production timing.",
+    )
+    parser.add_argument(
+        "--enforce-steady-memory",
+        action="store_true",
+        help="Exit nonzero unless all-rank measured peak growth stays below the limit.",
+    )
+    parser.add_argument("--max-steady-peak-growth", type=float, default=0.02)
     parser.add_argument("--skip-load-hf-weights", action="store_true")
     parser.add_argument("--skip-optimizer-build", action="store_true")
     parser.add_argument("--keep-experts", type=int, default=None)
@@ -417,6 +576,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--override-transformer-json", default="{}")
     parser.add_argument("--override-optimizer-json", default="{}")
     parser.add_argument("--impl-cfg-json", default="{}")
+    parser.add_argument(
+        "--normalize-deepep-topk-layout",
+        action="store_true",
+        help="Benchmark-only compatibility shim for DeepEP builds requiring contiguous top-k indices.",
+    )
+    parser.add_argument(
+        "--trace-fingerprints",
+        action="store_true",
+        help="Record bounded per-step gradient and post-update parameter fingerprints.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--output-json", default=None)
     return parser
@@ -437,6 +606,13 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             output_path = Path(cfg.output_json)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(text + "\n", encoding="utf-8")
+    memory_gate = artifact.get("result", {}).get("metadata", {}).get("memory_gate", {})
+    if cfg.enforce_steady_memory and not memory_gate.get("passed", False):
+        raise SystemExit(
+            "all-rank steady memory gate failed: "
+            f"growth={memory_gate.get('max_steady_peak_growth')} "
+            f"limit={memory_gate.get('limit')}"
+        )
     return artifact
 
 

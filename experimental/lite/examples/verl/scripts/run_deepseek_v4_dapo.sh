@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # DeepSeek-V4 DAPO launcher.
 #
-# Validated hero dependency contract (CW H100, 2026-07-17):
-#   VERL: 6a937b63
+# Validated DS4 alignment dependency contract (CW H100, 2026-08-20):
 #   Python: 3.12
 #   PyTorch: 2.12.0a0 nv26.05, CUDA 13.2
-#   vLLM: 0.25.1
+#   vLLM: 0.26.1rc1.dev631+g5426311d9
 #   Transformer Engine: >= 2.15.0
 #   nvidia-cudnn-frontend: >= 1.27.0, with DSA q_causal_offsets
-#   FlashInfer: 0.6.13
-#   nvidia-cutlass-dsl: 4.5.2
-#   TileLang: 0.1.9
+#   FlashInfer: 0.6.16.post3
+#   nvidia-cutlass-dsl: 4.6.2
+#   TileLang: 0.1.12
 #
 # validate_deepseek_v4_dapo.py enforces this contract before a real run.
 set -euo pipefail
@@ -48,6 +47,7 @@ ACTOR_PP="${ACTOR_PP:-4}"
 ACTOR_CP="${ACTOR_CP:-4}"
 ACTOR_EP="${ACTOR_EP:-8}"
 ROLLOUT_TP="${ROLLOUT_TP:-8}"
+ROLLOUT_EP="${ROLLOUT_EP:-1}"
 
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-32}"
@@ -55,6 +55,7 @@ MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-6144}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.60}"
+ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
 
 PARAM_OFFLOAD="${PARAM_OFFLOAD:-True}"
 OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-True}"
@@ -78,7 +79,6 @@ EXAMPLE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -L)"
 LITE_ROOT="$(cd "${EXAMPLE_ROOT}/../.." && pwd -L)"
 REPO_ROOT="$(cd "${LITE_ROOT}/../.." && pwd -L)"
 VALIDATOR="${SCRIPT_DIR}/validate_deepseek_v4_dapo.py"
-CHAT_TEMPLATE_FILE="${SCRIPT_DIR}/deepseek_v4_chat_template.jinja"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${EXAMPLE_ROOT}/outputs/ds4_dapo}"
 
 add_pythonpath() {
@@ -94,21 +94,17 @@ add_pythonpath "${VERL_ROOT:-}"
 add_pythonpath "${MEGATRON_ROOT:-}"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export VLLM_USE_V1=1
-export VERL_VLLM_FP8_QUANT_ENABLED=1
 
 case "${ROLLOUT_WEIGHT_BITS}" in
   4)
     ROLLOUT_RESYNC_FORMAT=mxfp4
     ROLLOUT_EXPERT_DTYPE=fp4
-    ROLLOUT_MOE_BACKEND=marlin
-    ROLLOUT_SCALE_FMT=ue8m0
+    ROLLOUT_MOE_BACKEND="${ROLLOUT_MOE_BACKEND:-marlin}"
     ;;
   8)
     ROLLOUT_RESYNC_FORMAT=block_fp8
     ROLLOUT_EXPERT_DTYPE=fp8
-    ROLLOUT_MOE_BACKEND=flashinfer_cutlass
-    ROLLOUT_SCALE_FMT=float32
+    ROLLOUT_MOE_BACKEND="${ROLLOUT_MOE_BACKEND:-flashinfer_cutlass}"
     ;;
   *)
     echo "ROLLOUT_WEIGHT_BITS must be 4 or 8, got ${ROLLOUT_WEIGHT_BITS}" >&2
@@ -180,8 +176,6 @@ python3 "${VALIDATOR}" geometry \
   --model-config "${MODEL_PATH}/config.json" \
   --rollout-tp "${ROLLOUT_TP}"
 
-DS4_CHAT_TEMPLATE="${DEEPSEEK_V4_FLASH_CHAT_TEMPLATE:-$(<"${CHAT_TEMPLATE_FILE}")}"
-
 # ---------------------------------------------------------------------------
 # Hydra configuration
 # ---------------------------------------------------------------------------
@@ -204,8 +198,10 @@ DATA=(
   "data.return_raw_chat=True"
   "data.max_prompt_length=${MAX_PROMPT_LENGTH}"
   "data.max_response_length=${MAX_RESPONSE_LENGTH}"
-  "data.filter_overlong_prompts=True"
-  "+data.apply_chat_template_kwargs.chat_template='${DS4_CHAT_TEMPLATE}'"
+  "data.filter_overlong_prompts=False"
+  "data.continuous_token.enable=True"
+  "data.continuous_token.model_family=deepseekv4"
+  "+data.apply_chat_template_kwargs.enable_thinking=True"
   "data.truncation=error"
   "data.dataloader_num_workers=8"
 )
@@ -214,7 +210,7 @@ MODEL=(
   "actor_rollout_ref.model.path=${MODEL_PATH}"
   "actor_rollout_ref.model.trust_remote_code=True"
   "actor_rollout_ref.model.use_fused_kernels=True"
-  "actor_rollout_ref.model.custom_chat_template='${DS4_CHAT_TEMPLATE}'"
+  "actor_rollout_ref.model.custom_chat_template=null"
 )
 
 ACTOR=(
@@ -247,6 +243,8 @@ ACTOR=(
   "actor_rollout_ref.actor.engine.cp=${ACTOR_CP}"
   "actor_rollout_ref.actor.engine.ep=${ACTOR_EP}"
   "actor_rollout_ref.actor.engine.etp=1"
+  "+actor_rollout_ref.actor.engine.rollout_ep=${ROLLOUT_EP}"
+  "+actor_rollout_ref.actor.engine.rollout_tp=${ROLLOUT_TP}"
   "actor_rollout_ref.actor.engine.param_offload=${PARAM_OFFLOAD}"
   "actor_rollout_ref.actor.engine.optimizer_offload=${OPTIMIZER_OFFLOAD}"
   "actor_rollout_ref.actor.engine.grad_offload=${GRAD_OFFLOAD}"
@@ -283,11 +281,17 @@ VLLM_CONFIG="actor_rollout_ref.rollout.engine_kwargs.vllm"
 VLLM_QUANT_CONFIG="${VLLM_CONFIG}.hf_overrides.quantization_config"
 VLLM_WORKER_EXTENSION="verl.workers.rollout.vllm_rollout.utils"
 VLLM_WORKER_EXTENSION+=".vLLMColocateWorkerExtension"
+CUDA_ARCH_MAJOR="$(python3 -c 'import torch; print(torch.cuda.get_device_capability()[0])')"
+if [[ "${CUDA_ARCH_MAJOR}" == 9 ]]; then
+  VLLM_WORKER_EXTENSION="verl_mlite.rollout.vllm_worker"
+  VLLM_WORKER_EXTENSION+=".MLiteVLLMColocateWorkerExtension"
+fi
 
 ROLLOUT=(
   "actor_rollout_ref.rollout.name=vllm"
   "actor_rollout_ref.rollout.mode=async"
   "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}"
+  "actor_rollout_ref.rollout.expert_parallel_size=${ROLLOUT_EP}"
   "actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION}"
   "actor_rollout_ref.rollout.n=${ROLLOUT_N}"
   "actor_rollout_ref.rollout.calculate_log_probs=True"
@@ -298,7 +302,8 @@ ROLLOUT=(
   "actor_rollout_ref.rollout.response_length=${MAX_RESPONSE_LENGTH}"
   "actor_rollout_ref.rollout.max_model_len=${MAX_SEQ_LEN}"
   "actor_rollout_ref.rollout.max_num_seqs=32"
-  "actor_rollout_ref.rollout.max_num_batched_tokens=${MAX_SEQ_LEN}"
+  "actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
+  "actor_rollout_ref.rollout.enable_chunked_prefill=True"
   "actor_rollout_ref.rollout.temperature=1.0"
   "actor_rollout_ref.rollout.top_p=1.0"
   "actor_rollout_ref.rollout.top_k=-1"
@@ -318,7 +323,7 @@ ROLLOUT=(
   "+${VLLM_QUANT_CONFIG}.activation_scheme=dynamic"
   "+${VLLM_QUANT_CONFIG}.fmt=e4m3"
   "+${VLLM_QUANT_CONFIG}.quant_method=fp8"
-  "+${VLLM_QUANT_CONFIG}.scale_fmt=${ROLLOUT_SCALE_FMT}"
+  "+${VLLM_QUANT_CONFIG}.scale_fmt=ue8m0"
   "+${VLLM_QUANT_CONFIG}.weight_block_size=[128,128]"
 )
 
@@ -375,7 +380,9 @@ if [[ "${COMPOSE_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
-python3 "${VALIDATOR}" environment
+if [[ "${VALIDATE_DS4_ENVIRONMENT:-1}" == "1" ]]; then
+  python3 "${VALIDATOR}" environment
+fi
 
 echo "[ds4-dapo] weights=expert-w${ROLLOUT_WEIGHT_BITS}/dense-w8 qat=${ENABLE_QAT} r3=${ENABLE_R3}"
 echo "[ds4-dapo] train=${TRAIN_FILES} val=${VAL_FILES} cmd=${CMD_FILE}"

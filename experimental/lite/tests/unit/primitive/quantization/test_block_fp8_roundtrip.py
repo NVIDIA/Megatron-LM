@@ -96,3 +96,25 @@ def test_roundtrip_is_deterministic() -> None:
     _, _, a = _roundtrip(source)
     _, _, b = _roundtrip(source)
     assert torch.equal(a, b)
+
+
+def test_quantize_matches_deep_gemm_operation_order_bytewise() -> None:
+    """Keep checkpoint/resync packing bytewise with DeepGEMM deployment packing."""
+    torch.manual_seed(20260822)
+    source = (torch.randn(256, 256) * 0.02).bfloat16()
+    quantized, scales = quantize_block_fp8(
+        source, (128, 128), scale_format="float32"
+    )
+
+    blocked = source.float().reshape(2, 128, 2, 128)
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    reference_scales = blocked.abs().amax(dim=(1, 3)).clamp_min(1e-4) / fp8_max
+    expanded = reference_scales.repeat_interleave(128, dim=0).repeat_interleave(
+        128, dim=1
+    )
+    reference = (source.float() * (1.0 / expanded)).clamp(
+        -fp8_max, fp8_max
+    ).to(torch.float8_e4m3fn)
+
+    assert torch.equal(scales, reference_scales)
+    assert torch.equal(quantized.view(torch.uint8), reference.view(torch.uint8))

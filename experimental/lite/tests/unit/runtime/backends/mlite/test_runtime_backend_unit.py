@@ -44,6 +44,54 @@ def test_runtime_returns_loss_separately_from_microbatch_metrics():
     assert result.model_output.loss is not None
 
 
+def test_zero_grad_without_optimizer_clears_parameter_gradients():
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    model = nn.Linear(2, 1, bias=False)
+    model.weight.grad = torch.ones_like(model.weight)
+    handle = ModelHandle(
+        model=model,
+        optimizer=None,
+        _extras={"model_chunks": [model]},
+    )
+
+    runtime.zero_grad(handle)
+
+    assert model.weight.grad is None
+
+
+def test_post_step_scale_invalidation_requires_a_successful_optimizer_update():
+    calls = []
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    model = nn.Linear(1, 1, bias=False)
+
+    no_optim = ModelHandle(
+        model=model,
+        optimizer=None,
+        _extras={"post_optimizer_step_hook": lambda: calls.append("no_optim")},
+    )
+    assert runtime.optimizer_step(no_optim) == (True, 0.0, 0)
+    assert calls == []
+
+    class Optimizer:
+        def __init__(self):
+            self.success = False
+
+        def step(self):
+            return self.success, torch.tensor(1.5), 0
+
+    optimizer = Optimizer()
+    fsdp2 = ModelHandle(
+        model=model,
+        optimizer=optimizer,
+        _extras={"post_optimizer_step_hook": lambda: calls.append("fsdp2")},
+    )
+    assert runtime.optimizer_step(fsdp2) == (False, 1.5, 0)
+    assert calls == []
+    optimizer.success = True
+    assert runtime.optimizer_step(fsdp2) == (True, 1.5, 0)
+    assert calls == ["fsdp2"]
+
+
 def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
     context = LossContext(source_batch="source")
     seen = []
@@ -99,14 +147,13 @@ def test_mlite_config_impl_cfg_optimizer_and_load_gate():
     hook = lambda cfg: cfg  # noqa: E731
     cfg = MegatronLiteConfig(
         model_name="qwen3_moe",
-        impl_cfg={"recompute": "full", "use_deepep": True},
+        impl_cfg={"recompute": "full"},
         optimizer=OptimizerConfig(lr=1e-4, weight_decay=0.1, adam_beta1=0.9),
         load_hf_weights=False,
         model_config_hook=hook,
     )
 
     assert cfg.impl_cfg["recompute"] == "full"
-    assert cfg.impl_cfg["use_deepep"] is True
     assert cfg.optimizer.lr == 1e-4
     assert cfg.optimizer.adam_beta1 == 0.9
     assert cfg.load_hf_weights is False
@@ -553,11 +600,23 @@ def test_megatron_ddp_detection_accepts_ddp_and_subclasses(monkeypatch):
 
 @pytest.mark.parametrize("model_cls", [_FakeMegatronDDP, _FakeMegatronDDPSubclass])
 def test_megatron_ddp_model_move_helpers_use_buffer_path(monkeypatch, model_cls):
+    import megatron.lite.runtime.megatron_utils as megatron_utils
     from megatron.lite.runtime.megatron_utils import load_model_to_gpu, offload_model_to_cpu
 
     _install_fake_megatron_ddp(monkeypatch)
     model = model_cls()
     buffer = model.buffer
+    pinned_copies = []
+
+    def fake_pinned_cpu_copy(tensor):
+        pinned_copies.append(tensor)
+        return tensor.cpu().pin_memory()
+
+    monkeypatch.setattr(
+        megatron_utils,
+        "_pinned_cpu_copy",
+        fake_pinned_cpu_copy,
+    )
 
     offload_model_to_cpu([model])
 
@@ -577,6 +636,14 @@ def test_megatron_ddp_model_move_helpers_use_buffer_path(monkeypatch, model_cls)
     assert buffer.param_data.copied_from is buffer.param_data.cpu_data
     assert buffer.param_data.copy_non_blocking is True
     assert buffer.grad_data.zero_calls == 1
+
+    cpu_data = buffer.param_data.cpu_data
+    offload_model_to_cpu([model])
+
+    assert pinned_copies == [buffer.param_data]
+    assert buffer.param_data.cpu_data is cpu_data
+    assert cpu_data.copied_from is buffer.param_data
+    assert cpu_data.copy_non_blocking is False
 
 
 def test_native_model_move_helpers_do_not_require_megatron_core(monkeypatch):

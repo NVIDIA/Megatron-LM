@@ -82,6 +82,42 @@ def test_runtime_local_checkpoint_load_matches_uninterrupted_training(tmp_path):
     _assert_model_close(direct_model, loaded_model)
 
 
+def test_runtime_local_checkpoint_honors_selective_restore(tmp_path):
+    saved_model = TinyMLP()
+    saved_optimizer = torch.optim.AdamW(saved_model.parameters(), lr=1.0e-3)
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+    runtime.save_checkpoint(
+        ModelHandle(model=saved_model, optimizer=saved_optimizer),
+        str(tmp_path),
+        step=1,
+        use_dcp=False,
+    )
+
+    loaded_model = TinyMLP()
+    loaded_optimizer = torch.optim.AdamW(loaded_model.parameters(), lr=2.0e-3)
+    model_before = copy.deepcopy(loaded_model)
+    runtime.load_checkpoint(
+        ModelHandle(model=loaded_model, optimizer=loaded_optimizer),
+        str(tmp_path),
+        use_dcp=False,
+        load_model=False,
+        load_optimizer=True,
+    )
+    _assert_model_close(loaded_model, model_before)
+    assert loaded_optimizer.param_groups[0]["lr"] == 1.0e-3
+
+    optimizer_before = copy.deepcopy(loaded_optimizer.state_dict())
+    runtime.load_checkpoint(
+        ModelHandle(model=loaded_model, optimizer=loaded_optimizer),
+        str(tmp_path),
+        use_dcp=False,
+        load_model=True,
+        load_optimizer=False,
+    )
+    _assert_model_close(loaded_model, saved_model)
+    assert loaded_optimizer.state_dict() == optimizer_before
+
+
 class DistOptLike:
     """Small optimizer wrapper with the same checkpoint contract as dist_opt."""
 

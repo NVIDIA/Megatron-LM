@@ -6,13 +6,11 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.primitive import transformer_engine as te
-# Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core.
-# The development branch groups them under the csa_utils package.
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     cp_layout_kernels as csa_cp_layout_kernels,
+    cp_utils,
 )
-from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.core.transformer.experimental_attention_variant.csa import (
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,

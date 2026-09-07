@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import ast
 import io
+import json
+import sys
 import tokenize
 from collections.abc import Iterable
 from pathlib import Path
@@ -15,6 +17,10 @@ pytestmark = pytest.mark.optional
 
 LITE_ROOT = Path(__file__).resolve().parents[3]
 VERL_MLITE_ROOT = LITE_ROOT / "examples" / "verl" / "verl_mlite"
+DS4_DAPO_SCRIPT = LITE_ROOT / "examples" / "verl" / "scripts" / "run_deepseek_v4_dapo.sh"
+VERL_SCRIPTS = LITE_ROOT / "examples" / "verl" / "scripts"
+sys.path.insert(0, str(VERL_SCRIPTS))
+from validate_alignment_metrics import validate  # noqa: E402
 
 MODEL_PACKAGE_PREFIXES = (
     "megatron.lite.model.deepseek_v4",
@@ -101,3 +107,41 @@ def test_verl_mlite_layer_does_not_see_model_internal_batch_fields() -> None:
         _python_files(VERL_MLITE_ROOT), {"packed_seq_params", "position_ids", "to_bridge_dict"}
     )
     assert violations == []
+
+
+def test_deepseek_v4_rollout_preserves_ue8m0_scale_contract() -> None:
+    script = DS4_DAPO_SCRIPT.read_text(encoding="utf-8")
+    assert '"+${VLLM_QUANT_CONFIG}.fmt=e4m3"' in script
+    assert '"+${VLLM_QUANT_CONFIG}.scale_fmt=ue8m0"' in script
+
+
+def test_deepseek_v4_rollout_uses_native_continuous_token_encoder() -> None:
+    script = DS4_DAPO_SCRIPT.read_text(encoding="utf-8")
+    assert '"data.continuous_token.enable=True"' in script
+    assert '"data.continuous_token.model_family=deepseekv4"' in script
+    assert '"data.filter_overlong_prompts=False"' in script
+    assert '"+data.apply_chat_template_kwargs.enable_thinking=True"' in script
+    assert '"actor_rollout_ref.model.custom_chat_template=null"' in script
+    assert "DS4_CHAT_TEMPLATE" not in script
+    assert "DEEPSEEK_V4_FLASH_CHAT_TEMPLATE" not in script
+
+
+def test_alignment_gate_accepts_upstream_verl_metrics(tmp_path: Path) -> None:
+    metrics = tmp_path / "metrics.jsonl"
+    records = []
+    for step in (1, 2):
+        records.append(
+            {
+                "step": step,
+                "data": {
+                    "training/rollout_probs_diff_valid": 1,
+                    "training/rollout_probs_diff_max": 0.0,
+                    "training/rollout_probs_diff_mean": 0.0,
+                    "training/rollout_probs_diff_std": 0.0,
+                    "rollout_corr/k3_kl": 0.0,
+                },
+            }
+        )
+    metrics.write_text("\n".join(json.dumps(record) for record in records))
+
+    validate(metrics, expected_steps=2)

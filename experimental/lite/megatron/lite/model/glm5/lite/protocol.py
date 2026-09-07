@@ -30,7 +30,6 @@ from megatron.lite.model.protocol_utils import (
     nested_from_packed,
     pack_r3_replay_mask as _pack_r3_replay_mask,
     pack_routed_experts as _pack_routed_experts,
-    router_replay_roots as router_replay_roots,
     set_cross_entropy_fusion,
 )
 from megatron.lite.primitive.bundle import ModelBundle
@@ -50,6 +49,9 @@ from megatron.lite.primitive.quantization import (
 )
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.data import PackedBatch
+
+
+SUPPORTS_LOCAL_EXPERT_SHARD = True
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:
@@ -442,6 +444,7 @@ __all__ = [
     "EXPERT_CLASSIFIER",
     "ImplConfig",
     "PLACEMENT_FN",
+    "SUPPORTS_LOCAL_EXPERT_SHARD",
     "build_model",
     "build_model_config",
     "export_hf_weights",

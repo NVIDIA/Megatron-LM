@@ -14,6 +14,7 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.utils.parametrize as parametrize
+from megatron.lite.model.protocol_utils import router_replay_roots
 from megatron.lite.primitive.modules.router_replay import (
     attach_router_replay,
     detach_router_replay,
@@ -714,7 +715,7 @@ def test_supported_model_replay_roots_are_exact_decoder_layers(
     )
     expected = _layers(case.chunk)
 
-    roots = case.protocol.router_replay_roots(case.chunk)
+    roots = router_replay_roots(case.chunk)
 
     assert roots == expected
     assert len(roots) == len(case.chunk.model.layers)
@@ -741,7 +742,7 @@ def test_supported_model_mtp_off_replay_attachment_count_is_unchanged(
     old_count = attach_router_replay(case.chunk, reset=False)
     detach_router_replay(case.chunk)
 
-    roots = case.protocol.router_replay_roots(case.chunk)
+    roots = router_replay_roots(case.chunk)
     new_count = sum(attach_router_replay(root, reset=False) for root in roots)
     try:
         assert old_count == len(case.chunk.model.layers)
@@ -763,7 +764,7 @@ def test_supported_model_attaches_replay_only_to_decoder_router_count(
         monkeypatch,
         mtp_enabled=True,
     )
-    roots = case.protocol.router_replay_roots(case.chunk)
+    roots = router_replay_roots(case.chunk)
 
     count = sum(attach_router_replay(root, reset=False) for root in roots)
     try:

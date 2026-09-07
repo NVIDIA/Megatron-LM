@@ -16,7 +16,9 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.lite.primitive.ckpt import dcp
 from megatron.lite.primitive.ckpt.distckpt import (
     _dist_opt_checkpoint_metadata,
+    _MemoryEfficientDistSaveStrategy,
     _model_sharded_state_dict,
+    _NodeLocalDistSaveStrategy,
     _rank_offsets_and_replica_id,
     _single_or_all_model_state,
     _synchronize_native_optimizer_steps,
@@ -81,6 +83,97 @@ def test_optimizer_checkpoint_roundtrips_rank_local_state(tmp_path) -> None:
     _assert_state_equal(optimizer.state_dict(), expected)
 
 
+def test_optimizer_checkpoint_load_uses_mmap(monkeypatch, tmp_path) -> None:
+    model = torch.nn.Linear(4, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    dcp._save_optimizer_checkpoint(optimizer, str(tmp_path))
+    original_load = dcp.torch.load
+    load_kwargs = {}
+
+    def observed_load(*args, **kwargs):
+        load_kwargs.update(kwargs)
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(dcp.torch, "load", observed_load)
+
+    dcp._load_optimizer_checkpoint(optimizer, str(tmp_path))
+
+    assert load_kwargs["mmap"] is True
+
+
+def test_dcp_local_stage_publishes_completed_shard(tmp_path) -> None:
+    stage_root = tmp_path / "stage"
+    destination = tmp_path / "checkpoint" / "__0_0.distcp"
+    filesystem = dcp._NodeLocalStagingFileSystem(stage_root)
+
+    with filesystem.create_stream(str(destination), "wb") as stream:
+        stream.write(b"checkpoint bytes")
+
+    assert destination.read_bytes() == b"checkpoint bytes"
+    assert not list(stage_root.rglob("*.stage"))
+
+
+def test_dcp_local_stage_does_not_publish_failed_write(tmp_path) -> None:
+    stage_root = tmp_path / "stage"
+    destination = tmp_path / "checkpoint" / "__0_0.distcp"
+    filesystem = dcp._NodeLocalStagingFileSystem(stage_root)
+
+    with (
+        pytest.raises(RuntimeError, match="write failed"),
+        filesystem.create_stream(str(destination), "wb") as stream,
+    ):
+        stream.write(b"partial checkpoint bytes")
+        raise RuntimeError("write failed")
+
+    assert not destination.exists()
+    assert not list(stage_root.rglob("*.stage"))
+
+
+def test_fsdp2_dcp_writer_is_single_threaded_and_local_stage_is_opt_in(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("MLITE_DCP_LOCAL_STAGE_DIR", raising=False)
+    writer = dcp._staged_dcp_writer(str(tmp_path / "checkpoint"))
+    assert writer.thread_count == 1
+    assert not isinstance(writer.fs, dcp._NodeLocalStagingFileSystem)
+
+    monkeypatch.setenv("MLITE_DCP_LOCAL_STAGE_DIR", str(tmp_path / "stage"))
+    writer = dcp._staged_dcp_writer(str(tmp_path / "checkpoint"))
+
+    assert writer.thread_count == 1
+    assert isinstance(writer.fs, dcp._NodeLocalStagingFileSystem)
+
+
+def test_dcp_local_stage_publishes_optimizer(monkeypatch, tmp_path) -> None:
+    stage_root = tmp_path / "stage"
+    monkeypatch.setenv("MLITE_DCP_LOCAL_STAGE_DIR", str(stage_root))
+    model = torch.nn.Linear(4, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+
+    dcp._save_optimizer_checkpoint(optimizer, str(tmp_path))
+
+    checkpoint = tmp_path / "optimizer_rank_0.pt"
+    assert checkpoint.exists()
+    _assert_state_equal(
+        torch.load(checkpoint, weights_only=False), optimizer.state_dict()
+    )
+    assert not list(stage_root.rglob("*.stage"))
+
+
+def test_dcp_local_stage_publishes_rng_sidecar(monkeypatch, tmp_path) -> None:
+    stage_root = tmp_path / "stage"
+    monkeypatch.setenv("MLITE_DCP_LOCAL_STAGE_DIR", str(stage_root))
+    expected = {"torch_rng_state": torch.arange(4)}
+    monkeypatch.setattr(dcp, "_get_rng_state", lambda: expected)
+
+    dcp._save_rng_sidecar(tmp_path)
+
+    checkpoint = tmp_path / "rng_state_rank_00000.pt"
+    assert checkpoint.exists()
+    _assert_state_equal(torch.load(checkpoint, weights_only=False), expected)
+    assert not list(stage_root.rglob("*.stage"))
+
+
 class FakeDistOpt:
     def __init__(self):
         self.save_model_sd = None
@@ -114,7 +207,7 @@ class FakeWrapper(torch.nn.Module):
 
 
 DISTOPT_METADATA = {
-    "distrib_optim_sharding_type": "fully_reshardable",
+    "distrib_optim_sharding_type": "dp_reshardable",
     "distrib_optim_fully_reshardable_mem_efficient": False,
     "chained_optim_avoid_prefix": True,
 }
@@ -145,7 +238,61 @@ def test_dist_opt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path)
     assert saved["checkpoint_dir"] == str(tmp_path / "step_5")
     assert saved["kwargs"]["validate_access_integrity"] is False
     assert saved["kwargs"]["content_metadata"] == DISTOPT_METADATA
+    assert isinstance(saved["kwargs"]["sharded_strategy"], _MemoryEfficientDistSaveStrategy)
     assert not (tmp_path / "step_5" / "optimizer_rank_0.pt").exists()
+
+
+def test_dist_opt_checkpoint_uses_local_stage_strategy(monkeypatch, tmp_path) -> None:
+    model = torch.nn.Linear(4, 2)
+    optimizer = FakeDistOpt()
+    attach_model_sharded_state_dict([model], ParallelState())
+    saved = {}
+
+    def fake_save(_state_dict, _checkpoint_dir, **kwargs):
+        saved.update(kwargs)
+
+    monkeypatch.setenv("MLITE_DCP_LOCAL_STAGE_DIR", str(tmp_path / "stage"))
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.save", fake_save
+    )
+
+    dcp.save_training_checkpoint(model, optimizer, 5, str(tmp_path), use_dcp=True)
+
+    strategy = saved["sharded_strategy"]
+    assert isinstance(strategy, _NodeLocalDistSaveStrategy)
+    assert strategy._stage_root == tmp_path / "stage"
+
+
+def test_dist_opt_local_stage_saves_checkpoint_end_to_end(
+    monkeypatch, tmp_path
+) -> None:
+    if torch.distributed.is_initialized():
+        pytest.skip("requires ownership of the default process group")
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{tmp_path / 'dist-init'}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        stage_root = tmp_path / "stage"
+        checkpoint_root = tmp_path / "checkpoint"
+        monkeypatch.setenv("MLITE_DCP_LOCAL_STAGE_DIR", str(stage_root))
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+        model = torch.nn.Linear(4, 2)
+        attach_model_sharded_state_dict([model], ParallelState())
+
+        dcp.save_training_checkpoint(
+            model, None, 5, str(checkpoint_root), use_dcp=True
+        )
+
+        step_path = checkpoint_root / "step_5"
+        assert (step_path / ".metadata").exists()
+        assert list(step_path.glob("*.distcp"))
+        assert not list(stage_root.rglob("*.stage"))
+    finally:
+        torch.distributed.destroy_process_group()
 
 
 def test_dist_opt_checkpoint_offsets_cover_tp_pp_ep_etp_topology() -> None:
@@ -388,3 +535,30 @@ def test_runtime_checkpoint_api_passes_current_training_checkpoint_signature(
         },
     )
     assert loaded_step == 7
+
+
+@pytest.mark.parametrize("load_model, expected_calls", [(True, 1), (False, 0)])
+def test_runtime_checkpoint_invalidates_state_only_after_model_load(
+    monkeypatch, tmp_path, load_model, expected_calls
+) -> None:
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.load_training_checkpoint",
+        lambda *_args, **_kwargs: 0,
+    )
+    calls = []
+    model = torch.nn.Linear(1, 1)
+    handle = ModelHandle(
+        model=model,
+        optimizer=object(),
+        parallel_state=object(),
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(tp=1, etp=1, ep=1, pp=1, cp=1)
+        ),
+        _extras={"post_optimizer_step_hook": lambda: calls.append("post_update")},
+    )
+
+    MegatronLiteRuntime.__new__(MegatronLiteRuntime).load_checkpoint(
+        handle, str(tmp_path), load_model=load_model
+    )
+
+    assert calls == ["post_update"] * expected_calls

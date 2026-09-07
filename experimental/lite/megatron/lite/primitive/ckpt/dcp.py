@@ -22,6 +22,13 @@ import torch.nn as nn  # pyright: ignore[reportMissingImports]
 from torch.distributed.device_mesh import DeviceMesh  # pyright: ignore[reportMissingImports]
 from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 
+from megatron.lite.primitive.ckpt.local_stage import (
+    NodeLocalStagingFileSystem as _NodeLocalStagingFileSystem,
+)
+from megatron.lite.primitive.ckpt.local_stage import (
+    local_stage_root,
+)
+from megatron.lite.primitive.ckpt.local_stage import publish_staged_file as _publish_staged_file
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
@@ -88,7 +95,12 @@ def save_training_checkpoint(
 
     ckpt_path = os.path.join(path, f"step_{step}")
     os.makedirs(ckpt_path, exist_ok=True)
-    dcp.save(state_dict, checkpoint_id=ckpt_path)
+    storage_writer = _staged_dcp_writer(ckpt_path)
+    dcp.save(
+        state_dict,
+        checkpoint_id=ckpt_path,
+        storage_writer=storage_writer,
+    )
     if save_optimizer:
         _save_optimizer_checkpoint(optimizer, ckpt_path)
     if save_rng:
@@ -121,6 +133,8 @@ def load_training_checkpoint(
             path,
             load_rng=load_rng,
             load_parameter_state_update_legacy_format=load_parameter_state_update_legacy_format,
+            load_model=load_model,
+            load_optimizer=load_optimizer,
         )
     ckpt_path = _resolve_step_checkpoint_path(path)
     if _supports_dist_opt_distckpt(model, optimizer):
@@ -205,7 +219,13 @@ def _save_dist_opt_checkpoint(
     from megatron.lite.primitive.ckpt.distckpt import save_dist_opt_checkpoint
 
     save_dist_opt_checkpoint(
-        model, optimizer, step, path, save_model=save_model, save_optimizer=save_optimizer
+        model,
+        optimizer,
+        step,
+        path,
+        save_model=save_model,
+        save_optimizer=save_optimizer,
+        local_stage_root=local_stage_root(),
     )
 
 
@@ -229,6 +249,33 @@ def _optimizer_checkpoint_path(path: str) -> str:
     return os.path.join(path, f"optimizer_rank_{rank}.pt")
 
 
+def _staged_dcp_writer(checkpoint_path: str):
+    # One writer bounds D2H staging to one tensor.  More writer threads trade
+    # host-memory peak for throughput, which is undesirable for colocated RL.
+    writer = dcp.FileSystemWriter(checkpoint_path, thread_count=1)
+    filesystem = _local_staging_filesystem()
+    if filesystem is None:
+        return writer
+    writer.fs = filesystem
+    return writer
+
+
+def _local_staging_filesystem() -> _NodeLocalStagingFileSystem | None:
+    stage_root = local_stage_root()
+    return _NodeLocalStagingFileSystem(stage_root) if stage_root is not None else None
+
+
+def _torch_save_with_optional_staging(
+    state: Any, destination: str | os.PathLike[str]
+) -> None:
+    filesystem = _local_staging_filesystem()
+    if filesystem is None:
+        torch.save(state, destination)
+        return
+    with filesystem.create_stream(os.fspath(destination), "wb") as stream:
+        torch.save(state, stream)
+
+
 def _save_optimizer_checkpoint(optimizer, path: str) -> None:
     if optimizer is None:
         log_rank0("Skipping optimizer checkpoint save because optimizer is None")
@@ -236,7 +283,9 @@ def _save_optimizer_checkpoint(optimizer, path: str) -> None:
     state_dict_fn = getattr(optimizer, "state_dict", None)
     if not callable(state_dict_fn):
         raise TypeError(f"Optimizer {type(optimizer).__name__} does not provide state_dict().")
-    torch.save(state_dict_fn(), _optimizer_checkpoint_path(path))
+    _torch_save_with_optional_staging(
+        state_dict_fn(), _optimizer_checkpoint_path(path)
+    )
 
 
 def _load_optimizer_checkpoint(optimizer, path: str) -> None:
@@ -250,7 +299,9 @@ def _load_optimizer_checkpoint(optimizer, path: str) -> None:
     load_state_dict_fn = getattr(optimizer, "load_state_dict", None)
     if not callable(load_state_dict_fn):
         raise TypeError(f"Optimizer {type(optimizer).__name__} does not provide load_state_dict().")
-    state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state = torch.load(
+        ckpt_path, map_location="cpu", weights_only=False, mmap=True
+    )
     load_state_dict_fn(state)
 
 
@@ -432,7 +483,7 @@ def _restore_rng_state(state: dict[str, Any] | None) -> None:
 def _save_rng_sidecar(path: str | os.PathLike[str]) -> None:
     rng_file = _rng_sidecar_file(path)
     rng_file.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(_get_rng_state(), rng_file)
+    _torch_save_with_optional_staging(_get_rng_state(), rng_file)
 
 
 def _load_rng_sidecar(path: str | os.PathLike[str]) -> None:
@@ -483,18 +534,21 @@ def _load_local_training_checkpoint(
     *,
     load_rng: bool = True,
     load_parameter_state_update_legacy_format: bool = False,
+    load_model: bool = True,
+    load_optimizer: bool = True,
 ) -> int:
     ckpt_file = _local_checkpoint_file(path)
     state = torch.load(ckpt_file, map_location="cpu", weights_only=False)
     if state.get("format") != "megatron_lite.local_training.v1":
         raise RuntimeError(f"Unsupported local checkpoint format in {ckpt_file}")
-    chunks = _model_chunks(model)
-    chunk_states = state.get("model")
-    if not isinstance(chunk_states, list) or len(chunk_states) != len(chunks):
-        raise RuntimeError("Checkpoint model chunk count does not match target model.")
-    for chunk, chunk_state in zip(chunks, chunk_states, strict=True):
-        _load_chunk_tensor_state(chunk, chunk_state)
-    if optimizer is not None and state.get("optimizer") is not None:
+    if load_model:
+        chunks = _model_chunks(model)
+        chunk_states = state.get("model")
+        if not isinstance(chunk_states, list) or len(chunk_states) != len(chunks):
+            raise RuntimeError("Checkpoint model chunk count does not match target model.")
+        for chunk, chunk_state in zip(chunks, chunk_states, strict=True):
+            _load_chunk_tensor_state(chunk, chunk_state)
+    if load_optimizer and optimizer is not None and state.get("optimizer") is not None:
         optimizer.load_state_dict(state["optimizer"])
         parameter_state_name = state.get("optimizer_parameter_state")
         load_parameter_state = getattr(optimizer, "load_parameter_state", None)
