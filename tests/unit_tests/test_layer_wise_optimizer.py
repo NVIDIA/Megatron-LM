@@ -248,11 +248,8 @@ class TestLayerWiseOptimizer:
             model_kwargs: Optional kwargs for model initialization
             use_layer_wise: If True, use LayerWiseDistributedOptimizer via dist_muon;
                           if False, use standard muon ChainedOptimizer (for reference)
-            use_param_layout: If True, supply DDP a precomputed shard-aligned
-                ``full_param_layout`` (turns on ``ddp_config.use_distributed_optimizer=True``
-                + ``start_param_sync``). If False (default), build DDP without a layout
-                so ``LayerWiseDistributedOptimizer`` syncs via the legacy
-                flatten / ``all_gather_v`` / unflatten ``allgather_params()`` codepath.
+            use_param_layout: If True, use the padded shard-aligned LayerWise layout.
+                If False (default), use the compact mixed LayerWise/DistOpt layout.
 
         Returns:
             tuple: (model, optimizer, pg_collection)
@@ -263,7 +260,7 @@ class TestLayerWiseOptimizer:
         model = model_class(**model_kwargs).bfloat16().cuda()
         model.requires_grad_(True)
 
-        if use_param_layout:
+        if use_layer_wise:
             from megatron.training.training import wrap_model_chunks_with_ddp
 
             ddp_config = DistributedDataParallelConfig()
@@ -271,7 +268,8 @@ class TestLayerWiseOptimizer:
                 [model],
                 TransformerConfig(num_attention_heads=1, num_layers=1),
                 ddp_config,
-                use_layer_wise_distributed_optimizer=use_layer_wise,
+                use_layer_wise_distributed_optimizer=True,
+                use_layer_wise_param_layout=use_param_layout,
             )[0]
         else:
             ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
@@ -292,6 +290,7 @@ class TestLayerWiseOptimizer:
             clip_grad=clip_grad,
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=use_layer_wise,
+            use_layer_wise_param_layout=use_param_layout,
             chunked_optimizer_state_offload=chunked_optimizer_state_offload,
             optimizer_state_offload_chunk_size_mb=optimizer_state_offload_chunk_size_mb,
             optimizer_state_offload_fraction=optimizer_state_offload_fraction,
@@ -331,9 +330,8 @@ class TestLayerWiseOptimizer:
             overlap_param_gather: If True, defer param all-gather to bucket infrastructure
             grad_reduce_in_fp32: If True, reduce grads in fp32 (regression test for dtype fix)
             bucket_size: Maximum number of parameters per bucket (None = single bucket)
-            use_param_layout: If True, supply DDP a precomputed shard-aligned
-                ``full_param_layout`` (turns on ``ddp_config.use_distributed_optimizer=True``
-                + ``start_param_sync``). If False (default), build DDP without a layout.
+            use_param_layout: If True, use the padded shard-aligned LayerWise layout.
+                If False (default), use the compact mixed LayerWise/DistOpt layout.
 
         Returns:
             tuple: (model, optimizer, pg_collection)
@@ -349,32 +347,21 @@ class TestLayerWiseOptimizer:
         # the two so a caller only has to flip one.
         overlap_grad_reduce = overlap_param_gather
 
-        if use_param_layout:
-            from megatron.training.training import wrap_model_chunks_with_ddp
+        from megatron.training.training import wrap_model_chunks_with_ddp
 
-            ddp_config = DistributedDataParallelConfig(
-                overlap_param_gather=overlap_param_gather,
-                overlap_grad_reduce=overlap_grad_reduce,
-                grad_reduce_in_fp32=grad_reduce_in_fp32,
-                bucket_size=bucket_size,
-            )
-            model = wrap_model_chunks_with_ddp(
-                [model],
-                TransformerConfig(num_attention_heads=1, num_layers=1),
-                ddp_config,
-                use_layer_wise_distributed_optimizer=True,
-            )[0]
-        else:
-            ddp_config = DistributedDataParallelConfig(
-                use_distributed_optimizer=False,
-                overlap_param_gather=overlap_param_gather,
-                overlap_grad_reduce=overlap_grad_reduce,
-                grad_reduce_in_fp32=grad_reduce_in_fp32,
-                bucket_size=bucket_size,
-            )
-            model = DistributedDataParallel(
-                TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
-            )
+        ddp_config = DistributedDataParallelConfig(
+            overlap_param_gather=overlap_param_gather,
+            overlap_grad_reduce=overlap_grad_reduce,
+            grad_reduce_in_fp32=grad_reduce_in_fp32,
+            bucket_size=bucket_size,
+        )
+        model = wrap_model_chunks_with_ddp(
+            [model],
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            ddp_config,
+            use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_param_layout=use_param_layout,
+        )[0]
         if copy_from:
             model.module.load_state_dict(copy_from.module.state_dict())
         else:
@@ -390,6 +377,7 @@ class TestLayerWiseOptimizer:
             overlap_param_gather=overlap_param_gather,
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_param_layout=use_param_layout,
         )
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -463,12 +451,12 @@ class TestLayerWiseOptimizer:
         """Compact-layout Muon updates whole tensors while state and masters live on CPU."""
 
         model, optimizer, _ = self.create_model_and_optimizer(
-            use_param_layout=True,
+            use_param_layout=False,
             chunked_optimizer_state_offload=True,
             optimizer_state_offload_chunk_size_mb=1,
         )
         reference_model, reference_optimizer, _ = self.create_model_and_optimizer(
-            use_param_layout=True, copy_from=model
+            use_param_layout=False, copy_from=model
         )
 
         layerwise_optimizer = next(
@@ -545,7 +533,7 @@ class TestLayerWiseOptimizer:
         """Muon children and sibling Adam DistOpt serialize copies on one stream pair."""
 
         _, optimizer, _ = self.create_model_and_optimizer(
-            use_param_layout=True,
+            use_param_layout=False,
             chunked_optimizer_state_offload=True,
             optimizer_state_offload_chunk_size_mb=1,
         )
@@ -592,7 +580,9 @@ class TestLayerWiseOptimizer:
         assert grad_norm >= 0, "Grad norm should be non-negative"
 
         # Compare with reference optimizer grad norm
-        torch.testing.assert_close(grad_norm, reference_grad_norm, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(
+            float(grad_norm), float(reference_grad_norm), rtol=1e-5, atol=1e-5
+        )
 
     def test_state_dict(self):
         """Test LayerWiseDistributedOptimizer state dict save and load."""
@@ -641,14 +631,27 @@ class TestLayerWiseOptimizer:
         from megatron.core.dist_checkpointing import ShardedTensor
         from megatron.core.dist_checkpointing.dict_utils import nested_values
 
-        for sh_base in nested_values(sharded_state_dict):
-            if isinstance(sh_base, ShardedTensor):
-                assert (
-                    len(sh_base.replica_id) == 3
-                ), f'Expected replica_id format (PP, TP, DP), got: {sh_base.replica_id}'
-                assert (
-                    sh_base.replica_id[2] == 0
-                ), f'Expected DP replica_id to be 0 for layer-wise optimizer, got: {sh_base.replica_id[2]}'
+        replica_ids = [
+            sh_base.replica_id
+            for sh_base in nested_values(sharded_state_dict)
+            if isinstance(sh_base, ShardedTensor)
+        ]
+        gathered_replica_ids = [None for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather_object(gathered_replica_ids, replica_ids)
+        for rank, rank_replica_ids in enumerate(gathered_replica_ids):
+            for replica_id in rank_replica_ids:
+                if isinstance(replica_id, int):
+                    assert (
+                        replica_id == 0
+                    ), f'Expected replica_id to be 0 on rank {rank}, got: {replica_id}'
+                else:
+                    assert len(replica_id) == 3, (
+                        'Expected replica_id format (PP, TP, DP) '
+                        f'on rank {rank}, got: {replica_id}'
+                    )
+                    assert (
+                        replica_id[2] == 0
+                    ), f'Expected DP replica_id to be 0 on rank {rank}, got: {replica_id[2]}'
 
     @pytest.mark.parametrize('use_param_layout', [False, True])
     def test_multiple_optimizers(self, use_param_layout):

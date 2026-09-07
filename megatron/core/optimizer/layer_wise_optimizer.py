@@ -555,15 +555,18 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     if optimizer.optimizer is None:
                         continue
                     # The chunk planner assumes exactly the state schema of TensorParallelMuon:
-                    # one fp32 full-size momentum. Reject subclasses such as AdaptiveMuon rather
-                    # than silently underestimating their tensor-state window.
+                    # one fp32 full-size momentum. Scalar optimizer siblings can still appear in
+                    # the legacy compact LayerWise layout; they are not chunk-offload children.
+                    # Reject Muon subclasses such as AdaptiveMuon rather than silently
+                    # underestimating their tensor-state window.
                     raw_optimizer = optimizer.optimizer
-                    assert type(raw_optimizer) is TensorParallelMuon, (
-                        "LayerWise chunked optimizer state offload currently supports exactly "
-                        "TensorParallelMuon with one fp32 full-size momentum tensor; got "
-                        f"{type(raw_optimizer).__name__}. Only Muon-managed parameter groups may "
-                        "be LayerWise optimizer children"
-                    )
+                    if type(raw_optimizer) is not TensorParallelMuon:
+                        assert not isinstance(raw_optimizer, TensorParallelMuon), (
+                            "LayerWise chunked optimizer state offload currently supports exactly "
+                            "TensorParallelMuon with one fp32 full-size momentum tensor; got "
+                            f"{type(raw_optimizer).__name__}"
+                        )
+                        continue
                     # Whole-parameter sharding can leave this rank with an optimizer object but
                     # no locally owned Muon parameters. Preserve the no-offloader path for it.
                     if not any(group["params"] for group in raw_optimizer.param_groups):
@@ -611,7 +614,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                         if hasattr(p, 'clear_high_precision_init_val'):
                             p.clear_high_precision_init_val()
 
-        self.tp_group = self.pg_collection.tp
+        self.tp_group = getattr(self.pg_collection, 'tp', None)
         self.expert_tp_group = getattr(self.pg_collection, 'expt_tp', self.tp_group)
         for optimizer in optimizers:
             optimizer.tp_group = self.tp_group

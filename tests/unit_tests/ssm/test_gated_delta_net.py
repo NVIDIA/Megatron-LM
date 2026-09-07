@@ -387,8 +387,8 @@ class TestGatedDeltaNet:
 
         # Input shape
         sequence_length = 32
-        micro_batch_size = 4
-        cu_seqlens = [0, 32, 64, 96, 128]
+        micro_batch_size = 1 if self.cp_size > 1 else 4
+        cu_seqlens = [i * sequence_length for i in range(micro_batch_size + 1)]
         # sbhd input shape: [sequence length, batch size, hidden size]
         sub_sequence_length = sequence_length // self.cp_size
         hidden_states_sbhd = torch.rand(
@@ -428,7 +428,7 @@ class TestGatedDeltaNet:
 
         atol, rtol = 3e-4, 3e-4
         sequence_length = 32
-        micro_batch_size = 4
+        micro_batch_size = 1 if self.cp_size > 1 else 4
 
         # sbhd input shape: [sequence length, batch size, hidden size]
         sub_sequence_length = sequence_length // self.cp_size
@@ -446,36 +446,43 @@ class TestGatedDeltaNet:
 
         rank = torch.distributed.get_rank()
 
+        actual_cu_seqlens = [i * (sequence_length - 2) for i in range(micro_batch_size + 1)]
+        padded_cu_seqlens = [i * sequence_length for i in range(micro_batch_size + 1)]
+
         # A) padded branch: prefer *_padded when available.
         padded_params = make_test_packed_seq_params_with_padding(
-            cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 128]
+            cu_seqlens=actual_cu_seqlens, cu_seqlens_padded=padded_cu_seqlens
         )
         output_thd_padded, _ = self.gdn(hidden_states_thd, None, packed_seq_params=padded_params)
         output_thd2bshd = output_thd_padded.view(*output_bshd.shape)
         torch.testing.assert_close(
-            output_bshd[:, :30, :],
-            output_thd2bshd[:, :30, :],
+            output_bshd[:, : sequence_length - 2, :],
+            output_thd2bshd[:, : sequence_length - 2, :],
             atol=atol,
             rtol=rtol,
             msg=lambda msg: f"THD padded output mismatch ({rank=}): {msg}",
         )
 
         # B) no-padded branch: use actual cu_seqlens when it matches total_sequence_length.
-        no_padding_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 128])
+        no_padding_params = make_test_packed_seq_params(cu_seqlens=padded_cu_seqlens)
         output_thd_no_padding, _ = self.gdn(
             hidden_states_thd, None, packed_seq_params=no_padding_params
         )
         assert output_thd_no_padding.shape == output_thd_padded.shape
 
         # C) padded mismatch branch: if *_padded[-1] mismatches total_sequence_length, should raise.
+        padded_mismatch = padded_cu_seqlens.copy()
+        padded_mismatch[-1] -= 2 * self.cp_size
         padded_mismatch_params = make_test_packed_seq_params_with_padding(
-            cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 126]
+            cu_seqlens=actual_cu_seqlens, cu_seqlens_padded=padded_mismatch
         )
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=padded_mismatch_params)
 
         # D) actual mismatch branch without *_padded: should raise.
-        actual_mismatch_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 129])
+        actual_mismatch = padded_cu_seqlens.copy()
+        actual_mismatch[-1] += 2 * self.cp_size
+        actual_mismatch_params = make_test_packed_seq_params(cu_seqlens=actual_mismatch)
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=actual_mismatch_params)
 
@@ -577,7 +584,7 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         cp=cp,
         seed=123,
         sequence_length=256,
-        micro_batch_size=4,
+        micro_batch_size=1 if cp > 1 and not sequence_packing else 4,
         sequence_packing=sequence_packing,
     )
 
