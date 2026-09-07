@@ -2365,6 +2365,48 @@ def _freeze_all_model_chunks(model_list):
     return model_list
 
 
+def _freeze_base_model_for_mtp(model_list):
+    """Freeze backbone parameters and router bias updates while keeping MTP trainable."""
+    frozen_params = 0
+    trainable_params = 0
+    frozen_router_biases = 0
+
+    for model_module in model_list:
+        for name, param in model_module.named_parameters():
+            is_mtp_parameter = 'mtp.layers.' in name
+            param.requires_grad_(is_mtp_parameter)
+            if is_mtp_parameter:
+                trainable_params += param.numel()
+            else:
+                frozen_params += param.numel()
+
+        for name, module in model_module.named_modules():
+            if hasattr(module, 'expert_bias'):
+                freeze_router_bias = 'mtp.layers.' not in name
+                module.frozen_expert_bias = freeze_router_bias
+                if freeze_router_bias:
+                    frozen_router_biases += 1
+
+    print_rank_0(
+        f'[freeze-base-model-for-mtp] Frozen {frozen_params:,} backbone parameters and '
+        f'{frozen_router_biases:,} backbone router expert-bias buffers. '
+        f'Trainable MTP parameters: {trainable_params:,}.'
+    )
+    return model_list
+
+
+def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_base_model_for_mtp):
+    """Install the requested freeze hook before a config-built model is wrapped."""
+    freeze_hook = None
+    if freeze_all_layers:
+        freeze_hook = _freeze_all_model_chunks
+    elif freeze_base_model_for_mtp:
+        freeze_hook = _freeze_base_model_for_mtp
+
+    if freeze_hook is not None and freeze_hook not in model_config.pre_wrap_hooks:
+        model_config.pre_wrap_hooks.append(freeze_hook)
+
+
 def _forward_backward_grad_context(args):
     """Grad context for a train step's forward/backward pass.
 
@@ -2453,6 +2495,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
         _freeze_all_model_chunks(model)
+    elif args.freeze_base_model_for_mtp:
+        _freeze_base_model_for_mtp(model)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -2720,10 +2764,13 @@ def setup_model_and_optimizer(
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
 
-            # Inject freeze_all_layers as a pre-wrap hook so DDP sees requires_grad=False
-            # and skips grad-buffer allocation for all params (matching get_model behavior).
-            if args.freeze_all_layers:
-                model_config.pre_wrap_hooks.append(_freeze_all_model_chunks)
+            # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
+            # gradient storage for parameters that remain trainable (matching get_model behavior).
+            _add_model_freeze_pre_wrap_hook(
+                model_config,
+                freeze_all_layers=args.freeze_all_layers,
+                freeze_base_model_for_mtp=args.freeze_base_model_for_mtp,
+            )
 
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
