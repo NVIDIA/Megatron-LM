@@ -9,7 +9,11 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
+from megatron.core.full_cuda_graph import (
+    FullCudaGraphPreparedIterator,
+    FullCudaGraphWrapper,
+    StaticBufferLoader,
+)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
@@ -33,7 +37,11 @@ def _reset_full_cuda_graph_state():
     FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
     FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
     FullCudaGraphWrapper.result = {'training': None, 'validation': None}
+    FullCudaGraphWrapper.prepared_run_signatures = {'training': None, 'validation': None}
     StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
+    StaticBufferLoader.prepared_static_buffers = {'training': None, 'validation': None}
+    StaticBufferLoader.prepared_schemas = {'training': None, 'validation': None}
+    StaticBufferLoader.prepared_owner_ptrs = {'training': None, 'validation': None}
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +56,242 @@ def reset_full_cuda_graph_state():
     MTPLossLoggingHelper.tracker = {}
     Utils.destroy_model_parallel()
     gc.collect()
+
+
+def _unused_prepared_forward_step(*_args, **_kwargs):
+    raise AssertionError("the fake full-iteration schedule should not call forward_step_func")
+
+
+def _consume_prepared_schedule(**kwargs):
+    """Consume every prepared slot like the no-pipeline schedule does."""
+    return [
+        [next(iterator) for _ in range(kwargs['num_microbatches'])]
+        for iterator in kwargs['data_iterator']
+    ]
+
+
+def _call_prepared_wrapper(wrapper, model, data_iterator, num_microbatches=2, **overrides):
+    kwargs = dict(
+        forward_step_func=_unused_prepared_forward_step,
+        data_iterator=data_iterator,
+        model=model,
+        num_microbatches=num_microbatches,
+        seq_length=16,
+        micro_batch_size=1,
+        decoder_seq_length=None,
+        forward_only=False,
+    )
+    kwargs.update(overrides)
+    return wrapper(**kwargs)
+
+
+class _CountingIterator:
+    def __init__(self, values):
+        self.values = iter(values)
+        self.next_calls = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.next_calls += 1
+        return next(self.values)
+
+
+def test_prepared_callback_runs_on_none_iterators_in_chunk_major_order():
+    calls = []
+
+    def prepare(**kwargs):
+        calls.append(
+            (kwargs['model_chunk_index'], kwargs['microbatch_index'], kwargs['data_iterator'])
+        )
+        return {
+            'tokens': torch.tensor([10 * kwargs['model_chunk_index'] + kwargs['microbatch_index']])
+        }
+
+    wrapper = FullCudaGraphWrapper(
+        _consume_prepared_schedule, cuda_graph_warmup_steps=100, batch_prepare_func=prepare
+    )
+    model = [object(), object()]
+    prepared_iterators = wrapper.data_read([None, None], model, training=True, num_microbatches=2)
+
+    assert calls == [(0, 0, None), (0, 1, None), (1, 0, None), (1, 1, None)]
+    assert all(
+        isinstance(iterator, FullCudaGraphPreparedIterator) for iterator in prepared_iterators
+    )
+    assert [int(next(prepared_iterators[0])['tokens']) for _ in range(2)] == [0, 1]
+    assert [int(next(prepared_iterators[1])['tokens']) for _ in range(2)] == [10, 11]
+
+
+def test_prepared_signature_drift_fails_before_callback_or_iterator_consumption():
+    callback_calls = []
+
+    def prepare(**kwargs):
+        callback_calls.append(kwargs['microbatch_index'])
+        return {'tokens': next(kwargs['data_iterator'])}
+
+    wrapper = FullCudaGraphWrapper(
+        _consume_prepared_schedule, cuda_graph_warmup_steps=100, batch_prepare_func=prepare
+    )
+    model = [object()]
+    first_iterator = _CountingIterator([torch.tensor([1])])
+    _call_prepared_wrapper(wrapper, model, [first_iterator], num_microbatches=1)
+    assert first_iterator.next_calls == 1
+    assert callback_calls == [0]
+
+    second_iterator = _CountingIterator([torch.tensor([2]), torch.tensor([3])])
+    with pytest.raises(RuntimeError, match="signature changed before input consumption"):
+        _call_prepared_wrapper(wrapper, model, [second_iterator], num_microbatches=2)
+    assert second_iterator.next_calls == 0
+    assert callback_calls == [0]
+
+
+def test_prepared_iteration_schema_failure_does_not_partially_copy_earlier_slots():
+    second_round = False
+
+    def prepare(**kwargs):
+        microbatch = kwargs['microbatch_index']
+        if second_round and microbatch == 1:
+            return {'tokens': torch.tensor([20, 21])}
+        value = 10 + microbatch if second_round else 1 + microbatch
+        return {'tokens': torch.tensor([value])}
+
+    wrapper = FullCudaGraphWrapper(
+        _consume_prepared_schedule, cuda_graph_warmup_steps=100, batch_prepare_func=prepare
+    )
+    model = [object()]
+    _call_prepared_wrapper(wrapper, model, [None], num_microbatches=2)
+    owners = StaticBufferLoader.prepared_static_buffers['training']
+    owner_ptrs = tuple(batch['tokens'].data_ptr() for batch in owners[0])
+    owner_values = tuple(batch['tokens'].clone() for batch in owners[0])
+
+    second_round = True
+    with pytest.raises(RuntimeError, match="prepared batch schema changed"):
+        _call_prepared_wrapper(wrapper, model, [None], num_microbatches=2)
+
+    assert tuple(batch['tokens'].data_ptr() for batch in owners[0]) == owner_ptrs
+    for batch, expected in zip(owners[0], owner_values):
+        torch.testing.assert_close(batch['tokens'], expected, rtol=0, atol=0)
+
+
+def test_prepared_callback_failure_does_not_copy_completed_earlier_slots():
+    second_round = False
+
+    def prepare(**kwargs):
+        microbatch = kwargs['microbatch_index']
+        if second_round and microbatch == 1:
+            raise RuntimeError("late prepare failure")
+        value = 10 + microbatch if second_round else 1 + microbatch
+        return {'tokens': torch.tensor([value])}
+
+    wrapper = FullCudaGraphWrapper(
+        _consume_prepared_schedule, cuda_graph_warmup_steps=100, batch_prepare_func=prepare
+    )
+    model = [object()]
+    _call_prepared_wrapper(wrapper, model, [None], num_microbatches=2)
+    owners = StaticBufferLoader.prepared_static_buffers['training']
+    owner_ptrs = tuple(batch['tokens'].data_ptr() for batch in owners[0])
+    owner_values = tuple(batch['tokens'].clone() for batch in owners[0])
+
+    second_round = True
+    with pytest.raises(RuntimeError, match="late prepare failure"):
+        _call_prepared_wrapper(wrapper, model, [None], num_microbatches=2)
+
+    assert tuple(batch['tokens'].data_ptr() for batch in owners[0]) == owner_ptrs
+    for batch, expected in zip(owners[0], owner_values):
+        torch.testing.assert_close(batch['tokens'], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "bad_batch",
+    [
+        {'tokens': torch.ones(2)},
+        {'tokens': torch.ones(1, dtype=torch.float64)},
+        {'tokens': torch.ones(1), 'extra': None},
+        {'tokens': torch.ones(1), 'mode': 'different'},
+    ],
+    ids=['shape', 'dtype', 'extra_key', 'constant'],
+)
+def test_prepared_static_loader_enforces_exact_schema(bad_batch):
+    loader = StaticBufferLoader()
+    good_batch = {'tokens': torch.ones(1), 'mode': 'thd'}
+    owners = loader.stage_prepared_iteration([[good_batch]], 'training')
+    owner_ptr = owners[0][0]['tokens'].data_ptr()
+    owner_value = owners[0][0]['tokens'].clone()
+
+    with pytest.raises(RuntimeError, match="prepared batch schema changed"):
+        loader.stage_prepared_iteration([[bad_batch]], 'training')
+    assert owners[0][0]['tokens'].data_ptr() == owner_ptr
+    torch.testing.assert_close(owners[0][0]['tokens'], owner_value, rtol=0, atol=0)
+
+
+def test_prepared_replay_updates_values_without_replacing_static_owners():
+    value = 1
+
+    def prepare(**_kwargs):
+        return {'tokens': torch.tensor([value]), 'mode': 'thd', 'optional': None}
+
+    wrapper = FullCudaGraphWrapper(
+        _consume_prepared_schedule, cuda_graph_warmup_steps=100, batch_prepare_func=prepare
+    )
+    model = [object()]
+    first_result = _call_prepared_wrapper(wrapper, model, [None], num_microbatches=1)
+    owner = StaticBufferLoader.prepared_static_buffers['training'][0][0]
+    owner_ptr = owner['tokens'].data_ptr()
+    assert int(first_result[0][0]['tokens']) == 1
+
+    value = 7
+    second_result = _call_prepared_wrapper(wrapper, model, [None], num_microbatches=1)
+    assert owner['tokens'].data_ptr() == owner_ptr
+    assert second_result[0][0]['tokens'] is owner['tokens']
+    assert int(second_result[0][0]['tokens']) == 7
+
+
+def test_reset_cuda_graph_clears_class_level_prepared_state():
+    def prepare(**_kwargs):
+        return {'tokens': torch.ones(1)}
+
+    wrapper = FullCudaGraphWrapper(
+        _consume_prepared_schedule, cuda_graph_warmup_steps=100, batch_prepare_func=prepare
+    )
+    model = [object()]
+    _call_prepared_wrapper(wrapper, model, [None], num_microbatches=1)
+    assert FullCudaGraphWrapper.prepared_run_signatures['training'] is not None
+    assert StaticBufferLoader.prepared_static_buffers['training'] is not None
+
+    wrapper.reset_cuda_graph('training')
+
+    assert FullCudaGraphWrapper.prepared_run_signatures['training'] is None
+    assert StaticBufferLoader.prepared_static_buffers['training'] is None
+    assert StaticBufferLoader.prepared_schemas['training'] is None
+    assert StaticBufferLoader.prepared_owner_ptrs['training'] is None
+    assert FullCudaGraphWrapper.curr_iteration['training'] == 0
+
+
+def test_callback_none_preserves_legacy_data_read_contract():
+    class RecordingLegacyLoader:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, inputs, stage, microbatch):
+            self.calls.append((inputs, stage, microbatch))
+            return {'legacy': inputs}
+
+    wrapper = FullCudaGraphWrapper(_consume_prepared_schedule, batch_prepare_func=None)
+    wrapper.static_loader = RecordingLegacyLoader()
+    model = object()
+    raw_batches = iter([{'tokens': 1}, {'tokens': 2}])
+
+    data_list = wrapper.data_read(raw_batches, model, training=True, num_microbatches=2)
+    assert len(data_list) == 1
+    assert not isinstance(data_list[0], FullCudaGraphPreparedIterator)
+    assert next(data_list[0]) == {'legacy': {'tokens': 1}}
+    assert next(data_list[0]) == {'legacy': {'tokens': 2}}
+    assert [call[1:] for call in wrapper.static_loader.calls] == [('training', 0), ('training', 1)]
+
+    assert wrapper.data_read(None, model, training=True, num_microbatches=2) == [None]
+    assert FullCudaGraphWrapper.prepared_run_signatures['training'] is None
+    assert StaticBufferLoader.prepared_static_buffers['training'] is None
 
 
 @pytest.mark.skipif(
