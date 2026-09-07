@@ -138,7 +138,7 @@ class _BoundaryChunkState:
     # Populated by `_issue_boundary_update` while this chunk's scatter is in flight.
     full_updates: dict[int, torch.Tensor] = dataclasses.field(default_factory=dict)
     scatter_plan: OwnerScatterPlan | None = None
-    scatter_recv: dict[int, torch.Tensor] = dataclasses.field(default_factory=dict)
+    scatter_recv: dict[tuple[int, int], torch.Tensor] = dataclasses.field(default_factory=dict)
     scatter_works: list[dist.Work] = dataclasses.field(default_factory=list)
     scatter_event: torch.cuda.Event | None = None
 
@@ -434,8 +434,11 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             compatible_chunks = chunks.setdefault(key, [])
             if (
                 not compatible_chunks
-                or self._max_params_per_owner_chunk is not None
-                and len(compatible_chunks[-1]) >= self._max_params_per_owner_chunk
+                or
+                (
+                    self._max_params_per_owner_chunk is not None
+                    and len(compatible_chunks[-1]) >= self._max_params_per_owner_chunk
+                )
             ):
                 compatible_chunks.append([])
             compatible_chunks[-1].append(index)
@@ -455,33 +458,23 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         plans: Sequence[ShardPlan],
         owners: dict[int, int],
         local_shards: Sequence[torch.Tensor],
-        device: torch.device,
-        dtype: torch.dtype,
-        group_param: DTensor,
+        comm_groups: list[torch.distributed.ProcessGroup],
     ) -> OwnerGatherPlan:
         """Pack all orthogonalization input shards for an owner into the owner's respective
         collective buffer.
 
         This sets up the buffers for communicating orthogonalization input shards to their owner.
         """
-        group = _get_parameter_dp_group(group_param)
-        return pack_owner_work(
-            plans,
-            owners,
-            local_shards,
-            dist.get_world_size(group=group),
-            dist.get_rank(group=group),
-            device=device,
-            dtype=dtype,
-        )
+        return pack_owner_work(plans, owners, local_shards, comm_groups)
 
     def _send_to_owner(
         self,
         gather_plan: OwnerGatherPlan,
         device: torch.device,
         dtype: torch.dtype,
-        group_param: DTensor,
-    ) -> tuple[dict[int, torch.Tensor], list[dist.Work], torch.cuda.Event | None]:
+    ) -> tuple[
+        dict[tuple[int, int], torch.Tensor], list[dist.Work], torch.cuda.Event | None
+    ]:
         """Send orthogonalization input shards to their respective owner.
 
         Uses peer-to-peer communication (`batch_isend_irecv`) to avoid memory
@@ -494,21 +487,19 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             device: Device for the send/recv buffers (the pre-NS device).
             dtype: Dtype for the send/recv buffers (the pre-NS dtype).
         """
-        group = _get_parameter_dp_group(group_param)
         stream = self._owner_comm_stream(device)
-        recv_buffers: dict[int, torch.Tensor] = {
-            src: torch.empty(size, dtype=dtype, device=device)
-            for src, size in gather_plan.recv_sizes.items()
-            if size > 0
+        recv_buffers: dict[tuple[int, int], torch.Tensor] = {
+            key: torch.empty(size, dtype=dtype, device=device)
+            for key, size in gather_plan.recv_sizes.items()
         }
         ops: list[dist.P2POp] = []
-        for owner, buf in gather_plan.send_buffers.items():
-            if buf.numel() == 0:
-                continue
+        for (param_index, owner), buf in gather_plan.send_buffers.items():
+            group = gather_plan.comm_groups[param_index]
             # `owner` is a DP-group rank index (mesh local rank); pass it as
             # group_peer so P2POp resolves it within the owner-comm group.
             ops.append(dist.P2POp(dist.isend, buf, group_peer=owner, group=group))
-        for src, buf in recv_buffers.items():
+        for (param_index, src), buf in recv_buffers.items():
+            group = gather_plan.comm_groups[param_index]
             ops.append(dist.P2POp(dist.irecv, buf, group_peer=src, group=group))
 
         default_stream = torch.cuda.current_stream() if stream is not None else None
@@ -579,9 +570,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         full_updates: dict[int, torch.Tensor],
         plans: Sequence[ShardPlan],
         owners: dict[int, int],
-        device: torch.device,
-        dtype: torch.dtype,
-        group_param: DTensor,
+        comm_groups: list[torch.distributed.ProcessGroup],
     ) -> OwnerScatterPlan:
         """Set up the buffers for communication by packing update shards into their respective
         collective buffers.
@@ -589,15 +578,11 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         Pack all update shards for their destination into the destination's respective collective
         buffer. This sets up the buffers for communicating update shards to their destination.
         """
-        group = _get_parameter_dp_group(group_param)
         return pack_update_shards(
             full_updates,
             plans,
             owners,
-            dist.get_world_size(group=group),
-            dist.get_rank(group=group),
-            device=device,
-            dtype=dtype,
+            comm_groups,
         )
 
     def _send_to_destination(
@@ -605,8 +590,9 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         scatter_plan: OwnerScatterPlan,
         device: torch.device,
         dtype: torch.dtype,
-        group_param: DTensor,
-    ) -> tuple[dict[int, torch.Tensor], list[dist.Work], torch.cuda.Event | None]:
+    ) -> tuple[
+        dict[tuple[int, int], torch.Tensor], list[dist.Work], torch.cuda.Event | None
+    ]:
         """Send update shards to their respective destination.
 
         Uses peer-to-peer communication (`batch_isend_irecv`) to avoid memory
@@ -618,19 +604,17 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             device: Device for the send/recv buffers (the update device).
             dtype: Dtype for the send/recv buffers (the update dtype).
         """
-        group = _get_parameter_dp_group(group_param)
         stream = self._owner_comm_stream(device)
-        recv_buffers: dict[int, torch.Tensor] = {
-            owner: torch.empty(size, dtype=dtype, device=device)
-            for owner, size in scatter_plan.recv_sizes.items()
-            if size > 0
+        recv_buffers: dict[tuple[int, int], torch.Tensor] = {
+            key: torch.empty(size, dtype=dtype, device=device)
+            for key, size in scatter_plan.recv_sizes.items()
         }
         ops: list[dist.P2POp] = []
-        for dest, buf in scatter_plan.send_buffers.items():
-            if buf.numel() == 0:
-                continue
+        for (param_index, dest), buf in scatter_plan.send_buffers.items():
+            group = scatter_plan.comm_groups[param_index]
             ops.append(dist.P2POp(dist.isend, buf, group_peer=dest, group=group))
-        for owner, buf in recv_buffers.items():
+        for (param_index, owner), buf in recv_buffers.items():
+            group = scatter_plan.comm_groups[param_index]
             ops.append(dist.P2POp(dist.irecv, buf, group_peer=owner, group=group))
 
         default_stream = torch.cuda.current_stream() if stream is not None else None
@@ -649,7 +633,9 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         return recv_buffers, list(works or []), completion_event
 
     def _unpack_update_shards(
-        self, scatter_plan: OwnerScatterPlan, recv_buffers: dict[int, torch.Tensor]
+        self,
+        scatter_plan: OwnerScatterPlan,
+        recv_buffers: dict[tuple[int, int], torch.Tensor],
     ) -> dict[int, torch.Tensor]:
         """Unpack the packed update shards in the given buffer."""
         return unpack_update_shards(scatter_plan, recv_buffers)
@@ -891,7 +877,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                 continue
             # Merge the gathered orthogonalization input shards back to the original, full,
             # unsharded input tensor.
-            full = reconstruct_full_tensor(i, plan, gather_plan, recv_buffers, owner_rank=this_rank)
+            full = reconstruct_full_tensor(i, plan, gather_plan, recv_buffers)
             # `full` is the reconstructed pre-NS matrix and is the
             # orthogonalization input (`pre_ns`). The default MCore Muon reads shape
             # and tensor-parallel attributes from `param` but does not read its values,
@@ -904,7 +890,6 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                     plan,
                     state.weight_gather_plan,
                     state.weight_recv_buffers,
-                    owner_rank=this_rank,
                 )
             else:
                 param_arg = b_params[i]
@@ -915,7 +900,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             full_updates, b_plans, b_owners, device, state.dtype, b_params[0]
         )
         scatter_recv, scatter_works, scatter_event = self._send_to_destination(
-            scatter_plan, device, state.dtype, b_params[0]
+            scatter_plan, device, state.dtype
         )
         state.full_updates = full_updates
         state.scatter_plan = scatter_plan
