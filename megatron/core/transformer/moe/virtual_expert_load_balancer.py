@@ -38,7 +38,7 @@ except ImportError:
     launch_virtual_expert_planner = None
     launch_virtual_expert_weight_prefetch = None
     _TRITON_AVAILABLE = False
-from megatron.core.utils import nvtx_decorator
+from megatron.core.utils import ensure_params_ready, nvtx_decorator
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -438,6 +438,10 @@ class _VirtualExpertProjection:
     by :meth:`bind_wgrad_scratch`) or the slot's gradient arena member and carries
     ``overwrite_main_grad``, so TE's wgrad GEMM rewrites every member on each backward
     and the slots never need clearing (a planned slot always receives tokens).
+
+    Under GTP the push only *peeks* at the gathered weights (:meth:`prepare`); the weights are
+    consumed in GTP's prefetch chain where TE would consume them, right before the expert GEMMs
+    (:meth:`consume`), so virtual experts leave GTP's gather and prefetch schedule alone.
     """
 
     def __init__(self, name, parameters, workspace: _VirtualExpertWeightWorkspace, index: int):
@@ -526,25 +530,48 @@ class _VirtualExpertProjection:
     def _components(self, direction: int) -> tuple[str, ...]:
         return _MXFP8_COMPONENTS[2 * direction : 2 * direction + 2] if self.mxfp8 else ("data",)
 
-    def prepare(self, direction: int) -> None:
-        """Materialize the source weights of ``direction`` and bind them for the push."""
-        if self.gtp_leader is None:
-            sources = self.parameters
-        else:
-            gathered = (
-                self.gtp_leader.materialize_group_for_backward()
-                if direction == BACKWARD
-                else self.gtp_leader.materialize_group_for_forward()
-            )
-            sources = tuple(gathered) if isinstance(gathered, (list, tuple)) else (gathered,)
+    def _pointers(self, direction: int, sources) -> tuple:
+        """The per-source device pointers the push of ``direction`` reads."""
         components = self._components(direction)
-        pointers = tuple(
+        return tuple(
             tuple(getattr(source, name).data_ptr() for name in components) for source in sources
         )
+
+    def _gathered(self, direction: int, peek: bool) -> tuple:
+        """Peek at or consume the GTP group's gathered weights of ``direction``."""
+        leader = self.gtp_leader
+        if direction == BACKWARD:
+            gathered = (
+                leader.peek_group_for_backward()
+                if peek
+                else leader.materialize_group_for_backward()
+            )
+        else:
+            gathered = (
+                leader.peek_group_for_forward() if peek else leader.materialize_group_for_forward()
+            )
+        return tuple(gathered) if isinstance(gathered, (list, tuple)) else (gathered,)
+
+    def prepare(self, direction: int) -> None:
+        """Bind the source weights of ``direction`` for the push.
+
+        Plain parameters are read once their DDP publication has landed. GTP weights are read
+        from their gathered buffers without consuming them in GTP's chain (a peek, see
+        ``GTPShardedParam._peek_gathered_weight``); :meth:`consume` follows at the GEMM.
+        """
+        if self.gtp_leader is None:
+            # The push reads the parameters ahead of the expert module's pre-forward hook, where
+            # DDP (overlap_param_gather) would otherwise finish publishing them.
+            ensure_params_ready(self.parameters)
+            sources = self.parameters
+        else:
+            sources = self._gathered(direction, peek=True)
+        pointers = self._pointers(direction, sources)
         if pointers == self.bound[direction]:
             return
         # A rebind is the exception (GTP gathers land in stable buffers); validate
         # the storage and refresh the table and the runtime parameters it describes.
+        components = self._components(direction)
         numel = math.prod(self.member_shape)
         expected = (
             ((numel, torch.uint8), (numel // 32, torch.uint8))
@@ -571,6 +598,23 @@ class _VirtualExpertProjection:
                 parameter.data = source
         self._upload(direction, list(zip(*pointers)))
         self.bound[direction] = pointers
+
+    def consume(self, direction: int) -> None:
+        """Consume the GTP weights of ``direction`` in GTP's prefetch chain.
+
+        This is GTP's real consume, the one TE would issue right before the expert GEMMs: it
+        waits for this group's gather and issues the chain's next prefetch. The push has already
+        read the buffers it returns (:meth:`prepare` peeked at the same gather), so they must be
+        the bound ones; anything else means the push copied other bytes than the GEMM reads.
+        """
+        if self.gtp_leader is None:
+            return
+        sources = self._gathered(direction, peek=False)
+        if self._pointers(direction, sources) != self.bound[direction]:
+            raise RuntimeError(
+                f"{self.name}: GTP consumed the expert weights from other buffers than the ones "
+                "the virtual-expert push read; the push must peek at the gather the GEMM consumes."
+            )
 
     def bind_wgrad_scratch(self) -> None:
         """Point the natives' ``main_grad`` and the reduction's pointer table at this layer's GTP
@@ -610,15 +654,21 @@ class _VirtualExpertProjection:
             return tuple(self.native_grad)
         if self.wgrad_scratch is None:
             raise RuntimeError(
-                f"{self.name} has no GTP wgrad scratch bound; the backward weight push must run "
-                "before the expert backward."
+                f"{self.name} has no GTP wgrad scratch bound; wait_prefetch_for_backward must "
+                "run before the expert backward."
             )
         scratch, self.wgrad_scratch = self.wgrad_scratch, None
         return tuple(scratch)
 
 
 class VirtualExpertWeightBridge:
-    """Asynchronous virtual-expert weight push and gradient reduction for one MoE layer."""
+    """Asynchronous virtual-expert weight push and gradient reduction for one MoE layer.
+
+    The push starts at the planner (forward) and at the layer output (backward) and only peeks
+    at GTP's gathered weights; GTP consumes them, and issues its next prefetch, right before the
+    expert GEMMs (:meth:`consume`, from the fused-op pre-forward hook and
+    :meth:`wait_prefetch_for_backward`), so its schedule does not depend on virtual experts.
+    """
 
     def __init__(
         self,
@@ -689,17 +739,15 @@ class VirtualExpertWeightBridge:
     @torch.no_grad()
     @nvtx_decorator(message="virtual_expert_weight_push_start")
     def start_prefetch(self, plan: VirtualExpertPlan, direction: int = FORWARD) -> None:
-        """Enqueue the owner push of the plan's FC1/FC2 weights on the weight stream."""
+        """Enqueue the owner push of the plan's FC1/FC2 weights on the weight stream.
+
+        Only reads the weights: GTP consumes them, and issues its next prefetch, at the expert
+        GEMMs (:meth:`consume`), exactly where it would without virtual experts.
+        """
         if self._prefetch_plan is not None:
             raise RuntimeError("Virtual-expert weight prefetch is already outstanding.")
-        if direction == FORWARD:
-            # DDP/FSDP parameter hooks (all-gathers) must run before the push reads them.
-            self._experts_ref().prepare_fused_impl_parameters()
-        # Expert backward computes FC2 before FC1; keep GTP's linked gathers in that order.
-        for projection in self.projections[:: -1 if direction == BACKWARD else 1]:
+        for projection in self._projections(direction):
             projection.prepare(direction)
-            if direction == BACKWARD:
-                projection.bind_wgrad_scratch()
         workspace = self.workspace
         current_stream = torch.cuda.current_stream(self.device)
         weight_stream = workspace.weight_stream(current_stream)
@@ -736,9 +784,26 @@ class VirtualExpertWeightBridge:
         torch.cuda.current_stream(self.device).wait_event(self.prefetch_done)
         self._completed_plan, self._prefetch_plan = plan, None
 
+    def _projections(self, direction: int) -> list:
+        """The projections in GEMM order: the expert backward computes FC2 before FC1, and
+        GTP's linked gathers are consumed in that order."""
+        return self.projections[:: -1 if direction == BACKWARD else 1]
+
+    @torch.no_grad()
+    def consume(self, direction: int) -> None:
+        """Consume the expert weights in GTP's prefetch chain, right before the expert GEMMs of
+        ``direction`` run; a no-op for projections without GTP."""
+        for projection in self._projections(direction):
+            projection.consume(direction)
+
+    @torch.no_grad()
     def wait_prefetch_for_backward(self, plan: VirtualExpertPlan) -> None:
-        """Wait for the backward push and remember the plan the expert backward reduces."""
+        """Right before the expert backward: wait for the backward push, consume the weights in
+        GTP's chain, bind the natives' wgrad scratch and remember the plan the backward reduces."""
         self.wait_prefetch(plan)
+        for projection in self._projections(BACKWARD):
+            projection.consume(BACKWARD)
+            projection.bind_wgrad_scratch()
         self._backward_plan = plan
 
     @torch.no_grad()
