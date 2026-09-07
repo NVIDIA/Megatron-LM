@@ -748,6 +748,10 @@ def forward_backward_no_pipelining(
 
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
+        if getattr(config, 'enable_attention_residuals', False):
+            from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
+
+            attn_res_source_cache_reset()
 
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
@@ -1178,6 +1182,10 @@ def forward_backward_pipelining_with_interleaving(
 
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
+        if getattr(config, 'enable_attention_residuals', False):
+            from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
+
+            attn_res_source_cache_reset()
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
@@ -1295,6 +1303,16 @@ def forward_backward_pipelining_with_interleaving(
         tensor_shape[0] = tensor_shape[0] // cp_group.size()
     if config.sequence_parallel:
         tensor_shape[0] = tensor_shape[0] // tp_group.size()
+
+    # Attention residuals: every boundary carries a delta of depth sources plus
+    # the running partial sum, padded to one uniform slice count so the single
+    # tensor_shape used by all interleaved p2p call sites stays valid. The rest
+    # of the depth prefix is reconstructed from a rank-local source cache (see
+    # attention_residual.AttnResStageSources).
+    if getattr(config, 'enable_attention_residuals', False) and pipeline_parallel_size > 1:
+        from megatron.core.transformer.attention_residual import attn_res_uniform_payload_slices
+
+        tensor_shape[0] = tensor_shape[0] * attn_res_uniform_payload_slices(config)
 
     # Compute number of warmup and remaining microbatches.
     # seems only used for vpp
@@ -2292,6 +2310,25 @@ def get_tensor_shapes(
         if use_nstream:
             hidden_size = hidden_size * getattr(config, 'num_residual_streams', 1)
 
+    # Attention residuals: intermediate stages exchange all depth sources plus the
+    # running partial sum, concatenated along the sequence dimension. The slice
+    # count is static per boundary and derived from the pipeline layer layout.
+    if getattr(config, 'enable_attention_residuals', False) and pp_group is not None:
+        from megatron.core.transformer.attention_residual import attn_res_payload_slices_for_pp_rank
+
+        pp_rank = pp_group.rank()
+        pp_size = pp_group.size()
+        # The boundary is identified by the rank that RECEIVES the payload.
+        boundary_recv_rank = None
+        if is_recv and pp_rank > 0:
+            boundary_recv_rank = pp_rank
+        elif not is_recv and pp_rank < pp_size - 1:
+            boundary_recv_rank = pp_rank + 1
+        if boundary_recv_rank is not None:
+            effective_seq_length = effective_seq_length * attn_res_payload_slices_for_pp_rank(
+                config, boundary_recv_rank
+            )
+
     tensor_shapes.append((effective_seq_length, effective_micro_batch_size, hidden_size))
     return tensor_shapes
 
@@ -2406,6 +2443,10 @@ def forward_backward_pipelining_without_interleaving(
 
     if getattr(config, "moe_paged_stash", False):
         paged_stash_reset(enabled=not forward_only, config=config)
+        if getattr(config, 'enable_attention_residuals', False):
+            from megatron.core.transformer.attention_residual import attn_res_source_cache_reset
+
+            attn_res_source_cache_reset()
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func

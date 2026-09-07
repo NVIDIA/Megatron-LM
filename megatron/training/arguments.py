@@ -3018,6 +3018,9 @@ def _add_network_size_args(parser):
         "gtp_weight_remat_size",
         # internal/derived: controlled only via --expert-tensor-parallel-num-weight-shards
         "expert_gtp_weight_remat_size",
+        # defined manually in _add_network_size_args; the config field is filled
+        # by the hasattr-gated copy in core_transformer_config_from_args
+        "hybrid_layer_pattern",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
