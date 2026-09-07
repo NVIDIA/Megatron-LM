@@ -271,7 +271,4 @@ def test_dispatcher_metadata_stays_materialized_in_meta_context() -> None:
         )
 
     assert dispatcher._sort_by_experts == [0, 2, 1, 3]
-    # ``_restore_by_ranks`` is gone: combine derives the inverse from the row
-    # index instead of keeping a second chunk order that could drift from this
-    # one. Asserting its absence keeps the test honest about what it covers.
-    assert not hasattr(dispatcher, "_restore_by_ranks")
+    assert dispatcher._restore_by_ranks == [0, 2, 1, 3]
