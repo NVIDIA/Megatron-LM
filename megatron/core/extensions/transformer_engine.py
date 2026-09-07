@@ -19,6 +19,7 @@ from torch import Tensor
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
+from megatron.core.activations import situlu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
@@ -483,6 +484,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     layer_type = te.pytorch.ops.GEGLU
                 elif config.activation_func == F.silu:
                     layer_type = te.pytorch.ops.ReGLU
+                elif config.activation_func is situlu:
+                    layer_type = getattr(te.pytorch.ops, "SiTUGLU", None)
+                    if layer_type is None:
+                        raise RuntimeError(
+                            "SiTU-GLU requires Transformer Engine with "
+                            "pytorch.ops.SiTUGLU support."
+                        )
             else:
                 if config.activation_func == F.gelu:
                     layer_type = te.pytorch.ops.GELU
@@ -490,10 +498,14 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     layer_type = te.pytorch.ops.ReLU
             if layer_type is None:
                 raise Exception(
-                    'Only SwiGLU, GEGLU, ReGLU, GELU, ReLU are supported by '
+                    'Only SwiGLU, SiTU-GLU, GEGLU, ReGLU, GELU, ReLU are supported by '
                     'transformer engine. Please set use_te_activation_func=False'
                 )
             activation_func_kwargs = {}
+            if config.activation_func is situlu:
+                activation_func_kwargs.update(
+                    beta1=config.situ_glu_beta1, beta2=config.situ_glu_beta2
+                )
             if config.activation_func_fp8_input_store:
                 activation_func_kwargs["cache_quantized_input"] = True
             layer = layer_type(**activation_func_kwargs)
@@ -985,6 +997,141 @@ class TELinear(te.pytorch.Linear):
 
     def backward_dw(self):
         """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
+        if self.config.delay_wgrad_compute:
+            super().backward_dw()
+
+
+class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
+    """Transformer Engine RMSNormLinear with weights duplicated across TP ranks."""
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        parallel_mode: Optional[str],
+        config: TransformerConfig,
+        init_method: Callable,
+        bias: bool,
+        skip_bias_add: bool,
+        skip_weight_param_allocation: bool,
+        is_expert: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
+    ):
+        if not HAVE_TE:
+            raise ImportError(
+                "Transformer Engine is not installed. "
+                "Please install it with `pip install transformer-engine`."
+            )
+        if parallel_mode != "duplicated":
+            raise ValueError("TERMSNormDuplicatedLinear requires parallel_mode='duplicated'.")
+        if is_expert:
+            raise ValueError("TERMSNormDuplicatedLinear does not support expert parameters.")
+        if skip_weight_param_allocation:
+            raise ValueError(
+                "Transformer Engine linear layers do not support skip_weight_param_allocation"
+            )
+
+        self.config = config
+        self.te_return_bias = skip_bias_add and bias
+        self.is_first_microbatch = True
+        self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
+        self.rng_tracker_name = get_data_parallel_rng_tracker_name()
+
+        extra_kwargs = _get_extra_te_kwargs(config)
+        if self.config.delay_wgrad_compute:
+            if is_te_min_version("2.3.0"):
+                extra_kwargs["delay_wgrad_compute"] = True
+            else:
+                raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
+
+        self.te_quant_params: Optional[TEQuantizationParams] = None
+        quant_config = get_quant_config_or_none(name, config.quant_recipe)
+        self.finish_init(quant_config)
+        init_quant_context = _get_fp8_model_init_for_quant_params(
+            self.te_quant_params, torch.is_grad_enabled()
+        )
+
+        # TODO: When GTP reaches LatentMoE on dev, accept its rematerialization and replica
+        # groups here and wrap TE construction in `_init_gtp_remat_context` with
+        # `rng_via_kwarg=False`. GTP should shard only the linear weight's output dimension
+        # (including any alignment padding); the RMSNorm scale stays replicated at [input_size],
+        # and the rematerialized output keeps the logical [..., output_size] shape.
+        with init_quant_context:
+            super().__init__(
+                in_features=input_size,
+                out_features=output_size,
+                eps=self.config.layernorm_epsilon,
+                sequence_parallel=False,
+                fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
+                tp_group=None,
+                tp_size=1,
+                get_rng_state_tracker=(
+                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                ),
+                init_method=condition_init_method(config, init_method),
+                bias=bias,
+                normalization="RMSNorm",
+                return_bias=self.te_return_bias,
+                parallel_mode=None,
+                return_layernorm_output=False,
+                zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
+                **extra_kwargs,
+            )
+
+        # TODO: With GTP, restore the optional bias after pre-sharded TE construction. GTP
+        # shards only the linear weight, so bias must remain replicated at [output_size].
+        self._tp_group = (
+            tp_group
+            if tp_group is not None
+            else get_tensor_model_parallel_group_if_none(tp_group, is_expert=False)
+        )
+        for param in self.parameters():
+            setattr(param, "allreduce", True)
+            setattr(param, "sequence_parallel", self.config.sequence_parallel)
+            setattr(param, "tensor_model_parallel", False)
+
+    def finish_init(self, quantization_config: QuantizationConfig):
+        """Post-init of quantization override."""
+        if quantization_config is None:
+            self.te_quant_params = None
+        else:
+            self.te_quant_params = TEQuantizationParams.parse_from_config(quantization_config)
+
+    def will_execute_quantized(self, is_context_quantized: bool) -> bool:
+        """Return whether the module is configured to execute quantized."""
+        return _get_should_context_be_quantized_params(
+            self.te_quant_params, self.training, is_context_quantized
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply RMSNorm followed by the duplicated linear projection."""
+        _is_first_microbatch = (
+            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+        )
+        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+        with quant_context:
+            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        self.is_first_microbatch = False
+        if self.te_return_bias:
+            return out
+        return out, None
+
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        """Replicate parameters across TP and DP checkpoint coordinates."""
+        state_dict = self.state_dict(prefix="", keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(
+            state_dict,
+            prefix,
+            None,
+            sharded_offsets,
+            tp_group=self._tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
+        )
+
+    def backward_dw(self):
+        """Compute weight gradients when delayed wgrad computation is enabled."""
         if self.config.delay_wgrad_compute:
             super().backward_dw()
 
@@ -2745,6 +2892,12 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 op_type = te.pytorch.ops.ReLU
             elif (activation_func, gated_linear_unit) == (F.relu, True):
                 op_type = te.pytorch.ops.ReGLU
+            elif (activation_func, gated_linear_unit) == (situlu, True):
+                op_type = getattr(te.pytorch.ops, "SiTUGLU", None)
+                if op_type is None:
+                    raise RuntimeError(
+                        "SiTU-GLU requires Transformer Engine with " "pytorch.ops.SiTUGLU support."
+                    )
 
             # Could not find corresponding activation op
             if op_type is None:
@@ -2756,6 +2909,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             # Construct op
             kwargs = {}
+            if activation_func is situlu:
+                kwargs.update(beta1=self.config.situ_glu_beta1, beta2=self.config.situ_glu_beta2)
             if is_te_min_version("2.3"):
                 kwargs["cache_quantized_input"] = cache_quantized_input
             return op_type(**kwargs)
@@ -2924,14 +3079,23 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                     f"{self.__class__.__name__} does not support add_bias_linear=True; "
                     "the CuTeGEMM fused kernel requires bias-free linear layers."
                 )
-            if self.config.activation_func != F.silu or not self.config.gated_linear_unit:
+            if not self.config.gated_linear_unit or self.config.activation_func not in (
+                F.silu,
+                situlu,
+            ):
                 raise ValueError(
-                    f"{self.__class__.__name__} requires SwiGLU activation "
-                    "(activation_func=F.silu, gated_linear_unit=True) "
+                    f"{self.__class__.__name__} requires SwiGLU or SiTU-GLU activation "
+                    "with gated_linear_unit=True "
                     "for the CuTeGEMM fused kernel, but got "
                     f"activation_func={self.config.activation_func}, "
                     f"gated_linear_unit={self.config.gated_linear_unit}."
                 )
+            if self.config.activation_func is situlu:
+                if not hasattr(te.pytorch.ops, "ScaledSiTUGLU"):
+                    raise RuntimeError(
+                        "SiTU-GLU requires Transformer Engine with "
+                        "pytorch.ops.ScaledSiTUGLU support."
+                    )
 
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module with GroupedLinear(num_groups=1) + ScaledSwiGLU."""
@@ -3008,9 +3172,19 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             op._glu_interleave_size = _GLU_INTERLEAVE_SIZE  # signals fuser_forward to interleave
             fused_impl.append(op)
 
-            # ScaledSwiGLU with glu_interleave_size=32
-            # Required by ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8
-            fused_impl.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=32))
+            if self.config.activation_func is situlu:
+                # ScaledSiTUGLU with glu_interleave_size=32.
+                fused_impl.append(
+                    te.pytorch.ops.ScaledSiTUGLU(
+                        glu_interleave_size=32,
+                        beta1=self.config.situ_glu_beta1,
+                        beta2=self.config.situ_glu_beta2,
+                    )
+                )
+            else:
+                # ScaledSwiGLU with glu_interleave_size=32
+                # Required by ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8
+                fused_impl.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=32))
 
             # FC2: GroupedLinear(num_groups=1) instead of BasicLinear
             weight = self.linear_fc2.weight
