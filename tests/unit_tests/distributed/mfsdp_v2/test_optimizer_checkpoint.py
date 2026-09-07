@@ -267,9 +267,9 @@ class TestOptimizerCheckpoint:
         a dropped or mis-serialized ``step`` (and the stale momentum that comes with it)
         fails the comparison instead of matching by construction.
 
-        With >=2 ranks this also covers the empty-local placeholder path: MFSDP v2 filters
-        empty-local shards out of the base optimizer per rank, so the placeholders are what
-        keep the DTensor keyspace identical across ranks.
+        With >=2 ranks this also covers the empty-shard case: MFSDP v2's flat packing leaves
+        some ranks owning no rows of a given parameter, so the checkpoint has to describe and
+        restore optimizer state whose local shard is empty.
         """
         config = _transformer_config()
         world_size = torch.distributed.get_world_size()
@@ -287,10 +287,10 @@ class TestOptimizerCheckpoint:
         assert {group["step"] for group in param_group_snapshot} == {source_steps}
 
         if world_size > 1:
-            # Confirm the placeholder path is not vacuous: at least one rank must have had an
-            # empty-local shard filtered out of its optimizer. Count empty local shards
-            # directly, which is the exact condition the filter tests, over the trainable
-            # parameters, which are the only ones the optimizer is given in the first place.
+            # Confirm the empty-shard case is not vacuous: at least one rank must own no rows
+            # of some parameter, so that the round trip above really covers zero-size local
+            # state. Counted over the trainable parameters, which are the ones the optimizer
+            # is given.
             empty_local = sum(
                 1
                 for param in source_model.parameters()
@@ -301,7 +301,7 @@ class TestOptimizerCheckpoint:
             empty_local_counts = [None] * world_size
             torch.distributed.all_gather_object(empty_local_counts, empty_local)
             assert any(empty_local_counts), (
-                "No rank had an empty local shard, so the placeholder path is untested for "
+                "No rank had an empty local shard, so the empty-shard case is untested for "
                 f"this config. empty_local_counts={empty_local_counts}"
             )
 

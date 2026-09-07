@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from typing import Any, Callable, List, Optional, override
 
 import torch
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
@@ -135,92 +135,51 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         )
 
     def _trainable_parameters(self) -> Iterator[torch.nn.Parameter]:
-        """Yield the parameters the base optimizer owns before the empty-shard filter.
+        """Yield the parameters the base optimizer owns, in model order.
 
-        ``_get_param_groups`` keeps every ``requires_grad`` parameter, but MFSDP v2 then
-        drops the ones whose *local* shard is empty, working around a TE FusedAdam bug (see
-        :func:`get_megatron_optimizer`). That filter is applied per rank, so the surviving
-        set differs across ranks; this iterator reconstructs the rank-invariant superset.
+        This is the same set ``_get_param_groups`` builds, read off the model so that it is
+        available before the optimizer exists and on a rank whose optimizer is a stub.
         """
         for model_chunk in self.model_chunks:
             for param in model_chunk.parameters():
                 if param.requires_grad:
                     yield param
 
-    def _shard_process_groups(self) -> list[torch.distributed.ProcessGroup]:
-        """Return the process groups across which the parameters are sharded.
+    def _raise_if_parameters_span_multiple_meshes(self) -> None:
+        """Reject a model whose parameters do not all share one device mesh.
 
-        Every sharded dimension of the parameter device mesh contributes one group.
-        Replicated dimensions are skipped: replicas hold identical shards, hence an
-        identical keyspace. These are the groups ``preprocess_state_dict_for_uneven_dtensor``
-        gathers over, so a collective run here reaches the same ranks the save and load
-        collectives do.
+        MFSDP v2 shards expert parameters over the expert-DP mesh and everything else over
+        the DP mesh (see :class:`FullyShardedDataParallelV2`), and expert parallelism gives
+        each rank a different set of expert FQNs. The ``fsdp_dtensor`` format needs a
+        rank-identical DTensor keyspace, because ``preprocess_state_dict_for_uneven_dtensor``
+        walks the state dict's DTensors in sorted key order and gathers over each one; a
+        keyspace that differs across ranks desynchronizes those collectives.
 
         Raises:
-            NotImplementedError: If the parameters do not all share one device mesh, which
-                is what expert parallelism produces. Not yet supported rather than refused
-                on principle; training under expert parallelism is unaffected.
+            NotImplementedError: If the parameters span more than one device mesh, which is
+                what expert parallelism produces. Not yet supported rather than refused on
+                principle -- describing such a model needs a keyspace built per mesh -- and
+                training under expert parallelism is unaffected, only checkpointing.
         """
-        sharded_parameters = [
-            param for param in self._trainable_parameters() if isinstance(param, DTensor)
-        ]
-        if len({param.device_mesh for param in sharded_parameters}) > 1:
-            # MFSDP v2 shards expert parameters over the expert-DP mesh and everything else
-            # over the DP mesh (see FullyShardedDataParallelV2). Expert parallelism also gives
-            # each rank a different set of expert FQNs, so the DTensor keyspace this method
-            # exists to equalize is rank-dependent for a reason no gather can repair.
-            # TODO: not a contract, just unimplemented -- describing an expert-parallel model
-            # needs a keyspace built per mesh instead of one gather over one mesh.
+        meshes = {
+            param.device_mesh
+            for param in self._trainable_parameters()
+            if isinstance(param, DTensor)
+        }
+        if len(meshes) > 1:
             raise NotImplementedError(
                 "MFSDP v2 optimizer checkpointing does not support expert parallelism yet: "
                 "its parameters span more than one device mesh."
             )
-        if not sharded_parameters:
-            return []
-
-        mesh = sharded_parameters[0].device_mesh
-        return [
-            mesh.get_group(mesh_dim)
-            for mesh_dim, placement in enumerate(sharded_parameters[0].placements)
-            if isinstance(placement, Shard) and mesh.size(mesh_dim) > 1
-        ]
-
-    def _gather_state_keys_by_fqn(self) -> dict[str, list[str]]:
-        """Map every parameter's FQN to the keys of its ``DTensor`` optimizer state entries.
-
-        The keys are read off live state (``exp_avg``/``exp_avg_sq`` for Adam) rather than
-        hard-coded, so any base optimizer works. They are gathered because a parameter that
-        this rank's optimizer filtered out is only described by the rank that owns a
-        non-empty shard of it, which is what lets every rank synthesize a placeholder with
-        exactly the owning rank's keys. A parameter that has no state anywhere (nothing has
-        stepped yet) is simply absent.
-
-        Which key set a parameter has is a property of the base optimizer, not of the shard,
-        so ranks that both describe an FQN describe it identically and the merge below can
-        let any of them win. Sorting is what makes that hold as stated rather than by luck:
-        it turns each entry into a canonical list, so two ranks whose state dicts happened to
-        insert the keys in different orders still produce equal values.
-        """
-        state_keys_by_fqn = {
-            self._param_to_fqn[param]: sorted(
-                key for key, value in state.items() if isinstance(value, DTensor)
-            )
-            for param, state in self.optimizer.state.items()
-        }
-        for group in self._shard_process_groups():
-            gathered = [None] * torch.distributed.get_world_size(group)
-            torch.distributed.all_gather_object(gathered, state_keys_by_fqn, group=group)
-            state_keys_by_fqn = {fqn: keys for rank in gathered for fqn, keys in rank.items()}
-        return state_keys_by_fqn
 
     def _param_to_group_meta(self) -> dict[str, Any]:
-        """Map each locally-owned parameter's FQN to its param-group hyperparameters.
+        """Map each parameter's FQN to its param-group hyperparameters.
 
-        Only the parameters this rank's optimizer owns appear, which is exactly what both
-        ends need: on save DCP unions the (non-tensor) entries written by all ranks, and on
-        load each rank reads back the entries of the parameters it owns. The base optimizer
-        (TE FusedAdam) tracks ``step`` per group rather than per parameter, so ``step``
-        round-trips here rather than in the per-parameter state.
+        The base optimizer (TE FusedAdam) tracks ``step`` per group rather than per
+        parameter, so ``step`` round-trips here rather than in the per-parameter state.
+        Keying by parameter rather than by group index means a load matches groups by the
+        parameters in them, so a checkpoint still applies when the groups are ordered
+        differently.
         """
         return {
             self._param_to_fqn[param]: {
@@ -250,8 +209,7 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
                     "match this model."
                 )
             # Every parameter of a group carries that group's hyperparameters, so read them
-            # from the first one. A group left empty by the empty-shard filter has none to
-            # read and contributes no state either.
+            # from the first one.
             hyperparameters = param_to_group_meta[fqns[0]] if fqns else {}
             param_groups.append({"params": fqns, **hyperparameters})
         return param_groups
@@ -267,18 +225,12 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         to the current parameters, mirroring the Megatron-FSDP branch of
         :meth:`DistributedOptimizer.load_state_dict`.
         """
-        param_groups = self._param_groups_from_group_meta(state_dict["param_to_group_meta"])
-        owned_fqns = {fqn for group in param_groups for fqn in group["params"]}
         self.optimizer.load_state_dict(
             {
-                # Drop the empty-local placeholders synthesized for save-time rank
-                # consistency; keep only what this rank's optimizer owns.
-                "state": {
-                    fqn: param_state
-                    for fqn, param_state in state_dict["state"].items()
-                    if fqn in owned_fqns
-                },
-                "param_groups": param_groups,
+                "state": state_dict["state"],
+                "param_groups": self._param_groups_from_group_meta(
+                    state_dict["param_to_group_meta"]
+                ),
             }
         )
 
@@ -302,12 +254,11 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         whose names are the plain ``named_parameters`` ones rather than MCore's PP/EP-unique
         checkpoint names.
 
-        Rank consistency is the load-bearing invariant here. The empty-shard filter (see
-        :meth:`_trainable_parameters`) leaves each rank with a different set of parameters,
-        while ``preprocess_state_dict_for_uneven_dtensor`` runs one ``all_gather_object``
-        *per DTensor* in sorted key order, so a rank-dependent DTensor keyspace deadlocks.
-        Every trainable parameter is therefore emitted: the parameters this rank's optimizer
-        holds contribute their real state, and the rest contribute empty-local placeholders.
+        Rank consistency is the load-bearing invariant here: every rank's optimizer holds
+        every trainable parameter, including the ones whose local shard is empty, so the
+        emitted DTensor keyspace is the same on all of them. That is what
+        ``preprocess_state_dict_for_uneven_dtensor`` needs, since it walks the DTensors in
+        sorted key order and gathers over each one.
 
         Args:
             model_sharded_state_dict: Accepted for interface parity; the optimizer state is
@@ -320,36 +271,14 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         Returns:
             The optimizer state dict, in the ``fsdp_dtensor`` format described above.
         """
+        self._raise_if_parameters_span_multiple_meshes()
         if is_loading:
             init_optimizer_state(self.optimizer)
 
-        state_keys_by_fqn = self._gather_state_keys_by_fqn()
-        state_by_fqn = {
+        packed_state = {
             self._param_to_fqn[param]: param_state
             for param, param_state in self.optimizer.state.items()
         }
-
-        packed_state: dict[str, Any] = {}
-        for param in self._trainable_parameters():
-            fqn = self._param_to_fqn[param]
-            if fqn in state_by_fqn:
-                packed_state[fqn] = state_by_fqn[fqn]
-            else:
-                # Filtered out of this rank's optimizer because its local shard is empty. The
-                # rank owning a non-empty shard saves the real state; this placeholder has the
-                # same global shape and dtype but no local rows, so it contributes no data and
-                # only keeps the DTensor keyspace identical on every rank.
-                # TODO: delete this branch, together with _gather_state_keys_by_fqn and the
-                # owned_fqns filter in load_state_dict, once the empty-shard filter in
-                # get_megatron_optimizer goes away. That filter works around
-                # https://github.com/NVIDIA/TransformerEngine/issues/3207, fixed by
-                # https://github.com/NVIDIA/TransformerEngine/pull/3212, which has not yet
-                # propagated to the LTS container the MFSDP v2 tests also run in. With the
-                # filter gone the keyspace is rank-invariant by construction.
-                packed_state[fqn] = {
-                    key: torch.zeros_like(param) for key in state_keys_by_fqn.get(fqn, ())
-                }
-
         return {"state": packed_state, "param_to_group_meta": self._param_to_group_meta()}
 
     @override
