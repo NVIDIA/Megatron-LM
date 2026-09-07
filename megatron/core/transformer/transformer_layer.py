@@ -1306,7 +1306,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         )
 
         mlp_output_with_bias = self._run_mlp(
-            pre_mlp_layernorm_output, residual, padding_mask, inference_context, input_ids=input_ids
+            pre_mlp_layernorm_output,
+            residual,
+            padding_mask,
+            inference_context,
+            input_ids=input_ids,
+            packed_seq_params=packed_seq_params,
         )
 
         if moe_unflatten_mbs is not None:
@@ -1363,7 +1368,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         )
 
         mlp_output_with_bias = self._run_mlp(
-            pre_mlp_layernorm_output, residual, padding_mask, inference_context, input_ids=input_ids
+            pre_mlp_layernorm_output,
+            residual,
+            padding_mask,
+            inference_context,
+            input_ids=input_ids,
+            packed_seq_params=packed_seq_params,
         )
 
         if moe_unflatten_mbs is not None:
@@ -1405,6 +1415,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         padding_mask: Tensor | None,
         inference_context: BaseInferenceContext | None,
         input_ids: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """Execute the MLP submodule with the appropriate variant.
 
@@ -1438,6 +1449,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         moe_kwargs = {}
         if self.is_moe_layer and input_ids is not None:
             moe_kwargs["input_ids"] = input_ids
+        if self.is_moe_layer and packed_seq_params is not None:
+            moe_kwargs["packed_seq_params"] = packed_seq_params
 
         if self.recompute_mlp:
             if self.config.fp8 or self.config.fp4:
