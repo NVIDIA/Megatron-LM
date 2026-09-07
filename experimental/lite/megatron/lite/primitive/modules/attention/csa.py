@@ -8,6 +8,7 @@ import torch.nn as nn
 
 # Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core.
 # The development branch groups them under the csa_utils package.
+from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_out_of_place
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.experimental_attention_variant.csa import (
     _apply_fused_rope,
@@ -854,7 +855,8 @@ class CompressedSparseAttention(nn.Module):
 
         ``x`` is ``[1, total, hidden]`` (batch-first, packed). Produces the
         TE-THD-convention tensors consumed by :meth:`_forward_thd_cp`, then applies
-        the output projection (inverse RoPE + ``wo``) via :meth:`_project_context`.
+        the output projection (inverse RoPE + ``wo``) in the THD layout, without
+        the round trip through BSHD that :meth:`_project_context` needs.
         Returns ``[1, total, hidden]`` for the SBHD shim.
         """
         batch, seq_len, _ = x.shape
@@ -936,16 +938,35 @@ class CompressedSparseAttention(nn.Module):
         context = self._forward_thd_cp(
             query_thd, key_thd, x_thd, qr_thd, boundary_hidden, boundary_kv, packed_seq_params
         )
-        # context: (total, 1, np * hn). Reshape to (1, np, total, hn) for the shared
-        # output projection (inverse RoPE + wo), then return (1, total, hidden).
-        context = (
-            context.squeeze(1)
-            .view(seq_len, self.num_heads, self.head_dim)
-            .permute(1, 0, 2)
-            .unsqueeze(0)
-            .contiguous()
+        # context: (total, 1, np * hn). Reaching the shared BSHD output projection
+        # from here cost three full materialisations of the largest tensor in the
+        # module: a permute into (1, np, total, hn), an unfused inverse RoPE that
+        # concatenates the untouched nope channels back onto the rotated ones, and
+        # a transpose + reshape on the way out -- per layer, paid twice again under
+        # activation recompute, and measured as 64% of this module's kernel time.
+        #
+        # THD needs none of it. (total, np, hn) is already
+        # (total, o_groups, heads_per_group * hn) by a free view, and Core's fused
+        # kernel undoes the rotation over the RoPE channels alone. This is the route
+        # mcore's DSv4 attention takes; out-of-place because fused DSA backward
+        # retains the raw attention output.
+        context = context.squeeze(1).view(seq_len, self.num_heads, self.head_dim)
+        context = fused_mla_rope_out_of_place(
+            context,
+            cos_thd,
+            sin_thd,
+            nope_dim,
+            self.rope_head_dim,
+            cu_seqlens,
+            rope_group.rank(),
+            rope_group.size(),
+            inverse=True,
+            remove_interleaving=True,
         )
-        return self._project_context(context, cos, sin)
+        grouped = context.view(
+            1, seq_len, self.config.o_groups, self.num_heads_per_group * self.head_dim
+        )
+        return self.wo_b(self.wo_a(grouped).flatten(2))
 
     def _forward_thd_cp(
         self,
