@@ -6,8 +6,13 @@ from typing import Any, Callable, Optional
 import torch
 from torch import Tensor
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.models.common.fine_grained_mfsdp_scheduler import (
+    reshard_fsdp_module,
+    setup_combined_1f1b_hooks,
+)
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -434,6 +439,15 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             self.post_process = post_process_cls(
                 model, self._model_chunk_state, self._event, get_comp_stream
             )
+
+        # setup FSDP hooks
+        has_fsdp_module = any(isinstance(submodule, FsdpModule) for submodule in model.modules())
+        if has_fsdp_module:
+            setup_combined_1f1b_hooks(model)
+            for layer_plan in self._transformer_layers:
+                # Forward resharding follows the schedule. Backward resharding and
+                # reduction are triggered by each FsdpModule's gradient countdown.
+                layer_plan.set_fsdp_reshard_hooks(reshard_fsdp_module, lambda _: None)
 
     def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):
         if module is None:
