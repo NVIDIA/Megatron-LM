@@ -2,7 +2,7 @@
 """Unit tests for the DeepSeek-V4 CSA THD context-parallel path.
 
 Coverage strategy (see the module docstring of
-``megatron.core.transformer.experimental_attention_variant.csa_cp_layout_kernels``):
+``megatron.core.transformer.experimental_attention_variant.csa_utils.thd_layout_kernels``):
 the full ``_forward_thd_cp`` is gated behind CuTeDSL/CUDA kernels
 (``prepare_cp_compressor_input`` and ``build_attention_indices``), so its numeric
 ``CP=1 == unsharded`` invariant is only reachable on a GPU with those kernels and
@@ -224,7 +224,7 @@ def test_thd_cp_uses_current_core_layout_interfaces(monkeypatch):
     )
     monkeypatch.setattr(csa, 'gather_from_sequence_parallel_region', fake_gather)
     monkeypatch.setattr(
-        csa.csa_cp_layout_kernels, 'build_attention_indices', fake_build_attention_indices
+        csa.thd_layout_kernels, 'build_attention_indices', fake_build_attention_indices
     )
     monkeypatch.setattr(
         csa, 'unfused_compressed_sparse_attn', lambda query, _kv, _sinks, _indices, _scale: query

@@ -122,9 +122,11 @@ def _prepare_sparse_loss_fallback(
         if physical_indices is not None:
             sanitized_physical_indices = physical_indices.masked_fill(row_mask, -1)
 
-    safe_indices = sanitized_topk_indices.clamp(min=0).long()
+    score_width = indexer_scores.shape[-1]
+    valid = (sanitized_topk_indices >= 0) & (sanitized_topk_indices < score_width)
+    safe_indices = sanitized_topk_indices.clamp(min=0, max=score_width - 1).long()
     gathered_scores = torch.gather(indexer_scores, dim=-1, index=safe_indices)
-    gathered_scores = torch.where(sanitized_topk_indices >= 0, gathered_scores, _FLOAT32_MIN)
+    gathered_scores = torch.where(valid, gathered_scores, _FLOAT32_MIN)
     predict = torch.softmax(gathered_scores, dim=-1)
     return predict, sanitized_topk_indices, sanitized_physical_indices
 

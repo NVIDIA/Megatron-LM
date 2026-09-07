@@ -950,8 +950,13 @@ class TestDSv4HybridAttentionTHDCP:
 
     @pytest.mark.parametrize(
         "use_fused_kernels,apply_rope_fusion",
-        [(False, True), (False, False), (True, True)],
-        ids=["unfused-attn-fused-rope", "unfused-attn-unfused-rope", "fused-attn"],
+        [(False, True), (False, False), (True, True), (True, False)],
+        ids=[
+            "unfused-attn-fused-rope",
+            "unfused-attn-unfused-rope",
+            "fused-attn-fused-rope",
+            "fused-attn-unfused-rope",
+        ],
     )
     def test_dynamic_cp_mla_up_proj_recompute_matches_eager(
         self, use_fused_kernels, apply_rope_fusion

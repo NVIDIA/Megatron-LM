@@ -5,17 +5,16 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from megatron.lite.primitive import transformer_engine as te
 # Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core.
 # The development branch groups them under the csa_utils package.
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.transformer.experimental_attention_variant.csa_utils import (
-    cp_layout_kernels as csa_cp_layout_kernels,
-)
-from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.core.transformer.experimental_attention_variant.csa import (
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_utils,
+    thd_layout_kernels,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
     FusedCSAIndexerSparseAttnFromTopkFunc,
@@ -25,12 +24,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
 )
+from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.modules.attention.dsa import rotate_activation
 from megatron.lite.primitive.parallel.state import ParallelState
-from megatron.lite.primitive.utils.rotary import (
-    _yarn_find_correction_range,
-    _yarn_linear_ramp_mask,
-)
+from megatron.lite.primitive.utils.rotary import _yarn_find_correction_range, _yarn_linear_ramp_mask
 
 
 class GroupedLinear(nn.Module):
@@ -890,6 +887,9 @@ class CompressedSparseAttention(nn.Module):
             ) = cp_utils.prepare_cp_compressor_input(
                 x, boundary_hidden, cu_seqlens, global_start, cp_size, ratio
             )
+            # TODO(lite): Thread the local prefixes through once Lite adopts Core's
+            # fused-compressor dispatch. Lite currently owns a separate eager
+            # ``_forward_thd`` implementation, so passing them alone has no effect.
 
             if indexer is not None:
                 indexer_x, indexer_qr = x.detach(), qr.detach()
@@ -967,7 +967,7 @@ class CompressedSparseAttention(nn.Module):
             else (max_seqlen_q // ratio if ratio > 1 else 0)
         )
         topk_idxs, topk_length, indexer_topk_rank_major, _ = (
-            csa_cp_layout_kernels.build_attention_indices(
+            thd_layout_kernels.build_attention_indices(
                 cu_seqlens,
                 global_start,
                 l_local,

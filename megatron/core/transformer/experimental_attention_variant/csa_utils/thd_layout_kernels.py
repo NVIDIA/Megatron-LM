@@ -842,7 +842,8 @@ class CompressorInputCompact(torch.autograd.Function):
         boundary_hidden: CUDA tensor, shape ``(d_window, ...)``.
         cu_seqlens: int32 CUDA tensor, shape ``(n_seq + 1,)``.
         global_start: first global row in ``hidden_local``.
-        ratio/d_comp/c_cap: compressor window and fixed group capacity.
+        ratio/d_comp: compressor window sizes; ``ratio`` must be positive.
+        c_cap: positive fixed group capacity.
         cp_size: number of context-parallel ranks.
 
     Outputs:
@@ -867,6 +868,12 @@ class CompressorInputCompact(torch.autograd.Function):
         cp_size: int,
     ):
         """Compact hidden rows and produce graph-safe compressor metadata."""
+        ratio = int(ratio)
+        c_cap = int(c_cap)
+        if ratio < 1 or c_cap < 1:
+            raise ValueError(
+                f"ratio and c_cap must both be >= 1, got ratio={ratio}, c_cap={c_cap}."
+            )
         _require_cute(
             "DSv4 CP compressor compaction requires CUDA tensors and CuTeDSL.",
             hidden_local,
@@ -877,12 +884,12 @@ class CompressorInputCompact(torch.autograd.Function):
         d_window = boundary_hidden.shape[0]
         ctx.hidden_shape = tuple(hidden_local.shape)
         ctx.boundary_shape = tuple(boundary_hidden.shape)
-        ctx.compact_args = (int(global_start), int(l_local), int(ratio), int(d_comp), int(d_window))
+        ctx.compact_args = (int(global_start), int(l_local), ratio, int(d_comp), int(d_window))
         ctx.save_for_backward(cu_seqlens)
 
-        compact_len = int(c_cap) * int(ratio)
+        compact_len = c_cap * ratio
         hidden_compact = hidden_local.new_empty((compact_len,) + tuple(hidden_local.shape[1:]))
-        comp_ids = torch.empty((int(c_cap),), dtype=torch.int32, device=hidden_local.device)
+        comp_ids = torch.empty((c_cap,), dtype=torch.int32, device=hidden_local.device)
         position_ids = torch.empty_like(comp_ids)
         metadata_shape = (cu_seqlens.shape[0],)
         local_cu_seqlens = torch.empty(
@@ -908,7 +915,7 @@ class CompressorInputCompact(torch.autograd.Function):
                 cu_seqlens.shape[0] - 1,
                 int(global_start),
                 int(l_local),
-                int(ratio),
+                ratio,
                 int(d_comp),
                 int(d_window),
                 compact_len,
@@ -917,7 +924,7 @@ class CompressorInputCompact(torch.autograd.Function):
             static_arg_indices=(3, 4, 5, 7),
         )
 
-        seq_major_rows = (int(l_local) * int(cp_size)) // int(ratio)
+        seq_major_rows = (int(l_local) * int(cp_size)) // ratio
         seq_to_rank_row = torch.empty(
             (seq_major_rows,), dtype=torch.int32, device=hidden_local.device
         )
@@ -929,9 +936,9 @@ class CompressorInputCompact(torch.autograd.Function):
                     cu_seqlens.shape[0] - 1,
                     int(l_local),
                     int(cp_size),
-                    int(ratio),
+                    ratio,
                     int(d_comp),
-                    int(c_cap),
+                    c_cap,
                     seq_major_rows,
                 ),
                 static_arg_indices=(3, 4),

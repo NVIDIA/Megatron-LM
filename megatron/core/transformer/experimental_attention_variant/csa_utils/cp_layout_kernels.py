@@ -3,8 +3,7 @@
 
 The implementation now lives in :mod:`.thd_layout_kernels` because final-index
 lowering is shared by context-parallel and generic packed-THD paths. Keep this
-module temporarily for callers, including Megatron Lite, that still import the
-old path.
+module temporarily for downstream callers that still import the old path.
 """
 
 from . import thd_layout_kernels as _impl
@@ -12,8 +11,8 @@ from . import thd_layout_kernels as _impl
 CompressorInputCompact = _impl.CompressorInputCompact
 build_attention_indices = _impl.build_attention_indices
 
-# Preserve the availability probe used by downstream tests and diagnostics.
-_CUTE_AVAILABLE = _impl._CUTE_AVAILABLE
+# ``_CUTE_AVAILABLE`` intentionally resolves through ``__getattr__`` so the
+# availability probe used by downstream tests stays live rather than snapshotted.
 
 __all__ = ["CompressorInputCompact", "build_attention_indices"]
 

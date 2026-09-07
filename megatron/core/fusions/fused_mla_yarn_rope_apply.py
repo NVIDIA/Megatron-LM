@@ -70,18 +70,28 @@ def _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size):
 def _get_contiguous_thd_token_idx(cu_seqlens, pid_m, seq_num, global_start):
     """Map a row in a contiguous THD slice to its position within the packed sequence."""
     global_row = pid_m.to(tl.int64) + global_start
-    token_idx = tl.full((), 0, dtype=tl.int64)
-    seq_idx = 0
-    while seq_idx < seq_num:
-        seq_start = tl.load(cu_seqlens + seq_idx).to(tl.int64)
-        seq_end = tl.load(cu_seqlens + seq_idx + 1).to(tl.int64)
-        in_sequence = (global_row >= seq_start) & (global_row < seq_end)
-        token_idx = tl.where(in_sequence, global_row - seq_start, token_idx)
-        seq_idx += 1
+    seq_count = seq_num.to(tl.int32)
+
+    # Find the first sequence whose end offset is greater than global_row,
+    # equivalent to torch.bucketize(global_row, cu_seqlens[1:], right=True).
+    # This keeps the per-row lookup logarithmic for batches with many short
+    # packed sequences. Using an upper bound also skips zero-length sequences
+    # represented by duplicate prefix offsets.
+    low = tl.full((), 0, dtype=tl.int32)
+    high = seq_count
+    while low < high:
+        mid = (low + high) >> 1
+        go_left = global_row < tl.load(cu_seqlens + mid + 1).to(tl.int64)
+        low = tl.where(go_left, low, mid + 1)
+        high = tl.where(go_left, mid, high)
+
+    in_sequence = low < seq_count
+    seq_start = tl.load(cu_seqlens + low, mask=in_sequence, other=0).to(tl.int64)
+    in_sequence = in_sequence & (global_row >= seq_start)
     # Boundary and CUDA-graph padding rows outside every packed sequence use
     # position zero so COS/SIN loads remain in bounds. Those rows are masked by
     # their downstream consumers.
-    return token_idx
+    return tl.where(in_sequence, global_row - seq_start, 0)
 
 
 @triton.autotune(

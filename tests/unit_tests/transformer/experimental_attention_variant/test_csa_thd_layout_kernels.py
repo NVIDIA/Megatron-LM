@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_layout_kernels,
     thd_indexer_kernels,
     thd_layout_kernels,
 )
@@ -18,6 +19,27 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils
 
 _E2E_RAGGED_PADDED_SEG_LENS = (1, 127, 1000, 23, 129, 900, 55, 257, 800, 95, 509, 200)
 _E2E_CP_SIZE = 4
+
+
+def test_cp_layout_compat_availability_probe_is_live(monkeypatch):
+    """The compatibility shim reads the implementation's current availability."""
+    patched_availability = not thd_layout_kernels._CUTE_AVAILABLE
+    monkeypatch.setattr(thd_layout_kernels, "_CUTE_AVAILABLE", patched_availability)
+
+    assert cp_layout_kernels._CUTE_AVAILABLE is patched_availability
+
+
+@pytest.mark.parametrize(("ratio", "c_cap"), ((4, 0), (0, 1)))
+def test_compressor_input_compact_rejects_nonpositive_dimensions(ratio, c_cap):
+    """A zero-size launch cannot initialize compressor metadata safely."""
+    hidden = torch.empty((1, 1))
+    boundary = torch.empty((1, 1))
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="ratio and c_cap must both be >= 1"):
+        thd_layout_kernels.CompressorInputCompact.apply(
+            hidden, boundary, cu_seqlens, 0, ratio, 1, c_cap, 1
+        )
 
 
 def _require_cute_cuda():

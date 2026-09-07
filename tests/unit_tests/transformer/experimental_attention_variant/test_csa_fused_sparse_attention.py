@@ -871,16 +871,18 @@ def _sparse_loss_preparation_reference(scores, topk, padding_mask=None, physical
         topk = topk.masked_fill(row_mask, -1)
         if physical is not None:
             physical = physical.masked_fill(row_mask, -1)
-    safe_topk = topk.clamp(min=0).long()
+    score_width = scores.shape[-1]
+    valid = (topk >= 0) & (topk < score_width)
+    safe_topk = topk.clamp(min=0, max=score_width - 1).long()
     selected = torch.gather(scores, -1, safe_topk)
-    selected = torch.where(topk >= 0, selected, torch.finfo(torch.float32).min)
+    selected = torch.where(valid, selected, torch.finfo(torch.float32).min)
     return torch.softmax(selected, -1), topk, physical
 
 
 def test_sparse_loss_preparation_cpu_fallback():
     scores = torch.tensor([[0.5, -1.0, 2.0, 1.0], [3.0, 2.0, 1.0, 0.0]])
-    topk = torch.tensor([[2, 0, -1], [3, 1, 0]], dtype=torch.int32)
-    physical = torch.tensor([[12, 10, -1], [23, 21, 20]], dtype=torch.int32)
+    topk = torch.tensor([[2, 4, -1], [3, 1, 0]], dtype=torch.int32)
+    physical = torch.tensor([[12, 14, -1], [23, 21, 20]], dtype=torch.int32)
     padding_mask = torch.tensor([False, True])
 
     actual = dk.csa_indexer_loss_kernels.prepare_sparse_loss(scores, topk, padding_mask, physical)
@@ -888,6 +890,7 @@ def test_sparse_loss_preparation_cpu_fallback():
     torch.testing.assert_close(actual[0], expected[0])
     assert torch.equal(actual[1], expected[1])
     assert torch.equal(actual[2], expected[2])
+    torch.testing.assert_close(actual[0][0], torch.tensor([1.0, 0.0, 0.0]))
     torch.testing.assert_close(actual[0][1], torch.full((3,), 1.0 / 3.0))
 
 
@@ -898,7 +901,7 @@ def test_sparse_loss_preparation_triton_matches_eager():
     scores = torch.randn(7, 11, dtype=torch.float32, device="cuda")
     topk = torch.tensor(
         [
-            [2, 7, 1, -1, -1],
+            [2, 11, 1, -1, -1],
             [8, 0, 3, 5, -1],
             [-1, -1, -1, -1, -1],
             [10, 9, 4, 2, 1],
@@ -917,6 +920,7 @@ def test_sparse_loss_preparation_triton_matches_eager():
     torch.testing.assert_close(actual[0], expected[0], atol=2e-6, rtol=2e-6)
     assert torch.equal(actual[1], expected[1])
     assert torch.equal(actual[2], expected[2])
+    assert actual[0][0, 1].item() == 0.0
     torch.testing.assert_close(actual[0][2], torch.full((5,), 0.2, device="cuda"))
 
 

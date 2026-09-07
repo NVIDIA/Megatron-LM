@@ -219,14 +219,25 @@ def _test_fused_mla_rope_inplace(
 @pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("inverse", [False, True])
-def test_mla_rope_contiguous_thd_global_start_matches_position_ids(inverse):
+@pytest.mark.parametrize(
+    "sequence_lengths,global_start,local_rows",
+    [
+        pytest.param([8], -2, 12, id="single-sequence-boundary-and-tail-padding"),
+        pytest.param([0, 1, 0, 3, 0, 5], -2, 13, id="zero-length-sequences"),
+        pytest.param([1] * 257, -2, 261, id="many-short-sequences"),
+    ],
+)
+def test_mla_rope_contiguous_thd_global_start_matches_position_ids(
+    inverse, sequence_lengths, global_start, local_rows
+):
     """Kernel-side THD row mapping must match explicit packed-sequence positions."""
     assert fused_mla_rope_inplace is not None
     torch.manual_seed(1234)
 
-    cu_seqlens = torch.tensor([0, 4, 12], dtype=torch.int32, device="cuda")
-    global_start = -2
-    local_rows = 16
+    sequence_lengths = torch.tensor(sequence_lengths, dtype=torch.int32, device="cuda")
+    cu_seqlens = torch.cat(
+        (torch.zeros(1, dtype=torch.int32, device="cuda"), sequence_lengths.cumsum(dim=0))
+    )
     global_rows = torch.arange(
         global_start, global_start + local_rows, dtype=torch.int32, device="cuda"
     )
@@ -241,7 +252,8 @@ def test_mla_rope_contiguous_thd_global_start_matches_position_ids(inverse):
     nope_dim = 4
     emb_dim = 8
     num_heads = 2
-    freqs = torch.randn(8, emb_dim, dtype=torch.float32, device="cuda")
+    max_sequence_length = max(sequence_lengths.max().item(), 1)
+    freqs = torch.randn(max_sequence_length, emb_dim, dtype=torch.float32, device="cuda")
     cos = freqs.cos().contiguous()
     sin = freqs.sin().contiguous()
     values = torch.randn(
