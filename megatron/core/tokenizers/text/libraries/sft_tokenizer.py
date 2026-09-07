@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass
 from typing import Dict, List, Union
@@ -46,18 +46,19 @@ class PromptConfig:
 class SFTTokenizer:
     """SFT Tokenizer."""
 
-    def __init__(self, tokenizer_path: str, prompt_format: str):
+    def __init__(self, tokenizer_path: str, prompt_format: str, trust_remote_code: bool = False):
         """
         Note: Currently, only HuggingFaceTokenizer is supported as the underlying text tokenizer.
 
         Args:
             tokenizer_path (str): Underlying tokenizer path.
             prompt_format (str): Prompt format for the tokenizer.
+            trust_remote_code (bool): Whether to allow custom Hugging Face tokenizer code.
         """
         if HAVE_TRANSFORMERS:
             # Currently, only HuggingFace tokenizers are supported.
             tokenizer = transformers.AutoTokenizer.from_pretrained(
-                pretrained_model_name_or_path=tokenizer_path
+                pretrained_model_name_or_path=tokenizer_path, trust_remote_code=trust_remote_code
             )
         else:
             raise ImportError(

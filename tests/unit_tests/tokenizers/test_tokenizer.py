@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from unittest.mock import MagicMock
 
@@ -534,6 +534,26 @@ class TestBuildTokenizer:
         assert tokenizer.chat_template == chat_template
         assert tokenizer._tokenizer.include_special_tokens == True
 
+    def test_build_sft_tokenizer_passes_trust_remote_code(self, monkeypatch):
+        factory = MagicMock(return_value=MagicMock())
+        monkeypatch.setattr(MegatronTokenizer, "from_pretrained", factory)
+        config = TokenizerConfig(
+            tokenizer_model="custom/tokenizer",
+            tokenizer_type="SFTTokenizer",
+            sft_tokenizer_prompt_format="default",
+            trust_remote_code=True,
+            pad_vocab_size=False,
+        )
+
+        build_tokenizer(config)
+
+        factory.assert_called_once_with(
+            tokenizer_path="custom/tokenizer",
+            metadata_path={"library": "sft"},
+            prompt_format="default",
+            trust_remote_code=True,
+        )
+
     def test_build_megatron_tokenizer(self):
         special_tokens = [f'<extra_id_{i}>' for i in range(100)]
         vocab_file = "/opt/data/tokenizers/megatron/gpt2-vocab.json"
@@ -649,6 +669,27 @@ try:
     HAVE_SFT_TOKENIZER = True
 except Exception:
     HAVE_SFT_TOKENIZER = False
+
+
+@pytest.mark.skipif(not HAVE_SFT_TOKENIZER, reason="SFTTokenizer not importable")
+def test_sft_tokenizer_passes_trust_remote_code(monkeypatch):
+    from megatron.core.tokenizers.text.libraries import sft_tokenizer as sft_module
+
+    inner = MagicMock()
+    inner.__len__.return_value = 128
+    inner.pad_token_id = 0
+    inner.eos_token_id = 1
+    inner.bos_token_id = None
+    inner.chat_template = "{{ messages }}"
+    factory = MagicMock(return_value=inner)
+    monkeypatch.setattr(sft_module.transformers.AutoTokenizer, "from_pretrained", factory)
+
+    SFTTokenizer("custom/tokenizer", "default", trust_remote_code=True)
+
+    factory.assert_called_once_with(
+        pretrained_model_name_or_path="custom/tokenizer", trust_remote_code=True
+    )
+
 
 _IDS = [1, 2, 3, 4, 5]
 
