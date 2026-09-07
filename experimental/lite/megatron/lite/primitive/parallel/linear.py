@@ -372,6 +372,35 @@ class _EmbeddingAccumulatingIntoMainGrad(torch.autograd.Function):
         return _dummy_wgrad(weight), None
 
 
+class AccumulatingLinear(nn.Linear):
+    """``nn.Linear`` whose weight gradient lands in ``main_grad`` directly.
+
+    Every plain ``nn.Linear`` in the model pays a separate
+    ``main_grad.add_(grad)`` once per microbatch, over its whole weight. An op
+    census put the six shapes coming from the attention projections at 281 ms
+    per profiling window between them -- 17.6 ms per step -- which is the same
+    cost the vocabulary projection and the embedding table used to pay before
+    they moved onto Core's accumulating paths.
+
+    This routes the same weights through Core's linear, which accumulates in
+    the wgrad GEMM instead. The forward matmul is Core's too, so nothing about
+    the arithmetic of the layer changes; the path is gated on ``main_grad``
+    existing, so optimizers that allocate none keep the stock behaviour.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if getattr(self.weight, "main_grad", None) is None:
+            return super().forward(x)
+        return linear_with_grad_accumulation_and_async_allreduce(
+            input=x,
+            weight=self.weight,
+            bias=self.bias,
+            gradient_accumulation_fusion=True,
+            allreduce_dgrad=False,
+            sequence_parallel=False,
+        )
+
+
 class VocabParallelEmbedding(nn.Module):
     """Embedding table split across TP on the vocab dimension."""
 

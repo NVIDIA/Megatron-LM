@@ -30,6 +30,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.kernels.jit import jit_fuser
 from megatron.lite.primitive.modules.attention.dsa import rotate_activation
+from megatron.lite.primitive.parallel.linear import AccumulatingLinear
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.utils.rotary import _yarn_find_correction_range, _yarn_linear_ramp_mask
 
@@ -268,8 +269,8 @@ class CompressedSequenceCompressor(nn.Module):
         self.coff = 2 if self.overlap else 1
         self.rotate = rotate
         self.initializer_range = config.initializer_range
-        self.wkv = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
-        self.wgate = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
+        self.wkv = AccumulatingLinear(config.hidden_size, self.coff * head_dim, bias=False)
+        self.wgate = AccumulatingLinear(config.hidden_size, self.coff * head_dim, bias=False)
         self.ape = nn.Parameter(
             torch.empty(compress_ratio, self.coff * head_dim, dtype=torch.float32)
         )
@@ -430,10 +431,10 @@ class CompressedSparseAttentionIndexer(nn.Module):
         self.index_topk = config.index_topk
         self.rope_head_dim = min(config.qk_rope_head_dim, config.index_head_dim)
         self.softmax_scale = self.index_head_dim**-0.5
-        self.wq_b = nn.Linear(
+        self.wq_b = AccumulatingLinear(
             config.q_lora_rank, config.index_n_heads * config.index_head_dim, bias=False
         )
-        self.weights_proj = nn.Linear(config.hidden_size, config.index_n_heads, bias=False)
+        self.weights_proj = AccumulatingLinear(config.hidden_size, config.index_n_heads, bias=False)
         self.compressor = CompressedSequenceCompressor(
             config, compress_ratio, config.index_head_dim, rotate=True
         )
@@ -478,17 +479,17 @@ class CompressedSparseAttention(nn.Module):
             self.compress_ratio = config.compress_ratios[_cr_idx]
         else:
             self.compress_ratio = 0
-        self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
+        self.wq_a = AccumulatingLinear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = te.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
-        self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
-        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        self.wq_b = AccumulatingLinear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
+        self.wkv = AccumulatingLinear(config.hidden_size, self.head_dim, bias=False)
         self.kv_norm = te.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.wo_a = GroupedLinear(
             self.num_heads_per_group * self.head_dim,
             config.o_groups * config.o_lora_rank,
             config.o_groups,
         )
-        self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
+        self.wo_b = AccumulatingLinear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
         self.sinks = nn.Parameter(torch.zeros(self.num_heads))
         self.compressor = (
             CompressedSequenceCompressor(config, self.compress_ratio, self.head_dim)
