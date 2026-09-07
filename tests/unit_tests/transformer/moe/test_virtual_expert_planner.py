@@ -450,8 +450,21 @@ def _gtp_projection(weight_format, device, num_local_experts=2):
     leader.is_gtp_weight_remat = True
     if mxfp8:
         leader._gtp_gather_quantizer = leader._quantizer
-    leader.materialize_group_for_forward = lambda: gathers[FORWARD]
-    leader.materialize_group_for_backward = lambda: gathers[BACKWARD]
+    # GTP's protocol: a peek reads the gathered buffers, the consume (materialize) hands out the
+    # same buffers and moves the prefetch chain along. Record which one the bridge calls.
+    leader.calls = []
+
+    def protocol(name, direction):
+        def call():
+            leader.calls.append((name, direction))
+            return gathers[direction]
+
+        return call
+
+    leader.peek_group_for_forward = protocol("peek", FORWARD)
+    leader.peek_group_for_backward = protocol("peek", BACKWARD)
+    leader.materialize_group_for_forward = protocol("consume", FORWARD)
+    leader.materialize_group_for_backward = protocol("consume", BACKWARD)
     parameters = (leader, *(make() for _ in range(num_local_experts - 1)))
     # GTP's wgrad protocol: each group member hands out fresh full-size scratch per backward.
     leader._weights = [
@@ -542,6 +555,68 @@ def test_virtual_expert_projection_binds_gtp_gathers_into_its_pointer_tables(wei
     # backward binds the layer's scratch.
     assert all(parameter.main_grad.numel() == 0 for parameter in natives)
     assert all(parameter.main_grad.numel() > 0 for parameter in projection.runtime_parameters[2:])
+
+
+@requires_cuda
+@pytest.mark.parametrize("weight_format", ["bf16", "mxfp8"])
+def test_virtual_expert_projection_peeks_for_the_push_and_consumes_at_the_gemm(weight_format):
+    """The push reads GTP's gathered weights through the non-consuming peek; the consume, GTP's
+    real chain step, happens separately and must find the buffers the push read."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    projection, gathers = _gtp_projection(weight_format, device)
+    leader = projection.gtp_leader
+
+    for direction in (FORWARD, BACKWARD):
+        leader.calls.clear()
+        projection.prepare(direction)
+        assert leader.calls == [("peek", direction)]
+        bound = projection.bound[direction]
+        projection.consume(direction)
+        assert leader.calls == [("peek", direction), ("consume", direction)]
+        # The consume validates against the bound pointers and rebinds nothing.
+        assert projection.bound[direction] == bound
+
+    # A consume that hands out other buffers than the peeked ones is an error, not a rebind:
+    # the push has already copied the peeked bytes to the peers.
+    gathers[FORWARD][0] = _gtp_projection(weight_format, device)[1][FORWARD][0]
+    with pytest.raises(RuntimeError, match="other buffers"):
+        projection.consume(FORWARD)
+
+
+def test_virtual_expert_bridge_consumes_gtp_weights_in_gemm_order():
+    """Forward consumes FC1 then FC2 at the expert GEMMs; the backward hook waits for the push,
+    then consumes FC2 before FC1 (the expert backward's order) and binds the wgrad scratch."""
+    plan = object()
+    events = []
+
+    class FakeProjection:
+        def __init__(self, name):
+            self.name = name
+
+        def consume(self, direction):
+            events.append(("consume", self.name, direction))
+
+        def bind_wgrad_scratch(self):
+            events.append(("bind", self.name))
+
+    bridge = VirtualExpertWeightBridge.__new__(VirtualExpertWeightBridge)
+    bridge.projections = [FakeProjection("FC1"), FakeProjection("FC2")]
+    bridge.wait_prefetch = lambda current_plan: events.append(("wait", current_plan))
+    bridge._backward_plan = None
+
+    bridge.consume(FORWARD)
+    assert events == [("consume", "FC1", FORWARD), ("consume", "FC2", FORWARD)]
+
+    events.clear()
+    bridge.wait_prefetch_for_backward(plan)
+    assert events == [
+        ("wait", plan),
+        ("consume", "FC2", BACKWARD),
+        ("bind", "FC2"),
+        ("consume", "FC1", BACKWARD),
+        ("bind", "FC1"),
+    ]
+    assert bridge._backward_plan is plan
 
 
 @requires_cuda
