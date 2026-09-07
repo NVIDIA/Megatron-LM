@@ -98,6 +98,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dsa_indexer_k_norm_fp32": False,
     "dsa_indexer_loss_coeff": None,
     "dsa_indexer_n_heads": None,
+    "dsa_indexer_precision": "bf16",
     "dsa_indexer_rope_interleaved": False,
     "dsa_indexer_rotate_activation": True,
     "dsa_indexer_scoring_relu": True,
