@@ -314,7 +314,10 @@ def get_qwen35_vl_language_config(
 
     kwargs = dict(
         # Architecture. HybridModel counts one layer per pattern symbol, so each
-        # Qwen block ('G'/'*' plus '-'/'E') contributes two layers.
+        # Qwen block ('G'/'*' plus '-'/'E') contributes two layers. is_hybrid_model
+        # tells TransformerConfig to interpret num_layers that way — without it the
+        # output-layer init std would be scaled by the doubled count.
+        is_hybrid_model=True,
         num_layers=2 * v["num_layers"],
         hidden_size=v["hidden_size"],
         ffn_hidden_size=v["ffn_hidden_size"],
@@ -338,9 +341,10 @@ def get_qwen35_vl_language_config(
         attention_dropout=0.0,
         hidden_dropout=0.0,
         add_bias_linear=False,
-        # Hybrid attention (GatedDeltaNet)
+        # Hybrid attention (GatedDeltaNet). The GDN / full-attention layout comes
+        # from --hybrid-layer-pattern, not linear_attention_freq: HybridModel
+        # builds its stack from the pattern and never reads that field.
         experimental_attention_variant="gated_delta_net",
-        linear_attention_freq=4,
         linear_conv_kernel_dim=4,
         linear_key_head_dim=128,
         linear_value_head_dim=128,

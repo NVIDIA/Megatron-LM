@@ -6,7 +6,7 @@ Encapsulates all Qwen3.5-VL-specific logic needed by ``pretrain_multimodal.py``
 so that the training entry point remains model-agnostic.
 """
 
-from examples.multimodal_dev.models.qwen35_vl.configuration import VISION_KWARGS
+from examples.multimodal_dev.models.qwen35_vl.configuration import MROPE_SECTION, VISION_KWARGS
 
 
 def post_language_config(language_config, args):
@@ -17,7 +17,8 @@ def post_language_config(language_config, args):
 
     ``mrope_section`` is deliberately not set here: it is a ``TransformerConfig``
     field fed by ``--mrope-section``, so overriding it would let the recipe and
-    the constructed model disagree.
+    the constructed model disagree. :func:`build_model` checks the value the
+    recipe supplied against the architecture constant instead.
 
     ``mrope_interleaved`` goes the other way. ``--mrope-interleaved`` also exists
     as a generated flag, but it is ``store_true`` with a ``False`` default, so a
@@ -68,6 +69,18 @@ def build_model(args, language_config, vision_config, **kwargs):
             "Qwen3.5-VL uses HybridModel and requires --hybrid-layer-pattern. "
             "Use GEGEGE*E per four MoE blocks (or G-G-G-*- for dense blocks), "
             "and append /*E or /*- for each MTP depth."
+        )
+
+    # The T/H/W split is architectural, not a tuning knob: it is tied to
+    # kv_channels and ROTARY_PERCENT. A section with the right total width but
+    # the wrong partition builds an incompatible rotary layout that trains to a
+    # plausible loss, so check the recipe value rather than documenting it.
+    mrope_section = getattr(language_config, "mrope_section", None)
+    if list(mrope_section or []) != list(MROPE_SECTION):
+        raise ValueError(
+            f"Qwen3.5-VL requires --mrope-section {' '.join(str(s) for s in MROPE_SECTION)}, "
+            f"but got {mrope_section}. The section split is tied to kv_channels and "
+            f"ROTARY_PERCENT; a mismatch silently misplaces the T/H/W channel boundaries."
         )
 
     from examples.multimodal_dev.models.qwen35_vl.model import Qwen35VLModel

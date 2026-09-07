@@ -373,7 +373,8 @@ LANGUAGE_MODEL_ARGS=(
     --disable-bias-linear
     # The decoder applies 3D MRoPE. --mrope-section must match MROPE_SECTION in
     # models/qwen35_vl/configuration.py and sum to half the rotary dimension
-    # (kv_channels * rotary_percent / 2 = 256 * 0.25 / 2 = 32).
+    # (kv_channels * rotary_percent / 2 = 256 * 0.25 / 2 = 32); the factory
+    # rejects any other split.
     --position-embedding-type mrope
     --mrope-section 11 11 10
     --rotary-percent 0.25
@@ -465,14 +466,17 @@ if [ "${NUM_EXPERTS:-0}" -gt 0 ]; then
 else
     MLP_LAYER_SYMBOL="-"
 fi
-ATTN_LAYER_SYMBOL="${ATTN_CADENCE:0:1}"
 HYBRID_LAYER_PATTERN=""
 for ((block_idx = 0; block_idx < NUM_LAYERS; block_idx++)); do
     ATTN_LAYER_SYMBOL="${ATTN_CADENCE:block_idx % ${#ATTN_CADENCE}:1}"
     HYBRID_LAYER_PATTERN+="${ATTN_LAYER_SYMBOL}${MLP_LAYER_SYMBOL}"
 done
+# Each MTP depth replicates the final decoder block, matching the GPT path's
+# copy.copy(spec.layer_specs[-1]). Derive that symbol explicitly rather than
+# reusing whatever the loop above left behind.
+LAST_BLOCK_ATTN_SYMBOL="${ATTN_CADENCE:(NUM_LAYERS - 1) % ${#ATTN_CADENCE}:1}"
 for ((mtp_depth = 0; mtp_depth < MTP_NUM_LAYERS; mtp_depth++)); do
-    HYBRID_LAYER_PATTERN+="/${ATTN_LAYER_SYMBOL}${MLP_LAYER_SYMBOL}"
+    HYBRID_LAYER_PATTERN+="/${LAST_BLOCK_ATTN_SYMBOL}${MLP_LAYER_SYMBOL}"
 done
 HYBRID_MODEL_ARGS=( --hybrid-layer-pattern "$HYBRID_LAYER_PATTERN" )
 

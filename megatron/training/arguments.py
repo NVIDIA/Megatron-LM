@@ -2138,7 +2138,11 @@ def validate_args(args, defaults={}):
 
     if args.mtp_num_layers:
         # MTP is compatible with position embedding types that use position_ids.
-        supported_position_types = ["learned_absolute", "rope", "mrope", "none"]
+        # 'learned_absolute' is excluded: MTP's sequence roll shifts position_ids,
+        # but learned_absolute adds embeddings from the unshifted embedding-side
+        # positions, and that combination has no test coverage. It was already
+        # unreachable before the duplicate check above was removed.
+        supported_position_types = ["rope", "mrope", "none"]
         assert args.position_embedding_type in supported_position_types, (
             f"Multi-Token Prediction (MTP) is not supported with '{args.position_embedding_type}' position embedding type. "
             f"The supported position embedding types are: {', '.join(supported_position_types)}."

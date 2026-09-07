@@ -163,6 +163,9 @@ def test_hybrid_logging_process_groups_are_paired():
 def test_hybrid_model_constructor_with_mrope():
     Utils.initialize_model_parallel(1, 1)
     try:
+        # use_cpu_initialization keeps the embedding off the CUDA RNG tracker; it
+        # does not make this a GPU-free test, because MultimodalRotaryEmbedding
+        # builds inv_freq on the current CUDA device regardless of the flag.
         model_config = TransformerConfig(
             num_layers=2,
             hidden_size=256,
@@ -185,6 +188,78 @@ def test_hybrid_model_constructor_with_mrope():
         assert model.mrope_section == [2, 3, 3]
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_hybrid_model_mrope_uses_injected_cp_group():
+    """The injected CP group must reach MRoPE, not the parallel_state global."""
+    from megatron.core.process_groups_config import ProcessGroupCollection
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        # A distinct group object over the same ranks: if the mrope branch falls
+        # back to parallel_state, the identity assertion below fails.
+        custom_cp_group = torch.distributed.new_group(
+            ranks=list(range(torch.distributed.get_world_size()))
+        )
+        assert custom_cp_group is not parallel_state.get_context_parallel_group()
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pg_collection.cp = custom_cp_group
+
+        model_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mrope_section=[2, 3, 3],
+            mrope_interleaved=True,
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="*-",
+            position_embedding_type="mrope",
+            rotary_percent=0.25,
+            pg_collection=pg_collection,
+        )
+
+        assert model.rotary_pos_emb.cp_group is custom_cp_group
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_mrope_stored_cp_group_drives_unpacked_slicing():
+    """HybridModel.forward passes cp_group=None on the unpacked path, so the
+    group stored at construction time is the one that slices the frequencies."""
+
+    class _StubCPGroup:
+        def size(self):
+            return 2
+
+    stub_cp_group = _StubCPGroup()
+    rotary = MultimodalRotaryEmbedding(
+        kv_channels=32,
+        rotary_percent=0.25,
+        interleaved_mrope=True,
+        cp_group=stub_cp_group,
+    )
+    position_ids = torch.arange(4, device=torch.cuda.current_device()).repeat(3, 1, 1)
+    seen = {}
+
+    def fake_slice(tensor, seq_dim, cp_group):
+        seen['cp_group'] = cp_group
+        return tensor
+
+    with patch(
+        'megatron.core.models.common.embeddings.rotary_pos_embedding.'
+        'get_pos_emb_on_this_cp_rank',
+        fake_slice,
+    ):
+        rotary(position_ids, mrope_section=[1, 1, 2])
+
+    assert seen['cp_group'] is stub_cp_group
 
 
 @pytest.mark.skipif(

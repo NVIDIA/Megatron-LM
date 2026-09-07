@@ -2,6 +2,7 @@
 
 """Focused tests for the multimodal_dev HybridModel migration."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -44,11 +45,51 @@ def _args(**overrides):
     return SimpleNamespace(**values)
 
 
+def _language_config(**overrides):
+    values = {"mrope_section": list(MROPE_SECTION)}
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_factory_requires_hybrid_layer_pattern():
     with pytest.raises(ValueError, match="requires --hybrid-layer-pattern"):
         factory.build_model(
             _args(hybrid_layer_pattern=None),
-            language_config=SimpleNamespace(),
+            language_config=_language_config(),
+            vision_config=SimpleNamespace(),
+        )
+
+
+def test_factory_accepts_architecture_mrope_section(monkeypatch):
+    """The architecture value passes the factory check."""
+    monkeypatch.setattr(
+        "examples.multimodal_dev.models.qwen35_vl.model.Qwen35VLModel",
+        lambda **kwargs: "model",
+    )
+
+    assert (
+        factory.build_model(
+            _args(),
+            language_config=_language_config(),
+            vision_config=SimpleNamespace(),
+        )
+        == "model"
+    )
+
+
+def test_factory_rejects_mrope_section_with_wrong_partition():
+    """A section with the right total width but the wrong T/H/W split is rejected.
+
+    [12, 10, 10] sums to the same 32 as MROPE_SECTION, so no generic
+    TransformerConfig check catches it, but it misplaces the channel boundaries.
+    """
+    wrong_split = [12, 10, 10]
+    assert sum(wrong_split) == sum(MROPE_SECTION)
+
+    with pytest.raises(ValueError, match="requires --mrope-section 11 11 10"):
+        factory.build_model(
+            _args(),
+            language_config=_language_config(mrope_section=wrong_split),
             vision_config=SimpleNamespace(),
         )
 
@@ -65,7 +106,7 @@ def test_factory_passes_hybrid_pattern(monkeypatch):
     )
     result = factory.build_model(
         _args(),
-        language_config=SimpleNamespace(),
+        language_config=_language_config(),
         vision_config=SimpleNamespace(),
     )
 
@@ -145,3 +186,9 @@ def test_language_config_num_layers_is_hybrid_layer_count():
     config = get_qwen35_vl_language_config("proxy")
 
     assert config.num_layers == get_hybrid_total_layer_count(MOE_PATTERN_4_BLOCKS)
+    # Without is_hybrid_model the doubled count would also scale the output-layer
+    # init std, so the config must declare which unit num_layers is in.
+    assert config.is_hybrid_model
+    assert config.output_layer_init_method.keywords["std"] == pytest.approx(
+        config.init_method_std / math.sqrt(config.num_layers)
+    )

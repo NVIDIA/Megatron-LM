@@ -343,6 +343,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
                 interleaved_mrope=self.config.mrope_interleaved,
+                cp_group=self.pg_collection.cp,
             )
             self.mrope_section = self.config.mrope_section
             assert (
@@ -585,7 +586,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
             )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
-            if not InferenceMode.is_active() or not self.config.flash_decode:
+            if not in_inference_mode or not self.config.flash_decode:
                 packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
                 in_inference = in_inference_mode or inference_context is not None
                 use_raw_mrope_freqs = (

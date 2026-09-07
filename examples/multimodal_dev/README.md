@@ -58,10 +58,10 @@ The decoder applies 3D MRoPE, so the recipe must say so: pass
 `--position-embedding-type mrope` together with `--mrope-section 11 11 10`.
 The sections are the temporal / height / width channel split and must sum to
 half the rotary dimension (`kv_channels * rotary_percent / 2 = 32`); they must
-also match `MROPE_SECTION` in `models/qwen35_vl/configuration.py`.
-`Qwen35VLModel` rejects any other `--position-embedding-type`, so the parsed
-args, the constructed decoder, and the checkpoint metadata can no longer
-disagree.
+also match `MROPE_SECTION` in `models/qwen35_vl/configuration.py`, which the
+model factory enforces. `Qwen35VLModel` rejects any other
+`--position-embedding-type`, so the parsed args, the constructed decoder, and
+the checkpoint metadata can no longer disagree.
 
 Each historical Qwen transformer block becomes two HybridModel layers:
 
