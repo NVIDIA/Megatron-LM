@@ -49,9 +49,8 @@ def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
     return deep_ep.Buffer(group=group, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=num_rdma_bytes)
 
 
-# The permutation fusion is always on. It was behind an environment variable
-# defaulting to off, which meant the shipped configuration was the slow one and
-# the fast one was only ever exercised by whoever knew the variable existed.
+def _use_moe_permute_fusion() -> bool:
+    return os.environ.get("MEGATRON_LITE_MOE_PERMUTE_FUSION", "0") == "1"
 
 
 def _tensor_hidden_bytes(x: torch.Tensor) -> int:
@@ -203,7 +202,7 @@ class TokenDispatcher:
         self.ep_size = ps.ep_size
         self.num_local_experts = ensure_divisible(num_experts, ps.ep_size)
         self.moe_permute_fusion = (
-            True if moe_permute_fusion is None else bool(moe_permute_fusion)
+            _use_moe_permute_fusion() if moe_permute_fusion is None else bool(moe_permute_fusion)
         )
 
         self.use_deepep = use_deepep and deep_ep is not None and ps.ep_size > 1
