@@ -157,7 +157,7 @@ def test_forward_aggregation_matches_pre_fusion_reference() -> None:
     module = HyperConnection(hidden_size=C, hc_mult=N, sinkhorn_iters=3, eps=1e-6)
     x = torch.randn(S, B, N, C)
     expected = _reference_forward(module, x)
-    actual, _, _ = module(x)
+    actual, _, _, _ = module(x)
     assert actual.shape == expected.shape
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
@@ -184,5 +184,5 @@ def test_forward_aggregation_matches_pre_fusion_reference_gpu() -> None:
     module = HyperConnection(hidden_size=C, hc_mult=N, sinkhorn_iters=3, eps=1e-6).cuda()
     x = torch.randn(S, B, N, C, device="cuda")
     expected = _reference_forward(module, x)
-    actual, _, _ = module(x)
+    actual, _, _, _ = module(x)
     torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
