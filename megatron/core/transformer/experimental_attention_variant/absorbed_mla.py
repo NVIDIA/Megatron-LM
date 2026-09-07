@@ -26,6 +26,7 @@ from megatron.core.models.common.embeddings import (
     YarnRotaryEmbedding,
     _yarn_get_mscale,
     apply_rotary_pos_emb,
+    maybe_share_rotary_pos_emb,
     should_use_fused_mla_rope,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -214,6 +215,10 @@ class AbsorbedMLASelfAttention(Attention):
                 f"Unsupported RoPE type: {self.config.rope_type}, supported types are "
                 "'rope' and 'yarn'"
             )
+        # Share one rotary instance across layers with the same configuration when enabled.
+        self.rotary_pos_emb = maybe_share_rotary_pos_emb(
+            self.config, (self.config.rope_type, self.config.rotary_base), self.rotary_pos_emb
+        )
 
         self.core_attention = build_module(
             submodules.core_attention,

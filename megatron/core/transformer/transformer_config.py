@@ -4076,6 +4076,13 @@ class MLATransformerConfig(TransformerConfig):
     mscale_all_dim: float = 0.0
     """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
+    share_rotary_pos_emb: bool = False
+    """Share a single rotary embedding module across all attention layers that have the same
+    rotary configuration. The rotary cos/sin buffers depend only on the configuration (not on any
+    layer weights), so they are identical across such layers and one shared instance can serve
+    them all. Enabling this removes the per-layer rotary buffer duplication, which at long
+    sequence lengths costs several GiB per rank, with no change to the numerics. Off by default."""
+
     o_groups: int = 8
     """Number of groups for grouped low-rank output projection (wo_a)."""
 
