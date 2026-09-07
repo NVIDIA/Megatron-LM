@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import math
+import weakref
 from collections.abc import Hashable
 from typing import Any
 
@@ -126,7 +127,15 @@ def build_yarn_rope_cos_sin(
 
 # The rotary tables depend only on the positions and the rope parameters,
 # but were rebuilt on every layer, every microbatch, and again under activation recompute.
-_ROPE_CACHE: dict[Hashable, tuple[torch.Tensor, torch.Tensor]] = {}
+# The entry carries a weak reference to the position tensor it was built from.
+# Keying on ``data_ptr`` alone is unsound -- the caching allocator hands the same
+# address to a later tensor of the same shape, whose ``_version`` starts at zero
+# again, so a lookup could return tables built for different positions. A hit is
+# therefore only honoured when the weak reference still resolves to the very
+# tensor being asked about. A strong reference would also close the hole, but it
+# keeps the buffer out of the allocator's reach and cost 1.5% of step time,
+# measured; a weak one costs nothing and simply misses once the tensor is gone.
+_ROPE_CACHE: dict[Hashable, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
 
 def _rope_cache_key(position_ids, rope_head_dim, rope_theta, config, use_yarn, device, dtype):
@@ -169,7 +178,10 @@ def build_compressed_rope_cos_sin(
     )
     hit = _ROPE_CACHE.get(key)
     if hit is not None:
-        return hit
+        ref, cos, sin = hit
+        if ref() is position_ids:
+            return cos, sin
+        del _ROPE_CACHE[key]
     built = _build_compressed_rope_cos_sin_uncached(
         position_ids,
         rope_head_dim,
@@ -183,7 +195,7 @@ def build_compressed_rope_cos_sin(
     # without limit over a run.
     if len(_ROPE_CACHE) > 64:
         _ROPE_CACHE.clear()
-    _ROPE_CACHE[key] = built
+    _ROPE_CACHE[key] = (weakref.ref(position_ids), *built)
     return built
 
 
