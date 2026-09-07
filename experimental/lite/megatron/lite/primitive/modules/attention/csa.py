@@ -129,6 +129,59 @@ def build_yarn_rope_cos_sin(
 
 
 
+def rope_tables_for_packed_batch(
+    packed_seq_params: Any,
+    cu_seqlens: torch.Tensor,
+    global_start: int,
+    length: int,
+    rope_head_dim: int,
+    rope_theta: float,
+    *,
+    config: Any,
+    use_yarn: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build the rotary tables once per packed batch instead of once per layer.
+
+    Every layer derives the same positions from the same ``cu_seqlens`` and rank
+    offset, so the tables were rebuilt identically eight times over, and again
+    under activation recompute. Megatron Core builds them once above the layers
+    and hands them down.
+
+    The tables live on the ``packed_seq_params`` object, which is created once
+    per microbatch and passed to every layer, so its lifetime is exactly the
+    tables' validity. An earlier attempt cached them globally against the
+    position tensor's address; the caching allocator reuses addresses, so that
+    could return tables built for different positions. Attaching them to the
+    object that defines the positions has no such failure mode.
+    """
+    key = (int(global_start), int(length), int(rope_head_dim), float(rope_theta),
+           bool(use_yarn), str(device), str(dtype))
+    cache = getattr(packed_seq_params, "_lite_rope_tables", None)
+    if cache is None:
+        cache = {}
+        try:
+            packed_seq_params._lite_rope_tables = cache
+        except AttributeError:
+            cache = None  # frozen params: fall through and rebuild each time
+    if cache is not None and key in cache:
+        return cache[key]
+    positions = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, length)
+    built = build_compressed_rope_cos_sin(
+        positions.view(1, length).long(),
+        rope_head_dim,
+        rope_theta,
+        config=config,
+        use_yarn=use_yarn,
+        device=device,
+        dtype=dtype,
+    )
+    if cache is not None:
+        cache[key] = built
+    return built
+
+
 def build_compressed_rope_cos_sin(
     position_ids: torch.Tensor,
     rope_head_dim: int,
@@ -770,9 +823,11 @@ class CompressedSparseAttention(nn.Module):
         # within-sequence positions), not the raw position_ids tensor, so the
         # mapping is identical to the unsharded reference at cp_size == 1.
         del position_ids
-        local_pos = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, seq_len).view(1, seq_len)
-        cos, sin = build_compressed_rope_cos_sin(
-            local_pos.long(),
+        cos, sin = rope_tables_for_packed_batch(
+            packed_seq_params,
+            cu_seqlens,
+            global_start,
+            seq_len,
             self.rope_head_dim,
             attention_rope_theta,
             config=self.config,
@@ -916,9 +971,11 @@ class CompressedSparseAttention(nn.Module):
                 q_indexer_cp = indexer.wq_b(indexer_qr.squeeze(1)).view(
                     l_local, indexer.index_n_heads, indexer.index_head_dim
                 )
-                idx_pos = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, l_local)
-                idx_cos, idx_sin = build_compressed_rope_cos_sin(
-                    idx_pos.view(1, l_local).long(),
+                idx_cos, idx_sin = rope_tables_for_packed_batch(
+                    packed_seq_params,
+                    cu_seqlens,
+                    global_start,
+                    l_local,
                     indexer.rope_head_dim,
                     self.config.compress_rope_theta,
                     config=self.config,

@@ -196,3 +196,40 @@ def test_clamped_swiglu_is_differentiable() -> None:
 
     assert y.grad is not None and torch.isfinite(y.grad).all()
     torch.testing.assert_close(y.grad, ref_in.grad, rtol=1e-4, atol=1e-4)
+
+
+class _Params:
+    """Stands in for PackedSeqParams: an object the layers all share."""
+
+
+def test_rope_tables_are_built_once_per_packed_batch() -> None:
+    """A second layer asking for the same tables must get the first one's."""
+    from megatron.lite.primitive.modules.attention.csa import rope_tables_for_packed_batch
+
+    params = _Params()
+    cu = torch.tensor([0, 4], dtype=torch.int32)
+    kw = dict(config=None, use_yarn=False, device=torch.device("cpu"), dtype=torch.float32)
+    first = rope_tables_for_packed_batch(params, cu, 0, 4, 4, 10000.0, **kw)
+    second = rope_tables_for_packed_batch(params, cu, 0, 4, 4, 10000.0, **kw)
+    assert first[0] is second[0] and first[1] is second[1]
+
+
+def test_rope_tables_differ_across_batches_and_offsets() -> None:
+    """Guard the guard: the tables must not outlive what defines them.
+
+    A cache that ignored the rank offset, or that lived longer than the batch,
+    would return the first batch's positions for the second -- finite, correctly
+    shaped, and wrong. Both axes are checked because either alone would pass.
+    """
+    from megatron.lite.primitive.modules.attention.csa import rope_tables_for_packed_batch
+
+    cu = torch.tensor([0, 4], dtype=torch.int32)
+    kw = dict(config=None, use_yarn=False, device=torch.device("cpu"), dtype=torch.float32)
+    a = rope_tables_for_packed_batch(_Params(), cu, 0, 4, 4, 10000.0, **kw)
+    b = rope_tables_for_packed_batch(_Params(), cu, 0, 4, 4, 10000.0, **kw)
+    assert a[0] is not b[0], "a new batch must not reuse the previous batch's tables"
+
+    same = _Params()
+    near = rope_tables_for_packed_batch(same, cu, 0, 4, 4, 10000.0, **kw)
+    far = rope_tables_for_packed_batch(same, cu, 4, 4, 4, 10000.0, **kw)
+    assert not torch.allclose(near[0], far[0]), "a different rank offset must rebuild"
