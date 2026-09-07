@@ -3203,6 +3203,12 @@ def train_step(
                     seqlen_sum_this_global_batch,
                     seqlen_squared_sum_this_global_batch,
                 ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
+                _validate_full_cuda_graph_packed_microbatch_count(
+                    config,
+                    num_microbatches,
+                    stage="training",
+                    iteration=(iteration + 1 if iteration is not None else 1),
+                )
                 has_wrapped_data_iterator = True
                 rerun_data_iterator = packed_data_iterator
             forward_backward_data_iterator = packed_data_iterator
@@ -4180,6 +4186,78 @@ def checkpoint_and_decide_exit(
     return False
 
 
+def _uses_full_cuda_graph_prepared_packed_inputs(config):
+    """Return whether packed inputs must be finalized outside full-graph capture."""
+    return (
+        getattr(config, "cuda_graph_impl", None) == "full_iteration"
+        and getattr(config, "sequence_packing_scheduler", None) == "dp_balanced"
+        and getattr(config, "experimental_attention_variant", None) == "dsv4_hybrid"
+        and getattr(config, "cp_partition_mode", None) == "contiguous"
+        and getattr(config, "context_parallel_size", 1) > 1
+    )
+
+
+def _get_full_cuda_graph_batch_prepare_func(forward_step_func, config):
+    """Resolve the fail-closed eager batch prologue for packed full graphs."""
+    if not _uses_full_cuda_graph_prepared_packed_inputs(config):
+        return None
+    batch_prepare_func = getattr(forward_step_func, "full_cuda_graph_batch_prepare_func", None)
+    if not callable(batch_prepare_func):
+        raise RuntimeError(
+            "packed inputs with cuda_graph_impl='full_iteration' require forward_step_func "
+            "to expose a callable "
+            "full_cuda_graph_batch_prepare_func. The prepared-batch contract must not fall back "
+            "to capture-time data scheduling."
+        )
+    return batch_prepare_func
+
+
+def _validate_full_cuda_graph_packed_microbatch_count(
+    config, scheduled_num_microbatches, *, stage, iteration
+):
+    """Fail closed when a prepared packed full graph would change its Python loop count.
+
+    ``dp_balanced`` broadcasts the scheduled physical-pack count before returning from
+    ``wrap_data_iterator``, so this validation takes the same branch on every rank. Keep it at
+    that boundary: prepared batch owners and the captured graph are still untouched.
+    """
+    if not _uses_full_cuda_graph_prepared_packed_inputs(config):
+        return
+
+    expected_num_microbatches = 1
+    if scheduled_num_microbatches != expected_num_microbatches:
+        raise ValueError(
+            "Full-iteration CUDA graphs with prepared packed inputs currently "
+            "require exactly one scheduled physical packed microbatch per data-parallel rank "
+            f"for every {stage} iteration; iteration {iteration} scheduled "
+            f"{scheduled_num_microbatches}, expected {expected_num_microbatches}. The "
+            "dp_balanced scheduler may produce a data-dependent number of physical packs, but "
+            "a captured full-iteration graph has a fixed Python microbatch loop count. Repack "
+            "the source batch to one fixed-capacity pack, use Transformer Engine module graphs, "
+            "or disable CUDA graphs."
+        )
+
+
+def _validate_full_cuda_graph_dynamic_pack_eval_contract(
+    config, *, process_non_loss_data_func, non_loss_data_func
+):
+    """Reject the last-rank-only raw-iterator eval path for prepared full graphs."""
+    if not (
+        _uses_full_cuda_graph_prepared_packed_inputs(config)
+        and process_non_loss_data_func is not None
+        and non_loss_data_func is None
+    ):
+        return
+
+    raise ValueError(
+        "Full-iteration CUDA graphs with prepared packed inputs do not "
+        "support process_non_loss_data_func. That legacy evaluation path runs only on the last "
+        "rank, bypasses dp_balanced scheduling, and changes collect_non_loss_data after the "
+        "full-iteration graph signature is captured. Disable process_non_loss_data_func or use "
+        "non_loss_data_func outside the graphed forward/backward schedule."
+    )
+
+
 def train(
     forward_step_func,
     model,
@@ -4456,6 +4534,7 @@ def train(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
+            batch_prepare_func=_get_full_cuda_graph_batch_prepare_func(forward_step_func, config),
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
@@ -5042,6 +5121,11 @@ def evaluate(
     """Evaluation."""
     args = get_args()
     timers = get_timers()
+    _validate_full_cuda_graph_dynamic_pack_eval_contract(
+        config,
+        process_non_loss_data_func=process_non_loss_data_func,
+        non_loss_data_func=non_loss_data_func,
+    )
 
     timers('evaluate', log_level=0).start(barrier=True)
 
@@ -5070,6 +5154,7 @@ def evaluate(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
+            batch_prepare_func=_get_full_cuda_graph_batch_prepare_func(forward_step_func, config),
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
@@ -5108,6 +5193,12 @@ def evaluate(
                 try:
                     (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
                         wrap_data_iterator(data_iterator, config, eval_num_microbatches)
+                    )
+                    _validate_full_cuda_graph_packed_microbatch_count(
+                        config,
+                        scheduled_eval_num_microbatches,
+                        stage="evaluation",
+                        iteration=iteration,
                     )
                 except StopIteration:
                     # Validation data iterator exhausted, stop evaluation early.

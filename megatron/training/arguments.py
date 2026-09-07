@@ -428,6 +428,72 @@ def tuple_type(x):
     return tuple(int(i) for i in x.strip('()').split(','))
 
 
+def _uses_prepared_packed_full_iteration_inputs(args):
+    """Return whether this run uses replay-updated full-iteration packed inputs."""
+    # Both contiguous-base and balanced runs need the seven prepared batch
+    # owners. Balanced routing is inferred later by TransformerConfig and adds
+    # two route owners; it is deliberately not a public argparse switch.
+    return (
+        args.cuda_graph_impl == 'full_iteration'
+        and args.sequence_packing_scheduler == 'dp_balanced'
+        and args.experimental_attention_variant == 'dsv4_hybrid'
+        and args.cp_partition_mode == 'contiguous'
+        and args.context_parallel_size > 1
+    )
+
+
+def _validate_prepared_packed_full_iteration_run_modes(args):
+    """Reject host-side modes that cannot be represented by the prepared ABI."""
+    if not _uses_prepared_packed_full_iteration_inputs(args):
+        return
+
+    if args.perform_rl_step:
+        raise ValueError(
+            "Full-iteration prepared packed inputs do not support --perform-rl-step: "
+            "the RL full-iteration graph wrapper does not yet provide the packed-input "
+            "preparation and replay-copy contract."
+        )
+    if args.inprocess_restart:
+        raise ValueError(
+            "Full-iteration prepared packed inputs do not support --inprocess-restart: "
+            "the restart teardown does not yet own the process-wide full-iteration graph, "
+            "prepared-buffer, and route-pointer state."
+        )
+    if args.save_wgrads_interval not in (None, 1):
+        raise ValueError(
+            "Full-iteration prepared packed inputs require --save-wgrads-interval to be "
+            "unset or 1. Other intervals change force_all_reduce after capture and would "
+            "invalidate the run-level graph signature."
+        )
+    if args.logits_load_dir is not None:
+        raise ValueError(
+            "Full-iteration prepared packed inputs do not support --logits-load-dir: "
+            "cached teacher logits are advanced by Python during capture and are not "
+            "part of the replay-updated prepared-batch ABI."
+        )
+    if args.logits_save_dir is not None:
+        raise ValueError(
+            "Full-iteration prepared packed inputs do not support --logits-save-dir: "
+            "Python logits-save hooks execute during capture but not graph replay."
+        )
+    if args.save_activations_interval is not None:
+        raise ValueError(
+            "Full-iteration prepared packed inputs do not support "
+            "--save-activations-interval: its Python logging hooks and host copies do not "
+            "execute on graph replay."
+        )
+    if args.save_dgrads_interval is not None:
+        raise ValueError(
+            "Full-iteration prepared packed inputs do not support --save-dgrads-interval: "
+            "its Python logging hooks and host copies do not execute on graph replay."
+        )
+    if args.check_for_spiky_loss:
+        raise ValueError(
+            "Full-iteration prepared packed inputs do not support --check-for-spiky-loss: "
+            "the diagnostic performs a host scalar read inside the captured loss."
+        )
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion.
@@ -480,6 +546,8 @@ def validate_args(args, defaults={}):
         * args.context_parallel_size
     )
     args.data_parallel_size = args.world_size // total_model_size
+
+    _validate_prepared_packed_full_iteration_run_modes(args)
 
     if args.perform_rl_step:
         # ----------------------------------------------------------------
@@ -1781,6 +1849,11 @@ def validate_args(args, defaults={}):
             #   * Otherwise fall back to ``dp_balanced`` (static packing).
             if args.sequence_packing_scheduler is None:
                 args.sequence_packing_scheduler = 'dp_balanced'
+
+    # The base prepared-input mode can be selected implicitly by the varlen
+    # scheduler default above, so re-check after scheduler normalization. The
+    # earlier call still catches graph-dynamic balanced modes before model setup.
+    _validate_prepared_packed_full_iteration_run_modes(args)
 
     # Packed-sequence buffer-size check. Placed after all scheduler auto-select
     # logic (dynamic-cp and --use-varlen-dataset both set the scheduler above)

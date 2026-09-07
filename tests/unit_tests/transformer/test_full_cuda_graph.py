@@ -103,7 +103,12 @@ def test_prepared_callback_runs_on_none_iterators_in_chunk_major_order():
 
     def prepare(**kwargs):
         calls.append(
-            (kwargs['model_chunk_index'], kwargs['microbatch_index'], kwargs['data_iterator'])
+            (
+                kwargs['model_chunk_index'],
+                kwargs['microbatch_index'],
+                kwargs['data_iterator'],
+                kwargs['pg_collection'],
+            )
         )
         return {
             'tokens': torch.tensor([10 * kwargs['model_chunk_index'] + kwargs['microbatch_index']])
@@ -113,12 +118,26 @@ def test_prepared_callback_runs_on_none_iterators_in_chunk_major_order():
         _consume_prepared_schedule, cuda_graph_warmup_steps=100, batch_prepare_func=prepare
     )
     model = [object(), object()]
-    prepared_iterators = wrapper.data_read([None, None], model, training=True, num_microbatches=2)
+    pg_collection = object()
+    prepared_iterators = wrapper._prepared_data_read(
+        [None, None],
+        model,
+        training=True,
+        num_microbatches=2,
+        pg_collection=pg_collection,
+    )
 
-    assert calls == [(0, 0, None), (0, 1, None), (1, 0, None), (1, 1, None)]
+    assert calls == [
+        (0, 0, None, pg_collection),
+        (0, 1, None, pg_collection),
+        (1, 0, None, pg_collection),
+        (1, 1, None, pg_collection),
+    ]
     assert all(
         isinstance(iterator, FullCudaGraphPreparedIterator) for iterator in prepared_iterators
     )
+    assert [iterator.model_chunk for iterator in prepared_iterators] == model
+    assert all(iterator.pg_collection is pg_collection for iterator in prepared_iterators)
     assert [int(next(prepared_iterators[0])['tokens']) for _ in range(2)] == [0, 1]
     assert [int(next(prepared_iterators[1])['tokens']) for _ in range(2)] == [10, 11]
 

@@ -66,9 +66,20 @@ class FullCudaGraphPreparedIterator(Iterator[Dict[str, Any]]):
     owner dictionary captured by the full-iteration graph.
     """
 
-    def __init__(self, batches: Iterable[Dict[str, Any]]):
+    def __init__(
+        self,
+        batches: Iterable[Dict[str, Any]],
+        *,
+        model_chunk=None,
+        pg_collection=None,
+    ):
         self._batches = tuple(batches)
         self._index = 0
+        # These are run-static Python context, not graph inputs. The frontend
+        # uses them to reconstruct each prepared batch with the same config and
+        # process groups that produced its tensor owners.
+        self.model_chunk = model_chunk
+        self.pg_collection = pg_collection
 
     def __iter__(self):
         return self
@@ -506,7 +517,9 @@ class FullCudaGraphWrapper:
             raw_iterators = [data_iterator]
         return model_chunks, raw_iterators
 
-    def _prepared_data_read(self, data_iterator, model, training, num_microbatches):
+    def _prepared_data_read(
+        self, data_iterator, model, training, num_microbatches, pg_collection=None
+    ):
         """Prepare every rank/slot first, then stage the complete iteration."""
         stage = 'training' if training else 'validation'
         model_chunks, raw_iterators = self._normalize_chunks(data_iterator, model)
@@ -524,6 +537,7 @@ class FullCudaGraphWrapper:
                     stage=stage,
                     microbatch_index=microbatch_index,
                     model_chunk_index=model_chunk_index,
+                    pg_collection=pg_collection,
                 )
                 if not isinstance(batch, dict):
                     raise TypeError(
@@ -535,12 +549,23 @@ class FullCudaGraphWrapper:
             prepared_batches.append(chunk_batches)
 
         static_chunks = self.static_loader.stage_prepared_iteration(prepared_batches, stage)
-        return [FullCudaGraphPreparedIterator(chunk) for chunk in static_chunks]
+        return [
+            FullCudaGraphPreparedIterator(
+                chunk, model_chunk=model_chunk, pg_collection=pg_collection
+            )
+            for chunk, model_chunk in zip(static_chunks, model_chunks)
+        ]
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
         if self.batch_prepare_func is not None:
-            return self._prepared_data_read(data_iterator, model, training, num_microbatches)
+            return self._prepared_data_read(
+                data_iterator,
+                model,
+                training,
+                num_microbatches,
+                pg_collection=None,
+            )
 
         # Legacy behavior below intentionally remains permissive and unchanged.
         if not isinstance(model, list) or len(model) == 1:
@@ -606,7 +631,16 @@ class FullCudaGraphWrapper:
                 )
             signature = self._prepared_run_signature(training_str, kwargs)
             self._pin_prepared_run_signature(training_str, signature)
-        data_list = self.data_read(data_iterator, model, training, num_microbatches)
+        if self.batch_prepare_func is not None:
+            data_list = self._prepared_data_read(
+                data_iterator,
+                model,
+                training,
+                num_microbatches,
+                pg_collection=kwargs.get('pg_collection'),
+            )
+        else:
+            data_list = self.data_read(data_iterator, model, training, num_microbatches)
         kwargs['data_iterator'] = data_list
 
         curr_iteration = self.curr_iter(training_str)

@@ -1142,6 +1142,134 @@ def test_balanced_dynamic_packs_are_inferred_for_attention_graph_with_pp_vpp(
 
 
 @pytest.mark.internal
+def test_balanced_dynamic_packs_are_inferred_for_full_iteration_pp1(monkeypatch):
+    config = _make_balanced_dynamic_pack_config(
+        monkeypatch,
+        cuda_graph_impl="full_iteration",
+        pipeline_model_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        cuda_graph_dynamic_microbatches=False,
+        calculate_per_token_loss=True,
+    )
+
+    assert config.cuda_graph_impl == "full_iteration"
+    assert config.pipeline_model_parallel_size == 1
+    assert config.virtual_pipeline_model_parallel_size is None
+    assert config.dsa_cp_balance_indexer_graph_dynamic_packs
+
+
+@pytest.mark.internal
+def test_prepared_base_packed_inputs_allow_full_iteration_pp1(monkeypatch):
+    config = _make_balanced_dynamic_pack_config(
+        monkeypatch,
+        cuda_graph_impl="full_iteration",
+        pipeline_model_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        cuda_graph_dynamic_microbatches=False,
+        calculate_per_token_loss=True,
+        dsa_cp_balance_indexer=False,
+    )
+
+    assert config.cuda_graph_impl == "full_iteration"
+    assert not config.dsa_cp_balance_indexer
+    assert not config.dsa_cp_balance_indexer_graph_dynamic_packs
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"calculate_per_token_loss": False}, "require calculate_per_token_loss=True"),
+        ({"pipeline_model_parallel_size": 2}, "require pipeline_model_parallel_size=1"),
+        (
+            {"virtual_pipeline_model_parallel_size": 2},
+            "require pipeline_model_parallel_size=1",
+        ),
+        (
+            {"csa_compress_ratios": [4, 4, 4, 4, 4], "mtp_num_layers": 1},
+            "does not yet support MTP",
+        ),
+        (
+            {
+                "num_moe_experts": 1,
+                "moe_router_topk": 1,
+                "moe_router_pre_softmax": True,
+                "moe_token_dispatcher_type": "alltoall",
+            },
+            "does not yet support MoE",
+        ),
+    ],
+)
+def test_prepared_base_full_iteration_keeps_narrow_contract(monkeypatch, overrides, match):
+    config_kwargs = {
+        "cuda_graph_impl": "full_iteration",
+        "pipeline_model_parallel_size": 1,
+        "virtual_pipeline_model_parallel_size": None,
+        "cuda_graph_dynamic_microbatches": False,
+        "calculate_per_token_loss": True,
+        "dsa_cp_balance_indexer": False,
+    }
+    config_kwargs.update(overrides)
+    with pytest.raises(ValueError, match=match):
+        _make_balanced_dynamic_pack_config(monkeypatch, **config_kwargs)
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "moe_overrides",
+    [
+        {
+            "num_moe_experts": 1,
+            "moe_router_topk": 1,
+            "moe_router_pre_softmax": True,
+            "moe_token_dispatcher_type": "alltoall",
+        },
+        {
+            "num_moe_experts": 8,
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_expert_capacity_factor": 1.0,
+            "moe_pad_expert_input_to_capacity": True,
+        },
+        {
+            "num_moe_experts": 8,
+            "moe_grouped_gemm": True,
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "hybridep",
+            "moe_expert_rank_capacity_factor": 1.2,
+            "use_transformer_engine_op_fuser": True,
+        },
+    ],
+    ids=("single_expert", "fixed_alltoall", "fixed_hybridep"),
+)
+def test_balanced_dynamic_packs_full_iteration_rejects_unverified_moe_paths(
+    monkeypatch, moe_overrides
+):
+    with pytest.raises(ValueError, match="does not yet support MoE"):
+        _make_balanced_dynamic_pack_config(
+            monkeypatch,
+            cuda_graph_impl="full_iteration",
+            pipeline_model_parallel_size=1,
+            virtual_pipeline_model_parallel_size=None,
+            cuda_graph_dynamic_microbatches=False,
+            **moe_overrides,
+        )
+
+
+@pytest.mark.internal
+def test_balanced_dynamic_packs_full_iteration_rejects_mtp(monkeypatch):
+    with pytest.raises(ValueError, match="does not yet support MTP"):
+        _make_balanced_dynamic_pack_config(
+            monkeypatch,
+            cuda_graph_impl="full_iteration",
+            pipeline_model_parallel_size=1,
+            virtual_pipeline_model_parallel_size=None,
+            cuda_graph_dynamic_microbatches=False,
+            csa_compress_ratios=[4, 4, 4, 4, 4],
+            mtp_num_layers=1,
+        )
+
+
+@pytest.mark.internal
 def test_balanced_dynamic_packs_allows_verified_safe_row_limit_boundary(monkeypatch):
     """Each half-call may contain exactly 32768 rows; only larger calls are unsafe."""
     config = _make_balanced_dynamic_pack_config(monkeypatch, max_seqlen_per_dp_cp_rank=2 * 32768)
@@ -1197,6 +1325,14 @@ def test_balanced_dynamic_packs_cannot_be_set_as_a_constructor_option(monkeypatc
     "overrides,match",
     [
         (
+            {
+                "cuda_graph_impl": "full_iteration",
+                "pipeline_model_parallel_size": 1,
+                "calculate_per_token_loss": False,
+            },
+            "require calculate_per_token_loss=True",
+        ),
+        (
             {"dynamic_context_parallel": True},
             "Dynamic context parallelism requires sequence_packing_scheduler=default_dynamic_cp",
         ),
@@ -1225,6 +1361,102 @@ def test_balanced_dynamic_packs_cannot_be_set_as_a_constructor_option(monkeypatc
 def test_balanced_dynamic_packs_validate_inferred_contract(monkeypatch, overrides, match):
     with pytest.raises(ValueError, match=match):
         _make_balanced_dynamic_pack_config(monkeypatch, **overrides)
+
+
+@pytest.mark.internal
+def test_full_iteration_dynamic_packs_requires_explicit_batch_prepare_callback():
+    from megatron.training.training import _get_full_cuda_graph_batch_prepare_func
+
+    config = SimpleNamespace(
+        cuda_graph_impl="full_iteration",
+        sequence_packing_scheduler="dp_balanced",
+        experimental_attention_variant="dsv4_hybrid",
+        cp_partition_mode="contiguous",
+        context_parallel_size=2,
+        dsa_cp_balance_indexer=True,
+    )
+
+    def forward_step():
+        pass
+
+    with pytest.raises(RuntimeError, match="full_cuda_graph_batch_prepare_func"):
+        _get_full_cuda_graph_batch_prepare_func(forward_step, config)
+
+    def prepare(**_kwargs):
+        return {}
+
+    forward_step.full_cuda_graph_batch_prepare_func = prepare
+    assert _get_full_cuda_graph_batch_prepare_func(forward_step, config) is prepare
+
+    base = SimpleNamespace(
+        cuda_graph_impl="full_iteration",
+        sequence_packing_scheduler="dp_balanced",
+        experimental_attention_variant="dsv4_hybrid",
+        cp_partition_mode="contiguous",
+        context_parallel_size=2,
+        dsa_cp_balance_indexer=False,
+    )
+    assert _get_full_cuda_graph_batch_prepare_func(forward_step, base) is prepare
+
+    balanced = SimpleNamespace(**vars(base))
+    balanced.dsa_cp_balance_indexer = True
+    assert _get_full_cuda_graph_batch_prepare_func(forward_step, balanced) is prepare
+
+    for cuda_graph_impl in ("none", "transformer_engine", "local"):
+        config.cuda_graph_impl = cuda_graph_impl
+        assert _get_full_cuda_graph_batch_prepare_func(forward_step, config) is None
+    config.cuda_graph_impl = "full_iteration"
+    config.sequence_packing_scheduler = None
+    assert _get_full_cuda_graph_batch_prepare_func(forward_step, config) is None
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("balance_indexer", [False, True], ids=("base", "balanced"))
+def test_full_iteration_prepared_packs_require_one_scheduled_physical_pack(balance_indexer):
+    from megatron.training.training import _validate_full_cuda_graph_packed_microbatch_count
+
+    config = SimpleNamespace(
+        cuda_graph_impl="full_iteration",
+        sequence_packing_scheduler="dp_balanced",
+        experimental_attention_variant="dsv4_hybrid",
+        cp_partition_mode="contiguous",
+        context_parallel_size=2,
+        dsa_cp_balance_indexer=balance_indexer,
+    )
+
+    _validate_full_cuda_graph_packed_microbatch_count(config, 1, stage="training", iteration=7)
+    with pytest.raises(ValueError, match="training iteration; iteration 8 scheduled 2, expected 1"):
+        _validate_full_cuda_graph_packed_microbatch_count(config, 2, stage="training", iteration=8)
+
+    # Module-level TE graphs do not capture the Python microbatch loop.
+    config.cuda_graph_impl = "transformer_engine"
+    _validate_full_cuda_graph_packed_microbatch_count(config, 2, stage="training", iteration=9)
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("balance_indexer", [False, True], ids=("base", "balanced"))
+def test_full_iteration_prepared_packs_reject_last_rank_only_non_loss_eval(balance_indexer):
+    from megatron.training.training import _validate_full_cuda_graph_dynamic_pack_eval_contract
+
+    config = SimpleNamespace(
+        cuda_graph_impl="full_iteration",
+        sequence_packing_scheduler="dp_balanced",
+        experimental_attention_variant="dsv4_hybrid",
+        cp_partition_mode="contiguous",
+        context_parallel_size=2,
+        dsa_cp_balance_indexer=balance_indexer,
+    )
+    process_non_loss = object()
+
+    with pytest.raises(ValueError, match="do not support process_non_loss_data_func"):
+        _validate_full_cuda_graph_dynamic_pack_eval_contract(
+            config, process_non_loss_data_func=process_non_loss, non_loss_data_func=None
+        )
+
+    # The all-rank function executes outside the graphed forward/backward schedule.
+    _validate_full_cuda_graph_dynamic_pack_eval_contract(
+        config, process_non_loss_data_func=process_non_loss, non_loss_data_func=object()
+    )
 
 
 @pytest.mark.internal

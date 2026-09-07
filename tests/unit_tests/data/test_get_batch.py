@@ -281,6 +281,293 @@ def test_gpt_scheduler_prebuilds_balanced_indexer_from_normalized_config(monkeyp
         prebuild.assert_not_called()
 
 
+class _FullGraphPackedCPGroup:
+    def size(self):
+        return 2
+
+    def rank(self):
+        return 0
+
+
+def _full_graph_dynamic_packed_config():
+    return SimpleNamespace(
+        cuda_graph_impl="full_iteration",
+        cuda_graph_modules=[],
+        dsa_cp_balance_indexer=True,
+        dsa_cp_balance_indexer_graph_dynamic_packs=True,
+        experimental_attention_variant="dsv4_hybrid",
+        sequence_packing_scheduler="dp_balanced",
+        dynamic_context_parallel=False,
+        cp_partition_mode="contiguous",
+        pipeline_model_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        context_parallel_size=2,
+        max_seqlen_per_dp_cp_rank=8,
+        thd_max_packed_sequences=3,
+        calculate_per_token_loss=True,
+    )
+
+
+def _full_graph_base_packed_config():
+    config = _full_graph_dynamic_packed_config()
+    config.dsa_cp_balance_indexer = False
+    config.dsa_cp_balance_indexer_graph_dynamic_packs = False
+    return config
+
+
+def _full_graph_eager_packed_batch(cp_group, *, include_route=True):
+    from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+    real_cu = torch.tensor([0, 4, 12, 16], dtype=torch.int32)
+    padded_cu = torch.tensor([0, 4, 12, 16], dtype=torch.int32)
+    packed = pretrain_gpt.PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=real_cu,
+        # Deliberately equal but not aliased: serialization must publish one
+        # real-cu owner and reconstruction must restore the q/kv alias.
+        cu_seqlens_kv=real_cu.clone(),
+        cu_seqlens_q_padded=padded_cu,
+        cu_seqlens_kv_padded=padded_cu.clone(),
+        max_seqlen_q=16,
+        max_seqlen_kv=16,
+        cp_group=cp_group,
+        local_cp_size=None,
+        total_tokens=None,
+        cp_partition_mode="contiguous",
+        pad_between_seqs=True,
+    )
+    if include_route:
+        spec = cp_balanced_indexer.GraphDynamicRouteSpec(
+            cp_size=2, cp_rank=0, l_local=8, cu_entries=4
+        )
+        route = cp_balanced_indexer.build_graph_dynamic_route(padded_cu, spec)
+        cp_balanced_indexer.attach_graph_dynamic_route(packed, route)
+    tokens = torch.arange(8, dtype=torch.int64).view(1, 8)
+    labels = tokens.clone()
+    loss_mask = torch.ones((1, 8), dtype=torch.float32)
+    position_ids = tokens.clone()
+    padding_mask = torch.zeros((1, 8), dtype=torch.bool)
+    return tokens, labels, loss_mask, None, position_ids, packed, padding_mask
+
+
+def test_full_iteration_dynamic_packed_serialization_has_nine_owners_and_restores_aliases(
+    monkeypatch,
+):
+    from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+    config = _full_graph_dynamic_packed_config()
+    cp_group = _FullGraphPackedCPGroup()
+    monkeypatch.setattr(pretrain_gpt.mpu, "get_context_parallel_group", lambda: cp_group)
+    eager_batch = _full_graph_eager_packed_batch(cp_group)
+
+    owners = pretrain_gpt._serialize_full_cuda_graph_dynamic_packed_batch(eager_batch, config)
+    assert tuple(owners) == pretrain_gpt._FULL_CUDA_GRAPH_PACKED_BATCH_KEYS
+    assert len(owners) == 9
+    assert all(isinstance(value, torch.Tensor) for value in owners.values())
+    assert owners["cu_seqlens"] is eager_batch[5].cu_seqlens_q
+    assert owners["cu_seqlens_padded"] is eager_batch[5].cu_seqlens_q_padded
+
+    reconstructed = pretrain_gpt._reconstruct_full_cuda_graph_dynamic_packed_batch(owners, config)
+    assert reconstructed[3] is None
+    packed = reconstructed[5]
+    assert packed.cu_seqlens_q is owners["cu_seqlens"]
+    assert packed.cu_seqlens_kv is owners["cu_seqlens"]
+    assert packed.cu_seqlens_q_padded is owners["cu_seqlens_padded"]
+    assert packed.cu_seqlens_kv_padded is owners["cu_seqlens_padded"]
+    assert packed.max_seqlen_q == packed.max_seqlen_kv == 16
+    assert packed.cp_group is cp_group
+    assert packed.cp_partition_mode == "contiguous"
+    assert packed.pad_between_seqs is True
+    assert packed.total_tokens is None
+    assert packed.cp_partition_route is None
+    layout, route = cp_balanced_indexer.get_graph_dynamic_plan_buffers(packed)
+    assert layout is owners["dsa_cp_graph_layout_buffer"]
+    assert route is owners["dsa_cp_graph_route_buffer"]
+
+
+def test_full_iteration_base_packed_serialization_has_only_common_owners(monkeypatch):
+    from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+    config = _full_graph_base_packed_config()
+    cp_group = _FullGraphPackedCPGroup()
+    monkeypatch.setattr(pretrain_gpt.mpu, "get_context_parallel_group", lambda: cp_group)
+    eager_batch = _full_graph_eager_packed_batch(cp_group, include_route=False)
+
+    # Base full-iteration graphs share only the prepared tensor-owner ABI. They
+    # must not accidentally validate, extract, or attach balanced route state.
+    route_helpers = (
+        "validate_graph_dynamic_plan_contract",
+        "get_graph_dynamic_plan_buffers",
+        "validate_graph_dynamic_route",
+        "attach_graph_dynamic_route",
+    )
+    route_mocks = []
+    for name in route_helpers:
+        mock = MagicMock(side_effect=AssertionError(f"base path called route helper {name}"))
+        monkeypatch.setattr(pretrain_gpt, name, mock)
+        route_mocks.append(mock)
+
+    owners = pretrain_gpt._serialize_full_cuda_graph_dynamic_packed_batch(eager_batch, config)
+    assert tuple(owners) == pretrain_gpt._FULL_CUDA_GRAPH_PACKED_BASE_BATCH_KEYS
+    assert len(owners) == 7
+    assert all(isinstance(value, torch.Tensor) for value in owners.values())
+
+    result = pretrain_gpt._reconstruct_full_cuda_graph_dynamic_packed_batch(owners, config)
+    packed = result[5]
+    assert result[0] is owners["tokens"]
+    assert result[6] is owners["padding_mask"]
+    assert packed.cu_seqlens_q is packed.cu_seqlens_kv is owners["cu_seqlens"]
+    assert (
+        packed.cu_seqlens_q_padded
+        is packed.cu_seqlens_kv_padded
+        is owners["cu_seqlens_padded"]
+    )
+    assert packed.max_seqlen_q == packed.max_seqlen_kv == 16
+    assert packed.cp_group is cp_group
+    assert packed.cp_partition_mode == "contiguous"
+    assert packed.cp_partition_route is None
+    assert cp_balanced_indexer.get_graph_dynamic_plan(packed) is None
+    for mock in route_mocks:
+        mock.assert_not_called()
+
+
+def test_full_iteration_prepared_base_get_batch_never_calls_eager_builders(monkeypatch):
+    config = _full_graph_base_packed_config()
+    cp_group = _FullGraphPackedCPGroup()
+    monkeypatch.setattr(pretrain_gpt.mpu, "get_context_parallel_group", lambda: cp_group)
+    owners = pretrain_gpt._serialize_full_cuda_graph_dynamic_packed_batch(
+        _full_graph_eager_packed_batch(cp_group, include_route=False), config
+    )
+    prepared_iterator = pretrain_gpt.FullCudaGraphPreparedIterator(
+        [owners], model_chunk=SimpleNamespace(config=config)
+    )
+    monkeypatch.setattr(pretrain_gpt, "get_args", lambda: SimpleNamespace())
+    monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _args: config)
+
+    forbidden = (
+        "get_batch_on_this_rank_for_sequence_packing",
+        "get_batch_on_this_tp_rank",
+        "get_batch_on_this_cp_rank",
+        "get_thd_batch_on_this_cp_rank",
+        "pad_sequence_for_thd",
+        "finalize_packed_seq_params",
+        "prebuild_balanced_layouts",
+        "validate_graph_dynamic_plan_contract",
+        "get_graph_dynamic_plan_buffers",
+        "validate_graph_dynamic_route",
+        "attach_graph_dynamic_route",
+    )
+    mocks = []
+    for name in forbidden:
+        mock = MagicMock(side_effect=AssertionError(f"capture path called forbidden {name}"))
+        monkeypatch.setattr(pretrain_gpt, name, mock)
+        mocks.append(mock)
+
+    result = pretrain_gpt.get_batch(prepared_iterator)
+    assert result[0] is owners["tokens"]
+    assert result[5].cu_seqlens_q is owners["cu_seqlens"]
+    assert result[5].cu_seqlens_q_padded is owners["cu_seqlens_padded"]
+    for mock in mocks:
+        mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "balance_indexer,dynamic_route",
+    [(True, False), (False, True)],
+)
+def test_full_iteration_prepared_packed_rejects_inconsistent_derived_route_state(
+    balance_indexer, dynamic_route
+):
+    config = _full_graph_dynamic_packed_config()
+    config.dsa_cp_balance_indexer = balance_indexer
+    config.dsa_cp_balance_indexer_graph_dynamic_packs = dynamic_route
+
+    with pytest.raises(ValueError, match="inconsistent balanced-route state"):
+        pretrain_gpt._validate_full_cuda_graph_prepared_packed_config(config)
+
+
+def test_full_iteration_prepared_get_batch_never_calls_eager_builders(monkeypatch):
+    from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
+
+    config = _full_graph_dynamic_packed_config()
+    cp_group = _FullGraphPackedCPGroup()
+    pg_collection = SimpleNamespace(cp=cp_group)
+    monkeypatch.setattr(
+        pretrain_gpt.mpu,
+        "get_context_parallel_group",
+        MagicMock(side_effect=AssertionError("prepared path ignored its process groups")),
+    )
+    owners = pretrain_gpt._serialize_full_cuda_graph_dynamic_packed_batch(
+        _full_graph_eager_packed_batch(cp_group), config, pg_collection
+    )
+    prepared_iterator = pretrain_gpt.FullCudaGraphPreparedIterator(
+        [owners],
+        model_chunk=SimpleNamespace(config=config),
+        pg_collection=pg_collection,
+    )
+    monkeypatch.setattr(pretrain_gpt, "get_args", lambda: SimpleNamespace())
+    monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _args: config)
+
+    forbidden = (
+        (pretrain_gpt, "get_batch_on_this_rank_for_sequence_packing"),
+        (pretrain_gpt, "get_batch_on_this_tp_rank"),
+        (pretrain_gpt, "get_batch_on_this_cp_rank"),
+        (pretrain_gpt, "get_thd_batch_on_this_cp_rank"),
+        (pretrain_gpt, "pad_sequence_for_thd"),
+        (pretrain_gpt, "finalize_packed_seq_params"),
+        (pretrain_gpt, "prebuild_balanced_layouts"),
+        (cp_balanced_indexer, "build_graph_dynamic_route"),
+        (cp_balanced_indexer, "build_graph_dynamic_plan"),
+    )
+    mocks = []
+    for module, name in forbidden:
+        mock = MagicMock(side_effect=AssertionError(f"capture path called forbidden {name}"))
+        monkeypatch.setattr(module, name, mock)
+        mocks.append(mock)
+
+    result = pretrain_gpt.get_batch(prepared_iterator)
+    assert result[0] is owners["tokens"]
+    assert result[5].cu_seqlens_q is owners["cu_seqlens"]
+    assert result[5].cu_seqlens_kv is owners["cu_seqlens"]
+    assert result[5].cu_seqlens_q_padded is owners["cu_seqlens_padded"]
+    assert result[5].cu_seqlens_kv_padded is owners["cu_seqlens_padded"]
+    for mock in mocks:
+        mock.assert_not_called()
+
+
+def test_full_iteration_prepare_calls_get_batch_when_raw_iterator_is_none(monkeypatch):
+    config = _full_graph_dynamic_packed_config()
+    cp_group = _FullGraphPackedCPGroup()
+    pg_collection = SimpleNamespace(cp=cp_group)
+    eager_batch = _full_graph_eager_packed_batch(cp_group)
+    get_batch_mock = MagicMock(return_value=eager_batch)
+    monkeypatch.setattr(
+        pretrain_gpt.mpu,
+        "get_context_parallel_group",
+        MagicMock(side_effect=AssertionError("prepare ignored its process groups")),
+    )
+    rebuild_config = MagicMock(side_effect=AssertionError("prepare rebuilt TransformerConfig"))
+    monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", rebuild_config)
+    monkeypatch.setattr(pretrain_gpt, "get_batch", get_batch_mock)
+
+    owners = pretrain_gpt.prepare_full_cuda_graph_dynamic_packed_batch(
+        data_iterator=None,
+        model=SimpleNamespace(config=config, vp_stage=None),
+        stage="training",
+        microbatch_index=0,
+        model_chunk_index=0,
+        pg_collection=pg_collection,
+    )
+    get_batch_mock.assert_called_once_with(
+        None, None, config=config, pg_collection=pg_collection
+    )
+    rebuild_config.assert_not_called()
+    assert tuple(owners) == pretrain_gpt._FULL_CUDA_GRAPH_PACKED_BATCH_KEYS
+    assert pretrain_gpt.forward_step.full_cuda_graph_batch_prepare_func is (
+        pretrain_gpt.prepare_full_cuda_graph_dynamic_packed_batch
+    )
+
+
 @pytest.mark.parametrize("frontend", ["gpt", "hybrid"])
 def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, frontend):
     """An MLP-only graph must not pin the eager indexer's pack composition."""

@@ -412,18 +412,17 @@ class TransformerConfig(ModelParallelConfig):
     at recipe level, by this flag.
     Under FP8 recipes, eval/no-grad forwards skip the indexer's loss-path projection, so its amax
     history sees fewer recordings than the reference during eval (training forwards identical).
-    For Transformer Engine CUDA graphs that capture attention, fixed-capacity dynamic-pack routing
-    is enabled automatically when ``sequence_packing_scheduler="dp_balanced"``. Data preparation
-    then builds one fixed-shape source plan from each microbatch's ``cu_seqlens``. The decoder stack
-    copies its two typed metadata owners once into a fixed-address graph-slot arena shared by all
-    captured DSA callables. Staged route inputs retain their originating slot so replay cannot
-    follow mutable layer microbatch state; this does not change the existing CUDA-graph/recompute
-    compatibility matrix. PP/VPP also requires ``cuda_graph_dynamic_microbatches`` so a graph input
-    slot cannot be reused while its forward remains live. Dynamic CP, local CUDA graphs, and
-    full-iteration CUDA graphs do not use dynamic-pack routing. A step batch-size schedule may not
-    increase the source global batch size after capture; doing so would require retaining graph
-    instances sized for the largest future schedule entry. Other graph configurations retain the
-    static-composition behavior."""
+    For Transformer Engine attention graphs and full-iteration CUDA graphs, fixed-capacity
+    dynamic-pack routing is enabled automatically when
+    ``sequence_packing_scheduler="dp_balanced"``. Data preparation builds one fixed-shape source
+    plan from each microbatch's ``cu_seqlens``. Transformer Engine graphs copy the two typed route
+    owners into their graph-slot arena; full-iteration graphs use an eager iteration prologue to
+    atomically refresh the complete fixed-address batch and route owners before replay.
+    Transformer Engine graphs support PP/VPP when ``cuda_graph_dynamic_microbatches`` gives every
+    in-flight forward a distinct input slot. Full-iteration packed graphs currently require a
+    dense PP1 model with no VPP, per-token loss normalization, and exactly one scheduled physical
+    pack per DP rank in every train/eval iteration. Dynamic CP and local CUDA graphs are not
+    supported. Other graph configurations retain the static-composition behavior."""
 
     @property
     def dsa_cp_balance_indexer_graph_dynamic_packs(self) -> bool:
@@ -434,7 +433,7 @@ class TransformerConfig(ModelParallelConfig):
         """
         return bool(
             self.dsa_cp_balance_indexer
-            and self.cuda_graph_impl == "transformer_engine"
+            and self.cuda_graph_impl in ("transformer_engine", "full_iteration")
             and cuda_graph_captures_attention(self)
             and self.sequence_packing_scheduler == "dp_balanced"
         )
@@ -3524,6 +3523,42 @@ class TransformerConfig(ModelParallelConfig):
 
         graph_captures_attention = cuda_graph_captures_attention(self)
 
+        prepared_packed_full_iteration = (
+            self.cuda_graph_impl == "full_iteration"
+            and self.sequence_packing_scheduler == "dp_balanced"
+            and self.experimental_attention_variant == "dsv4_hybrid"
+            and self.cp_partition_mode == "contiguous"
+            and self.context_parallel_size > 1
+        )
+        if prepared_packed_full_iteration:
+            if not self.calculate_per_token_loss:
+                raise ValueError(
+                    "Full-iteration prepared packed inputs require "
+                    "calculate_per_token_loss=True. Fixed-capacity packs contain "
+                    "data-dependent padding, so mean-mode fused indexer loss would otherwise "
+                    "be diluted by the padded row count."
+                )
+            if self.pipeline_model_parallel_size > 1 or (
+                self.virtual_pipeline_model_parallel_size or 1
+            ) > 1:
+                raise ValueError(
+                    "Full-iteration prepared packed inputs currently require "
+                    "pipeline_model_parallel_size=1 and no virtual pipeline parallelism."
+                )
+            if (self.mtp_num_layers or 0) > 0:
+                raise ValueError(
+                    "The full-iteration prepared packed-input path does not yet support MTP. "
+                    "Packed MTP roll-context compaction has a data-dependent output shape that "
+                    "cannot be a replay invariant."
+                )
+            if self.num_moe_experts is not None:
+                raise ValueError(
+                    "The full-iteration prepared packed-input path does not yet support MoE. "
+                    "Fixed-capacity all-to-all, HybridEP, and NCCL-EP each require a separately "
+                    "verified graph-safe expert path; use a dense model or Transformer Engine "
+                    "module graphs."
+                )
+
         if self.dsa_cp_balance_indexer_graph_dynamic_packs:
             if self.dynamic_context_parallel or self.context_parallel_size <= 1:
                 raise ValueError(
@@ -3561,7 +3596,11 @@ class TransformerConfig(ModelParallelConfig):
                 self.pipeline_model_parallel_size > 1
                 or (self.virtual_pipeline_model_parallel_size or 1) > 1
             )
-            if graph_dynamic_pp_vpp and not self.cuda_graph_dynamic_microbatches:
+            if (
+                self.cuda_graph_impl == "transformer_engine"
+                and graph_dynamic_pp_vpp
+                and not self.cuda_graph_dynamic_microbatches
+            ):
                 raise ValueError(
                     "CUDA-graphed balanced DSA dynamic-pack routing with PP/VPP requires "
                     "cuda_graph_dynamic_microbatches=True so each in-flight forward owns a "

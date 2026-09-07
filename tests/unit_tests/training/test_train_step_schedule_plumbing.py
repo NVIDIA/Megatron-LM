@@ -6,6 +6,8 @@ import inspect
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from megatron.core.enums import ModelType
 from megatron.training import training as training_mod
 
@@ -483,6 +485,61 @@ def test_train_step_wraps_sequence_packing_after_rerun_check():
     assert forwarded_iterators == [packed_iterator, packed_iterator]
     assert captured["num_microbatches"] == 3
     assert result[-3:] == (3, 12.0, 34.0)
+
+
+@pytest.mark.parametrize("balance_indexer", [False, True], ids=("base", "balanced"))
+def test_train_step_rejects_variable_full_graph_pack_count_before_forward_backward(
+    balance_indexer,
+):
+    """The scheduler count contract must fail before staging or graph replay can run."""
+    args = SimpleNamespace(
+        save_params_interval=None,
+        save_activations_interval=None,
+        save_tokens_per_expert_interval=None,
+        save_wgrads_interval=None,
+        save_dgrads_interval=None,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
+        overlap_param_gather=False,
+        seq_length=8,
+        global_batch_size=2,
+        micro_batch_size=1,
+        decoder_seq_length=None,
+        empty_unused_memory_level=0,
+    )
+    config = SimpleNamespace(
+        sequence_packing_scheduler="dp_balanced",
+        dsa_cp_balance_indexer=balance_indexer,
+        cuda_graph_impl="full_iteration",
+        experimental_attention_variant="dsv4_hybrid",
+        cp_partition_mode="contiguous",
+        context_parallel_size=2,
+    )
+    model = [SimpleNamespace(force_all_reduce=False, zero_grad_buffer=lambda: None)]
+    forward_backward = mock.Mock(side_effect=AssertionError("must fail before graph execution"))
+
+    with (
+        mock.patch.object(training_mod, "get_args", return_value=args),
+        mock.patch.object(training_mod, "get_timers", return_value=mock.MagicMock()),
+        mock.patch.object(training_mod, "get_rerun_state_machine", return_value=_Rerun()),
+        mock.patch.object(training_mod, "get_num_microbatches", return_value=2),
+        mock.patch.object(training_mod, "has_nvidia_modelopt", False),
+        mock.patch.object(
+            training_mod, "wrap_data_iterator", return_value=(object(), 2, 16.0, 128.0)
+        ),
+    ):
+        with pytest.raises(ValueError, match="scheduled 2, expected 1"):
+            training_mod.train_step(
+                forward_step_func=lambda *a, **k: None,
+                data_iterator=object(),
+                model=model,
+                optimizer=SimpleNamespace(zero_grad=lambda: None),
+                opt_param_scheduler=None,
+                config=config,
+                forward_backward_func=forward_backward,
+                iteration=4,
+            )
+
+    forward_backward.assert_not_called()
 
 
 def test_config_container_forwards_layer_wise_optimizer_to_model_builder():
