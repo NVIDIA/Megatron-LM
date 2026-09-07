@@ -38,6 +38,7 @@ from megatron.core.packed_seq_params import (
     pad_sequence_for_thd,
     resolve_thd_tail_padding_policy,
 )
+from megatron.core.process_groups_config import MultiModuleProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.cuda_graph_config import cuda_graph_captures_attention
@@ -96,10 +97,7 @@ _FULL_CUDA_GRAPH_PACKED_BASE_BATCH_KEYS = (
     "cu_seqlens",
     "cu_seqlens_padded",
 )
-_FULL_CUDA_GRAPH_PACKED_ROUTE_KEYS = (
-    "dsa_cp_graph_layout_buffer",
-    "dsa_cp_graph_route_buffer",
-)
+_FULL_CUDA_GRAPH_PACKED_ROUTE_KEYS = ("dsa_cp_graph_layout_buffer", "dsa_cp_graph_route_buffer")
 _FULL_CUDA_GRAPH_PACKED_BATCH_KEYS = (
     _FULL_CUDA_GRAPH_PACKED_BASE_BATCH_KEYS + _FULL_CUDA_GRAPH_PACKED_ROUTE_KEYS
 )
@@ -128,9 +126,7 @@ def _validate_full_cuda_graph_prepared_packed_config(config):
             "experimental_attention_variant='dsv4_hybrid'"
         )
     if getattr(config, "sequence_packing_scheduler", None) != "dp_balanced":
-        raise ValueError(
-            "prepared packed batches require sequence_packing_scheduler='dp_balanced'"
-        )
+        raise ValueError("prepared packed batches require sequence_packing_scheduler='dp_balanced'")
     if getattr(config, "dynamic_context_parallel", False):
         raise ValueError("prepared packed batches do not support dynamic context parallelism")
     if getattr(config, "cp_partition_mode", None) != "contiguous":
@@ -144,9 +140,7 @@ def _validate_full_cuda_graph_prepared_packed_config(config):
         raise ValueError("prepared packed batches currently require PP=1 and no VPP")
 
     balance_indexer = bool(getattr(config, "dsa_cp_balance_indexer", False))
-    dynamic_route = bool(
-        getattr(config, "dsa_cp_balance_indexer_graph_dynamic_packs", False)
-    )
+    dynamic_route = bool(getattr(config, "dsa_cp_balance_indexer_graph_dynamic_packs", False))
     if balance_indexer != dynamic_route:
         raise ValueError(
             "full-iteration prepared packed config has inconsistent balanced-route state: "
@@ -181,12 +175,23 @@ def _validate_full_cuda_graph_dynamic_packed_config(config):
     return _validate_full_cuda_graph_prepared_packed_config(config)
 
 
+def _resolve_full_cuda_graph_packed_pg_collection(pg_collection):
+    """Return the language-model process groups used by packed-input preparation."""
+    if not isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        return pg_collection
+    if not pg_collection.has_language_model():
+        raise ValueError(
+            "full-iteration packed inputs require a language-model process-group "
+            "collection on this rank"
+        )
+    return pg_collection.get_language_model_collection()
+
+
 def _full_cuda_graph_packed_context(config, pg_collection=None):
     """Resolve the run-static CP group and common packed-input schema."""
+    pg_collection = _resolve_full_cuda_graph_packed_pg_collection(pg_collection)
     cp_size, l_local, cu_entries = _validate_full_cuda_graph_prepared_packed_config(config)
-    cp_group = (
-        mpu.get_context_parallel_group() if pg_collection is None else pg_collection.cp
-    )
+    cp_group = mpu.get_context_parallel_group() if pg_collection is None else pg_collection.cp
     if cp_group is None or cp_group.size() != cp_size:
         actual_size = None if cp_group is None else cp_group.size()
         raise RuntimeError(
@@ -201,10 +206,9 @@ def _full_cuda_graph_packed_context(config, pg_collection=None):
 
 def _full_cuda_graph_route_context(config, pg_collection=None):
     """Resolve the run-static CP group and typed route schema."""
+    pg_collection = _resolve_full_cuda_graph_packed_pg_collection(pg_collection)
     cp_size, l_local, cu_entries = _validate_full_cuda_graph_dynamic_packed_config(config)
-    cp_group = (
-        mpu.get_context_parallel_group() if pg_collection is None else pg_collection.cp
-    )
+    cp_group = mpu.get_context_parallel_group() if pg_collection is None else pg_collection.cp
     if cp_group is None or cp_group.size() != cp_size:
         actual_size = None if cp_group is None else cp_group.size()
         raise RuntimeError(
@@ -291,9 +295,7 @@ def _serialize_full_cuda_graph_dynamic_packed_batch(batch, config, pg_collection
     if not isinstance(packed, PackedSeqParams) or packed.qkv_format != "thd":
         raise TypeError("full-iteration dynamic packed batch requires THD PackedSeqParams")
 
-    include_route = bool(
-        getattr(config, "dsa_cp_balance_indexer_graph_dynamic_packs", False)
-    )
+    include_route = bool(getattr(config, "dsa_cp_balance_indexer_graph_dynamic_packs", False))
     cp_group, spec = (
         _full_cuda_graph_route_context(config, pg_collection)
         if include_route
@@ -339,14 +341,9 @@ def _serialize_full_cuda_graph_dynamic_packed_batch(batch, config, pg_collection
         validate_graph_dynamic_plan_contract(packed, spec.cp_size, spec.cp_rank, spec.l_local)
         layout_i32, route_i64 = get_graph_dynamic_plan_buffers(packed)
         owners.update(
-            {
-                "dsa_cp_graph_layout_buffer": layout_i32,
-                "dsa_cp_graph_route_buffer": route_i64,
-            }
+            {"dsa_cp_graph_layout_buffer": layout_i32, "dsa_cp_graph_route_buffer": route_i64}
         )
-    buffers = _validate_full_cuda_graph_tensor_owners(
-        owners, spec, include_route=include_route
-    )
+    buffers = _validate_full_cuda_graph_tensor_owners(owners, spec, include_route=include_route)
     if buffers is not None:
         validate_graph_dynamic_route(owners["cu_seqlens_padded"], buffers)
     return owners
@@ -354,17 +351,13 @@ def _serialize_full_cuda_graph_dynamic_packed_batch(batch, config, pg_collection
 
 def _reconstruct_full_cuda_graph_dynamic_packed_batch(batch, config, pg_collection=None):
     """Reconstruct the THD object during capture without eager data preparation."""
-    include_route = bool(
-        getattr(config, "dsa_cp_balance_indexer_graph_dynamic_packs", False)
-    )
+    include_route = bool(getattr(config, "dsa_cp_balance_indexer_graph_dynamic_packs", False))
     cp_group, spec = (
         _full_cuda_graph_route_context(config, pg_collection)
         if include_route
         else _full_cuda_graph_packed_context(config, pg_collection)
     )
-    buffers = _validate_full_cuda_graph_tensor_owners(
-        batch, spec, include_route=include_route
-    )
+    buffers = _validate_full_cuda_graph_tensor_owners(batch, spec, include_route=include_route)
     if buffers is not None:
         validate_graph_dynamic_route(batch["cu_seqlens_padded"], buffers)
 
@@ -421,21 +414,16 @@ def prepare_full_cuda_graph_dynamic_packed_batch(
     config = get_attr_wrapped_model(model, "config", allow_none=False)
     _validate_full_cuda_graph_prepared_packed_config(config)
     vp_stage = get_attr_wrapped_model(model, "vp_stage")
+    packed_pg_collection = _resolve_full_cuda_graph_packed_pg_collection(pg_collection)
     eager_batch = get_batch(
-        data_iterator, vp_stage, config=config, pg_collection=pg_collection
+        data_iterator, vp_stage, config=config, pg_collection=packed_pg_collection
     )
     return _serialize_full_cuda_graph_dynamic_packed_batch(
-        eager_batch, config, pg_collection
+        eager_batch, config, packed_pg_collection
     )
 
 
-def get_batch(
-    data_iterator,
-    vp_stage: Optional[int] = None,
-    *,
-    config=None,
-    pg_collection=None,
-):
+def get_batch(data_iterator, vp_stage: Optional[int] = None, *, config=None, pg_collection=None):
     """Generate a batch.
 
     Packed sequence support (SFT / ``--sft`` flag):
@@ -492,9 +480,7 @@ def get_batch(
                 raise RuntimeError(
                     "prepared full-iteration batch is missing its owning model chunk"
                 )
-            config = get_attr_wrapped_model(
-                data_iterator.model_chunk, "config", allow_none=False
-            )
+            config = get_attr_wrapped_model(data_iterator.model_chunk, "config", allow_none=False)
         if pg_collection is None:
             pg_collection = data_iterator.pg_collection
         return _reconstruct_full_cuda_graph_dynamic_packed_batch(

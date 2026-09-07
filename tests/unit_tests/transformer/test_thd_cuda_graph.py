@@ -1181,14 +1181,8 @@ def test_prepared_base_packed_inputs_allow_full_iteration_pp1(monkeypatch):
     [
         ({"calculate_per_token_loss": False}, "require calculate_per_token_loss=True"),
         ({"pipeline_model_parallel_size": 2}, "require pipeline_model_parallel_size=1"),
-        (
-            {"virtual_pipeline_model_parallel_size": 2},
-            "require pipeline_model_parallel_size=1",
-        ),
-        (
-            {"csa_compress_ratios": [4, 4, 4, 4, 4], "mtp_num_layers": 1},
-            "does not yet support MTP",
-        ),
+        ({"virtual_pipeline_model_parallel_size": 2}, "require pipeline_model_parallel_size=1"),
+        ({"csa_compress_ratios": [4, 4, 4, 4, 4], "mtp_num_layers": 1}, "does not yet support MTP"),
         (
             {
                 "num_moe_experts": 1,
@@ -1251,6 +1245,7 @@ def test_balanced_dynamic_packs_full_iteration_rejects_unverified_moe_paths(
             pipeline_model_parallel_size=1,
             virtual_pipeline_model_parallel_size=None,
             cuda_graph_dynamic_microbatches=False,
+            calculate_per_token_loss=True,
             **moe_overrides,
         )
 
@@ -1264,6 +1259,7 @@ def test_balanced_dynamic_packs_full_iteration_rejects_mtp(monkeypatch):
             pipeline_model_parallel_size=1,
             virtual_pipeline_model_parallel_size=None,
             cuda_graph_dynamic_microbatches=False,
+            calculate_per_token_loss=True,
             csa_compress_ratios=[4, 4, 4, 4, 4],
             mtp_num_layers=1,
         )

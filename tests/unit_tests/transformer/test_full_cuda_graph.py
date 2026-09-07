@@ -120,11 +120,7 @@ def test_prepared_callback_runs_on_none_iterators_in_chunk_major_order():
     model = [object(), object()]
     pg_collection = object()
     prepared_iterators = wrapper._prepared_data_read(
-        [None, None],
-        model,
-        training=True,
-        num_microbatches=2,
-        pg_collection=pg_collection,
+        [None, None], model, training=True, num_microbatches=2, pg_collection=pg_collection
     )
 
     assert calls == [

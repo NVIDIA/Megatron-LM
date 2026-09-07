@@ -66,13 +66,7 @@ class FullCudaGraphPreparedIterator(Iterator[Dict[str, Any]]):
     owner dictionary captured by the full-iteration graph.
     """
 
-    def __init__(
-        self,
-        batches: Iterable[Dict[str, Any]],
-        *,
-        model_chunk=None,
-        pg_collection=None,
-    ):
+    def __init__(self, batches: Iterable[Dict[str, Any]], *, model_chunk=None, pg_collection=None):
         self._batches = tuple(batches)
         self._index = 0
         # These are run-static Python context, not graph inputs. The frontend
@@ -560,11 +554,7 @@ class FullCudaGraphWrapper:
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
         if self.batch_prepare_func is not None:
             return self._prepared_data_read(
-                data_iterator,
-                model,
-                training,
-                num_microbatches,
-                pg_collection=None,
+                data_iterator, model, training, num_microbatches, pg_collection=None
             )
 
         # Legacy behavior below intentionally remains permissive and unchanged.

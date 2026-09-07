@@ -428,6 +428,43 @@ class _MockCPGroup:
         return self._rank
 
 
+def test_fixed_sequence_packing_preserves_explicit_cp_group(monkeypatch):
+    """Fixed CP metadata must retain the same custom group used for slicing."""
+    custom_cp_group = _MockCPGroup(size=2, rank=1)
+    pg_collection = SimpleNamespace(
+        tp=_MockCPGroup(size=1, rank=0), pp=_MockCPGroup(size=1, rank=0), cp=custom_cp_group
+    )
+    batch = {
+        "tokens": torch.arange(4, dtype=torch.int64),
+        "position_ids": torch.arange(4, dtype=torch.int64),
+        "labels": torch.arange(4, dtype=torch.int64),
+        "loss_mask": torch.ones(4, dtype=torch.float32),
+        "cu_seqlens": torch.tensor([0, 4], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, 4], dtype=torch.int32),
+        "max_seqlen": torch.tensor([4], dtype=torch.int32),
+    }
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _: [0])
+    monkeypatch.setattr(data_schedule, "broadcast_tensor", lambda *_: None)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_context_parallel_group",
+        lambda: pytest.fail("fixed custom CP fell back to the global group"),
+    )
+
+    result = get_batch_on_this_rank_for_sequence_packing(
+        data_iterator=iter([batch]),
+        dynamic_cp=False,
+        pg_collection=pg_collection,
+        config=SimpleNamespace(cp_partition_mode="contiguous", pad_packed_seq_alignment=None),
+    )
+
+    assert result[5].cp_group is custom_cp_group
+    assert torch.equal(result[0], torch.tensor([[2, 3]], dtype=torch.int64))
+    assert torch.equal(result[1], torch.tensor([[2, 3]], dtype=torch.int64))
+
+
 def test_dsv4_thd_cp_slice_uses_static_partition_total():
     from megatron.core.datasets.data_schedule_utils import get_cp_slice_for_thd
 
@@ -581,6 +618,7 @@ def test_dsv4_thd_dynamic_cp_pads_before_slicing(
         torch.arange(global_start, global_start + local_target) >= total_tokens,
     )
     assert packed_seq_params.local_cp_size == local_cp_size
+    assert packed_seq_params.cp_group is dynamic_cp_group
     assert packed_seq_params.cp_partition_mode == "contiguous"
     global_target = local_target * local_cp_size
     if tail_padding_policy == "append_dummy_seq":

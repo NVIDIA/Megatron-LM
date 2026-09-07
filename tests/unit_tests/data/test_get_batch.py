@@ -12,6 +12,7 @@ import pretrain_gpt
 import pretrain_hybrid
 from megatron.core import mpu
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.process_groups_config import MultiModuleProcessGroupCollection
 from megatron.core.utils import (
     _get_batch_on_this_cp_rank_per_sequence_balancing,
     flatten_batch_for_packed_sequences,
@@ -175,6 +176,8 @@ def test_hybrid_scheduler_prebuilds_balanced_indexer_from_normalized_config(monk
         pipeline_model_parallel_layout=None,
         mtp_num_layers=0,
         virtual_pipeline_model_parallel_size=None,
+        sequence_packing_scheduler="dp_balanced",
+        dynamic_context_parallel=False,
         dsa_cp_balance_indexer=enabled,
         dsa_cp_balance_indexer_graph_dynamic_packs=enabled,
         pad_packed_seq_alignment="max",
@@ -236,6 +239,8 @@ def test_gpt_scheduler_prebuilds_balanced_indexer_from_normalized_config(monkeyp
         pipeline_model_parallel_layout=None,
         mtp_num_layers=0,
         virtual_pipeline_model_parallel_size=None,
+        sequence_packing_scheduler="dp_balanced",
+        dynamic_context_parallel=False,
         dsa_cp_balance_indexer=enabled,
         dsa_cp_balance_indexer_graph_dynamic_packs=enabled,
         pad_packed_seq_alignment="max",
@@ -303,6 +308,7 @@ def _full_graph_dynamic_packed_config():
         virtual_pipeline_model_parallel_size=None,
         context_parallel_size=2,
         max_seqlen_per_dp_cp_rank=8,
+        pad_packed_seq_alignment="max",
         thd_max_packed_sequences=3,
         calculate_per_token_loss=True,
     )
@@ -424,11 +430,7 @@ def test_full_iteration_base_packed_serialization_has_only_common_owners(monkeyp
     assert result[0] is owners["tokens"]
     assert result[6] is owners["padding_mask"]
     assert packed.cu_seqlens_q is packed.cu_seqlens_kv is owners["cu_seqlens"]
-    assert (
-        packed.cu_seqlens_q_padded
-        is packed.cu_seqlens_kv_padded
-        is owners["cu_seqlens_padded"]
-    )
+    assert packed.cu_seqlens_q_padded is packed.cu_seqlens_kv_padded is owners["cu_seqlens_padded"]
     assert packed.max_seqlen_q == packed.max_seqlen_kv == 16
     assert packed.cp_group is cp_group
     assert packed.cp_partition_mode == "contiguous"
@@ -478,10 +480,7 @@ def test_full_iteration_prepared_base_get_batch_never_calls_eager_builders(monke
         mock.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "balance_indexer,dynamic_route",
-    [(True, False), (False, True)],
-)
+@pytest.mark.parametrize("balance_indexer,dynamic_route", [(True, False), (False, True)])
 def test_full_iteration_prepared_packed_rejects_inconsistent_derived_route_state(
     balance_indexer, dynamic_route
 ):
@@ -508,9 +507,7 @@ def test_full_iteration_prepared_get_batch_never_calls_eager_builders(monkeypatc
         _full_graph_eager_packed_batch(cp_group), config, pg_collection
     )
     prepared_iterator = pretrain_gpt.FullCudaGraphPreparedIterator(
-        [owners],
-        model_chunk=SimpleNamespace(config=config),
-        pg_collection=pg_collection,
+        [owners], model_chunk=SimpleNamespace(config=config), pg_collection=pg_collection
     )
     monkeypatch.setattr(pretrain_gpt, "get_args", lambda: SimpleNamespace())
     monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _args: config)
@@ -565,9 +562,7 @@ def test_full_iteration_prepare_calls_get_batch_when_raw_iterator_is_none(monkey
         model_chunk_index=0,
         pg_collection=pg_collection,
     )
-    get_batch_mock.assert_called_once_with(
-        None, None, config=config, pg_collection=pg_collection
-    )
+    get_batch_mock.assert_called_once_with(None, None, config=config, pg_collection=pg_collection)
     rebuild_config.assert_not_called()
     assert tuple(owners) == pretrain_gpt._FULL_CUDA_GRAPH_PACKED_BATCH_KEYS
     assert pretrain_gpt.forward_step.full_cuda_graph_batch_prepare_func is (
@@ -575,7 +570,62 @@ def test_full_iteration_prepare_calls_get_batch_when_raw_iterator_is_none(monkey
     )
 
 
-def test_full_iteration_wrapper_reconstructs_underfilled_dynamic_packs_a_b_a(monkeypatch):
+def test_full_iteration_prepare_finalizes_with_language_cp_group_without_global_mpu(monkeypatch):
+    """The real prepare/get_batch seam must not consult global MPU for a caller-owned CP group."""
+    from megatron.core import parallel_state
+    from megatron.core.context_parallel_layout import routes
+
+    config = _full_graph_dynamic_packed_config()
+    config.pipeline_model_parallel_layout = None
+    config.mtp_num_layers = None
+    cp_group = _FullGraphPackedCPGroup()
+    language_pg_collection = SimpleNamespace(cp=cp_group)
+    pg_collection = MultiModuleProcessGroupCollection(
+        module_pgs={"llm": language_pg_collection}, language_model_module_name="llm"
+    )
+    model = SimpleNamespace(config=config, vp_stage=None)
+    source_batch = _full_graph_eager_packed_batch(cp_group)
+
+    monkeypatch.setattr(pretrain_gpt, "get_args", lambda: SimpleNamespace())
+    monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank", lambda *_args, **_kwargs: False)
+    scheduler = MagicMock(return_value=source_batch)
+    monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_rank_for_sequence_packing", scheduler)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_context_parallel_group",
+        MagicMock(side_effect=AssertionError("finalize consulted global MPU")),
+    )
+    real_prebuild = routes.prebuild_thd_cp_partition_routes
+    prebuild_calls = []
+
+    def record_prebuild(packed_seq_params, group):
+        prebuild_calls.append((packed_seq_params, group))
+        return real_prebuild(packed_seq_params, group)
+
+    monkeypatch.setattr(routes, "prebuild_thd_cp_partition_routes", record_prebuild)
+
+    owners = pretrain_gpt.prepare_full_cuda_graph_dynamic_packed_batch(
+        data_iterator=iter((source_batch,)),
+        model=model,
+        stage="training",
+        microbatch_index=0,
+        model_chunk_index=0,
+        pg_collection=pg_collection,
+    )
+
+    scheduler.assert_called_once()
+    assert scheduler.call_args.kwargs["pg_collection"] is language_pg_collection
+    assert len(prebuild_calls) == 1
+    assert prebuild_calls[0][0] is source_batch[5]
+    assert prebuild_calls[0][1] is cp_group
+    assert source_batch[5].cp_group is cp_group
+    assert tuple(owners) == pretrain_gpt._FULL_CUDA_GRAPH_PACKED_BATCH_KEYS
+
+
+@pytest.mark.parametrize("forward_only", [False, True], ids=("training", "validation"))
+def test_full_iteration_wrapper_reconstructs_underfilled_dynamic_packs_a_b_a(
+    monkeypatch, forward_only
+):
     """The production prepare/reconstruct seam refreshes nine fixed owners for A/B/A."""
     from megatron.core.full_cuda_graph import (
         FullCudaGraphPreparedIterator,
@@ -586,6 +636,11 @@ def test_full_iteration_wrapper_reconstructs_underfilled_dynamic_packs_a_b_a(mon
 
     config = _full_graph_dynamic_packed_config()
     cp_group = _FullGraphPackedCPGroup()
+    global_cp_group = _FullGraphPackedCPGroup()
+    language_pg_collection = SimpleNamespace(cp=cp_group)
+    expected_pg_collection = MultiModuleProcessGroupCollection(
+        module_pgs={"llm": language_pg_collection}, language_model_module_name="llm"
+    )
     model = SimpleNamespace(config=config, vp_stage=None)
     source_batches = (
         _full_graph_eager_packed_batch(
@@ -617,14 +672,18 @@ def test_full_iteration_wrapper_reconstructs_underfilled_dynamic_packs_a_b_a(mon
         (StaticBufferLoader, "prepared_owner_ptrs", {"training": None, "validation": None}),
     ):
         monkeypatch.setattr(owner, name, value)
-    monkeypatch.setattr(pretrain_gpt.mpu, "get_context_parallel_group", lambda: cp_group)
+    monkeypatch.setattr(pretrain_gpt.mpu, "get_context_parallel_group", lambda: global_cp_group)
     monkeypatch.setattr(pretrain_gpt, "get_args", lambda: SimpleNamespace())
     monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _args: config)
 
     real_get_batch = pretrain_gpt.get_batch
-    monkeypatch.setattr(
-        pretrain_gpt, "get_batch", lambda data_iterator, _vp_stage=None: next(data_iterator)
-    )
+
+    def next_source_batch(data_iterator, _vp_stage=None, *, config=None, pg_collection=None):
+        assert config is model.config
+        assert pg_collection is language_pg_collection
+        return next(data_iterator)
+
+    monkeypatch.setattr(pretrain_gpt, "get_batch", next_source_batch)
 
     def consume_prepared_batch(**kwargs):
         prepared_iterator = kwargs["data_iterator"][0]
@@ -637,6 +696,8 @@ def test_full_iteration_wrapper_reconstructs_underfilled_dynamic_packs_a_b_a(mon
         batch_prepare_func=pretrain_gpt.prepare_full_cuda_graph_dynamic_packed_batch,
     )
     source_iterator = iter(source_batches)
+    stage = "validation" if forward_only else "training"
+    opposite_stage = "training" if forward_only else "validation"
     owner_ptrs = None
     observed = []
     for source_batch in source_batches:
@@ -651,9 +712,11 @@ def test_full_iteration_wrapper_reconstructs_underfilled_dynamic_packs_a_b_a(mon
             seq_length=16,
             micro_batch_size=1,
             decoder_seq_length=None,
-            forward_only=False,
+            forward_only=forward_only,
+            pg_collection=expected_pg_collection,
         )
-        owners = StaticBufferLoader.prepared_static_buffers["training"][0][0]
+        owners = StaticBufferLoader.prepared_static_buffers[stage][0][0]
+        assert StaticBufferLoader.prepared_static_buffers[opposite_stage] is None
         assert tuple(owners) == pretrain_gpt._FULL_CUDA_GRAPH_PACKED_BATCH_KEYS
         assert len(owners) == 9
         iteration_ptrs = tuple(owners[name].data_ptr() for name in owners)
@@ -671,6 +734,7 @@ def test_full_iteration_wrapper_reconstructs_underfilled_dynamic_packs_a_b_a(mon
         )
         assert layout is owners["dsa_cp_graph_layout_buffer"]
         assert route is owners["dsa_cp_graph_route_buffer"]
+        assert packed.cp_group is cp_group
         expected_iteration = {
             "tokens": source_batch[0],
             "cu_seqlens": source_batch[5].cu_seqlens_q,
@@ -708,6 +772,8 @@ def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, front
         pipeline_model_parallel_layout=None,
         mtp_num_layers=0,
         virtual_pipeline_model_parallel_size=None,
+        sequence_packing_scheduler="dp_balanced",
+        dynamic_context_parallel=False,
         dsa_cp_balance_indexer=True,
         dsa_cp_balance_indexer_graph_dynamic_packs=False,
         pad_packed_seq_alignment="max",

@@ -37,9 +37,13 @@ def finalize_packed_seq_params(
     # Keep these imports local: routes depends on this module for metadata access.
     from megatron.core.context_parallel_layout.routes import prebuild_thd_cp_partition_routes
     from megatron.core.packed_seq_params import resolve_cp_group
-    from megatron.core.parallel_state import get_context_parallel_group
 
-    cp_group = resolve_cp_group(get_context_parallel_group(), packed_seq_params)
+    cp_group = getattr(packed_seq_params, "cp_group", None)
+    if cp_group is None:
+        from megatron.core.parallel_state import get_context_parallel_group
+
+        cp_group = get_context_parallel_group()
+    cp_group = resolve_cp_group(cp_group, packed_seq_params)
     packed_seq_params.cp_group = cp_group
     prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
     return packed_seq_params

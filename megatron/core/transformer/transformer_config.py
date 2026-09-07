@@ -3538,9 +3538,10 @@ class TransformerConfig(ModelParallelConfig):
                     "data-dependent padding, so mean-mode fused indexer loss would otherwise "
                     "be diluted by the padded row count."
                 )
-            if self.pipeline_model_parallel_size > 1 or (
-                self.virtual_pipeline_model_parallel_size or 1
-            ) > 1:
+            if (
+                self.pipeline_model_parallel_size > 1
+                or (self.virtual_pipeline_model_parallel_size or 1) > 1
+            ):
                 raise ValueError(
                     "Full-iteration prepared packed inputs currently require "
                     "pipeline_model_parallel_size=1 and no virtual pipeline parallelism."

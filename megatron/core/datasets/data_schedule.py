@@ -825,10 +825,10 @@ def get_batch_on_this_rank_for_sequence_packing(
     cu_seqlens_padded = batch['cu_seqlens_padded']
     max_seqlen = batch['max_seqlen'].item()
     local_cp_size = batch['local_cp_size'].item() if dynamic_cp else None
-    cp_group = (
+    packed_cp_group = (
         parallel_state.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
         if dynamic_cp
-        else None
+        else cp_group
     )
 
     # cu_seqlens_q/kv hold the original (unpadded) boundaries so downstream
@@ -844,7 +844,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
-        cp_group=cp_group,
+        cp_group=packed_cp_group,
         cp_partition_mode=cp_partition_mode,
         pad_between_seqs=True,
     )
@@ -866,7 +866,7 @@ def get_batch_on_this_rank_for_sequence_packing(
                 max_num_seqs=max_num_seqs,
                 tail_padding_policy=tail_padding_policy,
                 padding_mask=padding_mask,
-                cp_group=cp_group,
+                cp_group=packed_cp_group,
             )
         )
 

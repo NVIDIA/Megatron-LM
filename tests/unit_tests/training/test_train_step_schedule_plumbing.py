@@ -9,6 +9,7 @@ from unittest import mock
 import pytest
 
 from megatron.core.enums import ModelType
+from megatron.core.process_groups_config import MultiModuleProcessGroupCollection
 from megatron.training import training as training_mod
 
 
@@ -445,6 +446,10 @@ def test_train_step_wraps_sequence_packing_after_rerun_check():
     # mistaken for "not wrapped yet" when the rerun state machine repeats the step.
     packed_iterator = None
     config = SimpleNamespace(sequence_packing_scheduler="default_dynamic_cp")
+    language_pg_collection = object()
+    pg_collection = MultiModuleProcessGroupCollection(
+        module_pgs={"llm": language_pg_collection}, language_model_module_name="llm"
+    )
     captured = {}
     forwarded_iterators = []
     model = [SimpleNamespace(force_all_reduce=False, zero_grad_buffer=lambda: None)]
@@ -476,21 +481,84 @@ def test_train_step_wraps_sequence_packing_after_rerun_check():
             config=config,
             forward_backward_func=forward_backward,
             iteration=0,
+            pg_collection=pg_collection,
         )
 
     assert rerun.should_run_forward_backward.call_args_list[0].args[0] is original_iterator
     assert rerun.should_run_forward_backward.call_args_list[1].args[0] is packed_iterator
     assert rerun.should_run_forward_backward.call_args_list[2].args[0] is packed_iterator
-    wrap_data_iterator.assert_called_once_with(original_iterator, config, 1)
+    wrap_data_iterator.assert_called_once_with(
+        original_iterator, config, 1, pg_collection=language_pg_collection
+    )
     assert forwarded_iterators == [packed_iterator, packed_iterator]
     assert captured["num_microbatches"] == 3
+    assert captured["pg_collection"] is pg_collection
     assert result[-3:] == (3, 12.0, 34.0)
 
 
+def test_sequence_packing_rejects_multimodule_rank_without_language_model():
+    pg_collection = MultiModuleProcessGroupCollection(
+        module_pgs={"encoder": object()}, language_model_module_name=None
+    )
+
+    with pytest.raises(ValueError, match="requires a language-model process-group collection"):
+        training_mod._resolve_sequence_packing_pg_collection(pg_collection)
+
+
+def test_evaluate_threads_language_pg_to_sequence_packing_scheduler():
+    args = SimpleNamespace(
+        eval_global_batch_size=1,
+        eval_micro_batch_size=1,
+        data_parallel_size=1,
+        cuda_graph_impl="none",
+        moe_expert_rank_capacity_factor=None,
+        seq_length=8,
+        decoder_seq_length=None,
+    )
+    config = SimpleNamespace(sequence_packing_scheduler="dp_balanced", timers=object())
+    language_pg_collection = object()
+    pg_collection = MultiModuleProcessGroupCollection(
+        module_pgs={"llm": language_pg_collection}, language_model_module_name="llm"
+    )
+    data_iterator = object()
+    model_module = SimpleNamespace(
+        eval=mock.Mock(), train=mock.Mock(), pg_collection=SimpleNamespace(pp=object())
+    )
+    timers = mock.MagicMock()
+    rerun = mock.MagicMock()
+
+    with (
+        mock.patch.object(training_mod, "get_args", return_value=args),
+        mock.patch.object(training_mod, "get_timers", return_value=timers),
+        mock.patch.object(training_mod, "get_rerun_state_machine", return_value=rerun),
+        mock.patch.object(training_mod, "get_forward_backward_func", return_value=mock.Mock()),
+        mock.patch.object(training_mod, "has_nvidia_modelopt", False),
+        mock.patch.object(training_mod.ft_integration, "on_eval_step_start"),
+        mock.patch.object(training_mod.ft_integration, "on_eval_step_end"),
+        mock.patch.object(
+            training_mod, "wrap_data_iterator", side_effect=StopIteration
+        ) as wrap_data_iterator,
+    ):
+        result = training_mod.evaluate(
+            forward_step_func=mock.Mock(),
+            data_iterator=data_iterator,
+            model=[model_module],
+            process_non_loss_data_func=None,
+            config=config,
+            eval_iters=1,
+            pg_collection=pg_collection,
+        )
+
+    wrap_data_iterator.assert_called_once_with(
+        data_iterator, config, 1, pg_collection=language_pg_collection
+    )
+    model_module.eval.assert_called_once_with()
+    model_module.train.assert_called_once_with()
+    assert result == ({}, None, False)
+
+
 @pytest.mark.parametrize("balance_indexer", [False, True], ids=("base", "balanced"))
-def test_train_step_rejects_variable_full_graph_pack_count_before_forward_backward(
-    balance_indexer,
-):
+def test_train_step_rejects_variable_full_graph_pack_count_before_forward_backward(balance_indexer):
     """The scheduler count contract must fail before staging or graph replay can run."""
     args = SimpleNamespace(
         save_params_interval=None,

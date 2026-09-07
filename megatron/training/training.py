@@ -1486,8 +1486,7 @@ def num_floating_point_operations(
         # ``kw_args``, never back onto ``args``), so the attribute alone misses
         # exactly the runs this guard exists for.
         assert (
-            args.experimental_attention_variant != "dsa"
-            and layer_counts[Symbols.DS_ATTENTION] == 0
+            args.experimental_attention_variant != "dsa" and layer_counts[Symbols.DS_ATTENTION] == 0
         ), (
             "num_floating_point_operations does not support DSA "
             "('D' layers / experimental_attention_variant='dsa') on the "
@@ -3202,7 +3201,12 @@ def train_step(
                     num_microbatches,
                     seqlen_sum_this_global_batch,
                     seqlen_squared_sum_this_global_batch,
-                ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
+                ) = wrap_data_iterator(
+                    data_iterator,
+                    config,
+                    get_num_microbatches(),
+                    pg_collection=_resolve_sequence_packing_pg_collection(pg_collection),
+                )
                 _validate_full_cuda_graph_packed_microbatch_count(
                     config,
                     num_microbatches,
@@ -4195,6 +4199,17 @@ def _uses_full_cuda_graph_prepared_packed_inputs(config):
         and getattr(config, "cp_partition_mode", None) == "contiguous"
         and getattr(config, "context_parallel_size", 1) > 1
     )
+
+
+def _resolve_sequence_packing_pg_collection(pg_collection):
+    """Return the language-model process groups used by the packing scheduler."""
+    if not isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        return pg_collection
+    if not pg_collection.has_language_model():
+        raise ValueError(
+            "sequence packing requires a language-model process-group collection on this rank"
+        )
+    return pg_collection.get_language_model_collection()
 
 
 def _get_full_cuda_graph_batch_prepare_func(forward_step_func, config):
@@ -5191,8 +5206,13 @@ def evaluate(
             ft_integration.on_eval_step_start()
             if getattr(config, 'sequence_packing_scheduler', None) is not None:
                 try:
-                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
-                        wrap_data_iterator(data_iterator, config, eval_num_microbatches)
+                    packed_data_iterator, scheduled_eval_num_microbatches, _, _ = (
+                        wrap_data_iterator(
+                            data_iterator,
+                            config,
+                            eval_num_microbatches,
+                            pg_collection=_resolve_sequence_packing_pg_collection(pg_collection),
+                        )
                     )
                     _validate_full_cuda_graph_packed_microbatch_count(
                         config,
@@ -5495,7 +5515,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
     args = get_args()
 
-    (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
+    train_dataloader, valid_dataloaders, test_dataloader = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
 

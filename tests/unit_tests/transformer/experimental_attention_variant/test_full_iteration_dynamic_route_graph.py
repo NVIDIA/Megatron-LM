@@ -32,6 +32,7 @@ from megatron.core.full_cuda_graph import (
     FullCudaGraphPreparedIterator,
     FullCudaGraphWrapper,
     StaticBufferLoader,
+    get_shared_capture_stream,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -68,10 +69,7 @@ _PACK_PADDED_SEGMENTS = ((32, 96, 128, 256), (64, 64, 128, 256), (48, 80, 128, 2
 # Exercise restoration explicitly, rather than merely cycling A/B/C forever.
 _PACK_SCHEDULE = (0, 1, 2, 0)
 _ROUTE_OWNER_NAMES = ("layout_i32", "route_i64")
-_PREPARED_ROUTE_OWNER_NAMES = (
-    "dsa_cp_graph_layout_buffer",
-    "dsa_cp_graph_route_buffer",
-)
+_PREPARED_ROUTE_OWNER_NAMES = ("dsa_cp_graph_layout_buffer", "dsa_cp_graph_route_buffer")
 _PREPARED_OWNER_NAMES = (
     "tokens",
     "labels",
@@ -168,8 +166,7 @@ def _make_local_prepared_batch(packed, cp_rank, capacity, marker):
     padding_mask = full_padding_mask[local_start:local_end].view(1, local_rows).contiguous()
     position_ids = full_position_ids[local_start:local_end].view(1, local_rows).contiguous()
     tokens = (
-        torch.arange(local_start, local_end, dtype=torch.int64, device="cuda")
-        + marker * capacity
+        torch.arange(local_start, local_end, dtype=torch.int64, device="cuda") + marker * capacity
     ).view(1, local_rows)
     tokens = tokens.masked_fill(padding_mask, 0).contiguous()
     labels = (tokens + 1).masked_fill(padding_mask, 0).contiguous()
@@ -198,7 +195,7 @@ def _prepared_source_snapshot(batch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
 class TestFullIterationDynamicBalancedRouteGraph:
-    """One complete attention forward/backward graph accepts 30 changing packs."""
+    """Full-iteration training and validation graphs accept 30 changing packs."""
 
     @pytest.fixture(scope="class", autouse=True)
     def distributed_cp4(self, request):
@@ -212,7 +209,7 @@ class TestFullIterationDynamicBalancedRouteGraph:
             context_parallel_size=_CP_SIZE,
         )
         torch.manual_seed(7801)
-        model_parallel_cuda_manual_seed(7801)
+        model_parallel_cuda_manual_seed(7801, use_cudagraphable_rng=True, force_reset_rng=True)
 
         cls = request.cls
         cls.cp_rank = parallel_state.get_context_parallel_rank()
@@ -246,8 +243,11 @@ class TestFullIterationDynamicBalancedRouteGraph:
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
         _clear_cuda_state()
 
-    def test_production_wrapper_replays_30_underfilled_dynamic_packs(self, monkeypatch):
-        """Replay changing prepared owners through one real DSA forward/backward graph."""
+    @pytest.mark.parametrize("forward_only", [False, True], ids=("training", "validation"))
+    def test_production_wrapper_replays_30_underfilled_dynamic_packs(
+        self, monkeypatch, forward_only
+    ):
+        """Replay changing prepared owners through one real DSA full-iteration graph."""
         if not self.fused_kernels_available:
             pytest.skip(_DSV4_CP_FUSED_KERNELS_UNAVAILABLE_REASON)
 
@@ -293,12 +293,10 @@ class TestFullIterationDynamicBalancedRouteGraph:
         reference_plan = source_plans[0]
 
         assert all(
-            plan["layout_i32"].shape == reference_plan["layout_i32"].shape
-            for plan in source_plans
+            plan["layout_i32"].shape == reference_plan["layout_i32"].shape for plan in source_plans
         )
         assert all(
-            plan["route_i64"].shape == reference_plan["route_i64"].shape
-            for plan in source_plans
+            plan["route_i64"].shape == reference_plan["route_i64"].shape for plan in source_plans
         )
         assert all(
             plan["validated_cu"].shape == reference_plan["validated_cu"].shape
@@ -356,11 +354,11 @@ class TestFullIterationDynamicBalancedRouteGraph:
         assert config.dsa_cp_balance_indexer_graph_dynamic_packs
 
         torch.manual_seed(7802)
-        model_parallel_cuda_manual_seed(7802)
+        model_parallel_cuda_manual_seed(7802, use_cudagraphable_rng=True, force_reset_rng=True)
         graph_attention = _build_attention(config, layer_number=2, pg_collection=self.pg).cuda()
         eager_attention = _build_attention(config, layer_number=2, pg_collection=self.pg).cuda()
-        graph_attention.train()
-        eager_attention.train()
+        graph_attention.train(not forward_only)
+        eager_attention.train(not forward_only)
         # The production prepare callback asks the owning model chunk for this
         # optional VPP tag even though the supported FICG contract is PP1/VPP1.
         graph_attention.vp_stage = None
@@ -388,15 +386,10 @@ class TestFullIterationDynamicBalancedRouteGraph:
         # that half of the dispatcher is replaced by next(raw_iterator).
         original_get_batch = pretrain_gpt.get_batch
 
-        def get_batch_dispatch(
-            data_iterator, vp_stage=None, *, config=None, pg_collection=None
-        ):
+        def get_batch_dispatch(data_iterator, vp_stage=None, *, config=None, pg_collection=None):
             if isinstance(data_iterator, FullCudaGraphPreparedIterator):
                 return original_get_batch(
-                    data_iterator,
-                    vp_stage,
-                    config=config,
-                    pg_collection=pg_collection,
+                    data_iterator, vp_stage, config=config, pg_collection=pg_collection
                 )
             assert config is graph_attention.config
             assert pg_collection is self.pg
@@ -414,11 +407,10 @@ class TestFullIterationDynamicBalancedRouteGraph:
             batch = pretrain_gpt.get_batch(kwargs["data_iterator"][0])
             packed = batch[5]
             output, _ = kwargs["model"][0](
-                hidden_states=static_hidden,
-                attention_mask=None,
-                packed_seq_params=packed,
+                hidden_states=static_hidden, attention_mask=None, packed_seq_params=packed
             )
-            output.backward(static_grad)
+            if not kwargs["forward_only"]:
+                output.backward(static_grad)
             return output
 
         def unused_forward_step(*_args, **_kwargs):
@@ -439,20 +431,46 @@ class TestFullIterationDynamicBalancedRouteGraph:
                 seq_length=capacity,
                 micro_batch_size=1,
                 decoder_seq_length=None,
-                forward_only=False,
+                forward_only=forward_only,
                 pg_collection=self.pg,
             )
 
+        # This focused gate uses a raw module rather than Megatron DDP. Raw
+        # parameters retain their AccumulateGrad nodes, including the stream
+        # of the first backward that materialized them. Warm up and invoke the
+        # wrapper on its capture stream so those nodes cannot retain a legacy-
+        # stream dependency that invalidates the subsequent graph capture.
+        capture_stream = get_shared_capture_stream()
+
+        def run_wrapper_on_capture_stream(source_batch):
+            caller_stream = torch.cuda.current_stream()
+            capture_stream.wait_stream(caller_stream)
+            with torch.cuda.stream(capture_stream):
+                result = run_wrapper(source_batch)
+            caller_stream.wait_stream(capture_stream)
+            return result
+
         _phase("eager-baselines-begin")
-        eager_results = tuple(
-            _run_dsv4_attention_forward_backward(
-                eager_attention,
-                local_hidden.detach().clone().requires_grad_(True),
-                local_grad,
-                packed,
+        if forward_only:
+            eager_results = []
+            for packed in source_packs:
+                eager_output, _ = eager_attention(
+                    hidden_states=local_hidden.detach().clone(),
+                    attention_mask=None,
+                    packed_seq_params=packed,
+                )
+                eager_results.append(eager_output.detach().clone())
+            eager_results = tuple(eager_results)
+        else:
+            eager_results = tuple(
+                _run_dsv4_attention_forward_backward(
+                    eager_attention,
+                    local_hidden.detach().clone().requires_grad_(True),
+                    local_grad,
+                    packed,
+                )
+                for packed in source_packs
             )
-            for packed in source_packs
-        )
         _phase("eager-baselines-end")
 
         # Exercise the same three eager warmups used by the prior raw graph
@@ -461,23 +479,25 @@ class TestFullIterationDynamicBalancedRouteGraph:
         for warmup_index in range(3):
             _phase(f"warmup-{warmup_index + 1}-begin")
             _zero_existing_grads(graph_attention, static_hidden)
-            run_wrapper(source_batches[0])
+            run_wrapper_on_capture_stream(source_batches[0])
             torch.cuda.synchronize()
             _phase(f"warmup-{warmup_index + 1}-end")
 
-        prepared_owners = StaticBufferLoader.prepared_static_buffers["training"][0][0]
+        stage = "validation" if forward_only else "training"
+        opposite_stage = "training" if forward_only else "validation"
+        prepared_owners = StaticBufferLoader.prepared_static_buffers[stage][0][0]
+        assert StaticBufferLoader.prepared_static_buffers[opposite_stage] is None
         assert tuple(prepared_owners) == _PREPARED_OWNER_NAMES
         owner_ptrs = {name: tensor.data_ptr() for name, tensor in prepared_owners.items()}
 
         _phase("capture-begin")
         _zero_existing_grads(graph_attention, static_hidden)
-        run_wrapper(source_batches[0])
+        run_wrapper_on_capture_stream(source_batches[0])
         torch.cuda.synchronize()
         _phase("capture-end")
-        assert FullCudaGraphWrapper.cuda_graph["training"] is not None
-        assert {
-            name: tensor.data_ptr() for name, tensor in prepared_owners.items()
-        } == owner_ptrs
+        assert FullCudaGraphWrapper.cuda_graph[stage] is not None
+        assert FullCudaGraphWrapper.cuda_graph[opposite_stage] is None
+        assert {name: tensor.data_ptr() for name, tensor in prepared_owners.items()} == owner_ptrs
 
         first_graph_outputs = {}
         observed_nonzero_indexer_grad = False
@@ -487,7 +507,7 @@ class TestFullIterationDynamicBalancedRouteGraph:
             pack_index = _PACK_SCHEDULE[replay_index % len(_PACK_SCHEDULE)]
             _phase(f"replay-{replay_index:02d}-graph-begin")
             _zero_existing_grads(graph_attention, static_hidden)
-            graph_output = run_wrapper(source_batches[pack_index])
+            graph_output = run_wrapper_on_capture_stream(source_batches[pack_index])
             torch.cuda.synchronize()
             _phase(f"replay-{replay_index:02d}-graph-end")
 
@@ -497,43 +517,46 @@ class TestFullIterationDynamicBalancedRouteGraph:
             for name, expected in source_snapshots[pack_index].items():
                 torch.testing.assert_close(prepared_owners[name], expected, rtol=0, atol=0)
 
-            graph_result = (
-                graph_output.detach().clone(),
-                static_hidden.grad.detach().clone(),
-                {
+            graph_result = graph_output.detach().clone()
+            eager_result = eager_results[pack_index]
+            label = f"full_graph_replay_{replay_index:02d}_pack_{pack_index}"
+            eager_output = eager_result if forward_only else eager_result[0]
+            _assert_cp_graph_bitwise_match(graph_result, eager_output, f"{label}:output")
+            if not forward_only:
+                graph_hidden_grad = static_hidden.grad.detach().clone()
+                graph_param_grads = {
                     name: parameter.grad.detach().clone()
                     for name, parameter in graph_attention.named_parameters()
                     if parameter.grad is not None
-                },
-            )
-            eager_result = eager_results[pack_index]
-            label = f"full_graph_replay_{replay_index:02d}_pack_{pack_index}"
-            _assert_cp_graph_bitwise_match(graph_result[0], eager_result[0], f"{label}:output")
-            _assert_cp_graph_fused_grad_match(
-                graph_result[1], eager_result[1], f"{label}:hidden_grad"
-            )
-            assert graph_result[2].keys() == eager_result[2].keys()
-            observed_nonzero_indexer_grad = observed_nonzero_indexer_grad or any(
-                "core_attention.indexer" in name and bool(torch.count_nonzero(grad).item())
-                for name, grad in graph_result[2].items()
-            )
-            for name, graph_grad in graph_result[2].items():
-                _assert_fast_fused_grad_match(
-                    graph_grad, eager_result[2][name], f"{label}:param_grad:{name}"
+                }
+                _assert_cp_graph_fused_grad_match(
+                    graph_hidden_grad, eager_result[1], f"{label}:hidden_grad"
                 )
+                assert graph_param_grads.keys() == eager_result[2].keys()
+                observed_nonzero_indexer_grad = observed_nonzero_indexer_grad or any(
+                    "core_attention.indexer" in name and bool(torch.count_nonzero(grad).item())
+                    for name, grad in graph_param_grads.items()
+                )
+                for name, graph_grad in graph_param_grads.items():
+                    _assert_fast_fused_grad_match(
+                        graph_grad, eager_result[2][name], f"{label}:param_grad:{name}"
+                    )
 
             # Replaying A after B/C must restore exactly A's graph result.
             if pack_index in first_graph_outputs:
                 _assert_cp_graph_bitwise_match(
-                    graph_result[0], first_graph_outputs[pack_index], f"{label}:repeat_restore"
+                    graph_result, first_graph_outputs[pack_index], f"{label}:repeat_restore"
                 )
             else:
-                first_graph_outputs[pack_index] = graph_result[0]
+                first_graph_outputs[pack_index] = graph_result
             _phase(f"replay-{replay_index:02d}-checked")
         _phase("replays-end")
 
         assert set(first_graph_outputs) == {0, 1, 2}
-        assert observed_nonzero_indexer_grad, "nonzero auxiliary indexer gradients were not tested"
+        if not forward_only:
+            assert (
+                observed_nonzero_indexer_grad
+            ), "nonzero auxiliary indexer gradients were not tested"
         assert (
             _max_int_across_world(
                 int(not torch.equal(first_graph_outputs[0], first_graph_outputs[1]))
@@ -541,7 +564,7 @@ class TestFullIterationDynamicBalancedRouteGraph:
             == 1
         ), "the real consumer must observe the changing route on at least one CP rank"
 
-        wrapper.reset_cuda_graph("training")
+        wrapper.reset_cuda_graph(stage)
         del graph_output, graph_attention, eager_attention
         del static_hidden, static_grad, full_hidden, full_grad, local_hidden, local_grad
         _clear_cuda_state()
