@@ -904,8 +904,15 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
 
-        # Apply each aux loss type and attach aux loss autograd function to probs
-        if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
+        # Hash routing assignments come from tid2eid rather than the learned logits, so a
+        # learned top-k aux loss would optimize routing decisions that were never dispatched.
+        # Keep aux loss enabled for the non-hash MoE layers that share this configuration.
+        if (
+            not self.is_hash_layer
+            and self.training
+            and torch.is_grad_enabled()
+            and self.is_aux_loss_enabled()
+        ):
             # Calculate scores and routing_map for aux loss
             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
                 logits,
