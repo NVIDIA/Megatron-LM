@@ -104,6 +104,43 @@ def build_dist_opt_optimizer_config(
     return CoreOptimizerConfig(**args)
 
 
+def _enable_wgrad_accumulation_fusion(chunks: list[nn.Module]) -> int:
+    """Let Transformer Engine write weight gradients straight into ``main_grad``.
+
+    Without this, every weight gradient is materialised as its own tensor and
+    Megatron-Core's DDP then folds it in one parameter at a time --
+    ``param.main_grad.add_(param.grad.data)``, an unfused fp32 += bf16 add per
+    parameter per microbatch. An nsys kernel census measured that add at 4.5x
+    Megatron Core's, which pays for none of it: Core passes
+    ``fuse_wgrad_accumulation`` into every TE linear, so the wgrad GEMM
+    accumulates into ``main_grad`` in place and the add never exists.
+
+    Core reads the flag off a config field. Lite cannot: its modules are built
+    before the DDP wrapper creates ``main_grad``, so at construction time there
+    is nothing to accumulate into. Flipping it here instead makes the fusion
+    self-gating -- it turns on exactly when the buffer it needs exists, which is
+    the dist_opt path, and stays off for optimizers that never create one. TE
+    reads ``fuse_wgrad_accumulation`` per forward, so setting it after
+    construction is the same as having passed it in.
+
+    Returns the number of modules switched over, for the caller to assert on.
+    """
+    switched = 0
+    for chunk in chunks:
+        for module in chunk.modules():
+            if not hasattr(module, "fuse_wgrad_accumulation") or module.fuse_wgrad_accumulation:
+                continue
+            weights = [
+                p
+                for name, p in module.named_parameters(recurse=False)
+                if p.requires_grad and "weight" in name
+            ]
+            if weights and all(getattr(p, "main_grad", None) is not None for p in weights):
+                module.fuse_wgrad_accumulation = True
+                switched += 1
+    return switched
+
+
 def build_dist_opt_stack(
     model_chunks: list[nn.Module],
     *,
@@ -171,6 +208,10 @@ def build_dist_opt_stack(
                     **ddp_kwargs,
                 )
             )
+
+    # DDP has now created main_grad for every trainable parameter, so the wgrad
+    # GEMMs can accumulate into it directly instead of via a per-parameter add.
+    _enable_wgrad_accumulation_fusion(wrapped_chunks)
 
     # Single-source-of-truth OptimizerConfig construction for native lite
     # model protocols.
