@@ -662,6 +662,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
         else:
             expert_dp_mesh = None
+            expert_placements = None
 
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
         # without symmetric memory: it uses ncclCommRegister rather than the more performant

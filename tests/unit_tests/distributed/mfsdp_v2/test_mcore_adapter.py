@@ -771,19 +771,11 @@ class TestMcoreAdapterHybrid:
 
     @pytest.mark.parametrize(
         "dense_instances,expert_instances,dense_outer_strategy,expert_outer_strategy",
-        [
-            (2, 1, "optim", "no_shard"),
-            (1, 2, "no_shard", "no_shard"),
-            (2, 2, "no_shard", "optim"),
-        ],
+        [(2, 1, "optim", "no_shard"), (1, 2, "no_shard", "no_shard"), (2, 2, "no_shard", "optim")],
         ids=["dense-hybrid", "expert-hsdp", "independent-outer-strategies"],
     )
     def test_moe_with_independent_hybrid_meshes(
-        self,
-        dense_instances,
-        expert_instances,
-        dense_outer_strategy,
-        expert_outer_strategy,
+        self, dense_instances, expert_instances, dense_outer_strategy, expert_outer_strategy
     ):
         """Dense and expert parameters independently select their hybrid DP meshes."""
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -867,11 +859,14 @@ class TestMcoreAdapterHybrid:
             for parameter in model.parameters()
             if parameter.grad is not None
         }
-        expected_meshes = {
-            ("dp_outer", "dp_shard") if dense_instances > 1 else ("dp",),
-            ("dp_outer", "dp_shard") if expert_instances > 1 else ("expert_dp",),
-        }
-        assert meshes == expected_meshes, meshes
+        dense_mesh = ("dp_outer", "dp_shard") if dense_instances > 1 else ("dp",)
+        expert_mesh = ("dp_outer", "dp_shard") if expert_instances > 1 else ("expert_dp",)
+        assert dense_mesh in meshes, f"missing mesh {dense_mesh} from {meshes}"
+        assert expert_mesh in meshes, f"missing mesh {expert_mesh} from {meshes}"
+        expected_meshes = {dense_mesh, expert_mesh}
+        assert (
+            meshes == expected_meshes
+        ), f"unexpected meshes: expected {expected_meshes}, got {meshes}"
         placements = {
             parameter.grad.placements
             for parameter in model.parameters()
@@ -879,8 +874,15 @@ class TestMcoreAdapterHybrid:
         }
         dense_outer = Replicate() if dense_outer_strategy == "no_shard" else Shard(0)
         expert_outer = Replicate() if expert_outer_strategy == "no_shard" else Shard(0)
-        expected_placements = {
-            (dense_outer, Shard(0)) if dense_instances > 1 else (Shard(0),),
-            (expert_outer, Shard(0)) if expert_instances > 1 else (Shard(0),),
-        }
-        assert placements == expected_placements, placements
+        dense_placements = (dense_outer, Shard(0)) if dense_instances > 1 else (Shard(0),)
+        expert_placements = (expert_outer, Shard(0)) if expert_instances > 1 else (Shard(0),)
+        assert (
+            dense_placements in placements
+        ), f"missing placements {dense_placements} from {placements}"
+        assert (
+            expert_placements in placements
+        ), f"missing placements {expert_placements} from {placements}"
+        expected_placements = {dense_placements, expert_placements}
+        assert (
+            placements == expected_placements
+        ), f"unexpected placements: expected {expected_placements}, got {placements}"
