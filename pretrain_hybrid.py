@@ -46,7 +46,8 @@ from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.parallel_state import (
     get_context_parallel_group,
-    get_hybrid_data_context_parallel_groups,
+    get_dynamic_data_context_parallel_groups,
+    get_dynamic_tensor_data_context_parallel_group,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -115,15 +116,7 @@ def get_batch(data_iterator, vp_stage=None):
     config = core_transformer_config_from_args(args)
 
     if args.sequence_packing_scheduler is not None:
-        (
-            tokens,
-            labels,
-            loss_mask,
-            attention_mask,
-            position_ids,
-            packed_seq_params,
-            padding_mask,
-        ) = get_batch_on_this_rank_for_sequence_packing(
+        return get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank_func(
@@ -133,18 +126,9 @@ def get_batch(data_iterator, vp_stage=None):
                 vp_stage=vp_stage,
             ),
             vp_stage=vp_stage,
-        )
-        return ContextParallelBatch.from_single_layout(
-            config.linear_cp_layout,
-            {
-                "tokens": tokens,
-                "labels": labels,
-                "loss_mask": loss_mask,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "padding_mask": padding_mask,
-            },
-            packed_seq_params,
+            dynamic_cp=args.dynamic_context_parallel,
+            config=config,
+            return_context_parallel_batch=True,
         )
 
     cp_size = args.context_parallel_size
@@ -158,7 +142,7 @@ def get_batch(data_iterator, vp_stage=None):
         ignore_virtual=False,
         vp_stage=vp_stage,
     )
-    is_hybrid_cp = args.hybrid_context_parallel
+    is_hybrid_cp = args.dynamic_context_parallel
 
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
@@ -218,12 +202,18 @@ def get_batch(data_iterator, vp_stage=None):
         is_hybrid_cp=is_hybrid_cp,
         cp_group=get_context_parallel_group(),
         additional_layouts=additional_layouts,
-        hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+        hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
         use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
         sequence_parallel=config.sequence_parallel,
         tp_group=mpu.get_tensor_model_parallel_group(),
         tp_cp_group=(
-            mpu.get_tensor_and_context_parallel_group()
+            (
+                get_dynamic_tensor_data_context_parallel_group(
+                    group_size=int(batch['local_cp_size'].item())
+                )
+                if is_hybrid_cp
+                else mpu.get_tensor_and_context_parallel_group()
+            )
             if config.sequence_parallel and config.tensor_model_parallel_size > 1
             else None
         ),
@@ -427,7 +417,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         context_parallel_size=args.context_parallel_size,
         data_parallel_size=args.data_parallel_size,
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
-        hybrid_context_parallel=args.hybrid_context_parallel,
+        dynamic_context_parallel=args.dynamic_context_parallel,
         inter_document_masking=args.dataloader_inter_document_masking,
         varlen_mock_dataset_config_json=args.varlen_mock_dataset_config_json,
         varlen_sbhd_validation=args.varlen_sbhd_validation,

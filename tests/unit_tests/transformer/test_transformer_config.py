@@ -215,6 +215,19 @@ def test_sequence_packing_dense_config_passes():
 
 
 @requires_te_2_9
+def test_dynamic_cp_accepts_contiguous_linear_layout():
+    config = _make_packing_config(
+        dynamic_context_parallel=True,
+        sequence_packing_scheduler="default_dynamic_cp",
+        context_parallel_size=2,
+        linear_cp_layout="contiguous",
+        attention_cp_layout="zigzag",
+    )
+
+    assert config.linear_cp_layout == "contiguous"
+
+
+@requires_te_2_9
 def test_sequence_packing_moe_rejects_allgather_dispatcher():
     # The general allgather-vs-variable_seq_lengths check fires first, since
     # sequence packing derives variable_seq_lengths=True.

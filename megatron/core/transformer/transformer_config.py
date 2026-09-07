@@ -1501,18 +1501,6 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "attention_cp_layout='contiguous' is not yet supported with context parallelism."
             )
-        if self.linear_cp_layout == "contiguous" and self.hybrid_context_parallel:
-            raise ValueError(
-                "hybrid_context_parallel is not supported with linear_cp_layout='contiguous'."
-            )
-        if (
-            self.sequence_packing_scheduler is not None
-            and self.context_parallel_size > 1
-            and self.linear_cp_layout != self.attention_cp_layout
-        ):
-            raise ValueError(
-                "The sequence-packing scheduler does not support CP layout conversion."
-            )
         if (
             self.context_parallel_size > 1
             and self.linear_cp_layout != self.attention_cp_layout
