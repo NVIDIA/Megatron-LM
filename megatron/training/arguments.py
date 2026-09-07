@@ -1042,8 +1042,6 @@ def validate_args(args, defaults={}):
             '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
         assert args.overlap_grad_reduce, \
             'Must use --overlap-param-gather with --overlap-grad-reduce'
-        assert not args.use_legacy_models, \
-            '--overlap-param-gather only supported with MCore models'
         assert not getattr(args, 'dsa_train_indexer_only', False), \
             '--dsa-train-indexer-only is not compatible with --overlap-param-gather'
 
