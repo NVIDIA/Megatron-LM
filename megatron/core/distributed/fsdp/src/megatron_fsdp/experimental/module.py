@@ -166,6 +166,8 @@ class FsdpModule:
     # ``None`` lets pre_forward enqueue an all-gather unless an earlier FsdpModule
     # already prefetched this module.
     _unshard_event: torch.cuda.Event | None
+    # Event recorded after fused-wgrad reduce-scatter inputs are allocated.
+    _fused_wgrad_ready_event: torch.cuda.Event | None
     # ``phase`` is FORWARD between pre_forward() and post_forward(), BACKWARD
     # between pre_backward() and post_backward(), and RESTING otherwise. The only
     # exception is non-reentrant activation recomputation: it runs between pre_backward()
@@ -183,19 +185,25 @@ class FsdpModule:
         grad_divisor: int = 1,
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
+        fuse_wgrad_accumulation: bool = False,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
         self._context = context
         self._is_root = False
         self._name = None
         self._unshard_event = None
+        self._fused_wgrad_ready_event = None
         self._phase = FsdpModule.Phase.RESTING
         self._schedule_policy = schedule_policy
-        owned_parameters = _collect_owned_parameters(self)
+        owned_parameters, fused_wgrad_parameters = _collect_owned_parameters(
+            self, fuse_wgrad_accumulation
+        )
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
         parameter_groups = []
-        for group_parameters in _group_parameters(owned_parameters):
+        for group_parameters, group_fuses_wgrad in _group_parameters(
+            owned_parameters, fused_wgrad_parameters
+        ):
             group_dtype = next(iter(group_parameters.values())).dtype
             parameter_groups.append(
                 FsdpParameterGroup(
@@ -212,6 +220,7 @@ class FsdpModule:
                     mixed_precision_policy=mixed_precision_policy,
                     grad_divisor=grad_divisor,
                     use_symmetric_memory=use_symmetric_memory,
+                    fuse_wgrad_accumulation=group_fuses_wgrad,
                 )
             )
         self._parameter_groups = tuple(parameter_groups)
@@ -452,13 +461,38 @@ class FsdpModule:
             # fork each preceding module issues before its collective.
             context.reduce_scatter_stream.wait_stream(current_stream)
 
+        # An FSDP root may begin backward while upstream loss temporaries are still
+        # live. Let TE request its target lazily after those tensors are released.
+        # Non-roots normally arrive with a destination prefetched by their predecessor.
+        if not self.is_root():
+            self._prepare_fused_wgrad_buffers()
         self._unshard_parameter_groups()
         assert self._unshard_event is not None
         current_stream.wait_event(self._unshard_event)
+        if self._fused_wgrad_ready_event is not None:
+            current_stream.wait_event(self._fused_wgrad_ready_event)
 
         self._prefetch_parameter_groups(
             context.backward_order, self._schedule_policy.backward_prefetch_size
         )
+
+    def _prepare_fused_wgrad_buffers(self) -> None:
+        """Prepare fused-wgrad destinations on the reduce-scatter stream."""
+        if self._fused_wgrad_ready_event is not None:
+            return
+        fused_groups = [
+            group
+            for group in self._parameter_groups
+            if group.requires_grad and group.fuse_wgrad_accumulation
+        ]
+        if not fused_groups:
+            return
+
+        reduce_scatter_stream = self.context.reduce_scatter_stream
+        with torch.cuda.stream(reduce_scatter_stream):
+            for group in fused_groups:
+                group.prepare_fused_wgrad_buffer()
+            self._fused_wgrad_ready_event = reduce_scatter_stream.record_event()
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
@@ -472,20 +506,30 @@ class FsdpModule:
         context = self.context
         reduce_scatter_stream = context.reduce_scatter_stream
         current_stream = context.current_stream()
+        next_module = context.backward_order.next_item(self)
+        if next_module is not None and not self.is_root() and not next_module.is_root():
+            # Queue the next destination after this module's backward compute but
+            # before its reduce-scatter. Roots finish after their descendants, so
+            # their static successor has already run and must not be prefetched.
+            next_module._prepare_fused_wgrad_buffers()
 
         for group in self._parameter_groups:
             if not group.requires_grad:
                 continue
 
-            with torch.cuda.stream(reduce_scatter_stream):
-                partial_grad = group.allocate_partial_grad_buffer()
-
-            current_stream.wait_stream(reduce_scatter_stream)
+            if group.fuse_wgrad_accumulation:
+                partial_grad = group.take_fused_wgrad_buffer()
+            else:
+                with torch.cuda.stream(reduce_scatter_stream):
+                    partial_grad = group.allocate_partial_grad_buffer()
+                current_stream.wait_stream(reduce_scatter_stream)
             group.copy_gradients_to_partial_buffer(partial_grad)
 
             reduce_scatter_stream.wait_stream(current_stream)
             with torch.cuda.stream(reduce_scatter_stream):
                 group.reduce_partial_gradients(partial_grad, self.context.is_last_microbatch)
+
+        self._fused_wgrad_ready_event = None
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
@@ -524,11 +568,18 @@ def _collect_fsdp_children(module: nn.Module, children: set["FsdpModule"]) -> No
             _collect_fsdp_children(child, children)
 
 
-def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]:
+def _collect_owned_parameters(
+    root_module: nn.Module, fuse_wgrad_accumulation: bool
+) -> tuple[dict[str, nn.Parameter], set[nn.Parameter]]:
     parameters: dict[str, nn.Parameter] = {}
+    fused_wgrad_parameters: set[nn.Parameter] = set()
 
     def visit(submodule: nn.Module, submodule_fqn: str) -> None:
         direct_parameters = submodule.named_parameters(recurse=False, remove_duplicate=False)
+        module_fuses_wgrad = fuse_wgrad_accumulation and (
+            getattr(submodule, "fuse_wgrad_accumulation", False)
+            or getattr(submodule, "gradient_accumulation_fusion", False)
+        )
 
         for local_parameter_name, parameter in direct_parameters:
             parameter_fqn = (
@@ -539,6 +590,8 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
                     f"Parameter {parameter_fqn!r} is already owned by another FsdpModule."
                 )
             parameters[parameter_fqn] = parameter
+            if module_fuses_wgrad and parameter.requires_grad:
+                fused_wgrad_parameters.add(parameter)
 
         for child_name, child_module in submodule.named_children():
             if isinstance(child_module, FsdpModule):
@@ -547,15 +600,17 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
             visit(child_module, child_fqn)
 
     visit(root_module, "")
-    return parameters
+    return parameters, fused_wgrad_parameters
 
 
-def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
-    grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
+def _group_parameters(
+    parameters: dict[str, nn.Parameter], fused_wgrad_parameters: set[nn.Parameter]
+) -> list[tuple[dict[str, nn.Parameter], bool]]:
+    grouped: dict[tuple[torch.dtype, bool, bool], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (parameter.dtype, parameter.requires_grad)
+        key = (parameter.dtype, parameter.requires_grad, parameter in fused_wgrad_parameters)
         grouped.setdefault(key, {})[name] = parameter
-    return [grouped[key] for key in grouped]
+    return [(grouped[key], key[2]) for key in grouped]
 
 
 def _specialize_placements(

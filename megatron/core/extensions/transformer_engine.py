@@ -1375,7 +1375,9 @@ class TELinear(te.pytorch.Linear):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
         _is_first_microbatch = (
-            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+            None
+            if self.disable_parameter_transpose_cache or hasattr(self.weight, "__fsdp_param__")
+            else self.is_first_microbatch
         )
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
@@ -1624,7 +1626,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     def forward(self, x):
         """Forward."""
         _is_first_microbatch = (
-            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+            None
+            if self.disable_parameter_transpose_cache or hasattr(self.weight, "__fsdp_param__")
+            else self.is_first_microbatch
         )
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
@@ -2769,7 +2773,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
         def forward(self, x, m_splits):
             """Forward."""
             _is_first_microbatch = (
-                None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+                None
+                if self.disable_parameter_transpose_cache
+                or hasattr(getattr(self, "weight0", None), "__fsdp_param__")
+                else self.is_first_microbatch
             )
             quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
 
@@ -3724,6 +3731,7 @@ try:
         out: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
         grad: bool = False,
+        accumulate: bool = False,
     ) -> List[torch.Tensor]:
         """
         Wrapper for TE's general_gemm function.
@@ -3737,7 +3745,7 @@ try:
             quantization_params=None,
             gelu=None,
             gelu_in=None,
-            accumulate=False,
+            accumulate=accumulate,
             layout=layout,
             out=out,
             bias=bias,

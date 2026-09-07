@@ -664,6 +664,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                             mixed_precision_policy=self.mp_policy,
                             grad_divisor=config.expert_model_parallel_size,
                             schedule_policy=schedule_policy,
+                            fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
                         )
             for submodule in reversed(list(module.modules())):
                 if submodule is module:
@@ -679,6 +680,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                         placements=dense_placements,
                         mixed_precision_policy=self.mp_policy,
                         schedule_policy=schedule_policy,
+                        fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
                     )
             if config.init_model_with_meta_device:
                 _materialize_owned_meta_modules(module, device)
@@ -688,6 +690,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 placements=dense_placements,
                 mixed_precision_policy=self.mp_policy,
                 schedule_policy=schedule_policy,
+                fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
             )
         super().__init__(config=config, module=module)
 
@@ -782,7 +785,27 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 "i.e. num_distributed_optimizer_instances > 1."
             )
         if config.gradient_accumulation_fusion:
-            raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
+            if not is_te_min_version("2.10"):
+                raise ValueError(
+                    "MFSDP v2 gradient accumulation fusion requires Transformer Engine 2.10+."
+                )
+            unsupported_fused_wgrad_features = []
+            if config.cpu_offloading:
+                unsupported_fused_wgrad_features.append("CPU offloading")
+            if config.overlap_moe_expert_parallel_comm:
+                unsupported_fused_wgrad_features.append("1F1B EP overlap")
+            if config.overlap_dispatch_backward_with_experts_wgrad:
+                unsupported_fused_wgrad_features.append("delayed expert wgrad overlap")
+            if config.use_transformer_engine_op_fuser:
+                unsupported_fused_wgrad_features.append("Transformer Engine operation fuser")
+            if ddp_config.nccl_ub:
+                unsupported_fused_wgrad_features.append("symmetric-memory NCCL-UB")
+            if unsupported_fused_wgrad_features:
+                raise ValueError(
+                    "MFSDP v2 gradient accumulation fusion does not support: "
+                    + ", ".join(unsupported_fused_wgrad_features)
+                    + "."
+                )
         if config.calculate_per_token_loss:
             raise ValueError("MFSDP v2 does not currently support per-token loss normalization.")
         if config.fp8 or config.fp4 or ddp_config.fp8_param_gather or ddp_config.fp4_param_gather:
