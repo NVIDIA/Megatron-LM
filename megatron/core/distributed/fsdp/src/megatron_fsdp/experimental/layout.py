@@ -269,8 +269,8 @@ def _build_subgroup_layout(
     tensor_ids = sorted(
         range(len(tensor_shapes)), key=lambda i: (-tensor_shapes[i].numel(), i)
     )
-    # Only tensors larger than one subgroup's average payload may cross subgroup boundaries.
-    average_payload = sum(shape.numel() for shape in tensor_shapes) / num_subgroups
+    # Keep moderately large tensors subgroup-local; only oversized tensors may cross.
+    average_payload = 1.7 * sum(shape.numel() for shape in tensor_shapes) / num_subgroups
     large_ids = [i for i in tensor_ids if tensor_shapes[i].numel() > average_payload]
     small_ids = [i for i in tensor_ids if tensor_shapes[i].numel() <= average_payload]
 

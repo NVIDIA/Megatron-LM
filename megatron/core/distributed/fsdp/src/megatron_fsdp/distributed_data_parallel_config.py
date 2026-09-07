@@ -194,9 +194,8 @@ class DistributedDataParallelConfig:
     """
 
     muon_dp_subgroup_size: Optional[int] = None
-    """Maximum number of contiguous DP ranks across which one parameter may be sharded for
-    MFSDP v2 Muon. Values larger than a parameter mesh are capped to that mesh; otherwise
-    the mesh size must be divisible by this value."""
+    """Maximum number of same-node DP ranks across which one parameter may be sharded for
+    MFSDP v2 Muon."""
 
     def __post_init__(self):
         import os

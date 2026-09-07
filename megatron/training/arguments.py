@@ -2763,12 +2763,11 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
     group.add_argument('--muon-dp-subgroup-size', type=int, default=None,
-                       help='Maximum number of contiguous DP ranks across which one parameter '
-                       'may be sharded by Megatron-FSDP v2 Muon. The DP size must be divisible '
-                       'by this value. Defaults to the full DP group.')
-    group.add_argument('--muon-max-params-per-owner-chunk', type=int, default=4,
+                       help='Maximum number of same-node DP ranks across which one parameter may be '
+                       'sharded by Megatron-FSDP v2 Muon. Defaults to the full DP group.')
+    group.add_argument('--muon-max-params-per-owner-chunk', type=int, default=16,
                        help='Maximum number of parameters in each Megatron-FSDP v2 Muon owner '
-                       'communication chunk. Defaults to 4 parameters per chunk.')
+                       'communication chunk. Defaults to 16 parameters per chunk.')
     group.add_argument('--muon-tp-mode', type=str, default='duplicated',
                        choices=['blockwise', 'duplicated', 'distributed', 'auto'],
                        help='How to perform NS calculation for tensor model parallel weights. '

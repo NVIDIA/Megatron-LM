@@ -15,6 +15,8 @@
 """Minimal Megatron-FSDP fully_shard entrypoint."""
 
 import dataclasses
+import os
+from collections import Counter
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -132,9 +134,8 @@ def fully_shard(
             the expert-data-parallel mesh alone therefore divides by too little, and
             ``grad_divisor=ep_size`` makes up the difference. Dense parameters see only
             their own rank's tokens and need no divisor.
-        subgroup_size: Optional maximum number of contiguous DP ranks across which one
-            parameter may be sharded. Values larger than this mesh are capped to the mesh
-            size; otherwise the mesh size must be divisible by the subgroup size.
+        subgroup_size: Optional maximum number of same-node DP ranks across which one
+            parameter may be sharded.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -151,7 +152,9 @@ def fully_shard(
     _validate_dp_axes(mesh, placements.dp_axes)
     mixed_precision_policy = mixed_precision_policy or MixedPrecisionPolicy()
     if subgroup_size is not None:
-        subgroup_size = min(subgroup_size, mesh.size())
+        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        ranks_per_node = Counter(rank // local_world_size for rank in mesh.mesh.flatten().tolist())
+        subgroup_size = min(subgroup_size, max(ranks_per_node.values()))
 
     original_cls = module.__class__
     _attach_mixin(module)

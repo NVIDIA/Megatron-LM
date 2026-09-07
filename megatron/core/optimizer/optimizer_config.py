@@ -280,12 +280,12 @@ class OptimizerConfig:
     """The number of iteration steps to use in the Newton-Schulz iteration."""
 
     muon_dp_subgroup_size: int | None = None
-    """Maximum number of contiguous DP ranks across which one parameter may be sharded for
+    """Maximum number of same-node DP ranks across which one parameter may be sharded for
     MFSDP v2 Muon. None uses the full DP group."""
 
-    muon_max_params_per_owner_chunk: int | None = 4
+    muon_max_params_per_owner_chunk: int | None = 16
     """Maximum number of parameters in an MFSDP v2 Muon owner-communication chunk.
-    Defaults to 4; None places every compatible parameter in one chunk."""
+    Defaults to 16; None places every compatible parameter in one chunk."""
 
     muon_tp_mode: str = "duplicated"
     """How to perform NS calculation for tensor parallel weights. "blockwise" orthogonalizes
