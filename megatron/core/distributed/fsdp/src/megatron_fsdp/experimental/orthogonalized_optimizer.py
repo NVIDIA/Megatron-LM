@@ -112,8 +112,8 @@ class _BoundaryChunkState:
     """In-flight gather and scatter state for one boundary chunk.
 
     `FsdpOrthogonalizedOptimizer.step` issues every chunk's owner-gather first,
-    then `_issue_boundary_update` fills the scatter fields for
-    `_enqueue_boundary_update` to consume.
+    then `_compute_and_issue_boundary_scatter` fills the scatter fields for
+    `_apply_boundary_update` to consume.
     """
 
     b_params: Sequence[DTensor]
@@ -135,7 +135,7 @@ class _BoundaryChunkState:
     weight_gather_works: list[dist.Work] | None = None
     weight_gather_event: torch.cuda.Event | None = None
 
-    # Populated by `_issue_boundary_update` while this chunk's scatter is in flight.
+    # Populated by `_compute_and_issue_boundary_scatter` while this chunk's scatter is in flight.
     full_updates: dict[int, torch.Tensor] = dataclasses.field(default_factory=dict)
     scatter_plan: OwnerScatterPlan | None = None
     scatter_recv: dict[tuple[int, int], torch.Tensor] = dataclasses.field(default_factory=dict)
@@ -715,9 +715,6 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
 
             chunks = self._group_updates(matrix_params, local_shards, matrix_plans)
             owners = self._assign_owner_work(matrix_plans, chunks)
-            local_indices = [
-                i for i in range(len(matrix_plans)) if not matrix_plans[i].is_boundary()
-            ]
             boundary_indices_set = {
                 i for i in range(len(matrix_plans)) if matrix_plans[i].is_boundary()
             }
@@ -742,18 +739,17 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
                     )
                 )
 
-            for i in local_indices:
-                plan = matrix_plans[i]
-                param = matrix_params[i]
-                if plan.rank_row_count(dist.get_rank(group=_get_parameter_dp_group(param))) > 0:
-                    rows, cols = plan.full_shape
-                    cost = plan.full_numel() * (min(rows, cols) * self._num_ns_steps + 1)
-                    local_updates.append((cost, group, param, local_shards[i]))
-
-            for param in matrix_params:
+            for param, plan, local_shard in zip(matrix_params, matrix_plans, local_shards):
                 pg = get_containing_parameter_group(param)
                 if pg is not None:
                     fsdp_parameter_groups.add(pg)
+
+                if not plan.is_boundary():
+                    rank = dist.get_rank(group=_get_parameter_dp_group(param))
+                    if plan.rank_row_count(rank) > 0:
+                        rows, cols = plan.full_shape
+                        cost = plan.full_numel() * (min(rows, cols) * self._num_ns_steps + 1)
+                        local_updates.append((cost, group, param, local_shard))
 
         # Split fully-local NS across both communication edges. The first side
         # hides owner gathers; after boundary NS launches every scatter, the
@@ -765,19 +761,21 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             local_sides[side].append(update)
             local_costs[side] += update[0]
 
+        # Run fully-local NS to overlap the owner gathers for the boundary work below.
         for _, group, param, local_shard in local_sides[0]:
             self._orthogonalize_and_update(param, local_shard, group["lr"], group)
 
         for state in chunk_states:
-            self._issue_boundary_update(state)
+            self._compute_and_issue_boundary_scatter(state)
 
+        # Run fully-local NS while the previously submitted owner scatters are in flight.
         for _, group, param, local_shard in local_sides[1]:
             self._orthogonalize_and_update(param, local_shard, group["lr"], group)
 
         for state in chunk_states:
             self._wait_for_dist_buffer(state.scatter_works)
         for state in chunk_states:
-            self._enqueue_boundary_update(state)
+            self._apply_boundary_update(state)
 
         for parameter_group in fsdp_parameter_groups:
             parameter_group.sync_model_weight_from_main_weight()
@@ -798,17 +796,16 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         """Pack and asynchronously P2P-send this chunk's pre-NS shards to owners.
 
         Returns the in-flight gather state; `step` finishes it later with
-        `_issue_boundary_update` so fully-local Newton-Schulz overlaps the gathers.
+        `_compute_and_issue_boundary_scatter` so fully-local Newton-Schulz overlaps the gathers.
         """
         b_plans = [matrix_plans[i] for i in boundary_indices]
         b_params = [matrix_params[i] for i in boundary_indices]
         b_local = [local_shards[i] for i in boundary_indices]
         b_owners = {i: owners[boundary_indices[i]] for i in range(len(boundary_indices))}
-        gather_plan = self._pack_owner_work(
-            b_plans, b_owners, b_local, device, dtype, b_params[0]
-        )
+        comm_groups = [_get_parameter_dp_group(param) for param in b_params]
+        gather_plan = self._pack_owner_work(b_plans, b_owners, b_local, comm_groups)
         recv_buffers, gather_works, gather_event = self._send_to_owner(
-            gather_plan, device, dtype, b_params[0]
+            gather_plan, device, dtype
         )
 
         # Optionally also gather each rank's local *weight* shard so the owner can
@@ -824,10 +821,10 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             weight_local = [p.to_local() for p in b_params]
             weight_dtype = b_params[0].dtype
             weight_gather_plan = self._pack_owner_work(
-                b_plans, b_owners, weight_local, device, weight_dtype, b_params[0]
+                b_plans, b_owners, weight_local, comm_groups
             )
             weight_recv_buffers, weight_gather_works, weight_gather_event = self._send_to_owner(
-                weight_gather_plan, device, weight_dtype, b_params[0]
+                weight_gather_plan, device, weight_dtype
             )
         return _BoundaryChunkState(
             b_params=b_params,
@@ -847,7 +844,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
             weight_gather_event=weight_gather_event,
         )
 
-    def _issue_boundary_update(self, state: _BoundaryChunkState) -> None:
+    def _compute_and_issue_boundary_scatter(self, state: _BoundaryChunkState) -> None:
         """Wait for one owner-gather, orthogonalize, and issue its owner-scatter."""
         b_params = state.b_params
         b_plans = state.b_plans
@@ -897,7 +894,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
 
         # Phase 5: pack + P2P-send update shards from owners (async on owner stream).
         scatter_plan = self._pack_update_shards(
-            full_updates, b_plans, b_owners, device, state.dtype, b_params[0]
+            full_updates, b_plans, b_owners, list(gather_plan.comm_groups)
         )
         scatter_recv, scatter_works, scatter_event = self._send_to_destination(
             scatter_plan, device, state.dtype
@@ -908,7 +905,7 @@ class FsdpOrthogonalizedOptimizer(torch.optim.Optimizer):
         state.scatter_works = scatter_works
         state.scatter_event = scatter_event
 
-    def _enqueue_boundary_update(self, state: _BoundaryChunkState) -> None:
+    def _apply_boundary_update(self, state: _BoundaryChunkState) -> None:
         """Apply local update shards after the asynchronous owner-scatter."""
         # Depend only on this chunk's scatter, not later communication queued
         # on the shared owner-comm stream.
