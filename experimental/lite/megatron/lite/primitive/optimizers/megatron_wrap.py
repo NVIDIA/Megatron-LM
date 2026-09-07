@@ -82,6 +82,10 @@ def build_dist_opt_optimizer_config(
         "weight_decay": opt.weight_decay,
         "clip_grad": opt.clip_grad,
         "use_distributed_optimizer": True,
+        # Core requires this to carry the same value as the DDP config's, which
+        # the dist_opt stack sets; the optimizer needs to know the gather is
+        # already in flight so it does not issue its own.
+        "overlap_param_gather": True,
         "bf16": True,
         "params_dtype": torch.bfloat16,
     }
@@ -190,7 +194,17 @@ def build_dist_opt_stack(
         wrapped_chunks = list(model_chunks)
     else:
         ddp_config = DistributedDataParallelConfig(
-            use_distributed_optimizer=True, overlap_grad_reduce=False, grad_reduce_in_fp32=True
+            # Core's DDP overlaps the gradient reduce-scatter and the parameter
+            # all-gather with compute; mcore's DSv4 configuration turns both on
+            # and hides 174 ms of NCCL per step behind the backward pass. Lite
+            # left them off, so its collectives sat on the critical path: an
+            # anchor-normalised kernel census put lite's compute 13% *below*
+            # mcore's while its step time was 6% above, with GPU busy time
+            # essentially equal to wall time -- the signature of no overlap.
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            grad_reduce_in_fp32=True,
         )
         wrapped_chunks = []
         for chunk_idx, chunk in enumerate(model_chunks):

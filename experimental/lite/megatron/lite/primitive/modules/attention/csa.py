@@ -500,6 +500,19 @@ class CompressedSparseAttention(nn.Module):
             if self.compress_ratio == 4
             else None
         )
+        # The indexer runs on detached inputs and only picks top-k, which is not
+        # differentiable, so its weights are trained by the indexer loss and by
+        # nothing else. With that loss off they receive no gradient at all --
+        # every step, forever -- while still sitting in the gradient buckets and
+        # the optimizer state as if they were being trained. Core keeps them fed
+        # because its fused kernel returns their (zero) gradients whatever the
+        # coefficient; lite short-circuits the whole path, so the honest thing is
+        # to say they are frozen. Megatron-Core's DDP skips parameters that do
+        # not require grad, which is also what lets it account for every
+        # remaining parameter once per step and overlap the reductions.
+        if self.indexer is not None and not self.dsa_indexer_loss_coeff:
+            for parameter in self.indexer.parameters():
+                parameter.requires_grad_(False)
 
     def forward(
         self,
