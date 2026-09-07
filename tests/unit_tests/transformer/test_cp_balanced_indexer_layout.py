@@ -23,18 +23,24 @@ from megatron.core.context_parallel_layout.routes import _build_thd_layout_segme
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.experimental_attention_variant.cp_balanced_indexer import (
     _ZZ_PACK_OK,
+    GraphDynamicRouteBuffers,
+    GraphDynamicRouteSpec,
     _ensure_pack_zigzag_ok,
     _graph_dynamic_zigzag_plan,
     _zigzag_plan,
     add_graph_dynamic_plan_to_kwargs,
     attach_graph_dynamic_plan_buffers,
+    attach_graph_dynamic_route,
     build_graph_dynamic_plan,
+    build_graph_dynamic_route,
     copy_graph_dynamic_plan_,
+    copy_graph_dynamic_route_,
     get_graph_dynamic_plan,
     get_graph_dynamic_plan_buffers,
     pack_eligible_for_zigzag,
     pop_graph_dynamic_plan_from_kwargs,
     prebuild_balanced_layouts,
+    validate_graph_dynamic_route,
 )
 
 _S = 262144
@@ -355,6 +361,71 @@ def test_graph_dynamic_two_buffer_views_match_raw_builder():
         "dst_slot",
     ):
         assert torch.equal(packed[key], raw[key]), key
+
+
+def test_graph_dynamic_typed_route_abi_build_validate_attach_and_copy():
+    """The frontend-neutral API keeps two fixed owners and the legacy views."""
+    spec = GraphDynamicRouteSpec(cp_size=4, cp_rank=1, l_local=24, cu_entries=4)
+    cu_a = torch.tensor([0, 16, 48, 96], dtype=torch.int32)
+    cu_b = torch.tensor([0, 32, 64, 96], dtype=torch.int32)
+    route_a = build_graph_dynamic_route(cu_a, spec)
+    route_b = build_graph_dynamic_route(cu_b, spec)
+
+    assert isinstance(route_a, GraphDynamicRouteBuffers)
+    assert route_a.spec is spec
+    assert route_a.route_padding == 0
+    canonical = validate_graph_dynamic_route(cu_a, route_a)
+    assert canonical["cp_size"] == 4
+    assert canonical["cp_rank"] == 1
+    assert canonical["l_local"] == 24
+    assert canonical["validated_cu"].data_ptr() == route_a.layout_i32.data_ptr()
+
+    packed = _packed_params([0, 16, 48, 96], 96)
+    attach_graph_dynamic_route(packed, route_a)
+    attached_layout, attached_route = get_graph_dynamic_plan_buffers(packed)
+    assert attached_layout.data_ptr() == route_a.layout_i32.data_ptr()
+    assert attached_route.data_ptr() == route_a.route_i64.data_ptr()
+
+    destination = GraphDynamicRouteBuffers(
+        route_a.layout_i32.clone(), route_a.route_i64.clone(), spec
+    )
+    owner_ptrs = (destination.layout_i32.data_ptr(), destination.route_i64.data_ptr())
+    versions = (destination.layout_i32._version, destination.route_i64._version)
+    assert copy_graph_dynamic_route_(destination, route_b) is destination
+    assert (destination.layout_i32.data_ptr(), destination.route_i64.data_ptr()) == owner_ptrs
+    assert (destination.layout_i32._version, destination.route_i64._version) == (
+        versions[0] + 1,
+        versions[1] + 1,
+    )
+    assert torch.equal(destination.layout_i32, route_b.layout_i32)
+    assert torch.equal(destination.route_i64, route_b.route_i64)
+
+
+def test_graph_dynamic_typed_route_spec_and_schema_fail_closed():
+    with pytest.raises(ValueError, match="known CP rank"):
+        build_graph_dynamic_route(
+            torch.tensor([0, 96], dtype=torch.int32),
+            GraphDynamicRouteSpec(cp_size=4, cp_rank=None, l_local=24, cu_entries=2),
+        )
+    with pytest.raises(ValueError, match="compress_ratio=4"):
+        GraphDynamicRouteSpec(cp_size=4, cp_rank=0, l_local=24, cu_entries=2, compress_ratio=8)
+    with pytest.raises(ValueError, match="wrong padded-cu entry count"):
+        build_graph_dynamic_route(
+            torch.tensor([0, 48, 96], dtype=torch.int32),
+            GraphDynamicRouteSpec(cp_size=4, cp_rank=0, l_local=24, cu_entries=2),
+        )
+
+    route = build_graph_dynamic_route(
+        torch.tensor([0, 16, 48, 96], dtype=torch.int32),
+        GraphDynamicRouteSpec(cp_size=4, cp_rank=0, l_local=24, cu_entries=4),
+    )
+    wrong_schema = GraphDynamicRouteBuffers(
+        route.layout_i32,
+        route.route_i64,
+        GraphDynamicRouteSpec(cp_size=4, cp_rank=0, l_local=24, cu_entries=5),
+    )
+    with pytest.raises(ValueError, match="wrong padded-cu entry count"):
+        validate_graph_dynamic_route(torch.tensor([0, 16, 48, 96], dtype=torch.int32), wrong_schema)
 
 
 def test_graph_dynamic_fused_layout_views_keep_16_byte_alignment_for_five_cu_entries():
