@@ -53,7 +53,7 @@ from megatron.core.optimizer_param_scheduler import (
     combine_param_group_overrides,
     param_group_override_to_tuple,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
 from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
@@ -734,6 +734,42 @@ def check_config_overrides_consistency(
     return True
 
 
+def qkv_rows_after_gtp_gather(
+    param: torch.nn.Parameter,
+    qkv_split_shapes: List[int],
+    gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Tuple[int, int, bool]:
+    """Total rows of a fused QKV weight across its GTP shards, and whether [q|k|v] divides them.
+
+    Not ``param.shape[0]``: once the GTP degree stops dividing the query-group count, a
+    shard-local test switches the split off on GTP ranks while TP1 keeps it, and one
+    weight gets two different Muon rules.
+
+    The count is still TP-local, which is enough to decide because TP splits whole query
+    groups -- but it is not model-global, so do not reuse it for checkpoint shapes.
+
+    Args:
+        param: Fused QKV weight; reads ``is_gtp_weight_remat`` and ``pad_length``.
+        qkv_split_shapes: Per-query-group rows, e.g. ``[q, k, v]``. Must be non-empty.
+        gtp_remat_group: The group the optimizer gathers over -- ``param.group`` can name
+            a different one under a ``MultiModuleProcessGroupCollection``.
+
+    Returns:
+        ``(gathered_rows, gtp_size, splittable)``, padding already subtracted.
+    """
+    if not qkv_split_shapes:
+        raise ValueError("qkv_split_shapes must be non-empty to decide the QKV split")
+    gtp_size = (
+        get_pg_size(gtp_remat_group)
+        if gtp_remat_group is not None and getattr(param, 'is_gtp_weight_remat', False)
+        else 1
+    )
+    # Subtract the pad only when the rows were scaled up.
+    alignment_pad_rows = getattr(param, 'pad_length', 0) if gtp_size > 1 else 0
+    gathered_rows = param.shape[0] * gtp_size - alignment_pad_rows
+    return gathered_rows, gtp_size, gathered_rows % sum(qkv_split_shapes) == 0
+
+
 def _get_megatron_emerging_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -830,15 +866,15 @@ def _get_megatron_emerging_optimizer(
                 tp_size = get_pg_size(tp_group)
                 tp_rank = get_pg_rank(tp_group)
                 gtp_remat_group = (
-                    (
-                        pg_collection.expt_gtp_remat
-                        if getattr(param, 'expert_tp', False)
-                        else pg_collection.gtp_remat
+                    resolve_gtp_remat_group(
+                        pg_collection, is_expert=getattr(param, 'expert_tp', False)
                     )
                     if getattr(param, 'is_gtp_weight_remat', False)
                     else None
                 )
-                gtp_size = get_pg_size(gtp_remat_group)
+                logical_tp_local_rows, gtp_size, _ = qkv_rows_after_gtp_gather(
+                    param, qkv_split_shapes, gtp_remat_group
+                )
                 gtp_rank = get_pg_rank(gtp_remat_group)
 
                 qkv_gtp_pad_length = (
@@ -853,12 +889,11 @@ def _get_megatron_emerging_optimizer(
                         f"pad_length={qkv_gtp_pad_length}, "
                         f"physical_tp_local_rows={physical_tp_local_rows}"
                     )
-                logical_tp_local_rows = physical_tp_local_rows - qkv_gtp_pad_length
                 expected_logical_rows = logical_tp_local_rows * tp_size
                 if expected_logical_rows != sum(logical_split_shapes):
                     log_single_rank(
                         logger,
-                        logging.DEBUG,
+                        logging.INFO,
                         f"Emerging optimizer QKV split skipped for {name}: "
                         f"logical_rows={sum(logical_split_shapes)}, "
                         f"local_rows={param.shape[0]}, tp_size={tp_size}, "

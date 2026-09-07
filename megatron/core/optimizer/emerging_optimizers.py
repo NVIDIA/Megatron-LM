@@ -16,7 +16,7 @@ from typing import Any, Callable, Dict, Literal, Optional, get_args
 import torch
 from torch.optim.optimizer import ParamsT
 
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.utils import (
     get_emerging_optimizers_version,
     get_pg_rank,
@@ -410,11 +410,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
     def _get_gtp_remat_group(self, p):
         """Return the GTP-remat process group for a parameter, if configured."""
         is_expert = getattr(p, 'expert_tp', False)
-        return (
-            (self.pg_collection.expt_gtp_remat if is_expert else self.pg_collection.gtp_remat)
-            if self.pg_collection
-            else None
-        )
+        return resolve_gtp_remat_group(self.pg_collection, is_expert)
 
     def _warn_distributed_qkv_fallback(self):
         """Warn once when a QKV layout cannot use distributed Newton-Schulz."""
@@ -803,7 +799,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             qkv_split_shapes = getattr(p, "qkv_split_shapes", None)
             if qkv_split_shapes is None:
                 qkv_split_shapes = self.qkv_split_shapes
-            if qkv_split_shapes is None:
+            if not qkv_split_shapes:
                 raise RuntimeError("Muon QKV split requested but qkv_split_shapes is not set")
             if (
                 getattr(p, 'is_gtp_weight_remat', False)
