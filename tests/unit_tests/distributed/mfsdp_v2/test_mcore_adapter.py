@@ -73,9 +73,7 @@ class TestMcoreAdapterDense:
     def setup_method(self):
         Utils.initialize_model_parallel(1, 1)
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        # The CUDA-graph test may leave a TE tracker in process-global state; recreate the
-        # default tracker this non-graph test expects.
-        model_parallel_cuda_manual_seed(1234, force_reset_rng=True)
+        model_parallel_cuda_manual_seed(1234)
 
     def teardown_method(self):
         _destroy_model_parallel()
@@ -235,7 +233,7 @@ class TestMcoreAdapterDense:
         reference_model = _build_block(config)
         model = _build_block(config)
         model.load_state_dict(reference_model.state_dict())
-        # The unwrapped reference cannot use the DistributedOptimizer path, which
+        # The reference TransformerBlock cannot use the DistributedOptimizer path, which
         # requires DDP/FSDP buffer metadata, but the optimizer factory still expects
         # every model chunk to expose ddp_config.
         reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
@@ -284,10 +282,10 @@ class TestMcoreAdapterDense:
             for _ in range(10)
         ]
 
-        def run(model, optimizer, is_mfsdp):
+        def run(model, optimizer) -> torch.Tensor:
             losses = []
             for microbatches in steps:
-                if is_mfsdp:
+                if isinstance(model, FullyShardedDataParallelV2):
                     model.zero_grad_buffer()
                 optimizer.zero_grad(set_to_none=True)
                 microbatch_losses = []
@@ -301,8 +299,8 @@ class TestMcoreAdapterDense:
                 losses.append(torch.stack(microbatch_losses).mean())
             return torch.stack(losses)
 
-        reference_losses = run(reference_model, reference_optimizer, is_mfsdp=False)
-        losses = run(model, optimizer, is_mfsdp=True)
+        reference_losses = run(reference_model, reference_optimizer)
+        losses = run(model, optimizer)
 
         for state in optimizer.optimizer.state.values():
             assert state["exp_avg"].dtype == torch.bfloat16
@@ -526,10 +524,13 @@ class TestMcoreAdapterCudaGraph:
                 )
             return model, optimizer
 
-        def forward_backward(*, model, data_iterator, num_microbatches, **_):
+        def forward_backward(*, model, data_iterator, num_microbatches, seq_length, forward_only):
+            assert seq_length is None
+            assert not forward_only
             microbatch_losses = []
             for _ in range(num_microbatches):
                 batch = next(data_iterator[0])
+                # Pipeline schedules receive model chunks as a list, including with PP=1.
                 output = model[0](hidden_states=batch["hidden_states"], attention_mask=None)
                 loss = output.float().square().mean()
                 (loss / num_microbatches).backward()
@@ -553,6 +554,7 @@ class TestMcoreAdapterCudaGraph:
                     model=[model],
                     data_iterator=[iter([{"hidden_states": batch} for batch in microbatches])],
                     num_microbatches=len(microbatches),
+                    # FullCudaGraphWrapper requires the production schedule arguments.
                     seq_length=None,
                     forward_only=False,
                 )
@@ -616,9 +618,7 @@ class TestMcoreAdapterExpertParallel:
             embd=None,
             pos_embd=None,
         )
-        # The preceding CUDA-graph class uses a TE tracker; recreate the default tracker for
-        # this non-graph test instead of reusing that process-global state.
-        model_parallel_cuda_manual_seed(1234, force_reset_rng=True)
+        model_parallel_cuda_manual_seed(1234)
 
     def teardown_method(self):
         _destroy_model_parallel()
