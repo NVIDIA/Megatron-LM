@@ -167,6 +167,15 @@ class TestFusedPreGatedDeltaRule:
                 msg=lambda msg, output_name=name: f"{output_name} mismatch: {msg}",
             )
 
+    def _make_pre_gated_delta_rule_grad_outputs(self, outputs):
+        grad_outputs = []
+        for output_idx, output in enumerate(outputs):
+            grad = torch.linspace(
+                -0.1, 0.1, output.numel(), device=output.device, dtype=torch.float32
+            ).reshape(output.shape)
+            grad_outputs.append(grad + (output_idx - 2.5) * 0.01)
+        return grad_outputs
+
     def test_fused_and_unfused_forward_match(self):
         hidden_states = torch.randn(
             (32, 2, self.unfused_gdn.config.hidden_size),
@@ -349,6 +358,100 @@ class TestFusedPreGatedDeltaRule:
             output_tolerances={"g": (1e-3, 3e-3)},
         )
 
+    def test_fused_and_unfused_beta_use_fp32_sigmoid(self):
+        reference_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=False, deterministic_mode=True, conv_kernel_dim=4
+        )
+        fused_gdn = self._build_gdn(
+            gdn_pre_gated_delta_rule_fusion=True, deterministic_mode=False, conv_kernel_dim=4
+        )
+        fused_gdn.load_state_dict(reference_gdn.state_dict())
+
+        batch = 2
+        seq_len = 32
+        device = torch.cuda.current_device()
+        num_value_heads = reference_gdn.num_v_heads_local_tp
+        beta_channel_offset = 2 * reference_gdn.qk_dim_local_tp + 2 * reference_gdn.v_dim_local_tp
+        qkvzba = torch.randn(
+            (seq_len, batch, reference_gdn.in_proj_dim), device=device, dtype=torch.bfloat16
+        )
+        beta_raw = torch.linspace(
+            -6.0, 6.0, seq_len * batch * num_value_heads, device=device, dtype=torch.float32
+        ).reshape(seq_len, batch, num_value_heads)
+        qkvzba[:, :, beta_channel_offset : beta_channel_offset + num_value_heads] = beta_raw.to(
+            torch.bfloat16
+        )
+        expected_beta = (
+            qkvzba[:, :, beta_channel_offset : beta_channel_offset + num_value_heads]
+            .transpose(0, 1)
+            .float()
+            .sigmoid()
+        )
+
+        qkvzba_unfused = qkvzba.detach().clone().requires_grad_(True)
+        qkvzba_fused = qkvzba.detach().clone().requires_grad_(True)
+        reference_gdn.zero_grad(set_to_none=True)
+        fused_gdn.zero_grad(set_to_none=True)
+
+        unfused_outputs = reference_gdn.pre_gated_delta_rule(
+            qkvzba_unfused, batch, seq_len, reference_gdn.cp_size, reference_gdn.pg_collection.cp
+        )
+        fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(qkvzba_fused)
+        unfused_beta = unfused_outputs[4]
+        fused_beta = fused_outputs[4]
+
+        assert unfused_beta.dtype == torch.float32
+        assert fused_beta.dtype == torch.float32
+        torch.testing.assert_close(unfused_beta, expected_beta, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(fused_beta, expected_beta, atol=1e-5, rtol=1e-5)
+
+        beta_grad = torch.linspace(
+            -0.25, 0.25, unfused_beta.numel(), device=device, dtype=torch.float32
+        ).reshape_as(unfused_beta)
+
+        def _beta_only_loss(outputs):
+            loss = outputs[4].float().mul(beta_grad).sum()
+            return loss + sum(
+                output.float().sum() * 0.0 for idx, output in enumerate(outputs) if idx != 4
+            )
+
+        _beta_only_loss(unfused_outputs).backward()
+        _beta_only_loss(fused_outputs).backward()
+        beta_slice = slice(beta_channel_offset, beta_channel_offset + num_value_heads)
+        torch.testing.assert_close(
+            qkvzba_fused.grad[:, :, beta_slice].float(),
+            qkvzba_unfused.grad[:, :, beta_slice].float(),
+            atol=2e-3,
+            rtol=2e-3,
+        )
+
+    def test_apply_gated_norm_accepts_strided_gate_view(self):
+        import torch._dynamo
+
+        gdn = self.fused_gdn
+        batch = 2
+        seq_len = 16
+        device = torch.cuda.current_device()
+        num_value_heads = gdn.num_v_heads_local_tp
+        gate_channels = num_value_heads * gdn.value_head_dim
+        z_offset = 7
+        gate_storage = torch.randn(
+            seq_len, batch, z_offset + gate_channels + 5, device=device, dtype=torch.bfloat16
+        )
+        gate_view = (
+            gate_storage[:, :, z_offset : z_offset + gate_channels]
+            .view(seq_len, batch, num_value_heads, gdn.value_head_dim)
+            .permute(1, 0, 2, 3)
+        )
+        assert not gate_view.is_contiguous()
+        assert gate_view.untyped_storage().data_ptr() == gate_storage.untyped_storage().data_ptr()
+
+        norm_input = torch.randn_like(gate_view.contiguous())
+        with torch._dynamo.config.patch(disable=True):
+            strided_output = gdn._apply_gated_norm(norm_input, gate_view)
+            contiguous_output = gdn._apply_gated_norm(norm_input, gate_view.contiguous())
+        torch.testing.assert_close(strided_output, contiguous_output)
+
     def test_fused_and_unfused_pre_gated_delta_rule_backward_match(self):
         reference_gdn = self._build_gdn(
             gdn_pre_gated_delta_rule_fusion=False, deterministic_mode=True, conv_kernel_dim=4
@@ -360,6 +463,7 @@ class TestFusedPreGatedDeltaRule:
 
         batch = 2
         seq_len = 32
+        torch.manual_seed(1234)
         qkvzba = torch.randn(
             (seq_len, batch, reference_gdn.in_proj_dim),
             device=torch.cuda.current_device(),
@@ -375,7 +479,7 @@ class TestFusedPreGatedDeltaRule:
             qkvzba_unfused, batch, seq_len, reference_gdn.cp_size, reference_gdn.pg_collection.cp
         )
         fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(qkvzba_fused)
-        grad_outputs = [torch.randn_like(output.float()) for output in unfused_outputs]
+        grad_outputs = self._make_pre_gated_delta_rule_grad_outputs(unfused_outputs)
 
         unfused_loss = sum(
             (output.float() * grad).sum() for output, grad in zip(unfused_outputs, grad_outputs)
@@ -497,6 +601,7 @@ class TestFusedPreGatedDeltaRule:
             [0, 1, 4, 6, 11], device=torch.cuda.current_device(), dtype=torch.int32
         )
         seq_len = cu_seqlens[-1].item()
+        torch.manual_seed(1234)
         qkvzba = torch.randn(
             (seq_len, batch, reference_gdn.in_proj_dim),
             device=torch.cuda.current_device(),
@@ -514,7 +619,7 @@ class TestFusedPreGatedDeltaRule:
         fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(
             qkvzba_fused, cu_seqlens_q=cu_seqlens
         )
-        grad_outputs = [torch.randn_like(output.float()) for output in unfused_outputs]
+        grad_outputs = self._make_pre_gated_delta_rule_grad_outputs(unfused_outputs)
 
         unfused_loss = sum(
             (output.float() * grad).sum() for output, grad in zip(unfused_outputs, grad_outputs)
@@ -581,7 +686,7 @@ class TestFusedPreGatedDeltaRule:
         fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(
             qkvzba_fused, cu_seqlens_q=cu_seqlens
         )
-        grad_outputs = [torch.randn_like(output.float()) for output in unfused_outputs]
+        grad_outputs = self._make_pre_gated_delta_rule_grad_outputs(unfused_outputs)
 
         unfused_loss = sum(
             (output.float() * grad).sum() for output, grad in zip(unfused_outputs, grad_outputs)
@@ -820,6 +925,7 @@ class TestFusedPreGatedDeltaRuleChunkwiseCP:
                 cu_seqlens[i + 1] - cu_seqlens[i] for i in range(len(cu_seqlens) - 1)
             ),
             total_tokens=cu_seqlens[-1] // cp_size,
+            cp_partition_mode="contiguous",
         )
 
     @staticmethod

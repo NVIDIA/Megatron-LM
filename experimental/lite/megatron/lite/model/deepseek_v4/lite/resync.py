@@ -86,6 +86,11 @@ def export_resync_weights(
     # representation; serializing them as UE8M0 causes a large online-reload
     # regression even though W4/MXFP4 legitimately uses UE8M0 scales.
     fp8_scale_format = "e8m0" if expert_dtype == "fp4" else "float32"
+    # Run MXFP4 / block-FP8 on the GPU when it is available: SFT save
+    # gathers on CPU (rank0_only, cpu=True) and CPU quantization is
+    # Python/torch-op bound (~30x slower than the write). RL online resync
+    # already runs on GPU tensors, so the H2D/D2H copies are skipped.
+    quant_on_gpu = torch.cuda.is_available()
 
     for name, tensor in weights:
         if (
@@ -98,12 +103,17 @@ def export_resync_weights(
             yield name, tensor
             continue
 
+        needs_move_to_gpu = quant_on_gpu and tensor.device.type != "cuda"
+        source = tensor.cuda(non_blocking=True) if needs_move_to_gpu else tensor
         if is_routed_expert(name) and expert_dtype == "fp4":
-            quantized, scale = quantize_mxfp4(tensor)
+            quantized, scale = quantize_mxfp4(source)
         else:
             quantized, scale = quantize_block_fp8(
-                tensor, block_shape, scale_format=fp8_scale_format
+                source, block_shape, scale_format=fp8_scale_format
             )
+        if needs_move_to_gpu:
+            quantized = quantized.to(tensor.device)
+            scale = scale.to(tensor.device)
         yield name, quantized
         yield _scale_name(name), scale
 

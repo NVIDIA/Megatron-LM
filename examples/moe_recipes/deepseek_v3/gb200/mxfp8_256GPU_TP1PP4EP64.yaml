@@ -202,7 +202,8 @@ ARGS:
   recompute_granularity: selective
   recompute_modules:
   - mla_up_proj
-  offload_optimizer_states: true
+  chunked_optimizer_state_offload: true
+  optimizer_state_offload_chunk_size_mb: 256
   fine_grained_activation_offloading: true
   offload_modules:
   - expert_fc1

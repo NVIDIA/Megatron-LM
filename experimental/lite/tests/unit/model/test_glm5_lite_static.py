@@ -34,6 +34,65 @@ def _make_glm5_model(cfg, ps=None, **kwargs):
     return Glm5Model(cfg, _make_train_config(ps), ps, **kwargs)
 
 
+def _use_cpu_transformer_engine_stubs(monkeypatch):
+    """Make state-layout tests independent of Transformer Engine's CUDA default."""
+    import torch
+    import torch.nn as nn
+    import transformer_engine.pytorch as te
+
+    class _GroupedLinear(nn.Module):
+        def __init__(self, num_gemms, in_features, out_features, *, params_dtype=None, **_):
+            super().__init__()
+            dtype = params_dtype or torch.get_default_dtype()
+            for index in range(num_gemms):
+                self.register_parameter(
+                    f"weight{index}", nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
+                )
+
+    class _LayerNormLinear(nn.Module):
+        def __init__(
+            self,
+            in_features,
+            out_features,
+            *,
+            bias=True,
+            params_dtype=None,
+            **_,
+        ):
+            super().__init__()
+            dtype = params_dtype or torch.get_default_dtype()
+            self.layer_norm_weight = nn.Parameter(torch.zeros(in_features, dtype=dtype))
+            self.weight = nn.Parameter(
+                torch.empty(out_features, in_features, dtype=dtype)
+            )
+            self.bias = (
+                nn.Parameter(torch.zeros(out_features, dtype=dtype)) if bias else None
+            )
+
+    def _linear(in_features, out_features, *, bias=True, params_dtype=None, **_):
+        return nn.Linear(
+            in_features,
+            out_features,
+            bias=bias,
+            dtype=params_dtype or torch.get_default_dtype(),
+        )
+
+    def _rms_norm(normalized_shape, *, eps=None, params_dtype=None, **_):
+        return nn.RMSNorm(
+            normalized_shape,
+            eps=eps,
+            dtype=params_dtype or torch.get_default_dtype(),
+        )
+
+    monkeypatch.setattr(te, "GroupedLinear", _GroupedLinear)
+    monkeypatch.setattr(te, "LayerNormLinear", _LayerNormLinear)
+    monkeypatch.setattr(te, "Linear", _linear)
+    monkeypatch.setattr(te, "RMSNorm", _rms_norm)
+    import megatron.lite.primitive.modules.attention.dsa as dsa
+
+    monkeypatch.setattr(dsa, "RMSNorm", _rms_norm)
+
+
 def _tiny_config_kwargs():
     return dict(
         num_hidden_layers=2,
@@ -59,6 +118,11 @@ def _tiny_config_kwargs():
         n_shared_experts=1,
         num_experts_per_tok=2,
     )
+
+
+def _glm52_indexer_types(num_layers=78):
+    full_layers = {0, 1, 2, *range(6, num_layers, 4)}
+    return ["full" if idx in full_layers else "shared" for idx in range(num_layers)]
 
 
 def test_glm5_registry_resolves_lite():
@@ -129,6 +193,50 @@ def test_glm5_config_ignores_null_hf_optional_fields():
     assert cfg.mlp_layer_types is None
 
 
+def test_glm52_config_validates_index_share_schedule():
+    import pytest
+
+    from megatron.lite.model.glm5.config import Glm5Config
+
+    indexer_types = _glm52_indexer_types()
+    cfg = Glm5Config(
+        **{
+            **_tiny_config_kwargs(),
+            "num_hidden_layers": 78,
+            "num_nextn_predict_layers": 1,
+        },
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_types=indexer_types,
+        index_share_for_mtp_iteration=True,
+    )
+
+    assert indexer_types.count("full") == 21
+    assert indexer_types.count("shared") == 57
+    assert cfg.uses_dsa_index_share is True
+    assert cfg.dsa_indexer_type(2) == "full"
+    assert cfg.dsa_indexer_type(3) == "shared"
+    assert cfg.dsa_indexer_source_layer(3) == 2
+    assert cfg.dsa_indexer_type(74) == "full"
+    assert cfg.dsa_indexer_type(77) == "shared"
+    assert cfg.dsa_indexer_source_layer(77) == 74
+    # MTP layer 78 (0-based) is outside trunk indexer_types and is full by
+    # the same global layer-number schedule.
+    assert cfg.dsa_indexer_type(78) == "full"
+    assert cfg.builds_dsa_indexer(78) is True
+    assert cfg.index_share_for_mtp_iteration is True
+
+    bad_types = list(indexer_types)
+    bad_types[3] = "full"
+    with pytest.raises(ValueError, match="indexer_types\\[3\\]"):
+        Glm5Config(
+            **{**_tiny_config_kwargs(), "num_hidden_layers": 78},
+            index_topk_freq=4,
+            index_skip_topk_offset=3,
+            indexer_types=bad_types,
+        )
+
+
 def test_glm5_config_preserves_mtp_aliases_and_layer_types():
     from megatron.lite.model.glm5.config import Glm5Config
 
@@ -190,7 +298,7 @@ def test_lite_csa_imports_core_csa_kernel_namespace():
     csa_text = (root / "primitive" / "modules" / "attention" / "csa.py").read_text()
 
     assert (
-        "from megatron.core.transformer.experimental_attention_variant.csa_kernels import"
+        "from megatron.core.transformer.experimental_attention_variant.csa_utils"
         in csa_text
     )
     assert "FusedCSAIndexerSparseAttnFromTopkFunc" in csa_text
@@ -253,7 +361,14 @@ def test_glm5_dsa_training_forward_uses_fused_kernel(monkeypatch):
         calculate_per_token_loss=False,
         value_dim=None,
     ):
-        del attn_sink, q_indexer, k_indexer, weights, softmax_scale, indexer_softmax_scale
+        del (
+            attn_sink,
+            q_indexer,
+            k_indexer,
+            weights,
+            softmax_scale,
+            indexer_softmax_scale,
+        )
         calls["training"] = {
             "query_shape": tuple(query.shape),
             "kv_shape": tuple(kv_full.shape),
@@ -395,6 +510,52 @@ def test_glm5_lite_model_exports_native_state_names():
     assert "head.col.linear.weight" in keys
 
 
+def test_glm52_index_share_shared_layers_omit_indexer_modules(monkeypatch):
+    import pytest
+
+    try:
+        import transformer_engine.pytorch  # noqa: F401
+    except (ModuleNotFoundError, OSError) as exc:
+        pytest.skip(f"Transformer Engine is not importable in this environment: {exc}")
+
+    from megatron.lite.model.glm5.config import Glm5Config
+
+    _use_cpu_transformer_engine_stubs(monkeypatch)
+
+    cfg = Glm5Config(
+        **{
+            **_tiny_config_kwargs(),
+            "num_hidden_layers": 6,
+            "num_nextn_predict_layers": 1,
+        },
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_types=_glm52_indexer_types(num_layers=6),
+    )
+    model = _make_glm5_model(cfg, mtp_enable=True)
+    attention_modules = [layer.self_attention.self_attention for layer in model.layers]
+
+    assert [module.indexer is not None for module in attention_modules] == [
+        True,
+        True,
+        True,
+        False,
+        False,
+        False,
+    ]
+    assert model.mtp is not None
+    mtp_attention = model.mtp.layers[0].transformer_layer.self_attention.self_attention
+    assert mtp_attention.layer_number == 7
+    assert mtp_attention.indexer is not None
+
+    keys = set(model.state_dict())
+    assert "layers.2.self_attention.self_attention.indexer.wq_b.weight" in keys
+    assert "layers.3.self_attention.self_attention.indexer.wq_b.weight" not in keys
+    assert (
+        "mtp.layers.0.transformer_layer.self_attention.self_attention.indexer.wq_b.weight" in keys
+    )
+
+
 @pytest.mark.gpus(1)
 def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     import torch
@@ -459,9 +620,7 @@ def test_glm5_checkpoint_exports_and_saves_hf_style_weights(tmp_path):
     loaded_bf16 = _make_glm5_model(cfg, ps=ps)
     load_hf_weights(loaded_bf16, str(hf_bf16_dir), cfg, ps)
     assert torch.equal(
-        loaded_bf16.state_dict()["layers.1.moe.experts.fc1.weight2"][
-            cfg.moe_intermediate_size :
-        ]
+        loaded_bf16.state_dict()["layers.1.moe.experts.fc1.weight2"][cfg.moe_intermediate_size :]
         .detach()
         .cpu(),
         state["layers.1.moe.experts.fc1.weight2"][cfg.moe_intermediate_size :]
@@ -514,25 +673,141 @@ def test_glm5_checkpoint_exports_and_loads_mtp_layers(tmp_path):
     )
 
 
+def test_glm52_checkpoint_mapping_skips_shared_indexer_without_te():
+    import importlib.util
+    import torch
+
+    from megatron.lite.model.glm5.config import Glm5Config
+
+    checkpoint_path = (
+        Path(__file__).resolve().parents[3]
+        / "megatron"
+        / "lite"
+        / "model"
+        / "glm5"
+        / "lite"
+        / "checkpoint.py"
+    )
+    module_spec = importlib.util.spec_from_file_location("_glm5_checkpoint_test", checkpoint_path)
+    assert module_spec is not None and module_spec.loader is not None
+    checkpoint_module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(checkpoint_module)
+
+    cfg = Glm5Config(
+        **{
+            **_tiny_config_kwargs(),
+            "num_hidden_layers": 6,
+            "num_nextn_predict_layers": 1,
+        },
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_types=_glm52_indexer_types(num_layers=6),
+        index_share_for_mtp_iteration=True,
+    )
+    spec = checkpoint_module.Glm5WeightSpec(cfg)
+    tensor = torch.ones(1)
+
+    assert spec.native_to_hf(
+        "layers.2.self_attention.self_attention.indexer.wq_b.weight", tensor
+    ) == [("model.layers.2.self_attn.indexer.wq_b.weight", tensor)]
+    assert (
+        spec.native_to_hf("layers.3.self_attention.self_attention.indexer.wq_b.weight", tensor)
+        == []
+    )
+    assert spec.native_to_hf(
+        "mtp.layers.0.transformer_layer.self_attention.self_attention.indexer.wq_b.weight",
+        tensor,
+    ) == [("model.layers.6.self_attn.indexer.wq_b.weight", tensor)]
+
+    # Loading is now driven by the declarative HFWeights map rather than the
+    # removed private _load_attention helper.  A shared-indexer layer must
+    # retain every regular attention mapping while omitting every indexer one.
+    weight_map = spec.weight_map()
+    layer3 = {
+        native_name: hf_names
+        for native_name, hf_names in weight_map.items()
+        if native_name.startswith("layers.3.self_attention.self_attention.")
+    }
+    assert "layers.3.self_attention.self_attention.q_a_proj.weight" in layer3
+    assert not any(".indexer." in name for name in layer3)
+
+
+def test_glm52_checkpoint_skips_shared_indexer_weights_and_loads_full_layers(
+    tmp_path, monkeypatch
+):
+    import pytest
+    import torch
+
+    try:
+        import transformer_engine.pytorch  # noqa: F401
+    except (ModuleNotFoundError, OSError) as exc:
+        pytest.skip(f"Transformer Engine is not importable in this environment: {exc}")
+
+    from megatron.lite.model.glm5.config import Glm5Config
+    from megatron.lite.model.glm5.lite.checkpoint import export_hf_weights, load_hf_weights
+    from megatron.lite.primitive.ckpt.hf_weights import save_safetensors
+    from megatron.lite.primitive.parallel import ParallelState
+
+    _use_cpu_transformer_engine_stubs(monkeypatch)
+
+    cfg = Glm5Config(
+        **{
+            **_tiny_config_kwargs(),
+            "num_hidden_layers": 6,
+            "num_nextn_predict_layers": 1,
+        },
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_types=_glm52_indexer_types(num_layers=6),
+        index_share_for_mtp_iteration=True,
+    )
+    ps = ParallelState()
+    model = _make_glm5_model(cfg, ps=ps, mtp_enable=True)
+    state = model.state_dict()
+
+    exported = dict(export_hf_weights(model, cfg, ps))
+    assert "model.layers.2.self_attn.indexer.wq_b.weight" in exported
+    assert "model.layers.3.self_attn.indexer.wq_b.weight" not in exported
+    assert "model.layers.6.self_attn.indexer.wq_b.weight" in exported
+
+    save_safetensors(exported, str(tmp_path))
+    loaded = _make_glm5_model(cfg, ps=ps, mtp_enable=True)
+    load_hf_weights(loaded, str(tmp_path), cfg, ps)
+    loaded_state = loaded.state_dict()
+
+    assert torch.equal(
+        loaded_state["layers.2.self_attention.self_attention.indexer.wq_b.weight"],
+        state["layers.2.self_attention.self_attention.indexer.wq_b.weight"],
+    )
+    assert "layers.3.self_attention.self_attention.indexer.wq_b.weight" not in loaded_state
+    assert torch.equal(
+        loaded_state[
+            "mtp.layers.0.transformer_layer.self_attention.self_attention.indexer.wq_b.weight"
+        ],
+        state["mtp.layers.0.transformer_layer.self_attention.self_attention.indexer.wq_b.weight"],
+    )
+
+
 @pytest.mark.gpus(1)
 def test_glm5_router_modules_use_current_names_and_bias_buffers():
     import torch
 
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.model import Glm5SigmoidTopKRouter
 
     model = _make_glm5_model(
         Glm5Config(**_tiny_config_kwargs(), num_nextn_predict_layers=1), mtp_enable=True
     )
-    routers = [module for module in model.modules() if isinstance(module, Glm5SigmoidTopKRouter)]
+    routers = [
+        module
+        for module in model.modules()
+        if type(module).__name__ == "SigmoidTopKRouter"
+    ]
     assert len(routers) == 2
     for router in routers:
         assert hasattr(router, "gate")
         assert hasattr(router, "expert_bias")
         assert torch.isfinite(router.gate.weight).all()
-        assert torch.equal(
-            router.expert_bias, torch.zeros_like(router.expert_bias)
-        )
+        assert torch.equal(router.expert_bias, torch.zeros_like(router.expert_bias))
 
 
 def test_glm5_protocol_allows_cp_only_parallel_scope():
@@ -560,6 +835,71 @@ def test_glm5_impl_config_accepts_runtime_mtp_fields():
     assert ImplConfig(mtp_enable=False, mtp_enable_train=False).mtp_enable is False
     assert ImplConfig(mtp_enable=True, mtp_enable_train=True).mtp_enable_train is True
     assert cfg.num_nextn_predict_layers == 1
+
+
+def test_glm5_dsa_execution_policy_lives_in_impl_config_only(
+    transformer_engine_import_stub,
+):
+    from dataclasses import fields
+
+    transformer_engine_import_stub()
+    from megatron.lite.model.glm5.config import Glm5Config
+    from megatron.lite.model.glm5.lite.protocol import ImplConfig
+
+    architecture_fields = {field.name for field in fields(Glm5Config)}
+
+    assert {
+        "dsa_cp_mode",
+        "dsa_indexer_loss_coeff",
+        "dsa_indexer_use_sparse_loss",
+        "calculate_per_token_loss",
+    }.isdisjoint(architecture_fields)
+    assert ImplConfig().dsa_cp_mode == "native"
+    assert ImplConfig().dsa_indexer_loss_coeff == 0.0
+    assert ImplConfig().dsa_indexer_use_sparse_loss is False
+    assert ImplConfig().calculate_per_token_loss is False
+    assert ImplConfig(dsa_cp_mode="legacy_gather_all").dsa_cp_mode == "legacy_gather_all"
+
+
+def test_glm5_production_cp_path_has_no_zigzag_layout():
+    lite_root = Path(__file__).resolve().parents[3] / "megatron" / "lite"
+    model_text = (lite_root / "model" / "glm5" / "lite" / "model.py").read_text()
+    dsa_text = (lite_root / "primitive" / "modules" / "attention" / "dsa.py").read_text()
+
+    assert "zigzag" not in model_text
+    assert "zigzag" not in dsa_text
+
+
+def test_glm5_attention_receives_impl_dsa_policy(monkeypatch, transformer_engine_import_stub):
+    import torch.nn as nn
+
+    transformer_engine_import_stub()
+    from megatron.lite.model.glm5.config import Glm5Config
+    from megatron.lite.model.glm5.lite import model as model_module
+    from megatron.lite.primitive.parallel import ParallelState
+
+    captured = {}
+
+    class FakeDSA(nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            captured.update(kwargs)
+
+    monkeypatch.setattr(model_module, "DynamicSparseAttention", FakeDSA)
+    model_module.Glm5DSAAttention(
+        Glm5Config(**_tiny_config_kwargs()),
+        ParallelState(cp_size=2, cp_rank=0),
+        0,
+        dsa_cp_mode="legacy_gather_all",
+        dsa_indexer_loss_coeff=0.25,
+        dsa_indexer_use_sparse_loss=True,
+        calculate_per_token_loss=True,
+    )
+
+    assert captured["cp_mode"] == "legacy_gather_all"
+    assert captured["indexer_loss_coeff"] == 0.25
+    assert captured["indexer_use_sparse_loss"] is True
+    assert captured["calculate_per_token_loss"] is True
 
 
 def test_glm5_protocol_uses_mlite_optimizer_api():

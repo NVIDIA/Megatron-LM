@@ -4,21 +4,20 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import transformer_engine.pytorch as te
-# Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core. The
-# lite CSA module reuses Core's differentiable kernels, CP row-mapping utilities,
-# and CuTeDSL layout kernels rather than vendoring them; see the module docstring
-# of ``csa_cp_utils`` / ``csa_cp_layout_kernels`` for the exact contracts.
+
+from megatron.lite.primitive import transformer_engine as te
+# Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core.
+# The development branch groups them under the csa_utils package.
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.transformer.experimental_attention_variant import (
-    csa_cp_layout_kernels,
-    csa_cp_utils as cp_utils,
+from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+    cp_layout_kernels as csa_cp_layout_kernels,
 )
+from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.core.transformer.experimental_attention_variant.csa import (
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,
 )
-from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
+from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
     FusedCSAIndexerSparseAttnFromTopkFunc,
     csa_sparse_attn,
 )
@@ -41,6 +40,9 @@ class GroupedLinear(nn.Module):
         self.out_features = out_features
         self.n_groups = n_groups
         self.weight = nn.Parameter(torch.empty(out_features, in_features_per_group))
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -149,13 +151,17 @@ class CompressedSequenceCompressor(nn.Module):
         self.overlap = compress_ratio == 4
         self.coff = 2 if self.overlap else 1
         self.rotate = rotate
+        self.initializer_range = config.initializer_range
         self.wkv = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
         self.wgate = nn.Linear(config.hidden_size, self.coff * head_dim, bias=False)
         self.ape = nn.Parameter(
             torch.empty(compress_ratio, self.coff * head_dim, dtype=torch.float32)
         )
         self.norm = te.RMSNorm(head_dim, eps=config.rms_norm_eps)
-        nn.init.normal_(self.ape, mean=0.0, std=config.initializer_range)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.normal_(self.ape, mean=0.0, std=self.initializer_range)
 
     def _overlap_transform(self, tensor: torch.Tensor, fill_value: float) -> torch.Tensor:
         bsz, n_blocks, ratio, _, head_dim = tensor.shape

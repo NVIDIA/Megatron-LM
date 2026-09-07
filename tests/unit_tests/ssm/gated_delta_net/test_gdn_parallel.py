@@ -112,6 +112,8 @@ def test_parallel_gated_delta_net_correctness(
         sequence_length=256,
         micro_batch_size=micro_batch_size,
         sequence_packing=sequence_packing,
+        cp_partition_mode="contiguous" if is_chunkwise_cp else "zigzag",
+        compare_param_grads=is_chunkwise_cp and tp == 1 and not sequence_packing,
     )
 
 

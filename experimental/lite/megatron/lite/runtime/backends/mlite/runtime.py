@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import gc
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import fields as dc_fields
 from datetime import timedelta
 from itertools import chain
@@ -13,11 +13,16 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
-from megatron.lite.runtime.contracts.loss import get_loss_context, split_loss_context, use_loss_context
+from megatron.lite.runtime.contracts.loss import (
+    get_loss_context,
+    split_loss_context,
+    use_loss_context,
+)
 
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
@@ -51,6 +56,39 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     return proto.ImplConfig(**impl_cfg_kwargs)
 
 
+def _reset_parameters(module: torch.nn.Module) -> None:
+    reset = getattr(module, "reset_parameters", None)
+    if not callable(reset):
+        return
+
+    original_parameters = dict(module.named_parameters(recurse=False))
+    reset()
+    with torch.no_grad():
+        for name, original in original_parameters.items():
+            replacement = module._parameters.get(name)
+            if replacement is None:
+                raise RuntimeError(f"{type(module).__name__}.reset_parameters() removed {name!r}.")
+            if replacement is original:
+                continue
+            original_local = original.to_local() if isinstance(original, DTensor) else original
+            replacement_local = (
+                replacement.to_local() if isinstance(replacement, DTensor) else replacement
+            )
+            if original_local.shape != replacement_local.shape:
+                raise RuntimeError(
+                    f"{type(module).__name__}.reset_parameters() changed {name!r} shape "
+                    f"from {tuple(original_local.shape)} to {tuple(replacement_local.shape)}."
+                )
+            if original_local.data_ptr() != replacement_local.data_ptr():
+                original_local.copy_(
+                    replacement_local.to(
+                        device=original_local.device,
+                        dtype=original_local.dtype,
+                    )
+                )
+            module._parameters[name] = original
+
+
 def _apply_attention_backend_env(backend: str | None, *, tag: str) -> None:
     if backend is None:
         return
@@ -61,12 +99,16 @@ def _apply_attention_backend_env(backend: str | None, *, tag: str) -> None:
         "fused": ("0", "1", "0"),
         "unfused": ("0", "0", "1"),
         "local": ("0", "0", "0"),
+        # Magi owns core attention and ignores these TE selectors. Keep TE's
+        # auto-selection available so a built model can hot-swap back to TE.
+        "magi": ("1", "1", "1"),
     }
     try:
         flash, fused, unfused = env_overrides[backend]
     except KeyError as exc:
         raise ValueError(
-            "attention_backend_override must be one of {'auto', 'flash', 'fused', 'unfused', 'local'}"
+            "attention_backend_override must be one of "
+            "{'auto', 'flash', 'fused', 'unfused', 'local', 'magi'}"
         ) from exc
 
     os.environ["NVTE_FLASH_ATTN"] = flash
@@ -171,6 +213,14 @@ class MegatronLiteRuntime(RuntimeBase):
             if isinstance(cfg, MegatronLiteConfig)
             else MegatronLiteConfig.from_dict(hf_path, cfg)
         )
+        plugins = self._cfg.impl_cfg.get("runtime_plugins", {})
+        if not isinstance(plugins, Mapping):
+            raise TypeError("impl_cfg.runtime_plugins must be a mapping.")
+        dynamic_cp = plugins.get("dynamic_context_parallel")
+        if dynamic_cp:
+            from megatron.lite.runtime.backends.mlite.dynamic_cp import install
+
+            install(self, dynamic_cp)
 
     # ── build_model ──
 
@@ -214,6 +264,14 @@ class MegatronLiteRuntime(RuntimeBase):
 
         # ── build model (model owns ps + optimizer + everything) ──
         bundle = proto.build_model(model_cfg, impl_cfg=impl_cfg)
+        meta_initialized = any(
+            param.is_meta for chunk in bundle.chunks for param in chunk.parameters()
+        )
+        if meta_initialized:
+            bundle.optimizer = bundle.extras.pop("post_model_load_hook")()["optimizer"]
+            if not rt_cfg.load_hf_weights:
+                for chunk in bundle.chunks:
+                    chunk.apply(_reset_parameters)
 
         # ── load HF weights (optional) ──
         loaded_hf_weights = False
@@ -238,7 +296,7 @@ class MegatronLiteRuntime(RuntimeBase):
                         raise TypeError("post_model_load_hook extras update must be a dict.")
                     bundle.extras.update(extra_updates)
 
-        if loaded_hf_weights and bundle.optimizer is not None:
+        if (loaded_hf_weights or meta_initialized) and bundle.optimizer is not None:
             reload_model_params = getattr(bundle.optimizer, "reload_model_params", None)
             if callable(reload_model_params):
                 reload_model_params()

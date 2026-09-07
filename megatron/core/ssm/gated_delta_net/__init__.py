@@ -20,11 +20,19 @@ from megatron.core.ssm.gated_delta_net.common import (
     tensor_a2a_hp2cp,
 )
 from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet, torch_chunk_gated_delta_rule
+from megatron.core.ssm.gated_delta_net.kda import (
+    HAVE_FLA_KDA,
+    KimiDeltaAttention,
+    KimiDeltaAttentionSubmodules,
+)
 
 __all__ = [
     "HAVE_FLA",
+    "HAVE_FLA_KDA",
     "GatedDeltaNet",
     "GatedDeltaNetSubmodules",
+    "KimiDeltaAttention",
+    "KimiDeltaAttentionSubmodules",
     "_split_tensor_factory",
     "causal_conv1d",
     "chunk_gated_delta_rule",

@@ -914,6 +914,211 @@ class TestDsaFwdFlashMla:
 
 
 # ---------------------------------------------------------------------------
+# CP communication overlap scheduling
+# ---------------------------------------------------------------------------
+
+
+class TestCPCommunicationOverlap:
+    """Validate branch-local collective waits."""
+
+    def test_deferred_reduce_scatter_wait_is_branch_local(self):
+        source = torch.ones(4, requires_grad=True)
+        edge, state = dk.defer_reduce_scatter_wait(source)
+        events = []
+
+        class FakeHandle:
+            tensor = torch.full_like(source, 3.0)
+
+            def wait(self):
+                events.append("wait")
+                return self.tensor
+
+        state.handle = FakeHandle()
+        (edge * 2.0).sum().backward()
+
+        assert events == ["wait"]
+        assert state.handle is None
+        assert torch.equal(source.grad, torch.full_like(source, 3.0))
+
+    def test_deferred_reduce_scatter_wait_requires_published_handle(self):
+        source = torch.ones(1, requires_grad=True)
+        edge, _ = dk.defer_reduce_scatter_wait(source)
+
+        with pytest.raises(
+            RuntimeError, match="Deferred reduce-scatter was not launched before consumption"
+        ):
+            edge.sum().backward()
+
+    def test_deferred_reduce_scatter_waits_follow_consumer_branch_order(self):
+        events = []
+
+        class FakeHandle:
+            def __init__(self, name):
+                self.name = name
+                self.tensor = torch.ones(1)
+
+            def wait(self):
+                events.append(f"wait_{self.name}")
+                return self.tensor
+
+        class RecordBranch(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, input_, name):
+                ctx.name = name
+                return input_.view_as(input_)
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                events.append(ctx.name)
+                return grad_output, None
+
+        class JoinBranches(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, indexer, compressed_kv, independent):
+                return indexer + compressed_kv + independent
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                events.append("fused")
+                return grad_output, grad_output, grad_output
+
+        indexer_source = torch.ones(1, requires_grad=True)
+        indexer_compressed = RecordBranch.apply(indexer_source, "indexer_compressor")
+        indexer_edge, indexer_state = dk.defer_reduce_scatter_wait(
+            indexer_compressed, "indexer_wait"
+        )
+
+        compressed_kv_source = torch.ones(1, requires_grad=True)
+        compressed_kv = RecordBranch.apply(compressed_kv_source, "attention_kv_compressor")
+        compressed_kv_edge, compressed_kv_state = dk.defer_reduce_scatter_wait(
+            compressed_kv, "compressed_kv_wait"
+        )
+
+        independent_source = torch.ones(1, requires_grad=True)
+        independent = RecordBranch.apply(independent_source, "q_weight_branch")
+        indexer_state.handle = FakeHandle("indexer")
+        compressed_kv_state.handle = FakeHandle("compressed_kv")
+
+        JoinBranches.apply(indexer_edge, compressed_kv_edge, independent).sum().backward()
+
+        assert events == [
+            "fused",
+            "q_weight_branch",
+            "wait_compressed_kv",
+            "attention_kv_compressor",
+            "wait_indexer",
+            "indexer_compressor",
+        ]
+
+    def test_cp_backward_launches_collectives_in_dependency_order(
+        self, monkeypatch, reset_lazy_kernel_state
+    ):
+        events = []
+
+        class FakeGroup:
+            @staticmethod
+            def size():
+                return 2
+
+        class FakeHandle:
+            def __init__(self, name, tensor):
+                self.name = name
+                self.tensor = tensor
+
+            def wait(self):
+                events.append(f"wait_{self.name}")
+                return self.tensor
+
+        handles = {}
+
+        def fake_reduce_scatter(input_, group):
+            name = "indexer" if input_.shape[-1] == 3 else "compressed_kv"
+            events.append(f"launch_{name}")
+            handle = FakeHandle(name, input_[: input_.shape[0] // group.size()].clone())
+            handles[name] = handle
+            return handle
+
+        query = torch.zeros(2, 1, 5)
+        kv_full = torch.zeros(6, 5)
+        attn_sink = torch.zeros(1)
+        topk_idxs = torch.zeros(2, 1, dtype=torch.int32)
+        topk_length = torch.ones(2, dtype=torch.int32)
+        out_flat = torch.zeros(2, 1, 5)
+        lse = torch.zeros(2, 1)
+        saved_grad_q_indexer = torch.ones(2, 1, 3)
+        saved_grad_k_indexer = torch.ones(4, 3)
+        saved_grad_weights = torch.ones(2, 1)
+        indexer_rank_map = torch.empty(0, dtype=torch.int32)
+
+        def fake_sparse_attention_backward(*args, **kwargs):
+            events.append("sparse_attention_backward")
+            return {
+                "dq": torch.ones_like(query),
+                "dkv": torch.ones_like(kv_full),
+                "d_sink": torch.ones_like(attn_sink),
+            }
+
+        dk._DSA = types.SimpleNamespace(
+            sparse_attention_backward_wrapper=fake_sparse_attention_backward
+        )
+        monkeypatch.setattr(dk, "async_reduce_scatter_along_first_dim", fake_reduce_scatter)
+        monkeypatch.setattr(dk, "nvtx_range_push", lambda *_args: None)
+        monkeypatch.setattr(dk, "nvtx_range_pop", lambda *_args: None)
+
+        indexer_state = dk._DeferredReduceScatterState("indexer_wait")
+        compressed_kv_state = dk._DeferredReduceScatterState("compressed_kv_wait")
+
+        class FakeContext:
+            saved_tensors = (
+                query,
+                kv_full,
+                attn_sink,
+                topk_idxs,
+                topk_length,
+                out_flat,
+                lse,
+                saved_grad_q_indexer,
+                saved_grad_k_indexer,
+                saved_grad_weights,
+                indexer_rank_map,
+            )
+            cp_group = FakeGroup()
+            compressed_kv_start = 2
+            indexer_k_reduce_scatter_state = indexer_state
+            compressed_kv_reduce_scatter_state = compressed_kv_state
+            indexer_grad_is_sequence_major = False
+            local_k_indexer_rows = 2
+            local_compressed_kv_rows = 2
+            softmax_scale = 0.5
+            q_padding_mask = None
+            num_forward_inputs = 25
+
+        gradients = FusedCSAIndexerSparseAttnFromTopkFunc.backward(
+            FakeContext(), torch.ones(2, 5), torch.ones(())
+        )
+
+        assert len(gradients) == 25
+        assert events == ["sparse_attention_backward", "launch_compressed_kv", "launch_indexer"]
+        assert gradients[18] is handles["indexer"].tensor
+        assert gradients[19] is handles["compressed_kv"].tensor
+        assert gradients[18].shape == (2, 3)
+        assert gradients[19].shape == (2, 5)
+        assert indexer_state.handle is handles["indexer"]
+        assert compressed_kv_state.handle is handles["compressed_kv"]
+
+        indexer_state.handle.wait()
+        compressed_kv_state.handle.wait()
+        assert events[-2:] == ["wait_indexer", "wait_compressed_kv"]
+
+        FakeContext.cp_group = None
+        FakeContext.num_forward_inputs = 18
+        legacy_gradients = FusedCSAIndexerSparseAttnFromTopkFunc.backward(
+            FakeContext(), torch.ones(2, 5), torch.ones(())
+        )
+        assert len(legacy_gradients) == 18
+
+
+# ---------------------------------------------------------------------------
 # indexer_topk — cudnn DSA wrapper for inference
 # ---------------------------------------------------------------------------
 

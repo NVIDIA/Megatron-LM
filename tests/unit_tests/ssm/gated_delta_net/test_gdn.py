@@ -58,12 +58,24 @@ def _make_gdn_config(**overrides):
         "num_attention_heads": 8,
         "activation_func": F.silu,
         "bf16": True,
-        "experimental_attention_variant": "gated_delta_net",
+        "experimental_attention_variant": "gdn",
         "linear_attention_freq": [1],
         "transformer_impl": "transformer_engine",
     }
     config_kwargs.update(overrides)
     return TransformerConfig(**config_kwargs)
+
+
+def _set_gdn_test_cp_partition_mode(packed_seq_params, cp_size, linear_cp_mode):
+    if cp_size <= 1:
+        return packed_seq_params
+    if linear_cp_mode == "headwise":
+        packed_seq_params.cp_partition_mode = "zigzag"
+    elif linear_cp_mode == "chunkwise":
+        packed_seq_params.cp_partition_mode = "contiguous"
+    else:
+        raise ValueError(f"Invalid linear CP mode: {linear_cp_mode}")
+    return packed_seq_params
 
 
 def test_gdn_pre_gated_delta_rule_fusion_defaults_to_disabled():
@@ -77,7 +89,7 @@ def test_gdn_pre_gated_delta_rule_fusion_accepts_gdn_variant():
 
 
 def test_gdn_pre_gated_delta_rule_fusion_requires_gdn_variant():
-    with pytest.raises(ValueError, match="experimental_attention_variant='gated_delta_net'"):
+    with pytest.raises(ValueError, match="experimental_attention_variant='gdn'"):
         _make_gdn_config(
             experimental_attention_variant=None,
             linear_attention_freq=None,
@@ -90,6 +102,16 @@ def test_gdn_norm_out_recompute_accepts_gdn_variant():
     assert "gdn_norm_out" in config.recompute_modules
 
 
+def test_gdn_norm_out_recompute_rejects_non_hybrid_non_gdn_config():
+    with pytest.raises(ValueError, match="gdn_norm_out in recompute_modules"):
+        _make_gdn_config(
+            experimental_attention_variant=None,
+            linear_attention_freq=None,
+            recompute_granularity="selective",
+            recompute_modules=["gdn_norm_out"],
+        )
+
+
 def test_gdn_and_norm_out_recompute_are_mutually_exclusive():
     with pytest.raises(ValueError, match="'gdn' and 'gdn_norm_out'"):
         _make_gdn_config(
@@ -97,14 +119,18 @@ def test_gdn_and_norm_out_recompute_are_mutually_exclusive():
         )
 
 
-def test_gdn_norm_out_recompute_requires_gdn_variant():
-    with pytest.raises(ValueError, match="experimental_attention_variant='gated_delta_net'"):
-        _make_gdn_config(
-            experimental_attention_variant=None,
-            linear_attention_freq=None,
-            recompute_granularity="selective",
-            recompute_modules=["gdn_norm_out"],
-        )
+def test_gdn_norm_out_recompute_accepts_non_experimental_hybrid_config():
+    # Hybrid specs select GDN/KDA per layer without setting a global
+    # experimental_attention_variant, so the selector must remain valid here.
+    config = _make_gdn_config(
+        experimental_attention_variant=None,
+        is_hybrid_model=True,
+        linear_attention_freq=None,
+        recompute_granularity="selective",
+        recompute_modules=["gdn_norm_out"],
+    )
+
+    assert config.recompute_modules == ["gdn_norm_out"]
 
 
 def test_gdn_conv_pad_alignment_rejects_chunkwise_cp():
@@ -203,7 +229,8 @@ class TestGatedDeltaNet:
         # Get TP and CP process groups from device mesh
         tp_group = parallel_state.get_tensor_model_parallel_group()
         cp_group = parallel_state.get_context_parallel_group()
-        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+        tp_cp_group = parallel_state.get_tensor_and_context_parallel_group()
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group, tp_cp=tp_cp_group)
 
         # Initialize model, with the same config as Qwen Next except `num_layers`
         self.transformer_config = TransformerConfig(
@@ -577,7 +604,9 @@ class TestGatedDeltaNet:
 
         assert g.dtype == torch.float32
         assert g.shape == (batch, seq_len, num_v_heads_local)
+        assert beta_out.dtype == torch.float32
         assert beta_out.shape == (batch, seq_len, num_v_heads_local)
+        torch.testing.assert_close(beta_out, gate_feats[0].float().sigmoid())
 
     def test_fused_pre_gated_delta_rule_headwise_cp_uses_cp_local_parameters(self):
         if not HAVE_FUSED_PRE_GDR:
@@ -667,6 +696,7 @@ class TestGatedDeltaNet:
         hidden_states_thd = hidden_states_thd.view(-1, 1, self.gdn.config.hidden_size)
         attention_mask_thd = None
         packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+        _set_gdn_test_cp_partition_mode(packed_seq_params, self.cp_size, self.linear_cp_mode)
 
         # THD format
         output_thd, _ = self.gdn(
@@ -718,6 +748,7 @@ class TestGatedDeltaNet:
         padded_params = make_test_packed_seq_params_with_padding(
             cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 128]
         )
+        _set_gdn_test_cp_partition_mode(padded_params, self.cp_size, self.linear_cp_mode)
         output_thd_padded, _ = self.gdn(hidden_states_thd, None, packed_seq_params=padded_params)
         output_thd2bshd = output_thd_padded.view(*output_bshd.shape)
         torch.testing.assert_close(
@@ -730,6 +761,7 @@ class TestGatedDeltaNet:
 
         # B) no-padded branch: use actual cu_seqlens when it matches total_sequence_length.
         no_padding_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 128])
+        _set_gdn_test_cp_partition_mode(no_padding_params, self.cp_size, self.linear_cp_mode)
         output_thd_no_padding, _ = self.gdn(
             hidden_states_thd, None, packed_seq_params=no_padding_params
         )
@@ -755,11 +787,13 @@ class TestGatedDeltaNet:
         padded_mismatch_params = make_test_packed_seq_params_with_padding(
             cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 126]
         )
+        _set_gdn_test_cp_partition_mode(padded_mismatch_params, self.cp_size, self.linear_cp_mode)
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=padded_mismatch_params)
 
         # E) actual mismatch branch without *_padded: should raise.
         actual_mismatch_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 129])
+        _set_gdn_test_cp_partition_mode(actual_mismatch_params, self.cp_size, self.linear_cp_mode)
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=actual_mismatch_params)
 

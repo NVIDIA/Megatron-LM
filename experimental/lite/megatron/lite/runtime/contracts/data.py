@@ -43,6 +43,9 @@ class PackedBatch(Batch):
     loss_mask: torch.Tensor | None = None  # [total_tokens]
     position_ids: torch.Tensor | None = None  # [total_tokens], auto if None
     routed_experts: torch.Tensor | None = None
+    r3_replay_mask: torch.Tensor | None = (
+        None  # caller-provided causal replay mask [total_tokens]
+    )
     extras: dict[str, Any] = field(default_factory=dict)
 
     def __len__(self) -> int:

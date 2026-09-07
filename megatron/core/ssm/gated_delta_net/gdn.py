@@ -12,10 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
-from megatron.core.context_parallel_layout import (
-    contiguous_to_zigzag_chunks,
-    zigzag_to_contiguous_chunks,
-)
+from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
@@ -34,7 +31,8 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
 
 
 class GatedDeltaNet(_GDNBase):
-    # pylint: disable=missing-class-docstring
+    """Gated DeltaNet with a head-wise scalar memory-decay gate."""
+
     def _setup_variant_attrs(self):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
         self.gdn_pre_gated_delta_rule_fusion = self.config.gdn_pre_gated_delta_rule_fusion
@@ -89,8 +87,22 @@ class GatedDeltaNet(_GDNBase):
         # ``gate_feats`` arrives in ``in_proj_split_names`` order: beta, then alpha.
         beta, alpha = gate_feats
         g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
-        beta = beta.sigmoid()
+        beta = beta.float().sigmoid()
         return g, {"beta": beta.contiguous()}
+
+    @jit_fuser
+    def _apply_gated_norm(self, x, gate):
+        # Output norm. X is contiguous, so flattening it preserves a view.
+        x_dtype = x.dtype
+        original_shape = x.shape
+        y = self.out_norm(x.reshape(-1, x.shape[-1])).reshape(original_shape)
+
+        # Output gate. In the fused pre-GDR path, gate is a strided view of
+        # qkvzba's Z channels. Keep it 4-D so this pointwise operation reads Z
+        # through its strides instead of reshape() materializing a copy.
+        y = y * self.act_fn(gate.float())
+        y = y.to(x_dtype)
+        return y
 
     def forward(
         self,
@@ -113,7 +125,8 @@ class GatedDeltaNet(_GDNBase):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        base_cp_group = pg_collection.cp if pg_collection is not None else self.pg_collection.cp
+        active_pg_collection = pg_collection if pg_collection is not None else self.pg_collection
+        base_cp_group = active_pg_collection.cp
         cp_group = resolve_cp_group(base_cp_group, packed_seq_params)
         if self.config.linear_cp_mode == "chunkwise":
             cp_group_chunkwise = cp_group
@@ -132,6 +145,18 @@ class GatedDeltaNet(_GDNBase):
         cp_size_chunkwise = cp_group_chunkwise.size() if cp_group_chunkwise is not None else 1
         cp_size_headwise = cp_group_headwise.size() if cp_group_headwise is not None else 1
         cp_size_runtime = cp_group.size()
+        back_to_input_converter = None
+        if self.config.linear_cp_mode == "chunkwise":
+            hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
+                hidden_states=hidden_states,
+                packed_seq_params=packed_seq_params,
+                cp_group=cp_group_chunkwise,
+                tp_group=self.tp_group,
+                tp_cp_group=getattr(active_pg_collection, "tp_cp", None),
+                target_partition_mode="contiguous",
+                sequence_parallel=self.config.sequence_parallel,
+                config=self.config,
+            )
 
         seq_len_local, batch, _ = hidden_states.shape
         seq_len_post_headwise = seq_len_local * self.sp_size * cp_size_headwise
@@ -144,6 +169,22 @@ class GatedDeltaNet(_GDNBase):
             assert not self.config.sequence_parallel
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
+
+        if cp_size_headwise > 1 and (
+            (
+                packed_seq_params is not None
+                and packed_seq_params.qkv_format == "thd"
+                and packed_seq_params.cp_partition_mode != "zigzag"
+            )
+            or (
+                (packed_seq_params is None or packed_seq_params.qkv_format != "thd")
+                and self.config.cp_partition_mode != "zigzag"
+            )
+        ):
+            raise ValueError(
+                "GatedDeltaNet with headwise CP requires zigzag layout. CP partition "
+                "conversion must be handled before calling GatedDeltaNet."
+            )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
@@ -238,6 +279,11 @@ class GatedDeltaNet(_GDNBase):
                 chunkwise_cp_context,
             )
 
+        if back_to_input_converter is not None:
+            out = back_to_input_converter.convert(
+                out, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+            )
+
         return out, out_bias
 
     def _forward_compute(
@@ -258,18 +304,6 @@ class GatedDeltaNet(_GDNBase):
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
-
-        # TODO: Move CP layout ownership to a model/region-level scheduler so hybrid models can
-        # enter contiguous layout before GDN regions instead of paying module-local conversions.
-        if cp_size_chunkwise > 1:
-            nvtx_range_push(suffix="zigzag_to_contiguous")
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                qkvzba = zigzag_to_contiguous_chunks(
-                    qkvzba, cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
-                )
-            else:
-                qkvzba = zigzag_to_contiguous_chunks(qkvzba, cp_group_chunkwise, seq_dim=0)
-            nvtx_range_pop(suffix="zigzag_to_contiguous")
 
         qkvzba, thd_cp_a2a_inv = a2a_cp_to_hp(
             qkvzba,
@@ -413,20 +447,6 @@ class GatedDeltaNet(_GDNBase):
 
         norm_out = norm_out.reshape(batch, seq_len, -1)
         norm_out = norm_out.transpose(0, 1).contiguous()
-
-        # TODO: The planned CP layout refactor should keep consecutive GDN layers contiguous and
-        # restore zigzag only at SDPA/canonical-layout boundaries.
-        if cp_size_chunkwise > 1:
-            nvtx_range_push(suffix="contiguous_to_zigzag")
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                norm_out = contiguous_to_zigzag_chunks(
-                    norm_out, cp_group=cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
-                )
-            else:
-                norm_out = contiguous_to_zigzag_chunks(
-                    norm_out, cp_group=cp_group_chunkwise, seq_dim=0
-                )
-            nvtx_range_pop(suffix="contiguous_to_zigzag")
 
         return a2a_hp_to_cp(
             norm_out, cp_size_headwise, cp_group_headwise, packed_seq_params, thd_cp_a2a_inv

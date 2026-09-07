@@ -1,11 +1,10 @@
 ENV_VARS:
-  SKIP_PYTEST: 1
   CUDA_DEVICE_MAX_CONNECTIONS: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
   ARTIFACTS_ROOT: /workspace/checkpoints
-  DISTILL_CONFIG: '{intermediate_layer_pairs: [["decoder.final_layernorm", "decoder.final_layernorm"]], logit_layers: ["output_layer", "output_layer"], skip_lm_loss: true, kd_loss_scale: 10.0}'
+  DISTILL_CONFIG: '{intermediate_layer_pairs: [["decoder.final_layernorm", "decoder.final_layernorm"]], logit_layers: ["output_layer", "output_layer"], skip_lm_loss: true, kd_loss_scale: 1.0}'
 BEFORE_SCRIPT: |
   mkdir -p ${DATA_CACHE_PATH}/distill && echo $DISTILL_CONFIG | yq -P > ${DATA_CACHE_PATH}/distill/distill_config.yaml
 MODEL_ARGS:
@@ -68,4 +67,8 @@ MODEL_ARGS:
   --log-memory-to-tensorboard: true
   --async-save: true
   --use-persistent-ckpt-worker: true
+  --exit-interval: 100
 TEST_TYPE: ckpt-resume
+METRICS:
+  - lm loss
+  - total loss

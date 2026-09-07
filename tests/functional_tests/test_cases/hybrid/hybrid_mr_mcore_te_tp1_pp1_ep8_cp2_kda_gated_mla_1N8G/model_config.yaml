@@ -1,0 +1,128 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  NON_DETERMINSTIC_RESULTS: 1
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  ENABLE_LIGHTWEIGHT_MODE: true
+
+MODEL_ARGS:
+  # Reduced Hybrid stack: 3 KDA, 1 MLA, 1 dense MLP, 3 MoE, and 1 MTP depth.
+  --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec]"
+  --hybrid-layer-pattern: K-KEKE+E/+E
+
+  # Self-contained mock-data setup.
+  --mock-data: true
+  --tokenizer-type: NullTokenizer
+  --vocab-size: 4096
+  --make-vocab-size-divisible-by: 128
+  --seq-length: 256
+  --max-position-embeddings: 256
+  --micro-batch-size: 1
+  --global-batch-size: 8
+  --train-iters: 50
+  --eval-interval: 1000000000
+  --eval-iters: 0
+
+  # Reduced model dimensions exercise the attention and FFN paths.
+  --hidden-size: 512
+  --num-attention-heads: 8
+  --kv-channels: 64
+  --ffn-hidden-size: 1536
+  --normalization: RMSNorm
+  --norm-epsilon: 1.0e-6
+  --swiglu: true
+  --disable-bias-linear: true
+  --untie-embeddings-and-output-weights: true
+  --position-embedding-type: rope
+  --rotary-percent: 0.5
+  --rotary-base: 6000000
+  --transformer-impl: transformer_engine
+  --attention-backend: fused
+
+  # One-node topology exercises the EP=8 and CP=2 paths.
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --expert-model-parallel-size: 8
+  --context-parallel-size: 2
+  --linear-cp-mode: headwise
+  --cp-comm-type: p2p
+  --distributed-backend: nccl
+
+  # Grouped sigmoid MoE routing with 32 experts.
+  --num-experts: 32
+  --moe-ffn-hidden-size: 256
+  --moe-shared-expert-intermediate-size: 256
+  --moe-router-topk: 8
+  --moe-router-score-function: sigmoid
+  --moe-router-dtype: fp32
+  --moe-router-topk-scaling-factor: 2.5
+  --moe-router-num-groups: 8
+  --moe-router-group-topk: 4
+  --moe-router-enable-expert-bias: true
+  --moe-router-bias-update-rate: 0.0
+  --moe-router-load-balancing-type: none
+  --moe-z-loss-coeff: 2.9e-6
+  --moe-token-dispatcher-type: alltoall
+  --moe-grouped-gemm: true
+
+  # Kimi Delta Attention.
+  --linear-conv-kernel-dim: 4
+  --linear-key-head-dim: 64
+  --linear-value-head-dim: 64
+  --linear-num-key-heads: 8
+  --linear-num-value-heads: 8
+  --kda-safe-gate: true
+  --kda-lower-bound: -5.0
+
+  # Gated MLA with native unequal QK/V head dimensions.
+  --multi-latent-attention: true
+  --q-lora-rank: 128
+  --kv-lora-rank: 256
+  --qk-head-dim: 64
+  --qk-pos-emb-head-dim: 32
+  --v-head-dim: 64
+  --qk-layernorm: true
+  --attention-output-gate: true
+  --gated-attention-proj-granularity: headwise
+
+  # One MTP depth represented by the pattern suffix after '/'.
+  --mtp-num-layers: 1
+  --mtp-loss-scaling-factor: 0.1
+
+  --recompute-granularity: full
+  --recompute-method: uniform
+  --recompute-num-layers: 1
+  --bf16: true
+  --optimizer: adam
+  --lr: 1.0e-4
+  --min-lr: 1.0e-4
+  --lr-decay-style: constant
+  --weight-decay: 0.1
+  --clip-grad: 1.0
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --seed: 1234
+
+  --log-interval: 1
+  --log-num-zeros-in-grad: true
+  --log-params-norm: true
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --ckpt-format: torch_dist
+  --timing-log-level: 0
+
+TEST_TYPE: ckpt-resume
+METRICS:
+  - lm loss
+  - mtp_1 loss
+  - grad-norm
+  - z_loss
+  - num-zeros
+  - mem-allocated-bytes
+  - mem-max-allocated-bytes
+LAUNCHER: ft_launcher
