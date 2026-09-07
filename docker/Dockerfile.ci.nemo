@@ -8,6 +8,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends gettext && \
     apt-get clean && \
     wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq && \
+    echo "6dc2d0cd4e0caca5aeffd0d784a48263591080e4a0895abe69f3a76eb50d1ba3  /usr/local/bin/yq" | sha256sum --check - && \
     chmod a+x /usr/local/bin/yq
 
 ##### For NVIDIANS only #####

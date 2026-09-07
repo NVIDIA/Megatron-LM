@@ -312,7 +312,7 @@ def test_checkpointed_absorbed_attention_keeps_metadata_out_of_tensor_args(monke
 
 def test_absorbed_mla_forward_uses_and_restores_dynamic_cp_group():
     original_cp_group = object()
-    dynamic_cp_group = object()
+    dynamic_cp_group = SimpleNamespace(size=lambda: 2)
     pg_collection = SimpleNamespace(cp=original_cp_group)
     observed_groups = []
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain and SFT GPT."""
 
@@ -25,6 +25,7 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
+from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -52,7 +53,7 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
@@ -68,9 +69,14 @@ from model_provider import model_provider
 try:
     from megatron.post_training.arguments import add_modelopt_args
     from megatron.post_training.loss_func import loss_func as loss_func_modelopt
+    from megatron.post_training.model_builder import ModelOptModelConfig
+    from megatron.post_training.utils import maybe_enable_modelopt
 
     has_nvidia_modelopt = True
-except ImportError:
+except ImportError as error:
+    missing_module = error.name or ""
+    if missing_module != "modelopt" and not missing_module.startswith("modelopt."):
+        raise
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
@@ -132,7 +138,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     if args.sequence_packing_scheduler is not None:
         # `get_batch_on_this_rank_for_sequence_packing` owns scheduler THD metadata
         # and returns a 7-tuple including `padding_mask`.
-        return get_batch_on_this_rank_for_sequence_packing(
+        batch = get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
@@ -140,12 +146,16 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             dynamic_cp=args.dynamic_context_parallel,
             config=config,
         )
+        finalize_packed_seq_params(batch[5])
+        return batch
 
     # TODO: this is pretty hacky, find a better way
     is_packed_sequence = args.sft or (args.use_varlen_dataset and not args.varlen_sbhd_validation)
+    needs_padding_mask = args.use_varlen_dataset and args.varlen_sbhd_validation
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
         and not is_packed_sequence
+        and not needs_padding_mask
         and ((not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)))
     ):
         return None, None, None, None, None, None, None
@@ -154,6 +164,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     batch = get_batch_on_this_tp_rank(
         data_iterator,
         mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+        needs_padding_mask=needs_padding_mask,
     )
 
     cu_seqlens = batch.pop('cu_seqlens', None)
@@ -171,21 +182,15 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     # For middle pipeline stages with packed sequences, only cu_seqlens and
     # max_seqlen are needed (for attention masking); skip the full batch.
     if not is_first_or_last_pipeline_stage(vp_stage) and is_packed_sequence:
-        return (
-            None,
-            None,
-            None,
-            None,
-            None,
-            PackedSeqParams(
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_kv=cu_seqlens,
-                max_seqlen_q=int(max_seqlen[0].item()),
-                max_seqlen_kv=int(max_seqlen[0].item()),
-                qkv_format='thd',
-            ),
-            None,
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=int(max_seqlen[0].item()),
+            max_seqlen_kv=int(max_seqlen[0].item()),
+            qkv_format='thd',
         )
+        finalize_packed_seq_params(packed_seq_params)
+        return (None, None, None, None, None, packed_seq_params, None)
 
     thd_tail_padding_policy = resolve_thd_tail_padding_policy(config)
     if cu_seqlens is None:
@@ -199,6 +204,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     # Pad the already-packed THD tensors at the end when requested. A configured
     # thd_max_packed_sequences also pads cu_seqlens to a fixed capacity in eager or graph mode.
+    # SBHD validation samples carry physical right-padding metadata. CP has
+    # already partitioned it with the other sequence-dimension tensors.
     padding_mask = batch.pop('padding_mask', None)
     if config.pad_packed_seq_alignment is not None and packed_seq_params is not None:
         tokens = batch.get('tokens', None)
@@ -233,6 +240,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             batch['loss_mask'] = loss_mask
         if 'position_ids' in batch:
             batch['position_ids'] = position_ids
+
+    finalize_packed_seq_params(packed_seq_params)
 
     # Unpack explicitly to avoid relying on dict insertion order.
     return (
@@ -400,7 +409,12 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence:
+    elif is_packed_sequence or (
+        getattr(args, 'use_varlen_dataset', False)
+        and getattr(args, 'varlen_sbhd_validation', False)
+    ):
+        # Packed THD and SBHD validation both need padding metadata on every
+        # pipeline stage so each MoE layer excludes physical padding.
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank(
         config, ignore_virtual=False, vp_stage=vp_stage
@@ -557,7 +571,13 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    full_config = pretrain_cfg_container_from_args(args)
+    if has_nvidia_modelopt:
+        maybe_enable_modelopt(args)
+    if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
+        model_cfg = gpt_config_from_args(args, model_config_cls=ModelOptModelConfig)
+    else:
+        model_cfg = gpt_config_from_args(args)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

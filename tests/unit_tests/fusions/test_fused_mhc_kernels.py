@@ -18,6 +18,7 @@ from torch import Tensor
 from megatron.core.fusions.fused_mhc_kernels import is_cutile_available, is_triton_available
 from megatron.core.transformer.hyper_connection import (
     native_h_aggregate,
+    native_h_aggregate_into,
     native_h_post_bda,
     native_proj_rms,
     native_sinkhorn,
@@ -237,6 +238,72 @@ class TestNativeHAggregate:
         torch.testing.assert_close(xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
         torch.testing.assert_close(hf.grad, hr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
 
+    def test_caller_owned_output_preserves_pointer_and_gradients(self):
+        x_data = _rand(2, 3, 4, 64)
+        h_data = _rand(2, 3, 4)
+        grad_out = _rand(2, 3, 64)
+
+        xf = x_data.clone().requires_grad_(True)
+        hf = h_data.clone().requires_grad_(True)
+        arena_view = torch.empty(2, 3, 64, dtype=xf.dtype, device=xf.device)
+        expected_ptr = arena_view.data_ptr()
+        of = native_h_aggregate_into(xf, hf, arena_view)
+        assert of.data_ptr() == expected_ptr
+        of.backward(grad_out)
+
+        xr = x_data.clone().requires_grad_(True)
+        hr = h_data.clone().requires_grad_(True)
+        oref = _ref_h_aggregate(xr, hr)
+        oref.backward(grad_out)
+
+        torch.testing.assert_close(of, oref, atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
+        torch.testing.assert_close(hf.grad, hr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
+
+    def test_torch_fallback_grad_h_upcasts_before_the_product(self):
+        """The torch fallback must compute grad_h exactly like its fp32 siblings.
+
+        ``FusedHAggregateInto.backward`` routes here whenever cuTile is absent,
+        which includes ordinary Triton-only builds, so a precision difference
+        here would make the numerics of a run depend on whether cuTile happens to
+        be installed.
+        """
+        from megatron.core.fusions.fused_mhc_kernels import _torch_h_aggregate_bwd
+
+        # Seeded: this asserts on error magnitudes, so the inputs must not vary
+        # run to run.
+        torch.manual_seed(1234)
+        s, b, n, C = 2, 2, 4, 2048
+        x_data = _rand(s, b, n, C)
+        h_data = _rand(s, b, n)
+        grad_out = _rand(s, b, C)
+
+        xr = x_data.clone().requires_grad_(True)
+        hr = h_data.clone().requires_grad_(True)
+        arena_view = torch.empty(s, b, C, dtype=xr.dtype, device=xr.device)
+        native_h_aggregate_into(xr, hr, arena_view).backward(grad_out)
+
+        _, fallback_grad_h = _torch_h_aggregate_bwd(grad_out, x_data, h_data)
+        # Same reduction, same inputs, same precision -> bitwise identical.
+        assert torch.equal(fallback_grad_h, hr.grad)
+
+        # What the upcast buys, measured against an fp64 reference. Note this
+        # compares the *pre-cast* reductions: grad_h is returned in h_pre's dtype,
+        # and that final bf16 rounding is ~one ulp of the result, which swamps the
+        # difference the upcast makes. It is also specifically the elementwise
+        # product that matters -- torch.sum already accumulates a bf16 input in
+        # fp32, so rounding each go*x product to bf16 first is the whole cost.
+        reference = torch.sum(grad_out.unsqueeze(2).double() * x_data.double(), dim=-1)
+        upcast = torch.sum(grad_out.unsqueeze(2).float() * x_data.float(), dim=-1)
+        bf16_product = torch.sum(grad_out.unsqueeze(2) * x_data, dim=-1)
+
+        upcast_error = (upcast.double() - reference).abs().max()
+        bf16_error = (bf16_product.double() - reference).abs().max()
+        assert bf16_error > 10 * upcast_error, (
+            f"a bf16 product ({bf16_error}) is no longer materially worse than an fp32 one "
+            f"({upcast_error}), so this test no longer discriminates."
+        )
+
 
 class TestFusedHAggregate:
     """Public fused h_aggregate dispatch/fallback plus numerical correctness."""
@@ -260,6 +327,30 @@ class TestFusedHAggregate:
         of.backward(grad_out)
 
         # -- reference path --
+        xr = x_data.clone().requires_grad_(True)
+        hr = h_data.clone().requires_grad_(True)
+        oref = _ref_h_aggregate(xr, hr)
+        oref.backward(grad_out)
+
+        torch.testing.assert_close(of, oref, atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
+        torch.testing.assert_close(hf.grad, hr.grad, atol=BWD_ATOL, rtol=BWD_RTOL)
+
+    def test_caller_owned_output_preserves_pointer_and_gradients(self):
+        from megatron.core.fusions.fused_mhc_kernels import fused_h_aggregate_into
+
+        x_data = _rand(2, 3, 4, 64)
+        h_data = _rand(2, 3, 4)
+        grad_out = _rand(2, 3, 64)
+
+        xf = x_data.clone().requires_grad_(True)
+        hf = h_data.clone().requires_grad_(True)
+        arena_view = torch.empty(2, 3, 64, dtype=xf.dtype, device=xf.device)
+        expected_ptr = arena_view.data_ptr()
+        of = fused_h_aggregate_into(xf, hf, arena_view)
+        assert of.data_ptr() == expected_ptr
+        of.backward(grad_out)
+
         xr = x_data.clone().requires_grad_(True)
         hr = h_data.clone().requires_grad_(True)
         oref = _ref_h_aggregate(xr, hr)
@@ -527,7 +618,6 @@ class TestTritonHPostBDABwdE2EDebug:
             _triton_h_post_bda_bwd,
             fused_h_aggregate,
             fused_h_post_bda,
-            fused_proj_rms,
             fused_sinkhorn,
         )
 
@@ -544,7 +634,7 @@ class TestTritonHPostBDABwdE2EDebug:
         hs = hs_data.clone().requires_grad_(True)
         w = w_data.clone().requires_grad_(True)
         x_2d = hs.reshape(s * b, n * C)
-        proj, r = fused_proj_rms(x_2d, w, eps)
+        proj, r = native_proj_rms(x_2d, w, eps)
         proj = proj.view(s, b, -1)
         r = r.view(s, b, 1)
         h = r * proj
@@ -656,45 +746,6 @@ class TestNativeProjRms:
         proj_f, r_f = native_proj_rms(xf, wf, eps)
         (proj_f * grad_proj + r_f * grad_r).sum().backward()
 
-        xr = x_data.clone().requires_grad_(True)
-        wr = w_data.clone().requires_grad_(True)
-        proj_r, r_r = _ref_proj_rms(xr, wr, eps)
-        (proj_r * grad_proj + r_r * grad_r).sum().backward()
-
-        torch.testing.assert_close(proj_f, proj_r, atol=FWD_ATOL, rtol=FWD_RTOL)
-        torch.testing.assert_close(r_f, r_r, atol=FWD_ATOL, rtol=FWD_RTOL)
-        torch.testing.assert_close(
-            xf.grad, xr.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on x"
-        )
-        torch.testing.assert_close(
-            wf.grad, wr.grad, atol=BWD_ATOL, rtol=BWD_RTOL, msg="backward mismatch on weight"
-        )
-
-
-class TestFusedProjRms:
-    """Public fused proj_rms dispatch/fallback plus numerical correctness."""
-
-    @pytest.mark.flaky_in_dev
-    @_require_cutile
-    @pytest.mark.parametrize("M,N,K", [(256, 20, 4096), (64, 8, 512)])
-    def test_fwd_bwd_vs_reference(self, M, N, K):
-        """E2E: public fused fwd output and bwd grads must match the PyTorch reference."""
-        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms
-
-        _info()
-        eps = 1e-6
-        x_data = _rand(M, K)
-        w_data = _rand(N, K)
-        grad_proj = _rand(M, N)
-        grad_r = _rand(M, 1)
-
-        # -- fused path --
-        xf = x_data.clone().requires_grad_(True)
-        wf = w_data.clone().requires_grad_(True)
-        proj_f, r_f = fused_proj_rms(xf, wf, eps)
-        (proj_f * grad_proj + r_f * grad_r).sum().backward()
-
-        # -- reference path --
         xr = x_data.clone().requires_grad_(True)
         wr = w_data.clone().requires_grad_(True)
         proj_r, r_r = _ref_proj_rms(xr, wr, eps)
@@ -898,7 +949,6 @@ class TestEndToEndFused:
         from megatron.core.fusions.fused_mhc_kernels import (
             fused_h_aggregate,
             fused_h_post_bda,
-            fused_proj_rms,
             fused_sinkhorn,
         )
 
@@ -917,7 +967,7 @@ class TestEndToEndFused:
             w = w_data.clone().requires_grad_(True)
 
             x_2d = hs.reshape(s * b, n * C)
-            proj, r = fused_proj_rms(x_2d, w, eps)
+            proj, r = native_proj_rms(x_2d, w, eps)
             proj = proj.view(s, b, -1)
             r = r.view(s, b, 1)
 
@@ -1232,7 +1282,6 @@ class TestEndToEndFusedBroadcast:
             fused_add_3,
             fused_h_aggregate,
             fused_h_post_bda,
-            fused_proj_rms,
             fused_sinkhorn,
         )
         from megatron.core.transformer.hyper_connection import BroadcastTensorFused
@@ -1254,7 +1303,7 @@ class TestEndToEndFusedBroadcast:
             hs_map, hs_agg, hs_res = BroadcastTensorFused.apply(hs, fused_add_3)
 
             x_2d = hs_map.reshape(s * b, n * C)
-            proj, r = fused_proj_rms(x_2d, w, eps)
+            proj, r = native_proj_rms(x_2d, w, eps)
             proj = proj.view(s, b, -1)
             r = r.view(s, b, 1)
 
@@ -1426,3 +1475,175 @@ class TestEndToEndFusedBroadcast:
             COSINE_SIM_THRESH,
             msg="hidden_states grad (E2E backward, fused compute_h broadcast)",
         )
+
+
+class TestFusedProjRmsComputeHKeepFp32:
+    """Regression: the mHC mapping must stay fp32-accurate with bf16 activations.
+
+    HyperConnectionModule marks mapping_proj.weight / alpha_* / bias as
+    keep_in_fp32 and the unfused path upcasts the activations to fp32, so the
+    fused path must not silently degrade the mapping to the activation dtype.
+    Tolerances here are ~15x tighter than the module-level FWD_ATOL/RTOL: the
+    bug this guards against (bf16 split-K partials and bf16 mapping outputs)
+    cost 170x accuracy while staying well inside the loose tolerances.
+    """
+
+    # Native fp32 reference achieves ~8e-6 rms; the bf16-output bug gave ~1.5e-3.
+    MAPPING_RMS_TOL = 1e-4
+    # r is a pure reduction: native reaches ~5e-8, the bug gave ~2.7e-3.
+    R_RMS_TOL = 1e-5
+
+    @staticmethod
+    def _rms_rel(actual: Tensor, ref64: Tensor) -> float:
+        a = actual.detach().to(torch.float64)
+        r = ref64.detach().to(torch.float64)
+        return ((a - r).pow(2).mean().sqrt() / r.abs().max().clamp_min(1e-30)).item()
+
+    @pytest.mark.parametrize("M,n,hidden", [(256, 4, 4096), (128, 4, 1024)])
+    def test_bf16_activations_fp32_params(self, M, n, hidden):
+        """Fused mapping with production dtypes must match an fp64 reference."""
+        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms_compute_h
+
+        _info()
+        K = n * hidden
+        N = n * n + 2 * n
+        eps = compute_h_eps = 1e-6
+
+        # Activations arrive in bf16; the mapping parameters are keep_in_fp32.
+        x = torch.randn(M, K, device=DEVICE, dtype=torch.float32).to(torch.bfloat16)
+        w = torch.randn(N, K, device=DEVICE, dtype=torch.float32) / math.sqrt(K)
+        alpha_pre = torch.full((1,), 0.1, device=DEVICE, dtype=torch.float32)
+        alpha_post = torch.full((1,), 0.1, device=DEVICE, dtype=torch.float32)
+        alpha_res = torch.full((1,), 0.1, device=DEVICE, dtype=torch.float32)
+        bias = torch.randn(N, device=DEVICE, dtype=torch.float32) * 0.1
+
+        h_pre, h_post, h_res, r = fused_proj_rms_compute_h(
+            x, w, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps
+        )
+
+        # fp64 reference from the same input values.
+        x64, w64 = x.to(torch.float64), w.to(torch.float64)
+        proj64 = x64 @ w64.t()
+        r64 = x64.norm(dim=-1, keepdim=True) / math.sqrt(K)
+        alpha64 = torch.cat(
+            [
+                alpha_pre.to(torch.float64).expand(n),
+                alpha_post.to(torch.float64).expand(n),
+                alpha_res.to(torch.float64).expand(N - 2 * n),
+            ],
+            dim=-1,
+        )
+        h64 = proj64 * alpha64.unsqueeze(0) / (r64 + eps) + bias.to(torch.float64).unsqueeze(0)
+
+        assert self._rms_rel(h_pre, h64[..., :n].sigmoid() + compute_h_eps) < self.MAPPING_RMS_TOL
+        assert self._rms_rel(h_post, h64[..., n : 2 * n].sigmoid() * 2) < self.MAPPING_RMS_TOL
+        assert self._rms_rel(h_res, h64[..., 2 * n :]) < self.MAPPING_RMS_TOL
+        assert self._rms_rel(r, r64) < self.R_RMS_TOL
+
+    def test_native_fallback_accepts_mixed_dtypes(self):
+        """The native fallback must run with bf16 activations x fp32 parameters."""
+        from megatron.core.fusions.fused_mhc_kernels import _torch_proj_rms_compute_h
+
+        M, n, K = 64, 4, 512
+        N = n * n + 2 * n
+        x = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(N, K, device=DEVICE, dtype=torch.float32) / math.sqrt(K)
+        one = torch.full((1,), 0.1, device=DEVICE, dtype=torch.float32)
+        bias = torch.zeros(N, device=DEVICE, dtype=torch.float32)
+
+        h_pre, h_post, h_res, r = _torch_proj_rms_compute_h(x, w, one, one, one, bias, n, 1e-6)
+        for t in (h_pre, h_post, h_res, r):
+            assert torch.isfinite(t).all()
+
+    @_require_cutile
+    def test_no_fp32_activation_copy(self):
+        """cuTile must consume the bf16 activations, not an fp32 copy of them.
+
+        The kernels load and cast each tile independently, so normalizing the
+        activation dtype ahead of the launch would only cost memory.
+        """
+        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms_compute_h
+
+        _info()
+        M, n, hidden = 4096, 4, 4096
+        K, N = n * hidden, n * n + 2 * n
+        x = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(N, K, device=DEVICE, dtype=torch.float32) / math.sqrt(K)
+        one = torch.full((1,), 0.1, device=DEVICE, dtype=torch.float32)
+        bias = torch.zeros(N, device=DEVICE, dtype=torch.float32)
+
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        before = torch.cuda.memory_allocated()
+        fused_proj_rms_compute_h(x, w, one, one, one, bias, n, 1e-6)
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - before
+
+        fp32_activation_copy = M * K * 4
+        assert peak < fp32_activation_copy // 2, (
+            f"peak allocation {peak} suggests the activations were upcast "
+            f"(an fp32 copy of x is {fp32_activation_copy} bytes)"
+        )
+
+    def test_public_entry_point_native_branch(self, monkeypatch):
+        """The public op must also run natively — this is the forced-native path.
+
+        MHC_FORCE_BACKEND=native and an auto run on a cuTile-less container both
+        land here, and the module always calls the public op when
+        use_fused_mhc=True, so this branch is what a real training job hits.
+        """
+        from megatron.core.fusions import fused_mhc_kernels as fused_mod
+
+        _info()
+        monkeypatch.setattr(fused_mod, "is_cutile_available", lambda: False)
+
+        M, n, K = 64, 4, 512
+        N = n * n + 2 * n
+        x = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(N, K, device=DEVICE, dtype=torch.float32) / math.sqrt(K)
+        one = torch.full((1,), 0.1, device=DEVICE, dtype=torch.float32)
+        bias = torch.zeros(N, device=DEVICE, dtype=torch.float32)
+
+        outs = fused_mod.fused_proj_rms_compute_h(x, w, one, one, one, bias, n, 1e-6)
+        for t in outs:
+            assert torch.isfinite(t).all()
+
+
+class TestCutileHAggregateBackwardReduction:
+    """Regression: h_aggregate backward is the only other cuTile-only op.
+
+    `grad_h` is a reduction over the hidden dimension; evaluating the product
+    in bf16 before the fp32 accumulate made it ~2.5x noisier than the torch
+    reference at production widths.
+    """
+
+    @_require_cutile
+    @pytest.mark.parametrize("tokens,n,C", [(8192, 4, 1536), (2048, 4, 4096)])
+    def test_grad_h_reduction_not_worse_than_torch(self, tokens, n, C):
+        """cuTile grad_h must be at least as accurate as the torch reference."""
+        from megatron.core.fusions.fused_mhc_kernels import (
+            _cutile_h_aggregate_bwd,
+            _torch_h_aggregate_bwd,
+        )
+
+        _info()
+        s, b = 1, tokens
+        x = torch.randn(s, b, n, C, device=DEVICE, dtype=torch.float32).to(DTYPE)
+        h_pre = (torch.rand(s, b, n, device=DEVICE, dtype=torch.float32) + 0.5).to(DTYPE)
+        go = torch.randn(s, b, C, device=DEVICE, dtype=torch.float32).to(DTYPE)
+
+        goe = go.double().unsqueeze(2)
+        ref_gx = goe * h_pre.double().unsqueeze(-1)
+        ref_gh = (goe * x.double()).sum(-1)
+
+        def rel(a: Tensor, r: Tensor) -> float:
+            a, r = a.double().flatten(), r.double().flatten()
+            return ((a - r).pow(2).mean().sqrt() / r.pow(2).mean().sqrt()).item()
+
+        t_gx, t_gh = _torch_h_aggregate_bwd(go, x, h_pre)
+        c_gx, c_gh = _cutile_h_aggregate_bwd(go, x, h_pre)
+
+        # grad_x is a pure elementwise product — it must stay bit-identical.
+        assert torch.equal(c_gx, t_gx)
+        # A bf16 product before the fp32 accumulate showed up here as ~2.5x.
+        assert rel(c_gh, ref_gh) <= rel(t_gh, ref_gh) * 1.1

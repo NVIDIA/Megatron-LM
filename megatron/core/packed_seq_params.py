@@ -1,11 +1,14 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from dataclasses import dataclass
-from typing import Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Literal, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor
+
+if TYPE_CHECKING:
+    from megatron.core.context_parallel_layout import ThdCpRoute
 
 
 @dataclass
@@ -13,6 +16,10 @@ class PackedSeqParams:
     '''
     parameters to TEDotProductAttention and fused rope kernels for the
     `thd` (packed) sequence format
+
+    ``cp_partition_route`` is a per-microbatch THD CP layout conversion route.
+    Metadata annotation helpers update the current partition mode in-place while
+    preserving the route identity.
     '''
 
     qkv_format: str = None
@@ -29,6 +36,7 @@ class PackedSeqParams:
     pad_between_seqs: Optional[bool] = None
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     tokens_per_sample: int = None
+    cp_partition_route: Optional["ThdCpRoute"] = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

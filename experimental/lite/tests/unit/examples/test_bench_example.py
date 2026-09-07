@@ -8,11 +8,14 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 
+import pytest
 import torch
 
 from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs
 from megatron.lite.runtime.contracts.handle import ModelHandle
+
+pytestmark = pytest.mark.optional
 
 _LITE_ROOT = str(Path(__file__).resolve().parents[3])
 sys.path = [path for path in sys.path if path != _LITE_ROOT]
@@ -308,3 +311,47 @@ def test_correctness_compare_requires_bitwise_fields():
 
     assert comparison["passed"] is False
     assert comparison["max_grad_norm_abs"] == 0.5
+
+
+def test_correctness_compare_supports_explicit_numeric_tolerances():
+    from examples.bench.results import compare_correctness_artifacts
+
+    tensor_a = {"sha256": "a", "shape": [2], "values": [1.0, 2.0]}
+    tensor_b = {"sha256": "b", "shape": [2], "values": [1.001, 1.998]}
+    baseline = {
+        "eval_logits": tensor_a,
+        "steps": [
+            {
+                "loss": {"value": 1.0},
+                "logits": tensor_a,
+                "grad_norm": {"value": 2.0},
+                "post_step_weights": None,
+                "update_successful": True,
+                "num_zeros": 0,
+            }
+        ],
+    }
+    candidate = {
+        "eval_logits": tensor_b,
+        "steps": [
+            {
+                "loss": {"value": 1.000001},
+                "logits": tensor_b,
+                "grad_norm": {"value": 2.00001},
+                "post_step_weights": None,
+                "update_successful": True,
+                "num_zeros": 0,
+            }
+        ],
+    }
+
+    comparison = compare_correctness_artifacts(
+        baseline,
+        candidate,
+        loss_atol=1e-5,
+        grad_atol=1e-4,
+        tensor_atol=3e-3,
+    )
+
+    assert comparison["passed"] is True
+    assert abs(comparison["max_tensor_abs"] - 2e-3) < 1e-12

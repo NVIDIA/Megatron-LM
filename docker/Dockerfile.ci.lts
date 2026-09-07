@@ -30,12 +30,13 @@ RUN bash -ex <<"EOF"
     python -m venv /opt/jet
     ARCH=$(uname -m)
     case "${ARCH}" in \
-      "x86_64") YQ_ARCH=amd64 ;; \
-      "aarch64") YQ_ARCH=arm64 ;; \
-      "armv7l") YQ_ARCH=arm ;; \
+      "x86_64") YQ_ARCH=amd64; YQ_SHA256=6dc2d0cd4e0caca5aeffd0d784a48263591080e4a0895abe69f3a76eb50d1ba3 ;; \
+      "aarch64") YQ_ARCH=arm64; YQ_SHA256=8c12fcc10e14774ca6624cc282f092a526568b036fe1192258c3aecbad56d063 ;; \
+      "armv7l") echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
       *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;; \
     esac
     wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/local/bin/yq
+    echo "${YQ_SHA256}  /usr/local/bin/yq" | sha256sum --check -
     chmod a+x /usr/local/bin/yq
     curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 EOF
@@ -46,10 +47,9 @@ COPY megatron/core/package_info.py /workspace/megatron/core/
 ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
-    export NVTE_CUDA_ARCHS="80;90;100"
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --only-group build
-    uv sync --extra mlm --extra ssm --extra te --link-mode copy --locked \
+    uv sync --extra mlm --extra ssm --link-mode copy --locked \
         --no-install-package torch \
         --no-install-package torchvision \
         --no-install-package triton \
@@ -72,12 +72,16 @@ EOF
 #
 # These used to live in `[project.optional-dependencies].lts` in pyproject.toml,
 # but were moved out so pyproject.toml can host meaningful per-module
-# extras. The pinned set lives in `docker/lts/requirements.txt` and is reviewed
-# at LTS bump time only.
+# extras. Most of the pinned set lives in `docker/lts/requirements.txt` and is
+# reviewed at LTS bump time only. Transformer Engine is installed separately
+# because its source extension needs the existing PyTorch/CUDA build environment.
 COPY docker/lts/requirements.txt /workspace/docker/lts/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
+    export NVTE_CUDA_ARCHS="80;90;100"
     uv pip install -r /workspace/docker/lts/requirements.txt
+    uv pip install --no-build-isolation \
+        "transformer-engine @ git+https://github.com/NVIDIA/TransformerEngine.git@b9d690e042b1c4e455214e7dab65d6d3512c05d6"
 EOF
 
 # Install DeepEP

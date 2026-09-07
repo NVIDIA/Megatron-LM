@@ -23,7 +23,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant import csa_cp_utils as cp_utils
+from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -33,7 +33,7 @@ from megatron.core.utils import get_pg_size, is_te_min_version
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
 else:
-    (TEColumnParallelLinear, TELinear, set_save_original_input) = (None, None, None)
+    TEColumnParallelLinear, TELinear, set_save_original_input = (None, None, None)
 
 
 @torch.compile
@@ -571,13 +571,13 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         self.kv_layernorm = submodules.kv_layernorm(
             hidden_size=self.config.v_head_dim,
             config=self.config,
-            eps=self.config.layernorm_epsilon,
+            eps=self.config.attention_latent_norm_epsilon,
         )
 
         self.q_layernorm = submodules.q_layernorm(
             hidden_size=self.config.q_lora_rank,
             config=self.config,
-            eps=self.config.layernorm_epsilon,
+            eps=self.config.attention_latent_norm_epsilon,
         )
 
     def get_query_key_value_tensors(

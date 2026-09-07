@@ -381,12 +381,6 @@ def combined_forward_backward_step(
             unwrapped_model = get_attr_wrapped_model(
                 f_model, "build_schedule_plan", return_model_obj=True
             )
-            from megatron.core.models.gpt.gpt_model import GPTModel
-
-            assert isinstance(unwrapped_model, GPTModel), (
-                "The final unwrapped model must be a GPTModel instance "
-                "since only GPTModel is supported for EP A2A overlapping."
-            )
             f_schedule_plan, loss_func = forward_step_func(
                 data_iterator, unwrapped_model, return_schedule_plan=True
             )
@@ -399,6 +393,15 @@ def combined_forward_backward_step(
         # each layer's all-gathered parameters explicitly after its compute.
         # Only needed for optim_grads_params strategy (where params are sharded).
         forward_fsdp_wrapper = find_megatron_fsdp(f_model)
+        # Full recompute re-runs each layer segment's forward at backward time, which
+        # needs the (sharded) parameters to be all-gathered again. That interaction
+        # with the FSDP reshard hooks is not yet supported.
+        assert not (
+            forward_fsdp_wrapper is not None and getattr(f_schedule_plan, "recompute_full", False)
+        ), (
+            "overlap_moe_expert_parallel_comm full recompute (recompute_granularity=full) "
+            "is not yet supported together with Megatron FSDP."
+        )
         if (
             forward_fsdp_wrapper is not None
             and forward_fsdp_wrapper.ddp_config.data_parallel_sharding_strategy

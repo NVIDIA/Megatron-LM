@@ -310,8 +310,8 @@ def get_thd_context_parallel_rank_indices(
 
     The returned indices are ordered exactly as the rank-local THD tensor is stored.
     ``"zigzag"`` follows Megatron's per-sequence load-balanced chunk order; ``"contiguous"``
-    partitions the flattened packed THD buffer into rank-contiguous spans. Mirrors upstream
-    Megatron ``context_parallel_layout.get_thd_context_parallel_rank_indices``.
+    partitions the flattened packed THD buffer into rank-contiguous spans. This matches the
+    rank-index semantics used by Megatron's THD CP route builder.
     """
     if layout not in ("zigzag", "contiguous"):
         raise ValueError(f"Unsupported context-parallel layout {layout!r}.")
@@ -384,9 +384,8 @@ def _zigzag_contiguous_thd_swap(
 
     The packed THD tensor stays packed: we first group local tokens by their target
     CP rank, exchange those groups once, then scatter received tokens back into the
-    target rank-local order. Mirrors upstream Megatron
-    ``context_parallel_layout._zigzag_contiguous_thd_swap`` (packing-aware routing
-    from the *global* ``cu_seqlens``).
+    target rank-local order. This matches Megatron's route-based THD layout conversion
+    semantics in ``megatron.core.context_parallel_layout.conversion``.
     """
     cp_size = dist.get_world_size(cp_group) if cp_group is not None else 1
     if cp_size <= 1:

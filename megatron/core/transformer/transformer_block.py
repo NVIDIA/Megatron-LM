@@ -22,7 +22,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.random import CheckpointManager
+from megatron.core.tensor_parallel.random import MHCCheckpointManager
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import (
@@ -314,7 +314,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
 
         if get_cpu_offload_context is not None:
-            (self.offload_context, self.group_prefetch_offload_commit_async) = (
+            self.offload_context, self.group_prefetch_offload_commit_async = (
                 get_cpu_offload_context(
                     self.config.cpu_offloading,
                     self.config.cpu_offloading_num_layers,
@@ -611,15 +611,30 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             extract_layer_indices = set()
         intermediate_hidden_states: List[Tensor] = []
 
+        # Unpack dual RoPE before checkpointing because autograd only accepts
+        # tensors (or None) in save_for_backward.
+        is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
+        assert (
+            not is_dual_rope or len(rotary_pos_emb) == 2
+        ), "Dual RoPE input length is not equal to 2"
+        rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
+
         def custom(start: int, end: int):
             def custom_forward(
                 hidden_states,
                 attention_mask,
                 context,
                 context_mask,
-                rotary_pos_emb,
+                rotary_pos_emb_local,
+                rotary_pos_emb_global,
                 padding_mask=None,
             ):
+                rotary_pos_emb = (
+                    (rotary_pos_emb_local, rotary_pos_emb_global)
+                    if is_dual_rope
+                    else rotary_pos_emb_global
+                )
+
                 for index in range(start, end):
                     layer = self._get_layer(index)
 
@@ -669,7 +684,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     attention_mask,
                     context,
                     context_mask,
-                    rotary_pos_emb,
+                    *rotary_pos_emb,
                     padding_mask,
                 )
             else:
@@ -680,7 +695,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     attention_mask,
                     context,
                     context_mask,
-                    rotary_pos_emb,
+                    *rotary_pos_emb,
                     padding_mask,
                 )
 
@@ -725,7 +740,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
                 else:
                     hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                        hidden_states, attention_mask, context, context_mask, *rotary_pos_emb
                     )
 
                 # Feature extraction: collect hidden states at specified global layer indices
@@ -785,17 +800,17 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
     def _build_mhc_recompute_layer_plan(
         self, use_mhc_recompute: bool
-    ) -> Tuple[List[Optional[CheckpointManager]], List[bool]]:
+    ) -> Tuple[List[Optional[MHCCheckpointManager]], List[bool]]:
         """Pre-build per-layer MHC recompute managers and block-end markers."""
         num_layers = len(self.layers)
-        layer_managers: List[Optional[CheckpointManager]] = [None] * num_layers
+        layer_managers: List[Optional[MHCCheckpointManager]] = [None] * num_layers
         is_recompute_block_end: List[bool] = [False] * num_layers
 
         if not use_mhc_recompute or num_layers == 0:
             return layer_managers, is_recompute_block_end
 
         mhc_recompute_layer_num = self.config.mhc_recompute_layer_num
-        mhc_manager = CheckpointManager()
+        mhc_manager = MHCCheckpointManager()
 
         for l_no in range(num_layers):
             is_last_in_transformer_block = l_no == num_layers - 1
@@ -809,13 +824,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             is_recompute_block_end[l_no] = is_last_in_recompute_block
 
             if is_last_in_recompute_block and not is_last_in_transformer_block:
-                mhc_manager = CheckpointManager()
+                mhc_manager = MHCCheckpointManager()
 
         return layer_managers, is_recompute_block_end
 
     @staticmethod
     def _finalize_mhc_recompute_layer(
-        mhc_manager: Optional[CheckpointManager],
+        mhc_manager: Optional[MHCCheckpointManager],
         hidden_states: Tensor,
         is_last_in_recompute_block: bool,
     ) -> None:

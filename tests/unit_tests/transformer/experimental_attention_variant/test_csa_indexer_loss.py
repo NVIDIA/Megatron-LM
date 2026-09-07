@@ -9,9 +9,14 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.experimental_attention_variant.csa import (
     _build_compressed_thd_indexer_metadata,
     _compressed_thd_topk_to_local,
+    _compute_unfused_csa_non_compressed_lse,
+)
+from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
+    build_flat_topk_idxs,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     FusedDSAIndexerLoss,
+    _normalize_indexer_teacher_target,
     fused_qk_topk_naive,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -21,6 +26,60 @@ def _causal_compressed_mask(sq, sk, ratio, device):
     columns = torch.arange(sk, device=device).unsqueeze(0).expand(sq, -1)
     positions = torch.arange(1, sq + 1, device=device).unsqueeze(1)
     return torch.where(columns >= positions // ratio, float('-inf'), 0.0).unsqueeze(0)
+
+
+class _SingleRankGroup:
+    @staticmethod
+    def size():
+        return 1
+
+
+class _SingleRankPGCollection:
+    tp = _SingleRankGroup()
+
+
+def _make_legacy_abi_case(seed=23):
+    generator = torch.Generator().manual_seed(seed)
+    sq, sk, batch = 8, 2, 1
+    index_heads, index_dim = 2, 4
+    attention_heads, attention_dim = 2, 5
+    q = torch.randn(sq, batch, index_heads, index_dim, generator=generator)
+    weights = torch.randn(sq, batch, index_heads, generator=generator)
+    k = torch.randn(sk, batch, index_dim, generator=generator)
+    query = torch.randn(sq, batch, attention_heads, attention_dim, generator=generator)
+    key = torch.randn(sk, batch, attention_heads, attention_dim, generator=generator)
+    mask = _causal_compressed_mask(sq, sk, ratio=4, device='cpu')
+    return q, weights, k, query, key, mask
+
+
+def _run_legacy_abi_case(num_inputs):
+    q, weights, k, query, key, mask = _make_legacy_abi_case()
+    q = q.requires_grad_(True)
+    weights = weights.requires_grad_(True)
+    k = k.requires_grad_(True)
+    args = [
+        q,
+        weights,
+        k,
+        query,
+        key,
+        key.shape[-1] ** -0.5,
+        2,
+        0.7,
+        mask,
+        True,
+        _SingleRankPGCollection(),
+        None,
+        None,
+        None,
+        None,
+        False,
+        True,
+        None,
+    ]
+    topk_indices, loss = FusedDSAIndexerLoss.apply(*args[:num_inputs])
+    loss.backward()
+    return topk_indices, loss.detach(), q.grad, weights.grad, k.grad
 
 
 def _run_compressed_thd_topk(q, k, weights, topk, cu_q, cu_comp, ratio):
@@ -80,6 +139,101 @@ def _run_compressed_thd_loss(
     return _compressed_thd_topk_to_local(topk_global, offsets), loss
 
 
+@pytest.mark.parametrize("num_inputs", [14, 17, 18])
+def test_custom_autograd_backward_matches_legacy_arity(num_inputs):
+    reference = _run_legacy_abi_case(18)
+    actual = _run_legacy_abi_case(num_inputs)
+    for actual_tensor, reference_tensor in zip(actual, reference):
+        torch.testing.assert_close(actual_tensor, reference_tensor, rtol=0, atol=0)
+
+
+def test_corrected_teacher_normalizes_tiny_positive_mass():
+    target = torch.tensor([[[1.0e-30, 2.0e-30]]], dtype=torch.float32)
+
+    corrected = _normalize_indexer_teacher_target(
+        target, torch.zeros((1, 1, 1), dtype=torch.float32)
+    )
+    legacy = _normalize_indexer_teacher_target(target, None)
+
+    torch.testing.assert_close(
+        corrected, torch.tensor([[[1.0 / 3.0, 2.0 / 3.0]]]), rtol=1e-6, atol=0
+    )
+    assert corrected.sum().item() == pytest.approx(1.0)
+    torch.testing.assert_close(
+        legacy, target / torch.tensor(1.0e-10, dtype=torch.float32), rtol=0, atol=0
+    )
+
+
+def test_non_compressed_lse_chunking_and_all_invalid_window():
+    generator = torch.Generator().manual_seed(31)
+    query = torch.randn(5, 2, 3, 4, generator=generator)
+    kv = torch.randn(5, 2, 4, generator=generator)
+    sink = torch.randn(3, generator=generator)
+    window_indices = torch.tensor(
+        [[[0, -1], [0, 1], [1, 2], [2, 3], [3, 4]], [[0, -1], [0, 1], [1, 2], [2, 3], [3, 4]]]
+    )
+
+    row_chunks = _compute_unfused_csa_non_compressed_lse(
+        query, kv, sink, window_indices, softmax_scale=0.5, chunk_size=1
+    )
+    full_chunk = _compute_unfused_csa_non_compressed_lse(
+        query, kv, sink, window_indices, softmax_scale=0.5, chunk_size=10
+    )
+    torch.testing.assert_close(row_chunks, full_chunk, rtol=0, atol=0)
+
+    all_invalid = torch.full_like(window_indices, -1)
+    sink_only = _compute_unfused_csa_non_compressed_lse(
+        query, kv, sink, all_invalid, softmax_scale=0.5
+    )
+    expected = sink.view(1, -1, 1).expand(2, -1, 5)
+    torch.testing.assert_close(sink_only, expected, rtol=0, atol=0)
+
+
+def test_thd_non_compressed_lse_uses_global_interleaved_kv_offsets():
+    query = torch.tensor(
+        [
+            [[1.0, 0.0], [0.0, 1.0]],
+            [[0.5, 0.5], [1.0, -1.0]],
+            [[1.0, 1.0], [-1.0, 0.5]],
+            [[0.25, -0.5], [0.75, 1.0]],
+        ]
+    )
+    kv_full_thd = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 2.0],
+            [100.0, 100.0],
+            [3.0, 0.0],
+            [0.0, 4.0],
+            [200.0, 200.0],
+            [300.0, 300.0],
+        ]
+    )
+    local_window = torch.tensor([[0, -1], [0, 1], [0, -1], [0, 1]])
+    cu_q = torch.tensor([0, 2, 4], dtype=torch.int32)
+    cu_kv_full = torch.tensor([0, 3, 7], dtype=torch.int32)
+    global_window, _ = build_flat_topk_idxs(
+        local_window, batch_size=-1, cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv_full
+    )
+    assert torch.equal(
+        global_window, torch.tensor([[0, -1], [0, 1], [3, -1], [3, 4]], dtype=torch.int32)
+    )
+
+    sink = torch.tensor([0.25, -0.5])
+    actual = _compute_unfused_csa_non_compressed_lse(
+        query, kv_full_thd, sink, global_window, softmax_scale=0.5, chunk_size=1
+    )
+    gathered = kv_full_thd.index_select(0, global_window.clamp_min(0).reshape(-1)).reshape(4, 2, 2)
+    logits = torch.einsum('rhd,rkd->rhk', query.float(), gathered.float()) * 0.5
+    logits = logits.masked_fill((global_window < 0).unsqueeze(1), float('-inf'))
+    expected = (
+        torch.logaddexp(torch.logsumexp(logits, dim=-1), sink.view(1, -1))
+        .transpose(0, 1)
+        .unsqueeze(0)
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 class TestCompressedThdMetadata:
     def test_two_segments_and_padding_map_exactly(self):
         cu_q = torch.tensor([0, 8, 13], dtype=torch.int32)
@@ -93,6 +247,27 @@ class TestCompressedThdMetadata:
         assert torch.equal(ends, torch.tensor([0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 0, 0]))
         assert torch.equal(valid_rows, torch.tensor([True] * 13 + [False, False]))
         assert torch.equal(offsets, starts)
+
+    def test_per_segment_padding_uses_physical_offsets_and_real_lengths(self):
+        physical_cu_q = torch.tensor([0, 12, 24], dtype=torch.int32)
+        real_cu_q = torch.tensor([0, 9, 20], dtype=torch.int32)
+        physical_cu_comp = torch.tensor([0, 3, 6], dtype=torch.int32)
+
+        starts, ends, valid_rows, offsets = _build_compressed_thd_indexer_metadata(
+            physical_cu_q, physical_cu_comp, total_q=24, ratio=4, cu_seqlens_q_unpadded=real_cu_q
+        )
+
+        expected_valid = torch.tensor([True] * 9 + [False] * 3 + [True] * 11 + [False])
+        assert torch.equal(valid_rows, expected_valid)
+        assert torch.equal(starts[:9], torch.zeros(9, dtype=torch.int64))
+        assert torch.equal(starts[9:12], torch.zeros(3, dtype=torch.int64))
+        assert torch.equal(starts[12:23], torch.full((11,), 3, dtype=torch.int64))
+        assert starts[23] == 0
+        assert torch.equal(offsets, starts)
+        assert ends[8] == 2
+        assert torch.equal(ends[9:12], torch.zeros(3, dtype=torch.int64))
+        assert ends[22] == 5
+        assert ends[23] == 0
 
     @pytest.mark.parametrize(
         "cu_q,cu_comp,ratio,match",

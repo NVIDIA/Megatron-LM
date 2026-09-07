@@ -24,6 +24,7 @@ from megatron.training.checkpointing import (
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
     get_checkpoint_tracker_filename,
+    load_args_from_checkpoint,
     load_checkpoint,
     read_metadata,
     save_checkpoint,
@@ -74,6 +75,94 @@ class MockState:
         return self.state_dict()
 
 
+def test_load_args_restores_quantile_balancing_from_checkpoint():
+    """QB mode and histogram shape are reconstructed before the router is built."""
+    checkpoint_args = SimpleNamespace(
+        moe_router_load_balancing_type="quantile_balancing",
+        moe_aux_loss_coeff=0.0,
+        moe_router_quantile_balancing_estimation_scope="global_batch",
+        moe_router_qb_num_bins=257,
+    )
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        moe_router_load_balancing_type="aux_loss",
+        moe_aux_loss_coeff=0.01,
+        moe_router_quantile_balancing_estimation_scope="micro_batch",
+        moe_router_qb_num_bins=64,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.moe_router_load_balancing_type == "quantile_balancing"
+    assert restored_args.moe_aux_loss_coeff == 0.0
+    assert restored_args.moe_router_quantile_balancing_estimation_scope == "global_batch"
+    assert restored_args.moe_router_qb_num_bins == 257
+
+
+def test_load_args_restores_latent_rmsnorm_from_checkpoint():
+    """The latent dimension and its RMSNorm up-projection are reconstructed together."""
+    checkpoint_args = SimpleNamespace(moe_latent_size=16, moe_latent_up_projection_rmsnorm=True)
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        moe_latent_size=None,
+        moe_latent_up_projection_rmsnorm=False,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.moe_latent_size == 16
+    assert restored_args.moe_latent_up_projection_rmsnorm is True
+
+
+@pytest.mark.parametrize(
+    "checkpoint_args",
+    [
+        SimpleNamespace(swiglu=True, situ_glu=False, situ_glu_beta1=4.0, situ_glu_beta2=25.0),
+        SimpleNamespace(swiglu=False, situ_glu=True, situ_glu_beta1=3.0, situ_glu_beta2=20.0),
+    ],
+)
+def test_load_args_restores_glu_activation_from_checkpoint(checkpoint_args):
+    """Checkpoint arguments select the saved gated activation and SiTU scaling."""
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        swiglu=not checkpoint_args.swiglu,
+        situ_glu=not checkpoint_args.situ_glu,
+        situ_glu_beta1=1.0,
+        situ_glu_beta2=1.0,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.swiglu is checkpoint_args.swiglu
+    assert restored_args.situ_glu is checkpoint_args.situ_glu
+    assert restored_args.situ_glu_beta1 == checkpoint_args.situ_glu_beta1
+    assert restored_args.situ_glu_beta2 == checkpoint_args.situ_glu_beta2
+
+
 def create_checkpoint(load_path, ckpt_format):
     """Setup a dummy checkpoint directory."""
     iteration = 123
@@ -121,6 +210,87 @@ def create_args():
     args.verify_integrity = False
 
     yield args
+
+
+def test_async_save_rejects_reusable_chunked_optimizer_buffers(create_args):
+    """Checkpoint entry must preserve the CLI guard when startup validation was bypassed."""
+
+    create_args.async_save = True
+    create_args.ckpt_format = 'torch_dist'
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        pytest.raises(RuntimeError, match="does not support --async-save"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_rejects_mutated_format_with_chunked_optimizer_offload(create_args):
+    """Checkpoint entry revalidates the format after resume-time argument restoration."""
+
+    create_args.ckpt_format = 'torch'
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        pytest.raises(RuntimeError, match="requires --ckpt-format torch_dist"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_treats_zero_offload_fraction_as_disabled(create_args):
+    """A zero fraction must not impose async-save or distributed-format restrictions."""
+
+    create_args.async_save = True
+    create_args.ckpt_format = 'torch'
+    optimizer = SimpleNamespace(
+        config=SimpleNamespace(
+            chunked_optimizer_state_offload=True, optimizer_state_offload_fraction=0.0
+        )
+    )
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        mock.patch(
+            "megatron.training.checkpointing.is_empty_async_queue",
+            side_effect=RuntimeError("continued past optimizer offload guard"),
+        ),
+        pytest.raises(RuntimeError, match="continued past optimizer offload guard"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_skips_offload_guards_without_optimizer_state(create_args):
+    """Model-only saves do not expose reusable optimizer buffers to the async writer."""
+
+    create_args.async_save = True
+    create_args.ckpt_format = 'torch_dist'
+    create_args.no_save_optim = True
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        mock.patch(
+            "megatron.training.checkpointing.is_empty_async_queue",
+            side_effect=RuntimeError("continued past optimizer offload guard"),
+        ),
+        pytest.raises(RuntimeError, match="continued past optimizer offload guard"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
+
+
+def test_checkpoint_save_allows_legacy_format_without_optimizer_state(create_args):
+    """A model-only save is not forced through optimizer-specific distributed hooks."""
+
+    create_args.ckpt_format = 'torch'
+    create_args.no_save_optim = True
+    optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
+        mock.patch(
+            "megatron.training.checkpointing.on_save_checkpoint_start",
+            side_effect=RuntimeError("continued past optimizer offload guard"),
+        ),
+        pytest.raises(RuntimeError, match="continued past optimizer offload guard"),
+    ):
+        save_checkpoint(0, [], optimizer, None, 0)
 
 
 @pytest.fixture

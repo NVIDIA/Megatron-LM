@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import json
 import os
 import sys
 import types
@@ -10,36 +11,40 @@ import pytest
 
 LITE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(__file__).resolve().parents[3]
-VERL_EXAMPLE_ROOT = LITE_ROOT / "examples" / "verl"
-for root in (REPO_ROOT, LITE_ROOT, VERL_EXAMPLE_ROOT):
+HARNESS_ROOT = Path(__file__).resolve().parent / "_test_harness"
+for root in (REPO_ROOT, LITE_ROOT, HARNESS_ROOT):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 
+from markers import MarkerError, execution_for_item, register  # noqa: E402
+
 
 def pytest_configure(config):
-    config.addinivalue_line("markers", "mlite: mark a test as Megatron Lite validation coverage")
-    config.addinivalue_line(
-        "markers",
-        "smoke: mark a Megatron Lite smoke test; skipped unless --mlite-smoke or MLITE_RUN_SMOKE=1 is set",
-    )
-    config.addinivalue_line("markers", "gpu: mark a test as requiring CUDA")
-    config.addinivalue_line("markers", "distributed: mark a test as requiring torch.distributed")
-
-
-def pytest_addoption(parser):
-    parser.addoption(
-        "--mlite-smoke", action="store_true", default=False, help="run Megatron Lite smoke tests"
-    )
+    register(config)
 
 
 def pytest_collection_modifyitems(config, items):
-    run_smoke = config.getoption("--mlite-smoke") or os.getenv("MLITE_RUN_SMOKE") == "1"
-    if run_smoke:
-        return
-    skip_smoke = pytest.mark.skip(reason="set --mlite-smoke or MLITE_RUN_SMOKE=1 to run")
+    plan_path = os.getenv("MLITE_TEST_PLAN_PATH")
+    tests = []
     for item in items:
-        if "smoke" in item.keywords:
-            item.add_marker(skip_smoke)
+        try:
+            execution = execution_for_item(item)
+        except MarkerError as exc:
+            raise pytest.UsageError(f"{item.nodeid}: {exc}") from exc
+        if execution.gpus and os.getenv("MLITE_TEST_HARNESS") != "1":
+            item.add_marker(
+                pytest.mark.skip(reason="run GPU tests through tests/run_tests.sh")
+            )
+        if plan_path:
+            tests.append({"nodeid": item.nodeid, **execution.as_dict()})
+
+    if plan_path:
+        destination = Path(plan_path)
+        temporary = destination.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps({"tests": tests}, sort_keys=True), encoding="utf-8"
+        )
+        temporary.replace(destination)
 
 
 @pytest.fixture
@@ -58,7 +63,9 @@ def transformer_engine_import_stub(monkeypatch):
 
         class _UnavailableTE:
             def __init__(self, *args, **kwargs):
-                raise RuntimeError("Transformer Engine is not installed in this test environment.")
+                raise RuntimeError(
+                    "Transformer Engine is not installed in this test environment."
+                )
 
         root = types.ModuleType("transformer_engine")
         root.__version__ = "0.0.0"
@@ -93,12 +100,16 @@ def transformer_engine_import_stub(monkeypatch):
         root.pytorch = pytorch
         monkeypatch.setitem(sys.modules, "transformer_engine", root)
         monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", pytorch)
-        monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.permutation", permutation)
+        monkeypatch.setitem(
+            sys.modules, "transformer_engine.pytorch.permutation", permutation
+        )
         monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.router", router)
         monkeypatch.setitem(
             sys.modules, "transformer_engine.pytorch.cpp_extensions", cpp_extensions
         )
         monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.module", module)
-        monkeypatch.setitem(sys.modules, "transformer_engine.pytorch.module.base", module_base)
+        monkeypatch.setitem(
+            sys.modules, "transformer_engine.pytorch.module.base", module_base
+        )
 
     return install

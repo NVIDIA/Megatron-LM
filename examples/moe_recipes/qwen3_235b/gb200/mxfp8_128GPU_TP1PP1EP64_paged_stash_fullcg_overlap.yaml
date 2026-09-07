@@ -27,11 +27,12 @@ DEPENDENCIES:
         apt-get install -y --no-install-recommends git curl gettext sudo
         ARCH=$(uname -m)
         case "${ARCH}" in
-          "x86_64") YQ_ARCH=amd64 ;;
-          "aarch64") YQ_ARCH=arm64 ;;
+          "x86_64") YQ_ARCH=amd64; YQ_SHA256=9a54846e81720ae22814941905cd3b056ebdffb76bf09acffa30f5e90b22d615 ;;
+          "aarch64") YQ_ARCH=arm64; YQ_SHA256=ea360a0ecdff30c8625ccd0b97f8714b8308a429fd839cf8ccc481f311e217c6 ;;
           *) echo "Unsupported architecture: ${ARCH}" && exit 1 ;;
         esac
         wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/bin/yq
+        echo "${YQ_SHA256}  /usr/bin/yq" | sha256sum --check -
         chmod +x /usr/bin/yq
         apt-get clean
         rm -rf /var/lib/apt/lists/*

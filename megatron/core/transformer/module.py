@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron Module."""
+
 from functools import partial
 from typing import Optional, Tuple
 
@@ -185,6 +186,13 @@ class GraphableMegatronModule(MegatronModule):
             # script with the graphs returned by make_graphed_callables API before the first
             # training step.
             self.cuda_graphs = []
+            # Positional hidden-state inputs used as TE's fixed CUDA Graph input
+            # surfaces, indexed exactly like ``cuda_graphs``.  Most layers do not
+            # need to retain these handles.  They are exposed for eager producers
+            # whose recompute must restore bytes at the address captured by a
+            # downstream graph (for example, mHC aggregation feeding attention).
+            self._te_cuda_graph_static_hidden_inputs = ()
+            self._te_cuda_graph_static_hidden_input_ptrs = ()
             # List to store forward pre-hooks. Forward pre-hooks are not captured into CUDA
             # graphs. Those hooks and args are collected in this list and should be manually
             # triggered before CUDA Graph running. This is required to ensure the correct param
@@ -196,13 +204,65 @@ class GraphableMegatronModule(MegatronModule):
             # according to CUDA graph scope.
             self.cuda_graph_backward_dw_wrapper = None
 
+    def set_te_cuda_graph_static_hidden_inputs(self, inputs):
+        """Retain TE's fixed hidden-state input surface for each graph slot.
+
+        ``TECudaGraphHelper`` calls this only after ``make_graphed_callables``
+        returns because TE may rebind sample inputs while optimizing graph-buffer
+        reuse.  Different slots are allowed to alias when their schedule
+        lifetimes do not overlap.
+        """
+        inputs = tuple(inputs)
+        if len(inputs) != len(self.cuda_graphs):
+            raise ValueError(
+                "TE CUDA Graph static-input count must match graph count: "
+                f"got {len(inputs)} inputs and {len(self.cuda_graphs)} graphs"
+            )
+        if not all(isinstance(tensor, torch.Tensor) and tensor.is_cuda for tensor in inputs):
+            raise TypeError("TE CUDA Graph static hidden inputs must be CUDA tensors")
+
+        self._te_cuda_graph_static_hidden_inputs = inputs
+        self._te_cuda_graph_static_hidden_input_ptrs = tuple(tensor.data_ptr() for tensor in inputs)
+
+    def get_te_cuda_graph_static_hidden_input(self, microbatch_idx=None):
+        """Return the fixed hidden-state input for a TE CUDA Graph slot."""
+        if not self._te_cuda_graph_static_hidden_inputs:
+            raise RuntimeError("TE CUDA Graph static hidden inputs have not been attached")
+
+        if microbatch_idx is None:
+            microbatch_idx = getattr(self, 'current_microbatch', 0)
+        graph_index = microbatch_idx % len(self._te_cuda_graph_static_hidden_inputs)
+        tensor = self._te_cuda_graph_static_hidden_inputs[graph_index]
+        expected_ptr = self._te_cuda_graph_static_hidden_input_ptrs[graph_index]
+        if tensor.data_ptr() != expected_ptr:
+            raise RuntimeError(
+                f"TE CUDA Graph static hidden input {graph_index} changed address: "
+                f"expected {expected_ptr}, got {tensor.data_ptr()}"
+            )
+        return tensor
+
+    def clear_te_cuda_graph_static_hidden_inputs(self):
+        """Release retained TE static-input handles when graphs are deleted."""
+        self._te_cuda_graph_static_hidden_inputs = ()
+        self._te_cuda_graph_static_hidden_input_ptrs = ()
+
     def init_backward_dw_wrapper(self):
-        """Initialize the backward_dw_wrapper."""
-        from megatron.core.models.gpt.fine_grained_callables import _BackwardDWWrapper
+        """Initialize ``self.backward_dw_wrapper`` for delayed-wgrad scheduling.
+
+        The wrapper coordinates the per-layer wgrad callables (attention
+        wgrad, optional shared-expert wgrad) with cuda-graph replay scope so
+        captured components are not re-run eagerly. The method is defined on
+        ``GraphableMegatronModule`` so any graphable subclass can opt in;
+        ``_BackwardDWWrapper`` itself currently asserts the underlying layer
+        is a ``TransformerLayer``, so MambaLayer-derived modules implement
+        ``backward_dw`` directly and skip this helper.
+        """
+        from megatron.core.models.common.utils import _BackwardDWWrapper
 
         config = getattr(self, 'config', None)
         assert config is not None, (
-            "TransformerLayer must be initialized before calling " "`init_backward_dw_wrapper`."
+            "Module must be fully constructed (config set) before calling "
+            "`init_backward_dw_wrapper`."
         )
         self.backward_dw_wrapper = _BackwardDWWrapper(self)
 

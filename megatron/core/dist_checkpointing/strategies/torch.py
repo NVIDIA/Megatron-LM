@@ -1,6 +1,7 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-""" Strategies using PyTorch distributed.checkpoint as an underlying format. """
+"""Strategies using PyTorch distributed.checkpoint as an underlying format."""
+
 import inspect
 import io
 import os
@@ -332,7 +333,7 @@ def mcore_to_pyt_state_dict(
 
 
 def _unwrap_pyt_sharded_tensor(
-    sh_ten: Union[TorchShardedTensor, CheckpointableShardedTensor, LocalShardsContainer, Any]
+    sh_ten: Union[TorchShardedTensor, CheckpointableShardedTensor, LocalShardsContainer, Any],
 ) -> Union[List[torch.Tensor], Any]:
     """Unwrap tensor from PyT ShardedTensor instance.
 
@@ -679,7 +680,7 @@ class TorchDistSaveShardedStrategy:
                 _logged_mcore_async_deprecation = True
 
         # Translate the state dict
-        (sharded_state_dict, flat_mapping, rename_mapping) = (
+        sharded_state_dict, flat_mapping, rename_mapping = (
             _replace_state_dict_keys_with_sharded_keys(
                 sharded_state_dict, self.keep_only_main_replica
             )
@@ -884,7 +885,7 @@ class TorchDistLoadShardedStrategy:
 
         orig_sharded_state_dict = sharded_state_dict
         # MCore state dict to PyT Distributed compatible
-        (sharded_state_dict, flat_mapping, rename_mapping) = (
+        sharded_state_dict, flat_mapping, rename_mapping = (
             _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
@@ -1024,16 +1025,16 @@ class TorchDistLoadShardedStrategy:
             except AttributeError:
                 os.sync()
         ## move the old metadata
-        fs_writer.fs.rename(fs_writer.metadata_path, old_path)
+        fs_writer.fs.rename(metadata_filename, old_path)
         try:
             ## rename the new metadata
-            fs_writer.fs.rename(tmp_path, fs_writer.metadata_path)
+            fs_writer.fs.rename(tmp_path, metadata_filename)
 
             ## finally, remove the files we want to drop
             for f in files_to_remove:
-                fs_writer.fs.rm_file(checkpoint_dir / f)
+                fs_writer.fs.rm_file(Path(checkpoint_dir) / f)
         except Exception as e:
-            fs_writer.fs.rename(old_path, fs_writer.metadata_path)
+            fs_writer.fs.rename(old_path, metadata_filename)
             raise e
         else:
             fs_writer.fs.rm_file(old_path)

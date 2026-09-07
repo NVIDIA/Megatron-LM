@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
 from typing import List, Optional, Tuple, Union
@@ -413,9 +413,30 @@ class P2PCommunicator:
                 req.wait()
             reqs = None
 
-        if config.batch_p2p_comm and config.batch_p2p_sync:
+        if (
+            config.batch_p2p_comm
+            and config.batch_p2p_sync
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             # To protect against race condition when using batch_isend_irecv().
-            # User should assert that we have a modern enough PyTorch to not need this
+            # User should assert that we have a modern enough PyTorch to not need this.
+            #
+            # Skipped while a stream is capturing, which cuda_graph_impl=
+            # "full_iteration" makes reachable by recording the whole pipeline
+            # schedule. torch.cuda.synchronize() is a host-side device sync and is
+            # illegal under capture -- measured, not assumed: it raises
+            # "operation failed due to a previous error during capture", while the
+            # batch_isend_irecv and the req.wait() above it both capture cleanly.
+            # So no captured pipeline can carry this workaround in any form; the
+            # only choice is to skip it or to reject capture outright.
+            #
+            # Skipping is the right choice because the workaround targets a bug in
+            # older PyTorch, and capturing NCCL point-to-point work needs a far
+            # newer stack than that -- any build that can reach this line under
+            # capture is one the comment above says does not need the sync. This is
+            # a version argument, not a stream-ordering one: the race is cross-rank,
+            # so do not carry this skip over to a non-captured path by reasoning
+            # that local stream order stands in for it.
             torch.cuda.synchronize()
 
         return tensor_recv_prev, tensor_recv_next, reqs

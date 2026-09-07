@@ -1,10 +1,16 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from typing import List, Optional
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
+from megatron.core.ssm.gated_delta_net import (
+    GatedDeltaNet,
+    GatedDeltaNetSubmodules,
+    KimiDeltaAttention,
+    KimiDeltaAttentionSubmodules,
+)
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
@@ -67,6 +73,17 @@ except ImportError:
 
 
 ##########
+# Experimental Attention Variant Names
+##########
+
+# Canonical ``experimental_attention_variant`` names served by the gated delta net family.
+GDN_ATTENTION_VARIANTS = ("gdn", "kda")
+
+# Deprecated ``experimental_attention_variant`` spellings mapped to their canonical name.
+_DEPRECATED_ATTENTION_VARIANT_ALIASES = {"gated_delta_net": "gdn"}
+
+
+##########
 # Experimental Attention Variant Module Specs
 ##########
 
@@ -74,21 +91,33 @@ except ImportError:
 def get_gated_delta_net_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
-    """Build module spec for GatedDeltaNet attention."""
+    """Build a module spec for a GDN-family attention variant."""
 
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
     rms_norm = config.normalization == "RMSNorm"
-    attention = ModuleSpec(
-        module=GatedDeltaNet,
-        submodules=GatedDeltaNetSubmodules(
-            in_proj=backend.column_parallel_layer_norm_linear(),
-            out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
-            out_proj=backend.row_parallel_linear(),
-        ),
-        metainfo={"fuse_input_layernorm": True},
-    )
+    if config.experimental_attention_variant == "kda":
+        attention = ModuleSpec(
+            module=KimiDeltaAttention,
+            submodules=KimiDeltaAttentionSubmodules(
+                in_proj=backend.column_parallel_linear(),
+                beta_proj=backend.column_parallel_linear(),
+                out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+                out_proj=backend.row_parallel_linear(),
+            ),
+            metainfo={"fuse_input_layernorm": False},
+        )
+    else:
+        attention = ModuleSpec(
+            module=GatedDeltaNet,
+            submodules=GatedDeltaNetSubmodules(
+                in_proj=backend.column_parallel_layer_norm_linear(),
+                out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+                out_proj=backend.row_parallel_linear(),
+            ),
+            metainfo={"fuse_input_layernorm": True},
+        )
     return attention
 
 
@@ -209,7 +238,7 @@ def get_experimental_attention_variant_module_spec(
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
-    if config.experimental_attention_variant == "gated_delta_net":
+    if is_gated_delta_net_variant(config.experimental_attention_variant):
         return get_gated_delta_net_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
@@ -409,10 +438,34 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 ##########
 
 
+def normalize_experimental_attention_variant(
+    experimental_attention_variant: Optional[str],
+) -> Optional[str]:
+    """Resolve a deprecated attention-variant spelling to its canonical name."""
+    canonical = _DEPRECATED_ATTENTION_VARIANT_ALIASES.get(experimental_attention_variant)
+    if canonical is None:
+        return experimental_attention_variant
+
+    warnings.warn(
+        f"experimental_attention_variant='{experimental_attention_variant}' is deprecated "
+        f"and will be removed in a future release. Use '{canonical}' instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return canonical
+
+
+def is_gated_delta_net_variant(experimental_attention_variant: Optional[str]) -> bool:
+    """Return whether a name selects a GDN-family attention implementation."""
+    canonical = _DEPRECATED_ATTENTION_VARIANT_ALIASES.get(
+        experimental_attention_variant, experimental_attention_variant
+    )
+    return canonical in GDN_ATTENTION_VARIANTS
+
+
 def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -> bool:
     """Check if the experimental attention variant is a linear attention variant."""
-    linear_attention_variants = ["gated_delta_net"]
-    return experimental_attention_variant in linear_attention_variants
+    return is_gated_delta_net_variant(experimental_attention_variant)
 
 
 def _validate_dsa_index_share_pipeline_split(config: TransformerConfig, local_layer_ids) -> None:

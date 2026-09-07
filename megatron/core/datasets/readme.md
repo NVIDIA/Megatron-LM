@@ -246,11 +246,18 @@ Utility functions consumed by the schedulers above:
 | Function | Role |
 |---|---|
 | `get_batch_and_global_seqlens()` | Fetch `num_microbatches` batches from the data iterator and all-gather sequence lengths across DP ranks. |
-| `reroute_samples_to_dcp_ranks()` | All-to-all communication to transfer sub-samples to their scheduled DP×CP rank. |
+| `reroute_samples_to_dcp_ranks()` | All-gather communication within each CP lane, followed by local selection of sub-samples for the scheduled DP×CP rank. |
 | `build_packed_microbatches()` | Concatenate sub-samples within each microbatch group and produce `cu_seqlens`. |
 | `broadcast_scalars()` | Broadcast scalar values (e.g. `num_microbatches`, FLOPs stats) across a process group. |
 | `broadcast_tensor()` | Broadcast a single tensor within a process group. |
 | `create_data_iterator()` | Wrap packed sample lists into a data iterator; handles VPP stage splitting. |
+
+`reroute_samples_to_dcp_ranks()` requires all ranks in a DP group to provide the same
+field set. CP siblings that share a non-CP DP rank must additionally load byte-identical
+sample contents. The in-tree samplers satisfy this by selecting dataset indices with the
+non-CP DP rank. Fields are gathered one at a time: this incurs one collective launch per
+field, but limits temporary memory to one global field before the selected slices are
+cloned and the gather buffer is released.
 
 ## Offline cache preparation
 

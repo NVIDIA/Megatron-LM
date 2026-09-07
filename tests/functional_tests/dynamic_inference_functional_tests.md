@@ -53,7 +53,7 @@ CLI flags below are verified to exist in `megatron/training/arguments.py` and/or
 |---|---|---|---|
 | Enable prefix caching | `--inference-dynamic-batching-prefix-caching` | off | Reuse KV blocks for shared prompt prefixes |
 | Eviction policy | `--inference-dynamic-batching-prefix-caching-eviction-policy {ref_zero, lru}` | `ref_zero` | Block reclamation strategy |
-| Coordinator routing | `--inference-dynamic-batching-prefix-caching-coordinator-policy {longest_prefix, first_prefix_block, round_robin}` | `first_prefix_block` | Multi-rank request routing |
+| Coordinator routing | `--inference-dynamic-batching-prefix-caching-coordinator-policy {longest_prefix, first_prefix_block, load_balanced}` | `load_balanced` | Multi-rank request routing |
 | Routing alpha | `--inference-dynamic-batching-prefix-caching-routing-alpha` | 0.5 | 0=load-balance, 1=prefix-affinity |
 | Mamba state cache | `--inference-dynamic-batching-prefix-caching-mamba-gb` | — | GPU memory for Mamba hybrid block states |
 
@@ -306,7 +306,7 @@ User selected the **recommended cut** of 6 tests + drift fix + cw-dfw golden gen
 
 **Decision (2026-05-12):** User selected Tier 2 (18 tests). Substitutions vs. original Tier 2 pitch:
 - CP-parallelism tests **dropped** — dynamic inference doesn't support CP (issue #6).
-- Added 2 ZMQ-coordinator tests (longest_prefix + round_robin policies).
+- Added 2 ZMQ-coordinator tests (longest_prefix + load_balanced policies).
 
 | # | Test | model_config | recipe | run | golden | pytest verified |
 |---|---|---|---|---|---|---|
@@ -327,7 +327,7 @@ User selected the **recommended cut** of 6 tests + drift fix + cw-dfw golden gen
 | 15 | `gpt_dynamic_inference_tp4_pp1_ep4_16B_prefix_caching` (MoE) | ✅ | ✅ | ✅ | ✅ committed | ✅ **PASSED** |
 | 16 | `gpt_dynamic_inference_tp4_pp1_ep4_16B_chunked_prefill` (MoE) | ✅ | ✅ | ✅ | ✅ committed | ⏸️ (not sampled) |
 | 17 | `gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_longest_prefix_zmq` | ✅ | ✅ | ✅ | ✅ committed | ✅ **PASSED** |
-| 18 | `gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_round_robin_zmq` | ✅ | ✅ | ✅ | ✅ committed | ⏸️ (not sampled) |
+| 18 | `gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_load_balanced_zmq` | ✅ | ✅ | ✅ | ✅ committed | ⏸️ (not sampled) |
 
 **Verification methodology**: ran 4 representative tests (one per category: parallelism, 3-way combo, MoE, DP+ZMQ) without `RECORD_CHECKPOINTS=true` so the pytest comparison actually executes. All 4 reported `test_inference_pipeline PASSED` against their committed goldens.
 
