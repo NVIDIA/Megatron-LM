@@ -10,12 +10,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from megatron.training.determinism_trace import DigestMode, RankLocalTrace, TraceConfig
-from tools.determinism.trace_comparison import (
-    TraceValidationError,
-    compare_traces,
-    load_trace,
-)
+from megatron.core.determinism.trace import DigestMode, RankLocalTrace, TraceConfig
+from tools.determinism.trace_comparison import TraceValidationError, compare_traces, load_trace
 
 
 def _records(trace: RankLocalTrace) -> list[dict]:
@@ -33,9 +29,7 @@ def _event_trace(path: Path, names: list[str]) -> None:
 
 
 def _tensor_trace(path: Path, tensor: torch.Tensor, mode: DigestMode = DigestMode.FULL) -> None:
-    with RankLocalTrace(
-        TraceConfig(output_dir=path, rank=0, mode=mode, append=False)
-    ) as trace:
+    with RankLocalTrace(TraceConfig(output_dir=path, rank=0, mode=mode, append=False)) as trace:
         trace.record_tensor("hidden", tensor, iteration=1, phase="forward")
 
 
@@ -118,13 +112,7 @@ def test_sampled_mode_uses_stable_indices_and_digest(tmp_path):
     tensor = torch.arange(10, dtype=torch.float32)
     for output in (left, right):
         with RankLocalTrace(
-            TraceConfig(
-                output_dir=output,
-                rank=0,
-                mode="sampled",
-                sample_count=4,
-                append=False,
-            )
+            TraceConfig(output_dir=output, rank=0, mode="sampled", sample_count=4, append=False)
         ) as trace:
             trace.record_tensor("activation", tensor, iteration=1)
 
@@ -181,7 +169,7 @@ def test_append_rejects_malformed_existing_trace(tmp_path):
     output = tmp_path / "rank_000000.jsonl"
     output.write_text("{not-json}\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="invalid existing trace JSON"):
+    with pytest.raises(ValueError, match="invalid JSON"):
         RankLocalTrace(TraceConfig(output_dir=tmp_path, rank=0, append=True))
 
 
@@ -191,9 +179,9 @@ def test_comparator_reports_first_content_divergence(tmp_path):
 
     report = compare_traces(tmp_path / "left", tmp_path / "right")
     assert report["match"] is False
-    assert report["first_divergence"]["kind"] == "content_mismatch"
-    assert report["compared_records_before_divergence"] == 0
-    assert report["first_divergence"]["key"]["name"] == "hidden"
+    assert report["rank_results"]["0"]["first_divergence"]["kind"] == "content_mismatch"
+    assert report["rank_results"]["0"]["compared_records_before_divergence"] == 0
+    assert report["rank_results"]["0"]["first_divergence"]["key"]["name"] == "hidden"
 
 
 def test_comparator_reports_missing_event(tmp_path):
@@ -201,7 +189,7 @@ def test_comparator_reports_missing_event(tmp_path):
     _event_trace(tmp_path / "right", ["a"])
 
     report = compare_traces(tmp_path / "left", tmp_path / "right")
-    assert report["first_divergence"] == {
+    assert report["rank_results"]["0"]["first_divergence"] == {
         "kind": "missing_event",
         "key": {
             "event": "event",
@@ -213,6 +201,8 @@ def test_comparator_reports_missing_event(tmp_path):
             "rank": 0,
         },
         "missing_from": "right",
+        "left_sequence": 1,
+        "right_sequence": None,
     }
 
 
@@ -221,7 +211,7 @@ def test_comparator_reports_event_order_mismatch(tmp_path):
     _event_trace(tmp_path / "right", ["b", "a"])
 
     report = compare_traces(tmp_path / "left", tmp_path / "right")
-    assert report["first_divergence"]["kind"] == "event_order_mismatch"
+    assert report["rank_results"]["0"]["first_divergence"]["kind"] == "event_order_mismatch"
 
 
 @pytest.mark.parametrize(
@@ -310,12 +300,127 @@ def test_comparison_cli_exit_codes_and_report(tmp_path):
     ]
 
     completed = subprocess.run(
-        command,
-        cwd=repository_root,
-        check=False,
-        capture_output=True,
-        text=True,
+        command, cwd=repository_root, check=False, capture_output=True, text=True
     )
     assert completed.returncode == 0
     assert json.loads(completed.stdout)["status"] == "match"
     assert json.loads(report_path.read_text(encoding="utf-8"))["match"] is True
+
+
+@pytest.mark.parametrize("mode", ["summary", "sampled", "full"])
+def test_all_value_modes_snapshot_noncontiguous_inputs(tmp_path, mode):
+    original = torch.arange(24, dtype=torch.float64).reshape(4, 6).transpose(0, 1)
+    mutable = original.clone()
+    with RankLocalTrace(TraceConfig(output_dir=tmp_path / "left", rank=0, mode=mode)) as trace:
+        trace.record_tensor("hidden", mutable, iteration=1, phase="forward")
+        mutable.add_(100)
+    _tensor_trace(tmp_path / "right", original, DigestMode(mode))
+    assert compare_traces(tmp_path / "left", tmp_path / "right")["match"]
+
+
+@pytest.mark.parametrize(
+    "tensor", [torch.tensor(3.0), torch.empty(0), torch.ones(1, 4).expand(3, 4)]
+)
+def test_sampled_scalar_empty_and_expanded_inputs(tmp_path, tensor):
+    with RankLocalTrace(TraceConfig(output_dir=tmp_path, rank=0, mode="sampled")) as trace:
+        trace.record_tensor("input", tensor, iteration=1)
+    evidence = load_trace(tmp_path)[0]["tensor"]
+    assert evidence["captured_numel"] == tensor.numel()
+
+
+def test_metadata_tensor_capture_does_not_invoke_value_operations(tmp_path, monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("metadata capture must not read tensor values")
+
+    tensor = torch.ones(4)
+    for name in ("clone", "cpu", "item", "tolist", "numpy", "detach"):
+        monkeypatch.setattr(torch.Tensor, name, unexpected)
+    with RankLocalTrace(TraceConfig(output_dir=tmp_path, rank=0)) as trace:
+        trace.record_tensor("input", tensor, iteration=1)
+    assert load_trace(tmp_path)[0]["tensor"]["value_observed"] is False
+
+
+def test_scalar_override_is_explicit_in_metadata_trace(tmp_path):
+    with RankLocalTrace(TraceConfig(output_dir=tmp_path, rank=0, mode="metadata")) as trace:
+        trace.record_scalar("loss", torch.tensor(2.0), iteration=1)
+    evidence = load_trace(tmp_path)[0]["tensor"]
+    assert evidence["mode"] == "full"
+    assert evidence["value_observed"] is True
+
+
+def test_append_preserves_a_valid_final_line_without_newline(tmp_path):
+    _event_trace(tmp_path, ["first"])
+    path = tmp_path / "rank_000000.jsonl"
+    path.write_text(path.read_text(encoding="utf-8").rstrip("\n"), encoding="utf-8")
+    with RankLocalTrace(TraceConfig(output_dir=tmp_path, rank=0, append=True)) as trace:
+        trace.record_event("second", iteration=1, phase="forward")
+    assert [record["name"] for record in load_trace(tmp_path)] == ["first", "second"]
+
+
+@pytest.mark.parametrize("mutation", ["duplicate", "missing_fields", "invalid_evidence"])
+def test_append_uses_the_same_contract_as_the_offline_loader(tmp_path, mutation):
+    if mutation == "invalid_evidence":
+        _tensor_trace(tmp_path, torch.ones(2))
+    else:
+        _event_trace(tmp_path, ["first"])
+    path = tmp_path / "rank_000000.jsonl"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if mutation == "duplicate":
+        extra = dict(record, sequence=1)
+        text = json.dumps(record) + "\n" + json.dumps(extra) + "\n"
+    else:
+        if mutation == "missing_fields":
+            record.pop("fields")
+        else:
+            record["tensor"]["captured_numel"] = 1
+        text = json.dumps(record) + "\n"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError):
+        RankLocalTrace(TraceConfig(output_dir=tmp_path, rank=0, append=True))
+    with pytest.raises(TraceValidationError):
+        load_trace(tmp_path)
+    assert path.read_text(encoding="utf-8") == text
+
+
+def test_failed_capture_does_not_consume_occurrence_or_sequence(tmp_path):
+    with RankLocalTrace(TraceConfig(output_dir=tmp_path, rank=0)) as trace:
+        with pytest.raises(TypeError):
+            trace.record_tensor("same", object(), iteration=1)
+        trace.record_tensor("same", torch.ones(1), iteration=1)
+    record = load_trace(tmp_path)[0]
+    assert record["sequence"] == record["occurrence"] == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"rank": True}, {"rank": 0, "sample_count": 1.5}, {"rank": 0, "flush_every": False}]
+)
+def test_config_rejects_non_integer_counters(tmp_path, kwargs):
+    with pytest.raises(ValueError):
+        TraceConfig(output_dir=tmp_path, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.bool,
+        torch.int64,
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+        torch.complex64,
+        torch.complex128,
+    ],
+)
+def test_full_capture_preserves_supported_logical_dtypes(tmp_path, dtype):
+    tensor = torch.arange(8).to(dtype).reshape(2, 4).t()
+    _tensor_trace(tmp_path / "left", tensor)
+    _tensor_trace(tmp_path / "right", tensor.clone())
+    report = compare_traces(tmp_path / "left", tmp_path / "right")
+    assert report["match_strength"] == "full_tensor_certificate"
+
+
+def test_full_capture_distinguishes_signed_zero(tmp_path):
+    _tensor_trace(tmp_path / "left", torch.tensor([0.0]))
+    _tensor_trace(tmp_path / "right", torch.tensor([-0.0]))
+    assert not compare_traces(tmp_path / "left", tmp_path / "right")["match"]

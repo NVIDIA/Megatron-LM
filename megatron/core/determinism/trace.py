@@ -23,7 +23,7 @@ from typing import Any, Mapping
 
 import torch
 
-TRACE_SCHEMA_VERSION = 1
+from .trace_schema import TRACE_SCHEMA_VERSION, read_rank_trace, validate_record
 
 
 class DigestMode(str, Enum):
@@ -63,11 +63,11 @@ class TraceConfig:
     iteration_spec: str = "all"
 
     def __post_init__(self) -> None:
-        if self.rank < 0:
+        if type(self.rank) is not int or self.rank < 0:
             raise ValueError("rank must be non-negative")
-        if self.sample_count <= 0:
+        if type(self.sample_count) is not int or self.sample_count <= 0:
             raise ValueError("sample_count must be positive")
-        if self.flush_every < 0:
+        if type(self.flush_every) is not int or self.flush_every < 0:
             raise ValueError("flush_every must be non-negative")
         object.__setattr__(self, "mode", DigestMode(self.mode))
         _parse_range_spec(self.rank_spec, "rank_spec")
@@ -76,13 +76,18 @@ class TraceConfig:
 
 @dataclass
 class _PendingTensor:
+    """A snapshot and its completion event awaiting host materialization."""
+
     metadata: dict[str, Any]
     mode: DigestMode
     payload: torch.Tensor | None = None
     sample_indices: list[int] | None = None
+    ready: torch.cuda.Event | None = None
 
 
 def _parse_range_spec(spec: str, label: str) -> tuple[tuple[int, int], ...] | None:
+    if not isinstance(spec, str):
+        raise ValueError(f"{label} must be a string")
     normalized = spec.strip().lower()
     if normalized in {"", "all", "*"}:
         return None
@@ -150,6 +155,18 @@ def _sample_indices(numel: int, sample_count: int) -> list[int]:
 
 
 def _capture_tensor(tensor: torch.Tensor, mode: DigestMode, sample_count: int) -> _PendingTensor:
+    pending = _capture_tensor_payload(tensor, mode, sample_count)
+    if pending.payload is not None and pending.payload.is_cuda:
+        # Capture executes on the caller's current stream for this device. Record
+        # its completion so a later flush on another stream can safely consume it.
+        pending.ready = torch.cuda.Event()
+        pending.ready.record(torch.cuda.current_stream(pending.payload.device))
+    return pending
+
+
+def _capture_tensor_payload(
+    tensor: torch.Tensor, mode: DigestMode, sample_count: int
+) -> _PendingTensor:
     if not isinstance(tensor, torch.Tensor):
         raise TypeError("record_tensor requires a torch.Tensor")
 
@@ -160,25 +177,38 @@ def _capture_tensor(tensor: torch.Tensor, mode: DigestMode, sample_count: int) -
         raise ValueError(f"{mode.value} capture requires a strided tensor")
     if tensor.device.type == "meta":
         raise ValueError(f"{mode.value} capture does not support meta tensors")
-    if tensor.is_cuda and torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("value-bearing determinism traces are not CUDA-graph-capture safe")
+    if tensor.is_cuda:
+        with torch.cuda.device(tensor.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "value-bearing determinism traces are not CUDA-graph-capture safe"
+                )
 
     detached = tensor.detach()
     if mode == DigestMode.FULL:
-        return _PendingTensor(metadata=metadata, mode=mode, payload=detached.contiguous().clone())
+        return _PendingTensor(
+            metadata=metadata,
+            mode=mode,
+            payload=detached.clone(memory_format=torch.contiguous_format),
+        )
     if mode == DigestMode.SAMPLED:
         indices = _sample_indices(detached.numel(), sample_count)
         if indices:
             index_tensor = torch.tensor(indices, dtype=torch.int64, device=detached.device)
-            payload = detached.reshape(-1).index_select(0, index_tensor).clone()
+            if detached.ndim == 0:
+                payload = detached.reshape(1).index_select(0, index_tensor)
+            else:
+                # Advanced indexing gathers only selected logical elements, even
+                # for non-contiguous inputs; flattening could copy the full tensor.
+                coordinates = []
+                remaining = index_tensor
+                for dimension in reversed(detached.shape):
+                    coordinates.append(remaining.remainder(dimension))
+                    remaining = remaining.div(dimension, rounding_mode="floor")
+                payload = detached[tuple(reversed(coordinates))]
         else:
             payload = detached.new_empty((0,))
-        return _PendingTensor(
-            metadata=metadata,
-            mode=mode,
-            payload=payload,
-            sample_indices=indices,
-        )
+        return _PendingTensor(metadata=metadata, mode=mode, payload=payload, sample_indices=indices)
 
     if detached.numel() == 0:
         payload = torch.empty((0,), dtype=torch.float64, device=detached.device)
@@ -187,13 +217,7 @@ def _capture_tensor(tensor: torch.Tensor, mode: DigestMode, sample_count: int) -
         values = values.to(torch.float64)
         finite = torch.isfinite(values).all().to(torch.float64)
         payload = torch.stack(
-            (
-                finite,
-                values.min(),
-                values.max(),
-                values.sum(),
-                torch.linalg.vector_norm(values),
-            )
+            (finite, values.min(), values.max(), values.sum(), torch.linalg.vector_norm(values))
         )
     return _PendingTensor(metadata=metadata, mode=mode, payload=payload)
 
@@ -217,6 +241,15 @@ def _resolve_tensor(pending: _PendingTensor) -> dict[str, Any]:
         return result
     assert pending.payload is not None
 
+    if pending.ready is not None:
+        with torch.cuda.device(pending.payload.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("flush of value-bearing traces is not CUDA-graph-capture safe")
+        # Host materialization already blocks; synchronize only the capture event,
+        # not the whole device. This also protects snapshot storage during release.
+        pending.ready.synchronize()
+    cpu_payload = pending.payload.cpu()
+
     if pending.mode == DigestMode.SUMMARY:
         if pending.metadata["numel"] == 0:
             result["summary"] = {
@@ -227,7 +260,7 @@ def _resolve_tensor(pending: _PendingTensor) -> dict[str, Any]:
                 "minimum": None,
             }
             return result
-        finite, minimum, maximum, total, l2_norm = pending.payload.cpu().tolist()
+        finite, minimum, maximum, total, l2_norm = cpu_payload.tolist()
         count = pending.metadata["numel"]
         result["summary"] = {
             "all_finite": bool(finite),
@@ -238,7 +271,7 @@ def _resolve_tensor(pending: _PendingTensor) -> dict[str, Any]:
         }
         return result
 
-    raw = _tensor_bytes(pending.payload)
+    raw = _tensor_bytes(cpu_payload)
     hash_header: dict[str, Any] = {
         "dtype": pending.metadata["dtype"],
         "mode": pending.mode.value,
@@ -255,8 +288,8 @@ def _resolve_tensor(pending: _PendingTensor) -> dict[str, Any]:
     result["captured_numel"] = pending.payload.numel()
     if pending.mode == DigestMode.SAMPLED:
         result["sample_indices"] = pending.sample_indices
-    if pending.payload.is_floating_point() or pending.payload.is_complex():
-        result["all_finite"] = bool(torch.isfinite(pending.payload).all().item())
+    if cpu_payload.is_floating_point() or cpu_payload.is_complex():
+        result["all_finite"] = bool(torch.isfinite(cpu_payload).all().item())
     else:
         result["all_finite"] = True
     return result
@@ -280,6 +313,7 @@ class RankLocalTrace:
         self._pending: list[tuple[dict[str, Any], _PendingTensor | None]] = []
         self._occurrences: dict[tuple[Any, ...], int] = {}
         self._sequence = 0
+        self._append_separator = False
 
         self.output_path = Path(config.output_dir) / f"rank_{config.rank:06d}.jsonl"
         if self._enabled:
@@ -324,7 +358,11 @@ class RankLocalTrace:
         mode: DigestMode | str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> None:
-        """Snapshot a tensor boundary for deferred rank-local serialization."""
+        """Snapshot a boundary on the caller's current stream for the tensor device.
+
+        The caller must order prior writes to the input before this call and
+        subsequent mutation after it. Flush may run on a different stream.
+        """
         with self._lock:
             record = self._new_record("tensor", name, iteration, microbatch, phase)
             if record is None:
@@ -345,8 +383,9 @@ class RankLocalTrace:
     ) -> None:
         """Record a scalar with exact value evidence.
 
-        Scalar tensors use full mode regardless of the configured default; the
-        payload is only one element and is therefore inexpensive to preserve.
+        Scalar tensors use full mode regardless of the configured default.
+        Even one element adds device allocation/work and synchronization at
+        flush. Use record_tensor with metadata mode for structure-only captures.
         """
         if isinstance(value, torch.Tensor):
             if value.numel() != 1:
@@ -362,6 +401,8 @@ class RankLocalTrace:
             )
             return
 
+        if value is not None and type(value) not in (bool, int, float):
+            raise TypeError("record_scalar requires a number, boolean, tensor, or None")
         scalar_fields: dict[str, Any] = {"value": value}
         if isinstance(value, float) and not math.isfinite(value):
             scalar_fields = {
@@ -370,11 +411,7 @@ class RankLocalTrace:
                 "value": None,
             }
         self.record_event(
-            name,
-            iteration=iteration,
-            microbatch=microbatch,
-            phase=phase,
-            fields=scalar_fields,
+            name, iteration=iteration, microbatch=microbatch, phase=phase, fields=scalar_fields
         )
 
     def flush(self) -> None:
@@ -387,12 +424,16 @@ class RankLocalTrace:
                 resolved = dict(record)
                 if pending is not None:
                     resolved["tensor"] = _resolve_tensor(pending)
+                validate_record(resolved, str(self.output_path), self.config.rank)
                 serialized.append(
                     json.dumps(resolved, allow_nan=False, separators=(",", ":"), sort_keys=True)
                 )
             with self.output_path.open("a", encoding="utf-8") as output:
+                if self._append_separator:
+                    output.write("\n")
                 output.write("\n".join(serialized) + "\n")
                 output.flush()
+            self._append_separator = False
             self._pending.clear()
 
     def close(self) -> None:
@@ -410,30 +451,24 @@ class RankLocalTrace:
         self.close()
 
     def _new_record(
-        self,
-        event: str,
-        name: str,
-        iteration: int | None,
-        microbatch: int | None,
-        phase: str,
+        self, event: str, name: str, iteration: int | None, microbatch: int | None, phase: str
     ) -> dict[str, Any] | None:
         if self._closed:
             raise RuntimeError("determinism trace is closed")
         if not self._enabled:
             return None
         if iteration is not None:
-            if iteration < 0:
+            if type(iteration) is not int or iteration < 0:
                 raise ValueError("iteration must be non-negative")
             if not _selected(iteration, self._iteration_ranges):
                 return None
-        if microbatch is not None and microbatch < 0:
+        if microbatch is not None and (type(microbatch) is not int or microbatch < 0):
             raise ValueError("microbatch must be non-negative")
         name = _validate_name(name, "name")
         phase = _validate_name(phase, "phase")
 
         occurrence_key = (event, name, iteration, microbatch, phase)
         occurrence = self._occurrences.get(occurrence_key, 0)
-        self._occurrences[occurrence_key] = occurrence + 1
         record = {
             "event": event,
             "iteration": iteration,
@@ -445,68 +480,35 @@ class RankLocalTrace:
             "schema_version": TRACE_SCHEMA_VERSION,
             "sequence": self._sequence,
         }
-        self._sequence += 1
         return record
 
     def _enqueue(self, record: dict[str, Any], pending: _PendingTensor | None) -> None:
+        occurrence_key = tuple(
+            record[field] for field in ("event", "name", "iteration", "microbatch", "phase")
+        )
+        self._occurrences[occurrence_key] = record["occurrence"] + 1
+        self._sequence += 1
         self._pending.append((record, pending))
         if self.config.flush_every and len(self._pending) >= self.config.flush_every:
             self.flush()
 
     def _resume_append_state(self) -> None:
-        previous_sequence = -1
-        with self.output_path.open(encoding="utf-8") as existing:
-            for line_number, line in enumerate(existing, 1):
-                if not line.strip():
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(
-                        f"{self.output_path}:{line_number}: invalid existing trace JSON"
-                    ) from exc
-                required = {
-                    "event",
-                    "iteration",
-                    "microbatch",
-                    "name",
-                    "occurrence",
-                    "phase",
-                    "rank",
-                    "schema_version",
-                    "sequence",
-                }
-                if not isinstance(record, dict) or not required.issubset(record):
-                    raise ValueError(
-                        f"{self.output_path}:{line_number}: invalid existing trace record"
-                    )
-                sequence = record["sequence"]
-                if (
-                    record["rank"] != self.config.rank
-                    or record["schema_version"] != TRACE_SCHEMA_VERSION
-                    or not isinstance(sequence, int)
-                    or sequence <= previous_sequence
-                ):
-                    raise ValueError(
-                        f"{self.output_path}:{line_number}: incompatible existing trace record"
-                    )
-                occurrence = record["occurrence"]
-                if not isinstance(occurrence, int) or occurrence < 0:
-                    raise ValueError(
-                        f"{self.output_path}:{line_number}: invalid existing occurrence"
-                    )
-                occurrence_key = (
-                    record["event"],
-                    record["name"],
-                    record["iteration"],
-                    record["microbatch"],
-                    record["phase"],
-                )
-                self._occurrences[occurrence_key] = max(
-                    self._occurrences.get(occurrence_key, 0), occurrence + 1
-                )
-                previous_sequence = sequence
-        self._sequence = previous_sequence + 1
+        records = read_rank_trace(self.output_path, self.config.rank, allow_empty=True)
+        for record in records:
+            occurrence_key = tuple(
+                record[field] for field in ("event", "name", "iteration", "microbatch", "phase")
+            )
+            self._occurrences[occurrence_key] = max(
+                self._occurrences.get(occurrence_key, 0), record["occurrence"] + 1
+            )
+            self._sequence = record["sequence"] + 1
+        # Valid JSONL may end with a complete JSON object but no newline. Never
+        # concatenate the next object onto that line when continuing the stream.
+        with self.output_path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            if stream.tell():
+                stream.seek(-1, os.SEEK_END)
+                self._append_separator = stream.read(1) != b"\n"
 
 
 _ACTIVE_TRACE: RankLocalTrace | None = None

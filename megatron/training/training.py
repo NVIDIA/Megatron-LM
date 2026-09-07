@@ -40,10 +40,16 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 # measurement (kept for backwards compatibility).
 _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
+from megatron.core import mpu, nccl_allocator, tensor_parallel
+
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core import mpu, nccl_allocator, tensor_parallel
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
+from megatron.core.determinism.trace import (
+    TraceConfig,
+    close_determinism_trace,
+    initialize_determinism_trace,
+)
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -147,11 +153,6 @@ from megatron.training.checkpointing import (
 )
 from megatron.training.config import FaultInjectorConfig
 from megatron.training.config.container import PretrainConfigContainer
-from megatron.training.determinism_trace import (
-    TraceConfig,
-    close_determinism_trace,
-    initialize_determinism_trace,
-)
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
     initialize_megatron,
