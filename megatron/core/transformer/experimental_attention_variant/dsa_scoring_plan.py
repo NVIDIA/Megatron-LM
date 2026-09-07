@@ -40,10 +40,21 @@ class IndexerScoringPlan(Enum):
     """General packed THD scoring driven by query/key cu_seqlens metadata."""
 
     UNFUSED_BOUNDS = "unfused_bounds"
-    """No fused kernel claims this layout; scoring falls back to the per-head loop."""
+    """Valid row bounds exist, but no fused executor currently claims the layout.
+
+    Current cases are non-packed context parallelism, non-causal or otherwise
+    non-reconstructible bounds, and packed causal layouts for which neither the segment
+    specialization nor compatible general-THD metadata is available. This set can shrink
+    as fused scorer coverage expands; scoring currently falls back to the per-head loop.
+    """
 
     DECLINE = "decline"
-    """Bounds cannot be built at all, so the caller must not attempt fused scoring."""
+    """The available metadata cannot safely describe the layout to a fused scorer.
+
+    Current cases are explicit key positions that cannot be represented by row bounds and
+    resolver inputs reporting that key bounds could not be built for the mask. Unlike
+    ``UNFUSED_BOUNDS``, this is a safety boundary rather than a supported slow scoring path.
+    """
 
     @property
     def is_fused(self) -> bool:

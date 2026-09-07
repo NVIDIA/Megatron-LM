@@ -22,7 +22,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa_scoring_plan i
     report_unfused_scoring_once,
     resolve_indexer_scoring_plan,
 )
-from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
+from megatron.core.utils import (
+    filter_kwargs_for_callable,
+    get_pg_size,
+    round_up_to_nearest_multiple,
+)
 
 if TYPE_CHECKING:
     from megatron.core.packed_seq_params import PackedSeqParams
@@ -56,6 +60,7 @@ class CudnnDsaInterface(Protocol):
         cu_seqlens_k: Optional[Tensor] = None,
         max_seqlen_q: Optional[int] = None,
         max_seqlen_k: Optional[int] = None,
+        q_causal_offsets: Optional[Tensor] = None,
     ) -> dict:
         """Compute the head-summed indexer logits over the key axis (``"scores"``)."""
 
@@ -896,6 +901,7 @@ def _indexer_topk_packed_thd(
         raise RuntimeError("general packed THD scorer received incompatible layout metadata")
 
     device = q_bshd.device
+    score_q_causal_offsets: Optional[Tensor] = None
     if cp_size == 1:
         score_q = q_bshd[0]
         score_k = k_bshd[0]
@@ -918,6 +924,10 @@ def _indexer_topk_packed_thd(
         score_w = w_bsh[0]
         score_cu_q = layout.segment_cu_q.to(dtype=torch.int32)
         score_cu_k = layout.segment_cu_k.to(dtype=torch.int32)
+        # Restore each Q segment's sequence-relative position within its K prefix.
+        score_q_causal_offsets = (
+            (layout.segment_k_lengths - layout.segment_q_lengths).to(dtype=torch.int32).contiguous()
+        )
         max_score_q = packed_max_seqlen_q // segment_divisor
         max_k_half = packed_max_seqlen_k // segment_divisor
         max_score_k = max((cp_rank + 1) * max_k_half, packed_max_seqlen_k - cp_rank * max_k_half)
@@ -932,6 +942,11 @@ def _indexer_topk_packed_thd(
         cu_seqlens_k=score_cu_k,
         max_seqlen_q=max_score_q,
         max_seqlen_k=max_score_k,
+        **(
+            {"q_causal_offsets": score_q_causal_offsets}
+            if score_q_causal_offsets is not None
+            else {}
+        ),
     )["scores"]
 
     score_topk = min(topk_k, max_score_k)
@@ -1131,6 +1146,15 @@ def _ensure_dsa_namespace() -> None:
             "`pip install nvidia-cudnn-frontend[cutedsl]`."
         ) from e
     _cudnn_dsa = _ns
+
+
+def _supports_indexer_q_causal_offsets() -> bool:
+    """Whether the installed cuDNN frontend accepts per-segment Q offsets."""
+    if _cudnn_dsa is None:
+        return False
+    return bool(
+        filter_kwargs_for_callable(_cudnn_dsa.indexer_forward_wrapper, {"q_causal_offsets": None})
+    )
 
 
 def _local_to_global_flat(local_idxs: Tensor, batch_size: int) -> Tensor:
@@ -1414,6 +1438,20 @@ def _indexer_topk_bshd(
         )
     k_bshd = k_bsd.unsqueeze(2)  # (b, sk, 1, idx_hd)
 
+    packed_metadata_available = _packed_thd_kernel_applicable(
+        b=b,
+        sq=sq,
+        sk=sk,
+        device=device,
+        packed_cu_seqlens_q=packed_cu_seqlens_q,
+        packed_cu_seqlens_k=packed_cu_seqlens_k,
+        packed_max_seqlen_q=packed_max_seqlen_q,
+        packed_max_seqlen_k=packed_max_seqlen_k,
+        cp_size=packed_cp_size,
+        cp_rank=local_packed_cp_rank,
+        local_packed_cp_query_start=local_packed_cp_query_start,
+        local_packed_cp_query_len=local_packed_cp_query_len,
+    )
     scoring_plan = _resolve_scoring_plan_for_call(
         segment_kernel_applicable=_segment_kernel_applicable(
             b,
@@ -1432,21 +1470,17 @@ def _indexer_topk_bshd(
         use_local_indexer_varlen=use_local_indexer_varlen,
         explicit_key_positions=explicit_key_positions,
         single_packed_thd_sequence=single_packed_thd_sequence,
-        packed_metadata_available=_packed_thd_kernel_applicable(
-            b=b,
-            sq=sq,
-            sk=sk,
-            device=device,
-            packed_cu_seqlens_q=packed_cu_seqlens_q,
-            packed_cu_seqlens_k=packed_cu_seqlens_k,
-            packed_max_seqlen_q=packed_max_seqlen_q,
-            packed_max_seqlen_k=packed_max_seqlen_k,
-            cp_size=packed_cp_size,
-            cp_rank=local_packed_cp_rank,
-            local_packed_cp_query_start=local_packed_cp_query_start,
-            local_packed_cp_query_len=local_packed_cp_query_len,
-        ),
+        packed_metadata_available=packed_metadata_available,
     )
+    if (
+        scoring_plan.plan is IndexerScoringPlan.PACKED_THD_GENERAL
+        and packed_cp_size > 1
+        and not _supports_indexer_q_causal_offsets()
+    ):
+        scoring_plan = IndexerScoringDecision(
+            IndexerScoringPlan.UNFUSED_BOUNDS,
+            "cuDNN indexer_forward_wrapper lacks q_causal_offsets required for CP>1 packed THD",
+        )
     plan = scoring_plan.plan
     report_unfused_scoring_once(scoring_plan, "indexer scoring")
     if plan is IndexerScoringPlan.DECLINE:

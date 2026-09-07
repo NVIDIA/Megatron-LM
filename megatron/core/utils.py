@@ -762,6 +762,11 @@ def get_model_config(model):
     return get_attr_wrapped_model(model, "config", allow_none=False)
 
 
+def move_host_tensor_to_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Move a host tensor to ``device``."""
+    return values.to(device, non_blocking=device.type == "cuda")
+
+
 class GlobalMemoryBuffer:
     """Global buffer to avoid dynamic memory allocations.
     Caller should ensure that buffers of the same name

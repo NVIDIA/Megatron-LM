@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
+from megatron.core.utils import accepts_parameter
 from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_parity_utils import (
     assert_similarity as _assert_similarity,
 )
@@ -64,16 +66,28 @@ def test_unfused_absorbed_mla_dsa_matches_native(
     )
 
 
-def _skip_if_fused_dsa_unavailable() -> None:
+def _skip_if_fused_dsa_unavailable(*, require_q_causal_offsets: bool = False) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for fused DSA parity")
+    local_rank = os.environ.get("LOCAL_RANK")
+    if local_rank is not None:
+        torch.cuda.set_device(int(local_rank))
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("cudnn fused DSA path requires SM90+")
     missing = []
     try:
-        from cudnn import DSA  # noqa: F401
+        from cudnn import DSA
     except ImportError:
         missing.append("cudnn-frontend DSA (nvidia-cudnn-frontend[cutedsl]>=1.24.1)")
+    else:
+        try:
+            supports_q_causal_offsets = accepts_parameter(
+                DSA.indexer_forward_wrapper, "q_causal_offsets"
+            )
+        except (TypeError, ValueError):
+            supports_q_causal_offsets = False
+        if require_q_causal_offsets and not supports_q_causal_offsets:
+            missing.append("cudnn-frontend DSA q_causal_offsets support")
     try:
         from flash_mla import flash_mla_sparse_fwd  # noqa: F401
     except ImportError:
@@ -503,15 +517,27 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch):
     class FakeDSA:
         @staticmethod
         def indexer_forward_wrapper(
-            q, k, weights, ratio, sm_scale, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
+            q,
+            k,
+            weights,
+            ratio,
+            sm_scale,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            **packed_kwargs,
         ):
             del weights, ratio, sm_scale
+            q_causal_offsets = packed_kwargs.pop("q_causal_offsets")
+            assert not packed_kwargs
             seen["q_shape"] = q.shape
             seen["k_shape"] = k.shape
             seen["cu_q"] = cu_seqlens_q.clone()
             seen["cu_k"] = cu_seqlens_k.clone()
             seen["max_q"] = max_seqlen_q
             seen["max_k"] = max_seqlen_k
+            seen["q_causal_offsets"] = q_causal_offsets.clone()
             scores = torch.full((q.size(0), max_seqlen_k), float("-inf"))
             for segment in range(cu_seqlens_q.numel() - 1):
                 q_start = int(cu_seqlens_q[segment])
@@ -562,6 +588,9 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch):
     torch.testing.assert_close(seen["cu_k"], torch.tensor([0, 2, 10, 14, 30], dtype=torch.int32))
     assert seen["max_q"] == 4
     assert seen["max_k"] == 16
+    torch.testing.assert_close(
+        seen["q_causal_offsets"], torch.tensor([0, 6, 0, 12], dtype=torch.int32)
+    )
     expected_indices = []
     expected_scores = []
     expected_lengths = []
@@ -911,7 +940,7 @@ def test_cudnn_indexer_topk_multi_packed_cp1_real_kernel_matches_pytorch_gradien
 @pytest.mark.parametrize("cp_rank", [0, 1])
 def test_cudnn_indexer_topk_multi_packed_cp2_real_kernel_matches_pytorch_gradients(seed, cp_rank):
     """Both CP2 zigzag ranks match an independent multi-sequence PyTorch scorer."""
-    _skip_if_fused_dsa_unavailable()
+    _skip_if_fused_dsa_unavailable(require_q_causal_offsets=True)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
@@ -1086,6 +1115,50 @@ def test_cudnn_indexer_topk_incompatible_packed_boundaries_fall_back(monkeypatch
     torch.testing.assert_close(topk_length, torch.tensor([[1, 2, 1]], dtype=torch.int32))
 
 
+def test_cudnn_cp2_general_thd_without_q_causal_offsets_falls_back(monkeypatch):
+    calls = {"unfused": 0}
+
+    class LegacyDSA:
+        @staticmethod
+        def indexer_forward_wrapper(q, k, weights, ratio, sm_scale):
+            raise AssertionError("the legacy wrapper must not receive segmented THD metadata")
+
+    def unfused(*_args, **_kwargs):
+        calls["unfused"] += 1
+        return torch.zeros((1, 4, 2), dtype=torch.int32), None
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", LegacyDSA)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_topk_from_score_chunks", unfused)
+    monkeypatch.setattr(
+        dsa_cudnn_kernels,
+        "_indexer_topk_packed_thd",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a frontend without Q offsets must not reach the THD scorer")
+        ),
+    )
+
+    topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
+        torch.ones((1, 4, 1, 1)),
+        torch.ones((1, 8, 1)),
+        torch.ones((1, 4, 1)),
+        topk=2,
+        varlen_starts=torch.tensor([0, 0, 4, 4]),
+        varlen_ends=torch.tensor([1, 4, 5, 8]),
+        return_scores=False,
+        use_local_indexer_varlen=True,
+        packed_cu_seqlens_q=torch.tensor([0, 4, 8], dtype=torch.int32),
+        packed_cu_seqlens_k=torch.tensor([0, 4, 8], dtype=torch.int32),
+        packed_max_seqlen_q=4,
+        packed_max_seqlen_k=4,
+        packed_cp_size=2,
+    )
+
+    assert calls["unfused"] == 1
+    assert topk_indices.shape == torch.Size([1, 4, 2])
+    assert topk_length.shape == torch.Size([1, 4])
+
+
 def test_cudnn_general_thd_rejects_tp_query_slices():
     """THD cu-seqlens describe full Q, so either TP-slice marker must decline."""
     cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
@@ -1158,15 +1231,56 @@ def test_cudnn_general_thd_cp2_rejects_different_qk_boundaries():
 
 @pytest.mark.parametrize("max_segment_k", [5, 6], ids=["odd-k", "even-k"])
 @pytest.mark.parametrize("return_topk_scores", [False, True], ids=["indices", "scores"])
+@pytest.mark.parametrize(
+    ("cp_rank", "ends", "expected_offsets", "expected_indices", "expected_row_scores"),
+    [
+        pytest.param(
+            0,
+            [1, 4, 5, 8],
+            [0, 3, 0, 3],
+            [[0], [0, 1, 2, 3], [4], [4, 5, 6, 7]],
+            [[0], [0, 1, 2, 3], [0], [0, 1, 2, 3]],
+            id="rank0",
+        ),
+        pytest.param(
+            1,
+            [2, 3, 6, 7],
+            [1, 2, 1, 2],
+            [[0, 1], [0, 1, 2], [4, 5], [4, 5, 6]],
+            [[0, 1], [0, 1, 2], [0, 1], [0, 1, 2]],
+            id="rank1",
+        ),
+    ],
+)
 def test_cudnn_indexer_topk_multi_packed_cp_selects_all_segment_keys(
-    monkeypatch, max_segment_k, return_topk_scores
+    monkeypatch,
+    max_segment_k,
+    return_topk_scores,
+    cp_rank,
+    ends,
+    expected_offsets,
+    expected_indices,
+    expected_row_scores,
 ):
     class FakeDSA:
         @staticmethod
         def indexer_forward_wrapper(
-            q, k, weights, ratio, sm_scale, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k
+            q,
+            k,
+            weights,
+            ratio,
+            sm_scale,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            q_causal_offsets,
         ):
             del k, weights, ratio, sm_scale, cu_seqlens_q, cu_seqlens_k, max_seqlen_q
+            assert q_causal_offsets.is_contiguous()
+            torch.testing.assert_close(
+                q_causal_offsets, torch.tensor(expected_offsets, dtype=torch.int32)
+            )
             return {
                 "scores": torch.arange(max_seqlen_k, dtype=torch.float32)
                 .view(1, max_seqlen_k)
@@ -1182,7 +1296,7 @@ def test_cudnn_indexer_topk_multi_packed_cp_selects_all_segment_keys(
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
 
     starts = torch.tensor([0, 0, 4, 4])
-    ends = torch.tensor([1, 4, 5, 8])
+    ends = torch.tensor(ends)
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.ones((1, 4, 1, 1)),
         torch.ones((1, 8, 1)),
@@ -1198,38 +1312,23 @@ def test_cudnn_indexer_topk_multi_packed_cp_selects_all_segment_keys(
         packed_max_seqlen_q=4,
         packed_max_seqlen_k=max_segment_k,
         packed_cp_size=2,
-        local_packed_cp_rank=0,
+        local_packed_cp_rank=cp_rank,
     )
 
-    expected_indices = torch.tensor(
-        [
-            [
-                [0, -1, -1, -1, -1, -1, -1, -1],
-                [0, 1, 2, 3, -1, -1, -1, -1],
-                [4, -1, -1, -1, -1, -1, -1, -1],
-                [4, 5, 6, 7, -1, -1, -1, -1],
-            ]
-        ],
-        dtype=torch.int32,
-    )
-    expected_scores = torch.tensor(
-        [
-            [
-                [0, 0, 0, 0, 0, 0, 0, 0],
-                [0, 1, 2, 3, 0, 0, 0, 0],
-                [0, 0, 0, 0, 0, 0, 0, 0],
-                [0, 1, 2, 3, 0, 0, 0, 0],
-            ]
-        ],
-        dtype=torch.float32,
-    )
-    expected_scores.masked_fill_(expected_indices < 0, torch.finfo(torch.float32).min)
-    torch.testing.assert_close(topk_indices, expected_indices, rtol=0, atol=0)
+    padded_indices = torch.full((1, 4, 8), -1, dtype=torch.int32)
+    padded_scores = torch.full((1, 4, 8), torch.finfo(torch.float32).min)
+    for row, (row_indices, row_scores) in enumerate(zip(expected_indices, expected_row_scores)):
+        padded_indices[0, row, : len(row_indices)] = torch.tensor(row_indices, dtype=torch.int32)
+        padded_scores[0, row, : len(row_scores)] = torch.tensor(row_scores, dtype=torch.float32)
+    torch.testing.assert_close(topk_indices, padded_indices, rtol=0, atol=0)
     torch.testing.assert_close(
-        topk_length, torch.tensor([[1, 4, 1, 4]], dtype=torch.int32), rtol=0, atol=0
+        topk_length,
+        torch.tensor([[len(row) for row in expected_indices]], dtype=torch.int32),
+        rtol=0,
+        atol=0,
     )
     if return_topk_scores:
-        torch.testing.assert_close(topk_scores, expected_scores, rtol=0, atol=0)
+        torch.testing.assert_close(topk_scores, padded_scores, rtol=0, atol=0)
     else:
         assert topk_scores is None
 

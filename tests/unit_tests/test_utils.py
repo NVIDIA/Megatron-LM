@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 import time
@@ -50,6 +50,19 @@ def test_divide_properly():
 def test_divide_improperly():
     with pytest.raises(AssertionError):
         util.divide(4, 5)
+
+
+@pytest.mark.parametrize(
+    ("device", "expected_non_blocking"),
+    [(torch.device("cpu"), False), (torch.device("cuda"), True)],
+)
+def test_move_host_tensor_to_device(device, expected_non_blocking):
+    values = mock.Mock()
+    moved = object()
+    values.to.return_value = moved
+
+    assert util.move_host_tensor_to_device(values, device) is moved
+    values.to.assert_called_once_with(device, non_blocking=expected_non_blocking)
 
 
 @pytest.fixture

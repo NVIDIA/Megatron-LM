@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.utils import get_pg_size
+from megatron.core.utils import get_pg_size, move_host_tensor_to_device
 
 __all__ = [
     "PackedCPIndexerLayout",
@@ -483,11 +483,6 @@ def _host_packed_cp_spans(
     return spans
 
 
-def _host_to_device(values: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Move a freshly built host tensor to ``device``."""
-    return values.to(device, non_blocking=device.type == "cuda")
-
-
 def build_packed_allgather_cp_local_positions_from_host(
     host_cu_seqlens: List[int],
     cp_size: int,
@@ -512,7 +507,7 @@ def build_packed_allgather_cp_local_positions_from_host(
         # with no zigzag halving (and therefore no even-length requirement).
         if output_size is None:
             output_size = host_cu_seqlens[-1]
-        return _host_to_device(torch.arange(output_size, dtype=torch.int64), device)
+        return move_host_tensor_to_device(torch.arange(output_size, dtype=torch.int64), device)
     spans = _host_packed_cp_spans(host_cu_seqlens, cp_size, cp_rank)
     real = (
         torch.cat([torch.arange(start, start + length) for start, length in spans])
@@ -531,7 +526,7 @@ def build_packed_allgather_cp_local_positions_from_host(
         # it unconditionally rather than leave torch.empty garbage if a caller lies.
         pad_start = host_cu_seqlens[-1] + cp_rank * output_size
         positions[n:] = torch.arange(pad_start, pad_start + (output_size - n))
-    return _host_to_device(positions, device)
+    return move_host_tensor_to_device(positions, device)
 
 
 def build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
@@ -573,7 +568,9 @@ def build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
     if cp_size <= 1:
         # Identity layout: the gathered order is already the global order.
         out = key_local_output_size if key_local_output_size is not None else kv_total
-        return query_positions, _host_to_device(torch.arange(out, dtype=torch.int64), device)
+        return query_positions, move_host_tensor_to_device(
+            torch.arange(out, dtype=torch.int64), device
+        )
     spans_by_rank = [
         _host_packed_cp_spans(host_cu_seqlens_kv, cp_size, rank) for rank in range(cp_size)
     ]
@@ -602,7 +599,7 @@ def build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
             key_reorder_idx[kv_total + rank * pad : kv_total + (rank + 1) * pad] = torch.arange(
                 rank * out + local, rank * out + out
             )
-    return query_positions, _host_to_device(key_reorder_idx, device)
+    return query_positions, move_host_tensor_to_device(key_reorder_idx, device)
 
 
 def extract_query_positions_from_position_ids(
