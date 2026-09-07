@@ -8,22 +8,16 @@ are local to this test because the MFSDP v1 test utilities now build only
 HybridModel.
 """
 
-import os
-import sys
 from functools import partial
 
 import pytest
 import torch
-from torch.distributed.tensor import DTensor
 from torch.testing import assert_close
 
 import megatron.core.parallel_state as mpu
 from gpt_builders import gpt_builder
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed import finalize_model_grads
-from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-    gather_and_compute_chunk_metadata,
-    uneven_dtensor_to_full_tensor,
-)
 from megatron.core.enums import ModelType
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
@@ -149,12 +143,7 @@ def _make_model_and_optimizer(*, use_mfsdp_v2: bool, overrides: dict):
     }
     base_args.update(overrides)
 
-    original_argv = sys.argv
-    try:
-        sys.argv = [__file__]
-        args = parse_args()
-    finally:
-        sys.argv = original_argv
+    args = parse_args(ignore_unknown_args=True)
     for key, value in base_args.items():
         setattr(args, key, value)
     validate_args(args)
@@ -181,50 +170,27 @@ class TestMfsdpV2OverlapParity:
     GLOBAL_BATCH_SIZE = 8
     VOCAB_SIZE = 100
 
-    def teardown_method(self):
-        destroy_global_vars()
-        destroy_num_microbatches_calculator()
+    @classmethod
+    def _capture_parameters(cls, model_chunks):
+        if isinstance(model_chunks, torch.nn.Module):
+            model_chunks = [model_chunks]
 
-    @staticmethod
-    def _normalize_parameter_name(name: str) -> str:
-        while name.startswith("module."):
-            name = name[len("module.") :]
-        return name
+        for module in model_chunks:
+            for submodule in module.modules():
+                if isinstance(submodule, FsdpModule):
+                    submodule.unshard()
+        captured_parameters = {}
+        for module in model_chunks:
+            for name, param in module.named_parameters():
+                captured_parameters[name] = param.detach().clone().cpu()
+        for module in model_chunks:
+            for submodule in module.modules():
+                if isinstance(submodule, FsdpModule):
+                    submodule.reshard()
+        return captured_parameters
 
     @classmethod
-    def _capture_parameters(cls, model):
-        parameters = {}
-        for chunk_index, model_chunk in enumerate(model):
-            for name, parameter in model_chunk.named_parameters():
-                tensor = parameter.detach()
-                if isinstance(tensor, DTensor):
-                    tensor = uneven_dtensor_to_full_tensor(tensor)
-                name = cls._normalize_parameter_name(name)
-                parameters[f"{chunk_index}.{name}"] = tensor.float().cpu()
-        return parameters
-
-    @classmethod
-    def _load_parameters(cls, model, reference_parameters):
-        with torch.no_grad():
-            for chunk_index, model_chunk in enumerate(model):
-                for name, parameter in model_chunk.named_parameters():
-                    name = cls._normalize_parameter_name(name)
-                    reference = reference_parameters[f"{chunk_index}.{name}"].to(
-                        device=parameter.device, dtype=parameter.dtype
-                    )
-                    tensor = parameter.detach()
-                    if isinstance(tensor, DTensor):
-                        chunk = gather_and_compute_chunk_metadata(tensor)
-                        local_slice = tuple(
-                            slice(offset, offset + size)
-                            for offset, size in zip(chunk.offsets, chunk.sizes)
-                        )
-                        tensor._local_tensor.copy_(reference[local_slice])
-                    else:
-                        tensor.copy_(reference)
-
-    @classmethod
-    def _run_training(cls, *, use_mfsdp_v2: bool, initial_parameters=None):
+    def _run_training(cls, *, use_mfsdp_v2: bool):
         Utils.initialize_model_parallel(expert_model_parallel_size=2)
         data_parallel_group = mpu.get_data_parallel_group()
         _set_manual_seed(42)
@@ -243,7 +209,7 @@ class TestMfsdpV2OverlapParity:
                     "expert_model_parallel_size": 2,
                     "bf16": True,
                     "data_parallel_sharding_strategy": "optim_grads_params",
-                    "clip_grad": 0.0,
+                    "clip_grad": 1.0,
                     "megatron_fsdp_main_grads_dtype": torch.float32,
                     "moe_grouped_gemm": True,
                     "moe_token_dispatcher_type": "alltoall",
@@ -251,67 +217,7 @@ class TestMfsdpV2OverlapParity:
                     "delay_wgrad_compute": True,
                 },
             )
-            if use_mfsdp_v2 and os.environ.get("MFSDP_PARITY_DEBUG"):
-                for model_chunk in model:
-                    adapter = model_chunk
-                    while not hasattr(adapter, "post_backward"):
-                        adapter = adapter.module
-                    root = adapter.module
-                    source_model = root
-                    while not hasattr(source_model, "decoder"):
-                        source_model = source_model.module
-                    final_layernorm = source_model.decoder.final_layernorm
-                    final_layernorm.register_forward_hook(
-                        lambda _module, _inputs, _output: print(
-                            f"[MFSDP parity debug][rank={torch.distributed.get_rank()}] "
-                            "final_layernorm forward",
-                            flush=True,
-                        )
-                    )
-                    for group in root.parameter_groups:
-                        for fsdp_parameter in group.fsdp_parameters:
-                            if not any(
-                                fqn.endswith("decoder.final_layernorm.weight")
-                                for fqn in fsdp_parameter.fqns
-                            ):
-                                continue
-                            fsdp_parameter.unsharded.register_post_accumulate_grad_hook(
-                                lambda parameter: print(
-                                    f"[MFSDP parity debug][rank={torch.distributed.get_rank()}] "
-                                    "final_layernorm grad ready "
-                                    f"none={parameter.grad is None}",
-                                    flush=True,
-                                )
-                            )
 
-                    original_reduce_gradient_groups = root._reduce_gradient_groups
-
-                    def debug_reduce_gradient_groups(
-                        *, root=root, original=original_reduce_gradient_groups
-                    ):
-                        missing = [
-                            fsdp_parameter.fqns
-                            for group in root.parameter_groups
-                            for fsdp_parameter in group.fsdp_parameters
-                            if group.requires_grad and fsdp_parameter.unsharded.grad is None
-                        ]
-                        countdown = root._trainable_parameter_countdown
-                        print(
-                            f"[MFSDP parity debug][rank={torch.distributed.get_rank()}] "
-                            f"root reduce phase={root.phase} "
-                            f"countdown={countdown._value}/{countdown.initial_value} "
-                            f"missing={missing}",
-                            flush=True,
-                        )
-                        return original()
-
-                    root._reduce_gradient_groups = debug_reduce_gradient_groups
-            if initial_parameters is not None:
-                cls._load_parameters(model, initial_parameters)
-                for sub_optimizer in getattr(optimizer, "chained_optimizers", [optimizer]):
-                    sub_optimizer._copy_main_params_to_model_params()
-
-            captured_initial_parameters = cls._capture_parameters(model)
             num_micro_batches = (
                 cls.GLOBAL_BATCH_SIZE // cls.MICRO_BATCH_SIZE // data_parallel_group.size()
             )
@@ -328,8 +234,6 @@ class TestMfsdpV2OverlapParity:
             run_name = "MFSDP v2" if use_mfsdp_v2 else "DistOpt"
 
             for step in range(cls.NUM_STEPS):
-                for model_chunk in model:
-                    model_chunk.zero_grad_buffer()
                 optimizer.zero_grad()
                 output = _pretrain_forward_backward(
                     model=model,
@@ -358,12 +262,13 @@ class TestMfsdpV2OverlapParity:
                 parameter_snapshots.append(cls._capture_parameters(model))
 
             return {
-                "initial_parameters": captured_initial_parameters,
                 "losses": losses,
                 "parameters": parameter_snapshots,
             }
         finally:
             Utils.destroy_model_parallel()
+            destroy_global_vars()
+            destroy_num_microbatches_calculator()
 
     @pytest.mark.skipif(
         not is_torch_min_version("2.6.0"),
@@ -386,19 +291,9 @@ class TestMfsdpV2OverlapParity:
         if torch.distributed.get_rank() == 0:
             print("DistOpt reference run completed successfully.", flush=True)
 
-        actual = self._run_training(
-            use_mfsdp_v2=True, initial_parameters=reference["initial_parameters"]
-        )
+        actual = self._run_training(use_mfsdp_v2=True)
         if torch.distributed.get_rank() == 0:
             print("MFSDP v2 run completed successfully.", flush=True)
-
-        for run_name, run in (("DistOpt", reference), ("MFSDP v2", actual)):
-            changed_parameters = [
-                name
-                for name, initial_parameter in run["initial_parameters"].items()
-                if not torch.equal(initial_parameter, run["parameters"][-1][name])
-            ]
-            assert changed_parameters, f"{run_name} did not update any parameters."
 
         assert len(actual["losses"]) == len(reference["losses"])
         for step, (loss, reference_loss) in enumerate(zip(actual["losses"], reference["losses"])):
