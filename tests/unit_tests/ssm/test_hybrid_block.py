@@ -936,6 +936,72 @@ class TestAttnResHybridBlock:
         assert [layer.attn_res_num_sources for layer in block.layers] == [1, 1, 2, 2]
         assert isinstance(block.final_attn_res, torch.nn.Module)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_mtp_source_bridge_and_nested_partial_stack(self):
+        """Outer source history is reused by every nested MTP hybrid entry."""
+        from megatron.core.models.hybrid.hybrid_block import AttnResHybridLayer
+        from megatron.core.transformer.attention_residual import (
+            AttentionResidual,
+            attn_res_final_num_sources,
+        )
+
+        main_types = validate_segment_layers(
+            Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION + Symbols.MLP
+        )
+        mtp_types = validate_segment_layers(Symbols.ATTENTION + Symbols.MLP)
+        config = self._make_config(
+            len(main_types), block_layers=2, is_hybrid_model=True, mtp_num_layers=2
+        )
+        outer = self._make_stack(config, main_types).cuda().train()
+        nested = (
+            HybridStack(
+                config,
+                hybrid_stack_spec.submodules,
+                layer_type_list=mtp_types,
+                pp_layer_offset=0,
+                pre_process=True,
+                post_layer_norm=False,
+                post_process=True,
+                pg_collection=self.get_pg_collection(),
+                is_mtp_layer=True,
+                mtp_layer_number=1,
+            )
+            .cuda()
+            .train()
+        )
+
+        expected_sources = attn_res_final_num_sources(
+            config.num_layers, config.attn_res_block_layers
+        )
+        assert expected_sources == 3
+        assert not hasattr(nested, "final_attn_res")
+        assert all(isinstance(layer, AttnResHybridLayer) for layer in nested.layers)
+        assert all(not layer.attn_res_is_block_start for layer in nested.layers)
+        assert all(layer.attn_res_num_sources == expected_sources for layer in nested.layers)
+
+        sequence_length, micro_batch_size = 16, 2
+        hidden_states = torch.randn(
+            sequence_length, micro_batch_size, config.hidden_size, device="cuda", requires_grad=True
+        )
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool, device="cuda"
+        )
+        trunk_output, trunk_sources = outer(hidden_states, attention_mask=attention_mask)
+        assert isinstance(trunk_sources, tuple)
+        assert len(trunk_sources) == expected_sources
+
+        mtp_partial = nested(
+            trunk_output, attention_mask=attention_mask, attn_res_sources=trunk_sources
+        )
+        assert isinstance(mtp_partial, torch.Tensor)
+        assert mtp_partial.shape == trunk_output.shape
+        mtp_output = AttentionResidual(config).cuda()([*trunk_sources, mtp_partial])
+        mtp_output.float().sum().backward()
+
+        assert hidden_states.grad is not None
+        for layer in nested.layers:
+            assert layer.attn_res.pseudo_query.grad is not None
+
     @pytest.mark.parametrize(
         "layer_pattern",
         [

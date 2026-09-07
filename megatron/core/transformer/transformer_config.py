@@ -1344,11 +1344,14 @@ class TransformerConfig(ModelParallelConfig):
     enable_hyper_connections."""
 
     attn_res_block_layers: Optional[int] = None
-    """Block AttnRes: number of transformer layers per depth block (the paper's block size S
-    counted in sublayers is twice this value). Required when enable_attention_residuals=True.
-    The total number of depth sources at the network output is
+    """Block AttnRes: number of transformer layers per depth block for GPT stacks (the paper's
+    block size S counted in sublayers is twice this value), or number of pattern entries per
+    depth block for hybrid stacks (each entry is one sublayer). Required when
+    enable_attention_residuals=True. The total number of trunk depth sources at the network
+    output is
     floor((num_layers - 1) / attn_res_block_layers) + 2 (completed blocks + token embedding +
-    trailing partial block); the paper finds ~8-10 sources recover most of the quality gain."""
+    trailing partial block); every MTP depth reuses this immutable trunk source tuple and adds
+    its own running partial. The paper finds ~8-10 sources recover most of the quality gain."""
 
     attn_res_impl: str = "eager"
     """Implementation of the AttnRes depth aggregation: 'eager' (a memory-lean custom autograd
@@ -1583,20 +1586,20 @@ class TransformerConfig(ModelParallelConfig):
     def _validate_attention_residuals(self):
         """Validate the Attention Residuals (AttnRes) configuration.
 
-        Supported: eager/compile training with TP/SP/CP/EP, pipeline parallelism
+        Supported: eager/compile/FLA training with TP/SP/CP/EP, pipeline parallelism
         (non-interleaved: full depth-source prefix concatenated along the
         sequence dimension; interleaved VPP: per-boundary deltas padded to a
         uniform width plus a rank-local source cache — see
         attention_residual.AttnResStageSources), selective recompute of modules
         that live inside a sublayer (e.g. core_attn), MoE (incl. shared-expert
         overlap), attention-scope fine-grained activation offloading
-        (qkv_linear, core_attn, and attn_proj), and MTP in the standard
-        last-stage placement. Everything rejected below either has no mechanism
+        (qkv_linear, core_attn, and attn_proj), and MTP in the standard or
+        hybrid last-stage placement. Everything rejected below either has no mechanism
         yet (CUDA graphs, full recompute, EP-overlap fine-grained schedule,
         non-attention activation offloading, zero-layer virtual chunks) or
         would silently bypass the AttnRes residual interception (fused residual
-        norms, fp32 residual connection) or the static payload-width reasoning
-        (variable sequence lengths).
+        norms, fp32 residual connection) or the static pipeline payload-width
+        reasoning (variable sequence lengths with PP/VPP).
         """
         if not self.enable_attention_residuals:
             if self.attn_res_block_layers is not None:
@@ -1623,10 +1626,18 @@ class TransformerConfig(ModelParallelConfig):
                 f"got {self.attn_res_impl!r}."
             )
         unsupported = []
-        if self.variable_seq_lengths:
-            # Dynamic shape exchange bypasses the static payload-width
-            # reasoning (and the interleaved schedule's uniform padded width).
-            unsupported.append("variable_seq_lengths (incl. sequence packing)")
+        has_variable_sequences = (
+            self.variable_seq_lengths or self.sequence_packing_scheduler is not None
+        )
+        if has_variable_sequences and (
+            self.pipeline_model_parallel_size > 1
+            or self.virtual_pipeline_model_parallel_size is not None
+        ):
+            # The packing scheduler sets variable_seq_lengths later in
+            # __post_init__, so check the scheduler itself here as well.
+            # Dynamic shape exchange bypasses the static payload-width reasoning
+            # (and the interleaved schedule's uniform padded width).
+            unsupported.append("variable_seq_lengths (incl. sequence packing) together with PP/VPP")
         if self.virtual_pipeline_model_parallel_size is not None and (
             self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split
         ):
@@ -1683,10 +1694,6 @@ class TransformerConfig(ModelParallelConfig):
             # boundary yet.
             unsupported.append("MTP together with account_for_embedding/loss_in_pipeline_split")
         if self.is_hybrid_model:
-            if self.mtp_num_layers is not None:
-                # Hybrid MTP depths run a nested HybridStack; the depth-source
-                # hand-off into that stack is a follow-up.
-                unsupported.append("hybrid MTP (a '/' depth in the hybrid layer pattern)")
             if self.pipeline_model_parallel_size > 1:
                 if not self.hybrid_layer_pattern:
                     raise ValueError(

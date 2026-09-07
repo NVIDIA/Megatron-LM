@@ -2079,9 +2079,6 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         self.attn_res_enabled = self.config.enable_attention_residuals
         if self.attn_res_enabled:
-            assert (
-                mtp_layer_pattern is None
-            ), "Attention residuals support the GPT MTP path only (no hybrid MTP pattern)."
             # Per-depth AttnRes output head: aggregates the trunk depth history
             # plus this MTP depth's partial sum before its final layernorm.
             self.final_attn_res = AttentionResidual(self.config)
@@ -2272,6 +2269,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             # True so that the fp8 weight caching can be triggered correctly.
             with transformer_layer_fp8_context:
                 if self.mtp_layer_pattern is not None:
+                    attn_res_kwargs = (
+                        {"attn_res_sources": attn_res_sources} if self.attn_res_enabled else {}
+                    )
                     hidden_states = self.mtp_model_layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
@@ -2280,6 +2280,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         inference_context=inference_params,
                         packed_seq_params=packed_seq_params,
                         input_ids=input_ids,
+                        **attn_res_kwargs,
                     )
                 else:
                     # GPT path: single TransformerLayer
@@ -2963,6 +2964,10 @@ class MultiTokenPredictionBlock(MegatronModule):
                 a True field fill value so boundary positions are marked as padded.
             sequence_roll_context: Layout-specific metadata shared across all MTP
                 depths.
+            attn_res_sources: Complete immutable trunk depth-source tuple used by
+                every MTP depth when Attention Residuals are enabled. With
+                ``mtp_detach_heads``, the tuple is detached together with the
+                trunk hidden state before entering the first depth.
 
         Returns:
             (Tensor): The mtp loss tensor of shape [b, s].
