@@ -101,8 +101,6 @@ def chunk_gated_delta_rule_prefill_cute(
         raise ValueError("gate_is_log_cumsum and gate_is_log_decay are mutually exclusive")
     if use_qk_l2norm_in_kernel:
         raise NotImplementedError("QK L2 norm inside the GDN prefill kernel is not supported")
-    if initial_state is not None:
-        raise NotImplementedError("initial_state is out of scope for the local mcore prefill path")
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
         raise ValueError("q, k, and v must be 3D THD tensors")
     _check_cuda_sm100(q)
@@ -129,6 +127,19 @@ def chunk_gated_delta_rule_prefill_cute(
     cu_i32 = _prepare_cu_seqlens_for_launch(
         cu_seqlens, total_tokens, device=q.device, assume_valid=assume_valid_cu_seqlens
     )
+
+    if initial_state is not None:
+        expected_state_shape = (cu_i32.numel() - 1, num_o_heads, head_size, head_size)
+        if tuple(initial_state.shape) != expected_state_shape:
+            raise ValueError(
+                f"initial_state shape mismatch: expected {expected_state_shape}, "
+                f"got {tuple(initial_state.shape)}"
+            )
+        if initial_state.dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError("initial_state dtype must be torch.float32 or torch.bfloat16")
+        if initial_state.device != q.device:
+            raise ValueError("initial_state must be on the same device as q")
+        initial_state = _require_contiguous("initial_state", initial_state)
 
     if output is None:
         output = torch.empty((total_tokens, num_o_heads, head_size), dtype=q.dtype, device=q.device)
@@ -233,7 +244,7 @@ def chunk_gated_delta_rule_prefill_cute(
         beta=update,
         output=output,
         cu_seqlens=cu_i32,
-        initial_state=None,
+        initial_state=initial_state,
         output_state=output_state,
         scale=kernel_scale,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,

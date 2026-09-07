@@ -123,7 +123,6 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
 
     calls = {"fwd": 0, "bwd": 0}
     original_forward = implementation._cutedsl_forward
-    original_cp_forward = implementation._fla_forward_for_fused_bwd
     original_backward = implementation._call_fused_gdr_bwd_cute
     cp_forward_before = fused_gdr_cp_cute.get_cutedsl_fused_launch_count()
     cp_backward_before = fused_gdr_cp_cute.get_cutedsl_fused_bwd_launch_count()
@@ -132,10 +131,6 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
     def tracked_forward(**kwargs):
         calls["fwd"] += 1
         return original_forward(**kwargs)
-
-    def tracked_cp_forward(**kwargs):
-        calls["fwd"] += 1
-        return original_cp_forward(**kwargs)
 
     def tracked_backward(**kwargs):
         calls["bwd"] += 1
@@ -152,12 +147,12 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
             )
             path_guard.setattr(implementation, "_cutedsl_forward", tracked_forward)
         else:
-            path_guard.setattr(implementation, "_fla_forward_for_fused_bwd", tracked_cp_forward)
             path_guard.setattr(
                 implementation,
-                "_cutedsl_forward",
-                lambda **_kwargs: pytest.fail("CP mode must use FLA CP forward"),
+                "_fla_forward_for_fused_bwd",
+                lambda **_kwargs: pytest.fail("CP cute mode must not run FLA forward"),
             )
+            path_guard.setattr(implementation, "_cutedsl_forward", tracked_forward)
         path_guard.setattr(implementation, "_call_fused_gdr_bwd_cute", tracked_backward)
         path_guard.setattr(
             implementation,
@@ -186,11 +181,16 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
             msg=lambda message: f"{name}: {message}",
         )
     auto_forward_calls = []
-    original_auto_forward = implementation._fla_forward_for_fused_bwd
+    original_auto_fla_forward = implementation._fla_forward_for_fused_bwd
+    original_auto_cute_forward = implementation._cutedsl_forward
 
-    def tracked_auto_forward(**kwargs):
-        auto_forward_calls.append(True)
-        return original_auto_forward(**kwargs)
+    def tracked_auto_fla_forward(**kwargs):
+        auto_forward_calls.append("fla")
+        return original_auto_fla_forward(**kwargs)
+
+    def tracked_auto_cute_forward(**kwargs):
+        auto_forward_calls.append("cute")
+        return original_auto_cute_forward(**kwargs)
 
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
     with monkeypatch.context() as path_guard:
@@ -199,11 +199,12 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
             "_recompute_fused_bwd_h",
             lambda **_kwargs: pytest.fail("auto save-h path must not recompute h"),
         )
-        path_guard.setattr(implementation, "_fla_forward_for_fused_bwd", tracked_auto_forward)
+        path_guard.setattr(implementation, "_fla_forward_for_fused_bwd", tracked_auto_fla_forward)
+        path_guard.setattr(implementation, "_cutedsl_forward", tracked_auto_cute_forward)
         auto_output, auto_gradients = _forward_backward(
             implementation, inputs, grad_output, cp_context=cp_context
         )
-    assert auto_forward_calls == [True]
+    assert auto_forward_calls == (["fla"] if cp_context is None else ["cute"])
 
     torch.testing.assert_close(auto_output, reference_output, atol=1e-2, rtol=1e-2)
     for name, actual, expected in zip(
@@ -237,8 +238,8 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
         else:
             path_guard.setattr(
                 implementation,
-                "_cutedsl_forward",
-                lambda **_kwargs: pytest.fail("CP mode must use FLA CP forward"),
+                "_fla_forward_for_fused_bwd",
+                lambda **_kwargs: pytest.fail("CP cute mode must not run FLA forward"),
             )
         path_guard.setattr(implementation, "_recompute_fused_bwd_h", tracked_recompute)
         recompute_output, recompute_gradients = _forward_backward(
@@ -273,7 +274,7 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
     speedup = fla_ms / cute_ms
     if cp_context is None or torch.distributed.get_rank(group=cp_context.group) == 0:
         global_sequence_length = _SEQUENCE_LENGTH * cp_size
-        cute_label = "CuTe fused fwd+bwd" if cp_context is None else "FLA CP fwd + CuTe bwd"
+        cute_label = "CuTe fused fwd+bwd" if cp_context is None else "CuTe CP fused fwd+bwd"
         fla_label = "FLA" if cp_context is None else "FLA CP fwd+bwd"
         print(
             f"internal GDR E2E B={_BATCH_SIZE} local_T={_SEQUENCE_LENGTH} "

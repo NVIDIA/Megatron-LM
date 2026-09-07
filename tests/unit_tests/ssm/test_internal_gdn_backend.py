@@ -4,11 +4,12 @@
 
 import ast
 import bisect
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -1172,6 +1173,77 @@ def test_forward_save_h_policy_is_shared_by_fla_and_cute(monkeypatch, mode, reco
     assert (context.saved_tensors[6] is None) is recompute_h
 
 
+def test_cp_forward_dispatches_preprocessed_initial_state_to_cutedsl(monkeypatch):
+    implementation = _implementation()
+    shape = (1, 64, 64, 128)
+    inputs = {
+        "q": torch.empty(shape, dtype=torch.bfloat16),
+        "k": torch.empty(shape, dtype=torch.bfloat16),
+        "v": torch.empty(shape, dtype=torch.bfloat16),
+        "g": torch.empty(shape[:-1], dtype=torch.float32),
+        "beta": torch.empty(shape[:-1], dtype=torch.float32),
+    }
+    cp_cu_seqlens = torch.tensor([0, 64], dtype=torch.int32)
+    cp_context = SimpleNamespace(group=object(), cu_seqlens=cp_cu_seqlens)
+    forward_initial_state = torch.empty((1, 64, 128, 128), dtype=torch.float32)
+    saved_initial_state = torch.empty_like(forward_initial_state)
+    saved_h = torch.empty((1, 64, 128, 128), dtype=torch.bfloat16)
+    A = torch.empty((*shape[:-1], 64), dtype=torch.bfloat16)
+    output = torch.empty_like(inputs["q"])
+    chunk_offsets = torch.tensor([0, 1], dtype=torch.int32)
+    seen = {}
+
+    def cp_initial_state(**kwargs):
+        seen["cp_initial_state"] = kwargs
+        return forward_initial_state, saved_initial_state, kwargs["chunk_indices"]
+
+    def cute_forward(**kwargs):
+        seen["cute_forward"] = kwargs
+        return kwargs["g"], output, A, saved_h, kwargs["chunk_indices"], chunk_offsets
+
+    context = SimpleNamespace()
+    context.save_for_backward = lambda *args: setattr(context, "saved_tensors", args)
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    monkeypatch.setattr(implementation, "_can_use_fused_bwd_forward", lambda *_args: True)
+    monkeypatch.setattr(
+        implementation,
+        "_fla_forward_for_fused_bwd",
+        lambda **_kwargs: pytest.fail("CP CuTe path must not run the FLA forward helper"),
+    )
+    monkeypatch.setattr(
+        implementation, "_cp_initial_state_for_cutedsl_forward", cp_initial_state
+    )
+    monkeypatch.setattr(implementation, "_cutedsl_forward", cute_forward)
+
+    forward = implementation.InternalChunkGatedDeltaRuleFunction.forward
+    while hasattr(forward, "__wrapped__"):
+        forward = forward.__wrapped__
+    actual_output, final_state = forward(
+        context,
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["g"],
+        inputs["beta"],
+        128**-0.5,
+        cp_cu_seqlens,
+        None,
+        None,
+        False,
+        cp_context,
+    )
+
+    assert actual_output is output and final_state is None
+    assert seen["cp_initial_state"]["cp_context"] is cp_context
+    assert seen["cp_initial_state"]["dense_local_cp"] is True
+    assert seen["cute_forward"]["initial_state"] is forward_initial_state
+    assert seen["cute_forward"]["cu_seqlens"] is None
+    assert context.saved_tensors[6] is saved_h
+    assert context.saved_tensors[7] is saved_initial_state
+    assert context.saved_tensors[8] is cp_cu_seqlens
+    assert context.saved_tensors[10] is chunk_offsets
+
+
 @pytest.mark.parametrize("save_fused_bwd_state", [False, True])
 def test_fla_forward_can_save_fused_backward_h(monkeypatch, save_fused_bwd_state):
     implementation = _implementation()
@@ -1233,10 +1305,16 @@ def test_cutedsl_forward_controls_fused_backward_h(monkeypatch, save_fused_bwd_s
     monkeypatch.setattr(implementation, "chunk_local_cumsum", lambda g, **_kwargs: g)
     monkeypatch.setattr(fused_gdr_fwd_cute, "chunk_gated_delta_rule_prefill_cute", launcher)
 
+    initial_state = torch.empty((1, 3, 4, 4), dtype=torch.float32)
     _g, _output, _A, saved_h, _chunk_indices, _chunk_offsets = implementation._cutedsl_forward(
-        **inputs, scale=0.5, cu_seqlens=None, save_fused_bwd_state=save_fused_bwd_state
+        **inputs,
+        scale=0.5,
+        cu_seqlens=None,
+        save_fused_bwd_state=save_fused_bwd_state,
+        initial_state=initial_state,
     )
 
+    assert seen["initial_state"] is initial_state
     assert seen["output_h"] is saved_h
     assert seen["output_g"].shape == (64, 3)
     assert seen["output_g"].dtype == torch.float32
@@ -1332,6 +1410,42 @@ def test_fused_forward_rejects_conflicting_gate_modes():
             gate_is_log_cumsum=True,
             gate_is_log_decay=True,
         )
+
+
+def test_fused_forward_passes_initial_state_to_launcher(monkeypatch):
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_fwd_cute import (
+        fused_fwd,
+    )
+
+    launcher_name = (
+        "megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels."
+        "fused_gdr_fwd_cute.launcher"
+    )
+    launcher_stub = ModuleType(launcher_name)
+    seen = {}
+
+    def launcher(**kwargs):
+        seen.update(kwargs)
+
+    launcher_stub.cutedsl_fused_chunk_gdn_fwd_sm100 = launcher
+    monkeypatch.setitem(sys.modules, launcher_name, launcher_stub)
+    monkeypatch.setattr(fused_fwd, "_check_cuda_sm100", lambda _tensor: None)
+
+    initial_state = torch.empty((1, 64, 128, 128), dtype=torch.float32)
+    output = fused_fwd.chunk_gated_delta_rule_prefill_cute(
+        q=torch.empty((64, 64, 128), dtype=torch.bfloat16),
+        k=torch.empty((64, 64, 128), dtype=torch.bfloat16),
+        v=torch.empty((64, 64, 128), dtype=torch.bfloat16),
+        g=torch.empty((64, 64), dtype=torch.float32),
+        beta=torch.empty((64, 64), dtype=torch.float32),
+        initial_state=initial_state,
+        cu_seqlens=torch.tensor([0, 64], dtype=torch.int32),
+        assume_valid_cu_seqlens=True,
+        gate_is_log_decay=True,
+    )
+
+    assert seen["initial_state"] is initial_state
+    assert output is seen["output"]
 
 
 def test_cutedsl_forward_trusts_validated_varlen_cu_seqlens(monkeypatch):
