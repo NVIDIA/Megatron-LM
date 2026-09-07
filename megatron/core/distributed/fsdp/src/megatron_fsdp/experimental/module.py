@@ -15,7 +15,8 @@
 """Module mixin for the minimal Megatron-FSDP path."""
 
 import enum
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Literal, cast
 from weakref import ref
 
@@ -375,6 +376,9 @@ class FsdpModule:
         is_recomputing = self.phase is FsdpModule.Phase.BACKWARD or _is_in_backward()
         if self.phase is not FsdpModule.Phase.BACKWARD:
             self.phase = FsdpModule.Phase.FORWARD
+        # forward/backward each span multiple lifecycle methods (pre_forward ->
+        # post_forward and pre_backward -> post_backward), so they keep explicit
+        # push/pop instead of a single context scope.
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
 
         if self.is_root():
@@ -392,23 +396,22 @@ class FsdpModule:
         before this when ``self.is_root()``; the automatic forward path
         performs that root sync in ``pre_forward()`` immediately before this.
         """
-        torch.cuda.nvtx.range_push(self._nvtx_label("unshard"))
-        self._unshard_parameter_groups()
-        assert self._unshard_event is not None
-        # Compute waits only for this FsdpModule's all-gather (the prefetch below is
-        # issued afterwards, so it is free to run concurrently with this FsdpModule).
-        self.context.current_stream().wait_event(self._unshard_event)
+        with self._nvtx_range("unshard"):
+            self._unshard_parameter_groups()
+            assert self._unshard_event is not None
+            # Compute waits only for this FsdpModule's all-gather (the prefetch below is
+            # issued afterwards, so it is free to run concurrently with this FsdpModule).
+            self.context.current_stream().wait_event(self._unshard_event)
 
-        context = self.context
-        if prefetch == "forward":
-            self._prefetch_parameter_groups(
-                context.forward_order, self._schedule_policy.forward_prefetch_size
-            )
-        elif prefetch == "backward":
-            self._prefetch_parameter_groups(
-                context.backward_order, self._schedule_policy.backward_prefetch_size
-            )
-        torch.cuda.nvtx.range_pop()
+            context = self.context
+            if prefetch == "forward":
+                self._prefetch_parameter_groups(
+                    context.forward_order, self._schedule_policy.forward_prefetch_size
+                )
+            elif prefetch == "backward":
+                self._prefetch_parameter_groups(
+                    context.backward_order, self._schedule_policy.backward_prefetch_size
+                )
 
     def _prefetch_parameter_groups(
         self, order: IndexedOrder["FsdpModule"], prefetch_size: int | None
@@ -457,9 +460,8 @@ class FsdpModule:
 
     def reshard(self) -> None:
         """Reshard this FsdpModule's parameter groups."""
-        torch.cuda.nvtx.range_push(self._nvtx_label("reshard"))
-        self._reshard_parameter_groups()
-        torch.cuda.nvtx.range_pop()
+        with self._nvtx_range("reshard"):
+            self._reshard_parameter_groups()
 
     def _reshard_parameter_groups(self) -> None:
         """Reshard parameter groups and release unsharded storage after compute.
@@ -507,25 +509,26 @@ class FsdpModule:
 
     def _reduce_gradient_groups(self) -> None:
         """Pack gradients and immediately launch their reduce-scatters."""
-        torch.cuda.nvtx.range_push(self._nvtx_label("gradient_reduce"))
-        context = self.context
-        reduce_scatter_stream = context.reduce_scatter_stream
-        current_stream = context.current_stream()
+        with self._nvtx_range("gradient_reduce"):
+            context = self.context
+            reduce_scatter_stream = context.reduce_scatter_stream
+            current_stream = context.current_stream()
 
-        for group in self._parameter_groups:
-            if not group.requires_grad:
-                continue
+            for group in self._parameter_groups:
+                if not group.requires_grad:
+                    continue
 
-            with torch.cuda.stream(reduce_scatter_stream):
-                partial_grad = group.allocate_partial_grad_buffer()
+                with torch.cuda.stream(reduce_scatter_stream):
+                    partial_grad = group.allocate_partial_grad_buffer()
 
-            current_stream.wait_stream(reduce_scatter_stream)
-            group.copy_gradients_to_partial_buffer(partial_grad)
+                current_stream.wait_stream(reduce_scatter_stream)
+                group.copy_gradients_to_partial_buffer(partial_grad)
 
-            reduce_scatter_stream.wait_stream(current_stream)
-            with torch.cuda.stream(reduce_scatter_stream):
-                group.reduce_partial_gradients(partial_grad, self.context.is_last_microbatch)
-        torch.cuda.nvtx.range_pop()
+                reduce_scatter_stream.wait_stream(current_stream)
+                with torch.cuda.stream(reduce_scatter_stream):
+                    group.reduce_partial_gradients(
+                        partial_grad, self.context.is_last_microbatch
+                    )
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:
@@ -544,6 +547,15 @@ class FsdpModule:
     def _nvtx_label(self, operation: str) -> str:
         module_name = self.name or "<root>"
         return f"MFSDP {module_name} {operation}"
+
+    @contextmanager
+    def _nvtx_range(self, operation: str) -> Iterator[None]:
+        """Scope an nvtx range to this context so an early return still pops it."""
+        torch.cuda.nvtx.range_push(self._nvtx_label(operation))
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
 
 
 def _collect_backward_order(module: nn.Module, order: IndexedOrder["FsdpModule"]) -> None:
