@@ -50,6 +50,9 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
     NVLSAllGatherVDispatcher,
 )
+from megatron.core.transformer.moe.virtual_expert_load_balancer import (
+    FORWARD as VIRTUAL_EXPERT_FORWARD,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -316,7 +319,6 @@ class TEGroupedMLP(MegatronModule):
         self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         self._fused_ops: Optional[Tuple[torch.nn.Module]] = None
         self._virtual_expert_weight_bridge = None
-        self._fused_impl_parameters_prepared = False
         if (
             self.config.gated_linear_unit
             and self.config.moe_mlp_glu_interleave_size is not None
@@ -721,19 +723,17 @@ class TEGroupedMLP(MegatronModule):
 
         def forward_pre_hook(module, *_) -> None:
             self.prepare_fused_impl_parameters()
-            # Hooks such as DDP/FSDP all-gathers must run once per fused invocation.
-            self._fused_impl_parameters_prepared = False
-            if self._virtual_expert_weight_bridge is not None:
-                self._virtual_expert_weight_bridge.wait_prefetch(
-                    self._virtual_expert_weight_bridge.last_plan
-                )
+            bridge = self._virtual_expert_weight_bridge
+            if bridge is not None:
+                bridge.wait_prefetch(bridge.last_plan)
+                # GTP consumes the expert weights here, right before the expert GEMMs, as it
+                # would without virtual experts; the push above only peeked at them.
+                bridge.consume(VIRTUAL_EXPERT_FORWARD)
 
         return forward_pre_hook
 
     def prepare_fused_impl_parameters(self) -> None:
-        """Run fused-op parameter hooks before planner-side weight prefetch."""
-        if self._fused_impl_parameters_prepared:
-            return
+        """Run the fused ops' parameter hooks (DDP/FSDP all-gathers) before they execute."""
         for submodule in chain(self.linear_fc1.modules(), self.linear_fc2.modules()):
             for hook in submodule._forward_pre_hooks.values():
                 ret = hook(submodule, None)
@@ -744,7 +744,6 @@ class TEGroupedMLP(MegatronModule):
                         "modifies the input tensor."
                     )
         self._ensure_main_grad_for_fused_impl()
-        self._fused_impl_parameters_prepared = True
 
     @staticmethod
     def _ensure_main_grad(linear_module: torch.nn.Module) -> None:

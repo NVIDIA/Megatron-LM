@@ -1529,6 +1529,10 @@ class GTPShardedParam(torch.nn.Parameter):
         guard is compiled out unless check_param_states is on.
 
         Falling back to an on-demand AG costs the overlap for that consume but keeps it correct.
+
+        A peek (``_peek_gathered_weight``) that found no AG issues one itself and leaves the
+        drained marker, so the consume that follows takes the prefetched path even at a chain
+        head, where no neighbour ever issues an AG.
         """
         return self._prefetch_handle is not None or getattr(self, "_already_ag_drained", False)
 
@@ -1570,6 +1574,47 @@ class GTPShardedParam(torch.nn.Parameter):
         result = [self._strip_padding(r) for r in result]
 
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
+        return result if self.is_routed_expert else result[0]
+
+    def _peek_gathered_weight(self, fwd: bool):
+        """Return this weight's gathered tensor(s) WITHOUT consuming it in the prefetch chain.
+
+        The virtual-expert weight bridge needs the gathered bytes before TE's GEMM consumes the
+        weight (its push kernel copies them to the peers), while the consume
+        (``all_gather_and_prefetch`` / ``all_gather_and_prefetch_bwd``) has to stay where TE
+        issues it, so the chain's next prefetch keeps its place. The peek leaves the chain
+        links, tickets and debug states exactly as that consume expects them:
+
+        * a prefetch is available (a chain neighbour issued this weight's AG): drain it on
+          ag_stream as ``_wait_param_gather`` does and leave the ``_already_ag_drained`` hand-off
+          marker, so the consume skips the drain but keeps its ``ag_event`` wait;
+        * no prefetch (chain head, first iteration, MTP's second consume of a repeated layer):
+          issue this weight's AG asynchronously, as a predecessor would have, then drain and mark
+          it the same way; the consume reads it through the marker instead of gathering again;
+        * ``weight_prefetch`` off: a synchronous gather, which the consume repeats (debug mode).
+
+        The returned tensors are the cache buffers the consume hands out (nothing recycles their
+        tickets before it), padding stripped; unlike the consume's result they are not detached
+        copies, since the caller only reads their storage pointers.
+        """
+        if in_activation_recompute_phase():
+            raise RuntimeError(
+                f"[GTP] {self._debug_name}: peeking a gathered weight inside an activation-"
+                "recompute phase is not supported (the recompute chain owns other buffers)."
+            )
+        if not GTP_CONFIG.weight_prefetch:
+            return self._all_gather_weight_on_demand(fwd)
+        if not self._prefetch_available():
+            nvtx_label = self._debug_name + (".fwd" if fwd else ".bwd") + ".peek"
+            _, handle = self._all_gather_weight(async_op=True, fwd=fwd, nvtx_label=nvtx_label)
+            self._prefetch_handle = handle
+        self._wait_param_gather()
+        self._already_ag_drained = True
+        self.ag_event.wait()
+
+        cache = get_global_GTP_cache()
+        result = [cache.get(w._ag_ticket_fwd if fwd else w._ag_ticket_bwd) for w in self._weights]
+        result = [self._strip_padding(r) for r in result]
         return result if self.is_routed_expert else result[0]
 
     def _wait_recompute_param_gather(self):
@@ -1630,7 +1675,9 @@ class GTPShardedParam(torch.nn.Parameter):
         if not type(self)._link_tables_flushed:
             type(self).flush_link_tables()
 
-        if GTP_CONFIG.weight_prefetch and self.next_w is not None and self._prefetch_available():
+        # A successor's prefetch or a peek's own AG: either way an AG was issued for this
+        # consume (the chain tail only ever has the latter).
+        if GTP_CONFIG.weight_prefetch and self._prefetch_available():
             result = self._get_prefetched_weight(False)
         else:
             result = self._all_gather_weight_on_demand(False)
@@ -1685,12 +1732,9 @@ class GTPShardedParam(torch.nn.Parameter):
         # Consume current weight.
         if use_recompute_chain and self._recompute_prev is not None:
             result = self._get_recompute_prefetched_weight()
-        elif (
-            not in_recompute
-            and GTP_CONFIG.weight_prefetch
-            and self.prev_w is not None
-            and self._prefetch_available()
-        ):
+        elif not in_recompute and GTP_CONFIG.weight_prefetch and self._prefetch_available():
+            # A predecessor's prefetch or a peek's own AG (chain head, first iteration, MTP
+            # second consume): an AG was issued for this consume either way.
             result = self._get_prefetched_weight(True)
         elif use_recompute_chain:
             # Recompute chain head. It still needs the recompute buffer, and on the first
@@ -2265,6 +2309,19 @@ class GTPShardedParam(torch.nn.Parameter):
     def materialize_group_for_backward(self, nvtx_label=None):
         """Protocol: re-materialize the group's weight(s) for the backward GEMMs."""
         return self.all_gather_and_prefetch_bwd(nvtx_label=nvtx_label)
+
+    def peek_group_for_forward(self):
+        """Read the group's gathered forward weight(s) without consuming them in the chain.
+
+        For a consumer that needs the gathered bytes ahead of the GEMM (the virtual-expert weight
+        push); ``materialize_group_for_forward`` must still follow at the GEMM and hands out the
+        same buffers. See ``_peek_gathered_weight``.
+        """
+        return self._peek_gathered_weight(fwd=True)
+
+    def peek_group_for_backward(self):
+        """Backward counterpart of :meth:`peek_group_for_forward`."""
+        return self._peek_gathered_weight(fwd=False)
 
     def finalize_group_grads(self, wgrads, nvtx_label=None):
         """Protocol: reduce-scatter the group's freshly computed weight grad(s)."""
