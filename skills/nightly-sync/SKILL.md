@@ -1,7 +1,6 @@
 ---
 name: nightly-sync
 description: Domain knowledge for the nightly main-to-dev sync workflow. Covers merge strategy, CI architecture, failure investigation, and known issues.
-when_to_use: Working on the nightly sync PR; investigating a nightly sync failure; resolving merge conflicts between main and dev; 'nightly sync failed', 'main-to-dev merge', 'sync bot'.
 ---
 
 # Nightly Sync: Main to Dev
@@ -16,14 +15,25 @@ conflicts, iterating on CI, and shipping the PR.
 
 ### Branch Setup
 
-1. Create branch `$BRANCH` from `origin/dev`
-2. Merge: `git merge origin/main --no-edit`
-3. Resolve conflicts surgically. Do NOT use global `-X theirs`, and do NOT
+1. Fetch `origin/main` and `origin/dev`, then record their full SHAs.
+2. Enumerate `origin/dev..origin/main` and select the oldest reachable prefix whose
+   graph contains exactly 100 commits. Record those 100 full SHAs in order and
+   use its tip as `$MAIN_SLICE`. If fewer than 100 remain, wait; if no reachable
+   tip produces exactly 100, stop rather than approximating the slice.
+3. Create `$BRANCH` from the recorded `origin/dev` SHA and merge only the slice:
+   `git merge --no-ff "$MAIN_SLICE" --no-edit`. Never include commit 101.
+4. Resolve conflicts surgically. Do NOT use global `-X theirs`, and do NOT
    blanket-checkout main's version of a shared file. Main's version may be
    taken wholesale only for files in "Files to Override from Main" below, or
    when you have identified a specific main commit that intentionally removes
    the dev-only code. For all other conflicts, combine both sides so recent
    dev-only additions remain present.
+
+The PR graph relative to the recorded dev base must contain the exact 100
+original main commits, one aggregate merge commit, and zero or one squashed bot
+repair commit: 101 commits without repairs or 102 with repairs. Preserve every
+source commit object and its metadata; never cherry-pick or recreate the slice.
+Use `$MAIN_SLICE`, not the newer unsliced `origin/main`, throughout this run.
 
 ### Preserving Dev-Only Additions
 
@@ -75,7 +85,7 @@ Real example from PR #4882 / PR #4318:
 
 These files have known semantic conflicts where dev's versions reference args
 or APIs that main removed or renamed. Take main's version with
-`git checkout origin/main -- <file>`:
+`git checkout "$MAIN_SLICE" -- <file>`:
 
 - `megatron/training/training.py` — references dev-only args
 - `megatron/training/initialize.py` — references dev-only args
@@ -123,7 +133,7 @@ sources to `[tool.uv.sources]` that don't exist in dev's version. Main's
 merged code may import from packages only available at specific git revisions.
 
 1. Diff the `[tool.uv.sources]` sections:
-   `git show origin/main:pyproject.toml` vs `git show origin/dev:pyproject.toml`
+   `git show "$MAIN_SLICE":pyproject.toml` vs `git show origin/dev:pyproject.toml`
 2. For each git source in main but not dev, add it to dev's `pyproject.toml`
 3. For sources in both but at different revisions, check whether dev's revision
    works. If dev's revision is broken (TOML parse errors, missing classes main's
@@ -156,7 +166,7 @@ compiles fine but fails at runtime.
 After the merge, audit cross-boundary call sites:
 
 1. Identify files where main's version was taken (`-X theirs` or explicit
-   `git checkout origin/main`)
+   `git checkout "$MAIN_SLICE"`)
 2. For each, find all external call sites: classes it instantiates, methods
    it calls on imported objects, functions from other modules it invokes
 3. Verify method names, parameter counts, and signatures match between the
@@ -213,7 +223,7 @@ Main and dev have completely different classes in this file:
 
 ### Restore Deleted Files
 
-Compare `git ls-tree` between `origin/main` and HEAD to find files in main
+Compare `git ls-tree` between `$MAIN_SLICE` and HEAD to find files in main
 that are missing from the merged tree. For each:
 - **Restore** if main's code imports/references it and would break without it
   (e.g. `hybrid_cp_schedule.py` if `data_schedule.py` imports from it)
@@ -239,14 +249,13 @@ AND every fix-push in Phase 3), run these bash checks. If any fails,
 fix the condition and re-check before pushing:
 
 ```bash
-MERGE_COMMIT=$(git rev-list --min-parents=2 --max-count=1 HEAD || true)
-if [ -n "$MERGE_COMMIT" ]; then
-  DEV_REF="${MERGE_COMMIT}^1"
-  MAIN_REF="${MERGE_COMMIT}^2"
-else
-  DEV_REF="origin/dev"
-  MAIN_REF="origin/main"
+MERGE_COMMIT=$(git rev-list --min-parents=2 --max-count=1 HEAD)
+if [ -z "$MERGE_COMMIT" ]; then
+  echo "ABORT: aggregate merge commit is absent"
+  exit 1
 fi
+DEV_REF="${MERGE_COMMIT}^1"
+MAIN_REF="${MERGE_COMMIT}^2"
 
 # 1. CODEOWNERS must be identical to dev's.
 if ! git diff --quiet "$DEV_REF" HEAD -- .github/CODEOWNERS; then
@@ -265,7 +274,18 @@ for f in pyproject.toml uv.lock docker/Dockerfile.ci.dev; do
   fi
 done
 
-# 3. Dev-feature preservation audit.
+# 3. The PR contains 100 imported commits plus one merge and at most one repair.
+SOURCE_COUNT=$(git rev-list --count "$DEV_REF..$MAIN_REF")
+TOTAL_COUNT=$(git rev-list --count "$DEV_REF..HEAD")
+BOT_COUNT=$(git rev-list --count "$DEV_REF..HEAD" --not "$MAIN_REF")
+if [ "$SOURCE_COUNT" -ne 100 ] ||
+   { [ "$TOTAL_COUNT" -ne 101 ] && [ "$TOTAL_COUNT" -ne 102 ]; } ||
+   { [ "$BOT_COUNT" -ne 1 ] && [ "$BOT_COUNT" -ne 2 ]; }; then
+  echo "ABORT: expected 100 source + 1 merge + at most 1 repair commit"
+  exit 1
+fi
+
+# 4. Dev-feature preservation audit.
 #
 # The most common sync regression is silently dropping a dev-only feature
 # that main does not have yet. Pattern:
@@ -278,7 +298,7 @@ done
 # For each file the sync touched (modulo skill-sanctioned overrides and
 # the dependency triple), find every line that satisfies ALL of:
 #   line is on origin/dev        (dev had it)
-#   line is NOT on origin/main   (main never owned it)
+#   line is NOT on MAIN_REF      (the selected main slice never owned it)
 #   line is NOT in the merged tree  (the merge dropped it)
 # Filter out whitespace-only lines and bracket-only lines (they
 # frequently differ for cosmetic reasons).
@@ -317,7 +337,7 @@ done
 if [ "$VIOLATIONS" -gt 0 ]; then
   echo "ABORT: $VIOLATIONS dev-only line(s) dropped by the merge. For each:"
   echo "  (a) MAIN INTENTIONALLY REMOVED — find the specific commit in"
-  echo "      'git log origin/main -- <file>' that removed it; document the"
+  echo "      'git log $MAIN_REF -- <file>' that removed it; document the"
   echo "      SHA in the PR body, then the drop is acceptable."
   echo "  (b) MERGE ACCIDENT — main never explicitly touched that line."
   echo "      RESTORE the dev line (Edit/Write to put it back)."
@@ -354,10 +374,8 @@ Recent regressions the dev-feature audit would have flagged (all
 
 ### Commit and Push
 
-Phase 1 produces a single commit on the sync branch. The merge itself
-creates the merge commit; fold any post-merge work (formatting,
-conflict surgery, restored files, regenerated `uv.lock`) into it
-rather than stacking a second commit:
+Phase 1 adds only the aggregate merge commit after the 100 imported source
+commits. Fold conflict surgery and generated results into that merge commit:
 
 ```bash
 git add -A
@@ -366,9 +384,18 @@ git commit --amend --no-edit  # rewrites the merge commit's tree;
 git push -u origin "$BRANCH"  # only non-force push of the run.
 ```
 
-Once pushed, this commit is immutable for the rest of the run.
-Phase 3 fixes go into a separate rolling fix commit on top (see
-Phase 3 step 4 and the two-commit policy in Rules).
+Once pushed, this merge commit is immutable for the rest of the run. Phase 3
+fixes are combined into one squashed repair commit on top.
+
+### Validation evidence reuse
+
+Enumerate the complete required test matrix. A provider-verified successful CI
+check satisfies every test it unambiguously maps to; do not rerun those tests
+locally. After a candidate change, retain that evidence only when the diff since
+its tested SHA leaves the test, covered code, CI definition, generated inputs,
+dependency/lock inputs, and runtime inputs unchanged. Run failed, pending,
+missing, ambiguous, and invalidated tests locally. If mapping is ambiguous,
+fail toward the local run.
 
 ---
 
@@ -377,7 +404,8 @@ Phase 3 step 4 and the two-commit policy in Rules).
 - Title: `chore: nightly sync main into dev ($DATE)`
 - Create as **draft**: `gh pr create --draft`
 - Body should include:
-  1. Summary of what was synced (number of commits from main)
+  1. The recorded dev base, ordered 100 source SHAs, slice tip, merge parents,
+     and verified 101-or-102 commit graph
   2. **Python-only line-change stats**, so reviewers can gauge the real
      code surface (excluding golden-value JSON, uv.lock, etc.). Compute
      with:
@@ -538,8 +566,8 @@ does NOT show.
    - If `RESULT=FAILURE`: diagnose via
      `gh api repos/$REPO/actions/jobs/<JOB_ID>/logs` (or the
      external-context equivalent) and fix the code. The Phase 1
-     commit is immutable; fixes accumulate in a single rolling fix
-     commit on top of it:
+     commit is immutable; fixes accumulate in a single squashed repair
+     commit on top of it. Rerun locally only tests invalidated by the repair:
      ```bash
      git add -A
      if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
@@ -699,13 +727,13 @@ comment should include:
   wholesale only for the explicit override list above; otherwise resolve
   conflicts by combining main's incoming changes with dev's still-unmerged
   features.
-- **Two-commit policy:** the PR contains at most two bot-authored
-  commits — the Phase 1 merge commit (immutable once pushed) and a
-  single rolling fix commit on top. The fix commit is created on
-  the first Phase 3 failure (normal push) and amended on every
-  subsequent failure (`git commit --amend --no-edit` +
-  `git push --force-with-lease`). Never modify the Phase 1 commit
-  after pushing it; never let the fix-commit count exceed one.
+- **102-commit policy:** each PR contains exactly 100 original main commits,
+  one aggregate merge commit, and at most one squashed repair commit. The
+  repair is created for the first failure and amended thereafter with
+  `git push --force-with-lease`. Never append another repair or merge-refresh
+  commit. If dev advances, reconstruct the owned branch with one replacement
+  merge and the single combined repair, then guarded-force-push only after
+  proving branch ownership.
 - CI triggers via comment: `/ok to test <sha>`
 - CI runs appear on branch `pull-request/<PR_NUMBER>`
 - Git committer identity: `svcnvidia-nemo-ci`

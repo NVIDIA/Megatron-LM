@@ -104,9 +104,9 @@ jobs:
           git fetch origin main dev
           AHEAD_COUNT=$(git rev-list --count origin/dev..origin/main)
           echo "main is $AHEAD_COUNT commit(s) ahead of dev"
-          if [ "$AHEAD_COUNT" -eq 0 ]; then
+          if [ "$AHEAD_COUNT" -lt 100 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "No changes to sync."
+            echo "Fewer than 100 commits are ready; retaining them for the next exact slice."
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
@@ -120,14 +120,13 @@ jobs:
 
           echo "=== nightly-sync pre-push guard ==="
 
-          merge_commit=$(git rev-list --min-parents=2 --max-count=1 HEAD || true)
-          if [ -n "$merge_commit" ]; then
-            dev_ref="${merge_commit}^1"
-            main_ref="${merge_commit}^2"
-          else
-            dev_ref="origin/dev"
-            main_ref="origin/main"
+          merge_commit=$(git rev-list --min-parents=2 --max-count=1 HEAD)
+          if [ -z "$merge_commit" ]; then
+            echo "ABORT: aggregate merge commit is absent."
+            exit 1
           fi
+          dev_ref="${merge_commit}^1"
+          main_ref="${merge_commit}^2"
 
           if ! git diff --quiet "$dev_ref" HEAD -- .github/CODEOWNERS; then
             echo "ABORT: .github/CODEOWNERS differs from dev. Restore it before pushing."
@@ -140,9 +139,14 @@ jobs:
             fi
           done
 
-          if [ -z "$merge_commit" ]; then
-            echo "No merge commit found in HEAD history; skipping dev-feature audit."
-            exit 0
+          source_count=$(git rev-list --count "$dev_ref..$main_ref")
+          total_count=$(git rev-list --count "$dev_ref..HEAD")
+          bot_count=$(git rev-list --count "$dev_ref..HEAD" --not "$main_ref")
+          if [ "$source_count" -ne 100 ] ||
+             { [ "$total_count" -ne 101 ] && [ "$total_count" -ne 102 ]; } ||
+             { [ "$bot_count" -ne 1 ] && [ "$bot_count" -ne 2 ]; }; then
+            echo "ABORT: expected 100 source + 1 merge + at most 1 repair commit."
+            exit 1
           fi
 
           intentional_override_regex='^(megatron/training/training\.py|megatron/training/initialize\.py|megatron/training/utils\.py|megatron/training/datasets/data_samplers\.py|megatron/core/optimizer/layer_wise_optimizer\.py)$'
@@ -192,8 +196,9 @@ jobs:
           anthropic_api_key: ${{ secrets.NVIDIA_INFERENCE_KEY }}
           github_token: ${{ secrets.PAT }}
           prompt: |
-            You are an automated sync bot. Merge `main` into `dev`, create a
-            PR, ensure CI passes (fixing failures), and mark the PR ready.
+            You are an automated sync bot. Merge the oldest exact 100-commit
+            `main` slice into `dev`, create a PR, ensure CI passes (fixing
+            failures), and mark the PR ready.
             There are 4 phases. You are NOT done until Phase 4 completes.
 
             REPO: ${{ github.repository }}
@@ -237,19 +242,28 @@ jobs:
             creates windows where the agent could forget the loop.
 
             **Pre-push guard:** The workflow installs a local git pre-push
-            hook that enforces CODEOWNERS, dependency-triple, and dev-feature
-            preservation checks. You MUST NOT bypass it with `--no-verify`.
+            hook that enforces the 100+1+1 commit graph, CODEOWNERS,
+            dependency-triple, and dev-feature preservation checks. You MUST
+            NOT bypass it with `--no-verify`.
             If a push fails, read the hook output, restore the dropped dev
             code unless main explicitly removed it, and push again only after
             the hook passes.
 
-            **Merge strategy:** Start from `origin/dev` and run
-            `git merge origin/main --no-edit`. Do NOT use global
+            **Merge strategy:** Start from the recorded `origin/dev`, select
+            the oldest reachable main prefix containing exactly 100 commits,
+            and merge only that slice tip. Do NOT include commit 101 or use global
             `git merge -X theirs`. Main's version may be taken wholesale only
             for files explicitly listed in the nightly-sync skill's
             "Files to Override from Main" section. For other conflicts,
             preserve recent dev-only additions and combine them with main's
             incoming changes.
+
+            **Test evidence reuse:** Enumerate the complete required matrix,
+            but do not rerun a provider-verified green CI test locally. After
+            a candidate change, retain a prior pass only when the diff leaves
+            its test, covered code, CI definition, generated inputs,
+            dependency/lock inputs, and runtime inputs unchanged. Run failed,
+            missing, ambiguous, and invalidated tests locally.
 
             **Source of truth for CI status:**
             `gh pr view <PR_NUMBER> --repo $REPO --json statusCheckRollup`
