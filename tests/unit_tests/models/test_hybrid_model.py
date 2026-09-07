@@ -240,10 +240,7 @@ def test_mrope_stored_cp_group_drives_unpacked_slicing():
 
     stub_cp_group = _StubCPGroup()
     rotary = MultimodalRotaryEmbedding(
-        kv_channels=32,
-        rotary_percent=0.25,
-        interleaved_mrope=True,
-        cp_group=stub_cp_group,
+        kv_channels=32, rotary_percent=0.25, interleaved_mrope=True, cp_group=stub_cp_group
     )
     position_ids = torch.arange(4, device=torch.cuda.current_device()).repeat(3, 1, 1)
     seen = {}
