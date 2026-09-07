@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import math
-import weakref
 from collections.abc import Hashable
 from typing import Any
 
@@ -127,40 +126,7 @@ def build_yarn_rope_cos_sin(
 
 # The rotary tables depend only on the positions and the rope parameters,
 # but were rebuilt on every layer, every microbatch, and again under activation recompute.
-# The entry carries a weak reference to the position tensor it was built from.
-# Keying on ``data_ptr`` alone is unsound -- the caching allocator hands the same
-# address to a later tensor of the same shape, whose ``_version`` starts at zero
-# again, so a lookup could return tables built for different positions. A hit is
-# therefore only honoured when the weak reference still resolves to the very
-# tensor being asked about. A strong reference would also close the hole, but it
-# keeps the buffer out of the allocator's reach and cost 1.5% of step time,
-# measured; a weak one costs nothing and simply misses once the tensor is gone.
-_ROPE_CACHE: dict[Hashable, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
-
-def _rope_cache_key(position_ids, rope_head_dim, rope_theta, config, use_yarn, device, dtype):
-    """Key on everything the tables actually depend on."""
-    yarn = (
-        (
-            float(config.rotary_scaling_factor),
-            float(config.beta_fast),
-            float(config.beta_slow),
-            int(config.original_max_position_embeddings),
-        )
-        if use_yarn
-        else None
-    )
-    return (
-        position_ids.data_ptr(),
-        tuple(position_ids.shape),
-        position_ids._version,
-        int(rope_head_dim),
-        float(rope_theta),
-        bool(use_yarn),
-        yarn,
-        str(device),
-        str(dtype),
-    )
 
 
 def build_compressed_rope_cos_sin(
@@ -173,16 +139,7 @@ def build_compressed_rope_cos_sin(
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    key = _rope_cache_key(
-        position_ids, rope_head_dim, rope_theta, config, use_yarn, device, dtype
-    )
-    hit = _ROPE_CACHE.get(key)
-    if hit is not None:
-        ref, cos, sin = hit
-        if ref() is position_ids:
-            return cos, sin
-        del _ROPE_CACHE[key]
-    built = _build_compressed_rope_cos_sin_uncached(
+    return _build_compressed_rope_cos_sin_uncached(
         position_ids,
         rope_head_dim,
         rope_theta,
@@ -191,12 +148,6 @@ def build_compressed_rope_cos_sin(
         device=device,
         dtype=dtype,
     )
-    # Bound the cache: positions change every step, so without this it grows
-    # without limit over a run.
-    if len(_ROPE_CACHE) > 64:
-        _ROPE_CACHE.clear()
-    _ROPE_CACHE[key] = (weakref.ref(position_ids), *built)
-    return built
 
 
 def _build_compressed_rope_cos_sin_uncached(
