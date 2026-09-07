@@ -796,13 +796,6 @@ def initialize_model_parallel(
             sharp_enabled_group is None
         ), "sharp_enabled_group is only valid when use_sharp is True"
 
-    assert (
-        num_distributed_optimizer_instances > 0
-    ), "num_distributed_optimizer_instances must be positive"
-    assert (
-        expert_num_distributed_optimizer_instances > 0
-    ), "expert_num_distributed_optimizer_instances must be positive"
-
     if get_embedding_ranks is None:
         get_embedding_ranks = default_embedding_ranks
 
