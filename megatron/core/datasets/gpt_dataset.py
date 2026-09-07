@@ -3,6 +3,7 @@
 import logging
 import os
 import time
+import warnings
 from dataclasses import dataclass, field
 from math import ceil
 from typing import Dict, Optional, Tuple
@@ -59,12 +60,15 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     Set to 0 if sequence parallel is not enabled regardless of TP size.
     """
 
-    hybrid_context_parallel: bool = False
-    """Option to enable hybrid context parallelism. When setting this to True, 
+    dynamic_context_parallel: bool = False
+    """Option to enable dynamic context parallelism. When setting this to True,
     each sample should be divisible by the data parallel size * context parallel size * 2.
-    If sequence parallel is enabled, it should be divisible by the 
+    If sequence parallel is enabled, it should be divisible by the
     data parallel size * context parallel size * sequence parallel size * 2.
     """
+
+    hybrid_context_parallel: bool = False
+    """Deprecated alias for ``dynamic_context_parallel``."""
 
     sequences_per_dataset: Optional[Dict[str, int]] = None
     """If provided, the sequence and document counts for each dataset. 
@@ -120,10 +124,24 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
 
+        if self.hybrid_context_parallel:
+            warnings.warn(
+                "GPTDatasetConfig.hybrid_context_parallel is deprecated; use "
+                "dynamic_context_parallel instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot set both hybrid_context_parallel and dynamic_context_parallel"
+                )
+            self.dynamic_context_parallel = True
+            self.hybrid_context_parallel = False
+
         if self.varlen_sbhd_validation:
-            assert not self.hybrid_context_parallel, (
+            assert not self.dynamic_context_parallel, (
                 "--varlen-sbhd-validation is incompatible with "
-                "--hybrid-context-parallel (SBHD mode is not packed)."
+                "--dynamic-context-parallel (SBHD mode is not packed)."
             )
 
         self.token_dtype_code = (

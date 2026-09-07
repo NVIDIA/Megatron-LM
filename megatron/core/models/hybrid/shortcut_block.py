@@ -301,6 +301,7 @@ class ShortcutMoEBlock(MegatronModule):
         quant_context_factory,
         cp_layout_state=None,
         packed_sequence_cp_metadata=None,
+        padding_mask_by_layout=None,
     ):
         """Run the eager schedule with each physical layer's quantization context."""
 
@@ -313,16 +314,20 @@ class ShortcutMoEBlock(MegatronModule):
             )
         moe_hidden_states = hidden_states
         moe_packed_seq_params = packed_seq_params
+        moe_padding_mask = padding_mask
         if cp_layout_state is not None:
             moe_hidden_states, moe_packed_seq_params = cp_layout_state.prepare_layer(
                 self.moe_local_idx, moe_hidden_states
+            )
+            moe_padding_mask = cp_layout_state.get_layer_padding_mask(
+                self.moe_local_idx, padding_mask, padding_mask_by_layout
             )
 
         # Launch the moe_router
         with quant_context_factory(moe_config, self.moe_layer_idx):
             route_input, route_probs = self._moe_router_preprocess(
                 shortcut_hidden=moe_hidden_states,
-                padding_mask=padding_mask,
+                padding_mask=moe_padding_mask,
                 packed_seq_params=moe_packed_seq_params,
             )
             if self.overlap_mode:
@@ -374,7 +379,7 @@ class ShortcutMoEBlock(MegatronModule):
             shared_expert_output, moe_unflatten_mbs, mlp_residual, mlp_state = (
                 self._moe_shared_experts(
                     attn_layer_output,
-                    padding_mask=padding_mask,
+                    padding_mask=moe_padding_mask,
                     packed_seq_params=moe_packed_seq_params,
                 )
             )

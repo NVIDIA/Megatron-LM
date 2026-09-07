@@ -43,7 +43,7 @@ _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core import mpu, nccl_allocator, tensor_parallel
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
+from megatron.core.datasets.data_schedule import wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -96,7 +96,7 @@ from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_model_parallel,
     get_context_parallel_group,
-    get_hybrid_data_context_parallel_groups,
+    get_dynamic_data_context_parallel_groups,
     update_pg_timeout,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -1514,17 +1514,6 @@ def preprocess_common_state_dict(common_state_dict):
                     reorder_inner_param_groups(optimizer_state_dict[i])
 
     return preprocessed_common_state_dict
-
-
-def wrap_hybrid_cp_data_iterator(train_data_iterator, config):
-    """Wrap the training data iterator for hybrid context parallelism.
-
-    The rerun state machine asserts that every training data iterator is a
-    RerunDataIterator; a raw iter() around HybridCPDataLoaderWrapper would
-    strip the wrapping applied at dataloader build time and fail that assert
-    on the first train step.
-    """
-    return RerunDataIterator(iter(HybridCPDataLoaderWrapper(train_data_iterator, config)))
 
 
 def pretrain(
@@ -3047,7 +3036,7 @@ def dummy_train_step(data_iterator):
     args = get_args()
     tp_rank = mpu.get_tensor_model_parallel_rank()
     has_cu_seqlens = getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
-    is_hybrid_cp = args.hybrid_context_parallel
+    is_hybrid_cp = args.dynamic_context_parallel
 
     BATCH_KEYS = [
         "tokens", "labels", "loss_mask", "position_ids", "attention_mask",
@@ -3085,7 +3074,7 @@ def dummy_train_step(data_iterator):
                 batch,
                 is_hybrid_cp=is_hybrid_cp,
                 cp_group=get_context_parallel_group(),
-                hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+                hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
             )
 
 
@@ -3107,6 +3096,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         _otel_step_tracer = get_telemetry().tracer
 
     rerun_state_machine = get_rerun_state_machine()
+    packed_data_iterator = None
+    has_wrapped_data_iterator = False
+    scheduled_num_microbatches = get_num_microbatches()
+    rerun_data_iterator = data_iterator
     save_params_in_this_iteration = (args.save_params_interval is not None and
                                      (iteration + 1) % args.save_params_interval == 0)
     save_activations_in_this_iteration = (args.save_activations_interval is not None and
@@ -3117,7 +3110,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     save_dgrads_in_this_iteration = (args.save_dgrads_interval is not None and
                                      (iteration + 1) % args.save_dgrads_interval == 0)
-    while rerun_state_machine.should_run_forward_backward(data_iterator):
+    while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -3172,18 +3165,28 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     optim_instance._copy_main_params_to_param_buffer()
 
         if getattr(config, "sequence_packing_scheduler", None) is not None:
-            (
-                data_iterator,
-                scheduled_num_microbatches,
-                total_real_tokens_in_batch,
-                seqlen_squared_sum_in_batch,
-            ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
-            set_seqlen_stats_in_iteration(
-                total_real_tokens_in_batch,
-                seqlen_squared_sum_in_batch,
-            )
+            if not has_wrapped_data_iterator:
+                (
+                    packed_data_iterator,
+                    scheduled_num_microbatches,
+                    total_real_tokens_in_batch,
+                    seqlen_squared_sum_in_batch,
+                ) = wrap_data_iterator(
+                    data_iterator,
+                    config,
+                    get_num_microbatches(),
+                    pg_collection=get_attr_wrapped_model(model[0], "pg_collection"),
+                )
+                set_seqlen_stats_in_iteration(
+                    total_real_tokens_in_batch,
+                    seqlen_squared_sum_in_batch,
+                )
+                has_wrapped_data_iterator = True
+                rerun_data_iterator = packed_data_iterator
+            forward_backward_data_iterator = packed_data_iterator
         else:
             scheduled_num_microbatches = get_num_microbatches()
+            forward_backward_data_iterator = data_iterator
 
         # Forward pass.
         if save_activations_in_this_iteration:
@@ -3200,7 +3203,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         with grad_context, _fb_cm:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
+                data_iterator=forward_backward_data_iterator,
                 model=model,
                 num_microbatches=scheduled_num_microbatches,
                 seq_length=args.seq_length,
@@ -3251,7 +3254,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
+        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0, scheduled_num_microbatches
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -3364,8 +3367,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             grad_norm,
             num_zeros_in_grad,
             log_max_attention_logit,
+            scheduled_num_microbatches,
         )
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
+    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit, scheduled_num_microbatches
 
 
 def _get_indexer_logging_layer_counts(args) -> tuple[int, int | None]:
@@ -3409,6 +3413,7 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    num_microbatches: int | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -3585,7 +3590,7 @@ def training_log(
     # Log MoE metrics.
     moe_log_string = ""
     if args.num_experts is not None:
-        moe_loss_scale = 1 / get_num_microbatches()
+        moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
@@ -3652,7 +3657,7 @@ def training_log(
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        mtp_loss_scale = 1 / get_num_microbatches()
+        mtp_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
@@ -4443,9 +4448,6 @@ def train(
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
 
-    if args.hybrid_context_parallel:
-        train_data_iterator = wrap_hybrid_cp_data_iterator(train_data_iterator, config)
-
     if args.run_workload_inspector_server:
         try:
             import threading
@@ -4855,6 +4857,7 @@ def train(
             grad_norm = 0.0
             num_zeros_in_grad = 0
             max_attention_logit = None
+            scheduled_num_microbatches = get_num_microbatches()
             _step_span = None
         else:
             # OTel: dedicated span for the first iteration actually executed in this
@@ -4882,6 +4885,7 @@ def train(
                     grad_norm,
                     num_zeros_in_grad,
                     max_attention_logit,
+                    scheduled_num_microbatches,
                 ) = train_step(
                     forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration,
                     pg_collection=pg_collection,
@@ -5064,6 +5068,7 @@ def train(
                     is_first_iteration=is_first_iteration,
                     seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
                     total_real_tokens_in_batch=total_real_tokens_in_batch,
+                    num_microbatches=scheduled_num_microbatches,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
@@ -5353,9 +5358,18 @@ def evaluate(
             if getattr(config, "sequence_packing_scheduler", None) is not None:
                 try:
                     (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
-                        wrap_data_iterator(data_iterator, config, eval_num_microbatches)
+                        wrap_data_iterator(
+                            data_iterator,
+                            config,
+                            eval_num_microbatches,
+                            pg_collection=eval_pgc,
+                        )
                     )
                 except StopIteration:
+                    # Keep integration hooks and timers balanced when a finite
+                    # validation iterator ends between scheduled global batches.
+                    ft_integration.on_eval_step_end()
+                    config.timers = get_timers()
                     break
             else:
                 packed_data_iterator = data_iterator
