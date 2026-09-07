@@ -769,18 +769,33 @@ class TestMcoreAdapterHybrid:
         assert torch.isfinite(reference).all()
         torch.testing.assert_close(hybrid, reference, rtol=1e-2, atol=0)
 
-    def test_moe_with_hybrid_dense(self):
-        """Dense parameters go hybrid; experts stay ZeRO-3 over the whole expert-DP domain.
-
-        This is the intended MoE configuration: ZeRO-3 + EP for the large expert weights,
-        and hybrid sharding for the dense ones. The two must end up on different meshes.
-        """
+    @pytest.mark.parametrize(
+        "dense_instances,expert_instances,dense_outer_strategy,expert_outer_strategy",
+        [
+            (2, 1, "optim", "no_shard"),
+            (1, 2, "no_shard", "no_shard"),
+            (2, 2, "no_shard", "optim"),
+        ],
+        ids=["dense-hybrid", "expert-hsdp", "independent-outer-strategies"],
+    )
+    def test_moe_with_independent_hybrid_meshes(
+        self,
+        dense_instances,
+        expert_instances,
+        dense_outer_strategy,
+        expert_outer_strategy,
+    ):
+        """Dense and expert parameters independently select their hybrid DP meshes."""
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         if world_size < 4 or world_size % 4:
             pytest.skip("MoE + hybrid needs a world size divisible by four (EP=2, instances=2).")
 
         Utils.initialize_model_parallel(
-            1, 1, expert_model_parallel_size=2, num_distributed_optimizer_instances=2
+            1,
+            1,
+            expert_model_parallel_size=2,
+            num_distributed_optimizer_instances=dense_instances,
+            expert_num_distributed_optimizer_instances=expert_instances,
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         torch.manual_seed(123)
@@ -811,8 +826,10 @@ class TestMcoreAdapterHybrid:
                 megatron_fsdp_version=2,
                 use_distributed_optimizer=False,
                 data_parallel_sharding_strategy="optim_grads_params",
-                num_distributed_optimizer_instances=2,
-                outer_dp_sharding_strategy="optim",
+                num_distributed_optimizer_instances=dense_instances,
+                expert_num_distributed_optimizer_instances=expert_instances,
+                outer_dp_sharding_strategy=dense_outer_strategy,
+                expert_outer_dp_sharding_strategy=expert_outer_strategy,
             ),
             module=HybridModel(
                 config=config,
@@ -850,7 +867,20 @@ class TestMcoreAdapterHybrid:
             for parameter in model.parameters()
             if parameter.grad is not None
         }
-        assert ("dp_outer", "dp_shard") in meshes, f"no hybrid dense mesh in {meshes}"
-        assert ("expert_dp",) in meshes, f"no expert mesh in {meshes}"
-        # Experts must not have acquired an outer axis.
-        assert meshes == {("dp_outer", "dp_shard"), ("expert_dp",)}, meshes
+        expected_meshes = {
+            ("dp_outer", "dp_shard") if dense_instances > 1 else ("dp",),
+            ("dp_outer", "dp_shard") if expert_instances > 1 else ("expert_dp",),
+        }
+        assert meshes == expected_meshes, meshes
+        placements = {
+            parameter.grad.placements
+            for parameter in model.parameters()
+            if parameter.grad is not None
+        }
+        dense_outer = Replicate() if dense_outer_strategy == "no_shard" else Shard(0)
+        expert_outer = Replicate() if expert_outer_strategy == "no_shard" else Shard(0)
+        expected_placements = {
+            (dense_outer, Shard(0)) if dense_instances > 1 else (Shard(0),),
+            (expert_outer, Shard(0)) if expert_instances > 1 else (Shard(0),),
+        }
+        assert placements == expected_placements, placements
