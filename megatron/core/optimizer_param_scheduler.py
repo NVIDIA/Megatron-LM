@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Learning rate decay and weight decay incr functions."""
+
 import logging
 import math
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
@@ -147,26 +148,41 @@ class OptimizerParamScheduler:
         self.init_lr = init_lr
         self.max_lr = float(max_lr)
         self.min_lr = min_lr
-        assert self.min_lr >= 0.0
-        assert self.max_lr >= self.min_lr
-        assert self.init_lr <= self.max_lr
+        assert self.min_lr >= 0.0, f'min_lr must be >= 0.0, got {self.min_lr}'
+        assert (
+            self.max_lr >= self.min_lr
+        ), f'max_lr ({self.max_lr}) must be >= min_lr ({self.min_lr})'
+        assert (
+            self.init_lr <= self.max_lr
+        ), f'init_lr ({self.init_lr}) must be <= max_lr ({self.max_lr})'
 
         self.lr_warmup_steps = lr_warmup_steps
         self.num_steps = 0
         self.lr_decay_steps = lr_decay_steps
         self.wsd_decay_steps = wsd_decay_steps
         self.lr_wsd_decay_style = lr_wsd_decay_style
-        assert self.lr_decay_steps > 0
-        assert self.lr_warmup_steps < self.lr_decay_steps
+        assert self.lr_decay_steps > 0, (
+            f'lr_decay_steps must be > 0, got {self.lr_decay_steps}. When lr_decay_steps is '
+            f'derived from the number of training iterations, this usually means the computed '
+            f'number of training iterations is 0 (e.g. fewer samples than a single global batch).'
+        )
+        assert self.lr_warmup_steps < self.lr_decay_steps, (
+            f'lr_warmup_steps ({self.lr_warmup_steps}) must be < '
+            f'lr_decay_steps ({self.lr_decay_steps})'
+        )
 
         self.lr_decay_style = lr_decay_style
         if self.lr_decay_style == "WSD":
-            assert self.wsd_decay_steps is not None
+            assert (
+                self.wsd_decay_steps is not None
+            ), 'wsd_decay_steps must be provided when lr_decay_style is "WSD"'
 
         self.start_wd = start_wd
         self.end_wd = end_wd
-        assert self.start_wd >= 0.0
-        assert self.end_wd >= self.start_wd
+        assert self.start_wd >= 0.0, f'start_wd must be >= 0.0, got {self.start_wd}'
+        assert (
+            self.end_wd >= self.start_wd
+        ), f'end_wd ({self.end_wd}) must be >= start_wd ({self.start_wd})'
         self.wd_incr_steps = wd_incr_steps
         self.wd_incr_style = wd_incr_style
 
