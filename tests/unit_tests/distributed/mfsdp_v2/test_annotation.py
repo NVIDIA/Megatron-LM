@@ -88,7 +88,7 @@ def _setup_nvtx_recording(monkeypatch: pytest.MonkeyPatch, events: list[NvtxEven
     monkeypatch.setattr(torch.cuda.nvtx, "range_pop", record_pop)
 
 
-def _lifecycle_events(events: list[NvtxEvent]) -> list[NvtxEvent]:
+def _forward_backward_events(events: list[NvtxEvent]) -> list[NvtxEvent]:
     """Return the forward/backward ranges asserted by the lifecycle tests."""
     return [event for event in events if event.operation in ("forward", "backward")]
 
@@ -136,7 +136,7 @@ def test_fsdp_sibling_roots_emit_root_nvtx_ranges_after_training_step(
 
     model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
 
-    assert _lifecycle_events(events) == [
+    assert _forward_backward_events(events) == [
         ("push", "<root>", "forward"),
         ("pop", "<root>", "forward"),
         ("push", "<root>", "forward"),
@@ -161,7 +161,7 @@ def test_fsdp_training_hooks_emit_stacked_nvtx_ranges(distributed_setup, monkeyp
 
     model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
 
-    assert _lifecycle_events(events) == [
+    assert _forward_backward_events(events) == [
         ("push", "<root>", "forward"),
         ("push", "layers.0", "forward"),
         ("pop", "layers.0", "forward"),
@@ -191,7 +191,7 @@ def test_fsdp_frozen_parameters_emit_balanced_backward_nvtx_range(distributed_se
     x = torch.ones(2, 4, device=distributed_setup.device, requires_grad=True)
     model(x).sum().backward()
 
-    assert _lifecycle_events(events) == [
+    assert _forward_backward_events(events) == [
         ("push", "<root>", "forward"),
         ("pop", "<root>", "forward"),
         ("push", "<root>", "backward"),
@@ -216,7 +216,7 @@ def test_fsdp_frozen_child_without_grad_inputs_skips_backward_nvtx_range(
 
     model(torch.ones(2, 4, device=distributed_setup.device)).sum().backward()
 
-    assert _lifecycle_events(events) == [
+    assert _forward_backward_events(events) == [
         ("push", "<root>", "forward"),
         ("push", "layers.0", "forward"),
         ("pop", "layers.0", "forward"),
@@ -244,7 +244,7 @@ def test_tied_child_parameters_complete_backward_once_per_cycle(distributed_setu
         model.zero_grad(set_to_none=True)
         model(token_ids).backward()
 
-    assert _lifecycle_events(events) == [
+    assert _forward_backward_events(events) == [
         ("push", "<root>", "forward"),
         ("pop", "<root>", "forward"),
         ("push", "<root>", "backward"),

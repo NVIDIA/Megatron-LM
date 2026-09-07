@@ -160,7 +160,6 @@ class FsdpModule:
     _parameter_groups: tuple[FsdpParameterGroup, ...]
     _context: FsdpContext
     _trainable_parameter_countdown: Countdown
-    _grad_reduction_callback_registered: bool
     _is_root: bool
     _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
@@ -194,7 +193,6 @@ class FsdpModule:
         self._unshard_event = None
         self._phase = FsdpModule.Phase.RESTING
         self._schedule_policy = schedule_policy
-        self._grad_reduction_callback_registered = False
         owned_parameters = _collect_owned_parameters(self)
         if grad_divisor <= 0:
             raise ValueError(f"grad_divisor must be positive, got {grad_divisor}.")
@@ -226,6 +224,10 @@ class FsdpModule:
                 if group.requires_grad
             )
         )
+        # The state-dict safety hook is registered unconditionally. It is still
+        # required to keep loading a state dict safe when ``register_hooks`` is
+        # False (i.e. execution hooks are disabled), so it must not be turned off
+        # together with the auto-execution hooks below.
         self.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
         if register_hooks:
             self._register_hooks()
@@ -279,20 +281,22 @@ class FsdpModule:
         module.register_full_backward_pre_hook(
             lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
         )
-        self.register_grad_reduction_callback(FsdpModule.post_backward)
+        self.register_post_backward_hook(FsdpModule.post_backward)
 
-    def register_grad_reduction_callback(
+    def register_post_backward_hook(
         self, post_backward_hook: Callable[["FsdpModule"], None]
     ) -> None:
-        """Register a callback to run gradient reduction when this module's backward is complete.
+        """Register a post-backward hook to run after this module's backward completes.
+
+        The hook runs when this module's backward is complete, so it can reshard
+        this module's parameters and reduce their gradients. It is invoked once
+        all of this module's trainable parameters have accumulated gradients, or
+        via a full-backward hook when the module owns no trainable parameters.
 
         Args:
             post_backward_hook: Callback receiving this FSDP module after all of its
                 trainable parameters have accumulated gradients.
         """
-        if self._grad_reduction_callback_registered:
-            raise RuntimeError("This FSDP module already has a grad-reduction callback registered.")
-
         module = cast(nn.Module, self)
         if self._trainable_parameter_countdown.initial_value == 0:
             module.register_full_backward_hook(
@@ -300,7 +304,6 @@ class FsdpModule:
                     cast(FsdpModule, hooked_module)
                 )
             )
-            self._grad_reduction_callback_registered = True
             return
 
         # Gradient reduction for trainable parameters is parameter-completion
@@ -336,7 +339,6 @@ class FsdpModule:
                 parameter_module.register_wgrad_accumulation_and_reduce_hooks(
                     lambda parameter=parameter: grad_hook(parameter)
                 )
-        self._grad_reduction_callback_registered = True
 
     @staticmethod
     def _pre_load_state_dict(
