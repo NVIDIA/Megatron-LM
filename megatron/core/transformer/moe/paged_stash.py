@@ -1262,6 +1262,14 @@ class PagedStashRunner:
         self._te_graph_capture_finished = True
         self._te_graph_runtime_num_microbatches = num_microbatches
 
+    def _reset_qb_histograms(self) -> None:
+        """Discard histogram observations from a failed full-iteration attempt."""
+        for mlp in self.moe_layers:
+            router = getattr(mlp, 'router', None)
+            qb_histogram = getattr(router, 'qb_histogram', None)
+            if qb_histogram is not None:
+                qb_histogram.zero_()
+
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
         data_iterator_saved = []
@@ -1374,6 +1382,11 @@ class PagedStashRunner:
         if self.stash_manager.host_spill is not None:
             self.stash_manager.host_spill.zero_()
         self._set_moe_paged_stash_all(False)
+
+        # The dropless retry replays every microbatch. Preserve CUDA addresses while
+        # discarding the failed attempt so each token contributes exactly once.
+        if is_training:
+            self._reset_qb_histograms()
 
         # Set grad to zero.
         for model_chunk in self.model:

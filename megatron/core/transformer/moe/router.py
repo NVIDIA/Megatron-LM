@@ -230,6 +230,9 @@ class TopKRouter(Router):
         else:
             self.tid2eid = None
 
+        self.use_quantile_balancing = (
+            self.routing_type == "quantile_balancing" and not self.is_hash_layer
+        )
         self.enable_expert_bias = (
             self.config.moe_router_enable_expert_bias and not self.is_hash_layer
         )
@@ -243,6 +246,10 @@ class TopKRouter(Router):
                 ),
                 persistent=False,
             )
+        else:
+            self.local_tokens_per_expert = None
+
+        if self.enable_expert_bias or self.use_quantile_balancing:
             self.register_buffer(
                 'expert_bias',
                 torch.zeros(
@@ -252,8 +259,26 @@ class TopKRouter(Router):
                 ),
             )
         else:
-            self.local_tokens_per_expert = None
             self.expert_bias = None
+
+        if self.use_quantile_balancing:
+            self.register_buffer(
+                'qb_histogram',
+                torch.zeros(
+                    self.config.num_moe_experts,
+                    self.config.moe_router_qb_num_bins,
+                    dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                'qb_bin_bounds',
+                torch.tensor([-1.0, 1.0], dtype=torch.float32, device=torch.cuda.current_device()),
+            )
+        else:
+            self.qb_histogram = None
+            self.qb_bin_bounds = None
 
         # Initialize global tokens per expert for global aux loss
         if self.get_aux_loss_coeff("global_aux_loss") > 0:
@@ -289,6 +314,9 @@ class TopKRouter(Router):
         if hasattr(self, 'expert_bias') and self.expert_bias is not None:
             if self.expert_bias.dtype != torch.float32:
                 self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+        if hasattr(self, 'qb_bin_bounds') and self.qb_bin_bounds is not None:
+            if self.qb_bin_bounds.dtype != torch.float32:
+                self.qb_bin_bounds.data = self.qb_bin_bounds.data.to(torch.float32)
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -450,10 +478,11 @@ class TopKRouter(Router):
             aux_loss_groups.metric_reduce_group,
             avg_group=aux_loss_groups.metric_avg_group,
             needs_dp_avg=aux_loss_groups.metric_needs_dp_avg,
-            valid_token_count=local_num_tokens,
+            # local_num_tokens is per-sequence (bsz is folded into the expert dimension);
+            # restore the micro-batch total for per-token-loss gradient scaling.
+            valid_token_count=local_num_tokens * bsz,
             aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
-            aux_loss_scale_num_tokens=total_num_tokens,
         )
         return probs
 
@@ -822,6 +851,19 @@ class TopKRouter(Router):
         elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         else:
+            # Activation checkpointing runs the original forward under no-grad and its
+            # recompute under enable-grad, so this gate records each token exactly once.
+            accumulate_qb_histogram = (
+                self.use_quantile_balancing
+                and self.training
+                and torch.is_grad_enabled()
+                and not self.frozen_expert_bias
+            )
+            if accumulate_qb_histogram and padding_mask is not None:
+                raise RuntimeError(
+                    "Quantile Balancing does not yet support padding masks because the "
+                    "histogram APIs do not accept a valid-token mask."
+                )
             probs, routing_map = topk_routing_with_score_function(
                 logits,
                 self.topk,
@@ -833,6 +875,8 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
+                qb_histogram=self.qb_histogram if accumulate_qb_histogram else None,
+                qb_bin_bounds=self.qb_bin_bounds if accumulate_qb_histogram else None,
             )
 
         # Dropless HybridEP consumes the sparse routing map directly, so exclude padding
@@ -860,8 +904,15 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
 
-        # Apply each aux loss type and attach aux loss autograd function to probs
-        if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
+        # Hash routing assignments come from tid2eid rather than the learned logits, so a
+        # learned top-k aux loss would optimize routing decisions that were never dispatched.
+        # Keep aux loss enabled for the non-hash MoE layers that share this configuration.
+        if (
+            not self.is_hash_layer
+            and self.training
+            and torch.is_grad_enabled()
+            and self.is_aux_loss_enabled()
+        ):
             # Calculate scores and routing_map for aux loss
             routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
                 logits,
