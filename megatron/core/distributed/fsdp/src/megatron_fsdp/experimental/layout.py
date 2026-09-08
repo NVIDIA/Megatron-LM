@@ -21,9 +21,8 @@ from typing import TypeAlias
 
 import torch
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
-
-from .placement import BlockAtomic, Flat
 
 Shape: TypeAlias = torch.Size | Iterable[int]
 
@@ -239,7 +238,7 @@ class GlobalLayout:
         offset = 0
         numel = self.size
         for axis, placement in reversed(tuple(enumerate(placements))):
-            if not isinstance(placement, (Flat, BlockAtomic)):
+            if not isinstance(placement, Shard):
                 continue
             axis_size = mesh.size(axis)
             if numel % axis_size != 0:
