@@ -187,6 +187,22 @@ class TestDelayWgradCompute:
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("sharding_strategy", ["optim_grads_params", "optim_grads"])
     def test_fsdp_1f1b_delay_wgrad(self, dispatcher_type, flex_backend, sharding_strategy):
+        """Verify delayed wgrad with the default tensor-release behavior."""
+        self._run_fsdp_1f1b_delay_wgrad(dispatcher_type, flex_backend, sharding_strategy)
+
+    @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
+    def test_fsdp_1f1b_delay_wgrad_with_scheduled_tensor_release(self):
+        """Verify scheduled tensor release with FSDP and delayed wgrad."""
+        self._run_fsdp_1f1b_delay_wgrad(
+            dispatcher_type="alltoall",
+            flex_backend=None,
+            sharding_strategy="optim_grads_params",
+            scheduled_tensor_release=True,
+        )
+
+    def _run_fsdp_1f1b_delay_wgrad(
+        self, dispatcher_type, flex_backend, sharding_strategy, scheduled_tensor_release=False
+    ):
         """Verify FSDP + 1F1B overlap + delay_wgrad_compute.
 
         Compares per-step loss and final weights between:
@@ -235,8 +251,9 @@ class TestDelayWgradCompute:
                 **base_kwargs,
                 "delay_wgrad_compute": True,
                 "overlap_moe_expert_parallel_comm": True,
-                "ep_overlap_use_scheduled_tensor_release": True,
             }
+            if scheduled_tensor_release:
+                test_kwargs["ep_overlap_use_scheduled_tensor_release"] = True
             test_config = get_test_config(num_layers=num_layers, extra_kwargs=test_kwargs)
             test_model = build_gpt_model(test_config, vocab_size=VOCAB_SIZE)
             reset_model(test_model, init_params)

@@ -369,7 +369,6 @@ class TestPartialCudaGraphedA2AOverlap:
                 cuda_graph_modules,
                 cuda_graph_warmup_steps,
                 ep_overlap=True,
-                ep_overlap_use_scheduled_tensor_release=True,
                 **extra_kwargs,
             )
             assert len(loss_list) == len(loss_list_ref)

@@ -94,6 +94,15 @@ class TestFSDP1F1BOverlap:
             early_attn_memory_release=early_attn_memory_release,
         )
 
+    @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
+    def test_fsdp_1f1b_scheduled_tensor_release(self):
+        """Verify scheduled tensor release with a representative FSDP configuration."""
+        self._run_test_helper(
+            dispatcher_type="alltoall",
+            sharding_strategy="optim_grads_params",
+            scheduled_tensor_release=True,
+        )
+
     def _run_test_helper(
         self,
         dispatcher_type="alltoall",
@@ -104,6 +113,7 @@ class TestFSDP1F1BOverlap:
         offload_modules=None,
         flex_backend=None,
         early_attn_memory_release=False,
+        scheduled_tensor_release=False,
     ):
         """Verify multi-step FSDP training with overlap produces identical
         per-step loss and final weights as standard FSDP training.
@@ -154,12 +164,11 @@ class TestFSDP1F1BOverlap:
             ref_opt = fully_shard_optimizer(optimizer=ref_opt)
 
             # --- Test: FSDP model with overlap training loop ---
-            test_kwargs = {
-                **extra_kwargs,
-                "overlap_moe_expert_parallel_comm": True,
-                "ep_overlap_early_attn_memory_release": early_attn_memory_release,
-                "ep_overlap_use_scheduled_tensor_release": True,
-            }
+            test_kwargs = {**extra_kwargs, "overlap_moe_expert_parallel_comm": True}
+            if early_attn_memory_release:
+                test_kwargs["ep_overlap_early_attn_memory_release"] = True
+            if scheduled_tensor_release:
+                test_kwargs["ep_overlap_use_scheduled_tensor_release"] = True
             test_config = get_test_config(num_layers=num_layers, extra_kwargs=test_kwargs)
             test_model = build_gpt_model(test_config, vocab_size=VOCAB_SIZE)
             reset_model(test_model, init_params)
