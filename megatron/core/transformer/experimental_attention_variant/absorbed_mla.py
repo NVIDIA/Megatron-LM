@@ -27,6 +27,7 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
@@ -669,7 +670,7 @@ class AbsorbedMLASelfAttention(Attention):
             return q_absorbed, kv_compressed
 
         if self.recompute_up_proj:
-            quantization = self.config.fp8 or self.config.fp4
+            quantization = is_quantization_enabled(self.config)
             assert not quantization, "FP8/FP4 is not supported for AbsorbedMLA"
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
             q_absorbed, kv_compressed = self.qkv_up_checkpoint.checkpoint(

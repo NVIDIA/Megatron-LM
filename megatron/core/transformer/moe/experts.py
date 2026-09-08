@@ -29,6 +29,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.transformer.mlp import (
     MLP,
     MLPSubmodules,
@@ -276,7 +277,7 @@ class TEGroupedMLP(MegatronModule):
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
         )
-        if self.activation_recompute and (self.config.fp8 or self.config.fp4):
+        if self.activation_recompute and is_quantization_enabled(self.config):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc2)
@@ -309,7 +310,7 @@ class TEGroupedMLP(MegatronModule):
             )
 
         self._use_grouped_tensor = self.config.moe_use_grouped_tensor
-        if self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
+        if is_quantization_enabled(self.config) or self._use_grouped_tensor:
             assert HAVE_TE, "Quantized or TE grouped-tensor GroupedMLP execution requires TE."
             align_size = (
                 get_align_size_for_quantization(self.config) if self._use_grouped_tensor else None
@@ -742,7 +743,7 @@ class TEGroupedMLP(MegatronModule):
         # the padding needed by the fused grouped-MLP contract. FP8/FP4 require recipe-specific
         # alignment, while the TE operation-fuser grouped-tensor path currently uses 256-token
         # expert segments.
-        elif self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
+        elif is_quantization_enabled(self.config) or self._use_grouped_tensor:
             tokens_per_expert = tokens_per_expert.tolist()
             unpadded_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
@@ -902,7 +903,7 @@ class TEGroupedMLP(MegatronModule):
         # explicit fallback. FP8/FP4 need their recipe-specific alignment. MCore currently also
         # applies its common aligned-segment contract to the GroupedTensor backend so quantized
         # grouped execution receives supported shapes
-        elif self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
+        elif is_quantization_enabled(self.config) or self._use_grouped_tensor:
             tokens_per_expert = tokens_per_expert.tolist()
             unpadded_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
@@ -1584,7 +1585,7 @@ class SequentialMLP(MegatronModule):
             permuted_probs = torch.ones_like(permuted_probs)
 
         if self.num_local_experts == 1:
-            if self.config.fp8 or self.config.fp4:
+            if is_quantization_enabled(self.config):
                 hidden, probs = self._pad_tensor_for_quantization(
                     permuted_local_hidden_states, permuted_probs
                 )
@@ -1604,7 +1605,7 @@ class SequentialMLP(MegatronModule):
             output_local_list = []
 
             for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
-                if self.config.fp8 or self.config.fp4:
+                if is_quantization_enabled(self.config):
                     hidden, probs = self._pad_tensor_for_quantization(tokens, probs)
                     output, output_bias = expert(hidden, probs)
                     output = output[: tokens.shape[0]]

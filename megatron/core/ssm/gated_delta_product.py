@@ -27,6 +27,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic, causal_conv1d_cp
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.ssm.context_parallel.gdp_common import gdp_chunkwise_context_parallel
@@ -637,7 +638,7 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule):
             # replays under the recorded fp8_autocast, and the only quantized op inside
             # _in_proj_preprocess is in_proj itself. Everything downstream of it (causal
             # conv, gated delta product kernel) runs unquantized.
-            quantization = self.config.fp8 or self.config.fp4
+            quantization = is_quantization_enabled(self.config)
             in_proj_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
             # ``packed_seq_params`` is bound rather than passed through ``checkpoint`` so
             # that only tensors reach ``ctx.save_for_backward``.

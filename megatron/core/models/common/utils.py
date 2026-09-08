@@ -17,6 +17,7 @@ from typing import Callable
 import torch
 
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
@@ -85,7 +86,7 @@ def should_free_input(name, is_moe, config, num_local_experts):
 
     # When low precision fp8/4 is enabled, the casted tensors are saved and the
     # original bf16 tensors are safe to be freed.
-    free_mlp = config.fp8 is not None or config.fp4 is not None
+    free_mlp = is_quantization_enabled(config)
     if not free_mlp:
         # AlltoAll dispatcher with local_num_experts=1, HybridEP, and NCCL EP all use
         # identity operation for `dispatch_postprocess`, hence the mlp inputs will be

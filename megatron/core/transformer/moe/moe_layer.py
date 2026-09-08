@@ -14,6 +14,7 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_routed_mxfp8
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
@@ -536,7 +537,7 @@ class MoELayer(BaseMoELayer):
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
             if self.shared_experts_recompute:
-                if self.config.fp8 or self.config.fp4:
+                if is_quantization_enabled(self.config):
                     shared_expert_output = te_checkpoint(
                         apply_module(self.shared_experts),
                         False,
@@ -722,7 +723,7 @@ class MoELayer(BaseMoELayer):
             return output, mlp_bias
 
         if self.moe_layer_recompute and self.training:
-            if self.config.fp8 or self.config.fp4:
+            if is_quantization_enabled(self.config):
                 outputs = te_checkpoint(
                     custom_forward,
                     False,

@@ -49,6 +49,22 @@ def get_te_quantization_recipe(config: TransformerConfig) -> Any:
     return None
 
 
+def get_quantization_alignment(config: TransformerConfig) -> int:
+    """Return the required tensor alignment without probing an opaque factory."""
+    if config.custom_recipe is not None:
+        recipe = get_te_quantization_recipe(config)
+        return getattr(recipe, "quantization_alignment", 128)
+    if config.fp8:
+        from megatron.core.fp8_utils import get_fp8_align_size
+
+        return get_fp8_align_size(config.fp8_recipe)
+    if config.fp4:
+        from megatron.core.fp4_utils import get_fp4_align_size
+
+        return get_fp4_align_size(config.fp4_recipe)
+    return 0
+
+
 def get_quantization_context(
     config: TransformerConfig, layer_no: int = -1, is_init: bool = False
 ) -> ContextManager[Any]:

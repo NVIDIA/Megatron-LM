@@ -1775,6 +1775,35 @@ class TransformerConfig(ModelParallelConfig):
                 )
             warn_deprecated_legacy_custom_recipe("fp4")
 
+        if custom_recipe_enabled:
+            if self.tp_comm_overlap:
+                raise ValueError(
+                    "Custom recipes do not yet support TP communication overlap/Userbuffers."
+                )
+            if self.fp8_dot_product_attention and self.context_parallel_size > 1:
+                raise ValueError(
+                    "Custom-recipe dot-product attention does not support context parallelism."
+                )
+            if self.moe_single_grouped_weight or self.moe_single_grouped_bias:
+                raise ValueError(
+                    "Custom recipes do not yet support MoE single grouped parameters. "
+                    "Use discrete expert weights and biases."
+                )
+            if self.use_grouped_gemm_for_shared_expert:
+                raise ValueError(
+                    "Custom recipes do not yet support the fused grouped shared-expert MLP."
+                )
+            if self.moe_expert_rank_capacity_factor is not None:
+                raise ValueError(
+                    "Custom recipes do not yet support fixed-capacity HybridEP/NCCL-EP dispatch."
+                )
+            if self.transformer_impl == "inference_optimized":
+                raise ValueError(
+                    "Custom recipes do not yet support inference-optimized transformer layers."
+                )
+            if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
+                raise ValueError("Custom recipes do not yet support CUDA graphs in Megatron Core.")
+
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
@@ -2911,9 +2940,10 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_router_padding_for_quantization = True
 
         if self.moe_router_padding_for_quantization:
-            if self.fp8 is None and self.fp4 is None:
+            if self.fp8 is None and self.fp4 is None and self.custom_recipe is None:
                 raise ValueError(
-                    "fp8/fp4 must be specified when moe_router_padding_for_quantization is True."
+                    "FP8, FP4, or a custom recipe must be specified when "
+                    "moe_router_padding_for_quantization is True."
                 )
 
             if self.moe_token_dispatcher_type in ["allgather", "alltoall_seq"]:

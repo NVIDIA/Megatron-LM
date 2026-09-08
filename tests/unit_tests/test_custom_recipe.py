@@ -215,3 +215,16 @@ def test_custom_recipe_is_materialized_once_per_config():
     second = te_recipe.get_te_quantization_recipe(config)
 
     assert first is second
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+def test_custom_recipe_alignment_uses_declared_value_or_conservative_fallback():
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe=TEST_FACTORY_PATH
+    )
+    recipe = te_recipe.get_te_quantization_recipe(config)
+
+    expected = getattr(recipe, "quantization_alignment", 128)
+    assert te_recipe.get_quantization_alignment(config) == expected
+    with patch.object(te_recipe, "get_te_quantization_recipe", return_value=object()):
+        assert te_recipe.get_quantization_alignment(config) == 128

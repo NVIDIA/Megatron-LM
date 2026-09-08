@@ -242,8 +242,8 @@ if HAVE_TE:
                 )
         else:
             raise ValueError(
-                """FP4 support requires TransformerEngine version >= 2.7.0.dev0 
-                for NVFP4BlockScaling."""
+                "FP4 support requires TransformerEngine version >= 2.7.0.dev0 "
+                "for NVFP4BlockScaling."
             )
         return fp4_recipe
 

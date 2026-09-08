@@ -133,6 +133,32 @@ def test_custom_recipe_config_rejects_invalid_factory_path(factory_path):
         ({"fp8_param": True}, "do not yet support quantized parameter storage"),
         ({"fp8": "hybrid"}, "cannot be combined with FP8/FP4"),
         ({"fp4": "e2m1"}, "cannot be combined with FP8/FP4"),
+        ({"tp_comm_overlap": True}, "TP communication overlap/Userbuffers"),
+        (
+            {"fp8_dot_product_attention": True, "context_parallel_size": 2},
+            "dot-product attention does not support context parallelism",
+        ),
+        (
+            {
+                "moe_grouped_gemm": True,
+                "moe_use_grouped_tensor": True,
+                "moe_single_grouped_weight": True,
+            },
+            "do not yet support MoE single grouped parameters",
+        ),
+        (
+            {"use_grouped_gemm_for_shared_expert": True},
+            "do not yet support the fused grouped shared-expert MLP",
+        ),
+        (
+            {"moe_expert_rank_capacity_factor": 1.0},
+            "do not yet support fixed-capacity HybridEP/NCCL-EP dispatch",
+        ),
+        (
+            {"transformer_impl": "inference_optimized"},
+            "do not yet support inference-optimized transformer layers",
+        ),
+        ({"cuda_graph_impl": "local"}, "do not yet support CUDA graphs"),
         (
             {"fp8_recipe": "custom", "fp8_quantizer_factory": "package.module.legacy_factory"},
             "cannot be combined with FP8/FP4",
@@ -148,6 +174,21 @@ def test_custom_recipe_config_rejects_invalid_flag_combinations(overrides, error
             custom_recipe="package.module.factory",
             **overrides,
         )
+
+
+def test_custom_recipe_allows_quantization_router_padding():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        custom_recipe="package.module.factory",
+        num_moe_experts=2,
+        moe_ffn_hidden_size=128,
+        moe_router_padding_for_quantization=True,
+        moe_token_dispatcher_type="alltoall",
+    )
+
+    assert config.moe_router_padding_for_quantization
 
 
 def test_from_config_creates_independent_target_config_without_reinitializing():
