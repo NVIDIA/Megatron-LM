@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+from contextlib import nullcontext
 from typing import Any, Callable
 
 import torch
@@ -12,6 +13,10 @@ from megatron.core.distributed import (
     FullyShardedDataParallel,
 )
 from megatron.core.full_cuda_graph import get_shared_capture_stream
+from megatron.core.models.common.language_module.language_module import (
+    defer_initial_embedding_sync,
+    sync_initial_embeddings_and_output_layers,
+)
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
@@ -30,7 +35,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_model_config, get_pg_rank
-
 
 try:
     from megatron.core.fp8_utils import correct_amax_history_if_needed
@@ -96,11 +100,23 @@ def unimodal_build_distributed_models(
 
     vp_size = transformer_config.virtual_pipeline_model_parallel_size
     init_model_with_meta_device = transformer_config.init_model_with_meta_device
-    if init_model_with_meta_device:
-        with torch.device("meta"):
-            model_list = build_virtual_pipeline_stages(build_model_func, pg_collection, vp_size, model_type)
-    else:
-        model_list = build_virtual_pipeline_stages(build_model_func, pg_collection, vp_size, model_type)
+    should_defer_embedding_sync = pg_collection.pp.size() > 1 and vp_size is not None
+    embedding_sync_context = (
+        defer_initial_embedding_sync() if should_defer_embedding_sync else nullcontext()
+    )
+    with embedding_sync_context:
+        if init_model_with_meta_device:
+            with torch.device("meta"):
+                model_list = build_virtual_pipeline_stages(
+                    build_model_func, pg_collection, vp_size, model_type
+                )
+        else:
+            model_list = build_virtual_pipeline_stages(
+                build_model_func, pg_collection, vp_size, model_type
+            )
+
+    if should_defer_embedding_sync:
+        sync_initial_embeddings_and_output_layers(model_list)
 
     # Apply pre wrap hooks
     if pre_wrap_hook is not None:

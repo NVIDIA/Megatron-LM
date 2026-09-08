@@ -1,7 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
-from typing import Optional, Tuple
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Iterator, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -32,6 +34,33 @@ from megatron.core.utils import (
     is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
 )
+
+_DEFER_INITIAL_EMBEDDING_SYNC: ContextVar[bool] = ContextVar(
+    "defer_initial_embedding_sync", default=False
+)
+
+
+@contextmanager
+def defer_initial_embedding_sync() -> Iterator[None]:
+    """Defer tied embedding synchronization within a model-construction scope."""
+
+    token = _DEFER_INITIAL_EMBEDDING_SYNC.set(True)
+    try:
+        yield
+    finally:
+        _DEFER_INITIAL_EMBEDDING_SYNC.reset(token)
+
+
+def sync_initial_embeddings_and_output_layers(model: list[torch.nn.Module]) -> None:
+    """Synchronize deferred tied embeddings in nested model chunks."""
+
+    for model_module in model:
+        for module in model_module.modules():
+            sync_initial_embeddings = getattr(
+                module, 'sync_initial_embeddings_and_output_layer', None
+            )
+            if callable(sync_initial_embeddings):
+                sync_initial_embeddings()
 
 
 class LanguageModule(MegatronModule):
@@ -307,6 +336,22 @@ class LanguageModule(MegatronModule):
 
         # Ensure that first and last stages have the same initial parameter
         # values.
+        # Under VPP, defer synchronization until all local model chunks are built.
+        if not _DEFER_INITIAL_EMBEDDING_SYNC.get():
+            self.sync_initial_embeddings_and_output_layer()
+
+    def sync_initial_embeddings_and_output_layer(self) -> None:
+        """Synchronize tied embedding weights between pipeline stages."""
+
+        if not self.share_embeddings_and_output_weights and not getattr(
+            self.config, 'mtp_num_layers', 0
+        ):
+            return
+        if self.config.pipeline_model_parallel_size == 1:
+            return
+        if not (self.pre_process or self.post_process or getattr(self, 'mtp_process', False)):
+            return
+
         if torch.distributed.is_initialized():
             if self._is_in_embd_group() and not self.config.init_model_with_meta_device:
                 weight = self.shared_embedding_or_output_weight()
