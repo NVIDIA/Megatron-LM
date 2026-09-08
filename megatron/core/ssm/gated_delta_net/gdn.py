@@ -192,6 +192,11 @@ class GatedDeltaNet(_GDNBase):
                 not self.config.deterministic_mode
             ), "Packed sequence does not support deterministic mode."
 
+            # cu_seqlens *values* only exist on the device, so every check below is a
+            # D2H sync. They are skipped while a CUDA graph is being captured; the
+            # warmup iterations that must precede capture run them on the same buffers.
+            validate_cu_seqlens = not torch.cuda.is_current_stream_capturing()
+
             # Resolve cu_seqlens with alignment padding handling.
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
@@ -199,6 +204,7 @@ class GatedDeltaNet(_GDNBase):
                 seq_len_global,
                 "cu_seqlens_q",
                 cp_size=cp_size_runtime,
+                validate=validate_cu_seqlens,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
@@ -206,11 +212,13 @@ class GatedDeltaNet(_GDNBase):
                 seq_len_global,
                 "cu_seqlens_kv",
                 cp_size=cp_size_runtime,
+                validate=validate_cu_seqlens,
             )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
-                "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-            )
+            if validate_cu_seqlens:
+                assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+                    "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
+                    f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+                )
             num_packed_seqs = cu_seqlens_q.shape[0] - 1
             assert num_packed_seqs > 0, (
                 "Number of packed sequences must be greater than 0, "
@@ -377,6 +385,14 @@ class GatedDeltaNet(_GDNBase):
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
+        # torch_chunk_gated_delta_rule (the deterministic_mode path) accepts neither
+        # chunk_indices nor cu_seqlens_cpu, and asserts cu_seqlens is None outright,
+        # so the capture-safe varlen metadata is only threaded on the fla path.
+        gdr_varlen_kwargs = (
+            {}
+            if self.config.deterministic_mode
+            else self._fla_varlen_kwargs(cu_seqlens_q, cp_context=chunkwise_cp_context)
+        )
         core_attn_out, _ = self.gated_delta_rule(
             **kernel_inputs,
             initial_state=None,
@@ -384,6 +400,7 @@ class GatedDeltaNet(_GDNBase):
             use_qk_l2norm_in_kernel=False,
             cu_seqlens=cu_seqlens_q,
             cp_context=chunkwise_cp_context,
+            **gdr_varlen_kwargs,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
@@ -530,6 +547,16 @@ class GatedDeltaNet(_GDNBase):
                 conv_input = torch.nn.functional.pad(conv_input, (0, 0, 0, pad_n))
                 conv_cu_seqlens = cu_seqlens_q.clone()
                 conv_cu_seqlens[-1] += pad_n
+            # causal_conv1d host-builds chunk_indices from cu_seqlens contents just like
+            # chunk_gated_delta_rule does. Derived from conv_cu_seqlens (post conv
+            # padding); pad_n is passed separately because it grows the last sequence
+            # past the configured static buffer size and so widens the NT_max bound.
+            conv_varlen_kwargs = self._fla_varlen_kwargs(
+                conv_cu_seqlens,
+                cp_context=conv_cp_context,
+                extra_tokens=pad_n,
+                cu_seqlens_unpadded=cu_seqlens_q if pad_n > 0 else None,
+            )
             qkv, _ = causal_conv1d(
                 x=conv_input,
                 weight=conv1d_weight.squeeze(1),
@@ -539,6 +566,7 @@ class GatedDeltaNet(_GDNBase):
                 output_final_state=False,
                 cu_seqlens=conv_cu_seqlens,
                 cp_context=conv_cp_context,
+                **conv_varlen_kwargs,
             )
             if pad_n > 0:
                 qkv = qkv[:, :orig_seq, :]
