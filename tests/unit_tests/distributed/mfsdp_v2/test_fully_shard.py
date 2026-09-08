@@ -42,6 +42,46 @@ class TinyModel(nn.Module):
         return self.fc2(self.relu(self.fc1(x)))
 
 
+class _FusedWgradLinearFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: nn.Parameter, bias: nn.Parameter) -> torch.Tensor:
+        ctx.save_for_backward(x)
+        ctx.weight = weight
+        return torch.nn.functional.linear(x, weight, bias)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (x,) = ctx.saved_tensors
+        weight = ctx.weight
+        weight.get_main_grad().add_(grad_output.t().matmul(x))
+        weight.grad_added_to_main_grad = True
+        return grad_output.matmul(weight), torch.zeros_like(weight), grad_output.sum(dim=0)
+
+
+class FusedWgradLinear(nn.Linear):
+    """Linear module that follows TE's fused-wgrad parameter protocol."""
+
+    fuse_wgrad_accumulation = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the fused-wgrad autograd function."""
+        assert self.bias is not None
+        return _FusedWgradLinearFunction.apply(x, self.weight, self.bias)
+
+
+class SelectiveFusedWgradModel(nn.Module):
+    """Model with fused and ordinary parameters owned by the same FSDP root."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fused = FusedWgradLinear(8, 8)
+        self.ordinary = nn.Linear(8, 8)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run both parameter groups."""
+        return self.fused(x) + self.ordinary(x)
+
+
 class CheckpointedTinyModel(TinyModel):
     """Tiny model that activation-checkpoints each shardable module."""
 
@@ -303,6 +343,148 @@ def test_fully_shard_rejects_tied_delayed_weight_gradients(distributed_setup):
         pytest.raises(ValueError, match="Transformer Engine does not accumulate their gradients"),
     ):
         fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+
+def test_fused_wgrad_matches_baseline(distributed_setup):
+    """Direct wgrads should match ordinary autograd across microbatches."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(1234)
+    baseline = nn.Linear(8, 4).to(device)
+    model = FusedWgradLinear(8, 4).to(device)
+    model.load_state_dict(baseline.state_dict())
+
+    with fully_shard_context(device=device) as context:
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    fully_shard_optimizer(optimizer)
+    inputs = torch.randn(2, 2, 3, 8, device=device)
+    targets = torch.randn(2, 2, 3, 4, device=device)
+    baseline_losses = []
+    losses = []
+    for step in range(2):
+        baseline_optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
+        for microbatch_index, (x, target) in enumerate(zip(inputs[step], targets[step])):
+            baseline_loss = torch.nn.functional.mse_loss(baseline(x), target)
+            baseline_losses.append(baseline_loss.detach())
+            (baseline_loss / 2).backward()
+            with microbatch(context, is_last=microbatch_index == 1):
+                loss = torch.nn.functional.mse_loss(model(x), target)
+                losses.append(loss.detach())
+                (loss / 2).backward()
+        baseline_optimizer.step()
+        optimizer.step()
+
+    torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
+    parameter_group = model.parameter_groups[0]
+    assert parameter_group._fused_wgrad_buffer is None
+    assert not parameter_group._fused_wgrad_indices
+    for fsdp_parameter in parameter_group.fsdp_parameters:
+        parameter = fsdp_parameter.unsharded
+        assert parameter.main_grad is None
+        assert not parameter.grad_added_to_main_grad
+
+
+def test_fused_wgrad_only_marks_supported_module_parameters(distributed_setup):
+    """Only parameters owned by fused modules should receive TE's destination protocol."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = SelectiveFusedWgradModel().to(device)
+
+    with fully_shard_context(device=device):
+        fully_shard(model, mesh=mesh, placements=_flat_placements())
+
+    groups = {group.fuse_wgrad_accumulation: group for group in model.parameter_groups}
+    assert groups.keys() == {False, True}
+    assert {fqn for parameter in groups[True].fsdp_parameters for fqn in parameter.fqns} == {
+        "fused.weight",
+        "fused.bias",
+    }
+    assert {fqn for parameter in groups[False].fsdp_parameters for fqn in parameter.fqns} == {
+        "ordinary.weight",
+        "ordinary.bias",
+    }
+
+    for parameter in groups[True].fsdp_parameters:
+        assert parameter.unsharded.__fsdp_param__
+        assert parameter.unsharded.get_main_grad is not None
+        assert not parameter.unsharded.overwrite_main_grad
+        assert not parameter.unsharded.grad_added_to_main_grad
+        assert parameter.unsharded.zero_out_wgrad
+    for parameter in groups[False].fsdp_parameters:
+        assert not hasattr(parameter.unsharded, "get_main_grad")
+
+
+def test_te_linear_fused_wgrad_matches_baseline(distributed_setup):
+    """Real TE Linear kernels should train through MFSDP's direct destination."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    class TeTinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fc1 = te.Linear(
+                8, 16, params_dtype=torch.bfloat16, device=device, fuse_wgrad_accumulation=True
+            )
+            self.fc2 = te.Linear(
+                16, 4, params_dtype=torch.bfloat16, device=device, fuse_wgrad_accumulation=True
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            hidden = torch.relu(self.fc1(x)) + torch.relu(self.fc1(x * 0.5))
+            return self.fc2(hidden)
+
+    mesh = init_device_mesh(device.type, (world_size,))
+    torch.manual_seed(2468)
+    baseline = TinyModel().to(device=device, dtype=torch.bfloat16)
+    model = TeTinyModel()
+    incompatible_keys = model.load_state_dict(baseline.state_dict(), strict=False)
+    assert not incompatible_keys.unexpected_keys
+    assert incompatible_keys.missing_keys == ["fc1._extra_state", "fc2._extra_state"]
+
+    mp_policy = MixedPrecisionPolicy(main_params_dtype=torch.bfloat16)
+    with fully_shard_context(device=device) as context:
+        fully_shard(
+            model, mesh=mesh, placements=_flat_placements(), mixed_precision_policy=mp_policy
+        )
+
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    fully_shard_optimizer(optimizer)
+    inputs = torch.randn(2, 2, 3, 8, device=device, dtype=torch.bfloat16)
+    targets = torch.randn(2, 2, 3, 4, device=device, dtype=torch.bfloat16)
+    baseline_losses = []
+    losses = []
+
+    for step in range(2):
+        baseline_optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
+        for microbatch_index, (x, target) in enumerate(zip(inputs[step], targets[step])):
+            baseline_hidden = torch.relu(baseline.fc1(x)) + torch.relu(baseline.fc1(x * 0.5))
+            baseline_output = baseline.fc2(baseline_hidden)
+            baseline_loss = torch.nn.functional.mse_loss(baseline_output.float(), target.float())
+            baseline_losses.append(baseline_loss.detach())
+            (baseline_loss / 2).backward()
+
+            with microbatch(context, is_last=microbatch_index == 1):
+                loss = torch.nn.functional.mse_loss(model(x).float(), target.float())
+                losses.append(loss.detach())
+                (loss / 2).backward()
+        baseline_optimizer.step()
+        optimizer.step()
+
+    torch.testing.assert_close(
+        torch.stack(losses), torch.stack(baseline_losses), rtol=5e-3, atol=5e-3
+    )
 
 
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])

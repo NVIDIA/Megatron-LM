@@ -623,7 +623,7 @@ def linear_with_frozen_weight(
     return LinearWithFrozenWeight.apply(*args)
 
 
-def _wgrad_gemm(out, grad_output, total_input, accumulate: bool = False):
+def _wgrad_gemm(out, grad_output, total_input):
     """Weight-gradient GEMM into ``out``, which may be wider than the inputs (bf16 -> fp32).
 
     Returns ``out``, filled with the weight gradient.
@@ -634,21 +634,11 @@ def _wgrad_gemm(out, grad_output, total_input, accumulate: bool = False):
     if te_general_gemm is not None:
         # torch.matmul cannot widen via out=, so TE's GEMM does the mixed-precision output.
         te_general_gemm(
-            total_input,
-            grad_output,
-            out_dtype=out.dtype,
-            layout="NT",
-            out=out,
-            grad=True,
-            accumulate=accumulate,
+            total_input, grad_output, out_dtype=out.dtype, layout="NT", out=out, grad=True
         )
     else:
         # matmul rejects an out= of a different dtype, so land in the compute dtype and cast.
-        wgrad = grad_output.t().matmul(total_input)
-        if accumulate:
-            out.add_(wgrad)
-        else:
-            out.copy_(wgrad)
+        out.copy_(grad_output.t().matmul(total_input))
     return out
 
 
@@ -790,12 +780,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # In case of Megatron-FSDP, need to create main grad buffers in-place
                 if hasattr(weight, "__fsdp_param__"):
                     weight.main_grad = weight.get_main_grad()
-                    _wgrad_gemm(
-                        weight.main_grad,
-                        grad_output,
-                        total_input,
-                        accumulate=not weight.overwrite_main_grad,
-                    )
+                    _wgrad_gemm(weight.main_grad, grad_output, total_input)
                 else:
                     if weight.main_grad.dtype == torch.float32:
                         fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
