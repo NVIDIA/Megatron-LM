@@ -115,10 +115,11 @@ class TestDSAIndexShareHelpers:
         with pytest.raises(RuntimeError, match="pipeline split is invalid"):
             _validate_dsa_index_share_pipeline_split(config, [1, 2, 3, 4])
 
-    def test_repeated_mtp_index_share_rejects_cross_segment_source(self):
+    @pytest.mark.parametrize("shared_components", [["latent_kv"], ["sparse_attention_index"]])
+    def test_repeated_mtp_index_share_rejects_cross_segment_source(self, shared_components):
         config = SimpleNamespace(
             experimental_attention_variant="dsa",
-            mtp_repeated_layer_shared_components=["sparse_attention_index"],
+            mtp_repeated_layer_shared_components=shared_components,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=3,
         )

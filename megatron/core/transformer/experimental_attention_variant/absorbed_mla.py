@@ -442,6 +442,7 @@ class AbsorbedMLASelfAttention(Attention):
         key_value_states=None,
         packed_seq_params=None,
         inference_context=None,
+        reuse_mtp_latent_kv: bool = False,
         *,
         inference_params=None,
     ):
@@ -525,36 +526,41 @@ class AbsorbedMLASelfAttention(Attention):
         #     kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim) / TP]
         # elif linear_kv_down_proj is Linear:
         #     kv_combined: [s / TP, b, (kv_lora_rank + qk_pos_emb_head_dim)]
-        kv_combined, _ = self.linear_kv_down_proj(hidden_states)
-        if kv_combined.size(-1) != self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim:
-            # kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim)]
-            kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
-            # kv_compressed:[s, b, kv_lora_rank], k_pos_emb: [s, b, qk_pos_emb_head_dim]
-            kv_compressed, k_pos_emb = torch.split(
-                kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
-            )
-            if self.config.sequence_parallel:
+        if not reuse_mtp_latent_kv:
+            kv_combined, _ = self.linear_kv_down_proj(hidden_states)
+            if kv_combined.size(-1) != self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim:
+                # kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim)]
+                kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
+                # kv_compressed:[s, b, kv_lora_rank], k_pos_emb: [s, b, qk_pos_emb_head_dim]
+                kv_compressed, k_pos_emb = torch.split(
+                    kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
+                )
+                if self.config.sequence_parallel:
+                    # kv_compressed:[s / TP, b, kv_lora_rank]
+                    kv_compressed = scatter_to_sequence_parallel_region(kv_compressed)
+            else:
                 # kv_compressed:[s / TP, b, kv_lora_rank]
-                kv_compressed = scatter_to_sequence_parallel_region(kv_compressed)
+                # k_pos_emb: [s / TP, b, qk_pos_emb_head_dim]
+                kv_compressed, k_pos_emb = torch.split(
+                    kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
+                )
+                if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
+                    # k_pos_emb: [s, b, qk_pos_emb_head_dim]
+                    k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
         else:
-            # kv_compressed:[s / TP, b, kv_lora_rank], k_pos_emb: [s / TP, b, qk_pos_emb_head_dim]
-            kv_compressed, k_pos_emb = torch.split(
-                kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
-            )
-            if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
-                # k_pos_emb: [s, b, qk_pos_emb_head_dim]
-                k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb, group=self.tp_group)
+            kv_compressed = k_pos_emb = None
 
         if thd_packed_seq:
             assert q_compressed.ndim == 3 and q_compressed.size(1) == 1
-            assert kv_compressed.ndim == 3 and kv_compressed.size(1) == 1
-            assert k_pos_emb.ndim == 3 and k_pos_emb.size(1) == 1
             # If sequence packing, TE expect [t, h, d] shaped qkv input.
             # In Megatron-Core, the qkv shape is [t, 1, h, d].
             # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
             q_compressed = q_compressed.squeeze(1)
-            kv_compressed = kv_compressed.squeeze(1)
-            k_pos_emb = k_pos_emb.squeeze(1)
+            if not reuse_mtp_latent_kv:
+                assert kv_compressed.ndim == 3 and kv_compressed.size(1) == 1
+                assert k_pos_emb.ndim == 3 and k_pos_emb.size(1) == 1
+                kv_compressed = kv_compressed.squeeze(1)
+                k_pos_emb = k_pos_emb.squeeze(1)
 
         # =========================================
         # Apply norm
@@ -563,11 +569,14 @@ class AbsorbedMLASelfAttention(Attention):
             # q_compressed: [num_tokens, q_lora_rank]
             q_compressed = self.q_layernorm(q_compressed)
 
-        kv_compressed = self.kv_layernorm(kv_compressed)
-        # Because we won't apply V up projection to the compressed KV, so we need to gather it
-        # manually.
-        if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
-            kv_compressed = gather_from_sequence_parallel_region(kv_compressed, group=self.tp_group)
+        if not reuse_mtp_latent_kv:
+            kv_compressed = self.kv_layernorm(kv_compressed)
+            # Because we won't apply V up projection to the compressed KV, so we need to gather it
+            # manually.
+            if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
+                kv_compressed = gather_from_sequence_parallel_region(
+                    kv_compressed, group=self.tp_group
+                )
 
         # =========================================
         # QKV up projection and RoPE apply
@@ -592,10 +601,11 @@ class AbsorbedMLASelfAttention(Attention):
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
-            # [num_tokens, kv_lora_rank] -> [num_tokens, 1, kv_lora_rank]
-            kv_compressed = torch.unsqueeze(kv_compressed, -2)
-            # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
-            k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
+            if not reuse_mtp_latent_kv:
+                # [num_tokens, kv_lora_rank] -> [num_tokens, 1, kv_lora_rank]
+                kv_compressed = torch.unsqueeze(kv_compressed, -2)
+                # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
+                k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             k_up_weight, _ = self._get_kv_up_weights()
 
@@ -624,15 +634,19 @@ class AbsorbedMLASelfAttention(Attention):
                     cp_rank,
                     cp_size,
                 )
-                kv_compressed = fused_mla_rope_concat(
-                    kv_compressed,
-                    k_pos_emb,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    cu_seqlens_kv,
-                    cp_rank,
-                    cp_size,
-                )
+                if not reuse_mtp_latent_kv:
+                    kv_compressed = fused_mla_rope_concat(
+                        kv_compressed,
+                        k_pos_emb,
+                        rotary_pos_cos,
+                        rotary_pos_sin,
+                        cu_seqlens_kv,
+                        cp_rank,
+                        cp_size,
+                    )
+                else:
+                    # DSAttention resolves the canonical depth-0 key from its sharing state.
+                    kv_compressed = None
             else:
                 q_len = q.size()[0]
                 if inference_context is not None:
@@ -676,25 +690,29 @@ class AbsorbedMLASelfAttention(Attention):
                     mla_rotary_interleaved=True,
                     max_seqlen=rope_max_seqlen_q,
                 )
-                # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
-                k_pos_emb = apply_rotary_pos_emb(
-                    k_pos_emb,
-                    rotary_pos_emb,
-                    config=self.config,
-                    cu_seqlens=cu_seqlens_kv,
-                    mscale=mscale,
-                    cp_group=self.pg_collection.cp,
-                    mla_rotary_interleaved=True,
-                    max_seqlen=rope_max_seqlen_kv,
-                )
-
                 # query: [num_tokens, n, (kv_lora_rank + qk_pos_emb_head_dim)]
                 q_absorbed = torch.cat([q_absorbed, q_pos_emb], dim=-1)
-                # key: [num_tokens, 1, (kv_lora_rank + qk_pos_emb_head_dim)]
-                kv_compressed = torch.cat([kv_compressed, k_pos_emb], dim=-1)
+
+                if not reuse_mtp_latent_kv:
+                    # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
+                    k_pos_emb = apply_rotary_pos_emb(
+                        k_pos_emb,
+                        rotary_pos_emb,
+                        config=self.config,
+                        cu_seqlens=cu_seqlens_kv,
+                        mscale=mscale,
+                        cp_group=self.pg_collection.cp,
+                        mla_rotary_interleaved=True,
+                        max_seqlen=rope_max_seqlen_kv,
+                    )
+                    # key: [num_tokens, 1, (kv_lora_rank + qk_pos_emb_head_dim)]
+                    kv_compressed = torch.cat([kv_compressed, k_pos_emb], dim=-1)
+                else:
+                    # DSAttention resolves the canonical depth-0 key from its sharing state.
+                    kv_compressed = None
 
             assert q_absorbed.is_contiguous()
-            assert kv_compressed.is_contiguous()
+            assert kv_compressed is None or kv_compressed.is_contiguous()
 
             return q_absorbed, kv_compressed
 
@@ -918,6 +936,16 @@ class AbsorbedMLASelfAttention(Attention):
                 "Repeated-MTP cross-depth sharing does not support core_attn recompute."
             )
 
+        if (
+            getattr(self.core_attention, "mtp_latent_kv_share", False)
+            and self.recompute_up_proj
+            and self.training
+        ):
+            raise RuntimeError(
+                "Repeated-MTP latent_kv sharing does not support mla_up_proj recompute: "
+                "the source KV storage would be discarded before later depths consume it."
+            )
+
         # Set the right cp group for dynamic-cp. Downstream RoPE and CSA core
         # attention use self.pg_collection.cp, which must point at this
         # microbatch's dynamic CP group. Restored before returning.
@@ -940,13 +968,28 @@ class AbsorbedMLASelfAttention(Attention):
         # =====================
         # Query, Key, and Value
         # =====================
+        should_reuse_mtp_latent_kv = getattr(
+            self.core_attention, "should_reuse_mtp_latent_kv", None
+        )
+        reuse_mtp_latent_kv = (
+            should_reuse_mtp_latent_kv(packed_seq_params, attention_mask)
+            if should_reuse_mtp_latent_kv is not None
+            else False
+        )
+        mtp_latent_kv_kwargs = {}
+        if reuse_mtp_latent_kv:
+            mtp_latent_kv_kwargs["reuse_mtp_latent_kv"] = True
         q_absorbed, kv_compressed, q_compressed = self.get_query_key_value_tensors(
-            hidden_states, key_value_states, packed_seq_params, inference_context=inference_context
+            hidden_states,
+            key_value_states,
+            packed_seq_params,
+            inference_context=inference_context,
+            **mtp_latent_kv_kwargs,
         )
 
         assert q_absorbed.is_contiguous()
         assert q_compressed.is_contiguous()
-        assert kv_compressed.is_contiguous()
+        assert kv_compressed is None or kv_compressed.is_contiguous()
         v_up_weight = self._get_v_up_weight()
 
         # ==================================
