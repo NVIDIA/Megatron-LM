@@ -842,6 +842,7 @@ def ensure_nccl_ep_bootstrapped(
     max_tokens_per_rank,
     recv_capacity_per_rank,
     hidden_dim,
+    num_topk,
     num_sms=0,
     zero_copy=False,
 ):
@@ -857,9 +858,11 @@ def ensure_nccl_ep_bootstrapped(
         num_experts (int): Total experts across ``ep_group`` (global, not per-rank).
         max_tokens_per_rank (int): Upper bound on local input tokens per forward. Must be
             even (NCCL EP requires ``num_tokens_per_rank * inner_dim % 4 == 0``).
-        recv_capacity_per_rank (int): Per-rank receive-buffer capacity in tokens. Must be
-            ``>= max_tokens_per_rank``; runtime overflow hard-traps (no soft drop).
+        recv_capacity_per_rank (int, optional): Per-rank receive-buffer capacity in tokens.
+            When ``None``, TE uses eager mode and sizes the receive buffers from the per-step
+            routing result.
         hidden_dim (int): Token hidden size.
+        num_topk (int): Number of experts each token routes to.
         num_sms (int): SM cap passed to TE as ``max_num_sms`` (0 lets TE/NCCL choose).
     """
     if not HAVE_TE_EP:
@@ -875,6 +878,7 @@ def ensure_nccl_ep_bootstrapped(
         max_tokens_per_rank=max_tokens_per_rank,
         recv_capacity_per_rank=recv_capacity_per_rank,
         hidden_dim=hidden_dim,
+        num_topk=num_topk,
         max_num_sms=num_sms,
         zero_copy=zero_copy,
     )

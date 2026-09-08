@@ -8,10 +8,16 @@ import torch
 
 from megatron.core import config, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.transformer.moe import fused_a2a
+from megatron.core.transformer.moe import token_dispatcher as token_dispatcher_module
 from megatron.core.transformer.moe.fused_a2a import HYBRIDEP_TOKEN_ALIGNMENT, reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity
-from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher, _HybridEPManager
+from megatron.core.transformer.moe.token_dispatcher import (
+    MoETokenDispatcher,
+    _HybridEPManager,
+    _NCCLEPManager,
+)
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -106,6 +112,143 @@ def test_hybridep_variable_tokens_are_padded_to_group_max(monkeypatch):
     assert manager.token_probs.shape == (expected_num_tokens, manager.num_experts)
     assert not manager.routing_map[local_num_tokens:].any()
     assert not manager.token_probs[local_num_tokens:].any()
+
+
+def _make_ncclep_config(**overrides):
+    defaults = {
+        "hidden_size": 16,
+        "moe_expert_rank_capacity_factor": None,
+        "moe_flex_dispatcher_num_sms": None,
+        "moe_grouped_gemm": False,
+        "moe_latent_size": None,
+        "moe_ncclep_static_shape": False,
+        "moe_ncclep_use_symm_mem": False,
+        "use_transformer_engine_op_fuser": False,
+        "fp8": None,
+        "fp4": None,
+    }
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def test_ensure_nccl_ep_bootstrapped_passes_num_topk(monkeypatch):
+    calls = []
+
+    class FakeTEEP:
+        _BOOTSTRAPPED = False
+
+        def ep_bootstrap(self, ep_group, **kwargs):
+            calls.append((ep_group, kwargs))
+
+    fake_te_ep = FakeTEEP()
+    monkeypatch.setattr(fused_a2a, "HAVE_TE_EP", True)
+    monkeypatch.setattr(fused_a2a, "te_ep", fake_te_ep, raising=False)
+
+    ep_group = object()
+    fused_a2a.ensure_nccl_ep_bootstrapped(
+        ep_group,
+        num_experts=8,
+        max_tokens_per_rank=64,
+        recv_capacity_per_rank=None,
+        hidden_dim=32,
+        num_topk=4,
+        num_sms=7,
+        zero_copy=True,
+    )
+
+    assert calls == [
+        (
+            ep_group,
+            {
+                "num_experts": 8,
+                "max_tokens_per_rank": 64,
+                "recv_capacity_per_rank": None,
+                "hidden_dim": 32,
+                "num_topk": 4,
+                "max_num_sms": 7,
+                "zero_copy": True,
+            },
+        )
+    ]
+
+
+def test_ncclep_dynamic_shape_allows_missing_rank_capacity_and_bootstraps_eager(monkeypatch):
+    calls = []
+
+    def fake_ensure_nccl_ep_bootstrapped(group, **kwargs):
+        calls.append((group, kwargs))
+
+    monkeypatch.setattr(token_dispatcher_module, "nccl_ep_dispatch", object())
+    monkeypatch.setattr(
+        token_dispatcher_module,
+        "ensure_nccl_ep_bootstrapped",
+        fake_ensure_nccl_ep_bootstrapped,
+    )
+
+    group = object()
+    manager = _NCCLEPManager(
+        group=group,
+        num_local_experts=2,
+        router_topk=3,
+        num_experts=8,
+        config=_make_ncclep_config(
+            hidden_size=32,
+            moe_expert_rank_capacity_factor=None,
+            moe_flex_dispatcher_num_sms=5,
+            moe_ncclep_static_shape=False,
+        ),
+    )
+    manager.num_local_tokens = 65
+
+    manager._ensure_bootstrap()
+
+    assert manager._max_tokens_per_rank == 128
+    assert manager._recv_capacity is None
+    assert manager._bootstrapped
+    assert calls == [
+        (
+            group,
+            {
+                "num_experts": 8,
+                "max_tokens_per_rank": 128,
+                "recv_capacity_per_rank": None,
+                "hidden_dim": 32,
+                "num_topk": 3,
+                "num_sms": 5,
+                "zero_copy": False,
+            },
+        )
+    ]
+
+
+def test_ncclep_dynamic_shape_restores_expert_rows_without_padding():
+    manager = object.__new__(_NCCLEPManager)
+    manager._recv_capacity = None
+    hidden_states = torch.randn(7, 16)
+
+    assert manager.get_restored_hidden_states_by_experts(hidden_states) is hidden_states
+
+
+def test_ncclep_static_shape_requires_rank_capacity_factor(monkeypatch):
+    monkeypatch.setattr(token_dispatcher_module, "nccl_ep_dispatch", object())
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+
+    with pytest.raises(
+        ValueError,
+        match="moe_ncclep_static_shape=True requires .*moe_expert_rank_capacity_factor",
+    ):
+        _NCCLEPManager(
+            group=object(),
+            num_local_experts=2,
+            router_topk=3,
+            num_experts=8,
+            config=_make_ncclep_config(
+                moe_expert_rank_capacity_factor=None,
+                moe_ncclep_static_shape=True,
+                use_transformer_engine_op_fuser=True,
+            ),
+        )
 
 
 class MoEModelTestContainer:
