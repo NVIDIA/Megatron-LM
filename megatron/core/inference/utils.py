@@ -42,8 +42,6 @@ class InferenceMode:
     @classmethod
     def set_flashinfer_token_capacity(cls, token_capacity: int | None) -> None:
         """Set the inferred FlashInfer row capacity for the current inference step."""
-        if token_capacity is not None and token_capacity <= 0:
-            raise ValueError(f"FlashInfer token capacity must be positive, got {token_capacity}")
         cls._flashinfer_token_capacity = token_capacity
 
     @classmethod

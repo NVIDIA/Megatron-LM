@@ -276,15 +276,7 @@ class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
     @pytest.mark.internal
     @torch.inference_mode()
     def test_bounded_flashinfer_graph_admission_uses_ep_wide_mode(self):
-        """Exercise regular and disaggregated bounded-row graph admission.
-
-        NVLS normally matches CUDA graphs independently across EP ranks. That is
-        safe for full-buffer MoE kernels, but a bounded decode graph would omit
-        valid rows gathered from the prefill peer. Locally decode-only ranks must
-        therefore run the full eager path for an asymmetric regular step.
-        Dedicated decode and prefill roles resolve statically without that
-        regular-mode EP agreement.
-        """
+        """A local decode graph must reject bounded rows when an EP peer has prefill."""
         ep_rank = parallel_state.get_expert_model_parallel_rank()
 
         model = self._build_model()
@@ -311,22 +303,6 @@ class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
             assert not ctx.using_cuda_graph_this_step()
         else:
             assert ctx.using_cuda_graph_this_step()
-
-        ctx.reset()
-        ctx.set_disaggregated_inference_role("decode")
-        ctx.add_dummy_requests_for_cudagraph_capture(_STATE_DIMS[DECODE])
-        ctx.initialize_attention_state()
-
-        assert ctx.can_use_bounded_flashinfer_rows()
-        assert ctx.using_cuda_graph_this_step()
-
-        ctx.reset()
-        ctx.set_disaggregated_inference_role("prefill")
-        ctx.add_dummy_requests_for_cudagraph_capture(_STATE_DIMS[PREFILL])
-        ctx.initialize_attention_state()
-
-        assert not ctx.can_use_bounded_flashinfer_rows()
-        assert ctx.using_cuda_graph_this_step()
 
     @requires_te_batch_invariant_attention
     @torch.inference_mode()

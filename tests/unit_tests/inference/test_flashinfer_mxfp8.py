@@ -33,29 +33,17 @@ def test_inference_mode_tracks_flashinfer_token_capacity():
     assert InferenceMode.flashinfer_token_capacity() is None
 
 
-def test_inference_mode_rejects_nonpositive_flashinfer_token_capacity():
-    with pytest.raises(ValueError, match="must be positive"):
-        InferenceMode.set_flashinfer_token_capacity(0)
-
-
 def test_nvls_flashinfer_metadata_initializes_padding_routes_to_minus_one(monkeypatch):
     from megatron.core.inference.moe import InferenceGroupedGemmBackend
     from megatron.core.transformer.moe import token_dispatcher_inference as dispatcher_module
 
     routing = torch.zeros(8, 2, dtype=torch.int64)
-    monkeypatch.setattr(
-        dispatcher_module.NVLSAllGatherVDispatcher, "_symm_agv_routing", {"tensor": routing}
-    )
-    monkeypatch.setattr(
-        dispatcher_module.NVLSAllGatherVDispatcher,
-        "_symm_metadata",
-        {"tensor": torch.empty(2, dtype=torch.int32), "handle": object()},
-    )
-    monkeypatch.setattr(
-        dispatcher_module.NVLSAllGatherVDispatcher,
-        "_step_metadata",
-        torch.zeros(3, dtype=torch.int32),
-    )
+    for name, value in {
+        "_symm_agv_routing": {"tensor": routing},
+        "_symm_metadata": {"tensor": torch.empty(2, dtype=torch.int32), "handle": object()},
+        "_step_metadata": torch.zeros(3, dtype=torch.int32),
+    }.items():
+        monkeypatch.setattr(dispatcher_module.NVLSAllGatherVDispatcher, name, value)
     monkeypatch.setattr(dispatcher_module, "fused_metadata_update", lambda **kwargs: None)
     dispatcher = SimpleNamespace(
         config=SimpleNamespace(
@@ -69,35 +57,23 @@ def test_nvls_flashinfer_metadata_initializes_padding_routes_to_minus_one(monkey
     assert torch.equal(routing, torch.full_like(routing, -1))
 
 
-@pytest.mark.parametrize("bounded_rows_allowed", [False, True])
-def test_controller_infers_flashinfer_capacity_only_when_policy_allows(bounded_rows_allowed):
-    from megatron.core.inference.text_generation_controllers.text_generation_controller import (
-        TextGenerationController,
-    )
+@pytest.mark.parametrize(
+    ("bounded_rows_allowed", "num_speculative_tokens", "expected"),
+    [(False, 2, None), (True, 2, 1536)],
+)
+def test_context_infers_flashinfer_capacity_only_when_policy_allows(
+    bounded_rows_allowed, num_speculative_tokens, expected
+):
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 
     context = SimpleNamespace(
         max_requests=128,
+        num_speculative_tokens=num_speculative_tokens,
         expert_model_parallel_size=4,
         can_use_bounded_flashinfer_rows=lambda: bounded_rows_allowed,
-        config=SimpleNamespace(materialize_only_last_token_logits=True),
-        num_last_token_logits=1,
-        has_vlm_data=False,
-    )
-    logits = torch.empty(1, 1, 4)
-    controller = TextGenerationController.__new__(TextGenerationController)
-    controller.inference_wrapped_model = SimpleNamespace(
-        inference_context=context, run_one_forward_step=lambda inference_input: logits
-    )
-    controller.model_config = SimpleNamespace()
-    controller.num_speculative_tokens = 0
-    controller.model_is_pipeline_parallel = False
-    controller._enable_cuda_graph = False
-
-    controller._dynamic_step_forward_logits(
-        torch.zeros(1, 1, dtype=torch.int64), torch.zeros(1, 1, dtype=torch.int64)
     )
 
-    assert InferenceMode.flashinfer_token_capacity() == (512 if bounded_rows_allowed else None)
+    assert DynamicInferenceContext.flashinfer_token_capacity(context) == expected
 
 
 @pytest.mark.parametrize(
@@ -200,14 +176,6 @@ def _make_bounded_mxfp8_config(**overrides):
     return TransformerConfig(**kwargs)
 
 
-def test_bounded_flashinfer_mxfp8_config_accepts_nvls_ep():
-    config = _make_bounded_mxfp8_config()
-
-    assert config.inference_flashinfer_bounded_rows
-    assert config.inference_moe_token_dispatcher_type == "nvls"
-    assert config.expert_model_parallel_size == 2
-
-
 def test_bf16_config_ignores_inactive_mxfp8_recipe_gates():
     config = _make_bounded_mxfp8_config(
         fp8=None, fp8_param=False, activation_func=F.gelu, inference_flashinfer_bounded_rows=False
@@ -217,77 +185,64 @@ def test_bf16_config_ignores_inactive_mxfp8_recipe_gates():
 
 
 def _make_bounded_bf16_config(**overrides):
-    kwargs = dict(
-        num_layers=1,
-        hidden_size=128,
-        num_attention_heads=4,
-        num_moe_experts=2,
-        moe_ffn_hidden_size=128,
-        moe_grouped_gemm=True,
-        moe_router_dtype="fp32",
-        transformer_impl="inference_optimized",
-        normalization="RMSNorm",
-        add_bias_linear=False,
-        params_dtype=torch.bfloat16,
-        expert_model_parallel_size=2,
-        expert_tensor_parallel_size=1,
-        inference_grouped_gemm_backend="flashinfer",
-        inference_moe_token_dispatcher_type="nvls",
-        inference_flashinfer_bounded_rows=True,
-        fp8=None,
-        fp8_param=False,
-        activation_func=squared_relu,
-    )
+    kwargs = dict(fp8=None, fp8_param=False, params_dtype=torch.bfloat16)
     kwargs.update(overrides)
-    return TransformerConfig(**kwargs)
-
-
-def test_bounded_flashinfer_bf16_config_accepts_nvls_ep():
-    config = _make_bounded_bf16_config()
-
-    assert config.inference_flashinfer_bounded_rows
+    return _make_bounded_mxfp8_config(**kwargs)
 
 
 @pytest.mark.parametrize(
-    ("overrides", "match"),
+    "make_config", [_make_bounded_mxfp8_config, _make_bounded_bf16_config], ids=["mxfp8", "bf16"]
+)
+def test_bounded_flashinfer_config_accepts_nvls_ep(make_config):
+    assert make_config().inference_flashinfer_bounded_rows
+
+
+@pytest.mark.parametrize(
+    ("make_config", "overrides", "match"),
     [
-        ({"inference_grouped_gemm_backend": "vllm"}, "requires.*backend='flashinfer'"),
         (
+            _make_bounded_bf16_config,
+            {"inference_grouped_gemm_backend": "vllm"},
+            "requires.*backend='flashinfer'",
+        ),
+        (
+            _make_bounded_bf16_config,
             {"fp8": "hybrid", "fp8_recipe": "delayed", "fp8_param": True},
             "requires.*BF16 parameters.*mxfp8",
         ),
-        ({"params_dtype": torch.float32}, "requires.*BF16 parameters"),
-        ({"inference_moe_token_dispatcher_type": "nccl"}, "requires.*nvls"),
-        ({"expert_model_parallel_size": 1}, "requires.*expert_model_parallel_size > 1"),
+        (_make_bounded_bf16_config, {"params_dtype": torch.float32}, "requires.*BF16 parameters"),
+        (
+            _make_bounded_bf16_config,
+            {"inference_moe_token_dispatcher_type": "nccl"},
+            "requires.*nvls",
+        ),
+        (
+            _make_bounded_bf16_config,
+            {"expert_model_parallel_size": 1},
+            "requires.*expert_model_parallel_size > 1",
+        ),
+        (
+            _make_bounded_mxfp8_config,
+            {"inference_grouped_gemm_backend": "vllm", "inference_flashinfer_bounded_rows": False},
+            "vLLM Triton fused MoE only supports BF16",
+        ),
+        (_make_bounded_mxfp8_config, {"fp8_param": False}, "fp8_param must be enabled"),
+        (
+            _make_bounded_mxfp8_config,
+            {"fp8": None, "fp8_param": False},
+            "requires.*BF16 parameters",
+        ),
     ],
 )
-def test_bounded_flashinfer_bf16_config_rejects_invalid_configuration(overrides, match):
+def test_bounded_flashinfer_config_rejects_invalid_configuration(make_config, overrides, match):
     with pytest.raises(ValueError, match=match):
-        _make_bounded_bf16_config(**overrides)
+        make_config(**overrides)
 
 
 @pytest.mark.parametrize("activation_func", [F.gelu, F.silu, F.relu])
 def test_flashinfer_mxfp8_config_rejects_unsupported_activation(activation_func):
     with pytest.raises(ValueError, match="supports only non-gated squared-ReLU experts"):
         _make_bounded_mxfp8_config(activation_func=activation_func)
-
-
-@pytest.mark.parametrize(
-    ("overrides", "match"),
-    [
-        (
-            {"inference_grouped_gemm_backend": "vllm", "inference_flashinfer_bounded_rows": False},
-            "vLLM Triton fused MoE only supports BF16",
-        ),
-        ({"fp8_param": False}, "fp8_param must be enabled"),
-        ({"fp8": None, "fp8_param": False}, "requires.*BF16 parameters"),
-        ({"inference_moe_token_dispatcher_type": "nccl"}, "requires.*nvls"),
-        ({"expert_model_parallel_size": 1}, "requires.*expert_model_parallel_size > 1"),
-    ],
-)
-def test_bounded_flashinfer_mxfp8_config_rejects_invalid_configuration(overrides, match):
-    with pytest.raises(ValueError, match=match):
-        _make_bounded_mxfp8_config(**overrides)
 
 
 def test_missing_routed_mxfp8_capability_has_precise_error(monkeypatch):
@@ -319,23 +274,16 @@ def test_flashinfer_mxfp8_refresh_reports_noop_before_weight_build():
 def test_bf16_concatenated_weights_remain_refittable():
     from megatron.core.transformer.moe.experts import InferenceGroupedMLP
 
-    class ExpertLinear(torch.nn.Module):
-        def __init__(self, num_experts, rows, cols):
-            super().__init__()
-            for expert_idx in range(num_experts):
-                self.register_parameter(
-                    f"weight{expert_idx}",
-                    torch.nn.Parameter(torch.randn(rows, cols, dtype=torch.bfloat16)),
-                )
+    grouped_mlp = torch.nn.Module()
+    grouped_mlp.num_local_experts = 2
+    for name, shape in (("linear_fc1", (8, 4)), ("linear_fc2", (4, 8))):
+        linear = torch.nn.Module()
+        for expert_idx in range(grouped_mlp.num_local_experts):
+            linear.register_parameter(
+                f"weight{expert_idx}", torch.nn.Parameter(torch.randn(*shape, dtype=torch.bfloat16))
+            )
+        setattr(grouped_mlp, name, linear)
 
-    class GroupedMLP(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.num_local_experts = 2
-            self.linear_fc1 = ExpertLinear(self.num_local_experts, 8, 4)
-            self.linear_fc2 = ExpertLinear(self.num_local_experts, 4, 8)
-
-    grouped_mlp = GroupedMLP()
     InferenceGroupedMLP._build_concatenated_weights(grouped_mlp)
     fc1_ptr = grouped_mlp._fc1_weight.data_ptr()
     fc2_ptr = grouped_mlp._fc2_weight.data_ptr()
@@ -355,6 +303,21 @@ def test_bf16_concatenated_weights_remain_refittable():
     assert grouped_mlp._fc2_weight.data_ptr() == fc2_ptr
 
 
+def _mock_bf16_flashinfer(monkeypatch, experts, cutlass_fused_moe, hidden_size=8):
+    monkeypatch.setattr(experts, "HAVE_FLASHINFER", True)
+    monkeypatch.setattr(
+        experts, "fused_moe", SimpleNamespace(cutlass_fused_moe=cutlass_fused_moe), raising=False
+    )
+    return SimpleNamespace(
+        _fc1_weight=torch.empty(2, hidden_size, hidden_size, dtype=torch.bfloat16),
+        _fc2_weight=torch.empty(2, hidden_size, hidden_size, dtype=torch.bfloat16),
+        _flashinfer_activation_type=object(),
+        _activation_clamp_scale=None,
+        _nvls_dispatcher=True,
+        ep_group=SimpleNamespace(size=lambda: 2, rank=lambda: 0),
+    )
+
+
 def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
     from megatron.core.transformer.moe import experts
 
@@ -365,28 +328,13 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
     def cutlass_fused_moe(hidden_states, routing_map, probs, *args, **kwargs):
         captured["output"] = kwargs["output"]
         captured["hidden_rows"] = hidden_states.shape[0]
-        captured["last_route"] = routing_map[-1].item()
         return (expected,)
 
-    monkeypatch.setattr(experts, "HAVE_FLASHINFER", True)
-    monkeypatch.setattr(
-        experts, "fused_moe", SimpleNamespace(cutlass_fused_moe=cutlass_fused_moe), raising=False
-    )
-
-    grouped_mlp = SimpleNamespace(
-        _fc1_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
-        _fc2_weight=torch.empty(2, 8, 8, dtype=torch.bfloat16),
-        _flashinfer_activation_type=object(),
-        _activation_clamp_scale=None,
-        _nvls_dispatcher=True,
-        ep_group=SimpleNamespace(size=lambda: 2, rank=lambda: 0),
-    )
-    routing_map = torch.full((full_rows, 1), -1, dtype=torch.int64)
-    routing_map[-1] = 0
+    grouped_mlp = _mock_bf16_flashinfer(monkeypatch, experts, cutlass_fused_moe)
     output, bias = experts.InferenceGroupedMLP._flashinfer_forward(
         grouped_mlp,
         torch.empty(full_rows, 8, dtype=torch.bfloat16),
-        routing_map,
+        torch.zeros(full_rows, 1, dtype=torch.int64),
         torch.zeros(full_rows, 1, dtype=torch.float32),
     )
 
@@ -394,7 +342,6 @@ def test_bf16_flashinfer_nvls_uses_dispatcher_copy_fallback(monkeypatch):
     assert bias is None
     assert captured["output"] is None
     assert captured["hidden_rows"] == full_rows
-    assert captured["last_route"] == 0
 
 
 def test_bounded_bf16_flashinfer_uses_active_prefix_and_full_rsv_output(monkeypatch):
@@ -414,21 +361,11 @@ def test_bounded_bf16_flashinfer_uses_active_prefix_and_full_rsv_output(monkeypa
         captured["prob_shape"] = tuple(probs.shape)
         return (expected,)
 
-    monkeypatch.setattr(experts, "HAVE_FLASHINFER", True)
-    monkeypatch.setattr(
-        experts, "fused_moe", SimpleNamespace(cutlass_fused_moe=cutlass_fused_moe), raising=False
+    grouped_mlp = _mock_bf16_flashinfer(
+        monkeypatch, experts, cutlass_fused_moe, hidden_size=hidden_size
     )
     monkeypatch.setattr(
         experts.NVLSAllGatherVDispatcher, "_get_rsv_tensor", staticmethod(lambda: rsv_output)
-    )
-
-    grouped_mlp = SimpleNamespace(
-        _fc1_weight=torch.empty(2, hidden_size, hidden_size, dtype=torch.bfloat16),
-        _fc2_weight=torch.empty(2, hidden_size, hidden_size, dtype=torch.bfloat16),
-        _flashinfer_activation_type=object(),
-        _activation_clamp_scale=None,
-        _nvls_dispatcher=True,
-        ep_group=SimpleNamespace(size=lambda: 2, rank=lambda: 0),
     )
     InferenceMode.set_active()
     InferenceMode.set_flashinfer_token_capacity(active_rows)

@@ -413,6 +413,7 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
         hidden_size_per_attention_head=1,
         block_size_tokens=4,
         mamba_slot_allocator=object(),
+        set_disaggregated_inference_role=lambda role: None,
     )
     model_config = SimpleNamespace(
         num_query_groups=1, num_attention_heads=1, mamba_num_heads=2, mamba_num_groups=1

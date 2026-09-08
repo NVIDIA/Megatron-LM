@@ -1709,17 +1709,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Return whether this step may use the inferred FlashInfer row bound."""
         return self.inference_flashinfer_bounded_rows and self._use_bounded_flashinfer_rows
 
+    def flashinfer_token_capacity(self) -> int | None:
+        """Return the inferred FlashInfer row capacity for this step, if enabled."""
+        if not self.can_use_bounded_flashinfer_rows():
+            return None
+        return (
+            self.max_requests * (self.num_speculative_tokens + 1) * self.expert_model_parallel_size
+        )
+
     def set_disaggregated_inference_role(self, role: str) -> None:
-        """Publish a dedicated prefill/decode role to row-policy selection.
-
-        If this engine is designated as a dedicated decode engine, bounded rows are safe and no
-        per-step EP mode collective is needed. A dedicated prefill engine always retains the
-        full FlashInfer buffer. Regular continuous batching leaves the role unset and resolves the
-        policy collectively each step.
-
-        Args:
-            role: Inference role, either "prefill" or "decode".
-        """
+        """Publish a dedicated prefill/decode role to row-policy selection."""
         if role not in ("prefill", "decode"):
             raise ValueError(
                 f"disaggregated inference role must be 'prefill' or 'decode', got {role!r}"
@@ -1730,21 +1729,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             logging.info("FlashInfer disaggregated %s row policy: %s", role, policy)
 
     def _sync_all_ep_ranks_decode_only(self, batch_dimensions: InferenceBatchDimensions) -> bool:
-        """Return whether every EP rank is decode-only for the current step.
-
-        Bounded FlashInfer graphs omit the tail of the fixed NVLS AllGather-V buffer.
-        A prefill on any peer can place valid rows in that tail, so the decision must be collective
-        even though NVLS graph matching is conventionally rank-local.
-        """
+        """Return whether every EP rank is decode-only for the current step."""
         local_has_prefill = int(batch_dimensions.prefill_req_count > 0)
-        if self.expert_model_parallel_size <= 1 or self.is_creating_cuda_graphs:
-            # CUDA graphs are created in lockstep from the same batch dimensions.
+        if self.expert_model_parallel_size <= 1:
             return local_has_prefill == 0
-
         if self._ep_zmq_communicator is not None:
-            any_ep_rank_has_prefill = self._ep_zmq_communicator.sync_all_reduce_max(
-                local_has_prefill
-            )
+            any_rank_has_prefill = self._ep_zmq_communicator.sync_all_reduce_max(local_has_prefill)
         else:
             sync_tensor = torch.tensor(
                 [local_has_prefill], dtype=torch.int32, device=torch.cuda.current_device()
@@ -1754,17 +1744,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 op=torch.distributed.ReduceOp.MAX,
                 group=self.expert_model_parallel_group,
             )
-            any_ep_rank_has_prefill = int(sync_tensor.item())
-        return any_ep_rank_has_prefill == 0
+            any_rank_has_prefill = int(sync_tensor.item())
+        return any_rank_has_prefill == 0
 
     def _resolve_bounded_flashinfer_rows(self, batch_dimensions: InferenceBatchDimensions) -> bool:
-        """Resolve the bounded/full FlashInfer policy for the current step.
-
-        CUDA-graph construction is driven by the graph dimensions themselves:
-        decode graphs capture the bounded kernel and prefill/mixed graphs capture the full kernel.
-        Only non-disggregated continuous batching needs an EP-wide mode agreement because its ranks
-        may independently mix prefill and decode work.
-        """
+        """Resolve the bounded/full FlashInfer policy for the current step."""
         if not self.inference_flashinfer_bounded_rows:
             return False
 
