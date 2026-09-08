@@ -466,7 +466,7 @@ class MegatronFSDP(torch.nn.Module):
                 suggested_communication_unit_size = 1_000_000_000
 
             # Cap to 1B elements.
-            suggested_communication_unit_size = max(
+            suggested_communication_unit_size = min(
                 1_000_000_000, suggested_communication_unit_size
             )
 
