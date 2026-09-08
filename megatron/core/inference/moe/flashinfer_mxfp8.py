@@ -229,10 +229,10 @@ def quantize_routed_mxfp8_input(
     return quantized_hidden, hidden_scale
 
 
-def select_routed_mxfp8_active_rows(
+def select_flashinfer_active_rows(
     full_rows: int, *, token_capacity: int | None, use_bounded_rows: bool
 ) -> tuple[int, str]:
-    """Select the graph-stable row count for one routed-MoE invocation.
+    """Select the graph-stable row count for one FlashInfer MoE invocation.
 
     The controller enables a bounded prefix only for a decode-only graph whose
     static EP-wide token bound fits the configured capacity. All other graphs
@@ -332,7 +332,7 @@ def flashinfer_routed_mxfp8_moe(
         )
 
     full_rows = hidden_states.shape[0]
-    active_rows, policy = select_routed_mxfp8_active_rows(
+    active_rows, policy = select_flashinfer_active_rows(
         full_rows, token_capacity=token_capacity, use_bounded_rows=use_bounded_rows
     )
     if token_capacity is not None:

@@ -1320,14 +1320,17 @@ class TransformerConfig(ModelParallelConfig):
     fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
     launches (useful for debugging)."""
 
-    inference_flashinfer_mxfp8_token_capacity: int | None = None
-    """Optional fixed token-row capacity for FlashInfer routed MXFP8 MoE.
+    inference_flashinfer_token_capacity: int | None = None
+    """Optional fixed token-row capacity for FlashInfer MoE.
 
     Decode-only dynamic-inference graphs use this fixed prefix when their
     host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
     and oversized decode graphs retain the full dispatcher buffer. Requires
-    the NVLS inference dispatcher and EP > 1.
+    BF16 or MXFP8 parameters, the NVLS inference dispatcher, and EP > 1.
     """
+
+    inference_flashinfer_mxfp8_token_capacity: int | None = None
+    """Deprecated alias for inference_flashinfer_token_capacity."""
 
     inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
     """Token dispatcher to use for MoE expert parallelism during inference.
@@ -1533,6 +1536,26 @@ class TransformerConfig(ModelParallelConfig):
         """
         super().__post_init__()
         self._validate_cp_layouts()
+
+        if self.inference_flashinfer_mxfp8_token_capacity is not None:
+            if (
+                self.inference_flashinfer_token_capacity is not None
+                and self.inference_flashinfer_token_capacity
+                != self.inference_flashinfer_mxfp8_token_capacity
+            ):
+                raise ValueError(
+                    "inference_flashinfer_token_capacity and its deprecated "
+                    "inference_flashinfer_mxfp8_token_capacity alias must match when both are set"
+                )
+            warnings.warn(
+                "inference_flashinfer_mxfp8_token_capacity is deprecated; use "
+                "inference_flashinfer_token_capacity instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.inference_flashinfer_token_capacity = (
+                self.inference_flashinfer_mxfp8_token_capacity
+            )
 
         # Resolve deprecated attention variant spellings up front so that every consumer
         # downstream only has to handle the canonical names. Imported lazily because the
@@ -1810,22 +1833,25 @@ class TransformerConfig(ModelParallelConfig):
                     "gated_linear_unit=False, or select inference_grouped_gemm_backend='torch'."
                 )
 
-            if self.inference_flashinfer_mxfp8_token_capacity is not None:
-                if self.inference_flashinfer_mxfp8_token_capacity <= 0:
+            if self.inference_flashinfer_token_capacity is not None:
+                if self.inference_flashinfer_token_capacity <= 0:
                     raise ValueError(
-                        "inference_flashinfer_mxfp8_token_capacity must be > 0, got "
-                        f"{self.inference_flashinfer_mxfp8_token_capacity}"
+                        "inference_flashinfer_token_capacity must be > 0, got "
+                        f"{self.inference_flashinfer_token_capacity}"
                     )
                 if (
                     self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
-                    or not mxfp8_enabled
+                    or not (
+                        mxfp8_enabled
+                        or (not bool(self.fp8) and self.params_dtype == torch.bfloat16)
+                    )
                     or self.inference_moe_token_dispatcher_type != "nvls"
                     or self.expert_model_parallel_size <= 1
                 ):
                     raise ValueError(
-                        "inference_flashinfer_mxfp8_token_capacity requires "
-                        "inference_grouped_gemm_backend='flashinfer', FP8 enabled with "
-                        "fp8_recipe='mxfp8', "
+                        "inference_flashinfer_token_capacity requires "
+                        "inference_grouped_gemm_backend='flashinfer', BF16 parameters "
+                        "with FP8 disabled or FP8 enabled with fp8_recipe='mxfp8', "
                         "inference_moe_token_dispatcher_type='nvls' and "
                         "expert_model_parallel_size > 1"
                     )
