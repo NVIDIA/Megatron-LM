@@ -15,7 +15,6 @@
 """Distributed tensor buffers for Megatron-FSDP."""
 
 import dataclasses
-import math
 from collections.abc import Iterable
 
 import torch
@@ -26,7 +25,7 @@ from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import BlockAtomic, Flat, changed_mesh_axis
+from .placement import changed_mesh_axis
 
 
 @dataclasses.dataclass(frozen=True)
@@ -53,21 +52,6 @@ def _validate_placements(placements: Iterable[Placement]) -> None:
                 "Shard placements must be a suffix of the placement list so each "
                 "local buffer is a contiguous global-buffer range."
             )
-
-
-def _get_block_size(placements: Iterable[Placement], block_size: int | None) -> int:
-    """Resolve one layout block size from explicit and placement configuration."""
-    placement_block_size = 1
-    for placement in placements:
-        if isinstance(placement, BlockAtomic):
-            placement_block_size = math.lcm(placement_block_size, placement.block_size)
-    if block_size is None:
-        return placement_block_size
-    if block_size != placement_block_size and placement_block_size != 1:
-        raise ValueError(
-            f"BlockAtomic placements require block size {placement_block_size}, got {block_size}."
-        )
-    return block_size
 
 
 def _get_reduce_op(partial_placement: Partial) -> dist.ReduceOp.RedOpType:
@@ -102,7 +86,7 @@ class DBuffer:
         dtype: torch.dtype,
         device: torch.device | str,
         *,
-        block_size: int | None = None,
+        block_size: int = 1,
     ) -> None:
         """Create a DBuffer and allocate its local buffer.
 
@@ -125,9 +109,7 @@ class DBuffer:
 
         tensor_shapes = tuple(torch.Size(shape) for shape in tensor_shapes)
         self.layout = GlobalLayout.build(
-            tensor_shapes,
-            dp_size=self.mesh.size(),
-            block_size=_get_block_size(placements, block_size),
+            tensor_shapes, dp_size=self.mesh.size(), block_size=block_size
         )
 
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
@@ -196,9 +178,7 @@ class DBuffer:
         local_buffer: torch.Tensor,
         mesh: DeviceMesh,
         placements: Iterable[Placement],
-        tensor_shapes: Iterable[Shape],
-        *,
-        layout: GlobalLayout | None = None,
+        layout: GlobalLayout,
     ) -> "DBuffer":
         """Create a DBuffer from an existing local buffer.
 
@@ -208,7 +188,7 @@ class DBuffer:
                 reduce-scatter, which are efficient with contiguous tensors.
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
-            tensor_shapes: Global shapes for each logical tensor in this buffer.
+            layout: Existing global layout for the logical tensors in this buffer.
 
         Returns:
             A DBuffer that reuses ``local_buffer`` without allocating storage.
@@ -224,10 +204,6 @@ class DBuffer:
         if not local_buffer.is_contiguous():
             raise ValueError("local_buffer must be contiguous for collective operations.")
 
-        tensor_shapes = tuple(torch.Size(shape) for shape in tensor_shapes)
-        layout = layout or GlobalLayout.build(
-            tensor_shapes, dp_size=mesh.size(), block_size=_get_block_size(placements, None)
-        )
         offset, local_numel = layout.get_local_range(mesh, placements)
         if local_buffer.numel() != local_numel:
             raise ValueError(
@@ -273,17 +249,10 @@ class DBuffer:
                 self.local_buffer.narrow(0, local_offset, local_numel),
                 self.mesh,
                 placements,
-                self.layout.tensor_shapes,
-                layout=self.layout,
+                self.layout,
             )
         if isinstance(source_placement, Partial) and isinstance(destination_placement, Replicate):
-            return DBuffer.from_local(
-                self.local_buffer,
-                self.mesh,
-                placements,
-                self.layout.tensor_shapes,
-                layout=self.layout,
-            )
+            return DBuffer.from_local(self.local_buffer, self.mesh, placements, self.layout)
         raise ValueError(
             "DBuffer.view() supports identical placements, a Partial-to-Replicate relabel, "
             "or a Replicate/Partial-to-Flat slice, "
@@ -297,7 +266,7 @@ class DBuffer:
         mesh: DeviceMesh,
         placements: Iterable[Placement],
         *,
-        block_size: int | None = None,
+        block_size: int = 1,
     ) -> "DBuffer":
         """Distribute full local tensors into a DBuffer.
 
@@ -444,13 +413,7 @@ class DBuffer:
                 raise NotImplementedError(
                     "Replicate -> Partial redistribute does not support an out buffer."
                 )
-            return DBuffer.from_local(
-                self.local_buffer,
-                self.mesh,
-                new_placements,
-                self.layout.tensor_shapes,
-                layout=self.layout,
-            )
+            return DBuffer.from_local(self.local_buffer, self.mesh, new_placements, self.layout)
         raise NotImplementedError(
             "Unsupported DBuffer placement transition on axis "
             f"{axis}: {old_placement!r} -> {new_placement!r}."
