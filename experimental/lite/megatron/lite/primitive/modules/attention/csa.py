@@ -16,9 +16,9 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     unfused_compressed_sparse_attn,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
-    cp_layout_kernels as csa_cp_layout_kernels,
+    cp_utils,
+    thd_layout_kernels,
 )
-from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
     FusedCSAIndexerSparseAttnFromTopkFunc,
     csa_sparse_attn,
@@ -331,8 +331,27 @@ class CompressedSequenceCompressor(nn.Module):
         *,
         max_seqlen_q: int,
         compressed_group_ids: torch.Tensor,
+        compressed_position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, None]:
-        """Pre-grouped THD compression for the DSv4 CP path."""
+        """Pre-grouped THD compression for the DSv4 CP path.
+
+        ``hidden_compact`` is ``(compact_group_capacity * ratio, 1, hidden)``,
+        already packed into ratio-sized groups by
+        ``cp_utils.prepare_cp_compressor_input``; ``compressed_group_ids`` is
+        ``(compact_group_capacity,)`` int32 giving each compressed group's
+        per-sequence compressed id. ``compressed_position_ids`` optionally
+        supplies the graph-safe RoPE positions emitted by Core's compaction
+        kernel.
+
+        Reproduces Core ``Compressor._forward_thd`` pre-grouped semantics using
+        lite's compressor params (``wkv``/``wgate``/``ape``/``norm``) and lite's
+        RoPE convention (``build_compressed_rope_cos_sin`` + ``apply_partial_rope``)
+        so the CP path stays numerically identical to lite's BSHD path. ``cu_seqlens``
+        and ``max_seqlen_q`` are accepted to match Core's signature; they are only
+        needed by Core's fused-RoPE cache, which lite does not use.
+
+        Returns ``(compressed_thd (total_comp, 1, head_dim), None)``.
+        """
         del cu_seqlens, max_seqlen_q  # Only used by Core's fused-RoPE cache path.
         ratio = self.compress_ratio
         total_comp = int(compressed_group_ids.shape[0])
@@ -352,7 +371,11 @@ class CompressedSequenceCompressor(nn.Module):
         weights = torch.softmax(gate_grouped.float(), dim=1).to(kv_grouped.dtype)
         compressed = (kv_grouped * weights).sum(dim=1)  # (total_comp, 1, head_dim)
         compressed = self.norm(compressed)
-        positions = compressed_group_ids[:total_comp].clamp_min(0).to(torch.long) * ratio
+        positions = (
+            compressed_position_ids[:total_comp]
+            if compressed_position_ids is not None
+            else compressed_group_ids[:total_comp].clamp_min(0) * ratio
+        ).to(torch.long)
         cos, sin = build_compressed_rope_cos_sin(
             positions.view(1, total_comp),
             self.rope_head_dim,
@@ -958,26 +981,20 @@ class CompressedSparseAttention(nn.Module):
         calculate_per_token_loss = self.calculate_per_token_loss
 
         if self.compressor is not None and ratio > 1:
-            compressed_lens = torch.div(
-                cu_seqlens[1:] - cu_seqlens[:-1], ratio, rounding_mode="floor"
+            (
+                hidden_compact,
+                compressed_group_ids,
+                compressed_position_ids,
+                _local_cu_seqlens,
+                _local_cu_seqlens_compressed,
+                cu_seqlens_compressed,
+                seq_to_rank_row,
+            ) = cp_utils.prepare_cp_compressor_input(
+                x, boundary_hidden, cu_seqlens, global_start, cp_size, ratio
             )
-            cu_seqlens_compressed = torch.cat(
-                (
-                    torch.zeros_like(cu_seqlens[:1]),
-                    torch.cumsum(compressed_lens, dim=0, dtype=torch.int32),
-                )
-            )
-            hidden_compact, compressed_group_ids, seq_to_rank_row = (
-                cp_utils.prepare_cp_compressor_input(
-                    x,
-                    boundary_hidden,
-                    cu_seqlens,
-                    cu_seqlens_compressed,
-                    global_start,
-                    cp_size,
-                    ratio,
-                )
-            )
+            # TODO(lite): Thread the local prefixes through once Lite adopts Core's
+            # fused-compressor dispatch. Lite currently owns a separate eager
+            # ``_forward_thd`` implementation, so passing them alone has no effect.
 
             if indexer is not None:
                 indexer_x, indexer_qr = x.detach(), qr.detach()
@@ -1020,6 +1037,7 @@ class CompressedSparseAttention(nn.Module):
                     cu_seqlens,
                     max_seqlen_q=max_seqlen_q,
                     compressed_group_ids=compressed_group_ids,
+                    compressed_position_ids=compressed_position_ids,
                 )
                 k_indexer_rank_major = gather_from_sequence_parallel_region(
                     indexer_compressed_local.squeeze(1), group=cp_group
@@ -1046,6 +1064,7 @@ class CompressedSparseAttention(nn.Module):
                 cu_seqlens,
                 max_seqlen_q=max_seqlen_q,
                 compressed_group_ids=compressed_group_ids,
+                compressed_position_ids=compressed_position_ids,
             )
             compressed_kv_rank_major = gather_from_sequence_parallel_region(
                 compressed_kv_local.squeeze(1), group=cp_group
@@ -1060,8 +1079,8 @@ class CompressedSparseAttention(nn.Module):
             if compressed_topk is not None
             else (max_seqlen_q // ratio if ratio > 1 else 0)
         )
-        topk_idxs, topk_length, indexer_topk_rank_major = (
-            csa_cp_layout_kernels.build_attention_indices(
+        topk_idxs, topk_length, indexer_topk_rank_major, _ = (
+            thd_layout_kernels.build_attention_indices(
                 cu_seqlens,
                 global_start,
                 l_local,
@@ -1073,6 +1092,7 @@ class CompressedSparseAttention(nn.Module):
                 cu_seqlens_compressed=cu_seqlens_compressed,
                 seq_to_rank_row=seq_to_rank_row,
                 for_indexer_loss=use_indexer_loss,
+                compressed_rows=compressed_kv_rank_major.shape[0],
             )
         )
 
