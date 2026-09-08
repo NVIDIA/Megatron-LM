@@ -466,7 +466,11 @@ def test_out_of_place_inverse_rope_preserves_upstream_saved_output(input_format)
     emb_dim = 64
     dtype = torch.bfloat16
 
-    yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+    yarn_rope = YarnRotaryEmbedding(
+        emb_dim,
+        original_max_position_embeddings=seqlen,
+        cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
+    )
     freqs, mscale = yarn_rope(seqlen, 0)
     cos = (torch.cos(freqs) * mscale).to(dtype)
     sin = (torch.sin(freqs) * mscale).to(dtype)
@@ -543,7 +547,11 @@ def test_legacy_query_api_remains_in_place(input_format):
     emb_dim = 64
     dtype = torch.bfloat16
 
-    yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+    yarn_rope = YarnRotaryEmbedding(
+        emb_dim,
+        original_max_position_embeddings=seqlen,
+        cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
+    )
     freqs, mscale = yarn_rope(seqlen, 0)
     cos = (torch.cos(freqs) * mscale).to(dtype)
     sin = (torch.sin(freqs) * mscale).to(dtype)

@@ -2275,6 +2275,7 @@ class TestFusedMLAQUpProjIntegration:
                     get_mla_self_attn_submodules(),
                     layer_number=1,
                     attn_mask_type=AttnMaskType.causal,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
                 )
                 .cuda()
                 .bfloat16()
