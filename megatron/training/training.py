@@ -4569,9 +4569,7 @@ def train(
             optimizers=[optimizer],
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
             dynamic_cp_group_getter=(
-                get_dynamic_data_context_parallel_groups
-                if args.dynamic_context_parallel
-                else None
+                get_dynamic_data_context_parallel_groups if args.dynamic_context_parallel else None
             ),
         )
 

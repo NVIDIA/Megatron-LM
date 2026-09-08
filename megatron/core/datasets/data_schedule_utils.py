@@ -893,9 +893,9 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
             packed_ids = sample_id_group[0]
             if len(packed_ids) < 2:
                 return None, None
-            assert all(rank_ids == packed_ids for rank_ids in sample_id_group), (
-                "A full DPxCP group must carry the same packed sample IDs on every rank."
-            )
+            assert all(
+                rank_ids == packed_ids for rank_ids in sample_id_group
+            ), "A full DPxCP group must carry the same packed sample IDs on every rank."
             kept_ids = packed_ids[:-1]
             moved_ids = packed_ids[-1:]
             return (
@@ -952,7 +952,9 @@ def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_
         if i < 0:
             if attempts_since_split >= len(sample_id_groups):
                 if allow_packed_full_group:
-                    assert False, 'align_sample_id_groups: no tail microbatch has enough ids to split'
+                    assert (
+                        False
+                    ), 'align_sample_id_groups: no tail microbatch has enough ids to split'
                 allow_packed_full_group = True
                 attempts_since_split = 0
             i = len(sample_id_groups) - 1
