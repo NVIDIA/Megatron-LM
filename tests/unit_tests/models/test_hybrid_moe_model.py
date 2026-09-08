@@ -141,6 +141,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fp8_quantizer_factory": None,
     "fp8_recipe": "delayed",
     "fp8_wgrad": True,
+    "freeze_base_model_for_mtp": False,
     "fused_residual_rmsnorm": False,
     "fused_single_qkv_rope": False,
     "gated_linear_unit": False,

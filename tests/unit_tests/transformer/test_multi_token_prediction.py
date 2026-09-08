@@ -2205,6 +2205,7 @@ class TestMultiTokenPrediction:
         fp8=None,
         full_recompute=False,
         mtp_hsm=False,
+        freeze_base_model_for_mtp=False,
     ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
@@ -2214,6 +2215,7 @@ class TestMultiTokenPrediction:
         args.num_layers = 2
         args.mtp_num_layers = 2
         args.mtp_hsm = mtp_hsm
+        args.freeze_base_model_for_mtp = freeze_base_model_for_mtp
         args.mtp_loss_scaling_factor = 0.1
         args.padded_vocab_size = 128800
         args.hidden_size = 128
@@ -2470,6 +2472,57 @@ class TestMultiTokenPrediction:
             # for param in gpt_model[0].parameters():
             for name, param in gpt_model[0].named_parameters():
                 assert param.main_grad is not None
+
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("2.1.0"),
+        reason="grouped_gemm requires TransformerEngine >= 2.1.0",
+    )
+    @pytest.mark.parametrize("full_recompute", [False, True])
+    def test_forward_backward_with_frozen_base(self, full_recompute):
+        """Frozen-backbone training builds gradients and optimizer state only for MTP."""
+        args = self.create_test_args(
+            tp=1,
+            cp=1,
+            sequence_length=self.seq_length,
+            micro_batch_size=self.micro_batch_size,
+            full_recompute=full_recompute,
+            freeze_base_model_for_mtp=True,
+        )
+        set_args(args)
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        gpt_model, optimizer, _ = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder, self.model_provider
+        )
+        batch = self.get_batch(self.seq_length, self.micro_batch_size)
+        output = gpt_model[0].forward(
+            input_ids=batch['tokens'],
+            position_ids=batch['position_ids'],
+            attention_mask=batch['attention_mask'],
+            labels=batch['labels'],
+            loss_mask=batch['loss_mask'],
+        )
+
+        assert torch.isfinite(output).all()
+        tracker = MTPLossLoggingHelper.tracker
+        assert torch.isfinite(tracker['loss_values']).all()
+
+        output.mean().backward()
+        trainable_numel = sum(
+            param.numel() for param in gpt_model[0].parameters() if param.requires_grad
+        )
+        optimizer_numel = sum(param.numel() for param in optimizer.get_parameters())
+        assert optimizer_numel == trainable_numel
+        for name, param in gpt_model[0].named_parameters():
+            if 'mtp.layers.' in name:
+                assert param.requires_grad
+                assert param.main_grad is not None
+                assert torch.isfinite(param.main_grad).all()
+            else:
+                assert not param.requires_grad
+                assert getattr(param, 'main_grad', None) is None
 
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("2.1.0"),
@@ -3319,6 +3372,7 @@ class TestMultiTokenPredictionHybrid:
         model = types.SimpleNamespace(
             config=types.SimpleNamespace(
                 fine_grained_activation_offloading=False,
+                freeze_base_model_for_mtp=False,
                 moe_paged_stash=False,
                 multi_latent_attention=False,
                 mtp_num_layers=1,
