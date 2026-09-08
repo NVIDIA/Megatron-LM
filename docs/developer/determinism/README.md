@@ -21,6 +21,9 @@ This reference includes:
 - [`op-catalog.md`](./op-catalog.md): operations with a deterministic code path,
   operations that deterministic mode does not support, and the goal to shrink
   the unsupported set while speeding up the supported set
+- [`testing.md`](./testing.md): the kernel determinism test suite, the kernel
+  registry, and the pull-request gate that requires a bit-exact test for every
+  kernel change
 - [`glossary.md`](./glossary.md): definitions and abbreviations
 
 The roadmap is tracked dynamically in

@@ -178,6 +178,14 @@ For ad-hoc runs, prefer the direct `torch.distributed.run` invocations above.
 4. Verify locally (see Running Unit Tests Locally above).
 5. If the test needs a dedicated CI bucket, add an entry to
    `tests/test_utils/recipes/h100/unit-tests.yaml`.
+6. If the change adds or modifies a GPU kernel (Triton, `jit_fuser` /
+   `torch.compile`, CUDA extension, TE or external-library dispatch, or a
+   scatter/index accumulation), add or update its bit-exact replay test under
+   `tests/unit_tests/determinism/kernels/` and register it in
+   `tests/unit_tests/determinism/kernels/manifest.py`. The `linting` CI job
+   (`tools/check_kernel_determinism_coverage.py`) fails kernel PRs without
+   this; the `determinism-exempt` label overrides it for non-numeric edits.
+   See `docs/developer/determinism/testing.md`.
 
 ---
 
