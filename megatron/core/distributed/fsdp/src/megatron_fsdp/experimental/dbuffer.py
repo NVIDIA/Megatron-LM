@@ -95,7 +95,7 @@ class DBuffer:
     placements: tuple[Placement, ...]
     layout: GlobalLayout
     offset: int
-    tensor: torch.Tensor
+    local_tensor: torch.Tensor
 
     def __init__(
         self,
@@ -131,7 +131,7 @@ class DBuffer:
         )
 
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
-        self.tensor = torch.empty(local_numel, dtype=dtype, device=device)
+        self.local_tensor = torch.empty(local_numel, dtype=dtype, device=device)
 
     @classmethod
     def from_mxfp8(
@@ -185,7 +185,7 @@ class DBuffer:
             [tensor.shape], dp_size=mesh.size(), block_size=_MXFP8_BLOCK_SIZE
         )
         buffer.offset, _ = buffer.layout.get_local_range(mesh, placements)
-        buffer.tensor = local_tensor
+        buffer.local_tensor = local_tensor
         return buffer
 
     @staticmethod
@@ -209,12 +209,12 @@ class DBuffer:
     @property
     def dtype(self) -> torch.dtype:
         """Dtype of the stored tensor."""
-        return self.tensor.dtype
+        return self.local_tensor.dtype
 
     @property
     def device(self) -> torch.device:
         """Device of the stored tensor."""
-        return self.tensor.device
+        return self.local_tensor.device
 
     @property
     def is_symmetric_memory(self) -> bool:
@@ -222,22 +222,22 @@ class DBuffer:
         return (
             not self.is_mxfp8
             and hasattr(symm_mem, "is_symm_mem_tensor")
-            and symm_mem.is_symm_mem_tensor(self.tensor)
+            and symm_mem.is_symm_mem_tensor(self.local_tensor)
         )
 
     @property
     def is_mxfp8(self) -> bool:
         """Whether this buffer is backed by a TE MXFP8 logical tensor."""
-        return is_mxfp8_tensor(self.tensor)
+        return is_mxfp8_tensor(self.local_tensor)
 
     def _mxfp8_physical_tensors(self) -> tuple[torch.Tensor, ...]:
         """Return the physical tensors owned by this buffer's TE wrapper."""
         assert self.is_mxfp8
         return (
-            self.tensor._rowwise_data,
-            self.tensor._columnwise_data,
-            self.tensor._rowwise_scale_inv,
-            self.tensor._columnwise_scale_inv,
+            self.local_tensor._rowwise_data,
+            self.local_tensor._columnwise_data,
+            self.local_tensor._rowwise_scale_inv,
+            self.local_tensor._columnwise_scale_inv,
         )
 
     @staticmethod
@@ -266,7 +266,7 @@ class DBuffer:
             for tensor in self._mxfp8_physical_tensors():
                 self._resize_storage(tensor, tensor.numel())
             return
-        self._resize_storage(self.tensor, self.tensor.numel())
+        self._resize_storage(self.local_tensor, self.local_tensor.numel())
 
     def release_storage(self) -> None:
         """Release local buffer storage without replacing the Storage object."""
@@ -277,12 +277,12 @@ class DBuffer:
             for tensor in self._mxfp8_physical_tensors():
                 self._resize_storage(tensor, 0)
             return
-        self._resize_storage(self.tensor, 0)
+        self._resize_storage(self.local_tensor, 0)
 
     def rendezvous(self, mesh_axis: int) -> None:
         """Rendezvous this local buffer for symmetric-memory collectives."""
         group = self.mesh.get_group(mesh_axis)
-        symm_mem.rendezvous(self.tensor, group=group.group_name)
+        symm_mem.rendezvous(self.local_tensor, group=group.group_name)
 
     @staticmethod
     def _resize_storage(tensor: torch.Tensor, numel: int) -> None:
@@ -293,7 +293,7 @@ class DBuffer:
         tensor_start = self.layout.tensor_to_offset[tensor_index]
         tensor_end = tensor_start + self.layout.tensor_shapes[tensor_index].numel()
         buffer_start = self.offset
-        buffer_end = self.offset + self.tensor.numel()
+        buffer_end = self.offset + self.local_tensor.numel()
 
         overlap_start = max(tensor_start, buffer_start)
         overlap_end = min(tensor_end, buffer_end)
@@ -350,7 +350,7 @@ class DBuffer:
         buffer.placements = placements
         buffer.layout = layout
         buffer.offset = offset
-        buffer.tensor = local_buffer
+        buffer.local_tensor = local_buffer
         return buffer
 
     def view(self, placements: Iterable[Placement]) -> "DBuffer":
@@ -379,13 +379,16 @@ class DBuffer:
         ):
             offset, local_numel = self.layout.get_local_range(self.mesh, placements)
             local_offset = offset - self.offset
-            if local_offset < 0 or local_offset + local_numel > self.tensor.numel():
+            if local_offset < 0 or local_offset + local_numel > self.local_tensor.numel():
                 raise RuntimeError("DBuffer view is not contained in its source local buffer.")
             return DBuffer.from_local(
-                self.tensor.narrow(0, local_offset, local_numel), self.mesh, placements, self.layout
+                self.local_tensor.narrow(0, local_offset, local_numel),
+                self.mesh,
+                placements,
+                self.layout,
             )
         if isinstance(source_placement, Partial) and isinstance(destination_placement, Replicate):
-            return DBuffer.from_local(self.tensor, self.mesh, placements, self.layout)
+            return DBuffer.from_local(self.local_tensor, self.mesh, placements, self.layout)
         raise ValueError(
             "DBuffer.view() supports identical placements, a Partial-to-Replicate relabel, "
             "or a Replicate/Partial-to-Flat slice, "
@@ -441,9 +444,9 @@ class DBuffer:
             source_slice = tensor.view(-1).narrow(
                 0, owned_range.tensor_relative_offset, owned_range.numel
             )
-            buffer.tensor.narrow(0, owned_range.buffer_relative_offset, owned_range.numel).copy_(
-                source_slice
-            )
+            buffer.local_tensor.narrow(
+                0, owned_range.buffer_relative_offset, owned_range.numel
+            ).copy_(source_slice)
         return buffer
 
     def _create_or_validate_out(
@@ -486,7 +489,7 @@ class DBuffer:
         if not self.is_mxfp8:
             raise TypeError("sync_from_main() requires an MXFP8 DBuffer.")
         with torch.no_grad():
-            self.tensor.quantize_(main_weight.get_local_tensor(0))
+            self.local_tensor.quantize_(main_weight.get_local_tensor(0))
 
     def cast(self, dtype: torch.dtype, *, out: "DBuffer | None" = None) -> "DBuffer":
         """Return this buffer with the same layout and placements in ``dtype``."""
@@ -496,7 +499,7 @@ class DBuffer:
             return self
 
         destination = self._create_or_validate_out(out, dtype=dtype)
-        destination.tensor.copy_(self.tensor)
+        destination.local_tensor.copy_(self.local_tensor)
         return destination
 
     def redistribute(
@@ -525,7 +528,7 @@ class DBuffer:
             if out is None:
                 return self
             out = self._create_or_validate_out(out, placements=new_placements)
-            out.tensor.copy_(self.tensor)
+            out.local_tensor.copy_(self.local_tensor)
             return out
 
         axis = changed_axis
@@ -542,7 +545,7 @@ class DBuffer:
             if out is None:
                 return view
             out = self._create_or_validate_out(out, placements=new_placements)
-            out.tensor.copy_(view.tensor)
+            out.local_tensor.copy_(view.local_tensor)
             return out
         if isinstance(old_placement, Replicate) and isinstance(new_placement, Partial):
             # Replicate and Partial share the same local layout, so relabel the
@@ -558,7 +561,7 @@ class DBuffer:
                 raise NotImplementedError(
                     "Replicate -> Partial redistribute does not support an out buffer."
                 )
-            return DBuffer.from_local(self.tensor, self.mesh, new_placements, self.layout)
+            return DBuffer.from_local(self.local_tensor, self.mesh, new_placements, self.layout)
         raise NotImplementedError(
             "Unsupported DBuffer placement transition on axis "
             f"{axis}: {old_placement!r} -> {new_placement!r}."
@@ -589,8 +592,8 @@ class DBuffer:
         if isinstance(source_placement, Shard) and isinstance(destination_placement, Replicate):
             return self.allgather(changed_axis, out=out)
         if isinstance(source_placement, Replicate) and isinstance(destination_placement, Shard):
-            local_rows = self.tensor.shape[0] // self.mesh.size(changed_axis)
-            source_shard = self.tensor.split(local_rows, dim=0)[
+            local_rows = self.local_tensor.shape[0] // self.mesh.size(changed_axis)
+            source_shard = self.local_tensor.split(local_rows, dim=0)[
                 self.mesh.get_local_rank(changed_axis)
             ]
             for destination, source in zip(
@@ -628,7 +631,9 @@ class DBuffer:
         if out.is_symmetric_memory:
             out.rendezvous(mesh_axis)
         dist.all_gather_into_tensor(
-            output_tensor=out.tensor, input_tensor=self.tensor, group=self.mesh.get_group(mesh_axis)
+            output_tensor=out.local_tensor,
+            input_tensor=self.local_tensor,
+            group=self.mesh.get_group(mesh_axis),
         )
         return out
 
@@ -640,20 +645,22 @@ class DBuffer:
             raise ValueError("MXFP8 all-gather out buffer must replicate the gathered mesh axis.")
         group = self.mesh.get_group(mesh_axis)
         dist.all_gather_into_tensor(
-            out.tensor._rowwise_data, self.tensor._rowwise_data, group=group
+            out.local_tensor._rowwise_data, self.local_tensor._rowwise_data, group=group
         )
         dist.all_gather_into_tensor(
-            out.tensor._columnwise_data, self.tensor._columnwise_data, group=group
+            out.local_tensor._columnwise_data, self.local_tensor._columnwise_data, group=group
         )
         for columnwise in (False, True):
-            source = self._compact_mxfp8_scale(self.tensor, columnwise=columnwise)
+            source = self._compact_mxfp8_scale(self.local_tensor, columnwise=columnwise)
             gathered = torch.empty(
                 (self.mesh.size(mesh_axis), *source.shape), dtype=source.dtype, device=source.device
             )
             dist.all_gather_into_tensor(gathered, source, group=group)
             compact = gathered.flatten(0, 1)
             destination = (
-                out.tensor._columnwise_scale_inv if columnwise else out.tensor._rowwise_scale_inv
+                out.local_tensor._columnwise_scale_inv
+                if columnwise
+                else out.local_tensor._rowwise_scale_inv
             )
             self._unpack_mxfp8_scale(destination, compact)
         return out
@@ -668,9 +675,9 @@ class DBuffer:
         placements = list(self.placements)
         placements[axis] = Replicate()
         out = self._create_or_validate_out(out, placements=placements)
-        out.tensor.copy_(self.tensor)
+        out.local_tensor.copy_(self.local_tensor)
         dist.all_reduce(
-            out.tensor, op=_get_reduce_op(partial_placement), group=self.mesh.get_group(axis)
+            out.local_tensor, op=_get_reduce_op(partial_placement), group=self.mesh.get_group(axis)
         )
         return out
 
@@ -700,10 +707,13 @@ class DBuffer:
             if reduce_op == dist.ReduceOp.AVG:
                 reduce_op = dist.ReduceOp.SUM
         dist.reduce_scatter_tensor(
-            output=out.tensor, input=self.tensor, op=reduce_op, group=self.mesh.get_group(axis)
+            output=out.local_tensor,
+            input=self.local_tensor,
+            op=reduce_op,
+            group=self.mesh.get_group(axis),
         )
         if self.is_symmetric_memory and partial_placement.reduce_op == "avg":
-            out.tensor.div_(self.mesh.size(axis))
+            out.local_tensor.div_(self.mesh.size(axis))
         return out
 
     def get_local_tensor(self, index: int) -> torch.Tensor:
@@ -729,9 +739,9 @@ class DBuffer:
                 f"Local tensor shard for tensor {index} does not preserve dim-0 boundaries."
             )
         local_shape = torch.Size((owned_range.numel // row_size, *shape[1:]))
-        return self.tensor.narrow(0, owned_range.buffer_relative_offset, owned_range.numel).view(
-            local_shape
-        )
+        return self.local_tensor.narrow(
+            0, owned_range.buffer_relative_offset, owned_range.numel
+        ).view(local_shape)
 
     def get_dtensor(self, index: int) -> DTensor:
         """Return logical tensor ``index`` as a DTensor."""

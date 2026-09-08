@@ -953,10 +953,10 @@ def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
     loss = model(x).sum()
 
     assert group._unsharded_model_weight is not None
-    assert group._unsharded_model_weight.tensor.untyped_storage().nbytes() == 0
+    assert group._unsharded_model_weight.local_tensor.untyped_storage().nbytes() == 0
 
     loss.backward()
 
     assert group.main_grad is not None
     assert group._unsharded_model_weight is not None
-    assert group._unsharded_model_weight.tensor.untyped_storage().nbytes() == 0
+    assert group._unsharded_model_weight.local_tensor.untyped_storage().nbytes() == 0

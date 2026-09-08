@@ -351,7 +351,7 @@ class FsdpParameterGroup:
             # under no_grad. Without preserving it, backward can fail with "modified by an
             # inplace operation" even though FSDP only materialized internal storage.
             with torch.autograd._unsafe_preserve_version_counter(
-                self._unsharded_model_weight.tensor
+                self._unsharded_model_weight.local_tensor
             ):
                 self.model_weight.redistribute(
                     self._unsharded_model_weight.placements, out=self._unsharded_model_weight
@@ -440,7 +440,7 @@ class FsdpParameterGroup:
             # optimizer view. Clear the persistent full accumulation buffer before this
             # new step; set_to_none=True needs no clear because out= below overwrites it.
             if has_sharded_grads:
-                self.main_grad.tensor.zero_()
+                self.main_grad.local_tensor.zero_()
             self._main_grad_is_stale = False
 
         if can_reduce_into_main_grad := (
@@ -454,13 +454,13 @@ class FsdpParameterGroup:
         # Scale this backward's contribution before accumulating it so repeated
         # backwards do not repeatedly scale the running total.
         if self.grad_divisor != 1:
-            reduced_grad.tensor.div_(self.grad_divisor)
+            reduced_grad.local_tensor.div_(self.grad_divisor)
 
         if reduced_grad is not self.main_grad:
             if has_sharded_grads:
-                self.main_grad.tensor.add_(reduced_grad.tensor)
+                self.main_grad.local_tensor.add_(reduced_grad.local_tensor)
             else:
-                self.main_grad.tensor.copy_(reduced_grad.tensor)
+                self.main_grad.local_tensor.copy_(reduced_grad.local_tensor)
 
         def install_sharded_grads(main_grad: DBuffer) -> None:
             for index, fsdp_parameter in enumerate(self.fsdp_parameters):
