@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Learning rate decay and weight decay incr functions."""
+
 import logging
 import math
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
@@ -52,7 +53,20 @@ def get_canonical_lr_for_logging(param_groups: list[dict]) -> float | None:
             ``default_config=True`` group is found.
     """
     for param_group in param_groups:
+        if param_group.get('default_config', False) and not param_group.get(
+            'is_dsa_indexer', False
+        ):
+            return param_group.get('lr')
+    for param_group in param_groups:
         if param_group.get('default_config', False):
+            return param_group.get('lr')
+    return None
+
+
+def get_indexer_lr_for_logging(param_groups: list[dict]) -> float | None:
+    """Return the LR of the first DSA indexer parameter group, when present."""
+    for param_group in param_groups:
+        if param_group.get('is_dsa_indexer', False):
             return param_group.get('lr')
     return None
 
