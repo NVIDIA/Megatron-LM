@@ -1,6 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.training.utils.common_utils import (
+    calc_dsa_split_grad_norms,
+    get_model_to_optimizer_param_map,
+    calc_dsa_split_grad_num_zeros,
     calc_params_l2_norm,
     calc_dtensor_params_l2_norm,
     average_losses_across_data_parallel_group,
