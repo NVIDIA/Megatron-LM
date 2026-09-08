@@ -11,8 +11,11 @@ import torch.distributed._symmetric_memory as symm_mem
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer, Flat
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import BlockAtomic
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
+    BlockAtomic,
+    Flat,
+)
 
 
 def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
@@ -79,7 +82,7 @@ def test_block_atomic_layout_keeps_bf16_blocks_on_one_rank(distributed_setup):
         torch.arange(24, dtype=torch.bfloat16, device=distributed_setup.device).reshape(4, 6),
         torch.arange(32, dtype=torch.bfloat16, device=distributed_setup.device).reshape(8, 4),
     ]
-    block_atomic = DBuffer.distribute_tensors(tensors, mesh, [BlockAtomic(2)])
+    block_atomic = DBuffer.distribute_tensors(tensors, mesh, [BlockAtomic(2)], block_size=2)
 
     assert block_atomic.layout.block_size == 2
     assert all(block_atomic.get_local_tensor(index).shape[0] % 2 == 0 for index in range(2))
@@ -248,9 +251,7 @@ def test_from_local_reuses_required_local_buffer(distributed_setup):
     offset = distributed_setup.rank * local_numel
     local_buffer = replicated_buffer.local_buffer.narrow(0, offset, local_numel)
 
-    sharded_buffer = DBuffer.from_local(
-        local_buffer, mesh, [Flat()], replicated_buffer.layout.tensor_shapes
-    )
+    sharded_buffer = DBuffer.from_local(local_buffer, mesh, [Flat()], replicated_buffer.layout)
 
     assert sharded_buffer.placements == (Flat(),)
     assert sharded_buffer.layout == replicated_buffer.layout
