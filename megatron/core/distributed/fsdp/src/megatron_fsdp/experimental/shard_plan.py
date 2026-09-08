@@ -156,8 +156,9 @@ def assign_owner_work(
 ) -> dict[int, int]:
     """Assign one owner rank to each boundary parameter, balanced by cost.
 
-    Only ranks that own a non-empty shard of a parameter are eligible owners. Assignment greedily
-    gives each parameter to its eligible rank with the smallest running cost total.
+    Non-boundary parameters stay on their original rank and are skipped. Only ranks that own a
+    non-empty shard of a parameter are eligible owners. Assignment greedily gives each boundary
+    parameter to its eligible rank with the smallest running cost total.
 
     Args:
         plans: Shard plans indexed by their position in the input sequence.
@@ -167,21 +168,20 @@ def assign_owner_work(
             cost estimate).
 
     Returns:
-        Mapping from parameter index (in `plans`) to owner rank.
+        Mapping from boundary parameter index (in `plans`) to owner rank. Non-boundary parameters
+        are absent, as they stay on their original rank.
     """
     assignments: dict[int, int] = {}
     running: dict[int, float] = {r: 0.0 for r in range(plans[0].dp_size)} if plans else {}
     for param_index, plan in enumerate(plans):
+        if not plan.is_boundary():
+            continue
         candidates = plan.owner_candidates()
         if not candidates:
             raise RuntimeError(
                 f"No eligible owner for parameter {param_index} with shape {plan.full_shape}; "
                 "no rank owns a shard."
             )
-        if not plan.is_boundary():
-            # Fully local: the single owning rank is the owner with no communication.
-            assignments[param_index] = candidates[0]
-            continue
         cost = cost_fn(plan)
         owner = min(candidates, key=lambda r: running[r])
         assignments[param_index] = owner

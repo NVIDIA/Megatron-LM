@@ -113,11 +113,11 @@ def test_assign_owner_work_only_eligible_ranks_can_own():
     assert owners[0] != owners[1]
 
 
-def test_assign_owner_work_fully_local_owner_is_single_candidate():
-    """A fully local parameter is assigned to its single owning rank."""
+def test_assign_owner_work_skips_non_boundary():
+    """Non-boundary parameters stay on their original rank – no assignment needed."""
     plan = ShardPlan(torch.Size((4, 2)), ((0, 4), (0, 0)), 2)
     owners = assign_owner_work([plan], _ns_cost(3))
-    assert owners == {0: 0}
+    assert owners == {}
 
 
 # ---------------------------------------------------------------------------
