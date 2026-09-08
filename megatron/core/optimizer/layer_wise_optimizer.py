@@ -569,6 +569,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for chunk in model_chunks
                 if hasattr(chunk, 'full_param_layout') and chunk.full_param_layout is not None
             ] or None
+        # Mark all main weights as DP-sharded so parameter norms count only owners.
+        if config.bf16:
+            for optimizer in optimizers:
+                for group in optimizer.param_groups:
+                    for param in group['params']:
+                        if param.requires_grad and param.type() in [
+                            'torch.cuda.HalfTensor',
+                            'torch.cuda.BFloat16Tensor',
+                        ]:
+                            param.main_param_sharded = True
+
         self.shard_params(optimizers, full_param_layouts)
 
         # When a full_param_layout is available, ddp_config.use_distributed_optimizer
