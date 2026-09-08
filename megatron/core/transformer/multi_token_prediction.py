@@ -31,6 +31,10 @@ from megatron.core.tensor_parallel.inference_layers import (
     is_inference_column_parallel_linear,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.forward_sharing import (
+    is_forward_sharing_enabled,
+    preserve_forward_sharing_for_checkpoint,
+)
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -2628,6 +2632,11 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+            )
+
+        if is_forward_sharing_enabled(self.config):
+            custom_forward = preserve_forward_sharing_for_checkpoint(
+                custom_forward, packed_seq_params, self.config, attention_mask_arg=3
             )
 
         # Decide the outer quantization context, matching
