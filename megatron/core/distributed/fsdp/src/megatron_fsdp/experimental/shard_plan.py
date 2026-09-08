@@ -317,7 +317,7 @@ class OwnerGatherPlan:
             if numel == 0:
                 continue
             buf = send_buffers[owner]
-            buf[cursors[owner] : cursors[owner] + numel].copy_(shard.reshape(-1))
+            buf[cursors[owner] : cursors[owner] + numel].copy_(shard.flatten())
             cursors[owner] += numel
 
         # Per (owned param, src) recv offset within the recv buffer from src.
@@ -449,7 +449,7 @@ class OwnerScatterPlan:
                 full = full_results[param_index]
                 buf = send_buffers[dest]
                 buf[cursors[dest] : cursors[dest] + numel].copy_(
-                    full[row_start : row_start + row_count].reshape(-1)
+                    full[row_start : row_start + row_count].flatten()
                 )
                 cursors[dest] += numel
 
