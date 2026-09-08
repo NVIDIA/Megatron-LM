@@ -10,7 +10,6 @@ from megatron.core.fusions.fused_mhc_kernels import (
     fused_h_post_bda,
     fused_sinkhorn,
 )
-from megatron.core.transformer.hyper_connection import native_sinkhorn
 
 
 # The mapping maths is a long chain of narrow elementwise ops over ``[s, b, (2 +
@@ -41,27 +40,7 @@ def split_sinkhorn(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split the mHC mapping and project ``comb`` to a doubly stochastic matrix."""
     pre, post, comb_logits = _split_mixes(mixes, hc_scale, hc_base, hc_mult)
-    sinkhorn = fused_sinkhorn if _use_fused(comb_logits) else native_sinkhorn
-    return pre, post, sinkhorn(comb_logits, iters, eps)
-
-
-def _aggregate_native(x: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
-    """CPU form of ``fused_h_aggregate``; see ``_use_fused`` for why it exists."""
-    return torch.sum(pre.unsqueeze(-1) * x, dim=2)
-
-
-def _post_native(
-    x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
-) -> torch.Tensor:
-    """CPU form of ``fused_h_post_bda``; see ``_use_fused`` for why it exists."""
-    dtype = x.dtype
-    placed = post.to(dtype).unsqueeze(-1) * x.unsqueeze(-2)
-    return placed + torch.matmul(comb.to(dtype), residual.to(dtype))
-
-
-def _use_fused(x: torch.Tensor) -> bool:
-    """Core's fused mHC entry points are CUDA-only in practice."""
-    return x.is_cuda
+    return pre, post, fused_sinkhorn(comb_logits, iters, eps)
 
 
 class HyperConnection(nn.Module):
@@ -95,7 +74,7 @@ class HyperConnection(nn.Module):
         # ``fused_h_aggregate`` is ``(x * h_pre.unsqueeze(-1)).sum(dim=2)``, the same expression written here, so this is a kernel swap and not a
         # change of formula -- unlike the Sinkhorn and compute_h helpers next to it, which differ from Core in their regularisation.
         xs = xf.view(shape)
-        y = fused_h_aggregate(xs, pre) if _use_fused(xs) else _aggregate_native(xs, pre)
+        y = fused_h_aggregate(xs, pre)
         return y.to(dtype), post, comb
 
     @staticmethod
@@ -105,7 +84,5 @@ class HyperConnection(nn.Module):
         dtype = x.dtype
         # Core defines the mixing term as ``h_res.T @ residual`` while this module carries ``comb`` in the opposite orientation, so the
         # transpose converts between the two conventions rather than being a layout tweak: passing ``comb`` unchanged silently computes a different residual mixing.
-        if not _use_fused(x):
-            return _post_native(x, residual, post, comb)
         h_res = comb.to(dtype).transpose(-1, -2).contiguous()
         return fused_h_post_bda(h_res, residual.to(dtype), post.to(dtype), x, None)
