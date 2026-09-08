@@ -519,12 +519,15 @@ class DBuffer:
         """Return logical tensor ``index`` as a DTensor."""
         local_tensor = self.get_local_tensor(index)
         tensor_shape = self.layout.tensor_shapes[index]
-        # DBuffer uses contiguous flat storage, and Flat only shards dim 0, so
-        # the local view's stride matches the logical global tensor stride.
+        # Keep internal storage details (e.g. Flat and BlockAtomic) out of DTensor placements.
+        dtensor_placements = tuple(
+            Shard(placement.dim) if isinstance(placement, Shard) else placement
+            for placement in self.placements
+        )
         return DTensor.from_local(
             local_tensor=local_tensor,
             device_mesh=self.mesh,
-            placements=self.placements,
+            placements=dtensor_placements,
             run_check=False,
             shape=tensor_shape,
             stride=local_tensor.stride(),
