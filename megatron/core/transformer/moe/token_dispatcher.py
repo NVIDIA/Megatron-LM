@@ -1258,11 +1258,12 @@ class _HybridEPManager(_DispatchManager):
             and hidden_states.shape[0] > self._original_num_tokens
         ):
             hidden_states = hidden_states[: self._original_num_tokens]
-        # Release the used handle/num_permuted_tokens which could change in each iteration.
-        # For drop_and_pad mode, we don't need to reset the num_permuted_tokens and
-        # num_dispatched_tokens, because their values never change.
+        # Release the used handle and any dynamically computed token count. Keep static
+        # drop-and-pad and expert-rank-capacity budgets: CUDA graph replay skips
+        # setup_metadata(), so clearing a static budget would make a replayed dispatch fall
+        # back to HybridEP's host-synchronized dynamic-size path.
         self.handle = None
-        if not self.drop_and_pad:
+        if not self.drop_and_pad and self.moe_expert_rank_capacity_factor is None:
             self.num_permuted_tokens = None
         self._original_num_tokens = None
         self._padded_num_tokens = None
