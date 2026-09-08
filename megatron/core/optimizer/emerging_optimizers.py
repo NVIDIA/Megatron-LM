@@ -412,15 +412,19 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         is_expert = getattr(p, 'expert_tp', False)
         return resolve_gtp_remat_group(self.pg_collection, is_expert)
 
-    def _warn_distributed_qkv_fallback(self):
+    def _warn_distributed_qkv_fallback(self, p):
         """Warn once when a QKV layout cannot use distributed Newton-Schulz."""
         if self.tp_mode != "distributed" or self._warned_distributed_qkv_fallback:
             return
+        debug_name = getattr(p, '_debug_name', '')
         log_single_rank(
             logger,
             logging.WARNING,
             "muon_tp_mode='distributed' is not supported for per-head, GTP-rematerialized, "
-            "or fragmented QKV splitting; falling back to non-TP Newton-Schulz.",
+            "or fragmented QKV splitting"
+            + (f", first seen on {debug_name}" if debug_name else "")
+            + "; falling back to non-TP Newton-Schulz. Pass --muon-tp-mode duplicated "
+            "to make that execution mode explicit.",
         )
         self._warned_distributed_qkv_fallback = True
 
@@ -704,7 +708,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         QKV tensor. For a global layout, reconstruct GTP-remat and TP dimension 0 before
         splitting so heads crossing rank boundaries remain complete.
         """
-        self._warn_distributed_qkv_fallback()
+        self._warn_distributed_qkv_fallback(p)
         local_split_shapes = getattr(p, "qkv_split_shapes", None)
         heads_are_complete = getattr(p, "qkv_split_heads_are_complete", None)
         has_gtp_padding = int(getattr(p, "qkv_gtp_pad_length", 0)) > 0
@@ -746,7 +750,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
     def _orthogonalize_global_qkv(self, p, grad, tp_group, split_shapes):
         """Orthogonalize projections after reconstructing their global QKV layout."""
-        self._warn_distributed_qkv_fallback()
+        self._warn_distributed_qkv_fallback(p)
         global_split_shapes = getattr(p, "qkv_split_shapes_global", None)
         if global_split_shapes is None:
             raise RuntimeError("Muon global QKV split requires global split shapes")
