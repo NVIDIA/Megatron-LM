@@ -447,6 +447,8 @@ def test_own_metadata_class(tmp_path):
 
 def test_multimodal_tokenizer():
     """Test MegatronMultimodalTokenizer."""
+    from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX
+
     prompt_format = "qwen2p0"
     special_tokens = ["<image>"]
     image_tag_type = "nvlm"
@@ -461,6 +463,7 @@ def test_multimodal_tokenizer():
     assert (
         tokenizer.detokenize(tokenizer.tokenize("abc")) == "abc"
     ), "encode-decode roundtrip failed"
+    assert tokenizer.image_token_index == DEFAULT_IMAGE_TOKEN_INDEX
 
     conversation = [
         {"role": "system", "content": "You are a helpful assistant."},
@@ -493,6 +496,8 @@ def test_multimodal_tokenizer():
 
 def test_null_multimodal_tokenizer():
     """Test MegatronNullMultimodalTokenizer."""
+    from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX
+
     vocab_size = 10000
     tokenizer = MegatronTokenizer.from_pretrained(
         metadata_path={"library": "null-multimodal"}, vocab_size=vocab_size
@@ -503,6 +508,7 @@ def test_null_multimodal_tokenizer():
     assert tokenizer.tokenize("1 22 333") == [1, 22, 333], "tokenization is failed."
 
     assert tokenizer.detokenize([1, 22, 333]) == "1 22 333", "detokenization is failed."
+    assert tokenizer.image_token_index == DEFAULT_IMAGE_TOKEN_INDEX
 
 
 def test_sft_tokenizer():
