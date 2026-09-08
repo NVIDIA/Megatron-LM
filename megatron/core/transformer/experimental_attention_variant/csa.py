@@ -1862,6 +1862,19 @@ class CompressedSparseAttention(MegatronModule):
         if self.indexer is not None:
             self.indexer.backward_dw()
 
+    def _save_indexer_loss(self, loss, reduce_group=None):
+        """Save an indexer metric using one stable group for mixed CP."""
+        dynamic_cp_metric_group = (
+            self.pg_collection.dp_cp if self.config.dynamic_context_parallel else None
+        )
+        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+            loss=loss,
+            layer_number=self.layer_number,
+            num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
+            reduce_group=reduce_group,
+            dynamic_cp_metric_group=dynamic_cp_metric_group,
+        )
+
     # ------------------------------------------------------------------
     # Private helpers – each owns one logical slice of the forward pass.
     # ------------------------------------------------------------------
@@ -2105,11 +2118,7 @@ class CompressedSparseAttention(MegatronModule):
                         non_compressed_lse,
                     )
                     if indexer_loss_coeff > 0:
-                        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                            loss=indexer_loss,
-                            layer_number=self.layer_number,
-                            num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
-                        )
+                        self._save_indexer_loss(indexer_loss)
                 else:
                     _, topk_indices_compressed = self.indexer(
                         x_det, qr_det, mask=causal_mask, packed_seq_params=packed_seq_params
@@ -2276,11 +2285,7 @@ class CompressedSparseAttention(MegatronModule):
         nvtx_range_pop("sparse_attn_kernel")
 
         if indexer_loss_coeff > 0:
-            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                loss=indexer_loss,
-                layer_number=self.layer_number,
-                num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
-            )
+            self._save_indexer_loss(indexer_loss)
         return output, indexer_loss
 
     # ------------------------------------------------------------------
@@ -2486,11 +2491,7 @@ class CompressedSparseAttention(MegatronModule):
                     )
 
                     if indexer_loss_coeff > 0:
-                        DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                            loss=indexer_loss,
-                            layer_number=self.layer_number,
-                            num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
-                        )
+                        self._save_indexer_loss(indexer_loss)
                 else:
                     _, topk_indices_cmp = self.indexer(
                         x_det, qr_det, mask=None, packed_seq_params=packed_seq_params
@@ -2788,11 +2789,7 @@ class CompressedSparseAttention(MegatronModule):
         )
 
         if indexer_loss_coeff > 0:
-            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                loss=indexer_loss,
-                layer_number=self.layer_number,
-                num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
-            )
+            self._save_indexer_loss(indexer_loss)
         output = output.unsqueeze(1)
         return output, indexer_loss
 
@@ -3180,12 +3177,7 @@ class CompressedSparseAttention(MegatronModule):
                     *indexer_loss_args, tp_group=indexer.pg_collection.tp
                 )
             if indexer_loss_coeff > 0:
-                DSAIndexerLossLoggingHelper.save_loss_to_tracker(
-                    loss=indexer_loss,
-                    layer_number=self.layer_number,
-                    num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
-                    reduce_group=cp_group,
-                )
+                self._save_indexer_loss(indexer_loss, reduce_group=cp_group)
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
             return output.unsqueeze(1)
 

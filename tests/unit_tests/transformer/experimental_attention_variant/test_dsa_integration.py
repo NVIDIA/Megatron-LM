@@ -454,6 +454,82 @@ def test_indexer_loss_tracker_grows_for_mtp_layer_numbers():
         helper.tracker.clear()
 
 
+def test_indexer_loss_tracker_uses_one_stable_group_for_mixed_cp(monkeypatch):
+    """Mixed-CP values use one stable metric group, not the last runtime CP group."""
+    helper = dsa_module.DSAIndexerLossLoggingHelper
+    first_runtime_group = object()
+    last_runtime_group = object()
+    metric_group = object()
+    dp_group = object()
+    pp_group = object()
+    helper.tracker.clear()
+    helper.save_loss_to_tracker(
+        loss=torch.tensor(3.0),
+        layer_number=1,
+        num_layers=1,
+        reduce_group=first_runtime_group,
+        dynamic_cp_metric_group=metric_group,
+    )
+    helper.save_loss_to_tracker(
+        loss=torch.tensor(1.0),
+        layer_number=1,
+        num_layers=1,
+        reduce_group=last_runtime_group,
+        dynamic_cp_metric_group=metric_group,
+    )
+    helper.tracker["agreed_size"] = 1
+    reductions = []
+
+    monkeypatch.setattr(
+        dsa_module.parallel_state, "get_pipeline_model_parallel_group", lambda: pp_group
+    )
+    monkeypatch.setattr(
+        dsa_module.parallel_state,
+        "get_data_parallel_group",
+        lambda with_context_parallel=False: dp_group,
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, group=None, op=None: reductions.append((group, op)),
+    )
+
+    try:
+        torch.testing.assert_close(
+            helper.tracker["values"], helper.tracker["values"].new_tensor([4.0])
+        )
+        helper.reduce_loss_in_tracker()
+
+        assert reductions == [
+            (pp_group, None),
+            (metric_group, torch.distributed.ReduceOp.AVG),
+            (dp_group, torch.distributed.ReduceOp.AVG),
+        ]
+        assert all(group is not last_runtime_group for group, _ in reductions)
+    finally:
+        helper.tracker.clear()
+
+
+def test_indexer_loss_tracker_rejects_multiple_dynamic_cp_metric_groups():
+    """A tracker cannot silently mix values from unrelated DP-CP replicas."""
+    helper = dsa_module.DSAIndexerLossLoggingHelper
+    helper.tracker.clear()
+
+    try:
+        helper.save_loss_to_tracker(
+            loss=torch.tensor(1.0), layer_number=1, num_layers=1, dynamic_cp_metric_group=object()
+        )
+        with pytest.raises(RuntimeError, match="multiple dynamic-CP metric groups"):
+            helper.save_loss_to_tracker(
+                loss=torch.tensor(1.0),
+                layer_number=1,
+                num_layers=1,
+                dynamic_cp_metric_group=object(),
+            )
+    finally:
+        helper.tracker.clear()
+
+
 def test_dsv4_metric_logging_preserves_graph_groups_and_uses_indexer_layer_count(monkeypatch):
     """CUDA Graph reuse keeps groups, and only ratio-4 DSv4 layers enter the average."""
     helper = dsa_module.DSAIndexerLossLoggingHelper
@@ -465,8 +541,10 @@ def test_dsv4_metric_logging_preserves_graph_groups_and_uses_indexer_layer_count
             "values": torch.tensor([2.0, 0.0, 6.0, 0.0]),
             "reduce_group": reduce_group,
             "avg_group": avg_group,
+            "dynamic_cp_metric_group": object(),
         }
     )
+    dynamic_cp_metric_group = helper.tracker["dynamic_cp_metric_group"]
     recorded = []
 
     class Writer:
@@ -489,5 +567,6 @@ def test_dsv4_metric_logging_preserves_graph_groups_and_uses_indexer_layer_count
         torch.testing.assert_close(helper.tracker["values"], torch.zeros(4))
         assert helper.tracker["reduce_group"] is reduce_group
         assert helper.tracker["avg_group"] is avg_group
+        assert helper.tracker["dynamic_cp_metric_group"] is dynamic_cp_metric_group
     finally:
         helper.tracker.clear()
