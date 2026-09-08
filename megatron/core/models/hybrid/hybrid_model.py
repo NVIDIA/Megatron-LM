@@ -785,11 +785,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         *,
         mtp_input_mask: Optional[Tensor] = None,
+        output_processor: Optional[Callable[..., Any]] = None,
+        output_processor_context: Optional[Any] = None,
     ):
         """Build the HybridModel combined-1F1B schedule plan.
 
-        Mirrors ``GPTModel.build_schedule_plan``; ``mtp_input_mask`` is stored on the chunk
-        state so the schedule plan's MTP layer nodes and ``PostProcessNode`` apply it.
+        Mirrors ``GPTModel.build_schedule_plan``; ``mtp_input_mask``, ``output_processor``
+        and ``output_processor_context`` are stored on the chunk state so the schedule
+        plan's MTP layer nodes and ``PostProcessNode`` apply them.
         """
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
@@ -811,6 +814,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             loss_mask,
             padding_mask,
             mtp_input_mask=mtp_input_mask,
+            output_processor=output_processor,
+            output_processor_context=output_processor_context,
         )
 
     def sharded_state_dict(
