@@ -12,6 +12,7 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.transformer.moe.paged_stash import (
     PagedStashBuffer,
+    PagedStashManager,
     PagedTensor,
     check_paged_stash_overflow,
     paged_stash_init_chunk_handler,
@@ -28,6 +29,32 @@ from tests.unit_tests.transformer.moe.test_token_dispatcher import is_nccl_ep_fp
 # whole module for the GB200 CI bucket (selection there is marker-driven; see
 # tests/unit_tests/find_test_cases.py and recipes/gb200/unit-tests.yaml).
 pytestmark = pytest.mark.launch_on_gb200
+
+
+def test_saved_transposed_fp8_tensor_preserves_dtype():
+    """Retrieving an unpadded transposed FP8 tensor must not expose its byte view."""
+    manager = PagedStashManager.__new__(PagedStashManager)
+    manager.num_tokens_tensor = None
+    manager.max_num_tokens = 4
+    manager.avg_num_tokens = None
+    manager.status = 'capture'
+    manager.max_tokens_across_vp_stages = None
+    manager.current_vp_stage = 0
+    manager._pp_schedule = None
+    manager.current_schedule_index = 0
+    manager.page_size = 2
+
+    tensor = torch.arange(24, dtype=torch.float32).view(3, 8).to(torch.float8_e4m3fn)
+    tensor.grouped_tensor_scale_inv = False
+    tensor.grouped_tensor_token_axis = 1
+    tensor.grouped_tensor_num_tokens = torch.tensor([6], dtype=torch.int64)
+
+    saved = manager.on_save_for_backward(tensor)
+    restored = manager.on_get_saved_tensor(saved)
+
+    assert restored.dtype == torch.float8_e4m3fn
+    assert restored.shape == tensor.shape
+    torch.testing.assert_close(restored.view(torch.uint8), tensor.view(torch.uint8))
 
 
 def _global_tokens_per_expert_from_local_routing_map(routing_map: torch.Tensor) -> torch.Tensor:

@@ -221,7 +221,11 @@ class PagedTensor:
             (
                 max_num_tokens
                 if self.token_axis == 0
-                else (self.hidden_size + FEATURE_BLOCK_SIZE - 1) // FEATURE_BLOCK_SIZE
+                else (
+                    (max_num_tokens + self.page_size - 1)
+                    // self.page_size
+                    * ((self.hidden_size + FEATURE_BLOCK_SIZE - 1) // FEATURE_BLOCK_SIZE)
+                )
             ),
             max_blocks,
         )
@@ -287,7 +291,11 @@ class PagedTensor:
             (
                 max_num_tokens
                 if self.token_axis == 0
-                else (self.hidden_size + FEATURE_BLOCK_SIZE - 1) // FEATURE_BLOCK_SIZE
+                else (
+                    (max_num_tokens + self.page_size - 1)
+                    // self.page_size
+                    * ((self.hidden_size + FEATURE_BLOCK_SIZE - 1) // FEATURE_BLOCK_SIZE)
+                )
             ),
             max_blocks,
         )
@@ -838,16 +846,16 @@ class PagedStashManager:
                         else int(saved_state.avg_num_tokens) // SCALE_INV_BLOCK_SIZE
                     )
 
-                # Handle 1-byte tensors (torch.uint8)
-                dtype = saved_state._tensor.dtype
-                if saved_state._tensor.element_size() == 1:
-                    saved_state._tensor = saved_state._tensor.view(torch.uint8)
-
                 if saved_state.token_axis == 0:
                     # Pad the contiguous token prefix back to its original capacity.
                     assert (
                         saved_state._tensor.ndim == 1
                     ), f"saved_state._tensor.ndim is not 1 {saved_state._tensor.ndim}"
+                    # Padding kernels do not support every 1-byte dtype (for example FP8),
+                    # so pad their byte representation and restore the original dtype.
+                    dtype = saved_state._tensor.dtype
+                    if saved_state._tensor.element_size() == 1:
+                        saved_state._tensor = saved_state._tensor.view(torch.uint8)
                     npad = (
                         saved_state.max_num_tokens - num_tokens
                     ) * saved_state.hidden_size
