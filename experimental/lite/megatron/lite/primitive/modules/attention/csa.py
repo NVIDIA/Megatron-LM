@@ -1045,7 +1045,9 @@ class CompressedSparseAttention(nn.Module):
                 k_indexer_seq_major = torch.index_select(
                     k_indexer_rank_major, 0, seq_to_rank_row.clamp_min(0)
                 )
-                compressed_topk, indexer_layout = cp_utils.compute_cp_indexer_topk(
+                # The third value is the compact top-k softmax, returned only when
+                # ``return_softmax=True``; lite does not ask for it.
+                compressed_topk, indexer_layout, _ = cp_utils.compute_cp_indexer_topk(
                     q_indexer_cp,
                     weights_indexer_cp,
                     k_indexer_seq_major,
