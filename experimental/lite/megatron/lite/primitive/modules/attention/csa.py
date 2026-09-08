@@ -183,6 +183,18 @@ def rope_table(
     return cos, sin
 
 
+def rope_rows_for(
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    global_start: int,
+    length: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select this rank's rows, for callers that cannot hand off ``cu_seqlens``."""
+    rows = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, length).long().view(-1)
+    return cos[0].index_select(0, rows).unsqueeze(0), sin[0].index_select(0, rows).unsqueeze(0)
+
+
 def rope_tables_for_packed_batch(
     packed_seq_params: Any,
     cu_seqlens: torch.Tensor,
@@ -196,15 +208,16 @@ def rope_tables_for_packed_batch(
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-row tables for this rank's slice, gathered from the shared table.
+    """The shared table, for callers that hand ``cu_seqlens`` to the kernel.
 
     Every layer derives the same within-sequence positions from the same
-    ``cu_seqlens`` and rank offset, so building the tables per layer rebuilt them
+    ``cu_seqlens`` and rank offset, so building per-layer tables rebuilt them
     identically eight times over, and again under activation recompute. The
-    values live in one table keyed on scalars; this only selects the rows.
+    fused RoPE kernels take ``cu_seqlens`` and index the table themselves, so
+    they need no per-row form and no gather; ``rope_rows_for`` exists for the
+    one caller that does.
     """
-    positions = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, length).long()
-    cos, sin = rope_table(
+    return rope_table(
         int(packed_seq_params.max_seqlen_q),
         rope_head_dim,
         rope_theta,
@@ -213,8 +226,6 @@ def rope_tables_for_packed_batch(
         device=device,
         dtype=dtype,
     )
-    rows = positions.view(-1)
-    return cos[0].index_select(0, rows).unsqueeze(0), sin[0].index_select(0, rows).unsqueeze(0)
 
 
 def build_compressed_rope_cos_sin(
@@ -1022,17 +1033,24 @@ class CompressedSparseAttention(nn.Module):
                 q_indexer_cp = indexer.wq_b(indexer_qr.squeeze(1)).view(
                     l_local, indexer.index_n_heads, indexer.index_head_dim
                 )
-                idx_cos, idx_sin = rope_tables_for_packed_batch(
-                    packed_seq_params,
+                # ``apply_partial_rope`` below wants per-row tables, so this is
+                # the one caller that gathers rather than handing off cu_seqlens.
+                idx_cos, idx_sin = rope_rows_for(
+                    *rope_tables_for_packed_batch(
+                        packed_seq_params,
+                        cu_seqlens,
+                        global_start,
+                        l_local,
+                        indexer.rope_head_dim,
+                        self.config.compress_rope_theta,
+                        config=self.config,
+                        use_yarn=ratio > 1,
+                        device=q_indexer_cp.device,
+                        dtype=q_indexer_cp.dtype,
+                    ),
                     cu_seqlens,
                     global_start,
                     l_local,
-                    indexer.rope_head_dim,
-                    self.config.compress_rope_theta,
-                    config=self.config,
-                    use_yarn=ratio > 1,
-                    device=q_indexer_cp.device,
-                    dtype=q_indexer_cp.dtype,
                 )
                 # lite RoPE wants the sequence axis at dim -2: (1, n_heads, l_local, hd).
                 q_rope = q_indexer_cp.permute(1, 0, 2).unsqueeze(0)
