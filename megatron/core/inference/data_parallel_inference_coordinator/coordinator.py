@@ -125,6 +125,7 @@ class DataParallelInferenceCoordinator:
         schedule_output_path: str | None = None,
         hostname: str | None = None,
         disaggregated: bool = False,
+        initial_state: CoordinatorState = CoordinatorState.RUNNING,
     ):
         """
         Initializes the inference coordinator.
@@ -153,6 +154,8 @@ class DataParallelInferenceCoordinator:
                 reusable projected media embeddings.
             max_requests (int): Max concurrent requests per rank, used to cap load
                 balancing and to gate media affinity on spare capacity.
+            initial_state (CoordinatorState): State the control-signal machine starts in.
+                RUNNING by default; SUSPENDED when the engines are constructed without weights.
         """
         assert HAVE_ZMQ, (
             "please install the pyzmq library to use DataParallelInferenceCoordinator\n"
@@ -162,6 +165,7 @@ class DataParallelInferenceCoordinator:
             "please install the messagepack library to use DataParallelInferenceCoordinator\n"
             "pip install msgpack"
         )
+        assert initial_state in (CoordinatorState.RUNNING, CoordinatorState.SUSPENDED)
         self.pipe_connection = pipe_connection
         self.instance_id = uuid.uuid4().hex
         self.data_parallel_size = data_parallel_size
@@ -229,7 +233,7 @@ class DataParallelInferenceCoordinator:
 
         self.next_request_id = 0
         self.tokenizer = tokenizer
-        self.state = CoordinatorState.RUNNING
+        self.state = initial_state
 
         # Prefix caching state for routing.
         self.block_size_tokens = block_size_tokens
@@ -788,6 +792,7 @@ class DataParallelInferenceCoordinator:
         schedule_output_path: str | None = None,
         hostname: str | None = None,
         disaggregated: bool = False,
+        initial_state: CoordinatorState = CoordinatorState.RUNNING,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -814,6 +819,7 @@ class DataParallelInferenceCoordinator:
             vision_embedding_cache_enabled (bool): Whether engines retain
                 reusable projected media embeddings.
             max_requests (int): Max concurrent requests per rank.
+            initial_state (CoordinatorState): RUNNING or SUSPENDED for engines with no init weights.
         """
         coordinator = cls(
             pipe_connection,
@@ -833,6 +839,7 @@ class DataParallelInferenceCoordinator:
             schedule_output_path=schedule_output_path,
             hostname=hostname,
             disaggregated=disaggregated,
+            initial_state=initial_state,
         )
         ready_event.set()
         try:
