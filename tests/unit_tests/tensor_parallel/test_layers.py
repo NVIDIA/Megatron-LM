@@ -1,15 +1,18 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.tensor_parallel.layers import (
+    VocabParallelEmbedding,
     copy_gtp_attributes,
     gtp_local_pad_zero_count,
     linear_with_frozen_weight,
     linear_with_grad_accumulation_and_async_allreduce,
 )
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -303,3 +306,52 @@ def test_linear_fp32_output_matches_plain_te_general_gemm():
     )
 
     Utils.destroy_model_parallel()
+
+
+class TestVocabParallelEmbeddingLookup:
+    """VocabParallelEmbedding used to fork on deterministic_mode (weight[idx] vs F.embedding).
+
+    This layer never sets padding_idx, scale_grad_by_freq, or sparse, so both ops gather
+    the same rows. F.embedding's CUDA backward is deterministic when
+    torch.use_deterministic_algorithms(True) is set (--deterministic-mode), so the
+    lookup is unified on F.embedding.
+    """
+
+    def test_embedding_matches_advanced_indexing_on_cpu(self):
+        torch.manual_seed(0)
+        weight = torch.randn(8, 4, requires_grad=True)
+        # Repeated indices so backward accumulates into the same rows.
+        indices = torch.tensor([[0, 3, 3, 7], [1, 0, 5, 5]])
+
+        via_embedding = F.embedding(indices, weight)
+        via_index = weight[indices]
+        torch.testing.assert_close(via_embedding, via_index)
+
+        grad = torch.randn_like(via_embedding)
+        (grad_emb,) = torch.autograd.grad(via_embedding, weight, grad, retain_graph=True)
+        (grad_idx,) = torch.autograd.grad(via_index, weight, grad)
+        torch.testing.assert_close(grad_emb, grad_idx)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("deterministic_mode", [False, True])
+    def test_forward_matches_f_embedding(self, deterministic_mode):
+        Utils.initialize_model_parallel(1, 1)
+        try:
+            cfg = TransformerConfig(
+                num_layers=1,
+                hidden_size=8,
+                num_attention_heads=4,
+                deterministic_mode=deterministic_mode,
+            )
+            emb = VocabParallelEmbedding(
+                num_embeddings=16,
+                embedding_dim=8,
+                init_method=cfg.init_method,
+                config=cfg,
+            )
+            tokens = torch.tensor([[0, 3, 3, 15], [1, 0, 7, 7]], device=emb.weight.device)
+            output = emb(tokens)
+            expected = F.embedding(tokens, emb.weight)
+            torch.testing.assert_close(output, expected)
+        finally:
+            Utils.destroy_model_parallel()

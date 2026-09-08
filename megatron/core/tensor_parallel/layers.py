@@ -335,7 +335,6 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
         )
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
-        self.deterministic_mode = config.deterministic_mode
         self.config = config
 
         self.use_inference_optimized_reduce_scatter = (
@@ -419,12 +418,9 @@ class VocabParallelEmbedding(torch.nn.Module):
 
             weight = GTPEmbeddingWeight.apply(self.weight)
 
-        # Get the embeddings.
-        if self.deterministic_mode:
-            output_parallel = weight[masked_input]
-        else:
-            # F.embedding currently has a non-deterministic backward function
-            output_parallel = F.embedding(masked_input, weight)
+        # Row gather. F.embedding backward is deterministic under
+        # torch.use_deterministic_algorithms(True) (--deterministic-mode).
+        output_parallel = F.embedding(masked_input, weight)
         # Mask the output embedding.
         if self.tp_group.size() > 1:
             output_parallel[input_mask, :] = 0.0
