@@ -183,7 +183,7 @@ def assign_owner_work(
             assignments[param_index] = candidates[0]
             continue
         cost = cost_fn(plan)
-        owner = min(candidates, key=lambda r: (running[r], r))
+        owner = min(candidates, key=lambda r: running[r])
         assignments[param_index] = owner
         running[owner] += cost
     return assignments
