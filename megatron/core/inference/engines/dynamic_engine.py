@@ -2045,6 +2045,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if prompt_logprobs_complete:
             checkpointed_request = entry.record[-1]
             checkpointed_request.sampling_params.skip_prompt_log_probs = True
+            checkpointed_request.sampling_params.return_prompt_top_n_logprobs = False
             checkpointed_request.sampling_params._sync_prompt_logprobs_fields()
 
     def _stage_prompt_logprob_updates(
