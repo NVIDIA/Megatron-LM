@@ -33,7 +33,7 @@ Selected by `torch.are_deterministic_algorithms_enabled()` or
 
 | Operation | Where | Deterministic Path | Default Path |
 | --- | --- | --- | --- |
-| MoE token unpermute (combine) | `megatron/core/transformer/moe/moe_utils.py` | `index_add_` — deterministic under torch deterministic algorithms and CUDA-graph safe | `scatter_add_` (atomic accumulation) |
+| MoE token unpermute (combine) | `megatron/core/transformer/moe/moe_utils.py` | `scatter_add_` — under torch deterministic algorithms PyTorch dispatches it to the sort-based `index_put_` (bit-identical to `index_add_`, CUDA-graph safe; torch >= 2.9 does so without materialising the expanded index, `index_add_` stays as the fallback for older torch) | `scatter_add_` (atomic accumulation) |
 | MoE routing map and probabilities | `megatron/core/transformer/moe/moe_utils.py` | `index_put_(accumulate=False)` row-wise writes | out-of-place `scatter` |
 | Vocab-parallel embedding | `megatron/core/tensor_parallel/layers.py` | `F.embedding` — sort-then-segment-reduce backward, bit-exact under torch deterministic algorithms, which also disable the atomic few-segment path torch >= 2.11 added; `config.deterministic_mode` without the flag warns once | `F.embedding` (same kernel; on torch >= 2.11 tables under ~600 rows with >3072 ids may take the atomic path) |
 | Gated-delta-net kernel | `megatron/core/ssm/gated_delta_net.py` | torch `chunk_gated_delta_rule` | FLA fused kernel |
