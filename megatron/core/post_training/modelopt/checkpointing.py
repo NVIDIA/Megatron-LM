@@ -14,7 +14,6 @@ from megatron.core import mpu
 from megatron.core.dist_checkpointing.serialization import load, load_common_state_dict, save
 from megatron.core.dist_checkpointing.strategies.torch import TorchDistLoadShardedStrategy
 from megatron.core.dist_checkpointing.validation import StrictHandling
-from megatron.core.safe_globals import safe_load_from_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -95,10 +94,7 @@ def save_sharded_modelopt_state(
 
 
 def _load_extra_state_from_sharded_checkpoint(
-    model: torch.nn.Module,
-    checkpoint_name: str | Path,
-    prefix: str,
-    metadata: dict[str, Any] | None = None,
+    model: torch.nn.Module, checkpoint_name: str | Path, prefix: str
 ) -> None:
     """Load extra state from sharded checkpoint.
 
@@ -109,12 +105,6 @@ def _load_extra_state_from_sharded_checkpoint(
         model: the model to load extra state into
         checkpoint_name: the checkpoint folder path
         prefix: the prefix to add to the modelopt_state keys
-        metadata: the metadata for distributed checkpointing
-
-    Note:
-        The metadata includes several breaking changes. For example, `singleton_local_shards`
-        is set to `True` (was not set before) in megatron-core-0.15.0. This flag affects the
-        sharded state_dict format and must be consistent between saving and loading.
     """
     sharded_state_dict = model.sharded_state_dict(prefix=prefix)
     extra_sharded_state_dict = {k: v for k, v in sharded_state_dict.items() if "_extra_state" in k}
@@ -133,10 +123,7 @@ def _load_extra_state_from_sharded_checkpoint(
 
 
 def restore_sharded_modelopt_state(
-    model: list[torch.nn.Module],
-    checkpoint_name: str | Path,
-    prefix: str = "",
-    metadata: dict[str, Any] | None = None,
+    model: list[torch.nn.Module], checkpoint_name: str | Path, prefix: str = ""
 ) -> None:
     """Restore modelopt_state from the sharded state_dict format.
 
@@ -144,12 +131,6 @@ def restore_sharded_modelopt_state(
         model: the model to restore the modelopt optimization
         checkpoint_name: the checkpoint folder path
         prefix: the prefix to add to the modelopt_state keys ("model." for NeMo)
-        metadata: the metadata for distributed checkpointing
-
-    Note:
-        The metadata includes several breaking changes. For example, `singleton_local_shards`
-        is set to `True` (was not set before) in megatron-core-0.15.0. This flag affects the
-        sharded state_dict format and must be consistent between saving and loading.
     """
     import modelopt
     import modelopt.torch.opt as mto
@@ -166,13 +147,7 @@ def restore_sharded_modelopt_state(
         return
 
     # Loading the common modelopt_state (replicated on all ranks).
-    # Detect format: legacy checkpoints store common state in a standalone common.pt file;
-    # newer sharded checkpoints store it as a ShardedObject inside the torch_dist checkpoint.
-    legacy_common_path = os.path.join(modelopt_checkpoint_name, "common.py")
-    if os.path.exists(legacy_common_path):
-        common_modelopt_state = safe_load_from_bytes(legacy_common_path)
-    else:
-        common_modelopt_state = load_common_state_dict(modelopt_checkpoint_name)
+    common_modelopt_state = load_common_state_dict(modelopt_checkpoint_name)
 
     modelopt_load_version = common_modelopt_state["modelopt_version"]
 
@@ -182,4 +157,4 @@ def restore_sharded_modelopt_state(
 
     model[0] = mto.restore_from_modelopt_state(model[0], common_modelopt_state)
 
-    _load_extra_state_from_sharded_checkpoint(model[0], checkpoint_name, prefix, metadata=metadata)
+    _load_extra_state_from_sharded_checkpoint(model[0], checkpoint_name, prefix)

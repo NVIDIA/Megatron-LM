@@ -1358,6 +1358,10 @@ class TestMTPBlockScopeCudaGraph:
             context.request_query_lengths[:active_request_count] = torch.ones(
                 active_request_count, dtype=torch.int32, device='cuda'
             )
+            # reset() zeroes padded_active_token_count; the block-scope path slices the
+            # decoder hidden-states buffer to [:padded_active_token_count], so it must
+            # reflect the runtime token count (one decode token per active request).
+            context.padded_active_token_count = active_request_count
 
             ctrl.num_speculative_tokens = num_spec
             ctrl._init_mtp_sampling_tensors()

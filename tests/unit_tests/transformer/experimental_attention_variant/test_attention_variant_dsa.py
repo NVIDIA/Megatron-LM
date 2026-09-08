@@ -28,8 +28,11 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
     FusedDSAIndexerLoss,
+    _compute_indexer_teacher_probabilities,
+    _normalize_indexer_teacher_target,
     _run_sparse_attention,
     _validate_nonpacked_cp_uniform_length,
+    bwd_fused_indexer_loss_naive,
     compute_dsa_indexer_loss,
     fused_qk_topk_naive,
     is_dsa_skip_topk_layer,
@@ -50,6 +53,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
     build_fused_indexer_varlen_bounds,
     generate_varlen_mask_params_for_positions,
     masked_log_softmax,
+    masked_softmax,
     scatter_topk_into_index_mask,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -1656,6 +1660,111 @@ class TestRotateActivation:
 
         with pytest.raises(AssertionError, match="only support bf16"):
             rotate_activation(x)
+
+
+def test_indexer_teacher_probability_matches_full_softmax_oracle():
+    """External mass changes the denominator but not the compressed-key support."""
+    attention_scores = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])
+    valid_mask = torch.ones((1, 2, 2), dtype=torch.bool)
+    non_compressed_lse = torch.tensor([[[0.5, 1.5]]])
+
+    actual = _compute_indexer_teacher_probabilities(
+        attention_scores, valid_mask, non_compressed_lse
+    )
+    expected_denominator = torch.logaddexp(
+        torch.logsumexp(attention_scores, dim=-1), non_compressed_lse
+    )
+    expected = torch.exp(attention_scores - expected_denominator.unsqueeze(-1))
+    torch.testing.assert_close(actual, expected)
+
+    normalized = _normalize_indexer_teacher_target(actual.sum(dim=1), non_compressed_lse)
+    torch.testing.assert_close(normalized.sum(dim=-1), torch.ones((1, 2)))
+
+
+def test_indexer_teacher_probability_rescales_underflowed_external_mass():
+    """A huge external LSE preserves the relative compressed-key teacher target."""
+    attention_scores = torch.tensor([[[[0.0, -1.0]], [[-2.0, 1.0]]]], dtype=torch.float32)
+    valid_mask = torch.ones((1, 1, 2), dtype=torch.bool)
+    non_compressed_lse = torch.tensor([[[1000.0], [1002.0]]], dtype=torch.float32)
+
+    probabilities = _compute_indexer_teacher_probabilities(
+        attention_scores, valid_mask, non_compressed_lse
+    )
+    normalized = _normalize_indexer_teacher_target(probabilities.sum(dim=1), non_compressed_lse)
+
+    scores64 = attention_scores.double()
+    compressed_lse64 = torch.logsumexp(scores64, dim=-1)
+    full_lse64 = torch.logaddexp(non_compressed_lse.double(), compressed_lse64)
+    log_probabilities64 = scores64 - full_lse64.unsqueeze(-1)
+    expected = torch.softmax(torch.logsumexp(log_probabilities64, dim=1), dim=-1).float()
+
+    assert torch.isfinite(probabilities).all()
+    torch.testing.assert_close(normalized.sum(dim=-1), torch.ones((1, 1)))
+    torch.testing.assert_close(normalized, expected)
+
+
+def test_indexer_teacher_probability_keeps_fully_masked_rows_zero():
+    """A fully masked compressed row remains finite and exactly zero."""
+    attention_scores = torch.tensor([[[[1.0, 2.0]]]], requires_grad=True)
+    valid_mask = torch.zeros((1, 1, 2), dtype=torch.bool)
+    non_compressed_lse = torch.full((1, 1, 1), float("-inf"))
+
+    target = _compute_indexer_teacher_probabilities(
+        attention_scores, valid_mask, non_compressed_lse
+    )
+    assert torch.isfinite(target).all()
+    torch.testing.assert_close(target, torch.zeros_like(target))
+
+    normalized = _normalize_indexer_teacher_target(target.sum(dim=1), non_compressed_lse)
+    assert torch.isfinite(normalized).all()
+    torch.testing.assert_close(normalized, torch.zeros_like(normalized))
+    target.sum().backward()
+    assert torch.isfinite(attention_scores.grad).all()
+    torch.testing.assert_close(attention_scores.grad, torch.zeros_like(attention_scores))
+
+
+def test_indexer_teacher_probability_preserves_legacy_path():
+    """Without external mass, probability and target normalization stay unchanged."""
+    attention_scores = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])
+    valid_mask = torch.tensor([[[True, False], [False, False]]])
+    expanded_valid_mask = valid_mask.unsqueeze(1)
+
+    actual = _compute_indexer_teacher_probabilities(attention_scores, valid_mask)
+    expected = masked_softmax(attention_scores.float(), expanded_valid_mask, dim=-1)
+    torch.testing.assert_close(actual, expected)
+
+    actual_normalized = _normalize_indexer_teacher_target(actual.sum(dim=1), None)
+    expected_normalized = dsa_indexer_loss.normalize_indexer_target(expected.sum(dim=1))
+    torch.testing.assert_close(actual_normalized, expected_normalized)
+
+
+def test_indexer_teacher_valid_zero_mass_has_zero_manual_gradient():
+    """A valid row with zero teacher mass has zero manual KL gradient."""
+    q = torch.ones((1, 1, 1, 1), dtype=torch.float32)
+    weights = torch.ones((1, 1, 1), dtype=torch.float32)
+    k = torch.ones((1, 1, 1), dtype=torch.float32)
+    query = torch.ones((1, 1, 1, 1), dtype=torch.float32)
+    key = torch.ones((1, 1, 1, 1), dtype=torch.float32)
+
+    grad_q, grad_weights, grad_k = bwd_fused_indexer_loss_naive(
+        q=q,
+        weights=weights,
+        k=k,
+        query=query,
+        key=key,
+        topk_indices=torch.zeros((1, 1, 1), dtype=torch.long),
+        softmax_scale=1.0,
+        loss_coeff=1.0,
+        sparse_loss=False,
+        mask=torch.zeros((1, 1), dtype=torch.float32),
+        grad_loss=torch.tensor(1.0),
+        pg_collection=SimpleNamespace(tp=SimpleNamespace(size=lambda: 1)),
+        non_compressed_lse=torch.full((1, 1, 1), float("inf"), dtype=torch.float32),
+    )
+
+    torch.testing.assert_close(grad_q, torch.zeros_like(grad_q))
+    torch.testing.assert_close(grad_weights, torch.zeros_like(grad_weights))
+    torch.testing.assert_close(grad_k, torch.zeros_like(grad_k))
 
 
 @pytest.mark.parametrize("seqlen_and_topk", [[16, 32], [64, 32]])

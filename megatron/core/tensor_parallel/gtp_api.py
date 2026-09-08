@@ -23,6 +23,8 @@ try:
         get_rs_stream,
         gtp_native_fp8_load_context,
         gtp_remat_shard_dim0,
+        gtp_remat_slice_rows,
+        gtp_replica_rank,
         initialize_graph_wgrad_rings,
         is_gtp_param,
         make_sharded_tensors_for_checkpoint_with_gtp_remat,
@@ -31,8 +33,13 @@ try:
         wrap_module_params_gtp,
     )
     from megatron.core.tensor_parallel.gtp_cuda_graphs import (
+        preserve_gtp_prefetch_state,
         set_cuda_graph_mempool,
         track_gtp_capture_comms,
+    )
+    from megatron.core.tensor_parallel.gtp_symmetric_memory import (
+        deregister_and_clear_gtp_symm_pools,
+        register_gtp_symm_pool,
     )
 
     HAVE_GTP = HAVE_TE
@@ -41,9 +48,15 @@ except ImportError:
     # the other symbols lazily under an ``if HAVE_GTP:`` guard, so no stubs needed.
     HAVE_GTP = False
 
+    def deregister_and_clear_gtp_symm_pools() -> None:
+        """No-op stub: shutdown calls this unconditionally, and without the GTP
+        surface no pool can have been registered."""
+
 
 __all__ = [
     "HAVE_GTP",
+    "deregister_and_clear_gtp_symm_pools",
+    "register_gtp_symm_pool",
     "GTP_CONFIG",
     "GTPChain",
     "GTPEmbeddingWeight",
@@ -55,9 +68,12 @@ __all__ = [
     "get_rs_stream",
     "gtp_native_fp8_load_context",
     "gtp_remat_shard_dim0",
+    "gtp_remat_slice_rows",
+    "gtp_replica_rank",
     "is_gtp_param",
     "initialize_graph_wgrad_rings",
     "make_sharded_tensors_for_checkpoint_with_gtp_remat",
+    "preserve_gtp_prefetch_state",
     "set_cuda_graph_mempool",
     "track_gtp_capture_comms",
     "wait_async_comms",

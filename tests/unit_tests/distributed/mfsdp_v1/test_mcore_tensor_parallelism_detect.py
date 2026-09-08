@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
+import pytest
 import torch
 from torch import nn
 
@@ -85,6 +86,14 @@ def test_safe_get_rank_should_fall_back_to_rank_env_if_distributed_is_not_initia
     monkeypatch.setenv("RANK", "7")
 
     assert safe_get_rank() == 7
+
+
+def test_safe_get_rank_should_raise_value_error_if_rank_env_is_invalid(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setenv("RANK", "not-an-int")
+
+    with pytest.raises(ValueError):
+        safe_get_rank()
 
 
 class DummyConfig:

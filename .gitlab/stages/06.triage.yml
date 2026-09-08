@@ -49,11 +49,17 @@ triage:linear_write:
       artifacts: true
   allow_failure: true
   script:
-    - >-
-      cerno-linear write
-      --config "${CERNO_CONFIG}"
-      --plan linear_action_plan.json
-      --output linear_action_plan_post.json
+    # The shared GitHub email lookup reads the existing GH_TOKEN CI variable.
+    - |
+      ONCALL_ASSIGNEE="$(
+        python tests/test_utils/python_scripts/resolve_oncall_assignee.py \
+          --schedule-file .github/oncall_schedule.json
+      )"
+      cerno-linear write \
+        --config "${CERNO_CONFIG}" \
+        --plan linear_action_plan.json \
+        --output linear_action_plan_post.json \
+        --assignee "${ONCALL_ASSIGNEE}"
   artifacts:
     when: always
     paths:

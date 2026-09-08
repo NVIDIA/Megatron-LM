@@ -42,9 +42,6 @@ inputs:
   model:
     description: Model to launch
     required: false
-  PAT:
-    description: "GitHub Personal Access Token"
-    required: true
   scope:
     description: "Test scope (e.g. mr-github, mr-github-slim)"
     required: false

@@ -615,7 +615,14 @@ def unpermute(
         output_tokens.scatter_add_(
             0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
         )
-    return output_tokens.to(dtype=input_dtype)
+    out = output_tokens.to(dtype=input_dtype)
+    # Explicitly release intermediate tensor references to enable CUDA
+    # caching allocator to reclaim memory immediately during full
+    # recomputation. Without this, scatter_add_/index_add_ autograd
+    # references prevent GC until the next training iteration.
+    # See: https://github.com/NVIDIA/Megatron-LM/issues/3221
+    del output_tokens, permuted_tokens, sorted_indices
+    return out
 
 
 def sort_chunks_by_idxs(
@@ -965,9 +972,9 @@ def compute_routing_scores_for_aux_loss(
         score_function (str): The score function to use. Can be "softmax", "sigmoid"
                               or "sqrtsoftplus".
         fused (bool, optional): Whether to use the fused version. Defaults to False.
-        padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                               Shape in [num_tokens]. True for valid tokens,
-                                               False for padding tokens. Defaults to None.
+        padding_mask (torch.Tensor, optional): Boolean mask indicating padding positions.
+                                               Shape [num_tokens]. True = padding (exclude),
+                                               False = valid (include). Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The routing map and the normalized routing scores.
@@ -1163,6 +1170,7 @@ def track_moe_metrics(
     force_initialize: bool = False,
     track_names: Optional[List[str]] = None,
     num_layers: Optional[int] = None,
+    num_moe_layers: Optional[int] = None,
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
     mtp_num_layers: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
@@ -1180,6 +1188,7 @@ def track_moe_metrics(
         force_initialize=force_initialize,
         track_names=track_names,
         num_layers=num_layers,
+        num_moe_layers=num_moe_layers,
         moe_layer_freq=moe_layer_freq,
         mtp_num_layers=mtp_num_layers,
         pg_collection=pg_collection,
@@ -1378,8 +1387,11 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
 
         if te_general_gemm is not None and router_dtype != torch.float64:
-            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
-            output = output[0]
+            # cuBLASLt's non-FP8 bias epilogue expects bias and output to have the same
+            # dtype. Router parameters may be BF16 while router logits are FP32, so cast the
+            # small bias vector before passing it to TE.
+            gemm_bias = bias.to(router_dtype) if bias is not None else None
+            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=gemm_bias)[0]
         elif bias is None:
             output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
         else:
@@ -1457,22 +1469,33 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
     Returns:
         int: The alignment size for quantization.
     """
-    # CUTLASS kernel for grouped GEMM assumes 256 alignment.
-    if config.use_transformer_engine_op_fuser:
+    # TE's grouped-tensor and fused grouped-MLP kernels require 256-token alignment.
+    if config.use_transformer_engine_op_fuser or config.moe_use_grouped_tensor:
         return 256
     if config.fp8:
         return get_fp8_align_size(config.fp8_recipe)
     if config.fp4:
         return get_fp4_align_size(config.fp4_recipe)
-    # Only FP8 or FP4 requires padding. Defaults to 0.
+    # Legacy high-precision grouped GEMM does not require padding. Defaults to 0.
     return 0
+
+
+def _deepep_permute_pads_grouped_tensor_input(config: TransformerConfig) -> bool:
+    """Whether DeepEP fused permutation pads input for TE grouped-tensor GEMM."""
+    return (
+        config.moe_use_grouped_tensor
+        and config.moe_token_dispatcher_type == "flex"
+        and config.moe_flex_dispatcher_backend == "deepep"
+        and config.moe_permute_fusion
+        and fused_permute_and_pad_with_probs is not None
+    )
 
 
 def skip_routed_expert_padding(config: TransformerConfig) -> bool:
     """Whether the expert module should skip quantization padding.
 
-    Returns True when padding is already applied by the router or the
-    HybridEP / NCCL-EP dispatcher.
+    Returns True when padding is already applied by the router, the HybridEP / NCCL-EP
+    dispatcher, or DeepEP's fused permutation kernel.
     """
     if config.moe_router_padding_for_quantization:
         return True
@@ -1480,6 +1503,8 @@ def skip_routed_expert_padding(config: TransformerConfig) -> bool:
         "hybridep",
         "ncclep",
     ):
+        return True
+    if _deepep_permute_pads_grouped_tensor_input(config):
         return True
     return False
 

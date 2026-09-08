@@ -9,6 +9,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import situ_glu, tanh_soft_clamp
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
@@ -287,20 +288,41 @@ class SharedExpertMLP(MLP):
                         intermediate_parallel,
                         bias_parallel,
                         self.config.activation_func_fp8_input_store,
+                        clamp_value=self.config.activation_func_clamp_value,
+                        gate_clamp_scale=self.config.activation_func_tanh_clamp_scale,
+                        linear_clamp_scale=self.config.activation_func_tanh_clamp_scale_linear,
                     )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")
             else:
                 if bias_parallel is not None:
                     intermediate_parallel = intermediate_parallel + bias_parallel
+                tanh_clamp_scale = self.config.activation_func_tanh_clamp_scale
                 if self.config.gated_linear_unit:
+                    if tanh_clamp_scale is not None:
+                        intermediate_parallel = situ_glu(
+                            intermediate_parallel,
+                            tanh_clamp_scale,
+                            self.config.activation_func_tanh_clamp_scale_linear,
+                            self.config.glu_linear_offset,
+                        )
+                    else:
 
-                    def glu(x):
-                        x = torch.chunk(x, 2, dim=-1)
-                        return self.config.activation_func(x[0]) * x[1]
+                        def glu(x):
+                            x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                            if (val := self.config.activation_func_clamp_value) is not None:
+                                x_glu = x_glu.clamp(min=None, max=val)
+                                x_linear = x_linear.clamp(min=-val, max=val)
+                            return self.config.activation_func(x_glu) * (
+                                x_linear + self.config.glu_linear_offset
+                            )
 
-                    intermediate_parallel = glu(intermediate_parallel)
+                        intermediate_parallel = glu(intermediate_parallel)
                 else:
+                    if tanh_clamp_scale is not None:
+                        intermediate_parallel = tanh_soft_clamp(
+                            intermediate_parallel, tanh_clamp_scale
+                        )
                     intermediate_parallel = self.activation_func(intermediate_parallel)
 
             self.cached_fc2_input = intermediate_parallel
@@ -416,6 +438,15 @@ class FusedSharedExpertMLP(SharedExpertMLP):
                 f"fused kernel, but got activation_func={self.config.activation_func}, "
                 f"gated_linear_unit={self.config.gated_linear_unit}."
             )
+        if self.config.activation_func_clamp_value is not None and (
+            not is_te_min_version("2.17.0.dev0")
+            or not hasattr(te.pytorch.ops, "ScaledClampedQGeGLU")
+        ):
+            raise RuntimeError(
+                f"{self.__class__.__name__} requires Transformer Engine >= 2.17.0.dev0 "
+                "with pytorch.ops.ScaledClampedQGeGLU when "
+                "activation_func_clamp_value is set."
+            )
         if self.config.moe_shared_expert_glu_interleave_size is None:
             raise ValueError(
                 f"{self.__class__.__name__} requires "
@@ -452,7 +483,7 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         return self._fused_grouped_swiglu_recipe
 
     def _make_fused_grouped_swiglu_ops(self) -> torch.nn.Module:
-        """Construct GroupedLinear(num_groups=1) -> ScaledSwiGLU -> GroupedLinear."""
+        """Construct the grouped-linear shared-expert MLP operations."""
         ops = te.pytorch.ops.Sequential()
         tp_world_size = get_pg_size(self.tp_group)
         rng_state_tracker_function = None
@@ -475,7 +506,16 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         op._glu_interleave_size = glu_interleave_size
         ops.append(op)
 
-        activation_op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size)
+        clamp_value = self.config.activation_func_clamp_value
+        if clamp_value is None:
+            activation_op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave_size)
+        else:
+            activation_op = te.pytorch.ops.ScaledClampedQGeGLU(
+                glu_interleave_size=glu_interleave_size,
+                alpha=1.0,
+                limit=clamp_value,
+                glu_linear_offset=0.0,
+            )
         # Shared experts are not router-gated. Mark this fused-op instance so
         # TE can omit the optional forward cuDNN probability tensor without
         # changing the semantics of routed single-group MLPs.

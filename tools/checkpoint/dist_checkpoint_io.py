@@ -240,7 +240,7 @@ def save_dist_checkpoint_full(
     raw_state_dict = OrderedDict()
     for bare_key, tensor in model_state_dict.items():
         full_key = f"{model_prefix}{bare_key}" if model_prefix else bare_key
-        raw_state_dict[full_key] = tensor.contiguous() if tensor.is_contiguous() else tensor.contiguous()
+        raw_state_dict[full_key] = tensor.contiguous()
 
     writer = FileSystemWriter(save_dir)
     dcp.save(

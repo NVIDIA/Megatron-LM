@@ -345,8 +345,11 @@ def core_transformer_config_from_args(args, config_class=None):
     if args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
         if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
-            kw_args['experimental_attention_variant'] = 'dsa'
+            # Preserve an explicitly selected D-attention implementation while keeping
+            # the existing DSA default for legacy hybrid patterns.
+            kw_args['experimental_attention_variant'] = args.experimental_attention_variant or 'dsa'
 
     kw_args['inference_sampling_seed'] = args.seed
 
@@ -457,6 +460,7 @@ def gpt_config_from_args(
         kwargs["transformer_layer_spec"] = import_module(args.spec)
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
+    kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)
     kwargs["position_embedding_type"] = args.position_embedding_type
     kwargs["rotary_percent"] = args.rotary_percent
     kwargs["rotary_base"] = args.rotary_base
@@ -508,6 +512,7 @@ def hybrid_config_from_args(
         kwargs["hybrid_stack_spec"] = import_module(args.spec)
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
+    kwargs["logit_dtype"] = getattr(args, "logit_dtype", None)
     kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern
     kwargs["position_embedding_type"] = args.position_embedding_type
     kwargs["rotary_percent"] = args.rotary_percent

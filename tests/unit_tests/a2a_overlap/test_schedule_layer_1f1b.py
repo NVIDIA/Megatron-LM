@@ -27,6 +27,7 @@ from tests.unit_tests.a2a_overlap.utils import (
     reset_model,
 )
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.moe.test_token_dispatcher import is_nccl_ep_fp8_dispatch_available
 
 # Transformer Engine 2.17 aborts in the A2A overlap suite with a pybind11 GIL dec_ref failure.
 pytestmark = pytest.mark.flaky_in_dev
@@ -476,24 +477,38 @@ class TestA2AOverlap:
     @pytest.mark.skipif(
         not is_op_fuser_available(), reason="op-fuser (static-shape/zero-copy) needs TE>=2.14"
     )
-    def test_transformer_layer_overlap_zero_copy(self):
+    @pytest.mark.parametrize(
+        "wire_dtype", ["bf16", pytest.param("mxfp8", marks=pytest.mark.launch_on_gb200)]
+    )
+    def test_transformer_layer_overlap_zero_copy(self, wire_dtype):
         """ncclEP zero-copy under 1F1B a2a overlap must match the non-overlap reference.
 
         Zero-copy stays enabled in both runs, so this isolates the overlap schedule. It also
         compares the two ways zero-copy makes the dispatch-backward gradient symm-mem-backed:
         the reference gets it from the op-fuser's ``grad_input_buffer``, the overlap run from
         ``StageDispatchBwdGrad`` staging into the same buffer (plus the free_input symm guard).
-        bf16 op-fuser (SwiGLU, tp=1) -- no fp8/Blackwell dependency.
+        bf16 op-fuser (SwiGLU, tp=1) -- wire_dtype="bf16" has no fp8/Blackwell dependency.
+
+        wire_dtype="mxfp8" additionally sends the dispatch-fwd / combine-bwd payloads as the
+        opaque MXFP8 carrier. Both captures use the same wire dtype, so quantization is
+        common-mode; what this asserts is that the overlap schedule's staging/detach/free of
+        node-boundary tensors preserves the carrier bytes.
         """
+        if wire_dtype == "mxfp8" and not is_nccl_ep_fp8_dispatch_available():
+            pytest.skip("NCCL EP MXFP8 wire needs EpBuffer quant-recipe support and MXFP8 hardware")
         extra_kwargs = {}
         apply_flex_backend_kwargs(extra_kwargs, "flex", "ncclep")
         extra_kwargs.update(
             moe_ncclep_zero_copy=True,
-            moe_ncclep_static_shape=True,
+            # zero-copy needs the static path; generous factor since the small test token
+            # counts make routing imbalance high and overflow hard-traps.
+            moe_expert_rank_capacity_factor=8.0,
             use_transformer_engine_op_fuser=True,
             gated_linear_unit=True,
             activation_func=F.silu,
             overlap_moe_expert_parallel_comm=True,
+            moe_dispatch_fwd_dtype=wire_dtype,
+            moe_combine_bwd_dtype=wire_dtype,
         )
         config = get_test_config(extra_kwargs=extra_kwargs)
         microbatches = 4

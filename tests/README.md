@@ -15,4 +15,14 @@ passing as expected.
     d. Optionally pass in `--only-failing` to only download golden values for failing tests only
     e. Ensure you are only checking-in golden values for tests are you updating
 
+### Golden-value precision
+
+New training golden files preserve the full scalar precision available in TensorBoard and mark each metric with
+`"value_precision": "full"`. Deterministic checks compare these values without rounding. Approximate checks round
+both the golden and actual values to five decimal places before applying their configured tolerances.
+
+Existing golden files do not need to be regenerated. A metric without `value_precision` is treated as a legacy
+five-decimal golden, so deterministic checks retain their previous behavior until that golden is deliberately
+regenerated.
+
 The Github CI infra may not be appropriate for Perf tests. Perf tests may be more appropriate for nightly jobs on other infra.
