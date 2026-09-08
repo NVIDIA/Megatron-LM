@@ -600,25 +600,25 @@ class PagedStashManager:
 
         cuda_factor = moe_paged_stash_buffer_size_factor_cuda
         cpu_factor = moe_paged_stash_buffer_size_factor_cpu
+        avg_tokens_dict = self.max_avg_tokens_across_vp_stages
+        has_avg_capacity = bool(avg_tokens_dict) and any(
+            num_tokens > 0 for num_tokens in avg_tokens_dict.values()
+        )
 
         # Both factors use the same sign convention:
         # - positive: size based on avg_num_tokens-derived maxima
         # - negative: size based on actual num_tokens-derived maxima (legacy behavior)
         # Scale is always abs(factor). For CPU, 0 means no host buffer.
-        if cuda_factor >= 0:
-            max_tokens_dict = self.max_avg_tokens_across_vp_stages
+        if cuda_factor >= 0 and has_avg_capacity:
+            max_tokens_dict = avg_tokens_dict
             cuda_scale = cuda_factor
         else:
             max_tokens_dict = self.max_tokens_across_vp_stages
-            cuda_scale = -cuda_factor
-
-        # Fallback safety: if avg-based dict is not available/populated yet, use actual-max dict.
-        if not max_tokens_dict:
-            max_tokens_dict = self.max_tokens_across_vp_stages
+            cuda_scale = abs(cuda_factor)
 
         if cpu_factor > 0:
             host_tokens_dict = (
-                self.max_avg_tokens_across_vp_stages or self.max_tokens_across_vp_stages
+                avg_tokens_dict if has_avg_capacity else self.max_tokens_across_vp_stages
             )
             cpu_scale = cpu_factor
         elif cpu_factor < 0:
