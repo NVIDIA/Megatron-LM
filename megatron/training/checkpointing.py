@@ -1369,7 +1369,7 @@ def generate_state_dict(
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict["model"])
-    if args.swiglu:
+    if args.swiglu or getattr(args, "situ_glu", False):
         if "optimizer" in state_dict:
             model_state_dict, optimizer_state_dict = handle_swiglu_in_state_dict(
                 model, state_dict["model"], state_dict["optimizer"]
@@ -1927,6 +1927,9 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('add_qkv_bias', force=True)
     _set_arg('squared_relu', force=True)
     _set_arg('swiglu', force=True)
+    _set_arg('situ_glu', force=True)
+    _set_arg('situ_glu_beta1', force=True)
+    _set_arg('situ_glu_beta2', force=True)
     _set_arg('untie_embeddings_and_output_weights', force=True)
     _set_arg('apply_layernorm_1p', force=True)
     _set_arg('normalization', force=True)
@@ -1955,6 +1958,10 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('moe_single_grouped_weight', force=True)
     _set_arg('moe_single_grouped_bias', force=True)
     _set_arg('moe_shared_expert_intermediate_size', force=True)
+    _set_arg('moe_router_load_balancing_type', force=True)
+    _set_arg('moe_aux_loss_coeff', force=True)
+    _set_arg('moe_router_quantile_balancing_estimation_scope', force=True)
+    _set_arg('moe_router_qb_num_bins', force=True)
     _set_arg('moe_router_score_function', force=True)
     _set_arg('moe_router_enable_expert_bias', force=True)
     _set_arg('moe_router_topk_scaling_factor', force=True)
@@ -1974,6 +1981,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
 
     # MoE latent projection.
     _set_arg('moe_latent_size', force=True)
+    _set_arg('moe_latent_up_projection_rmsnorm', force=True)
 
     # Tokenizer args.
     if args.use_tokenizer_model_from_checkpoint_args:
