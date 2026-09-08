@@ -241,13 +241,6 @@ def _prepare_contiguous_cp_kwargs(model, kwargs):
     return kwargs
 
 
-def _uses_csa(model) -> bool:
-    """True when the model's attention is the compressed-sparse variant."""
-    from megatron.lite.primitive.modules.attention.csa import CompressedSparseAttention
-
-    return any(isinstance(m, CompressedSparseAttention) for m in model.modules())
-
-
 def _prepare_model_forward_kwargs(model, batch: PackedBatch):
     # THD-packed inputs (1-D values, or a single padded [1, S] row) carry their own
     # cu_seqlens and go through the packed builder. A dense multi-row [B, S] batch is
@@ -257,14 +250,6 @@ def _prepare_model_forward_kwargs(model, batch: PackedBatch):
     is_thd_packed = input_ids.dim() == 1 or (input_ids.dim() == 2 and input_ids.size(0) == 1)
     if is_thd_packed:
         return _prepare_packed_batch_kwargs(model, batch)
-    if _uses_csa(model):
-        # CSA has no dense BSHD path; refusing here names the constraint at the
-        # boundary that can still act on it, instead of raising frames deeper.
-        raise NotImplementedError(
-            f"DeepSeek-V4 CSA has no dense BSHD path, but this batch is "
-            f"[B, S] with B={input_ids.size(0)}. Pack the batch (1-D values, or a "
-            f"single [1, S] row with cu_seqlens) so it takes the THD route."
-        )
     kwargs = _base_model_forward_kwargs(batch)
     return _prepare_contiguous_cp_kwargs(model, kwargs)
 

@@ -544,9 +544,10 @@ class CompressedSparseAttention(nn.Module):
         # supported BSHD routes are the CP=1 fused sparse kernels dispatched above.
         # packed CP path (``packed_seq_params is not None`` above), and the only supported BSHD routes are the CP=1 fused sparse kernels dispatched above.
         raise NotImplementedError(
-            "DSv4 CSA BSHD path supports only the CP=1 fused sparse backends; pass "
-            "packed_seq_params for the THD context-parallel path. The dense BSHD "
-            "fallback was removed."
+            f"DSv4 CSA has no dense BSHD path: it supports the CP=1 fused sparse "
+            f"backends, or THD with packed_seq_params. This call had neither, with "
+            f"input {tuple(x.shape)}. Pack the batch (1-D values, or a single "
+            f"[1, S] row with cu_seqlens) so it takes the THD route."
         )
 
     def _project_context(
