@@ -1435,6 +1435,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         stride: int = 1,
         name: str | None = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        eps: float | None = None,
     ):
         """
         Args:
@@ -1558,7 +1559,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             super().__init__(
                 in_features=input_size,
                 out_features=gtp_output_size,
-                eps=self.config.layernorm_epsilon,
+                eps=self.config.layernorm_epsilon if eps is None else eps,
                 sequence_parallel=self.config.sequence_parallel,
                 fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
                 tp_group=tp_group if torch.distributed.is_initialized() else None,
