@@ -1200,7 +1200,10 @@ class TestTECudaGraphHelper:
         helper.config = _te_whole_moe_paged_stash_config(cuda_graph_modules=cuda_graph_modules)
         helper.flattened_callables = [layer]
         helper.callables_per_chunk = []
+        helper.chunks_with_decoder = []
         helper.num_microbatches = 1
+        helper._thd_rotary_seq_lens = {}
+        helper._capture_finished = False
         helper._start_capturing = lambda: 0.0
         helper._finish_capturing = lambda _start_time: None
         helper._get_cuda_graph_input_data = lambda: ([()], {'_order': [1, -1]})
