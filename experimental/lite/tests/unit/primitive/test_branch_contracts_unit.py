@@ -293,9 +293,10 @@ def _reference_post(x, residual, post, comb):
     return placed + mixed
 
 
+@pytest.mark.gpus(1)
 def test_orientation_is_not_symmetric() -> None:
     """Guard the guard: passing ``comb`` un-transposed must disagree."""
-    _, residual, _, comb = _make_inputs(torch.float32, "cpu")
+    _, residual, _, comb = _make_inputs(torch.float32, "cuda")
     assert not torch.allclose(comb, comb.transpose(-1, -2), rtol=1e-3, atol=1e-3)
     correct = torch.matmul(comb, residual)
     swapped = torch.matmul(comb.transpose(-1, -2), residual)
