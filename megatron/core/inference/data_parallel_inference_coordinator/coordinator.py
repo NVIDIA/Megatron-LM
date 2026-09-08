@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import bisect
 import errno
 import faulthandler
 import json
@@ -129,6 +130,9 @@ class DataParallelInferenceCoordinator:
                 expected to connect.
             tokenizer: The tokenizer to use for prompt tokenization and detokenization.
             inference_coordinator_port (Optional[int]): The TCP port number to bind the server to.
+            deterministic_mode (bool): Deprecated and ignored. Ranks are always ordered by
+                identity, so scheduling is reproducible in every mode; the keyword is kept so
+                existing callers keep working.
             prefix_cache_ttl_seconds (float): How long a routed block is assumed to
                 still be held by the engine it was routed to.
             prefix_caching_routing_alpha (float): How hard to penalise load when
@@ -203,11 +207,14 @@ class DataParallelInferenceCoordinator:
             self.identities_of_data_parallel_ranks.append(identity)
         logging.info("Inference Coordinator: Connected with data parallel ranks...")
 
-        # In deterministic mode, sort identities for consistent scheduling order.
-        if deterministic_mode:
-            self.identities_of_data_parallel_ranks = deque(
-                sorted(self.identities_of_data_parallel_ranks)
-            )
+        # Order the ranks by identity so scheduling does not depend on the order in which they
+        # happened to connect: the rank indices used for least-loaded tie-breaking and prefix
+        # cache affinity are derived from this order below, and _register_rank_identity keeps
+        # it for engines that join later. Sorting data_parallel_size short byte strings once at
+        # start-up is free, so it is not gated on deterministic_mode.
+        self.identities_of_data_parallel_ranks = deque(
+            sorted(self.identities_of_data_parallel_ranks)
+        )
 
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
@@ -292,14 +299,24 @@ class DataParallelInferenceCoordinator:
 
         Called when a rank dynamically connects to a running coordinator
         (e.g. in tests that spawn the coordinator with data_parallel_size=0
-        and let engines register after the fact).
+        and let engines register after the fact). The rank takes the slot it
+        would have had at start-up -- identities stay sorted -- and the
+        index-keyed state above it shifts up by one, the mirror image of
+        _remove_engine, so routing does not depend on connection timing.
         """
         if identity in self.identity_to_rank_index:
             return
-        new_idx = len(self._identities_list)
+        new_idx = bisect.bisect(self._identities_list, identity)
+        for ident, idx in list(self.identity_to_rank_index.items()):
+            if idx >= new_idx:
+                self.identity_to_rank_index[ident] = idx + 1
         self.identity_to_rank_index[identity] = new_idx
-        self._identities_list.append(identity)
-        self._pending_counts = np.append(self._pending_counts, np.int32(0))
+        self._identities_list.insert(new_idx, identity)
+        self._pending_counts = np.insert(self._pending_counts, new_idx, np.int32(0))
+        self._hash_table = {
+            h: {(r + 1 if r >= new_idx else r): ts for r, ts in rank_ts.items()}
+            for h, rank_ts in self._hash_table.items()
+        }
         logging.info(
             "Coordinator: registered engine %s as rank index %d (now %d engines)",
             identity,
@@ -607,7 +624,8 @@ class DataParallelInferenceCoordinator:
     def _handle_rank_registration(self, sender_identity):
         """Register a data parallel rank that connected to a running coordinator."""
         if sender_identity not in self.identities_of_data_parallel_ranks:
-            self.identities_of_data_parallel_ranks.append(sender_identity)
+            ranks = self.identities_of_data_parallel_ranks
+            ranks.insert(bisect.bisect(list(ranks), sender_identity), sender_identity)
             self._register_rank_identity(sender_identity)
 
     def detokenize(self, finished_request):
@@ -674,7 +692,8 @@ class DataParallelInferenceCoordinator:
                 once the coordinator is ready to accept connections.
             inference_coordinator_port (int): The port to bind to.
             data_parallel_size (int): The number of expected data parallel instances.
-            deterministic_mode (bool): Whether to enable deterministic scheduling.
+            deterministic_mode (bool): Deprecated and ignored; scheduling order is always
+                deterministic (see ``__init__``).
             block_size_tokens (Optional[int]): Token block size for prefix caching hashing.
             enable_prefix_caching (bool): Whether prefix caching is enabled.
             prefix_caching_coordinator_policy (PrefixCachingCoordinatorPolicy): Routing policy.
