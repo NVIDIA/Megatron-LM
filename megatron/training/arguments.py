@@ -3381,9 +3381,6 @@ def _add_distributed_args(parser):
                        help='If set, enable full sharding in megatron-fsdp Hybrid Sharded Data Parallel (HSDP) mode.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
                        help='Number of Distributed Optimizer copies across Data Parallel domain.')
-    group.add_argument('--expert-num-distributed-optimizer-instances', type=int, default=1,
-                       help='Number of optimizer instances across the expert-DP domain for MFSDP v2. '
-                            'Defaults to 1, which disables expert HSDP.')
     group.add_argument('--torch-fsdp2-no-reshard-after-forward', action='store_false', dest='torch_fsdp2_reshard_after_forward',
                        help='Whether to reshard weights after forward pass when using PyTorch FSDP2. '
                        'Set to enable FSDP ZeRO-2.')

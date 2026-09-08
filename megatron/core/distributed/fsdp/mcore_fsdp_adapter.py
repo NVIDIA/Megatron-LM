@@ -623,15 +623,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 optimizer=[axis.optimizer],
             )
         if config.expert_model_parallel_size > 1:
-            if has_expert_outer_dp_axis := (
-                ddp_config.expert_num_distributed_optimizer_instances > 1
-            ):
-                # Expert parameters get an outer DP axis. There is no HSDP/HFSDP special case:
-                # each axis takes the placements of its own strategy.
+            if has_outer_dp_axis:
+                # Match v1 topology: dense and expert parameters share the outer DP axis,
+                # while experts use the existing expert-DP inner group. Only placements differ.
                 expert_dp_mesh = _build_hybrid_dp_mesh(
-                    pg_collection.expert_inter_dist_opt,
-                    pg_collection.expert_intra_dist_opt,
-                    device_type,
+                    pg_collection.inter_dist_opt, pg_collection.intra_expt_dp, device_type
                 )
                 expert_inner = _DATA_PARALLEL_PLACEMENTS[
                     ddp_config.expert_data_parallel_sharding_strategy
@@ -795,11 +791,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 "MFSDP v2 requires data_parallel_sharding_strategy='optim_grads_params'."
             )
         if (
-            ddp_config.num_distributed_optimizer_instances < 1
-            or ddp_config.expert_num_distributed_optimizer_instances < 1
-        ):
-            raise ValueError("MFSDP v2 distributed optimizer instance counts must be positive.")
-        if (
             ddp_config.outer_dp_sharding_strategy != "no_shard"
             and ddp_config.num_distributed_optimizer_instances <= 1
         ):
@@ -812,13 +803,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if ddp_config.expert_outer_dp_sharding_strategy != "no_shard" and (
             config.expert_model_parallel_size <= 1
-            or ddp_config.expert_num_distributed_optimizer_instances <= 1
+            or ddp_config.num_distributed_optimizer_instances <= 1
         ):
             raise ValueError(
                 "MFSDP v2 expert_outer_dp_sharding_strategy="
                 f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires an outer expert-DP "
-                "axis, i.e. expert parallelism and "
-                "expert_num_distributed_optimizer_instances > 1."
+                "axis, i.e. expert parallelism and num_distributed_optimizer_instances > 1."
             )
         if config.gradient_accumulation_fusion:
             raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
