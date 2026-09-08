@@ -289,8 +289,8 @@ class OwnerGatherPlan:
             device: Device for the send buffers.
             dtype: Dtype for the send buffers.
         """
-        send_sizes: dict[int, int] = {o: 0 for o in range(dp_size) if o != this_rank}
-        recv_sizes: dict[int, int] = {s: 0 for s in range(dp_size) if s != this_rank}
+        send_sizes: dict[int, int] = {owner: 0 for owner in range(dp_size) if owner != this_rank}
+        recv_sizes: dict[int, int] = {sender: 0 for sender in range(dp_size) if sender != this_rank}
         for param_index, plan in enumerate(plans):
             owner = owners[param_index]
             if owner != this_rank:
@@ -306,7 +306,7 @@ class OwnerGatherPlan:
             send_buffers[owner] = torch.empty(size, dtype=dtype, device=device)
 
         # Fill each owner's send buffer in param order.
-        cursors: dict[int, int] = {o: 0 for o in send_buffers}
+        cursors: dict[int, int] = {owner: 0 for owner in send_buffers}
         own_shards: dict[int, torch.Tensor] = {}
         for param_index, (plan, shard) in enumerate(zip(plans, local_shards)):
             owner = owners[param_index]
@@ -418,8 +418,10 @@ class OwnerScatterPlan:
             dtype: Dtype for the send buffers.
         """
         owned_indices = [i for i in range(len(plans)) if owners[i] == this_rank]
-        send_sizes: dict[int, int] = {d: 0 for d in range(dp_size) if d != this_rank}
-        recv_sizes: dict[int, int] = {o: 0 for o in range(dp_size) if o != this_rank}
+        send_sizes: dict[int, int] = {
+            receiver: 0 for receiver in range(dp_size) if receiver != this_rank
+        }
+        recv_sizes: dict[int, int] = {owner: 0 for owner in range(dp_size) if owner != this_rank}
         for param_index in owned_indices:
             plan = plans[param_index]
             for dest in range(dp_size):
@@ -436,7 +438,7 @@ class OwnerScatterPlan:
         for dest, size in send_sizes.items():
             send_buffers[dest] = torch.empty(size, dtype=dtype, device=device)
 
-        cursors: dict[int, int] = {d: 0 for d in send_buffers}
+        cursors: dict[int, int] = {receiver: 0 for receiver in send_buffers}
         for dest in range(dp_size):
             if dest == this_rank:
                 continue
