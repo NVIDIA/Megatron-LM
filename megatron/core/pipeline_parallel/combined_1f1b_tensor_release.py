@@ -17,6 +17,80 @@ Phase finalization hands remaining deferred tensors back to their producer
 streams and exports outputs leaving the plan.  Distinct edge tensors sharing one
 storage are rejected because tensor-object ownership cannot safely represent
 aliases when an input's entire storage may be released.
+
+The manager keeps two kinds of strong references:
+
+* ``_owners[tensor_id]`` binds a published tensor to the stream and node that
+  produced it.
+* ``_pending[producer_stream]`` holds a consumed cross-stream tensor until that
+  producer stream has waited for the consumer's work.
+
+Each real schedule node participates in the following workflow.  ``consume``
+and ``publish`` below are the two halves of
+``consume_inputs_and_publish_outputs`` or
+``consume_output_grads_and_publish_input_grads``::
+
+    Node A produces tensor T on stream S_a
+      wait(event, S_a) -> drain(S_a) -> run A -> record(event, S_a)
+      consume(A inputs) + publish(T as owned by S_a)
+                         |
+             +-----------+---------------------------+
+             | stays in managed chain                | leaves managed chain
+             v                                       v
+    Node B consumes tensor T on stream S_b     export(T)
+      wait(event, S_b) -> drain(S_b)             remove owner; do not release
+      -> run B -> record(event, S_b)
+      consume(T) + publish(B outputs as owned by S_b)
+          |
+          +-- S_a == S_b: apply the release action immediately
+          |
+          +-- S_a != S_b: keep T in _pending[S_a]
+                                 |
+                                 v
+    A later node acquires S_a
+      wait(event, S_a) -> drain(S_a) -> apply T's release action -> run node
+
+    At the end of the forward or backward phase
+      finalize_phase(event, outputs)
+        -> wait + drain every stream remaining in _pending
+        -> export(outputs)
+        -> assert that _pending and _owners are empty
+
+The shared plan event is recorded before the consumer calls ``consume``.
+Consequently, the later ``wait(event, S_a)`` orders the producer stream after
+the consumer before ``drain(S_a)`` releases T.  The release action is
+``EMPTY_STORAGE`` for releasable forward inputs and ``DROP_REFERENCE`` for
+backward gradients.  The latter only ends the manager's strong reference; it
+does not resize gradient storage.
+
+A forward node calls ``consume_inputs_and_publish_outputs``: its inputs are
+consumed with ``EMPTY_STORAGE`` when ``free_input`` is true (otherwise with no
+release action), and its outputs are published.  A backward node first calls
+``consume_forward_outputs`` to end ownership of forward outputs retained by
+autograd without releasing them.  It then calls
+``consume_output_grads_and_publish_input_grads`` to consume output gradients
+with ``DROP_REFERENCE`` and publish the input gradients for the next backward
+node.
+
+The public operations have the following roles:
+
+* ``consume`` removes the input's owner binding after the consumer has finished.
+  It releases immediately on the owner stream, defers to ``_pending`` across
+  streams, or uses ``record_stream`` for values that entered from outside the
+  managed chain.  An action of ``None`` only removes ownership because autograd
+  or the caller still controls the tensor's lifetime.
+* ``publish`` creates an owner binding for each output using the current node's
+  stream.  It does not synchronize streams or release storage.
+* ``drain(stream)`` applies only the releases deferred to ``stream``.  Callers
+  invoke it after that stream waits on the shared plan event, either when a node
+  acquires the stream or during phase finalization.
+* ``export(value)`` removes owner bindings without releasing storage.  It is
+  used when a tensor leaves the managed node chain for pipeline communication,
+  post/pre-processing, or the caller.
+* ``finalize_phase(event, ...)`` is the terminal flush and consistency check.
+  It waits and drains every producer stream still in ``_pending``, exports the
+  phase outputs, and then requires both pending releases and owner bindings to
+  be empty.
 """
 
 from __future__ import annotations
