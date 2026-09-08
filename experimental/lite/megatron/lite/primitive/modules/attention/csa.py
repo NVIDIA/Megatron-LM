@@ -155,13 +155,17 @@ def rope_tables_for_packed_batch(
     position tensor's address; the caching allocator reuses addresses, so that
     could return tables built for different positions. Attaching them to the
     object that defines the positions has no such failure mode.
+
+    Core caches at a different shape and needs none of this: it builds one table
+    over ``[0, max_seq_len)`` keyed on scalars alone and lets the kernel index it
+    by ``cu_seqlens``. Reaching that here means moving the indexer off lite's
+    ``apply_partial_rope``, which consumes per-row tables, so it is left as
+    follow-up rather than approximated. The consequence to know about: editing
+    ``cu_seqlens`` in place on a params object already carrying tables returns
+    the ones built for the old boundaries.
     """
-    # ``cu_seqlens._version`` catches an in-place edit of the lengths on a params
-    # object that is otherwise being reused. Here that is a sound use of the
-    # counter: the object pins the tensor's identity, so the counter only has to
-    # answer whether it changed, not whether it is the same tensor.
     key = (int(global_start), int(length), int(rope_head_dim), float(rope_theta),
-           bool(use_yarn), str(device), str(dtype), cu_seqlens._version)
+           bool(use_yarn), str(device), str(dtype))
     cache = getattr(packed_seq_params, "_lite_rope_tables", None)
     if cache is None:
         cache = {}
