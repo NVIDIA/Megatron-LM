@@ -458,6 +458,12 @@ class MTPInferenceMixin:
         # cache with no valid block table), so it uses the cache-free graph; both still issue
         # identical fixed-size (expert-padded) MoE all-to-alls, keeping EP in lockstep.
         mtp_graph_key_prefix = "mtp_kv" if mtp_kv_cache_on else "mtp"
+        # The cache-free ("mtp") graph is captured with no `mtp_inference_context` kwarg at all
+        # (see `DynamicInferenceEngine.create_cuda_graphs`), and the EP dummy path replays it the
+        # same way. Replay requires the exact captured kwarg set, so pass the kwarg only on the
+        # KV-aware path -- sending an explicit `mtp_inference_context=None` into a cache-free
+        # replay fails with "CUDA graph argument mismatch: Unexpected kwargs".
+        mtp_context_kwarg = {"mtp_inference_context": context} if mtp_kv_cache_on else {}
         # A still-prefilling chunked request (chunked_prefill_request_id != -1) is always the last
         # active request and has base_position mid-prompt, so it must not draft — it decodes only
         # once its prompt completes. Excluding it (reducing the draft count by 1) makes it a padding
@@ -495,7 +501,7 @@ class MTPInferenceMixin:
                         if context.using_cuda_graph_this_step()
                         else None
                     ),
-                    mtp_inference_context=context if mtp_kv_cache_on else None,
+                    **mtp_context_kwarg,
                 )
                 if mtp_kv_cache_on:
                     context._mtp_advance_decode_step()

@@ -788,7 +788,10 @@ class TestSerialMtpDraftLoop:
         assert len(model.mtp_step_calls) == 2, "no extra append when the KV cache is off"
         for call in model.mtp_step_calls:
             assert call["cache_key"][0] == "mtp"
-            assert call["mtp_inference_context"] is None
+            # The kwarg must be ABSENT, not None: the cache-free ("mtp", ...) graph is captured
+            # without it and replay requires the exact captured kwarg set, so an explicit
+            # `mtp_inference_context=None` fails with "argument mismatch: Unexpected kwargs".
+            assert "mtp_inference_context" not in call
         context._mtp_begin_decode.assert_not_called()
         context._mtp_end_decode.assert_not_called()
 
