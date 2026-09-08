@@ -2015,6 +2015,19 @@ def test_build_extra_eos_token_id_set_rejects_booleans():
     assert controller.extra_eos_token_id_set == frozenset()
 
 
+@pytest.mark.launch_on_gb200
+def test_mtp_cross_depth_sharing_rejects_speculative_decoding_before_distributed_setup():
+    model_config = SimpleNamespace(mtp_repeated_layer_shared_components=["sparse_attention_index"])
+    inference_config = SimpleNamespace(num_speculative_tokens=1)
+    inference_wrapped_model = SimpleNamespace(
+        model=SimpleNamespace(config=model_config),
+        inference_context=SimpleNamespace(config=inference_config),
+    )
+
+    with pytest.raises(ValueError, match="do not provide"):
+        TextGenerationController(inference_wrapped_model, tokenizer=None)
+
+
 class TestTextGenerationController(TextGenerationControllerTestBase):
 
     @classmethod

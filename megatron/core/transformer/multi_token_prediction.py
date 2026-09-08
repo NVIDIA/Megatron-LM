@@ -37,6 +37,13 @@ from megatron.core.tensor_parallel.inference_layers import (
     is_inference_column_parallel_linear,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.forward_sharing import (
+    forward_sharing_lifetime,
+    get_forward_sharing_state,
+    is_forward_sharing_enabled,
+    mtp_repeated_sharing_lifetime,
+    preserve_forward_sharing_for_checkpoint,
+)
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -2563,6 +2570,11 @@ class MultiTokenPredictionLayer(MegatronModule):
         self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.mtp_layer_pattern = mtp_layer_pattern
         self.mhc_enabled = self.config.enable_mhc_connections
+        if self.config.mtp_repeated_layer_shared_components and mtp_layer_pattern is not None:
+            raise ValueError(
+                "mtp_repeated_layer_shared_components currently supports the GPT MTP path only, "
+                "not a hybrid MTP layer pattern."
+            )
 
         # Validate attention mask type if using transformer-based inner layers
         if self.submodules.mtp_model_layer is not None and hasattr(
@@ -3160,6 +3172,11 @@ class MultiTokenPredictionLayer(MegatronModule):
                 cp_layout_plan=cp_layout_plan,
             )
 
+        if is_forward_sharing_enabled(self.config):
+            custom_forward = preserve_forward_sharing_for_checkpoint(
+                custom_forward, packed_seq_params, self.config, attention_mask_arg=3
+            )
+
         # Decide the outer quantization context, matching
         # ``transformer_block._checkpointed_forward``. Only ``fp8 + delayed
         # scaling`` needs an active context at the ``te_checkpoint`` entry
@@ -3346,6 +3363,11 @@ class MultiTokenPredictionLayer(MegatronModule):
             and self.mtp_layer_pattern is None
         )
         if use_outer_recompute:
+            if self.config.mtp_repeated_layer_shared_components:
+                raise RuntimeError(
+                    "Repeated-MTP cross-depth sharing does not support "
+                    "full activation recomputation."
+                )
             hidden_states = self._checkpointed_forward(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
@@ -3876,31 +3898,31 @@ class MultiTokenPredictionBlock(MegatronModule):
         if hidden_state_mixing_enabled:
             hidden_state_history = [hidden_states]
 
-        for iteration in range(self.config.mtp_num_layers):
-            layer_idx = 0 if self.mtp_use_repeated_layer else iteration
+        sharing_lifetime = nullcontext()
+        if is_forward_sharing_enabled(self.config):
+            sharing_lifetime = forward_sharing_lifetime(
+                packed_seq_params, attention_mask, self.config
+            )
+        repeated_lifetime = nullcontext()
+        forward_sharing_state = None
+        if self.config.mtp_repeated_layer_shared_components:
+            forward_sharing_state = get_forward_sharing_state(
+                packed_seq_params, attention_mask, self.config
+            )
+            repeated_layer_number = self.config.num_layers + offset + 1
+            repeated_lifetime = mtp_repeated_sharing_lifetime(
+                forward_sharing_state, repeated_layer_number
+            )
 
-            if decoder_input is not None:
-                decoder_input, _ = roll_tensor_precomputed_embeddings(
-                    decoder_input,
-                    shifts=-1,
-                    dims=0,
-                    sp_group=self.tp_group if self.sequence_parallel else None,
-                    cp_group=cp_group,
-                    packed_seq_params=packed_seq_params,
-                    return_sum=False,
-                )
-                if padding_mask is not None:
-                    # Precomputed embeddings bypass the layer's _get_embeddings,
-                    # so shift validity here alongside those embeddings.
-                    valid_mask = (~padding_mask).transpose(0, 1).contiguous()
-                    if self.sequence_parallel and valid_mask.shape[0] != decoder_input.shape[0]:
-                        # The parent may supply a full CP-local mask. Match the
-                        # embedding shard before the roll gathers its SP slices.
-                        valid_mask = scatter_to_sequence_parallel_region(
-                            valid_mask, group=self.tp_group
-                        )
-                    valid_mask, _ = roll_tensor_precomputed_embeddings(
-                        valid_mask,
+        with sharing_lifetime, repeated_lifetime as is_source_by_layer:
+            for depth in range(self.config.mtp_num_layers):
+                if is_source_by_layer is not None:
+                    is_source_by_layer[repeated_layer_number] = depth == 0
+                layer_idx = 0 if self.mtp_use_repeated_layer else depth
+
+                if decoder_input is not None:
+                    decoder_input, _ = roll_tensor_precomputed_embeddings(
+                        decoder_input,
                         shifts=-1,
                         dims=0,
                         sp_group=self.tp_group if self.sequence_parallel else None,
@@ -3908,108 +3930,129 @@ class MultiTokenPredictionBlock(MegatronModule):
                         packed_seq_params=packed_seq_params,
                         return_sum=False,
                     )
-                    padding_mask = ~valid_mask.transpose(0, 1).contiguous()
+                    if padding_mask is not None:
+                        # Precomputed embeddings bypass the layer's _get_embeddings,
+                        # so shift validity here alongside those embeddings.
+                        valid_mask = (~padding_mask).transpose(0, 1).contiguous()
+                        if self.sequence_parallel and valid_mask.shape[0] != decoder_input.shape[0]:
+                            # The parent may supply a full CP-local mask. Match the
+                            # embedding shard before the roll gathers its SP slices.
+                            valid_mask = scatter_to_sequence_parallel_region(
+                                valid_mask, group=self.tp_group
+                            )
+                        valid_mask, _ = roll_tensor_precomputed_embeddings(
+                            valid_mask,
+                            shifts=-1,
+                            dims=0,
+                            sp_group=self.tp_group if self.sequence_parallel else None,
+                            cp_group=cp_group,
+                            packed_seq_params=packed_seq_params,
+                            return_sum=False,
+                        )
+                        padding_mask = ~valid_mask.transpose(0, 1).contiguous()
 
-            # Older HSM entries predict earlier targets than the newest entry. Roll
-            # them once per depth so all candidates correspond to the same target.
-            if hidden_state_mixing_enabled and len(hidden_state_history) > 1:
-                entries_to_roll = hidden_state_history[:-1]
-                newest_entry = hidden_state_history[-1]
-                num_entries = len(entries_to_roll)
-                sequence_length, batch_size, hidden_size = entries_to_roll[0].shape
-                stacked = torch.stack(entries_to_roll, dim=0)
-                flattened = stacked.permute(0, 2, 3, 1).reshape(
-                    num_entries * batch_size, hidden_size, sequence_length
-                )
-                # Under sequence parallelism this rank holds a 1/tp slice of its CP
-                # chunks, not the chunk pair roll_tensor's CP branch assumes, so that
-                # branch's neighbour exchange fills the boundary slots with tokens from
-                # unrelated positions -- and a plausible-looking hidden state is one
-                # the mixing step cannot recognise as invalid. Withholding cp_group takes the
-                # contiguous path, which zeroes the slot that has no local continuation
-                # so the mix falls back to the newest entry there instead.
-                sequence_parallel_size = get_pg_size(self.tp_group) if self.sequence_parallel else 1
-                # Document boundaries are global too, so they need the same treatment:
-                # translated into this shard's frame, the withheld cp_group leaves the
-                # roll on its cp_size == 1 path, which then rolls each document's local
-                # piece within its own bounds and zeroes the seam.
-                roll_packed_seq_params = packed_seq_params
-                use_local_packed_roll = sequence_parallel_size > 1
-                if packed_seq_params is not None:
-                    padded_cu_seqlens = packed_seq_params.cu_seqlens_q_padded
-                    genuinely_padded = (
-                        padded_cu_seqlens is not None
-                        and padded_cu_seqlens is not packed_seq_params.cu_seqlens_q
+                # Older HSM entries predict earlier targets than the newest entry. Roll
+                # them once per depth so all candidates correspond to the same target.
+                if hidden_state_mixing_enabled and len(hidden_state_history) > 1:
+                    entries_to_roll = hidden_state_history[:-1]
+                    newest_entry = hidden_state_history[-1]
+                    num_entries = len(entries_to_roll)
+                    sequence_length, batch_size, hidden_size = entries_to_roll[0].shape
+                    stacked = torch.stack(entries_to_roll, dim=0)
+                    flattened = stacked.permute(0, 2, 3, 1).reshape(
+                        num_entries * batch_size, hidden_size, sequence_length
                     )
-                    use_local_packed_roll = use_local_packed_roll or (
-                        genuinely_padded and self.config.attention_cp_layout != "contiguous"
+                    # Under sequence parallelism this rank holds a 1/tp slice of its CP
+                    # chunks, not the chunk pair roll_tensor's CP branch assumes, so that
+                    # branch's neighbour exchange fills the boundary slots with tokens from
+                    # unrelated positions -- and a plausible-looking hidden state is one
+                    # the mixing step cannot recognise as invalid. Withholding cp_group takes the
+                    # contiguous path, which zeroes the slot that has no local continuation
+                    # so the mix falls back to the newest entry there instead.
+                    sequence_parallel_size = (
+                        get_pg_size(self.tp_group) if self.sequence_parallel else 1
                     )
-                if use_local_packed_roll and packed_seq_params is not None:
-                    shard_params = _packed_seq_params_for_local_hsm_roll(
-                        packed_seq_params,
-                        local_seq_length=sequence_length,
+                    # Document boundaries are global too, so they need the same treatment:
+                    # translated into this shard's frame, the withheld cp_group leaves the
+                    # roll on its cp_size == 1 path, which then rolls each document's local
+                    # piece within its own bounds and zeroes the seam.
+                    roll_packed_seq_params = packed_seq_params
+                    use_local_packed_roll = sequence_parallel_size > 1
+                    if packed_seq_params is not None:
+                        padded_cu_seqlens = packed_seq_params.cu_seqlens_q_padded
+                        genuinely_padded = (
+                            padded_cu_seqlens is not None
+                            and padded_cu_seqlens is not packed_seq_params.cu_seqlens_q
+                        )
+                        use_local_packed_roll = use_local_packed_roll or (
+                            genuinely_padded and self.config.attention_cp_layout != "contiguous"
+                        )
+                    if use_local_packed_roll and packed_seq_params is not None:
+                        shard_params = _packed_seq_params_for_local_hsm_roll(
+                            packed_seq_params,
+                            local_seq_length=sequence_length,
+                            cp_group=cp_group,
+                            tp_group=self.tp_group if self.sequence_parallel else None,
+                        )
+                        if shard_params is not None:
+                            roll_packed_seq_params = shard_params
+                    rolled, _ = roll_tensor(
+                        flattened,
+                        shifts=-1,
+                        dims=-1,
+                        cp_group=None if use_local_packed_roll else cp_group,
+                        packed_seq_params=roll_packed_seq_params,
+                        return_sum=False,
+                        cp_layout=self.config.attention_cp_layout,
+                    )
+                    rolled_older_hidden_states = rolled.reshape(
+                        num_entries, batch_size, hidden_size, sequence_length
+                    ).permute(0, 3, 1, 2)
+                    hidden_states_input = _mix_hidden_state_history(
+                        rolled_older_hidden_states,
+                        newest_entry,
+                        sequence_parallel=self.sequence_parallel,
+                        tp_group=self.tp_group,
                         cp_group=cp_group,
-                        tp_group=self.tp_group if self.sequence_parallel else None,
+                        rng_tracker_name=self.hidden_state_mixing_rng_tracker_name,
                     )
-                    if shard_params is not None:
-                        roll_packed_seq_params = shard_params
-                rolled, _ = roll_tensor(
-                    flattened,
-                    shifts=-1,
-                    dims=-1,
-                    cp_group=None if use_local_packed_roll else cp_group,
-                    packed_seq_params=roll_packed_seq_params,
-                    return_sum=False,
-                    cp_layout=self.config.attention_cp_layout,
+                    hidden_state_history = list(rolled_older_hidden_states.unbind(0)) + [
+                        newest_entry
+                    ]
+                else:
+                    hidden_states_input = hidden_states
+
+                layer_outputs = self.layers[layer_idx](
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    hidden_states=hidden_states_input,
+                    attention_mask=attention_mask,
+                    padding_mask=padding_mask,
+                    inference_params=inference_params,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    packed_seq_params=packed_seq_params,
+                    sequence_roll_context=sequence_roll_context,
+                    roll_depth=depth,
+                    packed_seq_params_by_layout=packed_seq_params_by_layout,
+                    cp_layout_plan=cp_layout_plan,
+                    sequence_len_offset=sequence_len_offset,
+                    embedding=embedding,
+                    decoder_input=decoder_input,
+                    mtp_input_mask=mtp_input_mask,
+                    **(extra_block_kwargs or {}),
                 )
-                rolled_older_hidden_states = rolled.reshape(
-                    num_entries, batch_size, hidden_size, sequence_length
-                ).permute(0, 3, 1, 2)
-                hidden_states_input = _mix_hidden_state_history(
-                    rolled_older_hidden_states,
-                    newest_entry,
-                    sequence_parallel=self.sequence_parallel,
-                    tp_group=self.tp_group,
-                    cp_group=cp_group,
-                    rng_tracker_name=self.hidden_state_mixing_rng_tracker_name,
-                )
-                hidden_state_history = list(rolled_older_hidden_states.unbind(0)) + [newest_entry]
-            else:
-                hidden_states_input = hidden_states
+                hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask = layer_outputs
 
-            hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask = self.layers[
-                layer_idx
-            ](
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states_input,
-                attention_mask=attention_mask,
-                padding_mask=padding_mask,
-                inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                packed_seq_params=packed_seq_params,
-                sequence_roll_context=sequence_roll_context,
-                roll_depth=iteration,
-                packed_seq_params_by_layout=packed_seq_params_by_layout,
-                cp_layout_plan=cp_layout_plan,
-                sequence_len_offset=sequence_len_offset,
-                embedding=embedding,
-                decoder_input=decoder_input,
-                mtp_input_mask=mtp_input_mask,
-                **(extra_block_kwargs or {}),
-            )
+                if hidden_state_mixing_enabled:
+                    hidden_state_history.append(hidden_states)
 
-            if hidden_state_mixing_enabled:
-                hidden_state_history.append(hidden_states)
-
-            if mhc_multistream is not None:
-                mhc_chunks.append(hidden_states)
-                hidden_states_list.append(self.layers[layer_idx]._postprocess(hidden_states))
-            else:
-                hidden_states_list.append(hidden_states)
-
+                if mhc_multistream is not None:
+                    mhc_chunks.append(hidden_states)
+                    hidden_states_list.append(self.layers[layer_idx]._postprocess(hidden_states))
+                else:
+                    hidden_states_list.append(hidden_states)
         # concat the hidden states of all mtp layers
         hidden_states = torch.cat(hidden_states_list, dim=0)
         return hidden_states
