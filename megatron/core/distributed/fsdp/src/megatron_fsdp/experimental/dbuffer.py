@@ -16,6 +16,7 @@
 
 import dataclasses
 from collections.abc import Iterable
+from typing import Self
 
 import torch
 import torch.distributed as dist
@@ -171,7 +172,7 @@ class DBuffer:
         mesh: DeviceMesh,
         placements: Iterable[Placement],
         tensor_shapes: Iterable[Shape],
-    ) -> "DBuffer":
+    ) -> Self:
         """Create a DBuffer from an existing local buffer.
 
         Args:
@@ -213,7 +214,7 @@ class DBuffer:
         buffer.local_buffer = local_buffer
         return buffer
 
-    def view(self, placements: Iterable[Placement]) -> "DBuffer":
+    def view(self, placements: Iterable[Placement]) -> Self:
         """Return a storage-sharing buffer with supported ``placements``.
 
         Views preserve placements, relabel a full local buffer, or locally slice
@@ -239,14 +240,14 @@ class DBuffer:
             local_offset = offset - self.offset
             if local_offset < 0 or local_offset + local_numel > self.local_buffer.numel():
                 raise RuntimeError("DBuffer view is not contained in its source local buffer.")
-            return DBuffer.from_local(
+            return type(self).from_local(
                 self.local_buffer.narrow(0, local_offset, local_numel),
                 self.mesh,
                 placements,
                 self.layout.tensor_shapes,
             )
         if isinstance(source_placement, Partial) and isinstance(destination_placement, Replicate):
-            return DBuffer.from_local(
+            return type(self).from_local(
                 self.local_buffer, self.mesh, placements, self.layout.tensor_shapes
             )
         raise ValueError(
@@ -258,7 +259,7 @@ class DBuffer:
     @classmethod
     def distribute_tensors(
         cls, tensors: Iterable[torch.Tensor], mesh: DeviceMesh, placements: Iterable[Placement]
-    ) -> "DBuffer":
+    ) -> Self:
         """Distribute full local tensors into a DBuffer.
 
         Args:
@@ -305,11 +306,11 @@ class DBuffer:
 
     def _create_or_validate_out(
         self,
-        out: "DBuffer | None",
+        out: Self | None,
         *,
         placements: Iterable[Placement] | None = None,
         dtype: torch.dtype | None = None,
-    ) -> "DBuffer":
+    ) -> Self:
         if placements is None:
             placements = self.placements
         else:
@@ -317,7 +318,7 @@ class DBuffer:
         if dtype is None:
             dtype = self.dtype
         if out is None:
-            return DBuffer(
+            return type(self)(
                 mesh=self.mesh,
                 placements=placements,
                 tensor_shapes=self.layout.tensor_shapes,
@@ -337,7 +338,7 @@ class DBuffer:
             raise ValueError(f"Expected out device {self.device}, got {out.device}.")
         return out
 
-    def cast(self, dtype: torch.dtype, *, out: "DBuffer | None" = None) -> "DBuffer":
+    def cast(self, dtype: torch.dtype, *, out: Self | None = None) -> Self:
         """Return this buffer with the same layout and placements in ``dtype``."""
         if self.dtype == dtype and out is None:
             return self
@@ -346,9 +347,7 @@ class DBuffer:
         destination.local_buffer.copy_(self.local_buffer)
         return destination
 
-    def redistribute(
-        self, new_placements: Iterable[Placement], *, out: "DBuffer | None" = None
-    ) -> "DBuffer":
+    def redistribute(self, new_placements: Iterable[Placement], *, out: Self | None = None) -> Self:
         """Redistribute this buffer to ``new_placements``.
 
         This dispatcher supports the one-axis transitions:
@@ -402,7 +401,7 @@ class DBuffer:
                 raise NotImplementedError(
                     "Replicate -> Partial redistribute does not support an out buffer."
                 )
-            return DBuffer.from_local(
+            return type(self).from_local(
                 self.local_buffer, self.mesh, new_placements, self.layout.tensor_shapes
             )
         raise NotImplementedError(
@@ -410,7 +409,7 @@ class DBuffer:
             f"{axis}: {old_placement!r} -> {new_placement!r}."
         )
 
-    def allgather(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
+    def allgather(self, mesh_axis: int, *, out: Self | None = None) -> Self:
         """All-gather a sharded axis into Replicate placement."""
         if not isinstance(self.placements[mesh_axis], Flat):
             raise ValueError(
@@ -432,7 +431,7 @@ class DBuffer:
         )
         return out
 
-    def allreduce(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
+    def allreduce(self, mesh_axis: int, *, out: Self | None = None) -> Self:
         """All-reduce a Partial axis into Replicate placement."""
         axis = mesh_axis
         partial_placement = self.placements[axis]
@@ -449,8 +448,8 @@ class DBuffer:
         return out
 
     def reduce_scatter(
-        self, mesh_axis: int, new_placement: Placement, *, out: "DBuffer | None" = None
-    ) -> "DBuffer":
+        self, mesh_axis: int, new_placement: Placement, *, out: Self | None = None
+    ) -> Self:
         """Reduce-scatter a Partial axis into ``new_placement``."""
         axis = mesh_axis
         if not isinstance(new_placement, Flat):

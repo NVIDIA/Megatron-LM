@@ -17,7 +17,7 @@
 import dataclasses
 import math
 from collections.abc import Iterable
-from typing import TypeAlias
+from typing import Self, TypeAlias
 
 import torch
 from torch.distributed import DeviceMesh
@@ -37,7 +37,7 @@ class GlobalLayout:
     size: int
 
     @classmethod
-    def build(cls, shapes: Iterable[Shape], dp_size: int) -> "GlobalLayout":
+    def build(cls, shapes: Iterable[Shape], dp_size: int) -> Self:
         """Compute global tensor element offsets and padded size.
 
         This is a DBuffer-specific reimplementation of
