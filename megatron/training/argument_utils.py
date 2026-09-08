@@ -379,6 +379,7 @@ def core_transformer_config_from_args(args, config_class=None):
     config = config_class(**kw_args)
 
     _apply_yarn_config_from_args(config, args)
+    _apply_dsa_rope_config_from_args(config, args)
 
     # Return config.
     return config
@@ -414,6 +415,31 @@ def _apply_yarn_config_from_args(config, args) -> None:
     _set('yarn_mscale', args.mscale, 1.0)
     _set('yarn_mscale_all_dim', args.mscale_all_dim, 0.0)
     _set('yarn_correction_range_round_to_int', args.yarn_correction_range_round_to_int, True)
+
+
+def _apply_dsa_rope_config_from_args(config, args) -> None:
+    """Populate the RoPE settings the DSA-over-GQA indexer reads off the config.
+
+    The indexer builds its own RotaryEmbedding and so needs ``rope_type``, ``rotary_base`` and
+    friends. Those are not fields on ``TransformerConfig``: the CLI already declares
+    ``--rotary-base`` and the rest by hand, and adding fields would make ArgumentGroupFactory
+    generate a second flag for each and collide. ``MLATransformerConfig`` declares them itself, so
+    the MLA path needs nothing here. Pre-existing values on ``config`` are preserved.
+    """
+    if getattr(args, 'experimental_attention_variant', None) != 'dsa':
+        return
+    if getattr(args, 'multi_latent_attention', False):
+        return
+
+    from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
+        _DSA_ROPE_DEFAULTS,
+    )
+
+    for attr, default in _DSA_ROPE_DEFAULTS.items():
+        if hasattr(config, attr):
+            continue
+        value = getattr(args, attr, None)
+        setattr(config, attr, default if value is None else value)
 
 
 def _default_config_from_args(cls: type, args: Namespace, return_instance: bool = True) -> Any:
