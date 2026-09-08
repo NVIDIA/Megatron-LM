@@ -144,7 +144,7 @@ class ShardPlan:
     @functools.lru_cache(maxsize=None)
     def is_boundary(self) -> bool:
         """True if more than one rank owns a non-empty shard of this parameter."""
-        return sum(1 for _, count in self.rank_rows if count > 0) > 1
+        return any(0 < count < self.full_shape[0] for _, count in self.rank_rows)
 
     def full_numel(self) -> int:
         """Return the total number of elements in the full (unsharded) parameter."""
