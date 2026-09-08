@@ -92,6 +92,8 @@ Planned new features:
 
 - **Server returns `"model": "EMPTY"`.** The HTTP frontend doesn't expose a `ServeConfig.model_name` to echo in `/v1/completions` / `/v1/chat/completions` responses, doesn't validate the request `model` field against a configured name, and exposes no `GET /v1/models` discovery endpoint. Clients can still pass any `model` in their request body — the dynamic server ignores it.
 
+- **DSA / AbsorbedMLA has no in-framework inference path.** Models with `experimental_attention_variant="dsa"` (AbsorbedMLA; GLM-5.x, DeepSeek-V3.2-class) reject `inference_context` / `inference_params` and cannot use Megatron text generation or refit-style eval. `get_gpt_decoder_layer_specs` also refuses experimental attention variants. Export to Hugging Face via [Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) and serve with vLLM (`GlmMoeDsaForCausalLM`). Pass `--no-cache-mla-latents` if you still hit the AbsorbedMLA cache assert. Tracked in [NVIDIA/Megatron-LM#7106](https://github.com/NVIDIA/Megatron-LM/issues/7106).
+
 ## Low-level APIs
 
 For step-level control, custom forward-step integration, or migration from existing pipelines, drop down to the building blocks in this directory: `DynamicInferenceEngine` (manual `add_request` / `step_modern` stepping), `DynamicInferenceContext`, `TextGenerationController`, and the model inference wrappers under `model_inference_wrappers/`. Runnable examples live in [`examples/inference/advanced/`](../../examples/inference/advanced/): `gpt_dynamic_inference.py` (manual stepping), `gpt_dynamic_inference_with_coordinator.py` (explicit coordinator + `InferenceClient` lifecycle), `gpt_static_inference.py` (static engine), and `simple_t5_batch_inference.py` (T5).

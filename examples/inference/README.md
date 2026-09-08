@@ -7,6 +7,7 @@ This guide provides an example for Megatron Core for running model inference.
 - [Offline inference](#offline-inference)
 - [OpenAI-compatible inference server](#openai-compatible-inference-server)
 - [Advanced examples](#advanced-examples)
+- [Known limitations](#known-limitations)
 - [See also](#see-also)
 
 ### What's in here
@@ -195,6 +196,14 @@ To add a new routing metric, put capture logic in `megatron/core/transformer/moe
 adding bespoke logging flows to `megatron/training/activation_logging.py`
 for routing metrics — that file handles lightweight count monitoring
 (`tokens_per_expert`) and uses a different output format.
+
+### Known limitations
+
+Models with `experimental_attention_variant="dsa"` / AbsorbedMLA (GLM-5.x,
+DeepSeek-V3.2-class) cannot use these in-framework generation examples.
+Export to Hugging Face with Megatron Bridge and serve with vLLM. See
+[`megatron/core/inference/README.md`](../../megatron/core/inference/README.md)
+and [NVIDIA/Megatron-LM#7106](https://github.com/NVIDIA/Megatron-LM/issues/7106).
 
 ### See also
 

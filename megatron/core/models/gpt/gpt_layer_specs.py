@@ -570,8 +570,10 @@ def get_gpt_decoder_layer_specs(
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     assert config.experimental_attention_variant is None, (
-        "Experimental attention variant is not supported with get_gpt_decoder_layer_specs, "
-        f"but got {config.experimental_attention_variant=}."
+        "get_gpt_decoder_layer_specs has no inference path for experimental attention variants "
+        f"such as DSA/AbsorbedMLA (got {config.experimental_attention_variant=}). "
+        "Export to Hugging Face and serve with vLLM "
+        "(https://github.com/NVIDIA/Megatron-LM/issues/7106)."
     )
 
     if use_transformer_engine:
