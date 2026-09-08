@@ -241,8 +241,9 @@ class TestMcoreAdapterDense:
             data_parallel_sharding_strategy="optim_grads_params",
         )
         if optimizer_cuda_graph:
-            # Capturable TE FusedAdam requires the main-gradient and main-weight dtypes
-            # to match (https://github.com/NVIDIA/TransformerEngine/issues/3358).
+            # With the default None, MFSDP v2 uses BF16 main grads with FP32 main
+            # params. Older capturable TE FusedAdam requires matching dtypes
+            # (https://github.com/NVIDIA/TransformerEngine/issues/3358).
             ddp_config.megatron_fsdp_main_grads_dtype = ddp_config.megatron_fsdp_main_params_dtype
 
         model = FullyShardedDataParallel(
