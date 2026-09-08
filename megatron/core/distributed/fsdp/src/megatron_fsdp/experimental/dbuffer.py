@@ -487,11 +487,51 @@ class DBuffer:
         return out
 
     def sync_from_main(self, main_weight: "DBuffer") -> None:
-        """Refresh an MXFP8 compute buffer by quantizing its local master shard."""
-        if not self.is_mxfp8:
-            raise TypeError("sync_from_main() requires an MXFP8 DBuffer.")
-        with torch.no_grad():
-            self.local_tensor.quantize_(main_weight.get_local_tensor(0))
+        """Refresh this compute buffer from optimizer-layout master weights."""
+        if self.is_mxfp8:
+            # MXFP8 has one logical tensor and TE performs the quantization into
+            # the physical data and inverse-scale tensors owned by local_tensor.
+            with torch.no_grad():
+                self.local_tensor.quantize_(main_weight.get_local_tensor(0))
+        else:
+            main_weight.cast(self.dtype, out=self)
+
+    def materialize_unsharded_from(self, source: "DBuffer") -> "DBuffer":
+        """Populate this full-parameter buffer from ``source`` when needed."""
+        # Ordinary parameters can be rebound to source's flat views. An MXFP8
+        # parameter permanently owns this DBuffer's TE wrapper, so it must be
+        # refreshed even when both buffers have replicated placements.
+        if source.placements == self.placements and not self.is_mxfp8:
+            return source
+
+        self.reallocate_storage()
+        if self.is_mxfp8:
+            source.redistribute(self.placements, out=self)
+        else:
+            # This storage backs parameter views possibly saved by autograd.
+            # Preserve its version while FSDP writes the freshly materialized values.
+            with torch.autograd._unsafe_preserve_version_counter(self.local_tensor):
+                source.redistribute(self.placements, out=self)
+        return self
+
+    def initialize_unsharded_parameter(self, parameter: "torch.nn.Parameter", index: int) -> None:
+        """Install this buffer's initial local tensor into one module parameter."""
+        if parameter.is_meta or self.is_mxfp8:
+            local_tensor = self.local_tensor if self.is_mxfp8 else self.get_local_tensor(index)
+            materialized = torch.nn.Parameter(local_tensor, requires_grad=parameter.requires_grad)
+            torch.utils.swap_tensors(parameter, materialized)
+        else:
+            parameter.data = self.get_local_tensor(index)
+            parameter.grad = None
+
+    def install_unsharded_parameter_views(self, parameters: Iterable["torch.nn.Parameter"]) -> None:
+        """Point ordinary unsharded parameters at this buffer's current local views."""
+        if self.is_mxfp8:
+            # The TE wrapper was installed once by initialize_unsharded_parameter().
+            # Its physical tensors are updated in place by materialize_unsharded_from().
+            return
+        for index, parameter in enumerate(parameters):
+            parameter.data = self.get_local_tensor(index)
 
     def cast(self, dtype: torch.dtype, *, out: "DBuffer | None" = None) -> "DBuffer":
         """Return this buffer with the same layout and placements in ``dtype``."""

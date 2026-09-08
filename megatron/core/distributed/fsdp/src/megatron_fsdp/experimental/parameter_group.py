@@ -255,23 +255,7 @@ class FsdpParameterGroup:
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
-            if is_mxfp8:
-                # The MXFP8 prototype has one parameter per DBuffer, whose logical
-                # wrapper cannot be represented as a flat-storage tensor view.
-                unsharded_tensor = self._unsharded_model_weight.local_tensor
-            else:
-                unsharded_tensor = self._unsharded_model_weight.get_local_tensor(index)
-            if parameter.is_meta or is_mxfp8:
-                # A meta Parameter cannot set .data to a real tensor because their
-                # TensorImpl types are incompatible. MXFP8 likewise needs to replace the
-                # original TE wrapper with the independently owned DBuffer wrapper.
-                materialized_parameter = nn.Parameter(
-                    unsharded_tensor, requires_grad=parameter.requires_grad
-                )
-                torch.utils.swap_tensors(parameter, materialized_parameter)
-            else:
-                parameter.data = unsharded_tensor
-                parameter.grad = None
+            self._unsharded_model_weight.initialize_unsharded_parameter(parameter, index)
             # Parameter-owned markers must not retain their FSDP module tree.
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, ref(self))
 
@@ -312,55 +296,25 @@ class FsdpParameterGroup:
 
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
-        if self.model_weight.is_mxfp8:
-            self.post_optimizer_model_weight.sync_from_main(self.main_weight)
-            self._model_weight_is_stale = (
-                self.post_optimizer_model_weight.placements != self.model_weight.placements
-            )
-            return
-        self.main_weight.cast(self.model_weight.dtype, out=self.post_optimizer_model_weight)
+        self.post_optimizer_model_weight.sync_from_main(self.main_weight)
         self._model_weight_is_stale = (
             self.post_optimizer_model_weight.placements != self.model_weight.placements
         )
 
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
-        if self.model_weight.is_mxfp8:
-            if self._model_weight_is_stale:
-                self.post_optimizer_model_weight.redistribute(
-                    self.model_weight.placements, out=self.model_weight
-                )
-                self._model_weight_is_stale = False
-            self._unsharded_model_weight.reallocate_storage()
-            self.model_weight.redistribute(
-                [Replicate()] * self.mesh.ndim, out=self._unsharded_model_weight
-            )
-            self._switch_to_unsharded_parameters()
-            return
         if self._model_weight_is_stale:
             self.post_optimizer_model_weight.redistribute(
                 self.model_weight.placements, out=self.model_weight
             )
             self._model_weight_is_stale = False
-        if self.model_weight.placements == self._unsharded_model_weight.placements:
-            unsharded_model_weight = self.model_weight
-        else:
-            with self._symmetric_memory_context():
-                self._unsharded_model_weight.reallocate_storage()
-            # This buffer backs unsharded Parameters whose views may be saved by autograd.
-            # Autograd records a tensor's version counter when saving it for backward, and
-            # in-place writes like the out= redistribution below increment that counter even
-            # under no_grad. Without preserving it, backward can fail with "modified by an
-            # inplace operation" even though FSDP only materialized internal storage.
-            with torch.autograd._unsafe_preserve_version_counter(
-                self._unsharded_model_weight.local_tensor
-            ):
-                self.model_weight.redistribute(
-                    self._unsharded_model_weight.placements, out=self._unsharded_model_weight
-                )
-            unsharded_model_weight = self._unsharded_model_weight
-        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.unsharded.data = unsharded_model_weight.get_local_tensor(index)
+        with self._symmetric_memory_context():
+            unsharded_model_weight = self._unsharded_model_weight.materialize_unsharded_from(
+                self.model_weight
+            )
+        unsharded_model_weight.install_unsharded_parameter_views(
+            fsdp_parameter.unsharded for fsdp_parameter in self.fsdp_parameters
+        )
         self._switch_to_unsharded_parameters()
 
     def reshard_parameters(self) -> None:
