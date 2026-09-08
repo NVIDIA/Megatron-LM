@@ -1238,6 +1238,7 @@ def num_floating_point_operations(
         dsv4_hybrid_extra_core_term = 0
         dsa_extra_term = 0
         dsa_extra_core_term = 0
+        dsa_repeated_mtp_saved_term = 0
         if is_linear_attention_variant(args.experimental_attention_variant):
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
@@ -1396,6 +1397,21 @@ def num_floating_point_operations(
                 ),
                 indexer_loss_coeff=args.dsa_indexer_loss_coeff,
             )
+            if mtp_use_repeated_layer and "latent_kv" in mtp_shared_components:
+                # Later depths reuse the normalized, post-RoPE latent KV from depth 0.
+                # They still execute the absorbed K/V up-projection work on their query
+                # and attention output. Runtime also skips key RoPE and communication,
+                # which this FLOPs model does not count; only the KV down projection and
+                # norm disappear from the modeled standard MLA token-linear term.
+                dsa_repeated_mtp_saved_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * max(mtp_num_layers - 1, 0)
+                    * (
+                        args.hidden_size * (args.kv_lora_rank + args.qk_pos_emb_head_dim)
+                        + args.kv_lora_rank
+                    )
+                )
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
@@ -1408,6 +1424,7 @@ def num_floating_point_operations(
             + standard_self_attn_term * num_standard_attention_layers
             + dsv4_hybrid_extra_term
             + dsa_extra_term
+            - dsa_repeated_mtp_saved_term
         )
         # Core attention (L^2) FLOPs. Standard attention has a uniform per-layer
         # coefficient; DSv4 sparse attention varies by layer type and is pre-summed.

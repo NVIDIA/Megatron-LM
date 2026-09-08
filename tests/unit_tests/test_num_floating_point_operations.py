@@ -1373,8 +1373,8 @@ class TestDSA:
             no_sharing, batch_size
         )
 
-    def test_repeated_mtp_sparse_index_sharing_charges_the_indexer_once(self):
-        """Later repeated depths reuse depth 0's index instead of rerunning the indexer."""
+    def test_repeated_mtp_component_sharing(self):
+        """Each selected component removes only its own later-depth work."""
         args = _make_dsa_args()
         args.mtp_num_layers = 3
         args.mtp_use_repeated_layer = True
@@ -1385,9 +1385,26 @@ class TestDSA:
         args.mtp_repeated_layer_shared_components = []
         unshared = num_floating_point_operations(args, batch_size)
 
+        args.mtp_repeated_layer_shared_components = ["latent_kv"]
+        latent_shared = num_floating_point_operations(args, batch_size)
+
         args.mtp_repeated_layer_shared_components = ["sparse_attention_index"]
         index_shared = num_floating_point_operations(args, batch_size)
 
+        args.mtp_repeated_layer_shared_components = ["latent_kv", "sparse_attention_index"]
+        both_shared = num_floating_point_operations(args, batch_size)
+
+        num_consumer_depths = args.mtp_num_layers - 1
+        expected_latent_savings = (
+            total_tokens
+            * 3
+            * 2
+            * num_consumer_depths
+            * (
+                args.hidden_size * (args.kv_lora_rank + args.qk_pos_emb_head_dim)
+                + args.kv_lora_rank
+            )
+        )
         index_dim = args.dsa_indexer_n_heads * args.dsa_indexer_head_dim
         index_token_term = (
             2
@@ -1399,11 +1416,13 @@ class TestDSA:
             )
         )
         index_core_term = 3 * 2 * index_dim / 2
-        expected_savings = (args.mtp_num_layers - 1) * (
+        expected_index_savings = num_consumer_depths * (
             total_tokens * index_token_term + sum_sq * index_core_term
         )
 
-        assert unshared - index_shared == expected_savings
+        assert unshared - latent_shared == expected_latent_savings
+        assert unshared - index_shared == expected_index_savings
+        assert unshared - both_shared == expected_latent_savings + expected_index_savings
 
     def test_repeated_mtp_uses_one_global_layer_number_for_index_schedule(self):
         """A repeated skip layer must not be counted as fictitious later MTP layers."""

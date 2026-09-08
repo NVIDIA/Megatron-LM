@@ -91,9 +91,8 @@ class TransformerConfig(ModelParallelConfig):
 
     mtp_repeated_layer_shared_components: Optional[List[str]] = None
     """Components obtained by the first repeated MTP layer invocation and reused by later ones.
-    Currently, only "sparse_attention_index" is supported. None or an empty list disables
-    repeated-layer sharing.
-    """
+    Currently supported components are "latent_kv" and "sparse_attention_index". None or an
+    empty list disables repeated-layer sharing."""
 
     mtp_detach_heads: bool = False
     """If True, detach MTP head inputs from the main model graph.
@@ -1815,11 +1814,11 @@ class TransformerConfig(ModelParallelConfig):
         if shared_components is not None and not isinstance(shared_components, list):
             raise ValueError("mtp_repeated_layer_shared_components must be a list or None.")
         if shared_components is not None:
-            allowed_components = {"sparse_attention_index"}
+            allowed_components = {"latent_kv", "sparse_attention_index"}
             if any(not isinstance(component, str) for component in shared_components):
                 raise ValueError(
                     "mtp_repeated_layer_shared_components entries must be strings; supported "
-                    "component is 'sparse_attention_index'."
+                    "components are 'latent_kv' and 'sparse_attention_index'."
                 )
             if len(shared_components) != len(set(shared_components)):
                 raise ValueError(
@@ -2652,6 +2651,17 @@ class TransformerConfig(ModelParallelConfig):
             if "moe_act" in self.recompute_modules and not self.moe_grouped_gemm:
                 raise ValueError(
                     "moe_act in recompute_modules is only supported with moe_grouped_gemm."
+                )
+
+            if (
+                "latent_kv" in (self.mtp_repeated_layer_shared_components or [])
+                and "mla_up_proj" in self.recompute_modules
+            ):
+                raise ValueError(
+                    "mtp_repeated_layer_shared_components containing latent_kv does not support "
+                    "mla_up_proj recompute: it discards the source KV storage before later "
+                    "MTP depths consume it. Remove mla_up_proj from recompute_modules "
+                    "or disable latent_kv sharing."
                 )
 
             if "mla_up_proj" in self.recompute_modules and not self.multi_latent_attention:

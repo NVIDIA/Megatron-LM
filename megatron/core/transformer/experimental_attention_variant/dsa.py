@@ -1956,9 +1956,12 @@ class _DSAMTPRepeatedSharingPayload:
 
     topk_by_layer: dict[int, torch.Tensor] = field(default_factory=dict)
     topk_length_by_layer: dict[int, torch.Tensor] = field(default_factory=dict)
+    latent_kv_by_layer: dict[int, torch.Tensor] = field(default_factory=dict)
 
     def __copy__(self):
-        return type(self)(dict(self.topk_by_layer), dict(self.topk_length_by_layer))
+        return type(self)(
+            dict(self.topk_by_layer), dict(self.topk_length_by_layer), dict(self.latent_kv_by_layer)
+        )
 
 
 class DSAttention(MegatronModule):
@@ -1999,10 +2002,13 @@ class DSAttention(MegatronModule):
             self.layer_number, self.index_skip_topk_offset, self.index_topk_freq
         )
         mtp_shared_components = frozenset(self.config.mtp_repeated_layer_shared_components or ())
+        self.mtp_latent_kv_share = "latent_kv" in mtp_shared_components and is_mtp_layer
         self.mtp_sparse_attention_index_share = (
             "sparse_attention_index" in mtp_shared_components and is_mtp_layer
         )
-        self.mtp_cross_depth_share = self.mtp_sparse_attention_index_share
+        self.mtp_cross_depth_share = (
+            self.mtp_latent_kv_share or self.mtp_sparse_attention_index_share
+        )
         global _warned_mtp_index_sharing_fused_bypass
         if (
             self.mtp_sparse_attention_index_share
@@ -2072,6 +2078,7 @@ class DSAttention(MegatronModule):
             payload = state.get_or_create(_DSAMTPRepeatedSharingPayload)
             payload.topk_by_layer.pop(self.layer_number, None)
             payload.topk_length_by_layer.pop(self.layer_number, None)
+            payload.latent_kv_by_layer.pop(self.layer_number, None)
         else:
             payload = self._require_mtp_sharing_payload(packed_seq_params, attention_mask)
         return is_source, payload
@@ -2085,9 +2092,22 @@ class DSAttention(MegatronModule):
         payload = state.get(_DSAMTPRepeatedSharingPayload)
         if payload is None:
             raise RuntimeError("MTP sharing consumer requires published source tensors.")
+        if self.mtp_latent_kv_share and self.layer_number not in payload.latent_kv_by_layer:
+            raise RuntimeError("MTP sharing consumer requires published source latent KV.")
         if self.mtp_sparse_attention_index_share and self.layer_number not in payload.topk_by_layer:
             raise RuntimeError("MTP sharing consumer requires published source indices.")
         return payload
+
+    def should_reuse_mtp_latent_kv(
+        self,
+        packed_seq_params: Optional[PackedSeqParams],
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> bool:
+        """Consult the MTP-published role before computing absorbed MLA projections."""
+        if not self.mtp_latent_kv_share:
+            return False
+        state = self._get_forward_sharing_state(packed_seq_params, attention_mask)
+        return not is_mtp_repeated_sharing_source(state, self.layer_number)
 
     def backward_dw(self):
         """Compute the deferred weight gradients (delay_wgrad_compute) of the indexer."""
@@ -2097,7 +2117,7 @@ class DSAttention(MegatronModule):
     def forward(
         self,
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: Optional[torch.Tensor],
         value: Optional[torch.Tensor],
         attention_mask: torch.Tensor,
         x: torch.Tensor,
@@ -2113,7 +2133,8 @@ class DSAttention(MegatronModule):
 
         Args:
             query: Query tensor [sq, b, np, hn] or packed [t, np, hn].
-            key: Key tensor [skv, b, np, hn] or packed [t, np, hn].
+            key: Key tensor [skv, b, np, hn] or packed [t, np, hn]. May be None only for a
+                later repeated-MTP depth that reuses latent KV from the DSA sharing state.
             value: Value tensor [skv, b, np, hnv] or packed [t, np, hnv].
             x: Original hidden states [sq, b, hidden_size].
             qr: Low-rank query representation [sq, b, q_lora_rank].
@@ -2132,6 +2153,19 @@ class DSAttention(MegatronModule):
         reuse_sparse_attention_index = bool(
             self.mtp_sparse_attention_index_share and mtp_payload is not None and not is_mtp_source
         )
+        reuse_latent_kv = bool(
+            self.mtp_latent_kv_share and mtp_payload is not None and not is_mtp_source
+        )
+        if reuse_latent_kv:
+            if key is not None:
+                raise RuntimeError(
+                    "A repeated-MTP latent-KV consumer must obtain key from the DSA sharing "
+                    "state instead of receiving a newly computed key."
+                )
+            assert mtp_payload is not None
+            key = mtp_payload.latent_kv_by_layer[self.layer_number]
+        elif key is None:
+            raise RuntimeError("DSAttention requires a key tensor outside latent-KV reuse.")
         query, _ = dsa_layout.ensure_sbhd(query, "query")
         key, _ = dsa_layout.ensure_sbhd(key, "key")
         if value is not None:
@@ -2189,6 +2223,8 @@ class DSAttention(MegatronModule):
                     "DSA sequence-parallel query row count mismatch: "
                     f"query_rows={sq}, local_rows={local_sequence_rows}, tp_size={tp_size}"
                 )
+        cp_local_sequence_rows = sequence_parallel_tp_full_rows
+        cp_global_sequence_rows = cp_local_sequence_rows * cp_size
         packed_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         packed_query_positions = None
         nonpacked_query_positions = None
@@ -2250,19 +2286,18 @@ class DSAttention(MegatronModule):
                 )
             if packed_query_positions is not None:
                 packed_query_positions = packed_query_positions.contiguous()
-        elif cp_size > 1:
-            _validate_nonpacked_cp_uniform_length(
-                sq=sq, skv=key.size(0), cp_size=cp_size, cp_group=cp_group, device=query.device
-            )
-
         if sequence_parallel_tp:
             if key.size(0) == local_sequence_rows:
                 key = gather_from_sequence_parallel_region(key, group=tp_group)
-            elif key.size(0) != sequence_parallel_tp_full_rows:
+            elif key.size(0) != sequence_parallel_tp_full_rows and not (
+                reuse_latent_kv and cp_size > 1 and key.size(0) == cp_global_sequence_rows
+            ):
                 raise RuntimeError(
                     "DSA sequence-parallel key row count mismatch before CP gather: "
                     f"key_rows={key.size(0)}, local_rows={local_sequence_rows}, "
-                    f"full_rows={sequence_parallel_tp_full_rows}, tp_size={tp_size}"
+                    f"full_rows={sequence_parallel_tp_full_rows}, "
+                    f"cp_global_rows={cp_global_sequence_rows}, tp_size={tp_size}, "
+                    f"cp_size={cp_size}"
                 )
             if value is not None:
                 if value.size(0) == local_sequence_rows:
@@ -2274,9 +2309,16 @@ class DSAttention(MegatronModule):
                         f"full_rows={sequence_parallel_tp_full_rows}, tp_size={tp_size}"
                     )
 
-        local_cp_kv_lens = {sq}
-        if sequence_parallel_tp:
-            local_cp_kv_lens.add(sequence_parallel_tp_full_rows)
+        if not packed_thd and cp_size > 1:
+            _validate_nonpacked_cp_uniform_length(
+                sq=cp_local_sequence_rows,
+                skv=key.size(0),
+                cp_size=cp_size,
+                cp_group=cp_group,
+                device=query.device,
+            )
+
+        local_cp_kv_lens = {cp_local_sequence_rows}
         local_cp_kv_len = None
         if cp_size > 1:
             assert (
@@ -2339,6 +2381,13 @@ class DSAttention(MegatronModule):
                     value = value.index_select(0, kv_reorder_idx)
 
         skv = key.size(0)
+
+        if self.mtp_latent_kv_share and mtp_payload is not None and is_mtp_source:
+            # Capture the exact canonical tensor consumed by sparse attention: TP/SP and
+            # CP gathers plus CP reorder have already run. This must precede the combined
+            # fused DSA early return, which remains eligible for latent-KV-only sharing.
+            assert mtp_payload is not None
+            mtp_payload.latent_kv_by_layer[self.layer_number] = key
 
         if not packed_thd and sequence_parallel_query_is_local:
             nonpacked_query_positions = dsa_layout.extract_query_positions_from_position_ids(

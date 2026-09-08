@@ -28,7 +28,7 @@ The following table summarizes MTP configuration fields:
 | `mtp_num_layers` | Number of MTP layers. MTP extends prediction to multiple future tokens at each position. This stack uses `mtp_num_layers` sequential modules to predict that many additional tokens per position. Default: `None`. |
 | `mtp_loss_scaling_factor` | Weight for the MTP loss term. The implementation averages MTP losses across depths, multiplies by this factor, and adds the result to the training objective. Default: `0.1`. |
 | `mtp_use_repeated_layer` | Reuse one physical MTP layer for every prediction depth. Parameters are shared, while the hidden state, shifted token input, and query are recomputed at each depth. Default: `False`. |
-| `mtp_repeated_layer_shared_components` | Components to reuse from the first invocation of a repeated MTP layer at later prediction depths in the same forward. The supported value is `sparse_attention_index`. Omit the option or use an empty list to disable repeated-layer sharing. Default: `None`. |
+| `mtp_repeated_layer_shared_components` | Components to reuse from the first invocation of a repeated MTP layer at later prediction depths in the same forward. Supported values are `latent_kv` and `sparse_attention_index`; values must be unique and their order has no effect. Omit the option or use an empty list to disable repeated-layer sharing. Default: `None`. |
 
 ## Repeated-Layer Sharing
 
@@ -37,9 +37,16 @@ Set `mtp_use_repeated_layer: true`, `mtp_num_layers > 1`, and
 at later prediction depths within the same forward and microbatch. Currently,
 this requires `experimental_attention_variant: dsa` and the repeated-layer GPT MTP path.
 
-Set `mtp_repeated_layer_shared_components: ["sparse_attention_index"]` to reuse
-depth-0 top-k indices. Omit the option or use `[]` to disable sharing.
-KV, queries, and sparse attention are computed at every depth.
+| Shared components | Later prediction depths |
+| --- | --- |
+| omitted or `[]` | Recompute KV and follow the ordinary top-k schedule. |
+| `["latent_kv"]` | Reuse depth-0 KV; follow the ordinary top-k schedule. |
+| `["sparse_attention_index"]` | Recompute KV; reuse depth-0 top-k indices. |
+| `["latent_kv", "sparse_attention_index"]` | Reuse both depth-0 KV and top-k indices. |
+
+Queries and sparse attention are computed at every depth. Shared KV remains
+attached to autograd: consumer gradients accumulate into the depth-0 KV projection.
+This is training-time activation reuse, not inference KV caching.
 
 Ordinary IndexShare (`dsa_indexer_topk_freq` and `dsa_indexer_skip_topk_offset`)
 still determines how depth 0 obtains its indices, including reuse from an earlier
@@ -50,13 +57,13 @@ execution segment; cross-PP index sharing remains unsupported.
 Index sharing avoids additional indexer evaluations and auxiliary-loss contributions
 at later depths; review `dsa_indexer_loss_coeff` when changing this setting.
 It disables the combined DSA kernel, but separate fused top-k and sparse-attention
-kernels remain eligible.
+kernels remain eligible. KV-only sharing does not itself disable the combined kernel.
 
 Compatibility:
 
 - Selective recompute supports `mlp`, `moe`, `moe_act`, `shared_experts`,
   `layernorm`, and `mhc`, subject to their existing requirements.
-  `mla_up_proj` recompute is also supported.
+  `mla_up_proj` supports index-only sharing, but not KV sharing.
 - Full recompute and selective `core_attn` recompute are unsupported.
   Set `recompute_modules` explicitly: selective recompute defaults to `core_attn`.
 - Attention CUDA graph capture is unsupported; MoE-only scopes remain compatible.
@@ -88,4 +95,4 @@ Use `m` for MTP layers in the pipeline layout string. For example:
 
 ## Unsupported Combinations
 
-Arbitrary `AttnMaskType` and learned absolute position embeddings are not supported with MTP. Context Parallel support is specific to the attention implementation. Repeated DSA index sharing supports DSA with `cp_comm_type=allgather` and reuses the depth-0 global sparse-attention index within the same microbatch CP group. Speculative decoding is not yet supported when `mtp_repeated_layer_shared_components` is non-empty because its serial calls do not establish one ordered repeated forward; disable repeated-layer sharing or set `num_speculative_tokens=0`.
+Arbitrary `AttnMaskType` and learned absolute position embeddings are not supported with MTP. Context Parallel support is specific to the attention implementation. For repeated DSA sharing, the supported CP path is DSA with `cp_comm_type=allgather`; it reuses the selected depth-0 global latent KV and/or global sparse-attention index within the same microbatch CP group. Speculative decoding is not yet supported when `mtp_repeated_layer_shared_components` is non-empty because its serial calls do not establish one ordered repeated forward; disable repeated-layer sharing or set `num_speculative_tokens=0`.
