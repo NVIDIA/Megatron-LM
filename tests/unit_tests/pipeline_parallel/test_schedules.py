@@ -165,7 +165,17 @@ def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypat
         lambda group=None: barrier_groups.append(group),
     )
 
-    batch = [{"id": 0}, {"id": 1}, {"id": 2}]
+    def _make_sub_sample(length):
+        # Shape of a real HybridCPDataLoaderWrapper.unpack_batch sub-sample:
+        # 1-D token-level tensors, no cu_seqlens/max_seqlen keys.
+        return {
+            "tokens": torch.arange(length, dtype=torch.int64),
+            "labels": torch.arange(1, length + 1, dtype=torch.int64),
+            "loss_mask": torch.ones(length, dtype=torch.float32),
+            "position_ids": torch.arange(length, dtype=torch.int64),
+        }
+
+    batch = [_make_sub_sample(16), _make_sub_sample(24), _make_sub_sample(8)]
     sample_id_groups = [[[0], [0], []], [[1, 2], [1], [1, 2]]]
     forward_calls = []
 
@@ -182,9 +192,21 @@ def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypat
     ):
         assert isinstance(data_iterator, RerunDataIterator)
         sample = next(data_iterator)
+        # The schedule must hand forward_step the bridged 2-D batched schema
+        # that get_batch_on_this_tp_rank requires under is_hybrid_cp; a raw
+        # 1-D unpack_batch sub-sample here is the regression this test guards.
+        length = sample["tokens"].shape[-1]
+        for key in ("tokens", "labels", "loss_mask", "position_ids"):
+            assert sample[key].shape == (1, length)
+        assert sample["cu_seqlens"].dtype == torch.int32
+        assert sample["cu_seqlens"].tolist() == [[0, length]]
+        assert sample["cu_seqlens_padded"].tolist() == [[0, length]]
+        assert sample["max_seqlen"].shape == (1,)
+        assert int(sample["max_seqlen"].item()) == length
+        assert sample["local_cp_size"].shape == (1,)
         forward_calls.append(
             {
-                "sample_id": sample["id"],
+                "length": int(length),
                 "local_cp_size": int(sample["local_cp_size"].item()),
                 "local_cp_size_dtype": sample["local_cp_size"].dtype,
                 "cp_group_size": cp_group_size,
@@ -227,7 +249,7 @@ def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypat
     assert total_num_tokens == 30
     assert forward_calls == [
         {
-            "sample_id": 0,
+            "length": 16,
             "local_cp_size": 2,
             "local_cp_size_dtype": torch.int32,
             "cp_group_size": 2,
@@ -235,7 +257,7 @@ def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypat
             "is_first_microbatch": True,
         },
         {
-            "sample_id": 1,
+            "length": 24,
             "local_cp_size": 3,
             "local_cp_size_dtype": torch.int32,
             "cp_group_size": 3,
@@ -243,7 +265,7 @@ def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypat
             "is_first_microbatch": False,
         },
         {
-            "sample_id": 2,
+            "length": 8,
             "local_cp_size": 2,
             "local_cp_size_dtype": torch.int32,
             "cp_group_size": 2,

@@ -1,13 +1,19 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from functools import partial
+from typing import Protocol, cast
+
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttention,
+    CompressedSparseAttentionBuilder,
     CompressedSparseAttentionSubmodules,
     Compressor,
+    CompressorBuilder,
     CompressorSubmodules,
     CSAIndexer,
+    CSAIndexerBuilder,
     CSAIndexerSubmodules,
 )
 from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
@@ -17,6 +23,14 @@ from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+
+class _DSv4BackendSpecProvider(BackendSpecProvider, Protocol):
+    """Backend capabilities required by the native DSv4 attention spec."""
+
+    def linear(self) -> type:
+        """Return the duplicated linear implementation used by CSA."""
+        ...
 
 
 def get_dsv4_hybrid_module_spec_for_backend(
@@ -30,27 +44,28 @@ def get_dsv4_hybrid_module_spec_for_backend(
     qk_norm = (
         backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
     )
+    dsv4_backend = cast(_DSv4BackendSpecProvider, backend)
 
-    compressor_spec = ModuleSpec(
-        module=Compressor,
+    compressor_builder: CompressorBuilder = partial(
+        Compressor,
         submodules=CompressorSubmodules(
-            linear_wkv=backend.linear(),
-            linear_wgate=backend.linear(),
+            linear_wkv=dsv4_backend.linear(),
+            linear_wgate=dsv4_backend.linear(),
             norm=backend.layer_norm(rms_norm=True, for_qk=False),
         ),
     )
-    indexer_spec = ModuleSpec(
-        module=CSAIndexer,
+    indexer_builder: CSAIndexerBuilder = partial(
+        CSAIndexer,
         submodules=CSAIndexerSubmodules(
-            linear_wq_b=backend.linear(),
-            linear_weights_proj=backend.linear(),
-            compressor=compressor_spec,
+            linear_wq_b=dsv4_backend.linear(),
+            linear_weights_proj=dsv4_backend.linear(),
+            compressor=compressor_builder,
         ),
     )
-    core_attention = ModuleSpec(
-        module=CompressedSparseAttention,
+    core_attention: CompressedSparseAttentionBuilder = partial(
+        CompressedSparseAttention,
         submodules=CompressedSparseAttentionSubmodules(
-            compressor=compressor_spec, indexer=indexer_spec
+            compressor=compressor_builder, indexer=indexer_builder
         ),
     )
 
@@ -58,7 +73,7 @@ def get_dsv4_hybrid_module_spec_for_backend(
         module=DSv4HybridSelfAttention,
         params={"attn_mask_type": AttnMaskType.causal},
         submodules=DSv4HybridSelfAttentionSubmodules(
-            linear_q_down_proj=backend.linear(),
+            linear_q_down_proj=dsv4_backend.linear(),
             linear_q_up_proj=backend.column_parallel_linear(),
             linear_kv_proj=backend.column_parallel_linear(),
             core_attention=core_attention,

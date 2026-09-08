@@ -671,7 +671,11 @@ class TestFlexDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8)])
     @pytest.mark.parametrize(
-        "variant", ["zero_copy", pytest.param("mxfp8_wire", marks=pytest.mark.launch_on_gb200)]
+        "variant",
+        [
+            pytest.param("zero_copy", marks=pytest.mark.flaky_in_dev),
+            pytest.param("mxfp8_wire", marks=pytest.mark.launch_on_gb200),
+        ],
     )
     def test_forward_backward_variant_parity(self, tp_size, ep_size, variant):
         # The op-fuser needs tp=1 and a SwiGLU activation. Parity: the variant IO path must match

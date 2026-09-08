@@ -216,11 +216,14 @@ class TestInferenceWandbLogging:
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
+        mock_controller._async_sched_logits = Mock()
         # Set up nested mock structure
         mock_controller.inference_wrapped_model = Mock()
         mock_controller.inference_wrapped_model.model = Mock()
         mock_controller.inference_wrapped_model.model.config = Mock()
         mock_controller.inference_wrapped_model.model.config.cuda_graph_impl = "none"
+        mock_controller.inference_wrapped_model.model.config.moe_enable_routing_replay = False
+        mock_controller.num_mtp_depths = 0
 
         engine = DynamicInferenceEngine(controller=mock_controller, context=dynamic_context)
 
@@ -269,11 +272,14 @@ class TestInferenceWandbLogging:
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
+        mock_controller._async_sched_logits = Mock()
         # Set up nested mock structure
         mock_controller.inference_wrapped_model = Mock()
         mock_controller.inference_wrapped_model.model = Mock()
         mock_controller.inference_wrapped_model.model.config = Mock()
         mock_controller.inference_wrapped_model.model.config.cuda_graph_impl = "none"
+        mock_controller.inference_wrapped_model.model.config.moe_enable_routing_replay = False
+        mock_controller.num_mtp_depths = 0
 
         # Should not raise error even with logging interval set
         engine = DynamicInferenceEngine(controller=mock_controller, context=dynamic_context)

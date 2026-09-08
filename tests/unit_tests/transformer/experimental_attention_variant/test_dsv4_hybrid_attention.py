@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -59,8 +60,8 @@ def _make_config(
     v_head_dim=64,
     qk_pos_emb_head_dim=32,
     q_lora_rank=64,
-    o_groups=8,
-    o_lora_rank=64,
+    output_projection_groups=8,
+    output_projection_lora_rank=64,
     csa_compress_ratios=None,
     csa_window_size=8,
     tensor_model_parallel_size=1,
@@ -89,8 +90,8 @@ def _make_config(
         qk_head_dim=v_head_dim - qk_pos_emb_head_dim,
         qk_pos_emb_head_dim=qk_pos_emb_head_dim,
         v_head_dim=v_head_dim,
-        o_groups=o_groups,
-        o_lora_rank=o_lora_rank,
+        output_projection_groups=output_projection_groups,
+        output_projection_lora_rank=output_projection_lora_rank,
         rope_type='rope',
         rotary_base=10000,
         rotary_percent=1.0,
@@ -143,7 +144,6 @@ def test_module_spec_is_built_from_explicit_backend():
     from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
         DSv4HybridSelfAttention,
     )
-    from megatron.core.transformer.spec_utils import ModuleSpec
 
     class Linear:
         pass
@@ -177,19 +177,19 @@ def test_module_spec_is_built_from_explicit_backend():
     assert spec.submodules.linear_q_up_proj is ColumnParallelLinear
     assert spec.submodules.linear_kv_proj is ColumnParallelLinear
     assert spec.submodules.linear_proj is RowParallelLinear
-    core_attention_spec = spec.submodules.core_attention
-    assert isinstance(core_attention_spec, ModuleSpec)
-    assert core_attention_spec.module is CompressedSparseAttention
+    core_attention_builder = spec.submodules.core_attention
+    assert isinstance(core_attention_builder, partial)
+    assert core_attention_builder.func is CompressedSparseAttention
 
-    core_attention_submodules = core_attention_spec.submodules
-    compressor_spec = core_attention_submodules.compressor
-    assert isinstance(compressor_spec, ModuleSpec)
-    assert compressor_spec.module is Compressor
+    core_attention_submodules = core_attention_builder.keywords["submodules"]
+    compressor_builder = core_attention_submodules.compressor
+    assert isinstance(compressor_builder, partial)
+    assert compressor_builder.func is Compressor
 
-    indexer_spec = core_attention_submodules.indexer
-    assert isinstance(indexer_spec, ModuleSpec)
-    assert indexer_spec.module is CSAIndexer
-    assert indexer_spec.submodules.compressor is compressor_spec
+    indexer_builder = core_attention_submodules.indexer
+    assert isinstance(indexer_builder, partial)
+    assert indexer_builder.func is CSAIndexer
+    assert indexer_builder.keywords["submodules"].compressor is compressor_builder
 
 
 def test_grouped_output_projection_respects_cpu_initialization(monkeypatch):
@@ -371,7 +371,12 @@ class TestDSv4HybridAttentionConstructor:
 
     def test_latent_norm_epsilon_is_scoped_to_q_and_kv_latents(self):
         """The dedicated epsilon must not change the compressor norm."""
-        config = _make_config(layernorm_epsilon=1e-5, attention_latent_norm_epsilon=1e-6)
+        config = _make_config(
+            layernorm_epsilon=1e-5,
+            attention_latent_norm_epsilon=1e-6,
+            qk_layernorm=True,
+            csa_compress_ratios=[4, 4, 128, 4],
+        )
         pg = ProcessGroupCollection.use_mpu_process_groups()
         attn = _build_attention(config, layer_number=1, pg_collection=pg)
 
@@ -643,14 +648,17 @@ class TestDSv4HybridGroupedOutput:
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
 
-        o_groups = 8
-        o_lora_rank = 64
-        config = _make_config(o_groups=o_groups, o_lora_rank=o_lora_rank)
+        output_projection_groups = 8
+        output_projection_lora_rank = 64
+        config = _make_config(
+            output_projection_groups=output_projection_groups,
+            output_projection_lora_rank=output_projection_lora_rank,
+        )
         pg = ProcessGroupCollection.use_mpu_process_groups()
         attn = _build_attention(config, layer_number=1, pg_collection=pg)
 
-        expected_out = o_groups * o_lora_rank
-        expected_in = (config.v_head_dim * config.num_attention_heads) // o_groups
+        expected_out = output_projection_groups * output_projection_lora_rank
+        expected_in = (config.v_head_dim * config.num_attention_heads) // output_projection_groups
         assert attn.linear_o_group_proj.shape == (expected_out, expected_in)
         assert attn.linear_o_group_proj.requires_grad
 

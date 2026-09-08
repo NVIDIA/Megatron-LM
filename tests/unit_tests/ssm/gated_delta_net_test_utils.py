@@ -48,6 +48,7 @@ class GatedDeltaNetTestBase:
             pipeline_model_parallel_size=1,
             context_parallel_size=cp_size,
         )
+        torch.manual_seed(123)
         model_parallel_cuda_manual_seed(123)
         self.tp_size = tp_size
         self.cp_size = cp_size

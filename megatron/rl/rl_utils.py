@@ -793,7 +793,12 @@ def get_environment_rollouts(
         with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
             inf_core = unwrap_model(inference_model[0])
             _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-        swap_model_weights(model, inference_model, args.refit_method)
+        swap_model_weights(
+            model,
+            inference_model,
+            args.refit_method,
+            execution_batch_bytes=args.refit_execution_batch_bytes,
+        )
         if args.rl_verify_model_weights_swap:
             verify_model_weights_swap(
                 train_model=model,

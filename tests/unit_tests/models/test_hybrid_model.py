@@ -21,11 +21,15 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_logging_pg_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
@@ -234,8 +238,71 @@ class TestHybridModel:
 
         assert self.model.max_sequence_length == 4
 
+        decoder = self.model.decoder
+        assert "layer_type_list" not in decoder.__dict__
+        assert decoder.layer_type_list == [Symbols.MAMBA, Symbols.ATTENTION, Symbols.MLP]
+        assert [type(config) for config in decoder.layer_config_list] == [
+            MambaLayerConfig,
+            AttentionLayerConfig,
+            MLPLayerConfig,
+        ]
+        assert len({id(config) for config in decoder.layer_config_list}) == 3
+        assert all(config is not self.model.config for config in decoder.layer_config_list)
+        assert all(
+            layer.config is layer_config
+            for layer, layer_config in zip(decoder.layers, decoder.layer_config_list, strict=True)
+        )
+
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 1774872
+
+    @pytest.mark.parametrize(
+        ("freeze_base", "training", "expected_grad_enabled"),
+        [(False, True, True), (True, True, False), (True, False, True)],
+    )
+    def test_frozen_base_decoder_grad_context(
+        self, monkeypatch, freeze_base, training, expected_grad_enabled
+    ):
+        decoder_input = torch.ones(4, 2, self.model.config.hidden_size, requires_grad=True)
+        grad_enabled = []
+
+        def capture_decoder(**kwargs):
+            grad_enabled.append(torch.is_grad_enabled())
+            return kwargs['hidden_states'] * 2
+
+        monkeypatch.setattr(self.model.decoder, 'forward', capture_decoder)
+        self.model.config.freeze_base_model_for_mtp = freeze_base
+        self.model.post_process = False
+        self.model.train(training)
+
+        output = self.model(
+            input_ids=None, position_ids=None, attention_mask=None, decoder_input=decoder_input
+        )
+
+        assert grad_enabled == [expected_grad_enabled]
+        assert output.requires_grad is expected_grad_enabled
+
+    def test_mtp_rejects_tp_overlap(self):
+        model_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=1,
+            tp_comm_overlap=True,
+        )
+        with pytest.raises(
+            ValueError, match="TP communication overlap is not supported with hybrid MTP layers"
+        ):
+            HybridModel(
+                config=model_config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_pattern="-/M",
+            )
+
+        assert model_config.tp_comm_overlap is True
 
     def test_mtp_placement_uses_model_pipeline_group(self, mocker):
         placement = mocker.patch(
@@ -268,6 +335,9 @@ class TestHybridModel:
             def __init__(self):
                 super().__init__()
                 self.mtp_input_mask = None
+
+            def prepare_cp_layout(self, **kwargs):
+                return SimpleNamespace(**kwargs)
 
             def forward(self, **kwargs):
                 self.mtp_input_mask = kwargs["mtp_input_mask"]

@@ -101,8 +101,8 @@ class TestParallelTransformerLayer:
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])
         assert num_weights == 1884
 
-    def test_mtp_flag_is_not_forwarded_to_non_dsv4_attention(self):
-        """Strict attention implementations such as GDN must not receive the DSv4-only flag."""
+    def test_mtp_flag_is_forwarded_to_attention(self):
+        """All attention builders receive the MTP-layer flag."""
         config = TransformerConfig(
             num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
         )
@@ -122,7 +122,7 @@ class TestParallelTransformerLayer:
         ):
             TransformerLayer(config, submodules, is_mtp_layer=True)
 
-        assert "is_mtp_layer" not in attention_kwargs
+        assert attention_kwargs["is_mtp_layer"] is True
 
     def test_gpu_forward(self):
         parallel_transformer_layer = self.parallel_transformer_layer

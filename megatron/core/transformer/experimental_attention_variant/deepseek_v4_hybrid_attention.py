@@ -19,10 +19,13 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.csa import (
+    CompressedSparseAttentionBuilder,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.typed_torch import apply_module
+from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import get_pg_size, is_te_min_version
 
 try:
@@ -57,7 +60,7 @@ class DSv4HybridSelfAttentionSubmodules:
     linear_q_down_proj: Union[ModuleSpec, type] = None
     linear_q_up_proj: Union[ModuleSpec, type] = None
     linear_kv_proj: Union[ModuleSpec, type] = None
-    core_attention: Union[ModuleSpec, type] = None
+    core_attention: CompressedSparseAttentionBuilder | None = None
     linear_proj: Union[ModuleSpec, type] = None
 
 
@@ -159,8 +162,7 @@ class DSv4HybridAttention(Attention):
                 cp_group=self.pg_collection.cp,
             )
 
-        self.core_attention = build_module(
-            submodules.core_attention,
+        self.core_attention = not_none(submodules.core_attention)(
             config=self.config,
             layer_number=self.layer_number,
             attn_mask_type=self.attn_mask_type,
@@ -177,12 +179,14 @@ class DSv4HybridAttention(Attention):
         )
 
         # Output.
-        self.o_local_groups = self.config.o_groups
+        self.output_projection_local_groups = self.config.output_projection_groups
         assert (
-            self.query_projection_size % self.config.o_groups == 0
-        ), "num_attention_heads * v_head_dim must be divisible by o_groups"
-        group_proj_in_size = self.query_projection_size // self.config.o_groups
-        group_proj_out_size = self.config.o_groups * self.config.o_lora_rank
+            self.query_projection_size % self.config.output_projection_groups == 0
+        ), "num_attention_heads * v_head_dim must be divisible by output_projection_groups"
+        group_proj_in_size = self.query_projection_size // self.config.output_projection_groups
+        group_proj_out_size = (
+            self.config.output_projection_groups * self.config.output_projection_lora_rank
+        )
 
         group_proj_device = (
             'cpu' if self.config.use_cpu_initialization else torch.cuda.current_device()
@@ -197,7 +201,9 @@ class DSv4HybridAttention(Attention):
             self.config.init_method(_linear_o_group_proj)
         self.linear_o_group_proj = torch.nn.Parameter(_linear_o_group_proj)
 
-        linear_proj_in_size = self.config.o_groups * self.config.o_lora_rank
+        linear_proj_in_size = (
+            self.config.output_projection_groups * self.config.output_projection_lora_rank
+        )
 
         self.linear_proj = build_module(
             submodules.linear_proj,
@@ -291,7 +297,7 @@ class DSv4HybridAttention(Attention):
             self.offload_core_attention and self.training, query, "core_attn"
         )
         with core_attn_manager as query:
-            core_attn_out = self.core_attention(
+            core_attn_out = apply_module(self.core_attention)(
                 query,
                 key,
                 value,
@@ -375,10 +381,10 @@ class DSv4HybridAttention(Attention):
 
         # Grouped output
         core_attn_out = core_attn_out.view(
-            core_attn_out.size(0), core_attn_out.size(1), self.o_local_groups, -1
+            core_attn_out.size(0), core_attn_out.size(1), self.output_projection_local_groups, -1
         )
         wo_a_weight = self.linear_o_group_proj.view(
-            self.o_local_groups, self.config.o_lora_rank, -1
+            self.output_projection_local_groups, self.config.output_projection_lora_rank, -1
         )
         core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)

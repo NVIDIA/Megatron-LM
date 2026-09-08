@@ -55,6 +55,22 @@ class CapturingTransformerConfig:
         self.__dict__.update(kwargs)
 
 
+def _minimal_training_args(monkeypatch):
+    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py', '--freeze-base-model-for-mtp'])
+    args = parse_args()
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 1024
+    args.seq_length = 1024
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = 'NullTokenizer'
+    args.vocab_size = 1024
+    return args
+
+
 def test_moe_norm_flag_reaches_transformer_config():
     """The generated LatentMoE norm flag should populate the model config."""
     parser = ArgumentParser()
@@ -93,6 +109,25 @@ def test_moe_norm_flag_requires_latent_size(monkeypatch):
     args.moe_latent_size = None
 
     with pytest.raises(AssertionError, match="--moe-use-norm-before-up-proj requires"):
+        validate_args(args)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"mtp_num_layers": None}, "requires --mtp-num-layers"),
+        (
+            {"mtp_num_layers": 1, "freeze_all_layers": True, "position_embedding_type": "rope"},
+            "cannot be combined with --freeze-all-layers",
+        ),
+    ],
+)
+def test_freeze_base_model_for_mtp_validation(monkeypatch, overrides, error):
+    args = _minimal_training_args(monkeypatch)
+    for name, value in overrides.items():
+        setattr(args, name, value)
+
+    with pytest.raises(AssertionError, match=error):
         validate_args(args)
 
 
@@ -798,8 +833,33 @@ class TestMegatronMLAArgumentGeneration:
 
         assert config.original_max_position_embeddings == 65536
 
+    def test_d_symbol_defaults_to_dsa(self):
+        """The D symbol keeps its existing DSA default when no variant is specified."""
+        argv = [
+            'test_argument_utils.py',
+            '--hybrid-layer-pattern',
+            'D',
+            '--disable-bias-linear',
+            '--hidden-size',
+            '128',
+            '--num-attention-heads',
+            '8',
+            '--micro-batch-size',
+            '1',
+            '--seq-length',
+            '32',
+            '--max-position-embeddings',
+            '32',
+        ]
+        with patch('sys.argv', argv):
+            args = validate_args(parse_args())
+
+        config = core_transformer_config_from_args(args)
+
+        assert config.experimental_attention_variant == 'dsa'
+
     def test_dsv4_hybrid_arguments_reach_mla_config(self):
-        """The D symbol must preserve DSv4 mode and its latent-norm epsilon."""
+        """The D symbol preserves DSv4 mode and propagates MLA-specific arguments."""
         argv = [
             'test_argument_utils.py',
             '--hybrid-layer-pattern',
@@ -808,8 +868,14 @@ class TestMegatronMLAArgumentGeneration:
             'dsv4_hybrid',
             '--attention-latent-norm-epsilon',
             '1e-5',
+            '--csa-compress-ratios',
+            '[4]',
             '--q-lora-rank',
             '32',
+            '--output-projection-groups',
+            '4',
+            '--output-projection-lora-rank',
+            '64',
             '--hidden-size',
             '128',
             '--num-attention-heads',
@@ -828,6 +894,8 @@ class TestMegatronMLAArgumentGeneration:
 
         assert config.experimental_attention_variant == 'dsv4_hybrid'
         assert config.attention_latent_norm_epsilon == pytest.approx(1e-5)
+        assert config.output_projection_groups == 4
+        assert config.output_projection_lora_rank == 64
 
 
 class TestMegatronMixedPrecisionArguments:
