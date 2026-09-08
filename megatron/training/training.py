@@ -823,6 +823,9 @@ def num_floating_point_operations(
     batch_size,
     seqlen_squared_sum_in_batch=None,
     total_real_tokens_in_batch=None,
+    hybrid_layer_config_list=None,
+    hybrid_uses_gated_delta_product=None,
+    hybrid_dsa_uses_absorbed_mla=True,
 ):
     """Compute the number of floating-point operations for one global batch.
 
@@ -847,6 +850,13 @@ def num_floating_point_operations(
             than ``batch_size * args.seq_length`` whenever the dataloader added
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
+        hybrid_layer_config_list: Optional unsplit config sequence for a list-defined
+            HybridModel. Configs are consumed directly; the sequence is never converted
+            to a hybrid pattern string.
+        hybrid_uses_gated_delta_product: Whether the built HybridModel's Mamba slot uses
+            gated delta product. When omitted, retain the existing args/spec lookup.
+        hybrid_dsa_uses_absorbed_mla: Whether the built HybridModel's DSA slot uses
+            absorbed MLA. Defaults to the standard training hybrid stack.
     """
     # Defaults: BSHD layout assumption (full causal mask, every sample length =
     # seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
@@ -1024,6 +1034,196 @@ def num_floating_point_operations(
                 (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         return flops_fwd * 3
+
+    def hybrid_config_list_flops(layer_config_list):
+        """Calculate HybridModel FLOPs from each layer's concrete config."""
+        from megatron.core.models.hybrid.hybrid_layer_allocation import MTPSplit, PipelineSplit
+        from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
+        from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+        from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
+        from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+        from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import (
+            DSALayerConfig,
+        )
+        from megatron.core.transformer.mla_layer_config import MLALayerConfig
+        from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+
+        def mla_projection_flops(config):
+            """Return token-linear MLA projection FLOPs shared by MLA and DSA."""
+            q_head_dim = config.qk_head_dim + config.qk_pos_emb_head_dim
+            if config.q_lora_rank is None:
+                q_term = config.hidden_size * config.num_attention_heads * q_head_dim
+            else:
+                q_term = config.q_lora_rank * (
+                    config.hidden_size + config.num_attention_heads * q_head_dim + 1
+                )
+            projection_term = (
+                q_term
+                + config.kv_lora_rank
+                * (
+                    config.hidden_size
+                    + config.num_attention_heads * (config.qk_head_dim + config.v_head_dim)
+                    + 1
+                )
+                + config.hidden_size * config.qk_pos_emb_head_dim
+                + config.num_attention_heads * config.v_head_dim * config.hidden_size
+            )
+            return 2 * total_real_tokens_in_batch * projection_term
+
+        def mla_layer_flops(config):
+            """Return forward dense MLA FLOPs using the existing estimator."""
+            q_head_dim = config.qk_head_dim + config.qk_pos_emb_head_dim
+            core_term = config.num_attention_heads * (q_head_dim + config.v_head_dim)
+            return mla_projection_flops(config) + seqlen_squared_sum_in_batch * core_term
+
+        def dsa_layer_flops(config, layer_number):
+            """Return forward DSA FLOPs for this concrete layer and physical position."""
+            from megatron.core.transformer.experimental_attention_variant.dsa import (
+                is_dsa_skip_topk_layer,
+            )
+
+            if hybrid_dsa_uses_absorbed_mla:
+                core_dim = 2 * config.kv_lora_rank + config.qk_pos_emb_head_dim
+            else:
+                core_dim = (
+                    config.qk_head_dim + config.qk_pos_emb_head_dim + config.v_head_dim
+                )
+            sparse_pair_measure = min(
+                seqlen_squared_sum_in_batch,
+                2 * total_real_tokens_in_batch * config.dsa_indexer_topk,
+            )
+            flops = (
+                mla_projection_flops(config)
+                + sparse_pair_measure * config.num_attention_heads * core_dim
+            )
+
+            if not is_dsa_skip_topk_layer(
+                layer_number,
+                config.dsa_indexer_skip_topk_offset,
+                config.dsa_indexer_topk_freq,
+            ):
+                indexer_query_input = config.q_lora_rank or config.hidden_size
+                indexer_projection_flops = 2 * total_real_tokens_in_batch * (
+                    indexer_query_input
+                    * config.dsa_indexer_n_heads
+                    * config.dsa_indexer_head_dim
+                    + config.hidden_size * config.dsa_indexer_head_dim
+                    + config.hidden_size * config.dsa_indexer_n_heads
+                )
+                indexer_score_flops = (
+                    seqlen_squared_sum_in_batch
+                    * config.dsa_indexer_n_heads
+                    * config.dsa_indexer_head_dim
+                )
+                flops += indexer_projection_flops + indexer_score_flops
+            return flops
+
+        forward_flops = 0
+        mtp_num_depths = 0
+        layer_number = 0
+        use_gated_delta_product = (
+            _uses_gated_delta_product_spec(args)
+            if hybrid_uses_gated_delta_product is None
+            else hybrid_uses_gated_delta_product
+        )
+        for entry in layer_config_list:
+            if entry is PipelineSplit:
+                continue
+            if entry is MTPSplit:
+                mtp_num_depths += 1
+                layer_number = 0
+                continue
+
+            layer_number += 1
+
+            if type(entry) is AttentionLayerConfig:
+                forward_flops += attn_layer_flops(
+                    total_real_tokens_in_batch,
+                    seqlen_squared_sum_in_batch,
+                    entry.hidden_size,
+                    entry.num_attention_heads,
+                    gqa=True,
+                    gqa_groups=entry.num_query_groups,
+                    kv_channels=entry.kv_channels,
+                )
+                if entry.attention_output_gate:
+                    query_projection_size = entry.kv_channels * entry.num_attention_heads
+                    forward_flops += (
+                        2 * total_real_tokens_in_batch * entry.hidden_size * query_projection_size
+                    )
+            elif type(entry) is MLALayerConfig:
+                forward_flops += mla_layer_flops(entry)
+            elif type(entry) is DSALayerConfig:
+                forward_flops += dsa_layer_flops(entry, layer_number)
+            elif type(entry) is MambaLayerConfig:
+                if use_gated_delta_product:
+                    forward_flops += gated_delta_product_layer_flops(
+                        total_real_tokens_in_batch,
+                        entry.hidden_size,
+                        entry.gdp_num_householder,
+                        entry.mamba_state_dim,
+                        entry.mamba_head_dim,
+                        entry.mamba_num_groups,
+                        entry.mamba_num_heads,
+                    )
+                else:
+                    forward_flops += mamba_layer_flops(
+                        total_real_tokens_in_batch,
+                        entry.hidden_size,
+                        entry.mamba_state_dim,
+                        entry.mamba_head_dim,
+                        entry.mamba_num_groups,
+                        entry.mamba_num_heads,
+                    )
+            elif type(entry) is GDNLayerConfig:
+                forward_flops += gdn_layer_flops(
+                    total_real_tokens_in_batch,
+                    entry.hidden_size,
+                    entry.linear_key_head_dim or 128,
+                    entry.linear_value_head_dim or 128,
+                    entry.linear_num_key_heads or 16,
+                    entry.linear_num_value_heads or 32,
+                    entry.linear_conv_kernel_dim or 4,
+                    entry.experimental_attention_variant == "gdn2",
+                )
+            elif type(entry) is MLPLayerConfig:
+                forward_flops += mlp_layer_flops(
+                    total_real_tokens_in_batch,
+                    entry.hidden_size,
+                    entry.ffn_hidden_size / entry.hidden_size,
+                    entry.gated_linear_unit,
+                )
+            elif type(entry) is MoELayerConfig:
+                forward_flops += moe_layer_flops(
+                    total_real_tokens_in_batch,
+                    entry.hidden_size,
+                    entry.moe_ffn_hidden_size or entry.ffn_hidden_size,
+                    entry.moe_shared_expert_intermediate_size or 0,
+                    entry.moe_router_topk,
+                    entry.moe_latent_size,
+                    entry.gated_linear_unit,
+                )
+            else:
+                raise ValueError(
+                    f"Unexpected hybrid layer config type in FLOPs calculation: {type(entry).__name__}"
+                )
+
+        # Each prediction depth executes its input norms/projection in addition to the concrete
+        # inner-layer template above. This work is repeated even when the module is shared.
+        forward_flops += (
+            2
+            * total_real_tokens_in_batch
+            * mtp_num_depths
+            * (3 * args.hidden_size + 2 * args.hidden_size**2)
+        )
+        forward_flops += (
+            2
+            * total_real_tokens_in_batch
+            * args.hidden_size
+            * args.padded_vocab_size
+            * (1 + mtp_num_depths)
+        )
+        return forward_flops * 3
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -1348,6 +1548,9 @@ def num_floating_point_operations(
         return spec_parts[-1] in {'gdp_stack_spec', 'gated_delta_product_stack_spec'}
 
     # Main entrypoint for FLOPs calculation.
+    if hybrid_layer_config_list is not None:
+        return hybrid_config_list_flops(hybrid_layer_config_list)
+
     if is_hybrid_model(args):
         # Calculate the number of each type of layer.
         from operator import itemgetter
@@ -3357,6 +3560,101 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
 
 
+def _hybrid_config_list_moe_logging_metadata(
+    hybrid_layer_config_list, mtp_use_repeated_layer: bool
+):
+    """Derive exact physical MoE metric metadata from a HybridModel config list."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import MTPSplit, PipelineSplit
+    from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+
+    def aux_loss_coeff_for_config(moe_config, routing_type):
+        configured_types = moe_config.moe_router_load_balancing_type
+        if isinstance(configured_types, str):
+            return moe_config.moe_aux_loss_coeff if configured_types == routing_type else 0.0
+        try:
+            routing_index = configured_types.index(routing_type)
+        except ValueError:
+            return 0.0
+        return moe_config.moe_aux_loss_coeff[routing_index]
+
+    def enabled_routing_types_for_config(moe_config):
+        return {
+            routing_type
+            for routing_type in ("aux_loss", "seq_aux_loss", "global_aux_loss")
+            if aux_loss_coeff_for_config(moe_config, routing_type) > 0
+        }
+
+    physical_configs = []
+    mtp_depth = 0
+    for entry in hybrid_layer_config_list:
+        if entry is PipelineSplit:
+            continue
+        if entry is MTPSplit:
+            mtp_depth += 1
+        elif mtp_depth == 0 or not mtp_use_repeated_layer or mtp_depth == 1:
+            physical_configs.append(entry)
+
+    physical_moe_configs = [config for config in physical_configs if type(config) is MoELayerConfig]
+    if not physical_moe_configs:
+        return [], len(physical_configs), {}, False
+
+    routing_types = set()
+    for moe_config in physical_moe_configs:
+        routing_types.update(enabled_routing_types_for_config(moe_config))
+
+    metric_to_routing_type = {
+        "load_balancing_loss": "aux_loss",
+        "seq_load_balancing_loss": "seq_aux_loss",
+        "global_load_balancing_loss": "global_aux_loss",
+    }
+    track_names = [
+        metric_name
+        for metric_name, routing_type in metric_to_routing_type.items()
+        if routing_type in routing_types
+    ]
+    if any(config.moe_z_loss_coeff is not None for config in physical_moe_configs):
+        track_names.append("z_loss")
+
+    contributor_counts = {}
+    for track_name in track_names:
+        if track_name == "z_loss":
+            contributor_counts[track_name] = sum(
+                config.moe_z_loss_coeff is not None for config in physical_moe_configs
+            )
+        else:
+            routing_type = metric_to_routing_type[track_name]
+            contributor_counts[track_name] = sum(
+                routing_type in enabled_routing_types_for_config(config)
+                for config in physical_moe_configs
+            )
+
+    return track_names, len(physical_configs), contributor_counts, True
+
+
+def _find_hybrid_model_for_runtime_metrics(model):
+    """Find a HybridModel through precision/DDP and language-model wrappers."""
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+    pending = [model]
+    visited = set()
+    while pending:
+        candidate = pending.pop()
+        if candidate is None or id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        if isinstance(candidate, HybridModel):
+            return candidate
+        pending.extend(
+            nested
+            for nested in (
+                getattr(candidate, 'module', None),
+                getattr(candidate, 'language_model', None),
+            )
+            if nested is not None
+        )
+    return None
+
+
 def training_log(
     loss_dict,
     total_loss_dict,
@@ -3373,6 +3671,10 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    hybrid_layer_config_list=None,
+    hybrid_mtp_use_repeated_layer=None,
+    hybrid_uses_gated_delta_product=None,
+    hybrid_dsa_uses_absorbed_mla=True,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -3548,7 +3850,34 @@ def training_log(
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
     # Log MoE metrics.
     moe_log_string = ""
-    if args.num_experts is not None:
+    list_moe_metadata = None
+    if hybrid_layer_config_list is not None:
+        if hybrid_mtp_use_repeated_layer is None:
+            hybrid_mtp_use_repeated_layer = args.mtp_use_repeated_layer
+        list_moe_metadata = _hybrid_config_list_moe_logging_metadata(
+            hybrid_layer_config_list, hybrid_mtp_use_repeated_layer
+        )
+    has_moe_layers = list_moe_metadata[3] if list_moe_metadata else args.num_experts is not None
+
+    if list_moe_metadata and list_moe_metadata[3]:
+        moe_loss_scale = 1 / get_num_microbatches()
+        track_names, layers, num_moe_layers, _ = list_moe_metadata
+        moe_log_string = get_moe_metrics_tracker().report(
+            loss_scale=moe_loss_scale,
+            iteration=iteration,
+            writer=writer,
+            wandb_writer=wandb_writer,
+            per_layer_logging=args.moe_per_layer_logging,
+            force_initialize=True,
+            track_names=track_names,
+            num_layers=layers,
+            num_moe_layers=num_moe_layers,
+            moe_layer_freq=args.moe_layer_freq,
+            pg_collection=pg_collection,
+            total_loss_dict=total_loss_dict,
+        )
+
+    if args.num_experts is not None and hybrid_layer_config_list is None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
         if "aux_loss" in args.moe_router_load_balancing_type:
@@ -3650,6 +3979,9 @@ def training_log(
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            hybrid_layer_config_list=hybrid_layer_config_list,
+            hybrid_uses_gated_delta_product=hybrid_uses_gated_delta_product,
+            hybrid_dsa_uses_absorbed_mla=hybrid_dsa_uses_absorbed_mla,
         ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
@@ -3724,7 +4056,7 @@ def training_log(
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 if should_reset:
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
-        if args.num_experts is not None and moe_log_string:
+        if has_moe_layers and moe_log_string:
             log_string += moe_log_string
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
@@ -4275,6 +4607,22 @@ def train(
     """
     args = get_args()
     timers = get_timers()
+    hybrid_model = _find_hybrid_model_for_runtime_metrics(model[0])
+    hybrid_layer_config_list = (
+        hybrid_model.hybrid_layer_config_list if hybrid_model is not None else None
+    )
+    hybrid_mtp_use_repeated_layer = None
+    hybrid_uses_gated_delta_product = None
+    hybrid_dsa_uses_absorbed_mla = True
+    has_moe_layers = args.num_experts is not None
+    if hybrid_layer_config_list is not None:
+        from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+
+        hybrid_model_config = hybrid_model.config
+        hybrid_mtp_use_repeated_layer = hybrid_model_config.mtp_use_repeated_layer
+        hybrid_uses_gated_delta_product = hybrid_model._hybrid_uses_gated_delta_product
+        hybrid_dsa_uses_absorbed_mla = hybrid_model._hybrid_dsa_uses_absorbed_mla
+        has_moe_layers = any(type(entry) is MoELayerConfig for entry in hybrid_layer_config_list)
 
     fault_injector_kwargs = {}
     for f in dataclasses.fields(FaultInjectorConfig):
@@ -4943,6 +5291,9 @@ def train(
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            hybrid_layer_config_list=hybrid_layer_config_list,
+            hybrid_uses_gated_delta_product=hybrid_uses_gated_delta_product,
+            hybrid_dsa_uses_absorbed_mla=hybrid_dsa_uses_absorbed_mla,
         )
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
@@ -5003,6 +5354,10 @@ def train(
                     is_first_iteration=is_first_iteration,
                     seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
                     total_real_tokens_in_batch=total_real_tokens_in_batch,
+                    hybrid_layer_config_list=hybrid_layer_config_list,
+                    hybrid_mtp_use_repeated_layer=hybrid_mtp_use_repeated_layer,
+                    hybrid_uses_gated_delta_product=hybrid_uses_gated_delta_product,
+                    hybrid_dsa_uses_absorbed_mla=hybrid_dsa_uses_absorbed_mla,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
@@ -5076,7 +5431,7 @@ def train(
             timers('interval-time', log_level=0).start(barrier=True)
             if args.log_energy:
                 energy_monitor.resume()
-            if args.num_experts is not None:
+            if has_moe_layers:
                 get_moe_metrics_tracker().clear()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).

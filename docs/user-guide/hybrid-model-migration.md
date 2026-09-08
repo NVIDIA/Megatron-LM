@@ -68,6 +68,72 @@ An architecture-preserving `*-` or `*E` migration should be validated for
 numerical equivalence, and a pattern that adds another layer family should be
 treated as a new architecture and benchmarked independently.
 
+### Define heterogeneous layers in Python
+
+Python model definitions can provide concrete layer configs without converting
+them to a pattern string. Pass the sequence through `HybridModelConfig`; the
+builder forwards it directly to `HybridModel`:
+
+```python
+from megatron.core.models.hybrid import MTPSplit, PipelineSplit
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.models.hybrid import HybridModelConfig
+
+transformer = TransformerConfig(
+    num_layers=4,
+    hidden_size=4096,
+    num_attention_heads=32,
+    ffn_hidden_size=14336,
+    pipeline_model_parallel_size=2,
+    virtual_pipeline_model_parallel_size=2,
+)
+attention = AttentionLayerConfig.from_config(transformer)
+small_moe = MoELayerConfig.from_config(transformer)
+small_moe.num_moe_experts = 8
+small_moe.moe_ffn_hidden_size = 2048
+small_moe.moe_router_topk = 2
+large_moe = MoELayerConfig.from_config(transformer)
+large_moe.num_moe_experts = 64
+large_moe.moe_ffn_hidden_size = 4096
+large_moe.moe_router_topk = 8
+
+mtp_head = [MTPSplit, attention, small_moe]
+layer_configs = [
+    attention,
+    PipelineSplit,
+    small_moe,
+    PipelineSplit,
+    attention,
+    PipelineSplit,
+    large_moe,
+] + mtp_head * 2
+model_config = HybridModelConfig(
+    transformer=transformer,
+    vocab_size=131072,
+    hybrid_layer_config_list=layer_configs,
+)
+```
+
+`hybrid_layer_config_list` and `hybrid_layer_pattern` are mutually exclusive.
+The decoder config count must equal `num_layers`. `PipelineSplit` defines the
+same boundaries as `|`; PP/VPP must already match the number of segments. In
+this example, four segments require PP 2 and VPP 2; HybridModel never infers or
+changes VPP from the list.
+Each `MTPSplit` starts one MTP head. Repeated heads must reuse the same config
+objects in the same order, as in `mtp_head * 2`; their count is used when
+`mtp_num_layers` is unset and must match it otherwise. HybridModel treats the
+source sequence as read-only and creates an independent config for every
+physical layer occurrence.
+
+The Python definition remains the architecture source when resuming a
+checkpoint. Checkpoints record that the model is hybrid, but do not serialize
+or reconstruct `hybrid_layer_config_list`. A custom training entrypoint that
+validates arguments before creating the model should pass
+`is_hybrid_model=True` as an argument default; `pretrain_hybrid.py` already does
+this. The scalar is only a runtime/checkpoint family marker.
+
 ## 2. How to Convert a Checkpoint
 
 There are two ways to bring `GPTModel` weights into a `HybridModel` run. Both
@@ -366,10 +432,11 @@ remove `--decoder-first-pipeline-num-layers` and
 `--decoder-last-pipeline-num-layers`. Express virtual-pipeline segmentation
 with additional pipe-delimited segments instead.
 
-The declarative `HybridModelBuilder` currently rejects virtual pipeline
-parallelism. Pipe-defined virtual stages are supported by the
-`pretrain_hybrid.py` CLI builder, but custom builder users must avoid VPP or use
-a path that explicitly supports it.
+The declarative `HybridModelBuilder` supports virtual pipeline parallelism when
+the configured VPP size matches the number of explicit pipeline segments. The
+string form derives VPP from `|`; the config-list form requires the PP and VPP
+topology to be configured before construction and uses `PipelineSplit` markers
+for the segments.
 
 ### Update custom providers and conversion mappings
 

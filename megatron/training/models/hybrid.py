@@ -2,15 +2,17 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, ClassVar, Literal, override
+from typing import Any, Callable, ClassVar, Literal, Sequence, override
 
 import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.models.hybrid import HybridLayerConfigListEntry
+from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_layer_config_list
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
-    hybrid_inference_stack_spec,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
@@ -19,11 +21,8 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.training.models.base import (
-    ModelBuilder,
-    ModelConfig,
-    compose_hooks,
-)
+from megatron.training.global_vars import get_args
+from megatron.training.models.base import ModelBuilder, ModelConfig, compose_hooks
 from megatron.training.models.dist_utils import unimodal_build_distributed_models
 from megatron.training.vocab_utils import calculate_padded_vocab_size
 
@@ -41,7 +40,8 @@ class HybridModelConfig(ModelConfig):
     on the embedded ``transformer`` config are accessible directly on this object
     via ``__getattr__``/``__setattr__`` proxying.
 
-    Supports hybrid architectures via ``hybrid_layer_pattern``
+    Supports hybrid architectures via either ``hybrid_layer_pattern`` or a
+    first-class ``hybrid_layer_config_list``.
 
     Note:
         ``vocab_size`` must be set before passing this config to ``HybridModelBuilder``.
@@ -59,6 +59,7 @@ class HybridModelConfig(ModelConfig):
     hybrid_mlp_ratio: float = 0.0
     hybrid_override_pattern: str | None = None
     hybrid_layer_pattern: str | None = None
+    hybrid_layer_config_list: Sequence[HybridLayerConfigListEntry] | None = None
     seq_length: int = 8192
     # HybridModel with no attention has no need for position embeddings, so none is default
     position_embedding_type: Literal["learned_absolute", "rope", "none"] = "none"
@@ -148,9 +149,72 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         Returns:
             The constructed model
 
-        Note:
-            Virtual pipeline model parallelism is not supported for Hybrid models.
+        A config-list architecture may use ``PipelineSplit`` markers with a
+        matching preconfigured virtual-pipeline topology.
         """
+        hybrid_layer_config_list = self._model_config.hybrid_layer_config_list
+        parsed_config_list = None
+        try:
+            args = get_args()
+        except AssertionError:
+            args = None
+        args_mtp_num_layers = getattr(args, "mtp_num_layers", None) if args is not None else None
+        if hybrid_layer_config_list is not None:
+            has_deprecated_ratio = self._model_config.hybrid_attention_ratio != 0.0 or (
+                self._model_config.hybrid_mlp_ratio != 0.0
+            )
+            if (
+                self._model_config.hybrid_layer_pattern is not None
+                or self._model_config.hybrid_override_pattern is not None
+                or has_deprecated_ratio
+            ):
+                raise ValueError(
+                    "hybrid_layer_config_list is mutually exclusive with "
+                    "hybrid_layer_pattern, hybrid_override_pattern, "
+                    "hybrid_attention_ratio, and hybrid_mlp_ratio"
+                )
+
+            parsed_config_list = parse_hybrid_layer_config_list(
+                hybrid_layer_config_list,
+                expected_num_layers=self._model_config.transformer.num_layers,
+                expected_mtp_num_layers=self._model_config.transformer.mtp_num_layers,
+            )
+            # The stack-level config is normally separate from layer entries. If a caller reuses
+            # the same supported config object for both roles, detach the stack-level copy before
+            # synchronizing inferred runtime state so the list entry remains read-only.
+            if any(
+                entry is self._model_config.transformer for entry in hybrid_layer_config_list
+            ):
+                transformer = self._model_config.transformer
+                self._model_config.transformer = type(transformer).from_config(transformer)
+            if (
+                self._model_config.transformer.mtp_num_layers is None
+                and parsed_config_list.mtp_num_depths > 0
+            ):
+                self._model_config.transformer.mtp_num_layers = parsed_config_list.mtp_num_depths
+
+            freeze_base_model_for_mtp = self._model_config.transformer.freeze_base_model_for_mtp
+            if args is not None:
+                freeze_base_model_for_mtp = freeze_base_model_for_mtp or (
+                    getattr(args, "freeze_base_model_for_mtp", False) is True
+                )
+            if freeze_base_model_for_mtp and parsed_config_list.mtp_num_depths == 0:
+                raise ValueError(
+                    "freeze_base_model_for_mtp requires hybrid_layer_config_list "
+                    "to define at least one MTP head"
+                )
+
+            if args is not None:
+                if (
+                    args_mtp_num_layers is not None
+                    and args_mtp_num_layers != parsed_config_list.mtp_num_depths
+                ):
+                    raise ValueError(
+                        "hybrid_layer_config_list defines "
+                        f"{parsed_config_list.mtp_num_depths} MTP depths, but runtime "
+                        f"mtp_num_layers is {args_mtp_num_layers}"
+                    )
+
         hybrid_stack_spec = self._model_config.hybrid_stack_spec
         if hybrid_stack_spec is None:
             if self._model_config.transformer.transformer_impl == "inference_optimized":
@@ -175,12 +239,13 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
 
         pre_process = pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
         post_process = post_process if post_process is not None else is_pp_last_stage(pg_collection.pp)
-        return HybridModel(
+        model = HybridModel(
             config=self._model_config.transformer,
             hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=padded_vocab_size,
             max_sequence_length=self._model_config.seq_length,
             hybrid_layer_pattern=self._model_config.hybrid_layer_pattern,
+            hybrid_layer_config_list=hybrid_layer_config_list,
             fp16_lm_cross_entropy=self._model_config.fp16_lm_cross_entropy,
             logit_dtype=self._model_config.logit_dtype,
             parallel_output=self._model_config.parallel_output,
@@ -194,6 +259,15 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             pg_collection=pg_collection,
             vp_stage=vp_stage,
         )
+        if args is not None:
+            args.is_hybrid_model = True
+            if (
+                parsed_config_list is not None
+                and args_mtp_num_layers is None
+                and parsed_config_list.mtp_num_depths > 0
+            ):
+                args.mtp_num_layers = parsed_config_list.mtp_num_depths
+        return model
 
     def build_distributed_models(
         self,

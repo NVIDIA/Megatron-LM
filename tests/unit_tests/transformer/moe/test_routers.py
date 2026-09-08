@@ -9,6 +9,7 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.moe_logging import MoEMetricsTracker
 from megatron.core.transformer.moe.moe_utils import (
     get_updated_expert_bias,
     router_gating_linear,
@@ -66,6 +67,55 @@ class TestTop2Router:
 
         num_weights = sum([p.numel() for p in self.router.parameters()])
         assert num_weights == 12 * 4, num_weights
+
+    @pytest.mark.internal
+    def test_hybrid_mtp_metric_uses_physical_layer_index(self, monkeypatch):
+        recorded = {}
+
+        class _MetricsTracker:
+            def record(self, name, value, layer_number, num_layers, **kwargs):
+                recorded.update(
+                    name=name, value=value, layer_number=layer_number, num_layers=num_layers
+                )
+
+        monkeypatch.setattr(
+            "megatron.core.transformer.moe.router.get_moe_metrics_tracker",
+            lambda: _MetricsTracker(),
+        )
+        self.router.is_mtp_layer = True
+        self.router.config._hybrid_moe_metrics_layer_number = 7
+        self.router.config._hybrid_moe_metrics_num_layers = 9
+
+        self.router.attach_and_log_load_balancing_loss(
+            torch.ones(2, self.router.config.hidden_size),
+            1.0,
+            torch.tensor(2.0),
+            "load_balancing_loss",
+            reduce_group=None,
+        )
+
+        assert recorded["name"] == "load_balancing_loss"
+        assert recorded["layer_number"] == 7
+        assert recorded["num_layers"] == 9
+
+    @pytest.mark.internal
+    def test_heterogeneous_metrics_use_per_metric_contributor_counts(self, monkeypatch):
+        tracker = MoEMetricsTracker()
+        tracker.record("load_balancing_loss", torch.tensor(2.0), 1, 2)
+        tracker.record("seq_load_balancing_loss", torch.tensor(6.0), 2, 2)
+        monkeypatch.setattr(tracker, "_sync_metrics", lambda *args, **kwargs: None)
+        total_loss_dict = {}
+
+        tracker.report(
+            loss_scale=1.0,
+            iteration=1,
+            track_names=["load_balancing_loss", "seq_load_balancing_loss"],
+            num_moe_layers={"load_balancing_loss": 1, "seq_load_balancing_loss": 1},
+            total_loss_dict=total_loss_dict,
+        )
+
+        torch.testing.assert_close(total_loss_dict["load_balancing_loss"], torch.tensor(2.0))
+        torch.testing.assert_close(total_loss_dict["seq_load_balancing_loss"], torch.tensor(6.0))
 
     @pytest.mark.internal
     def test_skip_muon(self):

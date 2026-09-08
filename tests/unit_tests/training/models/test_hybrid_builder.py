@@ -5,7 +5,9 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 
+from megatron.core.models.hybrid import MTPSplit
 from megatron.core.transformer import ModuleSpec
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 
@@ -44,6 +46,7 @@ class TestHybridModelConfigInitialization:
         assert config.parallel_output is True
         assert config.share_embeddings_and_output_weights is False
         assert config.hybrid_layer_pattern is None
+        assert config.hybrid_layer_config_list is None
         assert config.seq_length == 8192
         assert config.position_embedding_type == "none"
         assert config.rotary_percent == 1.0
@@ -77,6 +80,17 @@ class TestHybridModelConfigInitialization:
     def test_hybrid_stack_spec_default_is_none(self):
         config = _make_hybrid_config()
         assert config.hybrid_stack_spec is None
+
+    def test_config_list_is_stored_without_conversion(self):
+        transformer = _make_transformer()
+        layer = AttentionLayerConfig.from_config(transformer)
+        layer_config_list = [layer, layer]
+
+        config = HybridModelConfig(
+            transformer=transformer, hybrid_layer_config_list=layer_config_list
+        )
+
+        assert config.hybrid_layer_config_list is layer_config_list
 
 
 class TestHybridModelConfigGetAttr:
@@ -349,6 +363,7 @@ class TestHybridModelBuilderBuildModel:
         assert kw["vocab_size"] == 32000
         assert kw["max_sequence_length"] == 4096
         assert kw["hybrid_layer_pattern"] == "M-A-"
+        assert kw["hybrid_layer_config_list"] is None
         assert kw["fp16_lm_cross_entropy"] is True
         assert kw["logit_dtype"] == torch.float32
         assert kw["parallel_output"] is False
@@ -359,6 +374,156 @@ class TestHybridModelBuilderBuildModel:
         assert kw["seq_len_interpolation_factor"] is None
         assert kw["pg_collection"] is pg
         assert kw["vp_stage"] is None
+
+    def test_pattern_config_sets_runtime_family_marker(self):
+        args = Mock(mtp_num_layers=None)
+        config = _make_hybrid_config(hybrid_layer_pattern="**")
+
+        with (
+            patch("megatron.training.models.hybrid.get_args", return_value=args),
+            patch("megatron.training.models.hybrid.HybridModel"),
+        ):
+            HybridModelBuilder(config).build_model(self.pg, pre_process=True, post_process=True)
+
+        assert args.is_hybrid_model is True
+
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_config_list_is_forwarded_unchanged(self, mock_model, *_):
+        transformer = _make_transformer()
+        layer = AttentionLayerConfig.from_config(transformer)
+        layer_config_list = [layer, layer]
+        config = _make_hybrid_config(
+            transformer=transformer, hybrid_layer_config_list=layer_config_list
+        )
+
+        HybridModelBuilder(config).build_model(Mock(), pre_process=True, post_process=True)
+
+        assert mock_model.call_args.kwargs["hybrid_layer_config_list"] is layer_config_list
+
+    @patch("megatron.training.models.hybrid.get_args")
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_config_list_syncs_inferred_mtp_depth(
+        self, mock_model, _mock_first, _mock_last, _mock_pad, mock_get_args
+    ):
+        transformer = _make_transformer()
+        decoder_layer = AttentionLayerConfig.from_config(transformer)
+        mtp_layer = AttentionLayerConfig.from_config(transformer)
+        layer_config_list = [decoder_layer, decoder_layer, MTPSplit, mtp_layer, MTPSplit, mtp_layer]
+        args = Mock(mtp_num_layers=None)
+        mock_get_args.return_value = args
+        config = _make_hybrid_config(
+            transformer=transformer, hybrid_layer_config_list=layer_config_list
+        )
+
+        HybridModelBuilder(config).build_model(Mock(), pre_process=True, post_process=True)
+
+        assert transformer.mtp_num_layers == 2
+        assert args.mtp_num_layers == 2
+        assert args.is_hybrid_model is True
+        assert mock_model.call_args.kwargs["hybrid_layer_config_list"] is layer_config_list
+
+    @patch("megatron.training.models.hybrid.get_args")
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_config_list_keeps_unset_mtp_disabled_without_heads(
+        self, mock_model, _mock_first, _mock_last, _mock_pad, mock_get_args
+    ):
+        transformer = _make_transformer()
+        decoder_layer = AttentionLayerConfig.from_config(transformer)
+        args = Mock(mtp_num_layers=None)
+        mock_get_args.return_value = args
+        config = _make_hybrid_config(
+            transformer=transformer, hybrid_layer_config_list=[decoder_layer, decoder_layer]
+        )
+
+        HybridModelBuilder(config).build_model(Mock(), pre_process=True, post_process=True)
+
+        assert transformer.mtp_num_layers is None
+        assert args.mtp_num_layers is None
+        assert args.is_hybrid_model is True
+        assert mock_model.called
+
+    @patch("megatron.training.models.hybrid.get_args", side_effect=AssertionError)
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_config_list_rejects_frozen_base_without_mtp_heads(self, mock_model, *_):
+        transformer = _make_transformer()
+        transformer.freeze_base_model_for_mtp = True
+        decoder_layer = AttentionLayerConfig.from_config(transformer)
+        config = _make_hybrid_config(
+            transformer=transformer, hybrid_layer_config_list=[decoder_layer, decoder_layer]
+        )
+
+        with pytest.raises(ValueError, match="requires.*at least one MTP head"):
+            HybridModelBuilder(config).build_model(self.pg, pre_process=True, post_process=True)
+
+        assert not mock_model.called
+
+    @patch("megatron.training.models.hybrid.get_args", side_effect=AssertionError)
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_config_list_does_not_mutate_reused_root_config(self, mock_model, *_):
+        transformer = AttentionLayerConfig.from_config(_make_transformer())
+        config = _make_hybrid_config(
+            transformer=transformer, hybrid_layer_config_list=[transformer, transformer]
+        )
+
+        HybridModelBuilder(config).build_model(Mock(), pre_process=True, post_process=True)
+
+        assert transformer.mtp_num_layers is None
+        assert config.transformer is not transformer
+        assert config.transformer.mtp_num_layers is None
+        forwarded = mock_model.call_args.kwargs["hybrid_layer_config_list"]
+        assert forwarded is config.hybrid_layer_config_list
+        assert all(entry is transformer for entry in forwarded)
+
+    @pytest.mark.parametrize(
+        "conflict",
+        [
+            {"hybrid_layer_pattern": "**"},
+            {"hybrid_override_pattern": "**"},
+            {"hybrid_attention_ratio": -0.5},
+            {"hybrid_attention_ratio": 1.0},
+            {"hybrid_mlp_ratio": 1.0},
+        ],
+    )
+    def test_config_list_rejects_other_architecture_inputs(self, conflict):
+        transformer = _make_transformer()
+        decoder_layer = AttentionLayerConfig.from_config(transformer)
+        config = _make_hybrid_config(
+            transformer=transformer,
+            hybrid_layer_config_list=[decoder_layer, decoder_layer],
+            **conflict,
+        )
+
+        with pytest.raises(ValueError, match="hybrid_layer_config_list is mutually exclusive"):
+            HybridModelBuilder(config).build_model(Mock(), pre_process=True, post_process=True)
+
+    @patch("megatron.training.models.hybrid.get_args")
+    def test_config_list_rejects_runtime_mtp_depth_mismatch(self, mock_get_args):
+        transformer = _make_transformer()
+        decoder_layer = AttentionLayerConfig.from_config(transformer)
+        mtp_layer = AttentionLayerConfig.from_config(transformer)
+        layer_config_list = [decoder_layer, decoder_layer, MTPSplit, mtp_layer]
+        mock_get_args.return_value = Mock(mtp_num_layers=2)
+        config = _make_hybrid_config(
+            transformer=transformer, hybrid_layer_config_list=layer_config_list
+        )
+
+        with pytest.raises(ValueError, match="runtime mtp_num_layers is 2"):
+            HybridModelBuilder(config).build_model(Mock(), pre_process=True, post_process=True)
 
 
 class TestHybridModelBuilderBuildDistributedModels:

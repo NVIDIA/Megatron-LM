@@ -129,6 +129,10 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`",
         )
         super().__init__(config=config, pg_collection=pg_collection)
+        if self.config.mtp_hsm and (
+            self.config.mtp_num_layers is None or self.config.mtp_num_layers < 2
+        ):
+            raise ValueError("mtp_hsm=True requires mtp_num_layers >= 2.")
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)

@@ -568,7 +568,7 @@ if __name__ == "__main__":
 
     args = parse_and_validate_args(
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
-        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer', 'is_hybrid_model': True},
     )
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)

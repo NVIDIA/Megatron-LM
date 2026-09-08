@@ -32,11 +32,15 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
+    MultiTokenPredictionBlockSubmodules,
     MultiTokenPredictionInputs,
+    MultiTokenPredictionLayer,
+    MultiTokenPredictionLayerSubmodules,
     _initialize_hidden_state_mixing_rng_tracker,
     _mix_hidden_state_history,
     _mtp_logits_are_vocab_sharded,
@@ -122,6 +126,199 @@ class TestMultiTokenPredictionLayer:
             config=config, spec=transformer_layer_spec, use_transformer_engine=use_te
         )
         return config, mtp_block_spec
+
+    @pytest.mark.parametrize(
+        ("mtp_use_repeated_layer", "expected_physical_depths"), [(False, 2), (True, 1)]
+    )
+    def test_hybrid_config_list_is_cloned_per_physical_layer(
+        self, monkeypatch, mtp_use_repeated_layer, expected_physical_depths
+    ):
+        """Direct hybrid configs stay caller-owned and are cloned for each built layer."""
+
+        class FakeGroup:
+
+            def rank(self):
+                return 0
+
+            def size(self):
+                return 1
+
+        class CapturingHybridStack(torch.nn.Module):
+
+            def __init__(self, *, layer_config_list, **kwargs):
+                super().__init__()
+                captured_config_lists.append(layer_config_list)
+                if hasattr(layer_config_list[0], "caller_owned_state"):
+                    layer_config_list[0].caller_owned_state.append("built")
+                self.layer_config_list = layer_config_list
+                self.scale = torch.nn.Parameter(torch.ones(()))
+                self.forward_calls = 0
+                self.layers = torch.nn.ModuleList([torch.nn.Identity() for _ in layer_config_list])
+                captured_stacks.append(self)
+
+            def forward(self, hidden_states, **kwargs):
+                self.forward_calls += 1
+                return hidden_states * self.scale
+
+        class Projection(torch.nn.Module):
+
+            def __init__(self):
+                super().__init__()
+                self.projection = torch.nn.Linear(16, 8, bias=False)
+
+            def forward(self, hidden_states):
+                return self.projection(hidden_states), None
+
+        class Embedding(torch.nn.Module):
+
+            def __init__(self):
+                super().__init__()
+                self.embedding = torch.nn.Embedding(16, 8)
+
+            def forward(self, input_ids, position_ids):
+                return self.embedding(input_ids).transpose(0, 1)
+
+        def make_norm(**kwargs):
+            return torch.nn.Identity()
+
+        layer_spec = object()
+        projection_spec = object()
+        layer_submodules = MultiTokenPredictionLayerSubmodules(
+            enorm=make_norm, hnorm=make_norm, layer_norm=make_norm, eh_proj=projection_spec
+        )
+        captured_config_lists = []
+        captured_stacks = []
+
+        def fake_build_module(module_spec, *args, **kwargs):
+            if module_spec is layer_spec:
+                return MultiTokenPredictionLayer(submodules=layer_submodules, **kwargs)
+            assert module_spec is projection_spec
+            return Projection()
+
+        monkeypatch.setattr(
+            "megatron.core.models.hybrid.hybrid_block.HybridStack", CapturingHybridStack
+        )
+        monkeypatch.setattr(mtp_module, "build_module", fake_build_module)
+
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        source_config = AttentionLayerConfig.from_config(config)
+        source_config.caller_owned_state = []
+        source_list = [source_config, source_config]
+        group = FakeGroup()
+        pg_collection = types.SimpleNamespace(cp=group, tp=group, pp=group, tp_cp=None, dp=None)
+
+        block = MultiTokenPredictionBlock(
+            config=config,
+            spec=MultiTokenPredictionBlockSubmodules(layer_specs=[layer_spec]),
+            pg_collection=pg_collection,
+            mtp_num_depths=2,
+            hybrid_submodules=object(),
+            mtp_layer_config_list=source_list,
+        )
+
+        assert block.is_hybrid_mtp
+        assert block.mtp_layer_pattern is None
+        assert block.mtp_layer_config_list == tuple(source_list)
+        assert len(block.layers) == expected_physical_depths
+        assert len(captured_config_lists) == expected_physical_depths
+        physical_configs = [
+            layer_config
+            for layer_config_list in captured_config_lists
+            for layer_config in layer_config_list
+        ]
+        assert all(type(layer_config) is AttentionLayerConfig for layer_config in physical_configs)
+        assert all(layer_config is not source_config for layer_config in physical_configs)
+        assert len({id(layer_config) for layer_config in physical_configs}) == len(physical_configs)
+        assert all(layer_config.is_hybrid_model for layer_config in physical_configs)
+        assert all(layer_config.mtp_num_layers == 2 for layer_config in physical_configs)
+        assert all(
+            layer_config.mtp_use_repeated_layer is mtp_use_repeated_layer
+            for layer_config in physical_configs
+        )
+        expected_tracker_size = 4 if mtp_use_repeated_layer else 6
+        assert all(
+            layer_config._hybrid_moe_metrics_num_layers == expected_tracker_size
+            for layer_config in physical_configs
+        )
+        expected_tracker_layers = [3, 4] if mtp_use_repeated_layer else [3, 4, 5, 6]
+        assert [
+            layer_config._hybrid_moe_metrics_layer_number for layer_config in physical_configs
+        ] == expected_tracker_layers
+
+        hidden_states = torch.randn(4, 1, 8, requires_grad=True)
+        output = block(
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            position_ids=torch.tensor([[0, 1, 2, 3]]),
+            hidden_states=hidden_states,
+            attention_mask=None,
+            embedding=Embedding(),
+        )
+        output.square().sum().backward()
+
+        assert output.shape == (12, 1, 8)
+        assert hidden_states.grad is not None
+        assert all(stack.scale.grad is not None for stack in captured_stacks)
+        expected_calls = [2] if mtp_use_repeated_layer else [1, 1]
+        assert [stack.forward_calls for stack in captured_stacks] == expected_calls
+        assert source_config.caller_owned_state == []
+
+        captured_config_lists.clear()
+        MultiTokenPredictionBlock(
+            config=config,
+            spec=MultiTokenPredictionBlockSubmodules(layer_specs=[layer_spec]),
+            pg_collection=pg_collection,
+            mtp_num_depths=2,
+            hybrid_submodules=object(),
+            mtp_layer_pattern="**",
+        )
+        pattern_configs = [
+            layer_config
+            for layer_config_list in captured_config_lists
+            for layer_config in layer_config_list
+        ]
+        assert pattern_configs
+        assert all(
+            not hasattr(layer_config, "_hybrid_moe_metrics_num_layers")
+            for layer_config in pattern_configs
+        )
+        assert all(
+            not hasattr(layer_config, "_hybrid_moe_metrics_layer_number")
+            for layer_config in pattern_configs
+        )
+
+    @pytest.mark.parametrize("constructor", [MultiTokenPredictionLayer, MultiTokenPredictionBlock])
+    def test_hybrid_pattern_and_config_list_are_mutually_exclusive(self, constructor):
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        layer_config = AttentionLayerConfig.from_config(config)
+        kwargs = {
+            "config": config,
+            "mtp_layer_pattern": "*",
+            "mtp_layer_config_list": [layer_config],
+            "hybrid_submodules": object(),
+        }
+        if constructor is MultiTokenPredictionLayer:
+            kwargs["submodules"] = object()
+        else:
+            kwargs["spec"] = object()
+
+        with pytest.raises(
+            ValueError,
+            match="Exactly one of mtp_layer_pattern or mtp_layer_config_list may be provided",
+        ):
+            constructor(**kwargs)
 
     def test_mtp_placement_uses_explicit_pipeline_group(self, monkeypatch):
         """An explicit PP group must avoid global MPU reads during model construction."""
@@ -392,9 +589,9 @@ class TestMultiTokenPredictionLayer:
         config = TransformerConfig(num_layers=2, hidden_size=4, num_attention_heads=1)
         assert config.mtp_hsm is False
 
-    @pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
+    @pytest.mark.parametrize("mtp_num_layers", [0, 1])
     def test_mtp_hsm_requires_multiple_layers(self, mtp_num_layers):
-        """TransformerConfig rejects HSM when there is no history to mix."""
+        """TransformerConfig rejects resolved depths with no history to mix."""
         with pytest.raises(ValueError, match="mtp_hsm=True requires mtp_num_layers >= 2"):
             TransformerConfig(
                 num_layers=2,
@@ -403,6 +600,42 @@ class TestMultiTokenPredictionLayer:
                 mtp_num_layers=mtp_num_layers,
                 mtp_hsm=True,
             )
+
+    def test_mtp_hsm_allows_unresolved_depth_for_hybrid_list_inference(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=4,
+            num_attention_heads=1,
+            mtp_num_layers=None,
+            mtp_hsm=True,
+            is_hybrid_model=True,
+        )
+
+        assert config.mtp_num_layers is None
+        assert config.mtp_hsm is True
+
+    def test_mtp_hsm_rejects_unresolved_depth_outside_hybrid_model(self):
+        with pytest.raises(ValueError, match="mtp_hsm=True requires mtp_num_layers >= 2"):
+            TransformerConfig(
+                num_layers=2,
+                hidden_size=4,
+                num_attention_heads=1,
+                mtp_num_layers=None,
+                mtp_hsm=True,
+            )
+
+    def test_mtp_block_rejects_unresolved_hsm_depth(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=4,
+            num_attention_heads=1,
+            mtp_num_layers=None,
+            mtp_hsm=True,
+            is_hybrid_model=True,
+        )
+
+        with pytest.raises(ValueError, match="mtp_hsm=True requires mtp_num_layers >= 2"):
+            MultiTokenPredictionBlock(config=config, spec=object())
 
     @pytest.mark.parametrize(
         ("training", "expected_second_input"), [(True, [1.0, 2.0]), (False, [2.0, 2.0])]

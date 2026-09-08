@@ -578,8 +578,17 @@ def print_rank_last(message):
 
 
 def is_hybrid_model(args):
-    """Returns True if the model is a hybrid Mamba-Transformer model."""
-    return args.hybrid_layer_pattern is not None
+    """Return whether the runtime builds a HybridModel.
+
+    ``is_hybrid_model`` is the explicit model-family marker used by Python
+    config-list architectures.  Pattern presence remains the fallback for
+    command-line configurations and checkpoints created before the marker was
+    introduced.
+    """
+    return bool(
+        getattr(args, 'is_hybrid_model', False)
+        or getattr(args, 'hybrid_layer_pattern', None) is not None
+    )
 
 
 def is_gtp_remat_active(args):

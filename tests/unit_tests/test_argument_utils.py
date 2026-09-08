@@ -89,6 +89,19 @@ def test_moe_norm_flag_reaches_transformer_config():
     assert config.moe_use_norm_before_up_proj is True
 
 
+def test_python_hybrid_marker_reaches_transformer_config_without_pattern():
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    args.params_dtype = torch.float32
+    args.is_hybrid_model = True
+
+    config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
+
+    assert config.is_hybrid_model is True
+    assert "experimental_attention_variant" not in config.__dict__
+
+
 def test_moe_norm_flag_requires_latent_size(monkeypatch):
     """validate_args should reject the LatentMoE norm flag without a latent size."""
     monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py'])
@@ -128,6 +141,53 @@ def test_freeze_base_model_for_mtp_validation(monkeypatch, overrides, error):
         setattr(args, name, value)
 
     with pytest.raises(AssertionError, match=error):
+        validate_args(args)
+
+
+def test_python_hybrid_marker_preserves_explicit_pipeline_topology(monkeypatch):
+    args = _minimal_training_args(monkeypatch)
+    args.freeze_base_model_for_mtp = False
+    args.world_size = 2
+    args.pipeline_model_parallel_size = 2
+    args.num_layers = 3
+    args.is_hybrid_model = True
+    args.virtual_pipeline_model_parallel_size = 2
+    args.overlap_p2p_comm = True
+
+    validate_args(args)
+
+    assert args.virtual_pipeline_model_parallel_size == 2
+
+
+def test_python_hybrid_marker_defers_unresolved_hsm_depth(monkeypatch):
+    args = _minimal_training_args(monkeypatch)
+    args.freeze_base_model_for_mtp = False
+    args.is_hybrid_model = True
+    args.mtp_num_layers = None
+    args.mtp_hsm = True
+
+    validate_args(args)
+
+    assert args.mtp_hsm is True
+
+
+def test_python_hybrid_marker_defers_freeze_validation_until_list_parse(monkeypatch):
+    args = _minimal_training_args(monkeypatch)
+    args.is_hybrid_model = True
+    args.mtp_num_layers = None
+    args.freeze_base_model_for_mtp = True
+
+    validate_args(args)
+
+    assert args.freeze_base_model_for_mtp is True
+
+
+def test_python_hybrid_marker_rejects_inferred_vpp_size(monkeypatch):
+    args = _minimal_training_args(monkeypatch)
+    args.is_hybrid_model = True
+    args.num_layers_per_virtual_pipeline_stage = 1
+
+    with pytest.raises(AssertionError, match="must configure VPP explicitly"):
         validate_args(args)
 
 

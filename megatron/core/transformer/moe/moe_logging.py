@@ -137,7 +137,7 @@ class MoEMetricsTracker:
         force_initialize: bool = False,
         track_names: Optional[Union[str, List[str]]] = None,
         num_layers: Optional[int] = None,
-        num_moe_layers: Optional[int] = None,
+        num_moe_layers: Optional[Union[int, Dict[str, int]]] = None,
         moe_layer_freq: Optional[Union[int, List[int]]] = None,
         mtp_num_layers: Optional[int] = None,
         total_loss_dict: Optional[dict[str, torch.Tensor]] = None,
@@ -162,7 +162,8 @@ class MoEMetricsTracker:
                 whose tensor sizes must match ranks that do have MoE layers.
             track_names: Metric name(s) to report.  ``None`` reports all.
             num_layers: Total transformer layers (required when *force_initialize*).
-            num_moe_layers: Number of MoE aux-loss contributors to average over.
+            num_moe_layers: Number of MoE aux-loss contributors to average over, or a
+                mapping from metric name to its contributor count for heterogeneous layers.
                 When set, this overrides ``moe_layer_freq`` and ``mtp_num_layers``.
             moe_layer_freq: MoE layer frequency or binary pattern list.
             mtp_num_layers: Extra layers from Multi-Token Prediction.
@@ -192,7 +193,15 @@ class MoEMetricsTracker:
 
         if num_moe_layers is None:
             num_moe_layers = self._count_moe_layers(num_layers, moe_layer_freq, mtp_num_layers)
-        if num_moe_layers <= 0:
+        if isinstance(num_moe_layers, dict):
+            missing_names = [name for name in metric_names if name not in num_moe_layers]
+            if missing_names:
+                raise ValueError(
+                    "Missing MoE contributor counts for metrics: " + ", ".join(missing_names)
+                )
+            if any(num_moe_layers[name] <= 0 for name in metric_names):
+                raise ValueError("MoE metrics require at least one contributing MoE layer.")
+        elif num_moe_layers <= 0:
             raise ValueError("MoE metrics require at least one MoE layer.")
         scalars = self._aggregate(loss_scale, num_moe_layers, metric_names, percentiles)
 
@@ -318,7 +327,7 @@ class MoEMetricsTracker:
     def _aggregate(
         self,
         loss_scale: float,
-        num_moe_layers: int,
+        num_moe_layers: Union[int, Dict[str, int]],
         metric_names: List[str],
         percentiles: Optional[Dict[str, List[float]]] = None,
     ) -> Dict[str, Union[float, torch.Tensor]]:
@@ -346,7 +355,10 @@ class MoEMetricsTracker:
                     for pct, pct_val in zip(pcts, pct_vals):
                         result[f"{name}_p{int(pct * 100)}"] = pct_val
 
-            result[name] = values.sum() / num_moe_layers
+            contributor_count = (
+                num_moe_layers[name] if isinstance(num_moe_layers, dict) else num_moe_layers
+            )
+            result[name] = values.sum() / contributor_count
 
         return result
 

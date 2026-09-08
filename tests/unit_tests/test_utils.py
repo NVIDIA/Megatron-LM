@@ -29,6 +29,19 @@ from tests.unit_tests.test_utilities import Utils
 success_string = "hello,world"
 
 
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (SimpleNamespace(is_hybrid_model=True), True),
+        (SimpleNamespace(is_hybrid_model=False, hybrid_layer_pattern="M*-"), True),
+        (SimpleNamespace(is_hybrid_model=False, hybrid_layer_pattern=None), False),
+        (SimpleNamespace(), False),
+    ],
+)
+def test_is_hybrid_model_uses_explicit_marker_with_pattern_fallback(args, expected):
+    assert training_util.is_hybrid_model(args) is expected
+
+
 @util.experimental_cls(introduced_with_version="0.1.0")
 class A:
 

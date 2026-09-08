@@ -869,6 +869,12 @@ def validate_args(args, defaults={}):
             else:
                 args.virtual_pipeline_model_parallel_size = None
 
+    # Python-defined HybridModel architectures carry only this scalar through argparse.
+    # Their config objects remain in the model definition and are validated by the builder.
+    is_hybrid_family = bool(
+        getattr(args, 'is_hybrid_model', False) or args.hybrid_layer_pattern is not None
+    )
+
     # Infer mtp_num_layers from unified pattern
     if args.hybrid_layer_pattern and sep in args.hybrid_layer_pattern:
         parsed = parse_hybrid_pattern(args.hybrid_layer_pattern)
@@ -893,15 +899,24 @@ def validate_args(args, defaults={}):
             + f"The supported position embedding types are rope and none."
         )
 
+    defer_mtp_depth_to_python_model = (
+        is_hybrid_family
+        and args.hybrid_layer_pattern is None
+        and args.mtp_num_layers is None
+    )
     if args.freeze_base_model_for_mtp:
-        assert args.mtp_num_layers, (
+        assert args.mtp_num_layers or defer_mtp_depth_to_python_model, (
             "--freeze-base-model-for-mtp requires --mtp-num-layers to be set."
         )
         assert not args.freeze_all_layers, (
             "--freeze-base-model-for-mtp cannot be combined with --freeze-all-layers."
         )
 
-    if args.mtp_hsm and not (args.mtp_num_layers and args.mtp_num_layers >= 2):
+    if (
+        args.mtp_hsm
+        and not defer_mtp_depth_to_python_model
+        and not (args.mtp_num_layers and args.mtp_num_layers >= 2)
+    ):
         warn_rank_0(
             "--mtp-hsm needs at least two MTP layers to mix anything, but "
             f"--mtp-num-layers is {args.mtp_num_layers}. Disabling Hidden State Mixing.",
@@ -921,7 +936,7 @@ def validate_args(args, defaults={}):
                     "or legacy --mtp-hybrid-override-pattern for old checkpoints.",
                     args.rank
                 )
-    else:
+    elif not is_hybrid_family:
         # Non-hybrid (GPT) model MTP validation
         if args.mtp_hybrid_override_pattern is not None:
             warn_rank_0(
@@ -953,6 +968,12 @@ def validate_args(args, defaults={}):
         f'{args.num_virtual_stages_per_pipeline_rank=}, '
         f'{args.pipeline_model_parallel_layout=}.'
     )
+    if is_hybrid_family and args.hybrid_layer_pattern is None:
+        assert args.num_layers_per_virtual_pipeline_stage is None, (
+            "Python-defined HybridModel config lists must configure VPP explicitly with "
+            "--num-virtual-stages-per-pipeline-rank; "
+            "--num-layers-per-virtual-pipeline-stage would infer VPP from a layer count."
+        )
 
     if args.pipeline_model_parallel_layout is not None:
         # Parse the input flattened layout to a list and get the vpp size.
@@ -995,13 +1016,15 @@ def validate_args(args, defaults={}):
             args.virtual_pipeline_model_parallel_size = None
     else:
         # Only set VPP to None if it wasn't already derived from --hybrid-layer-pattern
-        if args.hybrid_layer_pattern is None:
+        if not is_hybrid_family or not hasattr(
+            args, 'virtual_pipeline_model_parallel_size'
+        ):
             args.virtual_pipeline_model_parallel_size = None
 
         if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
             # Divisibility check not applicable for T5 models which specify encoder_num_layers
             # and decoder_num_layers, or for hybrid models using --hybrid-layer-pattern.
-            if args.num_layers is not None and args.hybrid_layer_pattern is None:
+            if args.num_layers is not None and not is_hybrid_family:
                 num_layers = args.num_layers
 
                 if args.account_for_embedding_in_pipeline_split:

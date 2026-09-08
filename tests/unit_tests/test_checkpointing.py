@@ -11,10 +11,13 @@ import torch.distributed.checkpoint
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -23,6 +26,8 @@ from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
+    _maybe_setup_gpt_to_hybrid_load,
+    generate_state_dict,
     get_checkpoint_tracker_filename,
     load_args_from_checkpoint,
     load_checkpoint,
@@ -74,6 +79,196 @@ class MockState:
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+@pytest.mark.parametrize("runtime_is_hybrid", [False, True])
+def test_generate_state_dict_persists_hybrid_model_family_marker(runtime_is_hybrid):
+    args = SimpleNamespace(ckpt_format="torch", no_save_optim=True, no_save_rng=True)
+    model = mock.Mock()
+    model.state_dict_for_save_checkpoint.return_value = {}
+
+    with mock.patch(
+        "megatron.training.checkpointing._contains_hybrid_model", return_value=runtime_is_hybrid
+    ):
+        state_dict = generate_state_dict(args, [model], None, None, None)
+
+    assert state_dict["args"].is_hybrid_model is runtime_is_hybrid
+    assert not hasattr(state_dict["args"], "hybrid_layer_config_list")
+
+
+def test_config_list_hybrid_checkpoint_resumes_into_hybrid_model(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt
+):
+    def build_model():
+        config = TransformerConfig(
+            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
+        )
+        narrow_mlp = MLPLayerConfig.from_config(config)
+        narrow_mlp.ffn_hidden_size = 128
+        wide_mlp = MLPLayerConfig.from_config(config)
+        wide_mlp.ffn_hidden_size = 256
+        source = [narrow_mlp, wide_mlp]
+        model = HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=32,
+            max_sequence_length=4,
+            hybrid_layer_config_list=source,
+        )
+        return model, source
+
+    args = create_ckpt_load_args
+    args.ckpt_format = "torch"
+    args.use_distributed_optimizer = False
+    args.use_dist_ckpt = False
+    args.no_save_optim = True
+    args.no_load_optim = True
+    args.no_save_rng = True
+    args.no_load_rng = True
+    args.fp16 = False
+    args.bf16 = False
+    args.hybrid_layer_pattern = None
+
+    with TempNamedDir(
+        tmp_path_dist_ckpt / "test_config_list_hybrid_checkpoint_resume", sync=True
+    ) as ckpt_dir:
+        args.load = ckpt_dir
+        args.save = ckpt_dir
+        args.save_tokenizer_assets = False
+        set_args(args)
+
+        iteration = 123
+        num_floating_point_operations_so_far = 456
+        model, _ = build_model()
+        with torch.no_grad():
+            for index, parameter in enumerate(model.parameters()):
+                parameter.fill_(index + 1)
+        expected_state_dict = {
+            key: value.detach().clone() if torch.is_tensor(value) else value
+            for key, value in model.state_dict().items()
+        }
+
+        save_checkpoint(iteration, [model], None, None, num_floating_point_operations_so_far)
+
+        checkpoint_path = ckpt_dir / "iter_0000123" / "mp_rank_00" / "model_optim_rng.pt"
+        saved_checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        assert saved_checkpoint["args"].is_hybrid_model is True
+        assert saved_checkpoint["args"].hybrid_layer_pattern is None
+        assert not hasattr(saved_checkpoint["args"], "hybrid_layer_config_list")
+
+        resumed_model, resumed_source = build_model()
+        with torch.no_grad():
+            for parameter in resumed_model.parameters():
+                parameter.zero_()
+
+        loaded_iteration, loaded_flops = load_checkpoint([resumed_model], None, None, strict=True)
+
+        assert loaded_iteration == iteration
+        assert loaded_flops == num_floating_point_operations_so_far
+        for key, expected in expected_state_dict.items():
+            actual = resumed_model.state_dict()[key]
+            if torch.is_tensor(expected):
+                assert torch.equal(actual, expected)
+            else:
+                assert actual == expected
+        assert all(
+            saved_source is supplied_source
+            for saved_source, supplied_source in zip(
+                resumed_model.hybrid_layer_config_list, resumed_source, strict=True
+            )
+        )
+        assert [config.ffn_hidden_size for config in resumed_source] == [128, 256]
+        assert all(config.is_hybrid_model is False for config in resumed_source)
+
+
+def test_config_list_hybrid_checkpoint_rejects_gpt_runtime():
+    args = SimpleNamespace(hybrid_layer_pattern=None, no_load_optim=False)
+    checkpoint_args = SimpleNamespace(is_hybrid_model=True)
+
+    with (
+        mock.patch("megatron.training.checkpointing._contains_hybrid_model", return_value=False),
+        pytest.raises(RuntimeError, match="config-list-defined hybrid model run"),
+    ):
+        _maybe_setup_gpt_to_hybrid_load(args, checkpoint_args, [object()])
+
+
+def test_gpt_checkpoint_rejects_config_list_hybrid_runtime():
+    args = SimpleNamespace(hybrid_layer_pattern=None, no_load_optim=False)
+
+    with (
+        mock.patch("megatron.training.checkpointing._contains_hybrid_model", return_value=True),
+        mock.patch(
+            "megatron.training.checkpointing._contains_config_list_hybrid_model", return_value=True
+        ),
+        pytest.raises(RuntimeError, match="config-list-defined hybrid model is not supported"),
+    ):
+        _maybe_setup_gpt_to_hybrid_load(args, SimpleNamespace(), [object()])
+
+
+def test_gpt_checkpoint_rejects_list_runtime_even_with_stale_pattern_arg():
+    args = SimpleNamespace(hybrid_layer_pattern="*-", no_load_optim=False)
+
+    with (
+        mock.patch("megatron.training.checkpointing._contains_hybrid_model", return_value=True),
+        mock.patch(
+            "megatron.training.checkpointing._contains_config_list_hybrid_model", return_value=True
+        ),
+        pytest.raises(RuntimeError, match="config-list-defined hybrid model is not supported"),
+    ):
+        _maybe_setup_gpt_to_hybrid_load(args, SimpleNamespace(num_layers=1), [object()])
+
+
+def test_torch_dcp_rejects_model_family_before_in_place_load():
+    args = SimpleNamespace(
+        load="checkpoint",
+        freeze_all_layers=False,
+        pretrained_checkpoint=None,
+        ckpt_format="torch_dcp",
+        auto_detect_ckpt_format=False,
+    )
+    metadata = (
+        {"args": SimpleNamespace(is_hybrid_model=True)},
+        "checkpoint",
+        False,
+        CheckpointType.TORCH_DCP,
+    )
+
+    with (
+        mock.patch("megatron.training.checkpointing.get_args", return_value=args),
+        mock.patch("megatron.training.checkpointing.unwrap_model", return_value=[object()]),
+        mock.patch(
+            "megatron.training.checkpointing._load_base_checkpoint", return_value=metadata
+        ) as load_base,
+        mock.patch(
+            "megatron.training.checkpointing._validate_checkpoint_model_family",
+            side_effect=RuntimeError("incompatible family"),
+        ),
+        pytest.raises(RuntimeError, match="incompatible family"),
+    ):
+        load_checkpoint([object()], None, None)
+
+    assert load_base.call_count == 1
+
+
+def test_legacy_pattern_still_marks_checkpoint_as_hybrid():
+    args = SimpleNamespace(hybrid_layer_pattern="*-", no_load_optim=False)
+    checkpoint_args = SimpleNamespace(hybrid_layer_pattern="*-")
+
+    with mock.patch("megatron.training.checkpointing._contains_hybrid_model", return_value=True):
+        result = _maybe_setup_gpt_to_hybrid_load(args, checkpoint_args, [object()])
+
+    assert result == (None, False)
+
+
+def test_gpt_to_pattern_hybrid_translation_is_unchanged():
+    args = SimpleNamespace(hybrid_layer_pattern="*-", no_load_optim=True)
+    checkpoint_args = SimpleNamespace(num_layers=1)
+
+    with mock.patch("megatron.training.checkpointing._contains_hybrid_model", return_value=True):
+        layer_maps, load_optim = _maybe_setup_gpt_to_hybrid_load(args, checkpoint_args, [object()])
+
+    assert layer_maps.num_gpt_layers == 1
+    assert load_optim is False
 
 
 def test_maybe_save_dataloader_state_uses_explicit_process_groups(tmp_path):

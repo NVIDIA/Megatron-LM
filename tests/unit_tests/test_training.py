@@ -6,10 +6,17 @@ from types import SimpleNamespace
 
 import torch
 
+from megatron.core.models.hybrid import MTPSplit, PipelineSplit
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.checkpointing import save_grads
 from megatron.training.global_vars import set_args
-from megatron.training.training import build_train_valid_test_data_iterators
+from megatron.training.training import (
+    _find_hybrid_model_for_runtime_metrics,
+    _hybrid_config_list_moe_logging_metadata,
+    build_train_valid_test_data_iterators,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -56,6 +63,48 @@ def create_test_args():
     args.phase_transition_iterations = None
 
     return args
+
+
+def test_hybrid_config_list_moe_logging_metadata_counts_physical_contributors():
+    base = TransformerConfig(num_layers=2, hidden_size=8, num_attention_heads=2)
+    aux = MoELayerConfig.from_config(base)
+    aux.moe_router_load_balancing_type = "aux_loss"
+    aux.moe_aux_loss_coeff = 1.0
+
+    disabled = MoELayerConfig.from_config(base)
+    disabled.moe_router_load_balancing_type = "aux_loss"
+    disabled.moe_aux_loss_coeff = 0.0
+
+    mtp = MoELayerConfig.from_config(base)
+    mtp.moe_router_load_balancing_type = "seq_aux_loss"
+    mtp.moe_aux_loss_coeff = 2.0
+    mtp.moe_z_loss_coeff = 0.1
+    source = [aux, PipelineSplit, disabled, MTPSplit, mtp, MTPSplit, mtp]
+
+    repeated = _hybrid_config_list_moe_logging_metadata(source, True)
+    assert repeated == (
+        ["load_balancing_loss", "seq_load_balancing_loss", "z_loss"],
+        3,
+        {"load_balancing_loss": 1, "seq_load_balancing_loss": 1, "z_loss": 1},
+        True,
+    )
+
+    independent = _hybrid_config_list_moe_logging_metadata(source, False)
+    assert independent == (
+        ["load_balancing_loss", "seq_load_balancing_loss", "z_loss"],
+        4,
+        {"load_balancing_loss": 1, "seq_load_balancing_loss": 2, "z_loss": 2},
+        True,
+    )
+
+
+def test_runtime_metrics_find_hybrid_model_under_language_model_wrapper():
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+    hybrid_model = HybridModel.__new__(HybridModel)
+    wrapper = SimpleNamespace(language_model=SimpleNamespace(module=hybrid_model))
+
+    assert _find_hybrid_model_for_runtime_metrics(wrapper) is hybrid_model
 
 
 class TestTraining:

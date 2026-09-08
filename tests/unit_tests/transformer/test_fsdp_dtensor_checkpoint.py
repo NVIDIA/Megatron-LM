@@ -780,9 +780,11 @@ class _Layer(torch.nn.Module):
 class _MTPLayer(torch.nn.Module):
     """Stands in for MultiTokenPredictionLayer."""
 
-    def __init__(self, mtp_layer_pattern=None):
+    def __init__(self, mtp_layer_pattern=None, mtp_layer_config_list=None):
         super().__init__()
         self.mtp_layer_pattern = mtp_layer_pattern
+        self.mtp_layer_config_list = mtp_layer_config_list
+        self.is_hybrid_mtp = mtp_layer_pattern is not None or mtp_layer_config_list is not None
         self.mtp_model_layer = torch.nn.Module()
 
 
@@ -1074,6 +1076,11 @@ class TestGetMTPInnerLayerPaths:
     def test_mamba_mtp_layer_excluded(self):
         """Mamba MTP keeps mtp_model_layer as its native checkpoint name."""
         model = _Model(mtp_layers=[_MTPLayer(mtp_layer_pattern="M-M-")])
+        assert get_mtp_inner_layer_paths(model) == []
+
+    def test_config_list_mtp_layer_excluded(self):
+        """Config-list hybrid MTP also keeps mtp_model_layer as its native checkpoint name."""
+        model = _Model(mtp_layers=[_MTPLayer(mtp_layer_config_list=[object()])])
         assert get_mtp_inner_layer_paths(model) == []
 
     def test_model_without_mtp(self):

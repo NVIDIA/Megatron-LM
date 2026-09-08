@@ -18,6 +18,12 @@ import pytest
 import torch
 
 import megatron.training.training as training_module
+from megatron.core.models.hybrid import MTPSplit
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
     num_floating_point_operations,
@@ -254,6 +260,200 @@ class TestHybridTHDScaling:
         expected_delta_per_layer_per_unit_sum = 2 * kv * n * 3  # *3 for fwd+bwd
         expected_delta = num_attn_layers * expected_delta_per_layer_per_unit_sum * bshd_sum
         assert flops_doubled - flops_bshd == expected_delta
+
+
+class TestHybridConfigListFlops:
+    """List-defined HybridModels use each concrete config for FLOPs reporting."""
+
+    @staticmethod
+    def _base_config(num_layers=2):
+        return TransformerConfig(
+            num_layers=num_layers,
+            hidden_size=512,
+            num_attention_heads=8,
+            ffn_hidden_size=2048,
+            gated_linear_unit=True,
+            use_cpu_initialization=True,
+            is_hybrid_model=True,
+        )
+
+    @classmethod
+    def _dsa_config(cls, num_layers=1):
+        config = DSALayerConfig.from_config(cls._base_config(num_layers=num_layers))
+        config.multi_latent_attention = True
+        config.experimental_attention_variant = "dsa"
+        config.q_lora_rank = 48
+        config.kv_lora_rank = 96
+        config.qk_head_dim = 64
+        config.qk_pos_emb_head_dim = 32
+        config.v_head_dim = 64
+        config.dsa_indexer_n_heads = 3
+        config.dsa_indexer_head_dim = 17
+        config.dsa_indexer_topk = 7
+        config.dsa_indexer_topk_freq = 1
+        config.dsa_indexer_skip_topk_offset = 0
+        return config
+
+    def test_heterogeneous_moe_fields_change_flops(self):
+        args = _make_hybrid_args(num_layers=2)
+        args.hybrid_layer_pattern = None
+        args.is_hybrid_model = True
+        batch_size = 4
+        total_tokens = batch_size * args.seq_length
+
+        base = self._base_config()
+        attention = AttentionLayerConfig.from_config(base)
+        small_moe = MoELayerConfig.from_config(base)
+        small_moe.moe_ffn_hidden_size = 1024
+        small_moe.moe_router_topk = 2
+        small_moe.moe_shared_expert_intermediate_size = None
+        small_moe.moe_latent_size = None
+        large_moe = MoELayerConfig.from_config(small_moe)
+        large_moe.moe_ffn_hidden_size = 3072
+        large_moe.moe_router_topk = 4
+
+        small_flops = num_floating_point_operations(
+            args, batch_size, hybrid_layer_config_list=[attention, small_moe]
+        )
+        large_flops = num_floating_point_operations(
+            args, batch_size, hybrid_layer_config_list=[attention, large_moe]
+        )
+
+        scale_factor = 3 / 2  # gated MLP
+        expected_forward_delta = (
+            4
+            * total_tokens
+            * base.hidden_size
+            * (
+                large_moe.moe_ffn_hidden_size * large_moe.moe_router_topk
+                - small_moe.moe_ffn_hidden_size * small_moe.moe_router_topk
+            )
+            * scale_factor
+        )
+        assert large_flops - small_flops == expected_forward_delta * 3
+
+    def test_mtp_heads_are_counted_as_executed_configs(self):
+        args = _make_hybrid_args(num_layers=1)
+        args.hybrid_layer_pattern = None
+        args.is_hybrid_model = True
+        base = self._base_config(num_layers=1)
+        attention = AttentionLayerConfig.from_config(base)
+        batch_size = 4
+
+        decoder_flops = num_floating_point_operations(
+            args, batch_size, hybrid_layer_config_list=[attention]
+        )
+        mtp_flops = num_floating_point_operations(
+            args,
+            batch_size,
+            hybrid_layer_config_list=[attention, MTPSplit, attention, MTPSplit, attention],
+        )
+
+        total_tokens = batch_size * args.seq_length
+        mtp_overhead = 3 * 2 * total_tokens * 2 * (3 * args.hidden_size + 2 * args.hidden_size**2)
+        assert mtp_flops == 3 * decoder_flops + mtp_overhead
+
+    def test_attention_output_gate_uses_concrete_layer_setting(self):
+        args = _make_hybrid_args(num_layers=1)
+        args.hybrid_layer_pattern = None
+        args.is_hybrid_model = True
+        base = self._base_config(num_layers=1)
+        attention = AttentionLayerConfig.from_config(base)
+        gated_attention = AttentionLayerConfig.from_config(attention)
+        gated_attention.attention_output_gate = True
+        batch_size = 4
+        total_tokens = batch_size * args.seq_length
+
+        ungated_flops = num_floating_point_operations(
+            args, batch_size, hybrid_layer_config_list=[attention]
+        )
+        gated_flops = num_floating_point_operations(
+            args, batch_size, hybrid_layer_config_list=[gated_attention]
+        )
+
+        query_projection_size = attention.kv_channels * attention.num_attention_heads
+        expected_delta = 3 * 2 * total_tokens * attention.hidden_size * query_projection_size
+        assert gated_flops - ungated_flops == expected_delta
+
+    def test_gdp_uses_built_model_discriminator_instead_of_args_spec(self):
+        args = _make_hybrid_args(num_layers=1)
+        args.hybrid_layer_pattern = None
+        args.is_hybrid_model = True
+        args.spec = ["megatron.core.models.hybrid.hybrid_layer_specs", "hybrid_stack_spec"]
+        mamba = MambaLayerConfig.from_config(self._base_config(num_layers=1))
+
+        mamba_flops = num_floating_point_operations(
+            args, 4, hybrid_layer_config_list=[mamba], hybrid_uses_gated_delta_product=False
+        )
+        gdp_flops = num_floating_point_operations(
+            args, 4, hybrid_layer_config_list=[mamba], hybrid_uses_gated_delta_product=True
+        )
+
+        assert gdp_flops != mamba_flops
+
+    def test_dsa_topk_uses_sparse_core_dimensions(self):
+        args = _make_hybrid_args(num_layers=1)
+        args.hybrid_layer_pattern = None
+        args.is_hybrid_model = True
+        batch_size = 4
+        total_tokens = batch_size * args.seq_length
+        small = self._dsa_config()
+        large = DSALayerConfig.from_config(small)
+        large.dsa_indexer_topk = 19
+
+        small_flops = num_floating_point_operations(
+            args, batch_size, hybrid_layer_config_list=[small]
+        )
+        large_flops = num_floating_point_operations(
+            args, batch_size, hybrid_layer_config_list=[large]
+        )
+
+        core_dim = 2 * small.kv_lora_rank + small.qk_pos_emb_head_dim
+        expected_forward_delta = (
+            2
+            * total_tokens
+            * (large.dsa_indexer_topk - small.dsa_indexer_topk)
+            * small.num_attention_heads
+            * core_dim
+        )
+        assert large_flops - small_flops == expected_forward_delta * 3
+
+    def test_dsa_topk_frequency_uses_physical_layer_number_and_indexer_fields(self):
+        args = _make_hybrid_args(num_layers=2)
+        args.hybrid_layer_pattern = None
+        args.is_hybrid_model = True
+        batch_size = 4
+        total_tokens = batch_size * args.seq_length
+        first = self._dsa_config(num_layers=2)
+        second = DSALayerConfig.from_config(first)
+        shared_first = DSALayerConfig.from_config(first)
+        shared_second = DSALayerConfig.from_config(second)
+        shared_first.dsa_indexer_topk_freq = 2
+        shared_second.dsa_indexer_topk_freq = 2
+
+        every_layer_flops = num_floating_point_operations(
+            args, batch_size, hybrid_layer_config_list=[first, second]
+        )
+        shared_flops = num_floating_point_operations(
+            args, batch_size, hybrid_layer_config_list=[shared_first, shared_second]
+        )
+
+        indexer_projection = (
+            2
+            * total_tokens
+            * (
+                second.q_lora_rank * second.dsa_indexer_n_heads * second.dsa_indexer_head_dim
+                + second.hidden_size * second.dsa_indexer_head_dim
+                + second.hidden_size * second.dsa_indexer_n_heads
+            )
+        )
+        indexer_scores = (
+            batch_size
+            * args.seq_length**2
+            * second.dsa_indexer_n_heads
+            * second.dsa_indexer_head_dim
+        )
+        assert every_layer_flops - shared_flops == (indexer_projection + indexer_scores) * 3
 
 
 class TestGatedDeltaProductFlops:

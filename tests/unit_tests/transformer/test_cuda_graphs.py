@@ -1148,6 +1148,21 @@ class TestTECudaGraphHelper:
         # Note: _unique_buffer_counts is intentionally NOT cleared here so we can
         # compare values across parametrized test runs
 
+    def test_hybrid_rotary_uses_decoder_and_mtp_attention_families(self):
+        class HybridChunk:
+            hybrid_layer_config_list = (object(),)
+            _decoder_uses_mla = True
+            _mtp_uses_mla = False
+
+        chunk = HybridChunk()
+
+        assert TECudaGraphHelper._layer_uses_mla_for_rotary(chunk, False, False)
+        assert not TECudaGraphHelper._layer_uses_mla_for_rotary(chunk, True, False)
+
+        chunk.hybrid_layer_config_list = None
+        assert not TECudaGraphHelper._layer_uses_mla_for_rotary(chunk, False, False)
+        assert TECudaGraphHelper._layer_uses_mla_for_rotary(chunk, True, True)
+
     @pytest.mark.parametrize("num_microbatches", [16, 64, 256])
     @pytest.mark.parametrize("pp_size", [1, 2, 4])
     @pytest.mark.parametrize("vpp_size", [None, 2])

@@ -21,17 +21,24 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+from megatron.core.models.hybrid import MTPSplit, PipelineSplit
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    gated_delta_product_stack_spec,
+    hybrid_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_logging_pg_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -157,8 +164,6 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
         )
 
         # Create model with custom process groups
-        from megatron.core.process_groups_config import ProcessGroupCollection
-
         pg_collection = ProcessGroupCollection(
             tp=tp_group, cp=cp_group, pp=pp_group, embd=embd_group, dp_cp=dp_cp_group
         )
@@ -211,6 +216,67 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
         Utils.destroy_model_parallel()
 
 
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) != 2,
+    reason="Config-list PP/VPP construction test requires exactly 2 ranks",
+)
+@pytest.mark.parametrize("vp_stage", [0, 1])
+def test_config_list_constructs_explicit_pp_vpp_segment(vp_stage):
+    Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
+    try:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        pp_rank = torch.distributed.get_rank(pg_collection.pp)
+        model_config = TransformerConfig(
+            num_layers=7,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float32,
+        )
+        attention = AttentionLayerConfig.from_config(model_config)
+        mlp = MLPLayerConfig.from_config(model_config)
+        segments = [[attention], [mlp, attention], [mlp], [attention, mlp, attention]]
+        source = []
+        for segment_index, segment in enumerate(segments):
+            if segment_index:
+                source.append(PipelineSplit)
+            source.extend(segment)
+
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            pre_process=False,
+            post_process=False,
+            hybrid_layer_config_list=source,
+            pg_collection=pg_collection,
+            vp_stage=vp_stage,
+        )
+
+        segment_index = vp_stage * 2 + pp_rank
+        expected_segment = segments[segment_index]
+        expected_offset = sum(len(segment) for segment in segments[:segment_index])
+        assert [type(config) for config in model.decoder.layer_config_list] == [
+            type(config) for config in expected_segment
+        ]
+        assert [layer.layer_number for layer in model.decoder.layers] == list(
+            range(expected_offset + 1, expected_offset + len(expected_segment) + 1)
+        )
+        assert all(
+            physical is not source_config
+            for physical, source_config in zip(
+                model.decoder.layer_config_list, expected_segment, strict=True
+            )
+        )
+        assert attention.is_hybrid_model is False
+        assert mlp.is_hybrid_model is False
+    finally:
+        Utils.destroy_model_parallel()
+
+
 class TestHybridModel:
 
     def setup_method(self, method):
@@ -235,6 +301,7 @@ class TestHybridModel:
 
     def test_constructor(self):
         assert isinstance(self.model, HybridModel)
+        assert self.model._hybrid_dsa_uses_absorbed_mla is True
 
         assert self.model.max_sequence_length == 4
 
@@ -255,6 +322,278 @@ class TestHybridModel:
 
         num_weights = sum([p.numel() for p in self.model.parameters()])
         assert num_weights == 1774872
+
+    def test_config_list_preserves_values_and_clones_each_occurrence(self):
+        model_config = TransformerConfig(
+            num_layers=3, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+        )
+        attention_config = AttentionLayerConfig.from_config(model_config)
+        attention_config.output_layer_init_method = torch.nn.init.zeros_
+        mlp_config = MLPLayerConfig.from_config(model_config)
+        mlp_config.ffn_hidden_size = 768
+        source = [attention_config, mlp_config, attention_config]
+
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_config_list=source,
+        )
+        source.append(mlp_config)
+
+        physical_configs = model.decoder.layer_config_list
+        assert model.hybrid_layer_pattern is None
+        assert len(model.hybrid_layer_config_list) == 3
+        assert [type(config) for config in physical_configs] == [
+            AttentionLayerConfig,
+            MLPLayerConfig,
+            AttentionLayerConfig,
+        ]
+        assert len({id(config) for config in physical_configs}) == 3
+        assert all(
+            physical is not source_config
+            for physical, source_config in zip(physical_configs, source[:3], strict=True)
+        )
+        assert physical_configs[0].output_layer_init_method is torch.nn.init.zeros_
+        assert physical_configs[1].ffn_hidden_size == 768
+        assert physical_configs[1].output_layer_init_method.keywords["std"] == pytest.approx(
+            model_config.init_method_std / model_config.num_layers**0.5
+        )
+        assert mlp_config.output_layer_init_method.keywords["std"] == pytest.approx(
+            model_config.init_method_std / (2 * model_config.num_layers) ** 0.5
+        )
+        assert all(config.is_hybrid_model for config in physical_configs)
+        assert attention_config.is_hybrid_model is False
+        assert mlp_config.is_hybrid_model is False
+        assert model.config is model_config
+        assert model_config.is_hybrid_model is True
+        assert model_config._hybrid_has_moe_layers is False
+
+    def test_config_list_marks_model_runtime_when_source_contains_moe(self, mocker):
+        model_config = TransformerConfig(
+            num_layers=1, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+        )
+        moe_config = MoELayerConfig.from_config(model_config)
+        mocker.patch(
+            "megatron.core.models.hybrid.hybrid_model.build_module",
+            return_value=torch.nn.Identity(),
+        )
+
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_config_list=[moe_config],
+        )
+
+        assert model.config._hybrid_has_moe_layers is True
+        assert not hasattr(moe_config, "_hybrid_has_moe_layers")
+
+    def test_config_list_records_built_gdp_stack(self, mocker):
+        model_config = TransformerConfig(
+            num_layers=1, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+        )
+        mamba_config = MambaLayerConfig.from_config(model_config)
+        mocker.patch(
+            "megatron.core.models.hybrid.hybrid_model.build_module",
+            return_value=torch.nn.Identity(),
+        )
+
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=gated_delta_product_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_config_list=[mamba_config],
+        )
+
+        assert model._hybrid_uses_gated_delta_product is True
+
+    def test_config_list_derives_mla_rope_handling_from_layer_type(self, monkeypatch):
+        model_config = TransformerConfig(
+            num_layers=1, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+        )
+        mla_base = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            rope_type="rope",
+        )
+        mla_config = MLALayerConfig.from_config(mla_base)
+
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            position_embedding_type="rope",
+            hybrid_layer_config_list=[mla_config],
+        )
+
+        assert model_config.multi_latent_attention is False
+        assert mla_config.multi_latent_attention is True
+        assert model._decoder_uses_mla is True
+        assert not hasattr(model, "rotary_pos_emb")
+
+        captured_rotary = []
+
+        def capture_decoder(**kwargs):
+            captured_rotary.append(kwargs["rotary_pos_emb"])
+            return kwargs["hidden_states"]
+
+        monkeypatch.setattr(model.decoder, "forward", capture_decoder)
+        model.post_process = False
+        decoder_input = torch.ones(4, 1, model.config.hidden_size)
+        model(input_ids=None, position_ids=None, attention_mask=None, decoder_input=decoder_input)
+        assert captured_rotary == [None]
+
+    def test_config_list_infers_mtp_depth_without_mutating_sources(self, mocker):
+        model_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_hsm=True,
+            is_hybrid_model=True,
+        )
+        main_config = MLPLayerConfig.from_config(model_config)
+        mtp_config = AttentionLayerConfig.from_config(model_config)
+        source = [main_config, MTPSplit, mtp_config, MTPSplit, mtp_config]
+        mocker.patch(
+            "megatron.core.models.hybrid.hybrid_model.mtp_on_this_rank", return_value=False
+        )
+
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_config_list=source,
+        )
+
+        assert model.config.mtp_num_layers == 2
+        assert model.config.mtp_hsm is True
+        assert model_config.mtp_num_layers == 2
+        assert model.mtp_num_depths == 2
+        assert model.mtp_layer_config_list == (mtp_config,)
+        assert main_config.is_hybrid_model is True
+        assert mtp_config.is_hybrid_model is True
+
+    def test_config_list_rejects_inferred_mtp_with_learned_absolute_positions(self):
+        model_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            is_hybrid_model=True,
+        )
+        main_config = MLPLayerConfig.from_config(model_config)
+        mtp_config = AttentionLayerConfig.from_config(model_config)
+
+        with pytest.raises(ValueError, match="MTP.*learned_absolute position embedding"):
+            HybridModel(
+                config=model_config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                position_embedding_type="learned_absolute",
+                hybrid_layer_config_list=[main_config, MTPSplit, mtp_config],
+            )
+
+    def test_config_list_validates_mtp_overlap_from_layer_configs(self):
+        model_config = TransformerConfig(
+            num_layers=1, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+        )
+        main_config = MLPLayerConfig.from_config(model_config)
+        mtp_config = AttentionLayerConfig.from_config(model_config)
+        mtp_config.overlap_moe_expert_parallel_comm = True
+        source = [main_config, MTPSplit, mtp_config, MTPSplit, mtp_config]
+
+        with pytest.raises(ValueError, match="MTP supports at most one layer"):
+            HybridModel(
+                config=model_config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_config_list=source,
+            )
+
+        assert model_config.overlap_moe_expert_parallel_comm is False
+        assert mtp_config.overlap_moe_expert_parallel_comm is True
+
+    @pytest.mark.parametrize("mtp_suffix", [[], [MTPSplit]])
+    def test_config_list_rejects_hsm_with_fewer_than_two_heads(self, mtp_suffix):
+        model_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_hsm=True,
+            is_hybrid_model=True,
+        )
+        main_config = MLPLayerConfig.from_config(model_config)
+        mtp_config = AttentionLayerConfig.from_config(model_config)
+        source = [main_config]
+        if mtp_suffix:
+            source.extend([*mtp_suffix, mtp_config])
+
+        with pytest.raises(ValueError, match="mtp_hsm=True requires mtp_num_layers >= 2"):
+            HybridModel(
+                config=model_config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_config_list=source,
+            )
+
+    def test_config_list_rejects_frozen_base_without_mtp(self):
+        model_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            freeze_base_model_for_mtp=True,
+        )
+        main_config = MLPLayerConfig.from_config(model_config)
+
+        with pytest.raises(ValueError, match="requires.*at least one MTP head"):
+            HybridModel(
+                config=model_config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_config_list=[main_config],
+            )
+
+    @pytest.mark.parametrize(
+        "conflict",
+        [
+            {"hybrid_layer_pattern": "-"},
+            {"hybrid_override_pattern": "-"},
+            {"hybrid_attention_ratio": 0.0},
+            {"hybrid_attention_ratio": -0.5},
+            {"hybrid_attention_ratio": 1.0},
+            {"hybrid_mlp_ratio": 1.0},
+        ],
+    )
+    def test_config_list_rejects_other_architecture_inputs(self, conflict):
+        model_config = TransformerConfig(
+            num_layers=1, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+        )
+        layer_config = MLPLayerConfig.from_config(model_config)
+
+        with pytest.raises(ValueError, match="hybrid_layer_config_list is mutually exclusive"):
+            HybridModel(
+                config=model_config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_config_list=[layer_config],
+                **conflict,
+            )
 
     @pytest.mark.parametrize(
         ("freeze_base", "training", "expected_grad_enabled"),

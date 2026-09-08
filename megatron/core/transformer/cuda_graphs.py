@@ -2339,6 +2339,19 @@ class TECudaGraphHelper:
         """
         return self._capture_finished
 
+    @staticmethod
+    def _layer_uses_mla_for_rotary(
+        transformer_module, is_mtp_layer, default_multi_latent_attention
+    ):
+        """Return whether this decoder or MTP section uses MLA-style rotary embeddings."""
+        if getattr(transformer_module, 'hybrid_layer_config_list', None) is None:
+            return default_multi_latent_attention
+        return (
+            transformer_module._mtp_uses_mla
+            if is_mtp_layer
+            else transformer_module._decoder_uses_mla
+        )
+
     def graphs_created(self):
         """
         Returns whether any CUDA Graphs were actually created.
@@ -2417,14 +2430,20 @@ class TECudaGraphHelper:
             """
             Get the static inputs for a layer.
             """
-            assert layer in chunk_of_the_layer.decoder.layers or any(
+            is_decoder_layer = any(
+                layer is decoder_layer for decoder_layer in chunk_of_the_layer.decoder.layers
+            )
+            is_mtp_layer = hasattr(chunk_of_the_layer, 'mtp') and any(
                 layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
-            ), "Layer is not in the chunk"
+            )
+            assert is_decoder_layer or is_mtp_layer, "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
                 if (
                     transformer_module.position_embedding_type == 'rope'
-                    and not self.config.multi_latent_attention
+                    and not self._layer_uses_mla_for_rotary(
+                        transformer_module, is_mtp_layer, self.config.multi_latent_attention
+                    )
                 ):
                     rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
                         None, transformer_module.decoder, transformer_input, self.config, None

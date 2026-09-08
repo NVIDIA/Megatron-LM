@@ -591,12 +591,16 @@ class TopKRouter(Router):
         # add the aux loss logging value to other layer's since it is difficult to get the
         # correct layer_number for MTP. It does not affect the correctness of the calculation
         # results and the reduced load_balancing_loss logging value.
-        num_layers = self.config.num_layers
-        if self.config.mtp_num_layers is not None:
-            num_layers += self.config.mtp_num_layers
+        num_layers = getattr(self.config, '_hybrid_moe_metrics_num_layers', None)
+        if num_layers is None:
+            num_layers = self.config.num_layers
+            if self.config.mtp_num_layers is not None:
+                num_layers += self.config.mtp_num_layers
 
         if self.is_mtp_layer:
-            layer_number = self.layer_number + self.config.num_layers
+            layer_number = getattr(self.config, '_hybrid_moe_metrics_layer_number', None)
+            if layer_number is None:
+                layer_number = self.layer_number + self.config.num_layers
         else:
             layer_number = self.layer_number
 
@@ -694,12 +698,16 @@ class TopKRouter(Router):
             ):
                 z_loss = z_loss / self.config.mtp_num_layers
 
-            num_layers = self.config.num_layers
-            if self.config.mtp_num_layers is not None:
-                num_layers += self.config.mtp_num_layers
+            num_layers = getattr(self.config, '_hybrid_moe_metrics_num_layers', None)
+            if num_layers is None:
+                num_layers = self.config.num_layers
+                if self.config.mtp_num_layers is not None:
+                    num_layers += self.config.mtp_num_layers
 
             if self.is_mtp_layer:
-                layer_number = self.layer_number + self.config.num_layers
+                layer_number = getattr(self.config, '_hybrid_moe_metrics_layer_number', None)
+                if layer_number is None:
+                    layer_number = self.layer_number + self.config.num_layers
             else:
                 layer_number = self.layer_number
 

@@ -8,6 +8,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_layer_config i
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import mup_scaled_init_method_normal, scaled_init_method_normal
 
 
 class Symbols:
@@ -88,6 +89,31 @@ def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
         if type(layer_config) is config_type:
             return symbol
     raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")
+
+
+def normalize_hybrid_layer_config(config: TransformerConfig) -> TransformerConfig:
+    """Mark a model-owned config as hybrid without replacing custom initialization.
+
+    ``TransformerConfig`` selects its default output projection initializer during
+    ``__post_init__``. A Python-defined config list may only identify the model as
+    hybrid later, so regenerate that initializer only when the framework originally
+    supplied it. Caller-owned configs must be cloned before using this helper.
+    """
+    config.is_hybrid_model = True
+    if getattr(config, '_output_layer_init_method_is_default', False) and (
+        config.output_layer_init_method
+        is getattr(config, '_default_output_layer_init_method', None)
+    ):
+        if config.use_mup:
+            config.output_layer_init_method = mup_scaled_init_method_normal(
+                config.init_method_std, config.num_layers, config.mup_width_mult, multiplier=1.0
+            )
+        else:
+            config.output_layer_init_method = scaled_init_method_normal(
+                config.init_method_std, config.num_layers, multiplier=1.0
+            )
+        config._default_output_layer_init_method = config.output_layer_init_method
+    return config
 
 
 def validate_tp_comm_overlap(

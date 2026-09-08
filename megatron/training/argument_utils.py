@@ -342,10 +342,13 @@ def core_transformer_config_from_args(args, config_class=None):
 
     if len(args.cp_comm_type) == 1:
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
-    if args.hybrid_layer_pattern is not None:
+    if getattr(args, 'is_hybrid_model', False) or args.hybrid_layer_pattern is not None:
         kw_args['is_hybrid_model'] = True
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
+        if (
+            args.hybrid_layer_pattern is not None
+            and Symbols.DS_ATTENTION in args.hybrid_layer_pattern
+        ):
             kw_args['experimental_attention_variant'] = 'dsa'
 
     kw_args['inference_sampling_seed'] = args.seed

@@ -6,16 +6,21 @@ from unittest.mock import patch
 
 import pytest
 
+from megatron.core.models.hybrid import HybridLayerConfigListEntry, MTPSplit, PipelineSplit
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    ParsedHybridConfigList,
     ParsedHybridPattern,
     Symbols,
+    clone_hybrid_layer_config_list,
     get_hybrid_layer_counts,
     get_hybrid_total_layer_count,
     get_hybrid_total_pipeline_segment_count,
     get_layer_maps_from_layer_type_list,
+    parse_hybrid_layer_config_list,
     parse_hybrid_pattern,
     pattern_from_ratios,
     select_pipeline_segment,
+    select_pipeline_segment_from_config_list,
     validate_segment_layers,
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
@@ -42,6 +47,10 @@ _EXPECTED_LAYER_CONFIG_CLASSES = {
 
 def _make_transformer_config() -> TransformerConfig:
     return TransformerConfig(num_layers=7, hidden_size=64, num_attention_heads=4)
+
+
+def _make_layer_config(layer_symbol: str) -> TransformerConfig:
+    return layer_utils.create_layer_config(_make_transformer_config(), layer_symbol)
 
 
 def _assert_layer_config_types(layer_config_list, pattern: str) -> None:
@@ -412,6 +421,343 @@ class TestParseHybridPattern:
         p1 = parse_hybrid_pattern("M*M*/MM/MM")
         p2 = ParsedHybridPattern(main_pattern="M*M*", mtp_pattern="MM", mtp_num_depths=2)
         assert p1 == p2
+
+
+@pytest.mark.internal
+class TestParseHybridLayerConfigList:
+
+    def test_preserves_source_configs_and_split_sentinels(self):
+        attention = _make_layer_config(Symbols.ATTENTION)
+        moe = _make_layer_config(Symbols.MOE)
+        entries: list[HybridLayerConfigListEntry] = [
+            attention,
+            PipelineSplit,
+            moe,
+            MTPSplit,
+            attention,
+            moe,
+            MTPSplit,
+            attention,
+            moe,
+        ]
+
+        parsed = parse_hybrid_layer_config_list(
+            entries, expected_num_layers=2, expected_mtp_num_layers=2
+        )
+
+        assert isinstance(parsed, ParsedHybridConfigList)
+        assert parsed.main_layer_config_list[0] is attention
+        assert parsed.main_layer_config_list[1] is PipelineSplit
+        assert parsed.main_layer_config_list[2] is moe
+        assert parsed.mtp_layer_config_list == (attention, moe)
+        assert parsed.mtp_layer_config_list[0] is attention
+        assert parsed.mtp_layer_config_list[1] is moe
+        assert parsed.mtp_num_depths == 2
+
+    def test_snapshots_container_without_cloning_configs(self):
+        mamba = _make_layer_config(Symbols.MAMBA)
+        source: list[HybridLayerConfigListEntry] = [mamba]
+
+        parsed = parse_hybrid_layer_config_list(source)
+        source.append(PipelineSplit)
+
+        assert parsed.main_layer_config_list == (mamba,)
+        assert parsed.main_layer_config_list[0] is mamba
+
+    def test_pipeline_split_preserves_leading_trailing_and_empty_segments(self):
+        mamba = _make_layer_config(Symbols.MAMBA)
+
+        parsed = parse_hybrid_layer_config_list(
+            [PipelineSplit, PipelineSplit, mamba, PipelineSplit], expected_num_layers=1
+        )
+
+        assert parsed.main_layer_config_list == (PipelineSplit, PipelineSplit, mamba, PipelineSplit)
+
+    @pytest.mark.parametrize("sentinel", [PipelineSplit, MTPSplit])
+    def test_rejects_sentinel_instances(self, sentinel):
+        with pytest.raises(ValueError, match="sentinel instance"):
+            parse_hybrid_layer_config_list([sentinel()])
+
+    def test_rejects_unsupported_config_subclass(self):
+        class AttentionSubclass(AttentionLayerConfig):
+            pass
+
+        attention_subclass = AttentionSubclass.from_config(_make_layer_config(Symbols.ATTENTION))
+
+        with pytest.raises(ValueError, match="Exact built-in layer config types are required"):
+            parse_hybrid_layer_config_list([attention_subclass])
+
+    def test_rejects_generic_transformer_config(self):
+        with pytest.raises(ValueError, match="unsupported hybrid layer config type"):
+            parse_hybrid_layer_config_list([_make_transformer_config()])
+
+    @pytest.mark.parametrize("specialized_symbol", [Symbols.DS_ATTENTION, Symbols.MLA])
+    def test_rejects_mixed_attention_families_in_decoder(self, specialized_symbol):
+        with pytest.raises(ValueError, match="main decoder"):
+            parse_hybrid_layer_config_list(
+                [
+                    _make_layer_config(Symbols.ATTENTION),
+                    PipelineSplit,
+                    _make_layer_config(specialized_symbol),
+                ]
+            )
+
+    def test_validates_attention_families_separately_for_mtp(self):
+        attention = _make_layer_config(Symbols.ATTENTION)
+        dsa = _make_layer_config(Symbols.DS_ATTENTION)
+
+        parsed = parse_hybrid_layer_config_list([attention, MTPSplit, dsa])
+
+        assert parsed.main_layer_config_list == (attention,)
+        assert parsed.mtp_layer_config_list == (dsa,)
+
+    def test_rejects_mixed_attention_families_within_mtp(self):
+        with pytest.raises(ValueError, match="MTP depth 1"):
+            parse_hybrid_layer_config_list(
+                [
+                    _make_layer_config(Symbols.MAMBA),
+                    MTPSplit,
+                    _make_layer_config(Symbols.ATTENTION),
+                    _make_layer_config(Symbols.MLA),
+                ]
+            )
+
+    def test_rejects_pipeline_split_after_mtp(self):
+        mamba = _make_layer_config(Symbols.MAMBA)
+        with pytest.raises(ValueError, match="not allowed after the first MTPSplit"):
+            parse_hybrid_layer_config_list([mamba, MTPSplit, mamba, PipelineSplit])
+
+    @pytest.mark.parametrize(
+        "entries",
+        [lambda config: [config, MTPSplit], lambda config: [config, MTPSplit, MTPSplit, config]],
+    )
+    def test_rejects_empty_mtp_depth(self, entries):
+        mamba = _make_layer_config(Symbols.MAMBA)
+        with pytest.raises(ValueError, match="non-empty"):
+            parse_hybrid_layer_config_list(entries(mamba))
+
+    def test_mtp_depths_must_reuse_exact_source_objects(self):
+        mamba = _make_layer_config(Symbols.MAMBA)
+        equivalent_but_distinct = type(mamba).from_config(mamba)
+
+        with pytest.raises(ValueError, match="same source objects"):
+            parse_hybrid_layer_config_list(
+                [mamba, MTPSplit, mamba, MTPSplit, equivalent_but_distinct]
+            )
+
+    def test_mtp_depths_must_preserve_source_order(self):
+        mamba = _make_layer_config(Symbols.MAMBA)
+        moe = _make_layer_config(Symbols.MOE)
+
+        with pytest.raises(ValueError, match="same source objects"):
+            parse_hybrid_layer_config_list([mamba, MTPSplit, mamba, moe, MTPSplit, moe, mamba])
+
+    def test_main_layer_count_must_match_when_provided(self):
+        with pytest.raises(ValueError, match="2 main decoder layers, but num_layers is 3"):
+            parse_hybrid_layer_config_list(
+                [_make_layer_config(Symbols.MAMBA), _make_layer_config(Symbols.MOE)],
+                expected_num_layers=3,
+            )
+
+    def test_mtp_depth_count_distinguishes_none_from_zero(self):
+        mamba = _make_layer_config(Symbols.MAMBA)
+        parsed = parse_hybrid_layer_config_list([mamba, MTPSplit, mamba])
+        assert parsed.mtp_num_depths == 1
+
+        with pytest.raises(ValueError, match="1 MTP depths, but mtp_num_layers is 0"):
+            parse_hybrid_layer_config_list([mamba, MTPSplit, mamba], expected_mtp_num_layers=0)
+
+
+@pytest.mark.internal
+class TestCloneHybridLayerConfigList:
+
+    def test_clones_every_occurrence_independently(self):
+        source = _make_layer_config(Symbols.MAMBA)
+        source.test_mutable_value = {"items": []}
+
+        clones = clone_hybrid_layer_config_list([source, source])
+
+        assert len(clones) == 2
+        assert all(type(clone) is type(source) for clone in clones)
+        assert all(clone is not source for clone in clones)
+        assert clones[0] is not clones[1]
+        assert source.is_hybrid_model is False
+        assert all(clone.is_hybrid_model is True for clone in clones)
+        assert clones[0].test_mutable_value is not clones[1].test_mutable_value
+        clones[0].test_mutable_value["items"].append("changed")
+        assert clones[1].test_mutable_value == {"items": []}
+        assert source.test_mutable_value == {"items": []}
+
+
+@pytest.mark.internal
+class TestSelectPipelineSegmentFromConfigList:
+
+    def _select(
+        self,
+        entries,
+        pp_rank=0,
+        pp_size=1,
+        vp_stage=None,
+        virtual_pipeline_model_parallel_size=None,
+        first_stage_layers=None,
+        last_stage_layers=None,
+    ):
+        pp_group = object() if pp_size > 1 else None
+        with (
+            patch('torch.distributed.get_rank', return_value=pp_rank),
+            patch('torch.distributed.get_world_size', return_value=pp_size),
+            patch('megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage'),
+        ):
+            return select_pipeline_segment_from_config_list(
+                entries,
+                pp_group=pp_group,
+                vp_stage=vp_stage,
+                virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
+                first_stage_layers=first_stage_layers,
+                last_stage_layers=last_stage_layers,
+            )
+
+    def test_single_rank_clones_source_occurrences(self):
+        source = _make_layer_config(Symbols.MAMBA)
+        source.test_mutable_value = {"items": []}
+
+        selected, offset = self._select([source, source])
+
+        assert offset == 0
+        assert len(selected) == 2
+        assert selected[0] is not source
+        assert selected[1] is not source
+        assert selected[0] is not selected[1]
+        selected[0].test_mutable_value["items"].append("changed")
+        assert selected[1].test_mutable_value == {"items": []}
+        assert source.test_mutable_value == {"items": []}
+
+    def test_marker_free_list_uses_contiguous_pp_slicing(self):
+        configs = [
+            _make_layer_config(Symbols.MAMBA),
+            _make_layer_config(Symbols.ATTENTION),
+            _make_layer_config(Symbols.MLP),
+            _make_layer_config(Symbols.MOE),
+        ]
+
+        selected, offset = self._select(configs, pp_rank=1, pp_size=2)
+
+        assert offset == 2
+        assert [type(config) for config in selected] == [MLPLayerConfig, MoELayerConfig]
+        assert selected[0] is not configs[2]
+        assert selected[1] is not configs[3]
+
+    def test_marker_free_list_supports_uneven_pp(self):
+        configs = [_make_layer_config(Symbols.MAMBA) for _ in range(6)]
+
+        first, first_offset = self._select(configs, pp_rank=0, pp_size=4, first_stage_layers=3)
+        last, last_offset = self._select(configs, pp_rank=3, pp_size=4, first_stage_layers=3)
+
+        assert len(first) == 3
+        assert first_offset == 0
+        assert len(last) == 1
+        assert last_offset == 5
+
+    def test_marker_free_list_supports_last_stage_override(self):
+        configs = [_make_layer_config(Symbols.MAMBA) for _ in range(6)]
+
+        first, first_offset = self._select(configs, pp_rank=0, pp_size=4, last_stage_layers=3)
+        last, last_offset = self._select(configs, pp_rank=3, pp_size=4, last_stage_layers=3)
+
+        assert len(first) == 1
+        assert first_offset == 0
+        assert len(last) == 3
+        assert last_offset == 3
+
+    def test_marker_free_list_supports_first_and_last_stage_overrides(self):
+        configs = [_make_layer_config(Symbols.MAMBA) for _ in range(9)]
+        expected_counts_and_offsets = [(1, 0), (2, 1), (2, 3), (4, 5)]
+
+        for pp_rank, (expected_count, expected_offset) in enumerate(expected_counts_and_offsets):
+            selected, offset = self._select(
+                configs, pp_rank=pp_rank, pp_size=4, first_stage_layers=1, last_stage_layers=4
+            )
+            assert len(selected) == expected_count
+            assert offset == expected_offset
+
+    def test_explicit_segments_use_vpp_major_order_and_config_only_offsets(self):
+        configs = [
+            _make_layer_config(Symbols.MAMBA),
+            _make_layer_config(Symbols.ATTENTION),
+            _make_layer_config(Symbols.MLP),
+            _make_layer_config(Symbols.MOE),
+        ]
+        entries = [
+            configs[0],
+            PipelineSplit,
+            configs[1],
+            configs[2],
+            PipelineSplit,
+            PipelineSplit,
+            configs[3],
+        ]
+        expected = [
+            (0, 0, [MambaLayerConfig], 0),
+            (1, 0, [AttentionLayerConfig, MLPLayerConfig], 1),
+            (0, 1, [], 3),
+            (1, 1, [MoELayerConfig], 3),
+        ]
+
+        for pp_rank, vp_stage, expected_types, expected_offset in expected:
+            selected, offset = self._select(
+                entries,
+                pp_rank=pp_rank,
+                pp_size=2,
+                vp_stage=vp_stage,
+                virtual_pipeline_model_parallel_size=2,
+            )
+            assert [type(config) for config in selected] == expected_types
+            assert offset == expected_offset
+
+    def test_leading_trailing_and_consecutive_markers_select_empty_segments(self):
+        mamba = _make_layer_config(Symbols.MAMBA)
+        entries = [PipelineSplit, PipelineSplit, mamba, PipelineSplit]
+
+        expected_counts_and_offsets = [(0, 0), (0, 0), (1, 0), (0, 1)]
+        for vp_stage, (expected_count, expected_offset) in enumerate(expected_counts_and_offsets):
+            selected, offset = self._select(
+                entries, vp_stage=vp_stage, virtual_pipeline_model_parallel_size=4
+            )
+            assert len(selected) == expected_count
+            assert offset == expected_offset
+
+    def test_explicit_segment_count_must_exactly_match_topology(self):
+        mamba = _make_layer_config(Symbols.MAMBA)
+        with pytest.raises(ValueError, match="configured PP x VPP topology requires 4"):
+            self._select(
+                [mamba, PipelineSplit, mamba],
+                pp_size=2,
+                vp_stage=0,
+                virtual_pipeline_model_parallel_size=2,
+            )
+
+    def test_explicit_segments_reject_uneven_stage_overrides(self):
+        mamba = _make_layer_config(Symbols.MAMBA)
+        with pytest.raises(ValueError, match="already explicitly defined"):
+            self._select([mamba, PipelineSplit, mamba], pp_size=2, first_stage_layers=1)
+
+    def test_marker_free_list_rejects_vpp(self):
+        with pytest.raises(ValueError, match="no PipelineSplit markers"):
+            self._select(
+                [_make_layer_config(Symbols.MAMBA)],
+                vp_stage=0,
+                virtual_pipeline_model_parallel_size=1,
+            )
+
+    def test_vpp_requires_a_stage_index(self):
+        mamba = _make_layer_config(Symbols.MAMBA)
+        with pytest.raises(ValueError, match="vp_stage must be provided"):
+            self._select([mamba, PipelineSplit, mamba], virtual_pipeline_model_parallel_size=2)
+
+    def test_rejects_mtp_split_defensively(self):
+        mamba = _make_layer_config(Symbols.MAMBA)
+        with pytest.raises(ValueError, match="not valid in a parsed main"):
+            self._select([mamba, MTPSplit, mamba])
 
 
 @pytest.mark.internal

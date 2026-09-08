@@ -387,6 +387,35 @@ def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
     )
 
 
+def test_config_list_moe_marker_enables_aux_loss_scaling(mocker):
+    set_loss_scale = mocker.patch.object(schedule.MoEAuxLossAutoScaler, "set_loss_scale")
+    config = SimpleNamespace(
+        calculate_per_token_loss=False,
+        experimental_attention_variant_loss_scale_func=None,
+        grad_scale_func=lambda tensor: tensor * 3.0,
+        num_moe_experts=None,
+        _hybrid_has_moe_layers=True,
+        mtp_num_layers=None,
+        timers=None,
+    )
+
+    schedule.forward_step_calc_loss(
+        model=None,
+        output_tensor=torch.tensor(8.0),
+        loss_func=lambda output: (output.clone(), torch.tensor(4), {}),
+        config=config,
+        vp_stage=None,
+        collect_non_loss_data=False,
+        num_microbatches=2,
+        forward_data_store=[],
+        cp_group_size=4,
+        is_last_stage=True,
+    )
+
+    set_loss_scale.assert_called_once()
+    torch.testing.assert_close(set_loss_scale.call_args.args[0], torch.tensor([6.0]))
+
+
 def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
     from megatron.core.transformer.experimental_attention_variant.dsa import (
         DSAIndexerLossAutoScaler,
