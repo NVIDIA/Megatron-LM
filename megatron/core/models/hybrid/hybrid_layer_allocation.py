@@ -2,7 +2,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple, cast
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -279,9 +279,13 @@ def _validate_pattern(pattern: str, allow_pipe: bool = False) -> None:
                 f"Valid symbols are: {Symbols.LAYER_CONFIG_MAP.keys()}"
             )
 
-    # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in pattern and (Symbols.DS_ATTENTION in pattern or Symbols.MLA in pattern):
-        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+    layer_utils.validate_layer_config_types(
+        {
+            Symbols.LAYER_CONFIG_MAP[symbol]
+            for symbol in pattern
+            if symbol in Symbols.LAYER_CONFIG_MAP
+        }
+    )
 
 
 def validate_segment_layers(segment: str, config: TransformerConfig) -> List[TransformerConfig]:
@@ -305,11 +309,7 @@ def validate_segment_layers(segment: str, config: TransformerConfig) -> List[Tra
     """
     _validate_pattern(segment)
 
-    layer_configs: list[TransformerConfig] = []
-    for layer_symbol in segment:
-        layer_configs.append(layer_utils.create_layer_config(config, layer_symbol))
-
-    return layer_configs
+    return [layer_utils.create_layer_config(config, symbol) for symbol in segment]
 
 
 def layer_config_list_from_hybrid_layer_pattern(
@@ -334,24 +334,21 @@ def layer_config_list_from_hybrid_layer_pattern(
     layer_config_list: list[ArchitectureEntry] = []
 
     if parsed.main_pattern is not None:
-        for segment_index, segment in enumerate(parsed.main_pattern.split(Symbols.PIPE)):
-            if segment_index > 0:
+        for symbol in parsed.main_pattern:
+            if symbol == Symbols.PIPE:
                 layer_config_list.append(PipelineSplit)
-            layer_config_list.extend(validate_segment_layers(segment, config))
+            else:
+                layer_config_list.append(layer_utils.create_layer_config(config, symbol))
 
     if parsed.mtp_pattern is not None:
-        mtp_template = validate_segment_layers(parsed.mtp_pattern, config)
+        mtp_template = [
+            layer_utils.create_layer_config(config, symbol) for symbol in parsed.mtp_pattern
+        ]
         for _ in range(parsed.mtp_num_depths):
             layer_config_list.append(MTPSplit)
             layer_config_list.extend(mtp_template)
 
     return layer_config_list
-
-
-def _clone_layer_configs(layer_config_list: Sequence[TransformerConfig]) -> list[TransformerConfig]:
-    """Clone configs before constructing physical layers."""
-
-    return [type(layer_config).from_config(layer_config) for layer_config in layer_config_list]
 
 
 def _normalize_vp_stage(vp_stage: Optional[int], vp_size: int) -> int:
@@ -400,7 +397,7 @@ def select_pipeline_config_segment(
         scan_hybrid_layer_config_list(decoder_entries, pp_size=pp_size) if decoder_entries else None
     )
     global_layer_config_list = [
-        cast(TransformerConfig, entry) for entry in decoder_entries if entry is not PipelineSplit
+        entry for entry in decoder_entries if isinstance(entry, TransformerConfig)
     ]
     decoder_layer_count = (
         architecture_metadata.decoder_layer_count if architecture_metadata is not None else 0
@@ -440,7 +437,8 @@ def select_pipeline_config_segment(
             if entry is PipelineSplit:
                 segments.append([])
             else:
-                segments[-1].append(cast(TransformerConfig, entry))
+                assert isinstance(entry, TransformerConfig)
+                segments[-1].append(entry)
 
         assert architecture_metadata.inferred_vpp_size is not None
         vp_size = architecture_metadata.inferred_vpp_size
@@ -459,26 +457,6 @@ def select_pipeline_config_segment(
     else:
         vp_size = config.virtual_pipeline_model_parallel_size or 1
         vp_rank = _normalize_vp_stage(vp_stage, vp_size)
-        explicit_stage_layer_counts = [
-            layer_count
-            for layer_count in (
-                config.num_layers_in_first_pipeline_stage,
-                config.num_layers_in_last_pipeline_stage,
-            )
-            if layer_count is not None
-        ]
-        middle_stage_count = pp_size - len(explicit_stage_layer_counts)
-        middle_layer_count = len(global_layer_config_list) - sum(explicit_stage_layer_counts)
-        if (
-            middle_stage_count < 0
-            or middle_layer_count < 0
-            or (middle_stage_count == 0 and middle_layer_count != 0)
-        ):
-            raise ValueError(
-                "First/last pipeline stage overrides are incompatible with the PP size "
-                "and decoder layer count."
-            )
-
         if pp_size == 1 and vp_size > 1:
             if len(global_layer_config_list) % vp_size != 0:
                 raise ValueError(
@@ -498,6 +476,11 @@ def select_pipeline_config_segment(
             except AssertionError as error:
                 raise ValueError(str(error)) from error
 
+        if any(layer_count < 0 for layer_count in chunk_layer_counts):
+            raise ValueError(
+                "Pipeline allocation produced a negative decoder layer count; check "
+                "num_layers_in_first_pipeline_stage and num_layers_in_last_pipeline_stage."
+            )
         if sum(chunk_layer_counts) != len(global_layer_config_list):
             raise ValueError(
                 f"Pipeline allocation owns {sum(chunk_layer_counts)} decoder layers, but "
@@ -509,7 +492,6 @@ def select_pipeline_config_segment(
         selected = global_layer_config_list[layer_offset : layer_offset + num_layers_to_build]
         segment_log = ""
 
-    selected = _clone_layer_configs(selected)
     log_on_each_pipeline_stage(
         logger,
         logging.INFO,
@@ -643,8 +625,8 @@ def select_pipeline_segment(
             count = layers_per_rank
 
         selected_pattern = full_pattern[offset : offset + count]
-        layer_utils.validate_tp_comm_overlap(config, selected_pattern)
         selected = validate_segment_layers(selected_pattern, config)
+        layer_utils.validate_tp_comm_overlap(config, selected)
         log_on_each_pipeline_stage(
             logger,
             logging.INFO,
@@ -678,8 +660,8 @@ def select_pipeline_segment(
     layer_offset = sum(len(segments[i]) for i in range(segment_index))
     my_segment = segments[segment_index]
 
-    layer_utils.validate_tp_comm_overlap(config, my_segment)
     layer_config_list = validate_segment_layers(my_segment, config)
+    layer_utils.validate_tp_comm_overlap(config, layer_config_list)
 
     log_on_each_pipeline_stage(
         logger,

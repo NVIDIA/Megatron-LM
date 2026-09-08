@@ -780,9 +780,9 @@ class _Layer(torch.nn.Module):
 class _MTPLayer(torch.nn.Module):
     """Stands in for MultiTokenPredictionLayer."""
 
-    def __init__(self, *, mtp_layer_config_list=None):
+    def __init__(self, *, is_hybrid_mtp=False):
         super().__init__()
-        self.is_hybrid_mtp = mtp_layer_config_list is not None
+        self.is_hybrid_mtp = is_hybrid_mtp
         self.mtp_model_layer = torch.nn.Module()
 
 
@@ -1072,8 +1072,8 @@ class TestGetMTPInnerLayerPaths:
         assert get_mtp_inner_layer_paths(model) == ["mtp.layers.0"]
 
     def test_list_defined_hybrid_mtp_layer_excluded(self):
-        """List-defined Hybrid MTP uses the derived discriminator."""
-        model = _Model(mtp_layers=[_MTPLayer(mtp_layer_config_list=[object()])])
+        """List-defined Hybrid MTP uses the explicit discriminator."""
+        model = _Model(mtp_layers=[_MTPLayer(is_hybrid_mtp=True)])
         assert get_mtp_inner_layer_paths(model) == []
 
     def test_model_without_mtp(self):
@@ -1161,7 +1161,7 @@ class TestHandleMTPInStateDict:
         assert opt_sd is None
 
     def test_noop_for_hybrid_mtp(self):
-        model = _Model(mtp_layers=[_MTPLayer(mtp_layer_config_list=[object()])])
+        model = _Model(mtp_layers=[_MTPLayer(is_hybrid_mtp=True)])
         sd = {self.MODEL_KEY: 1}
         model_sd, _ = handle_mtp_in_state_dict(model, sd, None)
         assert model_sd == sd

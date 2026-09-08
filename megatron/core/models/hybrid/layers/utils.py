@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
@@ -92,38 +92,64 @@ def get_layer_symbol_from_config(layer_config: TransformerConfig) -> str:
     raise ValueError(f"Unexpected hybrid layer config type: {type(layer_config).__name__}")
 
 
+def validate_layer_config_types(layer_config_types: Collection[type[TransformerConfig]]) -> None:
+    """Validate layer config types that share one hybrid model.
+
+    Args:
+        layer_config_types: Exact layer config types used by the model.
+
+    Raises:
+        ValueError: If a type is unsupported or regular attention is mixed with MLA/DSA.
+    """
+    layer_config_types = set(layer_config_types)
+    unsupported_types = layer_config_types.difference(Symbols.LAYER_CONFIG_MAP.values())
+    if unsupported_types:
+        unsupported_names = ", ".join(
+            sorted(config_type.__name__ for config_type in unsupported_types)
+        )
+        raise ValueError(f"Unexpected hybrid layer config type: {unsupported_names}")
+
+    attention_types = layer_config_types.intersection(Symbols.ATTENTION_LAYER_CONFIGS)
+    if AttentionLayerConfig in attention_types and len(attention_types) > 1:
+        raise ValueError(
+            "AttentionLayerConfig cannot be combined with MLA or DSA layer configs in one model."
+        )
+
+
+def count_layer_configs(
+    layer_config_list: Sequence[TransformerConfig], layer_config_type: type[TransformerConfig]
+) -> int:
+    """Count exact occurrences of a layer config type."""
+
+    return sum(type(layer_config) is layer_config_type for layer_config in layer_config_list)
+
+
 def validate_tp_comm_overlap(
-    config: TransformerConfig, layers: str | Sequence[TransformerConfig], has_mtp: bool = False
+    config: TransformerConfig,
+    layer_config_list: Sequence[TransformerConfig],
+    has_mtp: bool = False,
 ) -> None:
     """Validate TP communication overlap support for built-in hybrid layers.
 
     Args:
         config: Config whose TP communication overlap setting should be validated.
-        layers: Layer configs governed by ``config``. A string is also accepted by the
-            legacy pattern adapter.
+        layer_config_list: Layer configs governed by ``config``.
         has_mtp: Whether this model instance will build an MTP block.
 
     Raises:
         ValueError: If TP communication overlap is enabled with MLA, DSA, or MTP.
     """
+    overlap_configs = [
+        layer_config for layer_config in layer_config_list if layer_config.tp_comm_overlap
+    ]
+    layer_types = {type(layer_config) for layer_config in overlap_configs}
     unsupported_features: list[str] = []
-    if isinstance(layers, str):
-        overlap_enabled = config.tp_comm_overlap
-        has_mla = overlap_enabled and Symbols.MLA in layers
-        has_dsa = overlap_enabled and Symbols.DS_ATTENTION in layers
-        has_unsupported_mtp = overlap_enabled and has_mtp
-    else:
-        overlap_configs = [layer_config for layer_config in layers if layer_config.tp_comm_overlap]
-        layer_types = {type(layer_config) for layer_config in overlap_configs}
-        has_mla = MLALayerConfig in layer_types
-        has_dsa = DSALayerConfig in layer_types
-        has_unsupported_mtp = has_mtp and (config.tp_comm_overlap or bool(overlap_configs))
 
-    if has_mla:
+    if MLALayerConfig in layer_types:
         unsupported_features.append("MLA")
-    if has_dsa:
+    if DSALayerConfig in layer_types:
         unsupported_features.append("DSA")
-    if has_unsupported_mtp:
+    if has_mtp and (config.tp_comm_overlap or bool(overlap_configs)):
         unsupported_features.append("MTP")
 
     if not unsupported_features:

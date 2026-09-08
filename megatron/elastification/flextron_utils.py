@@ -7,16 +7,18 @@ Provides setup and configuration functions for Flextron elasticity.
 Extracted from HybridModel to keep the core model clean.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron.core import mpu, parallel_state
+from megatron.core.models.hybrid import ArchitectureEntry, MTPSplit, PipelineSplit
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.elastification.arguments import convert_per_lists_to_int_lists
 from megatron.elastification.flextron_config import inject_flextron_config
 from megatron.elastification.flextron_elasticity_hooks import apply_flextron_elasticity_to_model
@@ -24,10 +26,68 @@ from megatron.elastification.memory_config import MemoryConfig, load_memory_conf
 from megatron.elastification.router.flex_budget_utils import (
     get_memory_footprint,
     get_num_parameters,
-    validate_flextron_layer_config_list,
 )
 from megatron.elastification.router.hybrid_flex_router import FlextronRouter
 from megatron.training import get_args
+
+_FLEXTRON_STRUCTURE_FIELDS = {
+    MambaLayerConfig: (
+        "hidden_size",
+        "mamba_num_heads",
+        "mamba_head_dim",
+        "mamba_state_dim",
+        "mamba_num_groups",
+    ),
+    AttentionLayerConfig: ("hidden_size", "num_attention_heads", "num_query_groups", "kv_channels"),
+    MoELayerConfig: (
+        "hidden_size",
+        "ffn_hidden_size",
+        "moe_ffn_hidden_size",
+        "num_moe_experts",
+        "moe_shared_expert_intermediate_size",
+        "moe_router_topk",
+    ),
+}
+
+
+def _validate_flextron_layer_config_list(
+    layer_config_list: Sequence[ArchitectureEntry], root_config: TransformerConfig
+) -> tuple[TransformerConfig, ...]:
+    """Validate and snapshot the layer configs supported by Flextron."""
+    validated: list[TransformerConfig] = []
+    for layer_idx, layer_config in enumerate(layer_config_list):
+        if layer_config is PipelineSplit or layer_config is MTPSplit:
+            raise NotImplementedError("Flextron does not support pipeline or MTP split markers.")
+
+        layer_config_type = type(layer_config)
+        if layer_config_type not in _FLEXTRON_STRUCTURE_FIELDS:
+            raise NotImplementedError(
+                "Flextron supports only MambaLayerConfig, AttentionLayerConfig, and "
+                f"MoELayerConfig entries; got {layer_config_type.__name__} at index {layer_idx}."
+            )
+
+        for field_name in _FLEXTRON_STRUCTURE_FIELDS[layer_config_type]:
+            layer_value = getattr(layer_config, field_name)
+            root_value = getattr(root_config, field_name)
+            if layer_value != root_value:
+                raise NotImplementedError(
+                    "Flextron does not support heterogeneous structural layer configs: "
+                    f"entry {layer_idx} has {field_name}={layer_value!r}, while the root "
+                    f"config has {field_name}={root_value!r}."
+                )
+
+        validated.append(layer_config)
+
+    if any(type(layer_config) is MoELayerConfig for layer_config in validated):
+        if root_config.moe_ffn_hidden_size != root_config.ffn_hidden_size:
+            raise NotImplementedError(
+                "Flextron requires moe_ffn_hidden_size to equal ffn_hidden_size because "
+                "its MLP elasticity choices and masks use the root ffn_hidden_size; got "
+                f"moe_ffn_hidden_size={root_config.moe_ffn_hidden_size!r} and "
+                f"ffn_hidden_size={root_config.ffn_hidden_size!r}."
+            )
+
+    return tuple(validated)
 
 
 class FlextronModelManager:
@@ -58,7 +118,7 @@ class FlextronModelManager:
         source_layer_config_list = getattr(model, 'layer_config_list', None)
         if source_layer_config_list is None:
             raise ValueError("Flextron requires a HybridModel with layer_config_list.")
-        self.layer_config_list = validate_flextron_layer_config_list(
+        self.layer_config_list = _validate_flextron_layer_config_list(
             source_layer_config_list, root_config=config
         )
         if len(self.layer_config_list) != config.num_layers:
@@ -67,8 +127,6 @@ class FlextronModelManager:
                 f"config.num_layers={config.num_layers}."
             )
 
-        # Router and hook managers receive the same typed architecture snapshot.
-        config.flextron_layer_config_list = self.layer_config_list
         self.router = None
         self.budget_type = getattr(config, 'budget_type', 'param')
 
@@ -85,7 +143,9 @@ class FlextronModelManager:
     def setup_router(self):
         """Initialize the Flextron router if enabled."""
         if getattr(self.config, 'enable_router', False):  # and self.model.pre_process:
-            self.router = FlextronRouter(config=self.config)
+            self.router = FlextronRouter(
+                config=self.config, layer_config_list=self.layer_config_list
+            )
 
             # Make router name pipeline-stage-aware to avoid naming conflicts in PP>1
             pp_rank = mpu.get_pipeline_model_parallel_rank()
@@ -251,6 +311,7 @@ class FlextronModelManager:
             moe_router_topk=self.config.moe_router_topk,
         )
 
+
         if self.config.budget_type == 'param':
             if self.memory_config.param_budget_target == 'active':
                 diff = abs(current_param_active / (budget_item * self.active_param) - 1)
@@ -336,7 +397,11 @@ class FlextronModelManager:
             mse_loss_emb = F.mse_loss(flextron_kwargs['router_emb'][0], label_emb)
 
             diff += 10 * (
-                mse_loss_mamba + mse_loss_mlp + mse_loss_moe_expert + mse_loss_skip + mse_loss_emb
+                mse_loss_mamba
+                + mse_loss_mlp
+                + mse_loss_moe_expert
+                + mse_loss_skip
+                + mse_loss_emb
             )
 
         return diff.bfloat16(), {}
@@ -350,8 +415,8 @@ class FlextronModelManager:
         if self.router is None:
             return {}, None
 
-        router_mlp, router_skip, router_emb, router_mamba, router_moe_expert = self.router(
-            budget_item
+        (router_mlp, router_skip, router_emb, router_mamba, router_moe_expert) = (
+            self.router(budget_item)
         )
 
         flextron_kwargs = {

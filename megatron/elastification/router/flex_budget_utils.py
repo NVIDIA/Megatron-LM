@@ -4,126 +4,15 @@ from typing import Sequence
 
 import torch
 
-from megatron.core.models.hybrid import ArchitectureEntry, MTPSplit, PipelineSplit
+from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-_FLEXTRON_STRUCTURE_FIELDS = {
-    MambaLayerConfig: (
-        "hidden_size",
-        "mamba_num_heads",
-        "mamba_head_dim",
-        "mamba_state_dim",
-        "mamba_num_groups",
-    ),
-    AttentionLayerConfig: ("hidden_size", "num_attention_heads", "num_query_groups", "kv_channels"),
-    MoELayerConfig: (
-        "hidden_size",
-        "ffn_hidden_size",
-        "moe_ffn_hidden_size",
-        "num_moe_experts",
-        "moe_shared_expert_intermediate_size",
-        "moe_router_topk",
-    ),
-}
-_FLEXTRON_LAYER_CONFIG_TYPES = tuple(_FLEXTRON_STRUCTURE_FIELDS)
-
-
-def validate_flextron_layer_config_list(
-    layer_config_list: Sequence[ArchitectureEntry], root_config: TransformerConfig | None = None
-) -> tuple[TransformerConfig, ...]:
-    """Validate and snapshot the subset of layer configs supported by Flextron.
-
-    Flextron currently assumes one local decoder stack whose per-layer structural
-    dimensions match the root model config. Pipeline markers, MTP markers, additional
-    layer config types, and heterogeneous structural dimensions are therefore rejected.
-
-    Args:
-        layer_config_list: Flat HybridModel architecture to validate.
-        root_config: Optional root model config used to reject heterogeneous sizing.
-
-    Returns:
-        A tuple containing the validated layer config objects in source order.
-
-    Raises:
-        NotImplementedError: If the architecture uses a feature Flextron does not support.
-    """
-    validated: list[TransformerConfig] = []
-    for layer_idx, layer_config in enumerate(layer_config_list):
-        if layer_config is PipelineSplit:
-            raise NotImplementedError("Flextron does not support PipelineSplit markers.")
-        if layer_config is MTPSplit:
-            raise NotImplementedError("Flextron does not support MTPSplit markers or MTP layers.")
-
-        layer_config_type = type(layer_config)
-        if layer_config_type not in _FLEXTRON_LAYER_CONFIG_TYPES:
-            raise NotImplementedError(
-                "Flextron supports only MambaLayerConfig, AttentionLayerConfig, and "
-                f"MoELayerConfig entries; got {layer_config_type.__name__} at index {layer_idx}."
-            )
-
-        if root_config is not None:
-            for field_name in _FLEXTRON_STRUCTURE_FIELDS[layer_config_type]:
-                layer_value = getattr(layer_config, field_name)
-                root_value = getattr(root_config, field_name)
-                if layer_value != root_value:
-                    raise NotImplementedError(
-                        "Flextron does not support heterogeneous structural layer configs: "
-                        f"entry {layer_idx} has {field_name}={layer_value!r}, while the root "
-                        f"config has {field_name}={root_value!r}."
-                    )
-
-        validated.append(layer_config)
-
-    if root_config is not None and any(
-        type(layer_config) is MoELayerConfig for layer_config in validated
-    ):
-        if root_config.moe_ffn_hidden_size != root_config.ffn_hidden_size:
-            raise NotImplementedError(
-                "Flextron requires moe_ffn_hidden_size to equal ffn_hidden_size because "
-                "its MLP elasticity choices and masks use the root ffn_hidden_size; got "
-                f"moe_ffn_hidden_size={root_config.moe_ffn_hidden_size!r} and "
-                f"ffn_hidden_size={root_config.ffn_hidden_size!r}."
-            )
-
-    return tuple(validated)
-
-
-def count_flextron_layer_configs(
-    layer_config_list: Sequence[ArchitectureEntry], layer_config_type: type[TransformerConfig]
-) -> int:
-    """Count exact occurrences of a supported Flextron layer config type."""
-    if layer_config_type not in _FLEXTRON_LAYER_CONFIG_TYPES:
-        raise ValueError(f"Unsupported Flextron layer config type: {layer_config_type.__name__}.")
-    validated = validate_flextron_layer_config_list(layer_config_list)
-    return sum(type(layer_config) is layer_config_type for layer_config in validated)
-
-
-def get_flextron_layer_ordinal(
-    layer_config_list: Sequence[ArchitectureEntry],
-    layer_idx: int,
-    layer_config_type: type[TransformerConfig],
-) -> int:
-    """Return a layer's zero-based ordinal among configs of the requested exact type."""
-    if layer_config_type not in _FLEXTRON_LAYER_CONFIG_TYPES:
-        raise ValueError(f"Unsupported Flextron layer config type: {layer_config_type.__name__}.")
-    validated = validate_flextron_layer_config_list(layer_config_list)
-    if not 0 <= layer_idx < len(validated):
-        raise IndexError(
-            f"Flextron layer index {layer_idx} is outside the {len(validated)}-layer architecture."
-        )
-    if type(validated[layer_idx]) is not layer_config_type:
-        raise ValueError(
-            f"Flextron layer {layer_idx} is {type(validated[layer_idx]).__name__}, not "
-            f"{layer_config_type.__name__}."
-        )
-    return sum(type(layer_config) is layer_config_type for layer_config in validated[:layer_idx])
-
 
 def get_num_parameters(
-    layer_config_list: Sequence[ArchitectureEntry],
+    layer_config_list: Sequence[TransformerConfig],
     mamba_num_heads: int = 0,
     mamba_d_head: int = 0,
     mamba_d_state: int = 0,
@@ -138,8 +27,6 @@ def get_num_parameters(
     shared_expert_intermediate_size: int = 0,
     moe_router_topk: int = 0,
 ) -> tuple[int | torch.Tensor, int | torch.Tensor]:
-
-    layer_config_list = validate_flextron_layer_config_list(layer_config_list)
 
     norm_multiplier = 1
 
@@ -295,15 +182,13 @@ def get_num_parameters(
 
 
 def get_kv_cache_size(
-    layer_config_list: Sequence[ArchitectureEntry],
+    layer_config_list: Sequence[TransformerConfig],
     num_attention_heads=None,
     num_query_groups=None,
     kv_channels=None,
     mem_infer_seq_len: int = 0,
     mem_batch_size: int = 0,
 ) -> int | torch.Tensor:
-
-    layer_config_list = validate_flextron_layer_config_list(layer_config_list)
 
     # Per-layer attention head counts arise only from layer skipping; head
     # elasticity itself is no longer supported.
@@ -333,8 +218,8 @@ def get_kv_cache_size(
                 head_idx += 1
 
     else:
-        num_attention_layers = sum(
-            type(layer_config) is AttentionLayerConfig for layer_config in layer_config_list
+        num_attention_layers = layer_utils.count_layer_configs(
+            layer_config_list, AttentionLayerConfig
         )
         divider = (
             num_attention_heads.detach().item()
@@ -356,14 +241,12 @@ def get_kv_cache_size(
 
 
 def get_mamba_ssm_cache_size(
-    layer_config_list: Sequence[ArchitectureEntry],
+    layer_config_list: Sequence[TransformerConfig],
     mamba_num_heads: int = 0,
     mamba_d_head: int = 0,
     mamba_d_state: int = 0,
     mem_batch_size: int = 0,
 ) -> int | torch.Tensor:
-
-    layer_config_list = validate_flextron_layer_config_list(layer_config_list)
 
     if isinstance(mamba_num_heads, int):
         flex_hetero_mamba = False
@@ -382,9 +265,7 @@ def get_mamba_ssm_cache_size(
                 mamba_idx += 1
 
     else:
-        num_mamba_layers = sum(
-            type(layer_config) is MambaLayerConfig for layer_config in layer_config_list
-        )
+        num_mamba_layers = layer_utils.count_layer_configs(layer_config_list, MambaLayerConfig)
         ssm_cache_size = (
             mem_batch_size * mamba_num_heads * mamba_d_head * mamba_d_state * num_mamba_layers
         )
@@ -393,7 +274,7 @@ def get_mamba_ssm_cache_size(
 
 
 def get_max_buffer_size(
-    layer_config_list: Sequence[ArchitectureEntry],
+    layer_config_list: Sequence[TransformerConfig],
     moe_num_experts: int = 0,
     shared_expert_intermediate_size: int = 0,
     ffn_hidden_size: int = 0,
@@ -402,8 +283,7 @@ def get_max_buffer_size(
     prefill_chunk_size: int = 0,
 ) -> torch.Tensor:
 
-    layer_config_list = validate_flextron_layer_config_list(layer_config_list)
-    num_moe_layers = sum(type(layer_config) is MoELayerConfig for layer_config in layer_config_list)
+    num_moe_layers = layer_utils.count_layer_configs(layer_config_list, MoELayerConfig)
 
     if isinstance(moe_num_experts, int) or moe_num_experts.shape[0] == 1:
         moe_num_experts = (
@@ -435,7 +315,7 @@ def get_max_buffer_size(
 
 
 def get_memory_footprint(
-    layer_config_list: Sequence[ArchitectureEntry],
+    layer_config_list: Sequence[TransformerConfig],
     mamba_num_heads: int = 0,
     mamba_d_head: int = 80,
     mamba_d_state: int = 128,

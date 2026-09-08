@@ -46,14 +46,15 @@ def test_scanner_returns_raw_marker_positions():
         moe,
     ]
 
-    assert scan_hybrid_layer_config_list(architecture, pp_size=2) == ArchitectureMetadata(
+    metadata = scan_hybrid_layer_config_list(architecture, pp_size=2)
+    assert metadata == ArchitectureMetadata(
         decoder_layer_count=4,
-        mtp_num_depths=2,
         pipeline_split_indices=(1, 3, 5),
         mtp_split_indices=(7, 9),
-        pipeline_segment_count=4,
         inferred_vpp_size=2,
     )
+    assert metadata.mtp_num_depths == 2
+    assert metadata.pipeline_segment_count == 4
 
 
 def test_scanner_allows_decoder_only_and_leading_mtp_split():
@@ -61,18 +62,14 @@ def test_scanner_allows_decoder_only_and_leading_mtp_split():
 
     assert scan_hybrid_layer_config_list([mamba], pp_size=4) == ArchitectureMetadata(
         decoder_layer_count=1,
-        mtp_num_depths=0,
         pipeline_split_indices=(),
         mtp_split_indices=(),
-        pipeline_segment_count=1,
         inferred_vpp_size=None,
     )
     assert scan_hybrid_layer_config_list([MTPSplit, mamba]) == ArchitectureMetadata(
         decoder_layer_count=0,
-        mtp_num_depths=1,
         pipeline_split_indices=(),
         mtp_split_indices=(0,),
-        pipeline_segment_count=1,
         inferred_vpp_size=None,
     )
 

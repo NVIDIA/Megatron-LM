@@ -57,7 +57,7 @@ def stub_runtime_config(monkeypatch):
     monkeypatch.setattr(flextron_utils, "load_memory_config", lambda _: MemoryConfig())
 
 
-def test_manager_snapshots_model_layer_config_list_on_runtime_config():
+def test_manager_snapshots_model_layer_config_list():
     config = _root_config()
     source = list(_supported_architecture(config))
 
@@ -65,7 +65,7 @@ def test_manager_snapshots_model_layer_config_list_on_runtime_config():
 
     assert manager.layer_config_list == tuple(source)
     assert all(actual is expected for actual, expected in zip(manager.layer_config_list, source))
-    assert config.flextron_layer_config_list is manager.layer_config_list
+    assert not hasattr(config, "flextron_layer_config_list")
     assert not hasattr(config, "hybrid_layer_pattern")
 
 

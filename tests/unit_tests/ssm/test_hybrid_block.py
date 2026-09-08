@@ -92,7 +92,11 @@ def test_all_layer_configs_route_to_matching_specs(monkeypatch, layer_pattern, e
     assert [module_spec for module_spec, _ in build_calls] == expected_specs
     assert all(
         kwargs["config"] is layer_config
-        for (_, kwargs), layer_config in zip(build_calls, layer_config_list)
+        for (_, kwargs), layer_config in zip(build_calls, block.layer_config_list)
+    )
+    assert all(
+        physical is not source
+        for physical, source in zip(block.layer_config_list, layer_config_list, strict=True)
     )
     expected_layer_numbers = list(range(6, 6 + len(layer_pattern)))
     assert [kwargs["layer_number"] for _, kwargs in build_calls] == expected_layer_numbers
@@ -301,7 +305,7 @@ def test_layer_type_list_configs_follow_root_sequence_parallel_mutations(monkeyp
 
 
 def test_explicit_layer_config_mutations_are_isolated(monkeypatch):
-    """Mutating one explicitly supplied layer config does not affect the others."""
+    """Every physical occurrence gets an independent clone of its source config."""
 
     class BuiltLayer(torch.nn.Module):
 
@@ -313,27 +317,36 @@ def test_explicit_layer_config_mutations_are_isolated(monkeypatch):
     submodules = hybrid_stack_spec.submodules
 
     def fake_build_module(module_spec, **kwargs):
-        if module_spec is submodules.mla_layer:
+        if kwargs["layer_number"] == 1:
             kwargs["config"].add_bias_linear = False
         return BuiltLayer(kwargs["config"], kwargs["layer_number"])
 
     monkeypatch.setattr(hybrid_block_module, "build_module", fake_build_module)
 
     root_config = MLATransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4)
-    layer_configs = validate_segment_layers(Symbols.MLA + Symbols.MLP, root_config)
-    HybridStack(
+    source_config = MLALayerConfig.from_config(root_config)
+    source_config.custom_options = {"items": []}
+    block = HybridStack(
         config=root_config,
         submodules=submodules,
-        layer_config_list=layer_configs,
+        layer_config_list=[source_config, source_config],
         pre_process=False,
         post_layer_norm=False,
         post_process=False,
         pg_collection=_make_pg_collection(),
     )
 
-    assert type(layer_configs) is list
     assert root_config.add_bias_linear is True
-    assert [layer_config.add_bias_linear for layer_config in layer_configs] == [False, True]
+    assert source_config.add_bias_linear is True
+    assert [layer_config.add_bias_linear for layer_config in block.layer_config_list] == [
+        False,
+        True,
+    ]
+    assert all(layer_config is not source_config for layer_config in block.layer_config_list)
+    assert block.layer_config_list[0] is not block.layer_config_list[1]
+    assert (
+        block.layer_config_list[0].custom_options is not block.layer_config_list[1].custom_options
+    )
 
 
 def test_explicit_layer_configs_reject_mixed_attention_families():

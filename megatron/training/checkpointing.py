@@ -2375,21 +2375,14 @@ def _contains_hybrid_model(module) -> bool:
     from megatron.core.models.hybrid.hybrid_model import HybridModel
     from megatron.core.models.mimo.model.base import MimoModel
 
-    # Megatron-FSDP and Float16Module both retain the wrapped module under
-    # ``module`` but are intentionally not handled by the regular
-    # ``unwrap_model`` helper. Multimodal wrappers (e.g. LLaVAModel) attach
-    # the language model under ``language_model`` instead.
-    while module is not None:
-        if isinstance(module, HybridModel):
+    for submodule in unwrap_model(module).modules():
+        if isinstance(submodule, HybridModel):
             return True
-        if isinstance(module, MimoModel):
-            language_module = module.mimo_config.language_model_spec.module
+        # A Mimo rank may omit its language-model module, so consult the shared spec too.
+        if isinstance(submodule, MimoModel):
+            language_module = submodule.mimo_config.language_model_spec.module
             if isinstance(language_module, type) and issubclass(language_module, HybridModel):
                 return True
-        inner = getattr(module, 'language_model', None)
-        if inner is not None and isinstance(inner, HybridModel):
-            return True
-        module = getattr(module, 'module', None)
     return False
 
 

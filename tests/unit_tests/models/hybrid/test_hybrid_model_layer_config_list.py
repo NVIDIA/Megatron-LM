@@ -138,7 +138,7 @@ def test_uneven_pipeline_split_segments_preserve_ownership_and_offsets(
     assert offset == expected_offset
     assert [layer_config.architecture_index for layer_config in selected] == expected_indices
     assert all(
-        selected_config is not source_configs[source_index]
+        selected_config is source_configs[source_index]
         for selected_config, source_index in zip(selected, expected_indices, strict=True)
     )
 
@@ -163,7 +163,7 @@ def test_implicit_pipeline_selection_evenly_slices_pp_and_vpp(monkeypatch):
 
     assert offset == 2
     assert [type(layer_config) for layer_config in selected] == [MoELayerConfig]
-    assert selected[0] is not architecture[2]
+    assert selected[0] is architecture[2]
 
 
 def test_implicit_pipeline_selection_requires_exact_divisibility(monkeypatch):
@@ -238,7 +238,7 @@ def test_pipeline_selection_validates_uneven_stage_counts(
     monkeypatch.setattr(hybrid_allocation_module, "get_pg_rank", lambda group: 0)
     monkeypatch.setattr(hybrid_allocation_module, "get_pg_size", lambda group: pp_size)
 
-    with pytest.raises(ValueError, match="overrides are incompatible"):
+    with pytest.raises(ValueError, match="Pipeline allocation"):
         hybrid_allocation_module.select_pipeline_config_segment(
             architecture, config, _FakeGroup(0, pp_size), vp_stage=None
         )
@@ -450,19 +450,16 @@ def test_pattern_is_converted_once_to_the_authoritative_config_tuple(
         AttentionLayerConfig,
     ]
     assert all(
-        physical is not source
-        for physical, source in zip(
+        selected is source
+        for selected, source in zip(
             decoder_call["layer_config_list"], model.layer_config_list, strict=True
         )
     )
 
 
-def test_list_is_snapshotted_and_repeated_entries_get_independent_physical_clones(
-    patch_cpu_model_construction, monkeypatch
-):
+def test_list_is_snapshotted_before_decoder_selection(patch_cpu_model_construction, monkeypatch):
     config = _config(num_layers=2)
     source_config = _layer(AttentionLayerConfig, config)
-    source_config.custom_options = {"items": []}
     architecture = [source_config, source_config]
     monkeypatch.setattr(
         hybrid_allocation_module,
@@ -486,14 +483,7 @@ def test_list_is_snapshotted_and_repeated_entries_get_independent_physical_clone
 
     decoder_configs = patch_cpu_model_construction[0].kwargs["layer_config_list"]
     assert model.layer_config_list == (source_config, source_config)
-    assert all(layer_config is not source_config for layer_config in decoder_configs)
-    assert decoder_configs[0] is not decoder_configs[1]
-    assert decoder_configs[0].custom_options is not decoder_configs[1].custom_options
-    assert decoder_configs[0].custom_options is not source_config.custom_options
-
-    decoder_configs[0].custom_options["items"].append("changed")
-    assert decoder_configs[1].custom_options == {"items": []}
-    assert source_config.custom_options == {"items": []}
+    assert decoder_configs == [source_config, source_config]
 
 
 def test_pattern_and_config_list_are_mutually_exclusive(patch_cpu_model_construction):
@@ -558,6 +548,32 @@ def test_list_model_rejects_mtp_depth_count_mismatch(
             post_process=False,
             pg_collection=_pg_collection(),
             layer_config_list=[decoder, MTPSplit, head, MTPSplit, head],
+        )
+
+
+def test_list_model_rejects_remote_decoder_tp_overlap_with_mtp(patch_cpu_model_construction):
+    config = _config(num_layers=2, pp_size=2, mtp_num_layers=1)
+    first_stage_decoder = _layer(MambaLayerConfig, config)
+    first_stage_decoder.tp_comm_overlap = True
+    final_stage_decoder = _layer(MambaLayerConfig, config)
+    mtp_config = _layer(AttentionLayerConfig, config)
+
+    with pytest.raises(ValueError, match="TP communication overlap.*MTP"):
+        HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=32,
+            max_sequence_length=8,
+            pre_process=False,
+            post_process=False,
+            pg_collection=_pg_collection(pp_rank=1, pp_size=2),
+            layer_config_list=[
+                first_stage_decoder,
+                PipelineSplit,
+                final_stage_decoder,
+                MTPSplit,
+                mtp_config,
+            ],
         )
 
 
@@ -775,7 +791,7 @@ def test_list_defined_mtp_builds_independent_or_repeated_physical_layers(
     assert all(kwargs["mtp_layer_config_list"] is source_template for _, kwargs in build_calls)
 
 
-def test_gpt_mtp_build_does_not_receive_hybrid_arguments(monkeypatch):
+def test_gpt_mtp_build_omits_hybrid_arguments(monkeypatch):
     config = _config(num_layers=1, mtp_num_layers=2)
     build_calls = []
 
@@ -798,7 +814,6 @@ def test_gpt_mtp_build_does_not_receive_hybrid_arguments(monkeypatch):
         pg_collection=SimpleNamespace(tp=_FakeGroup(), cp=_FakeGroup(), pp=_FakeGroup()),
     )
 
-    assert block.is_hybrid_mtp is False
     assert len(block.layers) == 2
     assert all("hybrid_submodules" not in kwargs for _, kwargs in build_calls)
     assert all("mtp_layer_config_list" not in kwargs for _, kwargs in build_calls)
@@ -837,60 +852,22 @@ def test_hybrid_mtp_block_requires_positive_depth_count(mtp_num_layers):
         )
 
 
-def test_mtp_num_depths_compatibility_argument_must_match_config():
-    config = _config(num_layers=1, mtp_num_layers=2)
+@pytest.mark.parametrize("constructor", ["block", "layer"])
+def test_hybrid_mtp_rejects_an_empty_config_list(constructor):
+    config = _config(num_layers=1, mtp_num_layers=1)
 
-    with pytest.raises(ValueError, match="mtp_num_depths=1 conflicts"):
-        MultiTokenPredictionBlock(config=config, spec=object(), mtp_num_depths=1)
-
-
-def test_each_physical_mtp_layer_clones_the_source_template(monkeypatch):
-    config = _config(num_layers=1, mtp_num_layers=2)
-    source_config = _layer(AttentionLayerConfig, config)
-    source_config.test_mutable_value = {"items": []}
-    captured_config_lists = []
-
-    class CapturingHybridStack(nn.Module):
-
-        def __init__(self, *, layer_config_list, **kwargs):
-            super().__init__()
-            captured_config_lists.append(layer_config_list)
-            self.layers = nn.ModuleList([nn.Identity()])
-
-    submodules = SimpleNamespace(
-        mtp_model_layer=None,
-        enorm=lambda **kwargs: nn.Identity(),
-        hnorm=lambda **kwargs: nn.Identity(),
-        eh_proj=object(),
-        e_proj=None,
-        h_proj=None,
-        layer_norm=lambda **kwargs: nn.Identity(),
-    )
-    pg_collection = SimpleNamespace(tp=_FakeGroup(), cp=_FakeGroup(), pp=_FakeGroup())
-    monkeypatch.setattr(mtp_module, "build_module", lambda *args, **kwargs: nn.Identity())
-    monkeypatch.setattr(
-        "megatron.core.models.hybrid.hybrid_block.HybridStack", CapturingHybridStack
-    )
-
-    for layer_number in (1, 2):
-        MultiTokenPredictionLayer(
-            config=config,
-            submodules=submodules,
-            layer_number=layer_number,
-            pg_collection=pg_collection,
-            mtp_layer_config_list=[source_config],
-            hybrid_submodules=object(),
-        )
-
-    first_config = captured_config_lists[0][0]
-    second_config = captured_config_lists[1][0]
-    assert first_config is not source_config
-    assert second_config is not source_config
-    assert first_config is not second_config
-    assert first_config.test_mutable_value == {"items": []}
-    assert second_config.test_mutable_value == {"items": []}
-    assert first_config.test_mutable_value is not second_config.test_mutable_value
-
-    first_config.test_mutable_value["items"].append("changed")
-    assert second_config.test_mutable_value == {"items": []}
-    assert source_config.test_mutable_value == {"items": []}
+    with pytest.raises(ValueError, match="mtp_layer_config_list must not be empty"):
+        if constructor == "block":
+            MultiTokenPredictionBlock(
+                config=config,
+                spec=object(),
+                mtp_layer_config_list=[],
+                hybrid_submodules=object(),
+            )
+        else:
+            MultiTokenPredictionLayer(
+                config=config,
+                submodules=object(),
+                mtp_layer_config_list=[],
+                hybrid_submodules=object(),
+            )

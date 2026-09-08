@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import random
+from collections.abc import Sequence
 
 import numpy as np
 import torch
@@ -8,6 +9,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from megatron.core import parallel_state
+from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.num_microbatches_calculator import (
     get_current_global_batch_size,
     get_micro_batch_size,
@@ -28,7 +30,6 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal
-from megatron.elastification.router.flex_budget_utils import count_flextron_layer_configs
 
 # Import TE parallel linear layers
 try:
@@ -48,10 +49,12 @@ except ImportError:
 # Use router to determine #heads, MLP sizes, and layers to skip (Router_v2)
 # Only takes the budget as input
 class FlextronRouter(MegatronModule):
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig, layer_config_list: Sequence[TransformerConfig]):
         super().__init__(config=config)
 
         self.config = config
+        self.num_mamba_layers = layer_utils.count_layer_configs(layer_config_list, MambaLayerConfig)
+        self.num_moe_layers = layer_utils.count_layer_configs(layer_config_list, MoELayerConfig)
         self.input_dim = len(self.config.budget_list)
         self.n_dim = self.config.router_inter_dim
         self.budget_map = {
@@ -128,7 +131,9 @@ class FlextronRouter(MegatronModule):
         # must save/restore both - otherwise the CUDA RNG leaks the deterministic
         # state we set here into other CUDA random ops elsewhere in the model.
         cpu_state = torch.get_rng_state()
-        cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        cuda_state = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        )
         torch.manual_seed(seed)
 
         try:
@@ -193,9 +198,7 @@ class FlextronRouter(MegatronModule):
     def add_router_for_mlp(self):
         mlp_list = self.config.mlp_int_list
         if self.config.flex_hetero_ffn:
-            num_mlp = count_flextron_layer_configs(
-                self.config.flextron_layer_config_list, MoELayerConfig
-            )
+            num_mlp = self.num_moe_layers
             gate_mlp_layer_list = [
                 self._create_linear_layer(
                     self.input_dim, self.n_dim, bias=False, is_first_layer=True
@@ -232,9 +235,7 @@ class FlextronRouter(MegatronModule):
     def add_router_for_moe_expert(self):
         moe_expert_list = self.config.moe_expert_int_list
         if self.config.flex_hetero_moe_expert:
-            num_moe_expert = count_flextron_layer_configs(
-                self.config.flextron_layer_config_list, MoELayerConfig
-            )
+            num_moe_expert = self.num_moe_layers
             gate_moe_expert_layer_list = [
                 self._create_linear_layer(
                     self.input_dim, self.n_dim, bias=False, is_first_layer=True
@@ -285,9 +286,7 @@ class FlextronRouter(MegatronModule):
     def add_router_for_mamba(self):
         mamba_list = self.config.mamba_int_list
         if self.config.flex_hetero_mamba:
-            num_mamba = count_flextron_layer_configs(
-                self.config.flextron_layer_config_list, MambaLayerConfig
-            )
+            num_mamba = self.num_mamba_layers
             gate_mamba_layer_list = [
                 self._create_linear_layer(
                     self.input_dim, self.n_dim, bias=False, is_first_layer=True
@@ -564,7 +563,8 @@ class FlextronRouter(MegatronModule):
             # to the largest configured budget. Using max() instead of [0]
             # makes this independent of budget_list ordering.
             budget_tensor = torch.nn.functional.one_hot(
-                self.budget_map[max(self.budget_map.keys())], len(self.config.budget_list)
+                self.budget_map[max(self.budget_map.keys())],
+                len(self.config.budget_list),
             ).to(device=device, dtype=dtype)
         else:
             # budget_list is enforced descending by sort_budget_list_descending

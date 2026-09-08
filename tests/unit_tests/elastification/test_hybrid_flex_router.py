@@ -36,10 +36,6 @@ def _router_config(
         num_moe_experts=num_moe_experts,
         use_cpu_initialization=True,
     )
-    flextron_layer_config_list = (
-        MambaLayerConfig.from_config(config),
-        MoELayerConfig.from_config(config),
-    )
     flex_fields = dict(
         flextron=True,
         soft_mask=True,
@@ -47,7 +43,6 @@ def _router_config(
         flex_hetero_ffn=False,
         flex_hetero_mamba=False,
         flex_hetero_moe_expert=False,
-        flextron_layer_config_list=flextron_layer_config_list,
         normalize_router_logits=False,
         router_inter_dim=32,
         router_std=0.1,
@@ -78,6 +73,10 @@ def _router_config(
     for k, v in flex_fields.items():
         setattr(config, k, v)
     return config
+
+
+def _layer_config_list(config):
+    return (MambaLayerConfig.from_config(config), MoELayerConfig.from_config(config))
 
 
 @pytest.mark.internal
@@ -121,7 +120,7 @@ class TestFlextronRouter:
 
     def test_construction(self):
         config = _router_config()
-        router = FlextronRouter(config).cuda()
+        router = FlextronRouter(config, _layer_config_list(config)).cuda()
         # Each gate is a Sequential of two linear layers + activation.
         assert hasattr(router, "gate_mlp")
         assert hasattr(router, "gate_emb")
@@ -134,7 +133,7 @@ class TestFlextronRouter:
 
     def test_router_params_marked_for_pp_sync(self):
         config = _router_config()
-        router = FlextronRouter(config).cuda()
+        router = FlextronRouter(config, _layer_config_list(config)).cuda()
         for p in router.parameters():
             # _mark_router_params_for_pp_sync adds this attribute to every
             # trainable parameter so the PP gradient sync picks them up.
@@ -142,7 +141,7 @@ class TestFlextronRouter:
 
     def test_forward_returns_five_axis_outputs(self):
         config = _router_config()
-        router = FlextronRouter(config).cuda()
+        router = FlextronRouter(config, _layer_config_list(config)).cuda()
         out = router(1.0)
         assert len(out) == 5
         # Order (per hybrid_flex_router.forward):
@@ -156,7 +155,7 @@ class TestFlextronRouter:
 
     def test_emb_output_shape_matches_choice_count(self):
         config = _router_config()
-        router = FlextronRouter(config).cuda()
+        router = FlextronRouter(config, _layer_config_list(config)).cuda()
         _, _, emb, _, _ = router(1.0)
         logits, choice = emb
         # Logits have one entry per emb_int_list choice.
@@ -168,14 +167,14 @@ class TestFlextronRouter:
         config.flex_hetero_ffn = True
         config.flex_hetero_mamba = True
         config.flex_hetero_moe_expert = True
-        config.flextron_layer_config_list = (
+        layer_config_list = (
             MambaLayerConfig.from_config(config),
             MoELayerConfig.from_config(config),
             MambaLayerConfig.from_config(config),
             MoELayerConfig.from_config(config),
         )
 
-        router = FlextronRouter(config).cuda()
+        router = FlextronRouter(config, layer_config_list).cuda()
         mlp, _, _, mamba, moe_expert = router(1.0)
 
         assert mlp[0].shape == (2, len(config.mlp_int_list))
@@ -196,8 +195,9 @@ class TestFlextronRouter:
         config = _router_config()
         config.curr_iteration = 0
 
-        router_a = FlextronRouter(config).cuda()
-        router_b = FlextronRouter(config).cuda()
+        layer_config_list = _layer_config_list(config)
+        router_a = FlextronRouter(config, layer_config_list).cuda()
+        router_b = FlextronRouter(config, layer_config_list).cuda()
         # Copy weights so both routers are in the same parameter state; the
         # determinism check is about the Gumbel RNG, not init noise.
         router_b.load_state_dict(router_a.state_dict())
@@ -215,7 +215,7 @@ class TestFlextronRouter:
 
     def test_fwd_pass_count_increments(self):
         config = _router_config()
-        router = FlextronRouter(config).cuda()
+        router = FlextronRouter(config, _layer_config_list(config)).cuda()
         assert router.fwd_pass_count == 0
         router(1.0)
         assert router.fwd_pass_count == 1
@@ -225,7 +225,7 @@ class TestFlextronRouter:
     def test_different_iterations_give_different_samples(self):
         """Bumping curr_iteration changes the Gumbel seed; logits should differ."""
         config = _router_config()
-        router = FlextronRouter(config).cuda()
+        router = FlextronRouter(config, _layer_config_list(config)).cuda()
 
         # Iteration 0 via the default setup-method stub.
         out_iter_0 = router(1.0)

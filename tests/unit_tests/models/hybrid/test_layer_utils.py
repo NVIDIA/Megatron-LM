@@ -120,61 +120,79 @@ class TestGetLayerSymbolFromConfig:
 
 
 @pytest.mark.internal
+class TestCountLayerConfigs:
+
+    def test_counts_exact_types(self):
+        config = _make_transformer_config()
+        layer_config_list = [
+            MambaLayerConfig.from_config(config),
+            MoELayerConfig.from_config(config),
+            MambaLayerConfig.from_config(config),
+            MoELayerConfig.from_config(config),
+        ]
+
+        assert layer_utils.count_layer_configs(layer_config_list, MambaLayerConfig) == 2
+        assert layer_utils.count_layer_configs(layer_config_list, MoELayerConfig) == 2
+
+        class CustomMambaLayerConfig(MambaLayerConfig):
+            pass
+
+        layer_config_list.append(CustomMambaLayerConfig.from_config(config))
+        assert layer_utils.count_layer_configs(layer_config_list, MambaLayerConfig) == 2
+
+
+@pytest.mark.internal
 class TestValidateTpCommOverlap:
 
     @pytest.mark.parametrize(
-        ("segment", "has_mtp", "unsupported_features"),
+        ("config_types", "has_mtp", "unsupported_features"),
         [
-            (layer_utils.Symbols.MLA, False, "MLA"),
-            (layer_utils.Symbols.DS_ATTENTION, False, "DSA"),
-            ("", True, "MTP"),
-            (layer_utils.Symbols.DS_ATTENTION + layer_utils.Symbols.MLA, True, "MLA/DSA/MTP"),
+            ([MLALayerConfig], False, "MLA"),
+            ([DSALayerConfig], False, "DSA"),
+            ([], True, "MTP"),
+            ([DSALayerConfig, MLALayerConfig], True, "MLA/DSA/MTP"),
         ],
     )
-    def test_rejects_overlap_for_unsupported_features(self, segment, has_mtp, unsupported_features):
+    def test_rejects_overlap_for_unsupported_features(
+        self, config_types, has_mtp, unsupported_features
+    ):
         config = _make_transformer_config(tp_comm_overlap=True)
+        layer_config_list = [config_type.from_config(config) for config_type in config_types]
         expected_error = (
             "TP communication overlap is not supported with hybrid "
             f"{unsupported_features} layers. Set tp_comm_overlap=False."
         )
 
         with pytest.raises(ValueError) as exc_info:
-            layer_utils.validate_tp_comm_overlap(config, segment, has_mtp)
+            layer_utils.validate_tp_comm_overlap(config, layer_config_list, has_mtp)
 
         assert config.tp_comm_overlap is True
         assert str(exc_info.value) == expected_error
 
     @pytest.mark.parametrize(
-        ("config_type", "unsupported_feature"), [(MLALayerConfig, "MLA"), (DSALayerConfig, "DSA")]
-    )
-    def test_accepts_layer_configs(self, config_type, unsupported_feature):
-        config = _make_transformer_config(tp_comm_overlap=True)
-        layer_config = config_type.from_config(config)
-
-        with pytest.raises(ValueError, match=f"hybrid {unsupported_feature} layers"):
-            layer_utils.validate_tp_comm_overlap(config, [layer_config])
-
-    @pytest.mark.parametrize(
-        ("tp_comm_overlap", "segment", "has_mtp"),
+        ("tp_comm_overlap", "config_types", "has_mtp"),
         [
             (
                 True,
-                layer_utils.Symbols.MAMBA
-                + layer_utils.Symbols.GDN
-                + layer_utils.Symbols.ATTENTION
-                + layer_utils.Symbols.MLP
-                + layer_utils.Symbols.MOE,
+                [
+                    MambaLayerConfig,
+                    GDNLayerConfig,
+                    AttentionLayerConfig,
+                    MLPLayerConfig,
+                    MoELayerConfig,
+                ],
                 False,
             ),
-            (False, layer_utils.Symbols.MLA, False),
-            (False, "", True),
+            (False, [MLALayerConfig], False),
+            (False, [], True),
         ],
     )
     def test_leaves_supported_or_disabled_overlap_unchanged(
-        self, tp_comm_overlap, segment, has_mtp
+        self, tp_comm_overlap, config_types, has_mtp
     ):
         config = _make_transformer_config(tp_comm_overlap=tp_comm_overlap)
+        layer_config_list = [config_type.from_config(config) for config_type in config_types]
 
-        layer_utils.validate_tp_comm_overlap(config, segment, has_mtp)
+        layer_utils.validate_tp_comm_overlap(config, layer_config_list, has_mtp)
 
         assert config.tp_comm_overlap is tp_comm_overlap

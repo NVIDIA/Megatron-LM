@@ -25,9 +25,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_layer_type_list_from_layer_config_list,
-    validate_segment_layers,
 )
-from megatron.core.models.hybrid.hybrid_layer_config import validate_hybrid_layer_config_families
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -121,21 +119,28 @@ class HybridStack(MegatronModule):
         """
         if (layer_type_list is None) == (layer_config_list is None):
             raise ValueError("Exactly one of layer_type_list or layer_config_list must be provided")
+        clone_layer_configs = layer_config_list is not None
         if layer_type_list is not None:
             if any(
                 not isinstance(layer_symbol, str) or len(layer_symbol) != 1
                 for layer_symbol in layer_type_list
             ):
                 raise ValueError("Each entry in layer_type_list must be a single layer symbol")
-            segment = ''.join(layer_type_list)
             warnings.warn(
                 "DEPRECATED(layer_type_list): please use `layer_config_list` instead",
                 DeprecationWarning,
                 stacklevel=2,
             )
-            layer_config_list = validate_segment_layers(segment, config)
+            layer_config_list = [
+                layer_utils.create_layer_config(config, layer_symbol)
+                for layer_symbol in layer_type_list
+            ]
+        else:
+            assert layer_config_list is not None
 
-        validate_hybrid_layer_config_families(layer_config_list)
+        layer_utils.validate_layer_config_types({type(entry) for entry in layer_config_list})
+        if clone_layer_configs:
+            layer_config_list = [type(entry).from_config(entry) for entry in layer_config_list]
         layer_utils.validate_tp_comm_overlap(config, layer_config_list, has_mtp=is_mtp_layer)
 
         super().__init__(config=config)

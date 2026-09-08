@@ -16,9 +16,6 @@ from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import Yar
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid.hybrid_layer_config import (
     ArchitectureEntry,
-    ArchitectureMetadata,
-    MTPSplit,
-    PipelineSplit,
     scan_hybrid_layer_config_list,
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
@@ -48,15 +45,6 @@ from megatron.core.utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-__all__ = [
-    "ArchitectureEntry",
-    "ArchitectureMetadata",
-    "HybridModel",
-    "MTPSplit",
-    "PipelineSplit",
-    "scan_hybrid_layer_config_list",
-]
 
 
 def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
@@ -153,9 +141,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         vp_stage: Optional[int] = None,
         layer_config_list: Sequence[ArchitectureEntry] | None = None,
     ) -> None:
-        has_deprecated_ratios = (
-            hybrid_attention_ratio is not None and hybrid_attention_ratio > 0.0
-        ) or (hybrid_mlp_ratio is not None and hybrid_mlp_ratio > 0.0)
         if layer_config_list is not None and (
             hybrid_layer_pattern is not None
             or hybrid_override_pattern is not None
@@ -168,6 +153,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
 
         if layer_config_list is None:
+            has_deprecated_ratios = (
+                hybrid_attention_ratio is not None and hybrid_attention_ratio > 0.0
+            ) or (hybrid_mlp_ratio is not None and hybrid_mlp_ratio > 0.0)
             if hybrid_override_pattern is not None:
                 if hybrid_layer_pattern is None:
                     log_single_rank(
@@ -196,16 +184,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "hybrid_attention_ratio and hybrid_mlp_ratio have been deprecated. "
                     "Use hybrid_layer_pattern instead.",
                 )
-                if hybrid_layer_pattern is None:
-                    from megatron.core.models.hybrid.hybrid_layer_allocation import (
-                        pattern_from_ratios,
-                    )
+                from megatron.core.models.hybrid.hybrid_layer_allocation import pattern_from_ratios
 
-                    attn_ratio = hybrid_attention_ratio if hybrid_attention_ratio else 0.0
-                    mlp_ratio = hybrid_mlp_ratio if hybrid_mlp_ratio else 0.0
-                    hybrid_layer_pattern = pattern_from_ratios(
-                        config.num_layers, attn_ratio, mlp_ratio
-                    )
+                hybrid_layer_pattern = pattern_from_ratios(
+                    config.num_layers,
+                    hybrid_attention_ratio or 0.0,
+                    hybrid_mlp_ratio or 0.0,
+                )
             if hybrid_layer_pattern is None:
                 raise ValueError(
                     "Either hybrid_layer_pattern or layer_config_list must be provided."
@@ -217,10 +202,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             layer_config_list = layer_config_list_from_hybrid_layer_pattern(
                 hybrid_layer_pattern, config
             )
-            # The pattern is only a compatibility input. Do not retain it as a second
-            # architecture representation after producing the config list.
-            hybrid_layer_pattern = None
-            hybrid_override_pattern = None
         layer_config_list = tuple(layer_config_list)
 
         super().__init__(config=config, pg_collection=pg_collection)
@@ -269,6 +250,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             else len(self.layer_config_list)
         )
         decoder_entries = self.layer_config_list[:decoder_end]
+        if architecture_metadata.mtp_num_depths:
+            decoder_layer_configs = [
+                entry for entry in decoder_entries if isinstance(entry, TransformerConfig)
+            ]
+            layer_utils.validate_tp_comm_overlap(
+                self.config, decoder_layer_configs, has_mtp=True
+            )
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             select_pipeline_config_segment,
         )
@@ -290,9 +278,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
 
         # Determine whether this model instance builds MTP.
-        has_mtp_architecture = self.mtp_num_depths > 0
         self.mtp_process = (
-            has_mtp_architecture
+            self.mtp_num_depths > 0
             # The following forces MTP to be on the final pipeline stage. It might be more optimal
             # to place MTP independently while selecting the decoder's pipeline segment. This
             # could also enable MTP standalone (MTP in a pipeline stage separate from loss) to be
@@ -305,12 +292,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 pp_group=self.pg_collection.pp,
                 vp_size=self.config.virtual_pipeline_model_parallel_size,
             )
-        )
-
-        # Validate TP communication overlap after determining whether this rank builds MTP,
-        # before constructing the decoder or MTP modules.
-        layer_utils.validate_tp_comm_overlap(
-            self.config, local_layer_config_list, has_mtp=self.mtp_process
         )
 
         # megatron core pipelining currently depends on model type

@@ -84,11 +84,14 @@ def test_generate_state_dict_persists_actual_model_family(is_hybrid):
     """Checkpoint args record the built model family even when no pattern exists."""
     args = SimpleNamespace(ckpt_format="torch", no_save_optim=True, no_save_rng=True)
     model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
+    if is_hybrid:
+        from megatron.core.models.hybrid.hybrid_model import HybridModel
 
-    with mock.patch(
-        "megatron.training.checkpointing._contains_hybrid_model", return_value=is_hybrid
-    ):
-        state_dict = generate_state_dict(args, [model], None, None, None)
+        nested_hybrid = HybridModel.__new__(HybridModel)
+        torch.nn.Module.__init__(nested_hybrid)
+        model.language_model = nested_hybrid
+
+    state_dict = generate_state_dict(args, [model], None, None, None)
 
     assert state_dict["args"] is args
     assert state_dict["args"].checkpoint_model_is_hybrid is is_hybrid

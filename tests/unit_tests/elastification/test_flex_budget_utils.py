@@ -2,11 +2,7 @@
 
 """Unit tests for megatron.elastification.router.flex_budget_utils."""
 
-import pytest
-
-from megatron.core.models.hybrid import MTPSplit, PipelineSplit
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
-from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.elastification.router.flex_budget_utils import get_num_parameters
@@ -165,17 +161,6 @@ class TestGetNumParameters:
         )
         # Untied adds one more vocab*hidden block.
         assert total_untied - total_tied == _DIMS["vocab_size"] * _DIMS["hidden_size"]
-
-    @pytest.mark.parametrize("marker", [PipelineSplit, MTPSplit])
-    def test_split_markers_are_rejected(self, marker):
-        with pytest.raises(NotImplementedError, match="does not support"):
-            get_num_parameters(
-                layer_config_list=(*_layers(MambaLayerConfig), marker), tied_vocab=False, **_DIMS
-            )
-
-    def test_unsupported_layer_config_is_rejected(self):
-        with pytest.raises(NotImplementedError, match="supports only"):
-            get_num_parameters(layer_config_list=_layers(MLPLayerConfig), tied_vocab=False, **_DIMS)
 
     def test_moe_active_less_than_or_equal_total(self):
         # topk < num_experts, so active < total; topk == num_experts, active == total.

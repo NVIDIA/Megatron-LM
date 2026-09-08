@@ -21,27 +21,19 @@ from megatron.core.transformer.attention_layer_config import AttentionLayerConfi
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.moe.moe_utils import get_capacity, group_limited_topk
 from megatron.elastification.flextron_config import FlextronConfig
-from megatron.elastification.router.flex_budget_utils import (
-    get_flextron_layer_ordinal,
-    validate_flextron_layer_config_list,
-)
 
-_FLEXTRON_RUNTIME_CONFIG_FIELDS = frozenset(field.name for field in fields(FlextronConfig)) | {
-    'flextron_layer_config_list'
-}
+_FLEXTRON_CONFIG_FIELDS = {field.name for field in fields(FlextronConfig)}
 
 
-class _FlextronLayerConfigView:
-    """Resolve model settings per layer while keeping Flextron settings model-wide."""
-
-    __slots__ = ('layer_config', 'root_config')
+class _FlextronLayerConfig:
+    """Read Transformer settings per layer and Flextron settings from the root config."""
 
     def __init__(self, layer_config, root_config):
         self.layer_config = layer_config
         self.root_config = root_config
 
     def __getattr__(self, name):
-        if name in _FLEXTRON_RUNTIME_CONFIG_FIELDS:
+        if name in _FLEXTRON_CONFIG_FIELDS:
             return getattr(self.root_config, name)
         try:
             return getattr(self.layer_config, name)
@@ -71,7 +63,7 @@ class FlextronMambaElasticityManager:
     Based on the exact implementation from original flextron_os MambaMixer.
     """
 
-    def __init__(self, config, layer_idx=0):
+    def __init__(self, config, layer_idx=0, layer_ordinal=0):
         self.config = config
         self.layer_idx = layer_idx
         self.enabled = getattr(config, 'flextron', False)
@@ -79,9 +71,7 @@ class FlextronMambaElasticityManager:
         if not self.enabled:
             return
 
-        self.mamba_idx = get_flextron_layer_ordinal(
-            self.config.flextron_layer_config_list, self.layer_idx, MambaLayerConfig
-        )
+        self.mamba_idx = layer_ordinal
 
         # Current elasticity parameters - store the full router outputs
         self.current_router_emb = None
@@ -832,7 +822,7 @@ class FlextronTopKRouterElasticityManager:
     Handles expert masking in the routing logits before topk selection.
     """
 
-    def __init__(self, config, layer_idx=0):
+    def __init__(self, config, layer_idx=0, layer_ordinal=0):
         self.config = config
         self.layer_idx = layer_idx
         self.enabled = getattr(config, 'flextron', False)
@@ -840,9 +830,7 @@ class FlextronTopKRouterElasticityManager:
         if not self.enabled:
             return
 
-        self.moe_idx = get_flextron_layer_ordinal(
-            self.config.flextron_layer_config_list, self.layer_idx, MoELayerConfig
-        )
+        self.moe_idx = layer_ordinal
 
         # Current elasticity parameters
         self.current_router_moe_expert = None
@@ -1072,7 +1060,7 @@ class FlextronMoEElasticityManager:
 class FlextronGroupedMLPElasticityManager:
     """Manages elasticity hooks for grouped MLP layers."""
 
-    def __init__(self, config, layer_idx=0):
+    def __init__(self, config, layer_idx=0, layer_ordinal=0):
         self.config = config
         self.layer_idx = layer_idx
         self.enabled = getattr(config, 'flextron', False)
@@ -1080,9 +1068,7 @@ class FlextronGroupedMLPElasticityManager:
         if not self.enabled:
             return
 
-        self.mlp_idx = get_flextron_layer_ordinal(
-            self.config.flextron_layer_config_list, self.layer_idx, MoELayerConfig
-        )
+        self.mlp_idx = layer_ordinal
 
         self.current_router_mlp = None
         self.current_router_emb = None
@@ -1638,7 +1624,7 @@ class FlextronStackElasticityManager:
         self.detach_hooks()
 
 
-def add_flextron_mamba_elasticity(mamba_mixer, config, layer_idx=0):
+def add_flextron_mamba_elasticity(mamba_mixer, config, layer_idx=0, layer_ordinal=0):
     """
     Add elasticity to a MambaMixer using hooks.
 
@@ -1646,13 +1632,14 @@ def add_flextron_mamba_elasticity(mamba_mixer, config, layer_idx=0):
         mamba_mixer: The MambaMixer instance to add elasticity to
         config: Configuration object with flextron settings
         layer_idx: Index of this layer in the typed architecture list
+        layer_ordinal: Index of this layer among Mamba layers
 
     Returns:
         FlextronMambaElasticityManager: Manager object to control elasticity
     """
     if hasattr(mamba_mixer, '_flextron_manager'):
         return mamba_mixer._flextron_manager
-    manager = FlextronMambaElasticityManager(config, layer_idx)
+    manager = FlextronMambaElasticityManager(config, layer_idx, layer_ordinal)
     manager.attach_hooks(mamba_mixer)
 
     # Store manager reference on the mixer for easy access
@@ -1684,7 +1671,7 @@ def add_flextron_transformer_layer_elasticity(transformer_layer, config, layer_i
     return manager
 
 
-def add_flextron_topk_router_elasticity(router, config, layer_idx=0):
+def add_flextron_topk_router_elasticity(router, config, layer_idx=0, layer_ordinal=0):
     """
     Add elasticity to a TopKRouter using hooks.
 
@@ -1692,13 +1679,14 @@ def add_flextron_topk_router_elasticity(router, config, layer_idx=0):
         router: The TopKRouter instance to add elasticity to
         config: Configuration object with flextron settings
         layer_idx: Index of this layer in the typed architecture list
+        layer_ordinal: Index of this layer among MoE layers
 
     Returns:
         FlextronTopKRouterElasticityManager: Manager object to control elasticity
     """
     if hasattr(router, '_flextron_router_manager'):
         return router._flextron_router_manager
-    manager = FlextronTopKRouterElasticityManager(config, layer_idx)
+    manager = FlextronTopKRouterElasticityManager(config, layer_idx, layer_ordinal)
     manager.attach_hooks(router)
 
     # Store manager reference on the router for easy access
@@ -1730,13 +1718,13 @@ def add_flextron_moe_elasticity(moe_module, config, layer_idx=0):
     return manager
 
 
-def add_flextron_grouped_mlp_elasticity(grouped_mlp_module, config, layer_idx=0):
+def add_flextron_grouped_mlp_elasticity(grouped_mlp_module, config, layer_idx=0, layer_ordinal=0):
     """
     Add elasticity to a GroupedMLP using hooks.
     """
     if hasattr(grouped_mlp_module, '_flextron_manager'):
         return grouped_mlp_module._flextron_manager
-    manager = FlextronGroupedMLPElasticityManager(config, layer_idx)
+    manager = FlextronGroupedMLPElasticityManager(config, layer_idx, layer_ordinal)
     manager.attach_hooks(grouped_mlp_module)
 
     # Store manager reference on the module for easy access
@@ -1795,10 +1783,9 @@ def apply_flextron_elasticity_to_model(model, config):
     """Apply elasticity managers according to the model's typed layer config list."""
     managers = []
 
-    layer_config_list = getattr(config, 'flextron_layer_config_list', ())
+    layer_config_list = getattr(model, 'layer_config_list', ())
     if not layer_config_list:
         return managers
-    layer_config_list = validate_flextron_layer_config_list(layer_config_list)
 
     # Find decoder layers
     decoder = getattr(model, 'decoder', None)
@@ -1814,8 +1801,10 @@ def apply_flextron_elasticity_to_model(model, config):
         )
 
     # FlextronModelManager rejects PP/VPP, so list and local module indices align exactly.
+    mamba_ordinal = 0
+    moe_ordinal = 0
     for layer_idx, (layer_config, layer) in enumerate(zip(layer_config_list, layers, strict=True)):
-        manager_config = _FlextronLayerConfigView(layer_config, config)
+        manager_config = _FlextronLayerConfig(layer_config, config)
         if type(layer_config) is MoELayerConfig:
             if (
                 'MoETransformerLayer' == layer.__class__.__name__
@@ -1844,7 +1833,7 @@ def apply_flextron_elasticity_to_model(model, config):
                         break
                 if router_module is not None:
                     router_manager = add_flextron_topk_router_elasticity(
-                        router_module, manager_config, layer_idx
+                        router_module, manager_config, layer_idx, layer_ordinal=moe_ordinal
                     )
                     managers.append(router_manager)
 
@@ -1855,8 +1844,11 @@ def apply_flextron_elasticity_to_model(model, config):
                     moe_module = module
                     break
             if moe_module is not None:
-                manager = add_flextron_grouped_mlp_elasticity(moe_module, manager_config, layer_idx)
+                manager = add_flextron_grouped_mlp_elasticity(
+                    moe_module, manager_config, layer_idx, layer_ordinal=moe_ordinal
+                )
                 managers.append(manager)
+            moe_ordinal += 1
 
         elif type(layer_config) is MambaLayerConfig:
             mamba_module = None
@@ -1865,8 +1857,11 @@ def apply_flextron_elasticity_to_model(model, config):
                     mamba_module = module
                     break
             if mamba_module is not None:
-                manager = add_flextron_mamba_elasticity(mamba_module, manager_config, layer_idx)
+                manager = add_flextron_mamba_elasticity(
+                    mamba_module, manager_config, layer_idx, layer_ordinal=mamba_ordinal
+                )
                 managers.append(manager)
+            mamba_ordinal += 1
 
         elif type(layer_config) is AttentionLayerConfig:
             attention_module = None
