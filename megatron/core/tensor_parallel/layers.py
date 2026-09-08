@@ -335,8 +335,8 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
         )
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
-        self.deterministic_mode = config.deterministic_mode
         self.config = config
+        self._deterministic_flag_checked = False
 
         self.use_inference_optimized_reduce_scatter = (
             getattr(config, 'transformer_impl', None) == 'inference_optimized'
@@ -419,12 +419,26 @@ class VocabParallelEmbedding(torch.nn.Module):
 
             weight = GTPEmbeddingWeight.apply(self.weight)
 
-        # Get the embeddings.
-        if self.deterministic_mode:
-            output_parallel = weight[masked_input]
-        else:
-            # F.embedding currently has a non-deterministic backward function
-            output_parallel = F.embedding(masked_input, weight)
+        # Get the embeddings. F.embedding's CUDA backward (embedding_dense_backward) is
+        # bit-reproducible under torch.use_deterministic_algorithms(True), which
+        # --deterministic-mode sets: its <=3072-id kernel and its sort-then-segment-reduce path
+        # accumulate in a fixed order, and the fused atomic path torch >= 2.11 added for tables
+        # with few segments is disabled under that flag. It needs no deterministic-mode special
+        # case. Indexing the weight instead (index_put_ with accumulate=True) is reproducible too
+        # but reduces duplicate ids serially, which is 10-30x slower on padding-heavy batches.
+        if self.config.deterministic_mode and not self._deterministic_flag_checked:
+            self._deterministic_flag_checked = True
+            if not torch.are_deterministic_algorithms_enabled():
+                warnings.warn(
+                    "VocabParallelEmbedding: config.deterministic_mode is set but "
+                    "torch.use_deterministic_algorithms(True) is not. F.embedding's backward is "
+                    "bit-reproducible only under that flag (torch >= 2.11 may take an atomic path "
+                    "for tables under ~600 rows without it). --deterministic-mode sets the flag; "
+                    "library callers must set it themselves.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        output_parallel = F.embedding(masked_input, weight)
         # Mask the output embedding.
         if self.tp_group.size() > 1:
             output_parallel[input_mask, :] = 0.0

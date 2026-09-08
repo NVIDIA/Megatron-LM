@@ -35,7 +35,7 @@ Selected by `torch.are_deterministic_algorithms_enabled()` or
 | --- | --- | --- | --- |
 | MoE token unpermute (combine) | `megatron/core/transformer/moe/moe_utils.py` | `index_add_` — deterministic under torch deterministic algorithms and CUDA-graph safe | `scatter_add_` (atomic accumulation) |
 | MoE routing map and probabilities | `megatron/core/transformer/moe/moe_utils.py` | `index_put_(accumulate=False)` row-wise writes | out-of-place `scatter` |
-| Vocab-parallel embedding | `megatron/core/tensor_parallel/layers.py` | direct indexing `weight[idx]` (deterministic backward) | `F.embedding` (non-deterministic atomic backward) |
+| Vocab-parallel embedding | `megatron/core/tensor_parallel/layers.py` | `F.embedding` — sort-then-segment-reduce backward, bit-exact under torch deterministic algorithms, which also disable the atomic few-segment path torch >= 2.11 added; `config.deterministic_mode` without the flag warns once | `F.embedding` (same kernel; on torch >= 2.11 tables under ~600 rows with >3072 ids may take the atomic path) |
 | Gated-delta-net kernel | `megatron/core/ssm/gated_delta_net.py` | torch `chunk_gated_delta_rule` | FLA fused kernel |
 | Gated-delta-net causal conv1d | `megatron/core/ssm/gated_delta_net/` | `F.conv1d` (plus transposes) | FLA `causal_conv1d` |
 | Mamba/SSM Triton ops | `megatron/core/ssm/ops/common/determinism.py` | one fixed autotune config plus a zero-initialized tiled workspace reduced with an ordered `sum` | timing-based autotune, uninitialized workspace |
