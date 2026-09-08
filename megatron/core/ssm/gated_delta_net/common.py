@@ -429,7 +429,25 @@ class _GDNBase(MegatronModule):
 
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            query_key = l2norm(query_key.contiguous())
+            # deterministic_mode must cover this step too. It swaps the gated delta rule for
+            # its torch implementation but historically left this one as fla's Triton kernel,
+            # and torch.use_deterministic_algorithms cannot see inside Triton -- so the whole
+            # determinism checklist passed while training stayed irreproducible run to run.
+            # The deviation reaches the scan through q and k while v and beta stay
+            # bit-identical, which is the signature of this step alone.
+            query_key = query_key.contiguous()
+            if self.config.deterministic_mode:
+                # Mirror fla's formula, not just its result: it computes rsqrt(sum + eps) with
+                # eps=1e-6, NOT rsqrt(max(sum, eps)). The two agree bitwise at normal magnitudes
+                # but diverge sharply once the row norm approaches eps, so a clamp-based variant
+                # is not a drop-in replacement. deterministic_mode is supposed to swap the
+                # kernel, not the function.
+                qk32 = query_key.float()
+                query_key = (qk32 * torch.rsqrt(qk32.pow(2).sum(-1, keepdim=True) + 1e-6)).to(
+                    query_key.dtype
+                )
+            else:
+                query_key = l2norm(query_key)
 
         # Split query and key
         split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size
