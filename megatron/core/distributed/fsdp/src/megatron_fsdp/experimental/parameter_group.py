@@ -181,19 +181,34 @@ class FsdpParameterGroup:
             self._symm_mem_pool = None
 
         if is_mxfp8:
-            self.model_weight = DBuffer.from_mxfp8(
-                parameter_to_fqns, self.mesh, model_weight_placements, allocate_new=True
+            self.model_weight = DBuffer(
+                mesh=self.mesh,
+                placements=model_weight_placements,
+                tensor_shapes=tensor_shapes,
+                dtype=torch.uint8,
+                device=self.main_weight.device,
+                block_size=block_size,
             )
-            self.post_optimizer_model_weight = DBuffer.from_mxfp8(
-                parameter_to_fqns, self.mesh, main_weight_placements, allocate_new=True
+            self.post_optimizer_model_weight = DBuffer(
+                mesh=self.mesh,
+                placements=main_weight_placements,
+                tensor_shapes=tensor_shapes,
+                dtype=torch.uint8,
+                device=self.main_weight.device,
+                block_size=block_size,
             )
             self.post_optimizer_model_weight.sync_from_main(self.main_weight)
             self.post_optimizer_model_weight.redistribute(
                 model_weight_placements, out=self.model_weight
             )
             self._model_weight_is_stale = False
-            self._unsharded_model_weight = DBuffer.from_mxfp8(
-                parameter_to_fqns, self.mesh, [Replicate()] * self.mesh.ndim, allocate_new=True
+            self._unsharded_model_weight = DBuffer(
+                mesh=self.mesh,
+                placements=[Replicate()] * self.mesh.ndim,
+                tensor_shapes=tensor_shapes,
+                dtype=torch.uint8,
+                device=self.main_weight.device,
+                block_size=block_size,
             )
         elif main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
             self.model_weight = self.main_weight

@@ -29,8 +29,11 @@ from .layout import GlobalLayout, Shape, non_leading_numel
 from .placement import changed_mesh_axis
 
 if HAVE_TE_MXFP8TENSOR:
-    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
 else:
+    tex = None
+    MXFP8Quantizer = None
     MXFP8Tensor = None
 
 _MXFP8_BLOCK_SIZE = 32
@@ -113,7 +116,8 @@ class DBuffer:
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
             tensor_shapes: Global shapes for each logical tensor in this buffer.
-            dtype: Dtype for the local buffer.
+            dtype: Physical dtype for the local buffer. ``torch.uint8`` creates
+                an MXFP8 buffer with TE's default quantizer.
             device: Device for the local buffer.
         """
         placements = tuple(placements)
@@ -131,79 +135,36 @@ class DBuffer:
         )
 
         self.offset, local_numel = self.layout.get_local_range(self.mesh, self.placements)
-        self.local_tensor = torch.empty(local_numel, dtype=dtype, device=device)
+        if dtype != torch.uint8:
+            self.local_tensor = torch.empty(local_numel, dtype=dtype, device=device)
+            return
 
-    @classmethod
-    def from_mxfp8(
-        cls,
-        tensors: Iterable[torch.Tensor],
-        mesh: DeviceMesh,
-        placements: Iterable[Placement],
-        *,
-        allocate_new: bool = False,
-    ) -> "DBuffer":
-        """Create a DBuffer whose logical tensor is a TE MXFP8Tensor.
-
-        TE owns the physical data and scale subtensors. DBuffer owns their
-        placement and collective lifecycle through the retained logical wrapper.
-        """
-        tensors = tuple(tensors)
-        if len(tensors) != 1:
-            raise NotImplementedError("Experimental MXFP8 MFSDP supports one parameter per group.")
-        tensor = tensors[0]
-        placements = tuple(placements)
-        if not is_mxfp8_tensor(tensor) or tensor.ndim != 2:
-            raise TypeError("DBuffer.from_mxfp8() requires a 2D materialized MXFP8Tensor.")
-        if len(placements) != mesh.ndim:
-            raise ValueError(
-                f"Expected {mesh.ndim} placements for device mesh, got {len(placements)}."
-            )
-        _validate_placements(placements)
+        if not HAVE_TE_MXFP8TENSOR:
+            raise RuntimeError("MXFP8 DBuffer construction requires Transformer Engine.")
+        if len(tensor_shapes) != 1 or len(tensor_shapes[0]) != 2:
+            raise NotImplementedError("Experimental MXFP8 MFSDP supports one 2D tensor per group.")
         if mesh.ndim != 1 or any(
             not isinstance(placement, (Replicate, Shard)) for placement in placements
         ):
             raise NotImplementedError(
                 "Experimental MXFP8 MFSDP supports one-dimensional Replicate/Shard meshes."
             )
-        if allocate_new:
-            tensor = cls._empty_mxfp8_like(tensor)
-        is_replicated = all(isinstance(placement, Replicate) for placement in placements)
-        if is_replicated:
-            local_tensor = tensor
+
+        if all(isinstance(placement, Replicate) for placement in placements):
+            local_shape = tensor_shapes[0]
         else:
-            if tensor.shape[0] % _MXFP8_BLOCK_SIZE or mesh.size() != 2:
+            if tensor_shapes[0][0] % _MXFP8_BLOCK_SIZE or mesh.size() != 2:
                 raise NotImplementedError("MXFP8 MFSDP requires two equal 32-row-block shards.")
-            local_rows = tensor.shape[0] // mesh.size()
+            local_rows = tensor_shapes[0][0] // mesh.size()
             if local_rows % _MXFP8_BLOCK_SIZE:
                 raise NotImplementedError("MXFP8 MFSDP requires two equal 32-row-block shards.")
-            local_tensor = tensor.split(local_rows, dim=0)[mesh.get_local_rank()]
+            local_shape = torch.Size((local_rows, tensor_shapes[0][1]))
 
-        buffer = cls.__new__(cls)
-        buffer.mesh = mesh
-        buffer.placements = placements
-        buffer.layout = GlobalLayout.build(
-            [tensor.shape], dp_size=mesh.size(), block_size=_MXFP8_BLOCK_SIZE
-        )
-        buffer.offset, _ = buffer.layout.get_local_range(mesh, placements)
-        buffer.local_tensor = local_tensor
-        return buffer
-
-    @staticmethod
-    def _empty_mxfp8_like(tensor: torch.Tensor) -> torch.Tensor:
-        """Allocate an independent TE MXFP8 wrapper with the same physical layout."""
-        assert is_mxfp8_tensor(tensor)
-        return MXFP8Tensor(
-            shape=tensor.shape,
-            dtype=tensor.dtype,
-            rowwise_data=torch.empty_like(tensor._rowwise_data),
-            rowwise_scale_inv=torch.empty_like(tensor._rowwise_scale_inv),
-            columnwise_data=torch.empty_like(tensor._columnwise_data),
-            columnwise_scale_inv=torch.empty_like(tensor._columnwise_scale_inv),
-            fp8_dtype=tensor._fp8_dtype,
-            quantizer=tensor._quantizer,
-            with_gemm_swizzled_scales=tensor._with_gemm_swizzled_scales,
-            device=tensor.device,
-            requires_grad=False,
+        # Quantizing zeros is the public, layout-driven way to allocate both
+        # MXFP8 representations and their scale tensors. sync_from_main()
+        # overwrites the placeholder values before the buffer is used.
+        self.local_tensor = MXFP8Quantizer(tex.DType.kFloat8E4M3)(
+            torch.zeros(local_shape, dtype=torch.bfloat16, device=device)
         )
 
     @property
