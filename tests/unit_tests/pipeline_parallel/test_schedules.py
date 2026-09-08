@@ -151,32 +151,42 @@ def _patch_hybrid_cp_cpu_tensors(monkeypatch):
     )
 
 
-def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypatch):
+def test_hybrid_context_parallel_forward_backward_passes_packed_samples(monkeypatch):
     _patch_hybrid_cp_cpu_tensors(monkeypatch)
     _patch_hybrid_cp_parallel_state(monkeypatch, is_first_tp_rank=True)
 
     monkeypatch.setattr(
         hybrid_cp_schedule.torch.distributed, "broadcast", lambda *args, **kwargs: None
     )
-    barrier_groups = []
+    barrier_calls = []
     monkeypatch.setattr(
         hybrid_cp_schedule.torch.distributed,
         "barrier",
-        lambda group=None: barrier_groups.append(group),
+        lambda group=None: barrier_calls.append(group),
     )
 
-    def _make_sub_sample(length):
-        # Shape of a real HybridCPDataLoaderWrapper.unpack_batch sub-sample:
-        # 1-D token-level tensors, no cu_seqlens/max_seqlen keys.
+    def _make_packed_sample(length, local_cp_size):
+        # Shape of a real packed sample from HybridCPDataLoaderWrapper: the
+        # bridged 2-D batched schema that get_batch_on_this_tp_rank requires
+        # under is_hybrid_cp, produced by _pack_sequences at the dataloader.
         return {
-            "tokens": torch.arange(length, dtype=torch.int64),
-            "labels": torch.arange(1, length + 1, dtype=torch.int64),
-            "loss_mask": torch.ones(length, dtype=torch.float32),
-            "position_ids": torch.arange(length, dtype=torch.int64),
+            "tokens": torch.arange(length, dtype=torch.int64).unsqueeze(0),
+            "labels": torch.arange(1, length + 1, dtype=torch.int64).unsqueeze(0),
+            "loss_mask": torch.ones(1, length, dtype=torch.float32),
+            "position_ids": torch.arange(length, dtype=torch.int64).unsqueeze(0),
+            "cu_seqlens": torch.tensor([[0, length]], dtype=torch.int32),
+            "cu_seqlens_padded": torch.tensor([[0, length]], dtype=torch.int32),
+            "max_seqlen": torch.tensor([length], dtype=torch.int32),
+            "local_cp_size": torch.tensor([local_cp_size], dtype=torch.int32),
         }
 
-    batch = [_make_sub_sample(16), _make_sub_sample(24), _make_sub_sample(8)]
-    sample_id_groups = [[[0], [0], []], [[1, 2], [1], [1, 2]]]
+    packed_samples = [
+        _make_packed_sample(16, 2),
+        _make_packed_sample(24, 3),
+        _make_packed_sample(8, 2),
+    ]
+    # One packed sample per group after sequence packing.
+    sample_id_groups = [[[0], [0], []], [[1, 2], [1], [1, 2]], [[3], [], [3]]]
     forward_calls = []
 
     def fake_forward_step(
@@ -190,11 +200,9 @@ def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypat
         cp_group_size,
         **kwargs,
     ):
+        # The schedule must pass the packed-sample iterator through untouched.
         assert isinstance(data_iterator, RerunDataIterator)
         sample = next(data_iterator)
-        # The schedule must hand forward_step the bridged 2-D batched schema
-        # that get_batch_on_this_tp_rank requires under is_hybrid_cp; a raw
-        # 1-D unpack_batch sub-sample here is the regression this test guards.
         length = sample["tokens"].shape[-1]
         for key in ("tokens", "labels", "loss_mask", "position_ids"):
             assert sample[key].shape == (1, length)
@@ -208,7 +216,6 @@ def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypat
             {
                 "length": int(length),
                 "local_cp_size": int(sample["local_cp_size"].item()),
-                "local_cp_size_dtype": sample["local_cp_size"].dtype,
                 "cp_group_size": cp_group_size,
                 "current_microbatch": kwargs["current_microbatch"],
                 "is_first_microbatch": kwargs["is_first_microbatch"],
@@ -225,10 +232,11 @@ def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypat
     monkeypatch.setattr(schedule, "backward_step", fake_backward_step)
 
     config = SimpleNamespace()
+    pg_collection = SimpleNamespace(cp=SimpleNamespace(size=lambda: 4))
     forward_data_store, total_num_tokens = (
         hybrid_cp_schedule.hybrid_context_parallel_forward_backward(
             forward_step_func=None,
-            data_iterator=iter([(batch, sample_id_groups)]),
+            data_iterator=iter([(RerunDataIterator(iter(packed_samples)), sample_id_groups)]),
             model="model",
             num_microbatches=3,
             input_tensor="input",
@@ -241,34 +249,32 @@ def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypat
             no_sync_func=_no_sync,
             total_num_tokens=0,
             check_first_val_step=lambda first_val_step, forward_only, is_first: is_first,
-            model_type="unused",
+            pg_collection=pg_collection,
         )
     )
 
     assert forward_data_store == []
     assert total_num_tokens == 30
+    assert hybrid_cp_schedule.get_num_total_groups() == 3
     assert forward_calls == [
         {
             "length": 16,
             "local_cp_size": 2,
-            "local_cp_size_dtype": torch.int32,
-            "cp_group_size": 2,
+            "cp_group_size": 4,
             "current_microbatch": 0,
             "is_first_microbatch": True,
         },
         {
             "length": 24,
             "local_cp_size": 3,
-            "local_cp_size_dtype": torch.int32,
-            "cp_group_size": 3,
+            "cp_group_size": 4,
             "current_microbatch": 1,
             "is_first_microbatch": False,
         },
         {
             "length": 8,
             "local_cp_size": 2,
-            "local_cp_size_dtype": torch.int32,
-            "cp_group_size": 2,
+            "cp_group_size": 4,
             "current_microbatch": 2,
             "is_first_microbatch": False,
         },
@@ -279,21 +285,17 @@ def test_hybrid_context_parallel_forward_backward_passes_local_cp_size(monkeypat
         ("input", 2.0, "grad"),
     ]
     assert all(call[3] is config for call in backward_calls)
-    assert "dp_cp_group" in barrier_groups
+    assert barrier_calls == [None]
 
 
-def test_hybrid_context_parallel_non_first_tp_rank_uses_broadcast_cp_size(monkeypatch):
+def test_hybrid_context_parallel_non_first_tp_rank_uses_broadcast_group_count(monkeypatch):
     _patch_hybrid_cp_parallel_state(monkeypatch, is_first_tp_rank=False)
     monkeypatch.setattr(
         hybrid_cp_schedule.torch.cuda, "current_device", lambda: torch.device("cpu")
     )
     monkeypatch.setattr(hybrid_cp_schedule.torch.distributed, "barrier", lambda group=None: None)
 
-    broadcast_values = [
-        torch.tensor([1], dtype=torch.int64),
-        torch.tensor([1], dtype=torch.int32),
-        torch.tensor([7], dtype=torch.int32),
-    ]
+    broadcast_values = [torch.tensor(2, dtype=torch.int32)]
 
     def fake_broadcast(item, src, group=None):
         item.copy_(broadcast_values.pop(0))
@@ -327,7 +329,7 @@ def test_hybrid_context_parallel_non_first_tp_rank_uses_broadcast_cp_size(monkey
         forward_step_func=None,
         data_iterator=None,
         model="model",
-        num_microbatches=1,
+        num_microbatches=2,
         input_tensor="input",
         output_tensor_grad="grad",
         forward_data_store=[],
@@ -338,12 +340,16 @@ def test_hybrid_context_parallel_non_first_tp_rank_uses_broadcast_cp_size(monkey
         no_sync_func=_no_sync,
         total_num_tokens=0,
         check_first_val_step=lambda first_val_step, forward_only, is_first: is_first,
-        model_type="unused",
+        pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 7)),
     )
 
-    assert forward_calls == [(None, 7, 0)]
-    assert total_num_tokens == 4
+    # The non-first TP rank learns the group count from the broadcast and runs
+    # one forward step per group with a None iterator; the CP size comes from
+    # pg_collection, not a per-group broadcast.
+    assert forward_calls == [(None, 7, 0), (None, 7, 1)]
+    assert total_num_tokens == 8
     assert broadcast_values == []
+    assert hybrid_cp_schedule.get_num_total_groups() == 2
 
 
 @pytest.mark.parametrize("calculate_per_token_loss,expected_scale", [(False, 6.0), (True, 3.0)])

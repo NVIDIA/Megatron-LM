@@ -769,8 +769,6 @@ def forward_backward_no_pipelining(
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
 
-    model_type = get_model_type(model)
-
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
@@ -808,7 +806,7 @@ def forward_backward_no_pipelining(
             no_sync_func,
             total_num_tokens,
             check_first_val_step,
-            model_type,
+            pg_collection,
         )
     else:
         with no_sync_func():
