@@ -81,7 +81,11 @@ _hybrid_mtp_block_spec = ModuleSpec(
                 submodules=MultiTokenPredictionLayerSubmodules(
                     enorm=TENorm,
                     hnorm=TENorm,
+                    # Hybrid MTP selects the combined projection normally and
+                    # per-stream projections when mHC is enabled.
                     eh_proj=TEColumnParallelLinear,
+                    e_proj=TEColumnParallelLinear,
+                    h_proj=TEColumnParallelLinear,
                     mtp_model_layer=None,  # Built via pattern + hybrid_submodules
                     layer_norm=TENorm,
                 ),
@@ -387,7 +391,10 @@ hybrid_inference_stack_spec = ModuleSpec(
                         submodules=MultiTokenPredictionLayerSubmodules(
                             enorm=TENorm,
                             hnorm=TENorm,
+                            # Keep both projection forms available for Hybrid MTP.
                             eh_proj=InferenceColumnParallelLinear,
+                            e_proj=InferenceColumnParallelLinear,
+                            h_proj=InferenceColumnParallelLinear,
                             mtp_model_layer=None,  # Built via pattern + hybrid_submodules
                             layer_norm=TENorm,
                         ),

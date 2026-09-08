@@ -253,6 +253,7 @@ class RolloutPipeline:
         self._assemble_pending: dict[int, list[_InferredItem]] = {}
         self._consume_pending: dict[int, list[RolloutGroup]] = {}
         self._output_enqueued_at: dict[tuple[int, int], float] = {}
+        self._restored_output_keys: set[tuple[int, int]] = set()
 
         # Observability accumulators.
         self.infer_queue_dwell: list[float] = []
@@ -270,6 +271,7 @@ class RolloutPipeline:
         self.yielded_count = 0
         self.prepared_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
         self.assembled_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
+        self.restored_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
         self.yielded_groups_per_env = [0] * len(self.gran_policy.num_groups_per_env)
         self.refill_failure_reasons: dict[str, int] = {}
         self._lifetime_refilled_groups = 0
@@ -388,9 +390,10 @@ class RolloutPipeline:
                         )
                         restored.batch_id = batch_id
                         restored.index_in_batch = index_in_batch
-                        self._output_enqueued_at[(batch_id, index_in_batch)] = time.monotonic()
+                        output_key = (batch_id, index_in_batch)
+                        self._output_enqueued_at[output_key] = time.monotonic()
+                        self._restored_output_keys.add(output_key)
                         await self.output_queue.put(restored)
-                        self.restored_count += 1
                         self._groups_in_flight -= 1
                         self._maybe_close_intake()
                         group_id += 1
@@ -551,13 +554,22 @@ class RolloutPipeline:
             raise
 
     def _record_output_dwell(self, group: RolloutGroup) -> None:
-        """Record how long a group sat in output_queue before being yielded."""
+        """Record how long a group sat in output_queue before being dequeued."""
         key = (group.batch_id, group.index_in_batch)
         enqueued_at = self._output_enqueued_at.pop(key, 0.0)
         if enqueued_at:
             self.output_queue_dwell.append(time.monotonic() - enqueued_at)
+
+    def _record_yield(self, group: RolloutGroup) -> None:
+        """Record a group handed to the trainer, including whether it was restored."""
+        key = (group.batch_id, group.index_in_batch)
+        env_index = self.gran_policy.env_of_index(group.index_in_batch)
+        if key in self._restored_output_keys:
+            self._restored_output_keys.remove(key)
+            self.restored_count += 1
+            self.restored_groups_per_env[env_index] += 1
         self.yielded_count += 1
-        self.yielded_groups_per_env[self.gran_policy.env_of_index(group.index_in_batch)] += 1
+        self.yielded_groups_per_env[env_index] += 1
 
     async def _next_complete_group(self) -> RolloutGroup | None:
         """Pop the next group off output_queue and record its dwell."""
@@ -575,6 +587,7 @@ class RolloutPipeline:
             "B": self._consume_batch_order,
         }[self.gran_policy.consumption]
         async for group in consume():
+            self._record_yield(group)
             yield group
 
     async def _consume_completion_order(self) -> AsyncIterator[RolloutGroup]:
